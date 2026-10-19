@@ -131,7 +131,8 @@ class AuthoritativeCIReadTests(unittest.TestCase):
         }
         return paths, pages
 
-    def query(self, pages, *, http_codes=None, links=None):
+    def query(self, pages, *, http_codes=None, links=None,
+              transition_review_pr=None, transition_diff_sha256=None):
         current = {"path": None}
         requests = []
         connection = Mock()
@@ -176,7 +177,10 @@ class AuthoritativeCIReadTests(unittest.TestCase):
         connection.getresponse.side_effect = response
         with (patch.object(admission, "_github_token", return_value="test-only-credential", create=True) as credentials,
               patch.object(admission.http.client, "HTTPSConnection", return_value=connection)):
-            value = admission._fresh_github_checks(TARGET, serving_head=SERVING)
+            value = admission._fresh_github_checks(
+                TARGET, serving_head=SERVING, review_pr=transition_review_pr,
+                diff_sha256=transition_diff_sha256,
+            )
         credentials.assert_called_once_with()
         return value, requests
 
@@ -249,6 +253,124 @@ class AuthoritativeCIReadTests(unittest.TestCase):
         self.assertEqual(2, len(accepted["checks"]))
         self.assertEqual(64, len(accepted["workflow"]["trusted_control_sources_sha256"]))
         self.assertEqual(12, len(requests))
+
+    def test_changed_validation_policy_requires_authentic_full_delta_r3(self):
+        paths, pages = self.fixture()
+        next(item for item in pages[paths["target_tree"]]["tree"]
+             if item["path"] == "tests")["sha"] = "2" * 40
+        with patch.object(admission, "validate_independent_release_review") as review:
+            with self.assertRaisesRegex(
+                admission.ReleaseAdmissionDenied, "policy transition.*R3",
+            ):
+                self.query(pages)
+        review.assert_not_called()
+
+    def test_valid_independent_release_r3_authorizes_exact_policy_transition(self):
+        paths, pages = self.fixture()
+        next(item for item in pages[paths["target_tree"]]["tree"]
+             if item["path"] == "tests")["sha"] = "2" * 40
+        proof = {
+            "review_pr": 1452,
+            "review_binding_sha256": "a" * 64,
+            "review_attempts_sha256": "b" * 64,
+            "independent_pass_count": 1,
+            "admissible_slots": ["independent-grok-4.6"],
+        }
+        with patch.object(
+            admission, "validate_independent_release_review", return_value=proof,
+        ) as verified:
+            result, requests = self.query(
+                pages, transition_review_pr=1452, transition_diff_sha256=DIFF,
+            )
+        verified.assert_called_once_with(
+            serving_head=SERVING, target_head=TARGET,
+            diff_sha256=DIFF, review_pr=1452,
+        )
+        self.assertEqual(2, len(result["checks"]))
+        self.assertTrue(result["workflow"]["ci_policy_transition_required"])
+        self.assertEqual("a" * 64, result["workflow"]["ci_policy_transition_review_binding_sha256"])
+        self.assertIn(paths["target_tree"], requests)
+
+    def test_invalid_independent_review_cannot_authorize_changed_policy(self):
+        paths, pages = self.fixture()
+        next(item for item in pages[paths["target_tree"]]["tree"]
+             if item["path"] == "Makefile")["sha"] = "2" * 40
+        with patch.object(
+            admission, "validate_independent_release_review",
+            side_effect=admission.ReleaseAdmissionDenied(
+                "authentic independent release R3 PASS is missing"
+            ),
+        ) as verified:
+            with self.assertRaisesRegex(admission.ReleaseAdmissionDenied, "R3 PASS is missing"):
+                self.query(
+                    pages, transition_review_pr=1452, transition_diff_sha256=DIFF,
+                )
+        verified.assert_called_once_with(
+            serving_head=SERVING, target_head=TARGET,
+            diff_sha256=DIFF, review_pr=1452,
+        )
+
+    def test_malformed_independent_review_result_cannot_authorize_policy_transition(self):
+        for invalid in (None, {}, {"review_binding_sha256": "a" * 64},
+                        {"review_binding_sha256": "a" * 64,
+                         "review_attempts_sha256": "b" * 64,
+                         "independent_pass_count": 0,
+                         "admissible_slots": []}):
+            with self.subTest(invalid=invalid):
+                paths, pages = self.fixture()
+                next(item for item in pages[paths["target_tree"]]["tree"]
+                     if item["path"] == "Makefile")["sha"] = "2" * 40
+                with patch.object(
+                    admission, "validate_independent_release_review", return_value=invalid,
+                ):
+                    with self.assertRaisesRegex(
+                        admission.ReleaseAdmissionDenied, "authentic independent.*R3",
+                    ):
+                        self.query(
+                            pages, transition_review_pr=1452, transition_diff_sha256=DIFF,
+                        )
+
+    def test_malformed_policy_tree_never_consults_review_authorizer(self):
+        paths, pages = self.fixture()
+        pages[paths["target_tree"]]["truncated"] = True
+        with patch.object(admission, "validate_independent_release_review") as review:
+            with self.assertRaisesRegex(
+                admission.ReleaseAdmissionDenied, "inventory is unproved",
+            ):
+                self.query(
+                    pages, transition_review_pr=1452, transition_diff_sha256=DIFF,
+                )
+        review.assert_not_called()
+
+    def test_independent_review_transition_may_cover_changed_workflow(self):
+        paths, pages = self.fixture()
+        pages[paths["target_workflow"]]["sha"] = "2" * 40
+        proof = {
+            "review_pr": 1452,
+            "review_binding_sha256": "a" * 64,
+            "review_attempts_sha256": "b" * 64,
+            "independent_pass_count": 1,
+            "admissible_slots": ["independent-grok-4.6"],
+        }
+        with patch.object(
+            admission, "validate_independent_release_review", return_value=proof,
+        ) as verified:
+            result, _ = self.query(
+                pages, transition_review_pr=1452, transition_diff_sha256=DIFF,
+            )
+        verified.assert_called_once_with(
+            serving_head=SERVING, target_head=TARGET, diff_sha256=DIFF, review_pr=1452,
+        )
+        self.assertTrue(result["workflow"]["ci_policy_transition_required"])
+        self.assertEqual("1" * 40, result["workflow"]["trusted_blob_oid"])
+        self.assertEqual("2" * 40, result["workflow"]["target_blob_oid"])
+
+    def test_unmodified_validation_controls_never_consume_transition_review(self):
+        paths, pages = self.fixture()
+        with patch.object(admission, "validate_independent_release_review") as review:
+            result, _ = self.query(pages)
+        review.assert_not_called()
+        self.assertFalse(result["workflow"]["ci_policy_transition_required"])
 
     def test_new_root_execution_input_cannot_evade_tree_pin(self):
         paths, pages = self.fixture()

@@ -11,7 +11,7 @@ import http.client
 import json
 import os
 import re
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import parse_qs, urlsplit
 
 REPOSITORY = "heimgewebe/grabowski"
@@ -162,7 +162,8 @@ def _github_inventory(path: str, key: str, *, token: str) -> list[dict[str, Any]
 
 def _trusted_validate_workflow_blob(
     *, serving_head: str, target_head: str, token: str,
-) -> str:
+    authorize_transition: Callable[[str], dict[str, Any]] | None = None,
+) -> tuple[str, str]:
     """The target cannot redefine its own validation policy and grade itself.
 
     The actually serving source is our immutable CI-policy trust anchor. A
@@ -183,12 +184,15 @@ def _trusted_validate_workflow_blob(
             raise ReleaseAdmissionDenied("trusted Validate workflow identity is unproved")
         blobs.append(blob)
     if blobs[0] != blobs[1]:
-        raise ReleaseAdmissionDenied("trusted Validate workflow definition changed")
-    return blobs[0]
+        if authorize_transition is None:
+            raise ReleaseAdmissionDenied("trusted Validate workflow definition changed")
+        authorize_transition("trusted Validate workflow definition changed")
+    return blobs[0], blobs[1]
 
 
 def _trusted_validate_control_sources(
     *, serving_head: str, target_head: str, token: str,
+    authorize_transition: Callable[[str], dict[str, Any]] | None = None,
 ) -> str:
     """Pin transitive Validate control inputs by Git tree identities.
 
@@ -248,37 +252,91 @@ def _trusted_validate_control_sources(
             raise ReleaseAdmissionDenied("trusted Validate control roots are missing")
         observed.append(entries)
     serving, target = observed
-    if set(serving) != set(target):
-        # A newly introduced root sitecustomize.py or script is itself an
-        # untrusted validation input even if every known policy file matches.
-        raise ReleaseAdmissionDenied("trusted Validate control paths changed")
-    for path, old in serving.items():
-        new = target[path]
-        if path in VALIDATION_POLICY_MUTABLE_ROOTS:
+    changed_controls: list[str] = []
+    for path in sorted(set(serving) | set(target)):
+        old, new = serving.get(path), target.get(path)
+        if old is None or new is None:
+            # A new root script (including sitecustomize.py) or the removal
+            # of a trusted entry changes the executed validation boundary.
+            changed_controls.append(path)
+        elif path in VALIDATION_POLICY_MUTABLE_ROOTS:
             if old[:2] != new[:2]:
                 raise ReleaseAdmissionDenied("trusted Validate control type changed")
         elif old != new:
+            changed_controls.append(path)
+    if changed_controls:
+        if authorize_transition is None:
             raise ReleaseAdmissionDenied("trusted Validate control sources changed")
+        # Only a fresh role/commit/diff-bound independent full-release R3 may
+        # establish this transition. Target-generated green CI is not enough.
+        authorize_transition("trusted Validate control sources changed")
     return _sha256_json({
-        "policy_roots": {p: serving[p] for p in sorted(serving)
-                         if p not in VALIDATION_POLICY_MUTABLE_ROOTS},
-        "mutable_roots": sorted(VALIDATION_POLICY_MUTABLE_ROOTS),
+        "serving_policy_roots": {p: serving[p] for p in sorted(serving)
+                                 if p not in VALIDATION_POLICY_MUTABLE_ROOTS},
+        "target_policy_roots": {p: target[p] for p in sorted(target)
+                                if p not in VALIDATION_POLICY_MUTABLE_ROOTS},
+        "changed_policy_paths": changed_controls,
     })
 
 
-def _fresh_github_checks(target_head: str, *, serving_head: str) -> dict[str, Any]:
-    """Bind green checks to the trusted immutable workflow, run, job and suite."""
+def _fresh_github_checks(
+    target_head: str, *, serving_head: str,
+    review_pr: int | None = None, diff_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Bind CI origins; changed validation policy additionally needs an independent full-R3."""
     if (
         not isinstance(target_head, str) or not _SHA40.fullmatch(target_head)
         or not isinstance(serving_head, str) or not _SHA40.fullmatch(serving_head)
     ):
         raise ReleaseAdmissionDenied("release target or serving commit is invalid")
     token = _github_token()
-    trusted_blob = _trusted_validate_workflow_blob(
+    transition_review: dict[str, Any] | None = None
+
+    def authorize_transition(failure_reason: str) -> dict[str, Any]:
+        nonlocal transition_review
+        if transition_review is None:
+            if (
+                type(review_pr) is not int or review_pr <= 0
+                or not isinstance(diff_sha256, str)
+                or _SHA256.fullmatch(diff_sha256) is None
+            ):
+                raise ReleaseAdmissionDenied(
+                    failure_reason + "; CI policy transition requires authentic independent full-delta R3"
+                )
+            # Reconcile the entire immutable serving-to-target diff on each
+            # admission. The caller can only name a reviewer namespace, not
+            # assert its PASS or choose which CI control input has changed.
+            proof = validate_independent_release_review(
+                serving_head=serving_head, target_head=target_head,
+                diff_sha256=diff_sha256, review_pr=review_pr,
+            )
+            if (
+                not isinstance(proof, dict)
+                or proof.get("review_pr") != review_pr
+                or type(proof.get("independent_pass_count")) is not int
+                or proof["independent_pass_count"] < 1
+                or not isinstance(proof.get("admissible_slots"), list)
+                or not proof["admissible_slots"]
+                or not all(isinstance(slot, str) and slot.startswith("independent-")
+                           for slot in proof["admissible_slots"])
+                or not isinstance(proof.get("review_binding_sha256"), str)
+                or _SHA256.fullmatch(proof["review_binding_sha256"]) is None
+                or not isinstance(proof.get("review_attempts_sha256"), str)
+                or _SHA256.fullmatch(proof["review_attempts_sha256"]) is None
+            ):
+                raise ReleaseAdmissionDenied(
+                    "authentic independent full-delta R3 result is invalid"
+                )
+            transition_review = proof
+        return transition_review
+
+    serving_blob, target_blob = _trusted_validate_workflow_blob(
         serving_head=serving_head, target_head=target_head, token=token,
+        authorize_transition=authorize_transition,
     )
     trusted_control_sources_sha256 = _trusted_validate_control_sources(
         serving_head=serving_head, target_head=target_head, token=token,
+        authorize_transition=authorize_transition,
     )
     prefix = f"/repos/{REPOSITORY}"
     workflow, link = _github_json(
@@ -395,8 +453,13 @@ def _fresh_github_checks(target_head: str, *, serving_head: str) -> dict[str, An
         })
     workflow_identity = {
         "id": workflow_id, "path": CANONICAL_WORKFLOW_PATH,
-        "trusted_blob_oid": trusted_blob,
+        "trusted_blob_oid": serving_blob,
+        "target_blob_oid": target_blob,
         "trusted_control_sources_sha256": trusted_control_sources_sha256,
+        "ci_policy_transition_required": transition_review is not None,
+        "ci_policy_transition_review_binding_sha256": (
+            transition_review["review_binding_sha256"] if transition_review else None
+        ),
         "run_id": run_id, "run_attempt": attempt,
         "check_suite_id": suite_id, "event": "push", "head_branch": "main",
         "head_repository": REPOSITORY, "head_sha": target_head,
@@ -484,7 +547,10 @@ def validate_release(
         serving_head=serving_head, target_head=target_head,
         diff_sha256=diff_sha256, review_pr=review_pr,
     )
-    checks = _fresh_github_checks(target_head, serving_head=serving_head)
+    checks = _fresh_github_checks(
+        target_head, serving_head=serving_head,
+        review_pr=review_pr, diff_sha256=diff_sha256,
+    )
     material = {
         "schema_version": 1,
         "kind": "grabowski_post_merge_release_review",
