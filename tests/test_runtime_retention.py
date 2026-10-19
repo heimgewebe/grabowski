@@ -2396,6 +2396,179 @@ class RuntimeRetentionTests(unittest.TestCase):
             self.assertFalse(list(receipts.glob("*.json")))
             reset.assert_not_called()
 
+    def test_indexed_live_source_aba_swap_cannot_authorize_reset(self) -> None:
+        # P1: a same-UID writer can temporarily present a younger registry
+        # directory during path-based _job_record, then restore the older
+        # directory before a pinned-fd/path identity check.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs = root / "jobs"
+            archive = root / "archive"
+            receipts = root / "receipts"
+            name = "grabowski-job-474747474747"
+            unit = name + ".service"
+            now = int(RETENTION.time.time())
+            young = self._job(jobs, name, now - 400)
+            old = self._job(root / "old-jobs", name, now - 1_200)
+            held_young = root / "held-young"
+            parked_old = root / "parked-old"
+            index_path = jobs / "runtime-deploy-index.json"
+            index_path.write_text(json.dumps({
+                "schema_version": 1, "units": [name],
+                "pending_unit": None, "updated_at_unix": now - 600,
+            }) + "\n", encoding="utf-8")
+            index_path.chmod(0o600)
+            states = {unit: self._state(unit)}
+            plan = RETENTION.build_plan(
+                minimum_job_age_seconds=500, now=now,
+                jobs_root=jobs, archive_root=archive, receipt_root=receipts,
+                task_db=root / "missing.sqlite3",
+                failed_units=[unit], unit_states=states,
+            )
+            self.assertEqual(plan["reset_failed_units"], [unit])
+            self.assertEqual(plan["archive_jobs"], [])
+            young.rename(held_young)
+            old.rename(jobs / name)
+            actual_reader = RETENTION._job_record
+            swaps = []
+
+            def briefly_swap_source(*args, **kwargs):
+                (jobs / name).rename(parked_old)
+                held_young.rename(jobs / name)
+                try:
+                    observed = actual_reader(*args, **kwargs)
+                    swaps.append(observed["archive"])
+                    return observed
+                finally:
+                    (jobs / name).rename(held_young)
+                    parked_old.rename(jobs / name)
+
+            fake_deploy = types.ModuleType("grabowski_self_deploy")
+            fake_deploy.DEPLOY_INDEX_FILENAME = "runtime-deploy-index.json"
+            fake_deploy._deploy_schedule_lock = lambda: nullcontext()
+            fake_base = types.ModuleType("grabowski_mcp")
+            fake_base._append_audit = Mock()
+            fake_base._require_mutations_enabled = Mock()
+            fake_base._require_capability = Mock()
+            reset = Mock(return_value=Mock(returncode=0, stderr=""))
+            with patch.dict("sys.modules", {
+                "grabowski_self_deploy": fake_deploy, "grabowski_mcp": fake_base,
+            }), patch.object(RETENTION, "_run", reset), patch.object(
+                RETENTION, "_systemd_unit_states", return_value=states
+            ), patch.object(
+                RETENTION, "_job_record", side_effect=briefly_swap_source
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "retention reset phase did not complete"
+                ):
+                    RETENTION.apply_plan(
+                        plan, expected_plan_sha256=plan["plan_sha256"]
+                    )
+            self.assertEqual(swaps, [False], "the attacker presented younger metadata")
+            reset.assert_not_called()
+            self.assertEqual(
+                json.loads((jobs / name / "metadata.json").read_text())["created_at_unix"],
+                now - 1_200,
+            )
+            self.assertEqual(json.loads(index_path.read_text())["units"], [name])
+
+    def test_forged_recovery_plan_cannot_reset_indexed_moved_archive(self) -> None:
+        # P2: a plan SHA is not an authority MAC. A caller can remove a
+        # recovered archived unit and rehash an otherwise valid retry plan.
+        # The live directory must still be positively proven before reset.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs, archive, receipts = root / "jobs", root / "archive", root / "receipts"
+            name = "grabowski-job-464646464646"
+            unit = name + ".service"
+            self._job(jobs, name, 100)
+            index_path = jobs / "runtime-deploy-index.json"
+            index_path.write_text(json.dumps({
+                "schema_version": 1, "units": [name],
+                "pending_unit": None, "updated_at_unix": 500,
+            }) + "\n", encoding="utf-8")
+            index_path.chmod(0o600)
+            state = {unit: self._state(unit)}
+            plan = RETENTION.build_plan(
+                minimum_job_age_seconds=50, now=1_000,
+                jobs_root=jobs, archive_root=archive, receipt_root=receipts,
+                task_db=root / "missing.sqlite3",
+                failed_units=[unit], unit_states=state,
+            )
+            fake_deploy = types.ModuleType("grabowski_self_deploy")
+            fake_deploy.DEPLOY_INDEX_FILENAME = "runtime-deploy-index.json"
+            fake_deploy._deploy_schedule_lock = lambda: nullcontext()
+            fake_base = types.ModuleType("grabowski_mcp")
+            fake_base._append_audit = Mock()
+            fake_base._require_mutations_enabled = Mock()
+            fake_base._require_capability = Mock()
+            real_writer = RETENTION._write_json_atomic
+            attempted_index_write = []
+            reset = Mock(return_value=Mock(returncode=0, stderr=""))
+
+            def abort_index_publication(path: Path, payload: dict, **kwargs):
+                if path == index_path and not attempted_index_write:
+                    attempted_index_write.append(True)
+                    raise RuntimeError("simulated post-move index failure")
+                return real_writer(path, payload, **kwargs)
+
+            with patch.dict("sys.modules", {
+                "grabowski_self_deploy": fake_deploy, "grabowski_mcp": fake_base,
+            }), patch.object(RETENTION, "_run", reset), patch.object(
+                RETENTION, "_systemd_unit_states", return_value=state
+            ):
+                with patch.object(
+                    RETENTION, "_write_json_atomic",
+                    side_effect=abort_index_publication,
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "post-move index"):
+                        RETENTION.apply_plan(
+                            plan, expected_plan_sha256=plan["plan_sha256"]
+                        )
+                self.assertEqual(attempted_index_write, [True])
+                self.assertFalse((jobs / name).exists())
+                self.assertTrue((archive / name / "archive-manifest.json").is_file())
+
+                retry = RETENTION.build_plan(
+                    minimum_job_age_seconds=50, now=1_100,
+                    jobs_root=jobs, archive_root=archive,
+                    receipt_root=receipts, task_db=root / "missing.sqlite3",
+                    failed_units=[unit], unit_states={},
+                )
+                self.assertEqual(
+                    [row["unit"] for row in retry["recovered_archived_failed_units"]],
+                    [unit],
+                )
+                self.assertEqual(retry["reset_failed_units"], [unit])
+                forged = json.loads(json.dumps(retry))
+                forged["recovered_archived_failed_units"] = []
+                forged["plan_sha256"] = RETENTION._sha256({
+                    key: val for key, val in forged.items() if key != "plan_sha256"
+                })
+                with self.assertRaisesRegex(
+                    RuntimeError, "retention reset phase did not complete"
+                ):
+                    RETENTION.apply_plan(
+                        forged, expected_plan_sha256=forged["plan_sha256"]
+                    )
+                # Independent R3 P1: the same index entry must remain
+                # protected when the attacker briefly hides the entire index.
+                # Missing pathname is not proof of nonmembership.
+                hidden_index = root / "index-hidden-during-apply"
+                index_path.rename(hidden_index)
+                try:
+                    with self.assertRaisesRegex(
+                        RuntimeError, "retention reset phase did not complete"
+                    ):
+                        RETENTION.apply_plan(
+                            retry, expected_plan_sha256=retry["plan_sha256"]
+                        )
+                finally:
+                    hidden_index.rename(index_path)
+            reset.assert_not_called()
+            self.assertEqual(json.loads(index_path.read_text())["units"], [name])
+            self.assertEqual((archive / name / "stdout.log").read_bytes(), b"done\n")
+
     def test_recent_indexed_failed_job_can_reset_without_archive_recovery(self) -> None:
         # Codex P1: a live terminal job younger than the retention age
         # remains in the deploy index. Its verified local failed-state reset
@@ -2405,7 +2578,8 @@ class RuntimeRetentionTests(unittest.TestCase):
             jobs, archive, receipts = root / "jobs", root / "archive", root / "receipts"
             name = "grabowski-job-414141414141"
             unit = name + ".service"
-            source = self._job(jobs, name, 600)
+            observed_now = int(RETENTION.time.time())
+            source = self._job(jobs, name, observed_now - 400)
             index_file = jobs / "runtime-deploy-index.json"
             index_file.write_text(json.dumps({
                 "schema_version": 1, "units": [name], "pending_unit": None,
@@ -2414,7 +2588,7 @@ class RuntimeRetentionTests(unittest.TestCase):
             index_file.chmod(0o600)
             states = {unit: self._state(unit)}
             plan = RETENTION.build_plan(
-                minimum_job_age_seconds=500, now=1_000,
+                minimum_job_age_seconds=500, now=observed_now,
                 jobs_root=jobs, archive_root=archive, receipt_root=receipts,
                 task_db=root / "missing.sqlite3", failed_units=[unit],
                 unit_states=states,

@@ -1674,6 +1674,9 @@ def _validated_plan(plan: dict[str, Any], expected_plan_sha256: str) -> dict[str
         raise RuntimeError("retention plan hash mismatch")
     if plan.get("schema_version") != 3:
         raise RuntimeError("retention plan schema is unsupported")
+    minimum_job_age_seconds = plan.get("minimum_job_age_seconds")
+    if type(minimum_job_age_seconds) is not int or not 0 <= minimum_job_age_seconds <= 31_536_000:
+        raise RuntimeError("retention plan age bound is invalid")
     max_archive_jobs = plan.get("max_archive_jobs")
     if (
         isinstance(max_archive_jobs, bool)
@@ -2569,32 +2572,56 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
                     expected_parent_identity=root_identity,
                 )
 
-        # Only a unit that build_plan recovered from an already-moved
-        # archive is affected by the untrusted-history index fence. A live,
-        # terminal but not-yet-archive-eligible failed job may legitimately
-        # remain in the index and must still be reset-failed.
-        indexed_archive_recovery_units = {
-            evidence["unit"]
-            for evidence in plan["recovered_archived_failed_units"]
-            if evidence["job_name"] in indexed_units
-        }
+        # A plan SHA is not an authority MAC. A caller can remove recovered
+        # archive entries and rehash the plan, or hide the index pathname.
+        # Require POSITIVE live-registry evidence for still-indexed jobs and
+        # whenever the index is missing. The sole other authority is an
+        # authenticated archive move completed in THIS apply.
+        just_archived_units = {item["unit"] for item in archived}
         reset_results: list[dict[str, Any]] = []
         reset_failures: list[dict[str, str]] = []
         for unit in plan["reset_failed_units"]:
-            if unit in indexed_archive_recovery_units:
-                # A stale indexed deployment cannot be cleared by an
-                # untrusted archive receipt during retry after a partial
-                # move. Do not reset-failed until the index is authentically
-                # reconciled, and preserve an actionable failure receipt.
-                reset_failures.append(
-                    _redacted_reset_failure(
-                        unit=unit, stage="deployment_index_recovery",
-                        error=RuntimeError(
-                            "deployment index member lacks verified archive move"
-                        ),
-                    )
+            if (
+                JOB_UNIT.fullmatch(unit)
+                and unit not in just_archived_units
+                and (
+                    index is None
+                    or unit.removesuffix(".service") in indexed_units
                 )
-                continue
+            ):
+                job_dir = jobs_root / unit.removesuffix(".service")
+                try:
+                    _archive_require_pinned_identity(jobs_root, index_root_identity)
+                    live_fd = _archive_open_private_root(job_dir)
+                    try:
+                        state = _systemd_unit_states([unit])[unit]
+                        current = _job_record(
+                            unit, jobs_root, now=int(time.time()),
+                            minimum_age_seconds=plan["minimum_job_age_seconds"],
+                            systemd_state=state,
+                        )
+                        # A same-UID peer can swap A -> B -> A while the
+                        # path-based metadata reader runs. Bind its bytes to
+                        # the ORIGINAL directory inode held by live_fd.
+                        _, pinned_metadata_sha256 = _archive_private_file_digest(
+                            live_fd, job_dir / "metadata.json", max_bytes=MAX_JSON_BYTES
+                        )
+                        _archive_require_unchanged_root(job_dir, live_fd)
+                        if pinned_metadata_sha256 != current["metadata_sha256"]:
+                            raise RuntimeError("indexed job live registry inode/metadata mismatch")
+                        if not current["terminal"] or current["archive"]:
+                            raise RuntimeError(
+                                "indexed job is not a live, terminal, non-archive-eligible registry entry"
+                            )
+                    finally:
+                        os.close(live_fd)
+                except (RuntimeError, OSError, KeyError, ValueError) as exc:
+                    reset_failures.append(
+                        _redacted_reset_failure(
+                            unit=unit, stage="deployment_index_recovery", error=exc
+                        )
+                    )
+                    continue
             if WORKER_UNIT.fullmatch(unit):
                 try:
                     _prepare_worker_resets(plan, units=[unit])
