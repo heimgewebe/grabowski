@@ -432,10 +432,12 @@ def _trusted_validate_control_sources(
         authorize_transition(
             "legacy serving policy transition requires authentic independent full-delta R3"
         )
+    # Explicit JSON arrays make root identity receipts independent of the
+    # JSON encoder's implicit conversion of Python tuples to arrays.
     return _sha256_json({
-        "serving_policy_roots": {p: serving[p] for p in sorted(serving)
+        "serving_policy_roots": {p: [*serving[p]] for p in sorted(serving)
                                  if p not in serving_mutable},
-        "target_policy_roots": {p: target[p] for p in sorted(target)
+        "target_policy_roots": {p: [*target[p]] for p in sorted(target)
                                 if p not in serving_mutable},
         "changed_policy_paths": changed_controls,
     })

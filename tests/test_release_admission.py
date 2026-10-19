@@ -767,6 +767,49 @@ class AuthoritativeCIReadTests(unittest.TestCase):
                         )
                 reviewer.assert_not_called()
 
+    def test_actual_release_admission_source_is_valid_static_policy(self):
+        # Synthetic two-line fixtures cannot prove the real, imported source
+        # remains syntactically admissible as a future serving trust anchor.
+        source = Path(admission.__file__).read_text(encoding="utf-8")
+        path = (
+            f"/repos/{admission.REPOSITORY}/contents/"
+            f"src/grabowski_release_admission.py?ref={TARGET}"
+        )
+        with patch.object(
+            admission, "_github_json",
+            return_value=(_policy_response(source), ""),
+        ) as github:
+            required, mutable = admission._policy_roots_from_commit(
+                head=TARGET, token="static-source-only-test",
+            )
+        github.assert_called_once_with(path, token="static-source-only-test")
+        self.assertEqual(set(admission.VALIDATION_POLICY_REQUIRED_ROOTS), required)
+        self.assertEqual(set(admission.VALIDATION_POLICY_MUTABLE_ROOTS), mutable)
+
+    def test_control_source_digest_has_explicit_json_native_root_arrays(self):
+        # The hash contract encodes [git_type, mode, object_id] arrays, never
+        # arbitrary Python object representations. Tuples are legal in
+        # json.dumps, but recording the array contract makes drift detectable.
+        paths, pages = self.fixture()
+        value, _ = self.query(pages)
+
+        def root_arrays(tree_path):
+            return {
+                row["path"]: [row["type"], row["mode"], row["sha"]]
+                for row in pages[tree_path]["tree"]
+                if row["path"] not in admission.VALIDATION_POLICY_MUTABLE_ROOTS
+            }
+
+        expected_sha = admission._sha256_json({
+            "serving_policy_roots": root_arrays(paths["serving_tree"]),
+            "target_policy_roots": root_arrays(paths["target_tree"]),
+            "changed_policy_paths": [],
+        })
+        self.assertEqual(
+            expected_sha,
+            value["workflow"]["trusted_control_sources_sha256"],
+        )
+
     def test_target_policy_document_must_be_authenticated_and_static(self):
         for corruption in (
             "wrong_path", "wrong_type", "wrong_encoding", "missing_content",
