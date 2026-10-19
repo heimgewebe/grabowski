@@ -2314,6 +2314,91 @@ class TaskAttentionTests(unittest.TestCase):
             again["projection"]["projection_sha256"],
         )
 
+    def test_archived_replay_defers_output_cleanup_without_external_retirement(self) -> None:
+        record = self._completed_task()
+        parameters = self._archive_parameters(record)
+        with patch.object(
+            tasks, "_observe", return_value=self._inactive_process_observation(),
+        ):
+            first = attention.execute_closeout_archive(parameters)
+        self.assertFalse(first["already_archived"])
+        prior_projection = first["projection"]["projection_sha256"]
+        before = self.database.read_bytes()
+        # Current Fleet could be remapped after the irreversible historical
+        # archive. Replay is permitted to VERIFY its immutable projection, not
+        # to delete further task outputs based on today's SSH show/stop.
+        with (
+            patch.object(
+                attention, "_require_host_authenticated_archive_retirement",
+                self.production_archive_retirement_gate,
+            ),
+            # Ensure the replay reaches the eligible output deletion path.
+            patch.object(
+                attention, "_task_output_cleanup_now_unix",
+                return_value=2_000_000_000,
+            ),
+            patch.object(
+                tasks, "_resolve_task_dispatch_host",
+                return_value=("remote", {"transport": "ssh"}, False),
+            ),
+            patch.object(
+                attention, "_assert_no_live_task_process",
+                side_effect=AssertionError("must not probe old remote unit"),
+            ) as probe,
+            patch.object(
+                tasks, "_task_output_cleanup_run",
+                side_effect=AssertionError("must not delete archived output"),
+            ) as deletion,
+        ):
+            replay = attention.execute_closeout_archive(parameters)
+        probe.assert_not_called()
+        deletion.assert_not_called()
+        self.assertTrue(replay["already_archived"])
+        self.assertTrue(replay["idempotent_replay"])
+        self.assertEqual(prior_projection, replay["projection"]["projection_sha256"])
+        self.assertEqual("deferred", replay["task_output_cleanup"]["status"])
+        self.assertEqual(
+            "external_retirement_unverified", replay["task_output_cleanup"]["reason"]
+        )
+        self.assertEqual(before, self.database.read_bytes())
+
+    def test_archive_output_reconcile_defers_without_external_retirement(self) -> None:
+        record = self._completed_task()
+        with patch.object(
+            tasks, "_observe", return_value=self._inactive_process_observation(),
+        ):
+            first = attention.execute_closeout_archive(self._archive_parameters(record))
+        self.assertFalse(first["already_archived"])
+        with (
+            patch.object(
+                attention, "_require_host_authenticated_archive_retirement",
+                self.production_archive_retirement_gate,
+            ),
+            # Force the real cleanup eligibility boundary to have passed:
+            # otherwise a retention defer would mask the unsafe replay path.
+            patch.object(
+                attention, "_task_output_cleanup_now_unix",
+                return_value=2_000_000_000,
+            ),
+            patch.object(
+                attention, "_assert_no_live_task_process",
+                side_effect=AssertionError("must not probe unknown host"),
+            ) as probe,
+            patch.object(
+                tasks, "_task_output_cleanup_run",
+                side_effect=AssertionError("must not inspect/delete without retirement"),
+            ) as deletion,
+        ):
+            result = attention.reconcile_archived_task_outputs(limit=1)
+        probe.assert_not_called()
+        deletion.assert_not_called()
+        self.assertEqual("ok", result["status"])
+        self.assertEqual(1, result["counts"]["deferred"])
+        self.assertEqual("deferred", result["results"][0]["status"])
+        self.assertEqual(
+            "external_retirement_unverified", result["results"][0]["reason"]
+        )
+
     def test_closeout_archive_completed_task_writes_segment_and_projection_idempotently(self) -> None:
         record = self._completed_task()
         parameters = self._archive_parameters(record)

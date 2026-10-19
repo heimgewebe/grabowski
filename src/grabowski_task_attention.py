@@ -2363,6 +2363,33 @@ def _task_output_cleanup_all_attempts_after_archive(
     archived_binding = _task_binding(record)
     final_attempt = int(archived_binding["attempt"])
     task_id = str(archived_binding["task_id"])
+    # Both idempotent archive replay and scheduled archived-output cleanup
+    # reach this helper. A stale inactive systemd/SSH probe cannot authorize
+    # irreversible deletion when the original host may restart an old unit.
+    # Preserve archive/receipt/projection reads, but leave all outputs and the
+    # per-attempt cursor unchanged until independently enforced retirement is
+    # authenticated. Failures of the external authority are not success.
+    try:
+        _require_host_authenticated_archive_retirement(record)
+    except TaskAttentionConflictError:
+        return {
+            "status": "deferred",
+            "reason": "external_retirement_unverified",
+            "task_binding": archived_binding,
+            "attempt_count": final_attempt,
+            "attempts_scanned": 0,
+            "attempt_cycle_completed": False,
+            "attempt_results": [],
+            "counts": {"deleted": 0, "deferred": 0, "not_present": 0, "errors": 0},
+            "retention_boundary_unix": retention_boundary_unix,
+            "eligible_at_unix": None,
+            "deleted_attempts": [],
+            "not_present_attempts": [],
+            "does_not_establish": [
+                "safe_to_delete_archived_output",
+                "historic_host_or_unit_nonrestartability",
+            ],
+        }
     resource_key = "component:grabowski-task-output-cleanup-task:" + task_id
     owner = tasks.resources._owner(
         "operator:task-output-cleanup-task:"
