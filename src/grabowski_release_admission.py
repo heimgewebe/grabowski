@@ -21,17 +21,17 @@ REQUIRED_CI_CHECKS = ("validate (3.10)", "validate (3.12)")
 CANONICAL_WORKFLOW_PATH = ".github/workflows/validate.yml"
 MAX_GITHUB_ITEMS = 1_000
 GITHUB_PAGE_SIZE = 100
-# Only target application code and inert documentation can vary under
-# ordinary post-merge CI admission. All other root files/trees can control
-# make, Python test discovery, validation scripts or deployment checks.
-# A change to those validation inputs needs a separate CI-policy transition.
+# Only inert documentation may vary without a CI-policy transition. Python
+# application sources under src can execute at interpreter startup via
+# sitecustomize.py when Makefile recipes set PYTHONPATH=src. All executable
+# roots therefore require an exact independent full-delta R3 when changed.
 VALIDATION_POLICY_REQUIRED_ROOTS = frozenset({
     ".github", ".gitignore", "AGENTS.md", "Makefile", "pyproject.toml",
     "config", "contracts", "deploy", "requirements", "systemd",
-    "tests", "tmpfiles", "tools",
+    "src", "tests", "tmpfiles", "tools",
 })
 VALIDATION_POLICY_MUTABLE_ROOTS = frozenset({
-    "src", "docs", "README.md", "CHANGELOG.md", "SECURITY.md",
+    "docs", "README.md", "CHANGELOG.md", "SECURITY.md",
     "GRABOWSKI.md", "OPERATOR_V2_REPORT.md",
 })
 MAX_VALIDATION_ROOT_ENTRIES = 256
@@ -200,7 +200,8 @@ def _trusted_validate_control_sources(
     configuration. Comparing only the YAML leaves a target-self-grading P1.
     Every unexempted root blob/tree is therefore immutable relative to
     the actually serving commit; Git subtree OIDs cover all nested content.
-    Application sources still require an independent whole-release review.
+    Executable sources including src/sitecustomize.py are policy inputs:
+    their changes require an independent whole-release review.
     """
     prefix = f"/repos/{REPOSITORY}/git"
     observed: list[dict[str, tuple[str, str, str]]] = []

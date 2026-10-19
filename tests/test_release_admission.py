@@ -244,15 +244,51 @@ class AuthoritativeCIReadTests(unittest.TestCase):
                 with self.assertRaisesRegex(admission.ReleaseAdmissionDenied, "trusted Validate.*(policy|control|input).*changed"):
                     self.query(pages)
 
-    def test_runtime_source_and_docs_are_data_not_validation_policy(self):
+    def test_passive_docs_are_not_validation_policy(self):
         paths, pages = self.fixture()
-        for path in ("src", "docs", "README.md"):
+        for path in ("docs", "README.md"):
             next(e for e in pages[paths["target_tree"]]["tree"]
                  if e["path"] == path)["sha"] = "2" * 40
         accepted, requests = self.query(pages)
         self.assertEqual(2, len(accepted["checks"]))
         self.assertEqual(64, len(accepted["workflow"]["trusted_control_sources_sha256"]))
         self.assertEqual(12, len(requests))
+
+    def test_executable_src_tree_requires_independent_r3_even_with_green_ci(self):
+        # Makefile calls PYTHONPATH=src python -m ...; src/sitecustomize.py
+        # executes before any validator and can mutate validation scripts.
+        paths, pages = self.fixture()
+        next(e for e in pages[paths["target_tree"]]["tree"]
+             if e["path"] == "src")["sha"] = "2" * 40
+        with patch.object(admission, "validate_independent_release_review") as review:
+            with self.assertRaisesRegex(
+                admission.ReleaseAdmissionDenied, "control sources changed.*R3",
+            ):
+                self.query(pages)
+        review.assert_not_called()
+
+    def test_executable_src_change_only_after_bound_independent_r3(self):
+        paths, pages = self.fixture()
+        next(e for e in pages[paths["target_tree"]]["tree"]
+             if e["path"] == "src")["sha"] = "2" * 40
+        proof = {
+            "review_pr": 1452,
+            "review_binding_sha256": "a" * 64,
+            "review_attempts_sha256": "b" * 64,
+            "independent_pass_count": 1,
+            "admissible_slots": ["independent-grok-4.6"],
+        }
+        with patch.object(
+            admission, "validate_independent_release_review", return_value=proof,
+        ) as reviewer:
+            accepted, _ = self.query(
+                pages, transition_review_pr=1452, transition_diff_sha256=DIFF,
+            )
+        reviewer.assert_called_once_with(
+            serving_head=SERVING, target_head=TARGET,
+            diff_sha256=DIFF, review_pr=1452,
+        )
+        self.assertTrue(accepted["workflow"]["ci_policy_transition_required"])
 
     def test_changed_validation_policy_requires_authentic_full_delta_r3(self):
         paths, pages = self.fixture()
