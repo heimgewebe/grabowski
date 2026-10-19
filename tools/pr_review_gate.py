@@ -1025,9 +1025,39 @@ def _paths(pr: dict[str, Any]) -> list[str]:
     return paths
 
 
+def _security_review_paths(pr: dict[str, Any]) -> tuple[list[str], bool]:
+    """Include both sides of renames in risk classification, not file counts.
+
+    GitHub's changedFiles counts a rename once; its previousPath still
+    identifies authority that a renamed destination may have removed.
+    """
+    paths = _paths(pr)
+    missing_rename_source = False
+    raw_files = pr.get("files")
+    if not isinstance(raw_files, list):
+        return paths, missing_rename_source
+    for item in raw_files:
+        if not isinstance(item, dict):
+            continue
+        status = item.get("status")
+        if not isinstance(status, str) or status.strip().lower() != "renamed":
+            continue
+        previous = item.get("previousPath")
+        if previous is None:
+            previous = item.get("previous_filename")
+        if not isinstance(previous, str) or _normalized_review_path(previous) != previous:
+            missing_rename_source = True
+            continue
+        paths.append(previous)
+    return paths, missing_rename_source
+
+
 def _current_pr_paths_failures(pr: dict[str, Any]) -> tuple[list[str], list[str]]:
     paths = _paths(pr)
     failures: list[str] = []
+    _, missing_rename_source = _security_review_paths(pr)
+    if missing_rename_source:
+        failures.append("renamed source path is missing or invalid")
     if not paths:
         failures.append("current PR file list is missing or empty")
     changed_files = pr.get("changedFiles")
@@ -1144,13 +1174,15 @@ def classify_complexity(
 ) -> dict[str, Any]:
     changed_files = int(pr.get("changedFiles") or 0)
     changed_lines = int(pr.get("additions") or 0) + int(pr.get("deletions") or 0)
-    paths = _paths(pr)
+    paths, missing_rename_source = _security_review_paths(pr)
     docs_only = bool(paths) and all(_is_documentation_path(path) for path in paths)
     very_small_uncomplicated = _is_very_small_uncomplicated_change(paths, changed_files, changed_lines)
     normalized_repo = _canonical_repo_slug(repo_name)
     important_repo = normalized_repo in IMPORTANT_REPOS
 
     high_critical_reasons: list[str] = []
+    if missing_rename_source:
+        high_critical_reasons.append("renamed source path is missing or invalid")
     if not docs_only:
         if changed_files > 15:
             high_critical_reasons.append("many files")
