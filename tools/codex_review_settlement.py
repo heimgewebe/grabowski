@@ -770,6 +770,7 @@ def _live_state(repo: Path, repository: str, pr_number: int) -> dict[str, Any]:
         timeout=90,
         env=pr_review_gate._env(),
     )
+    oversized_diff_bound = False
     if diff_bytes.returncode != 0:
         diagnostic = diff_bytes.stderr + b"\n" + diff_bytes.stdout
         detail = diff_bytes.stderr.decode("utf-8", errors="replace")
@@ -818,11 +819,73 @@ def _live_state(repo: Path, repository: str, pr_number: int) -> dict[str, Any]:
         ):
             raise SettlementError("PR head, base or file count drifted during local diff readback")
         pull_request["diff_sha256"] = pr_review_gate.github_pr_diff_identity_sha256(local_diff)
+        # The existing exact-Git-object fallback has already reconciled
+        # complete REST file evidence with the immutable raw local diff.
+        pull_request["files"] = {
+            "nodes": rest_files, "pageInfo": {"hasNextPage": False}
+        }
+        oversized_diff_bound = True
     else:
         if not diff_bytes.stdout:
             raise SettlementError("current PR diff is empty")
         pull_request["diff_sha256"] = pr_review_gate.github_pr_diff_identity_sha256(diff_bytes.stdout)
+    # A destination-only GraphQL list cannot rule out a high-critical
+    # workflow/action being renamed to an apparently ordinary path.
+    # Resolve provenance from the immutable SHA comparison only when the
+    # destination paths do not already require external review.
+    if not oversized_diff_bound and not _policy(
+        pull_request, repository, explicitly_required=False
+    )["external_review_required"]:
+        pinned = _revision_bound_rename_files(repo, repository, pull_request)
+        pull_request["files"] = {
+            "nodes": pinned, "pageInfo": {"hasNextPage": False}
+        }
     return pull_request
+
+def _revision_bound_rename_files(
+    repo: Path, repository: str, pr: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Bind rename source paths to immutable base/head commit IDs, not PR REST state.
+
+    GitHub's PR files endpoint has no revision parameter; an A->B->A head
+    transition could otherwise substitute metadata from B into a review of A.
+    GitHub compare is addressed by the exact SHA pair and fails closed when
+    its bounded changed-file inventory cannot be authenticated.
+    """
+    base, head = _current_base(pr), _current_head(pr)
+    count = pr.get("changedFiles")
+    graphql = _list_nodes(pr.get("files"), label="files")
+    if type(count) is not int or count < 1 or count > 300 or len(graphql) != count:
+        raise SettlementError("immutable changed-file evidence is incomplete or too large")
+    paths = [item.get("path") for item in graphql]
+    if any(not isinstance(path, str) or not path for path in paths):
+        raise SettlementError("GraphQL changed-file paths are malformed")
+    payload = _run_json(
+        repo, ["gh", "api", f"repos/{repository}/compare/{base}...{head}"]
+    )
+    if not isinstance(payload, dict):
+        raise SettlementError("revision-bound compare response is invalid")
+    commits = payload.get("commits")
+    if (
+        not isinstance(payload.get("base_commit"), dict)
+        or payload["base_commit"].get("sha") != base
+        or not isinstance(commits, list)
+        or not commits
+        or not isinstance(commits[-1], dict)
+        or commits[-1].get("sha") != head
+    ):
+        raise SettlementError("revision-bound compare base/head identity drifted")
+    evidence = pr_review_gate._pull_file_evidence([payload.get("files")])
+    if (
+        evidence is None
+        or len(evidence) != count
+        or pr_review_gate._complete_pr_diff_paths({
+            "pullFilesEvidenceComplete": True, "files": evidence
+        }) is None
+        or sorted(paths) != sorted(item["path"] for item in evidence)
+    ):
+        raise SettlementError("revision-bound compare rename evidence is incomplete or drifted")
+    return evidence
 
 
 def _list_nodes(container: Any, *, label: str) -> list[dict[str, Any]]:
@@ -1027,13 +1090,44 @@ def _current_diff(pr: dict[str, Any]) -> str:
 
 def _policy(pr: dict[str, Any], repository: str, *, explicitly_required: bool) -> dict[str, Any]:
     files = _list_nodes(pr.get("files"), label="files")
+    # Keep the source side of an authenticated rename risk-visible.  The
+    # base review-gate classifier may predate native previousPath support;
+    # treating the source as another risk path is conservative on both versions.
+    paths = [{"path": item.get("path")} for item in files]
+    renamed_critical_sources: list[str] = []
+    for item in files:
+        if item.get("status") == "renamed":
+            previous = item.get("previousPath")
+            if (not isinstance(previous, str)
+                    or pr_review_gate._normalized_review_path(previous) != previous):
+                raise SettlementError("rename source path is missing or invalid")
+            paths.append({"path": previous})
+            # Until the separate PR #1568 risk-path normalizer is integrated,
+            # .github is wrongly lstrip("./")-normalized to github.  Apply
+            # the existing high-critical prefix policy to the exact source
+            # path without rewriting its identity.
+            if any(previous.lower() == prefix.rstrip("/")
+                   or previous.lower().startswith(prefix)
+                   for prefix in pr_review_gate.HIGH_CRITICAL_PATH_PREFIXES):
+                renamed_critical_sources.append(previous)
     view = {
         "changedFiles": pr.get("changedFiles"),
         "additions": pr.get("additions"),
         "deletions": pr.get("deletions"),
-        "files": [{"path": item.get("path")} for item in files],
+        "files": paths,
     }
     complexity = pr_review_gate.classify_complexity(view, None, repo_name=repository)
+    if renamed_critical_sources:
+        complexity["review_tier"] = "high_critical"
+        complexity["external_review_required"] = True
+        complexity["self_review_required"] = True
+        complexity["minimum_self_review_iterations"] = max(
+            4, int(complexity.get("minimum_self_review_iterations") or 0)
+        )
+        complexity["reasons"] = list(complexity.get("reasons") or []) + [
+            f"immutable rename source requires high-critical review: {source}"
+            for source in renamed_critical_sources
+        ]
     policy_required = complexity.get("external_review_required") is True
     required = explicitly_required or policy_required
     reasons: list[str] = []

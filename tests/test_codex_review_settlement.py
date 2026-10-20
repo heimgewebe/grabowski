@@ -56,6 +56,106 @@ def base_state(*, path: str = "src/grabowski_grips.py") -> dict:
     }
 
 
+class PinnedRenameEvidenceRegressionTests(unittest.TestCase):
+    def _compare(self, *, filename="docs/ci.md",
+                 previous=".github/workflows/ci.yml",
+                 status="renamed", base=BASE, head=HEAD):
+        item = {"filename": filename, "status": status}
+        if previous is not None:
+            item["previous_filename"] = previous
+        return {
+            "base_commit": {"sha": base},
+            "commits": [{"sha": head}],
+            "files": [item],
+            "total_commits": 1,
+        }
+
+    def test_critical_workflow_rename_out_of_github_requires_high_critical(self):
+        pr = base_state(path="docs/ci.md")
+        compare = self._compare()
+        with mock.patch.object(settlement, "_run_json", return_value=compare) as read:
+            files = settlement._revision_bound_rename_files(ROOT, REPOSITORY, pr)
+        self.assertIn(f"{BASE}...{HEAD}", " ".join(read.call_args.args[1]))
+        self.assertEqual(files, [{
+            "path": "docs/ci.md",
+            "status": "renamed",
+            "previousPath": ".github/workflows/ci.yml",
+        }])
+        pr["files"] = connection(files, hasNextPage=False)
+        decision = settlement._policy(pr, REPOSITORY, explicitly_required=False)
+        self.assertTrue(decision["external_review_required"])
+        self.assertEqual("high_critical", decision["review_tier"])
+
+    def test_benign_documentation_rename_keeps_documentation_policy(self):
+        pr = base_state(path="docs/new.md")
+        compare = self._compare(filename="docs/new.md", previous="docs/old.md")
+        with mock.patch.object(settlement, "_run_json", return_value=compare):
+            pr["files"] = connection(
+                settlement._revision_bound_rename_files(ROOT, REPOSITORY, pr),
+                hasNextPage=False,
+            )
+        decision = settlement._policy(pr, REPOSITORY, explicitly_required=False)
+        self.assertEqual("documentation", decision["review_tier"])
+        self.assertFalse(decision["external_review_required"])
+
+    def test_immutable_head_or_base_drift_rejects_aba_file_evidence(self):
+        pr = base_state(path="docs/ci.md")
+        for kwargs in ({"head": "c" * 40}, {"base": "d" * 40}):
+            with self.subTest(kwargs=kwargs), mock.patch.object(
+                settlement, "_run_json", return_value=self._compare(**kwargs)
+            ):
+                with self.assertRaises(settlement.SettlementError):
+                    settlement._revision_bound_rename_files(ROOT, REPOSITORY, pr)
+
+    def test_partial_or_malformed_pinned_rename_metadata_fails_closed(self):
+        pr = base_state(path="docs/ci.md")
+        cases = [
+            {**self._compare(), "files": []},
+            self._compare(previous=None),
+            self._compare(filename="docs/another.md"),
+            self._compare(status="copied", previous=None),
+            self._compare(status="unrecognized"),
+            {**self._compare(), "commits": []},
+        ]
+        for comparison in cases:
+            with self.subTest(comparison=comparison), mock.patch.object(
+                settlement, "_run_json", return_value=comparison
+            ):
+                with self.assertRaises(settlement.SettlementError):
+                    settlement._revision_bound_rename_files(ROOT, REPOSITORY, pr)
+
+    def test_live_state_promotes_pinned_rename_source_before_policy(self):
+        pr = base_state(path="docs/ci.md")
+        payload = {"data": {"repository": {"pullRequest": pr}}}
+        bound_files = [{
+            "path": "docs/ci.md", "status": "renamed",
+            "previousPath": ".github/workflows/ci.yml",
+        }]
+        with (
+            mock.patch.object(settlement, "_run_json", return_value=payload),
+            mock.patch.object(settlement, "_collect_files",
+                              return_value=pr["files"]),
+            mock.patch.object(settlement, "_collect_comments",
+                              return_value=pr["comments"]),
+            mock.patch.object(settlement, "_collect_reviews",
+                              return_value=pr["reviews"]),
+            mock.patch.object(settlement, "_collect_review_threads",
+                              return_value=pr["reviewThreads"]),
+            mock.patch.object(settlement.subprocess, "run", return_value=mock.Mock(
+                returncode=0, stdout=b"diff --git a/docs/ci.md b/docs/ci.md\n",
+                stderr=b"",
+            )),
+            mock.patch.object(settlement, "_revision_bound_rename_files",
+                              return_value=bound_files) as pinned,
+        ):
+            observed = settlement._live_state(ROOT, REPOSITORY, PR)
+        pinned.assert_called_once()
+        self.assertEqual(observed["files"]["nodes"], bound_files)
+        self.assertTrue(settlement._policy(
+            observed, REPOSITORY, explicitly_required=False
+        )["external_review_required"])
+
+
 def request_comment(
     *,
     actor: str = "alex",
