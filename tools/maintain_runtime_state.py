@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
 import ctypes
 import errno
 import hashlib
@@ -1102,6 +1103,14 @@ def build_plan(
             f"max_archive_jobs must be between 1 and {MAX_ARCHIVE_JOBS_PER_PLAN}"
         )
     jobs_root = _private_directory(jobs_root)
+    # Bind this plan to the canonical root before enumerating job entries.
+    jobs_pin_fd = _archive_open_private_root(jobs_root)
+    try:
+        root_stat = os.fstat(jobs_pin_fd)
+        planned_jobs_root_identity = (root_stat.st_dev, root_stat.st_ino)
+        _archive_require_unchanged_root(jobs_root, jobs_pin_fd)
+    finally:
+        os.close(jobs_pin_fd)
     if archive_root.is_symlink() or receipt_root.is_symlink():
         raise RuntimeError("retention output roots may not be symlinks")
     observed_now = int(time.time()) if now is None else now
@@ -1122,6 +1131,9 @@ def build_plan(
     # of maintenance may continue without producing partial receipt storms.
     index_fd = _archive_open_private_root(jobs_root)
     try:
+        index_root_stat = os.fstat(index_fd)
+        if (index_root_stat.st_dev, index_root_stat.st_ino) != planned_jobs_root_identity:
+            raise RuntimeError("jobs root identity changed before plan index read")
         deploy_index = _archive_read_deploy_index_pinned(jobs_root, index_fd, None)
         _archive_require_unchanged_root(jobs_root, index_fd)
     finally:
@@ -1329,6 +1341,7 @@ def build_plan(
         "minimum_job_age_seconds": minimum_job_age_seconds,
         "max_archive_jobs": max_archive_jobs,
         "jobs_root": str(jobs_root),
+        "jobs_root_identity": list(planned_jobs_root_identity),
         "archive_root": str(archive_root),
         "receipt_root": str(receipt_root),
         "task_db": str(task_db),
@@ -1890,6 +1903,13 @@ def _validated_plan(plan: dict[str, Any], expected_plan_sha256: str) -> dict[str
         raise RuntimeError("retention plan hash mismatch")
     if plan.get("schema_version") != 3:
         raise RuntimeError("retention plan schema is unsupported")
+    jobs_identity = plan.get("jobs_root_identity")
+    if (
+        not isinstance(jobs_identity, list)
+        or len(jobs_identity) != 2
+        or any(type(value) is not int or value < 0 for value in jobs_identity)
+    ):
+        raise RuntimeError("retention plan jobs root identity is invalid")
     minimum_job_age_seconds = plan.get("minimum_job_age_seconds")
     if type(minimum_job_age_seconds) is not int or not 0 <= minimum_job_age_seconds <= 31_536_000:
         raise RuntimeError("retention plan age bound is invalid")
@@ -1994,9 +2014,35 @@ def _prepare_worker_resets(
 
 def _prepare_archives(
     plan: dict[str, Any],
+    *,
+    expected_archive_root_identity: tuple[int, int] | None = None,
 ) -> tuple[Path, Path, Path, list[dict[str, Any]], tuple[int, int]]:
-    jobs_root = _private_directory(Path(plan["jobs_root"]))
+    # Authenticate both roots BEFORE the record/manifest preflight. The old
+    # late first open allowed a foreign same-UID tree to become the authority.
+    requested_jobs_root = Path(plan["jobs_root"])
+    jobs_pin_fd = _archive_open_private_root(requested_jobs_root)
+    try:
+        start_jobs_stat = os.fstat(jobs_pin_fd)
+        initial_jobs_identity = (start_jobs_stat.st_dev, start_jobs_stat.st_ino)
+        if initial_jobs_identity != tuple(plan["jobs_root_identity"]):
+            raise RuntimeError("jobs root identity changed since planning")
+        jobs_root = _private_directory(requested_jobs_root)
+        _archive_require_unchanged_root(jobs_root, jobs_pin_fd)
+    finally:
+        os.close(jobs_pin_fd)
     archive_root = _private_directory(Path(plan["archive_root"]), create=True)
+    archive_pin_fd = _archive_open_private_root(archive_root)
+    try:
+        start_archive_stat = os.fstat(archive_pin_fd)
+        initial_archive_identity = (start_archive_stat.st_dev, start_archive_stat.st_ino)
+        if (
+            expected_archive_root_identity is not None
+            and initial_archive_identity != expected_archive_root_identity
+        ):
+            raise RuntimeError("archive root identity changed before preparation")
+        _archive_require_unchanged_root(archive_root, archive_pin_fd)
+    finally:
+        os.close(archive_pin_fd)
     receipt_root = _private_directory(Path(plan["receipt_root"]), create=True)
     archive_records = plan["archive_jobs"]
     prepared: list[dict[str, Any]] = []
@@ -2085,6 +2131,10 @@ def _prepare_archives(
             jobs_stat, archive_stat = os.fstat(jobs_fd), os.fstat(archive_fd)
             jobs_identity = (jobs_stat.st_dev, jobs_stat.st_ino)
             archive_identity = (archive_stat.st_dev, archive_stat.st_ino)
+            if jobs_identity != initial_jobs_identity:
+                raise RuntimeError("jobs root identity changed during preparation")
+            if archive_identity != initial_archive_identity:
+                raise RuntimeError("archive root identity changed during preparation")
         finally:
             os.close(archive_fd)
     finally:
@@ -2645,11 +2695,26 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
 
     import grabowski_self_deploy as self_deploy
 
-    with self_deploy._deploy_schedule_lock():
+    with self_deploy._deploy_schedule_lock(), ExitStack() as root_pins:
+        # These descriptors stay open until all archive moves and reset
+        # actions finish, so inode reuse cannot substitute a foreign root.
+        jobs_root_pin_fd = _archive_open_private_root(Path(plan["jobs_root"]))
+        root_pins.callback(os.close, jobs_root_pin_fd)
+        pinned_jobs_stat = os.fstat(jobs_root_pin_fd)
+        pinned_jobs_identity = (pinned_jobs_stat.st_dev, pinned_jobs_stat.st_ino)
+        if pinned_jobs_identity != tuple(plan["jobs_root_identity"]):
+            raise RuntimeError("jobs root identity changed since planning")
+        archive_pin_path = _private_directory(Path(plan["archive_root"]), create=True)
+        archive_root_pin_fd = _archive_open_private_root(archive_pin_path)
+        root_pins.callback(os.close, archive_root_pin_fd)
+        pinned_archive_stat = os.fstat(archive_root_pin_fd)
+        pinned_archive_identity = (pinned_archive_stat.st_dev, pinned_archive_stat.st_ino)
         (
             jobs_root, archive_root, receipt_root, prepared,
             prepared_jobs_root_identity,
-        ) = _prepare_archives(plan)
+        ) = _prepare_archives(
+            plan, expected_archive_root_identity=pinned_archive_identity,
+        )
         _prepare_worker_resets(plan)
         receipt_target, attempt, previous_receipt_sha256 = _select_receipt_target(
             receipt_root, plan_sha256=plan["plan_sha256"]

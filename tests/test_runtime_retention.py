@@ -1916,7 +1916,16 @@ class RuntimeRetentionTests(unittest.TestCase):
             root = Path(temporary)
             consumed: list[int] = []
 
+            jobs = root / "jobs"
+            jobs.mkdir(mode=0o700)
+
             class FakeJobsRoot:
+                def __fspath__(self) -> str:
+                    return os.fspath(jobs)
+
+                def lstat(self):
+                    return jobs.lstat()
+
                 def iterdir(self):
                     for index in range(4):
                         consumed.append(index)
@@ -3615,6 +3624,91 @@ class RuntimeRetentionTests(unittest.TestCase):
             self.assertEqual(json.loads(index.read_text())["units"], [])
             self.assertTrue((archive / name / "archive-manifest.json").is_file())
 
+    def test_reset_only_prepare_time_foreign_root_never_authorizes_reset(self) -> None:
+        # Independent high-critical R3 P1: the canonical root can be swapped
+        # immediately after _private_directory() resolves the original tree
+        # but before the old late _prepare_archives root-FD snapshot.
+        # A foreign tree with matching job metadata and permissive index must
+        # never authorize clearing a real, now-pending deployment unit.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs, archive, receipts = root / "jobs", root / "archive", root / "receipts"
+            name = "grabowski-job-636363636363"
+            unit = name + ".service"
+            now = int(RETENTION.time.time())
+            self._job(jobs, name, now - 400)
+            free_index = {
+                "schema_version": 1, "units": [],
+                "pending_unit": None, "updated_at_unix": now - 500,
+            }
+            real_index = jobs / "runtime-deploy-index.json"
+            real_index.write_text(json.dumps(free_index) + "\n")
+            real_index.chmod(0o600)
+            plan = RETENTION.build_plan(
+                minimum_job_age_seconds=500, now=now,
+                jobs_root=jobs, archive_root=archive, receipt_root=receipts,
+                task_db=root / "missing.sqlite3", failed_units=[unit],
+                unit_states={unit: self._state(unit)},
+            )
+            self.assertEqual(plan["archive_jobs"], [])
+            self.assertEqual(plan["reset_failed_units"], [unit])
+
+            protected_index = {**free_index, "pending_unit": name}
+            real_index.write_text(json.dumps(protected_index) + "\n")
+            real_index.chmod(0o600)
+            foreign = root / "foreign-private-jobs"
+            self._job(foreign, name, now - 400)
+            foreign_index = foreign / "runtime-deploy-index.json"
+            foreign_index.write_text(json.dumps(free_index) + "\n")
+            foreign_index.chmod(0o600)
+            hidden = root / "authentic-jobs"
+            actual_private = RETENTION._private_directory
+            swapped = [False]
+
+            def swap_after_private(path: Path, *, create: bool = False) -> Path:
+                result = actual_private(path, create=create)
+                if path == jobs and not swapped[0]:
+                    jobs.rename(hidden)
+                    foreign.rename(jobs)
+                    swapped[0] = True
+                return result
+
+            fake_deploy = types.ModuleType("grabowski_self_deploy")
+            fake_deploy.DEPLOY_INDEX_FILENAME = "runtime-deploy-index.json"
+            fake_deploy._deploy_schedule_lock = lambda: nullcontext()
+            fake_base = types.ModuleType("grabowski_mcp")
+            fake_base._append_audit = Mock()
+            fake_base._require_mutations_enabled = Mock()
+            fake_base._require_capability = Mock()
+            reset = Mock(return_value=Mock(returncode=0, stderr=""))
+            try:
+                with patch.dict("sys.modules", {
+                    "grabowski_self_deploy": fake_deploy,
+                    "grabowski_mcp": fake_base,
+                }), patch.object(
+                    RETENTION, "_private_directory", side_effect=swap_after_private
+                ), patch.object(
+                    RETENTION, "_run", reset
+                ), patch.object(
+                    RETENTION, "_systemd_unit_states",
+                    return_value={unit: self._state(unit)},
+                ):
+                    with self.assertRaisesRegex(
+                        RuntimeError, "jobs root identity changed|archive source directory changed"
+                    ):
+                        RETENTION.apply_plan(
+                            plan, expected_plan_sha256=plan["plan_sha256"]
+                        )
+            finally:
+                if swapped[0]:
+                    jobs.rename(foreign)
+                    hidden.rename(jobs)
+            self.assertTrue(swapped[0])
+            self.assertEqual(json.loads(real_index.read_text()), protected_index)
+            self.assertTrue((jobs / name / "metadata.json").is_file())
+            self.assertFalse((archive / name).exists())
+            reset.assert_not_called()
+
     def test_reset_only_index_read_rejects_foreign_jobs_root(self) -> None:
         # Codex P1: when no archive candidates exist, the reset-only path
         # must still bind the first index FD to the jobs-root inode pinned
@@ -3657,8 +3751,8 @@ class RuntimeRetentionTests(unittest.TestCase):
             real_open = RETENTION._archive_open_private_root
             armed, swapped = [False], [False]
 
-            def prepare_then_arm(actual_plan):
-                prepared = real_prepare(actual_plan)
+            def prepare_then_arm(actual_plan, **kwargs):
+                prepared = real_prepare(actual_plan, **kwargs)
                 armed[0] = True
                 return prepared
 
@@ -3753,8 +3847,8 @@ class RuntimeRetentionTests(unittest.TestCase):
             armed, switched, restored = [False], [False], [False]
             foreign_checks = [0]
 
-            def prepare_then_arm(arg):
-                result = actual_prepare(arg)
+            def prepare_then_arm(arg, **kwargs):
+                result = actual_prepare(arg, **kwargs)
                 armed[0] = True
                 return result
 
