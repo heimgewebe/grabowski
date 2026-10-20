@@ -301,15 +301,13 @@ def _pinned_output_root_fd(plan: "_PinnedRetentionPlan", kind: str) -> int:
     _archive_require_unchanged_root(root.parent, parent_fd)
     descriptor = getattr(plan, f"{kind}_fd")
     if descriptor < 0:
-        # A foreign directory appearing since planning cannot acquire custody.
-        try:
-            os.mkdir(root.name, mode=0o700, dir_fd=parent_fd)
-        except FileExistsError as exc:
-            raise RuntimeError(
-                f"{kind} root appeared since planning; explicit retry required"
-            ) from exc
-        descriptor = _archive_open_child_root(parent_fd, root.name, root)
-        setattr(plan, f"{kind}_fd", descriptor)
+        # A missing root has NO authenticated inode. mkdirat followed by
+        # openat would let a same-UID peer rename away the newly created
+        # directory before our first FD open, then supply its own private tree.
+        # Never create/adopt it on an effect-bearing retention apply.
+        raise RuntimeError(
+            f"{kind} root absent during planning; explicit trusted recovery required"
+        )
     _archive_require_child_bound(parent_fd, root.name, descriptor, root)
     return descriptor
 

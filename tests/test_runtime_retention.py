@@ -61,6 +61,15 @@ class RuntimeRetentionTests(unittest.TestCase):
     ) -> Path:
         root.mkdir(parents=True, exist_ok=True, mode=0o700)
         root.chmod(0o700)
+        # Normal retention runs against pre-provisioned private output roots.
+        # Untrusted apply may not create/adopt an archive or receipt directory
+        # that was absent at planning time; explicit missing-root tests remove
+        # the provisioned fixture themselves.
+        if root.name == "jobs":
+            for output_name in ("archive", "receipts"):
+                output_root = root.parent / output_name
+                output_root.mkdir(mode=0o700, exist_ok=True)
+                output_root.chmod(0o700)
         # Ordinary retention runs against an existing private deployment
         # index. Tests exercising absence or foreign replacement explicitly
         # remove/replace it; other tests must not rely on an unsafe implicit
@@ -701,6 +710,9 @@ class RuntimeRetentionTests(unittest.TestCase):
             root.chmod(0o700)
             jobs = root / "jobs"
             jobs.mkdir(mode=0o700)
+            # Existing private output roots are an apply-time safety precondition.
+            (root / "archive").mkdir(mode=0o700)
+            (root / "receipts").mkdir(mode=0o700)
             worker_id = "5" * 20
             worker_db, resource_db, unit = self._worker_state_dbs(
                 root,
@@ -784,6 +796,9 @@ class RuntimeRetentionTests(unittest.TestCase):
             root.chmod(0o700)
             jobs = root / "jobs"
             jobs.mkdir(mode=0o700)
+            # Existing private output roots are an apply-time safety precondition.
+            (root / "archive").mkdir(mode=0o700)
+            (root / "receipts").mkdir(mode=0o700)
             task_unit = "grabowski-task-" + "c" * 24 + "-a1.service"
             task_db = self._task_db(root / "tasks.sqlite3", task_unit, "failed")
             plan = RETENTION.build_plan(
@@ -2182,7 +2197,7 @@ class RuntimeRetentionTests(unittest.TestCase):
             jobs, archive = root / "jobs", root / "archive"
             name = "grabowski-job-585858585858"
             self._job(jobs, name, 100)
-            archive.mkdir(mode=0o700)
+            archive.mkdir(mode=0o700, exist_ok=True)
             source = jobs / name
             target = archive / name
             expected = RETENTION._archive_file_manifest(source)
@@ -3067,7 +3082,7 @@ class RuntimeRetentionTests(unittest.TestCase):
             name = "grabowski-job-484848484848"
             unit = name + ".service"
             job = self._job(jobs, name, 100)
-            archive.mkdir(mode=0o700)
+            archive.mkdir(mode=0o700, exist_ok=True)
             destination = archive / name
             job.rename(destination)
             files = RETENTION._archive_file_manifest(destination)
@@ -3652,7 +3667,7 @@ class RuntimeRetentionTests(unittest.TestCase):
             name = "grabowski-job-a2a2a2a2a2a2"
             unit = name + ".service"
             self._job(jobs, name, 100)
-            archive.mkdir(mode=0o700)
+            archive.mkdir(mode=0o700, exist_ok=True)
             foreign = root / "foreign-archive"
             foreign.mkdir(mode=0o700)
             hidden = root / "genuine-archive"
@@ -3909,6 +3924,97 @@ class RuntimeRetentionTests(unittest.TestCase):
             self.assertTrue((jobs / name / "metadata.json").is_file())
             reset.assert_not_called()
 
+    def test_missing_output_roots_fail_closed_without_adopting_foreign_dir(self) -> None:
+        # mkdirat(final basename) followed by openat lets a same-UID peer
+        # exchange the directory BEFORE the first FD pin. Until a protected
+        # creator exists, missing roots require explicit trusted recovery.
+        for output_name, root_opener, fd_name in (
+            ("archive", RETENTION._archive_root_fd_for_plan, "archive_fd"),
+            ("receipts", RETENTION._receipt_root_fd_for_plan, "receipt_fd"),
+        ):
+            with self.subTest(output=output_name), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                jobs = root / "jobs"
+                name = "grabowski-job-abcabcabcabc"
+                self._job(jobs, name, 100)
+                target = root / output_name
+                target.rmdir()
+                plan = RETENTION.build_plan(
+                    minimum_job_age_seconds=50, now=1000,
+                    jobs_root=jobs, archive_root=root / "archive",
+                    receipt_root=root / "receipts",
+                    task_db=root / "missing.sqlite3",
+                    failed_units=[],
+                    unit_states={name + ".service": self._state(name + ".service")},
+                )
+                self.assertEqual(getattr(plan, fd_name), -1)
+                # A substitute appearing after planning cannot gain
+                # authority merely because its mode and owner are plausible.
+                foreign = root / "foreign"
+                foreign.mkdir(mode=0o700)
+                foreign.rename(target)
+                with patch.object(
+                    RETENTION.os, "mkdir",
+                    side_effect=AssertionError("unsafe mkdirat called"),
+                ):
+                    with self.assertRaisesRegex(
+                        RuntimeError, "root absent during planning"
+                    ):
+                        root_opener(plan)
+                self.assertTrue(target.is_dir())
+                self.assertEqual(getattr(plan, fd_name), -1)
+
+    def test_missing_output_root_apply_fails_before_archive_reset_or_audit(self) -> None:
+        # The root may be missing at plan time and an attacker may publish a
+        # replacement before apply. No trusted FD means no irreversible effect.
+        for output in ("archive", "receipts"):
+            with self.subTest(output=output), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                jobs = root / "jobs"
+                name = "grabowski-job-aabaabbaabba"
+                unit = name + ".service"
+                source = self._job(jobs, name, 100)
+                target = root / output
+                target.rmdir()
+                plan = RETENTION.build_plan(
+                    minimum_job_age_seconds=50, now=1000,
+                    jobs_root=jobs, archive_root=root / "archive",
+                    receipt_root=root / "receipts",
+                    task_db=root / "missing.sqlite3",
+                    failed_units=[unit],
+                    unit_states={unit: self._state(unit)},
+                )
+                self.assertEqual(len(plan["archive_jobs"]), 1)
+                foreign = root / "foreign-private-output"
+                foreign.mkdir(mode=0o700)
+                foreign.rename(target)
+                fake_deploy = types.ModuleType("grabowski_self_deploy")
+                fake_deploy.DEPLOY_INDEX_FILENAME = "runtime-deploy-index.json"
+                fake_deploy._deploy_schedule_lock = lambda: nullcontext()
+                fake_base = types.ModuleType("grabowski_mcp")
+                fake_base._append_audit = Mock()
+                fake_base._require_mutations_enabled = Mock()
+                fake_base._require_capability = Mock()
+                reset = Mock(return_value=Mock(returncode=0, stderr=""))
+                with patch.dict("sys.modules", {
+                    "grabowski_self_deploy": fake_deploy,
+                    "grabowski_mcp": fake_base,
+                }), patch.object(RETENTION, "_run", reset), patch.object(
+                    RETENTION, "_systemd_unit_states",
+                    return_value={unit: self._state(unit)},
+                ):
+                    with self.assertRaisesRegex(
+                        RuntimeError, "root absent during planning"
+                    ):
+                        RETENTION.apply_plan(
+                            plan, expected_plan_sha256=plan["plan_sha256"]
+                        )
+                self.assertTrue((source / "metadata.json").is_file())
+                self.assertFalse((target / name).exists())
+                self.assertFalse((root / "receipts" / f"{plan['plan_sha256']}.json").exists())
+                reset.assert_not_called()
+                fake_base._append_audit.assert_not_called()
+
     def test_archive_root_forged_before_initial_fd_never_redirects_move(self) -> None:
         # A private counterfeit archive root can be present BEFORE build_plan.
         with tempfile.TemporaryDirectory() as temporary:
@@ -3918,7 +4024,7 @@ class RuntimeRetentionTests(unittest.TestCase):
             name = "grabowski-job-abababababab"
             unit = name + ".service"
             self._job(jobs, name, 100)
-            archive.mkdir(mode=0o700)
+            archive.mkdir(mode=0o700, exist_ok=True)
             foreign.mkdir(mode=0o700)
             archive.rename(hidden)
             foreign.rename(archive)
@@ -4722,6 +4828,9 @@ class RuntimeRetentionTests(unittest.TestCase):
             root.chmod(0o700)
             jobs = root / "jobs"
             jobs.mkdir(mode=0o700)
+            # Existing private output roots are an apply-time safety precondition.
+            (root / "archive").mkdir(mode=0o700)
+            (root / "receipts").mkdir(mode=0o700)
             receipts = root / "receipts"
             worker_db, resource_db, unit = self._worker_state_dbs(
                 root, worker_id="7" * 20
