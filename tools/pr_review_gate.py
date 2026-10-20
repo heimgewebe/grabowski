@@ -115,6 +115,7 @@ BOOTSTRAP_EXPECTED_CHECK_NAMES_BY_REPO = {
     "alexdermohr/mark-api": ("verify",),
     "heimgewebe/metarepo": ("ci (ubuntu-latest)", "ci (macos-latest)"),
     "heimgewebe/mitschreiber": ("ci / reusable-ci",),
+    "heimgewebe/recovery-evidence-authority": ("security-selftest",),
     "heimgewebe/systemkatalog": ("Repository Contract", "Secret Scan"),
     "heimgewebe/weltgewebe": ("Detect docs updates", "Core Guard Tests"),
 }
