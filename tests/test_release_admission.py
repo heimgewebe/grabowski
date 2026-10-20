@@ -1506,10 +1506,14 @@ class RealGitDocumentationModeTests(unittest.TestCase):
                     with self.assertRaisesRegex(RuntimeError, "raw modes|documentation Git mode"):
                         deploy._require_release_source_admission(target)
                 else:
-                    result = deploy._require_release_source_admission(target)
-                    self.assertEqual("non-runtime-documentation", result["status"])
+                    # Plain .md may be executed by Makefile/CI; never exempt
+                    # a new source commit from an independent release R3.
+                    with self.assertRaisesRegex(
+                        RuntimeError, "release review admission missing",
+                    ):
+                        deploy._require_release_source_admission(target)
 
-    def test_genuine_git_regular_file_delta_allowed(self):
+    def test_genuine_git_regular_file_delta_requires_review(self):
         self._run_real_git_delta(symlink=False)
 
     def test_genuine_git_symlink_delta_blocked(self):
