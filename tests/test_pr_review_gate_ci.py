@@ -182,6 +182,18 @@ class ReviewEvidenceCiRenameAwareConsumerTests(unittest.TestCase):
             review_tier="documentation", minimum_review_iterations=1,
             actual_review_iterations=1,
         ))
+        # Exercise the actual publication path, not only the REST helper.
+        # Path-only, invalid rename metadata, and an authentic critical
+        # workflow rename must all deny a documentation-level review PASS.
+        blocked_rest_cases = (
+            None,
+            [{"path": "docs/ci.md"}],
+            [{"path": "docs/ci.md", "status": "renamed"}],
+            [{"path": "docs/ci.md", "status": "modified",
+              "previousPath": ".github/workflows/ci.yml"}],
+            [{"path": "docs/ci.md", "status": "renamed",
+              "previousPath": ".github/workflows/ci.yml"}],
+        )
         with mock.patch.dict(ci.os.environ, {
             "GITHUB_ACTOR": "writer",
             "REVIEW_GATE_COMMENT_BODY": "fixture",
@@ -196,12 +208,16 @@ class ReviewEvidenceCiRenameAwareConsumerTests(unittest.TestCase):
             ci, "current_diff_sha256s", return_value=("b" * 64,)
         ), mock.patch.object(
             ci, "parse_comment_evidence", return_value=(projection, True)
-        ), mock.patch.object(
-            gate, "_load_pull_file_evidence", return_value=None
         ), mock.patch.object(ci, "publish_commit_status") as published:
-            result = ci.evaluate_comment_command(args)
-        self.assertEqual(1, result)
-        self.assertFalse(published.call_args.kwargs["passed"])
+            for rest in blocked_rest_cases:
+                with self.subTest(rest=rest), mock.patch.object(
+                    gate, "_load_pull_file_evidence", return_value=rest
+                ):
+                    published.reset_mock()
+                    result = ci.evaluate_comment_command(args)
+                    self.assertEqual(1, result)
+                    published.assert_called_once()
+                    self.assertFalse(published.call_args.kwargs["passed"])
 
 
 class ReviewEvidenceCiProjectionTests(unittest.TestCase):
