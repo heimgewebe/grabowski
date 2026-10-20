@@ -13,13 +13,23 @@ spec.loader.exec_module(gate)
 
 class RecoveryRequiredCheckTests(unittest.TestCase):
     def expected(self, *, head=None, base=None, repo_name="heimgewebe/recovery-evidence-authority"):
-        with tempfile.TemporaryDirectory() as raw, mock.patch.object(
-            gate, "_required_check_catalog_text_at_revision", side_effect=[head, base]
-        ) as catalog, mock.patch.object(gate, "_workflow_text_at_revision", return_value=None):
-            value = gate.expected_check_names_for_repo(
-                Path(raw), repo_name=repo_name, head_sha="a"*40, base_sha="b"*40
+        with tempfile.TemporaryDirectory() as raw:
+            repo = Path(raw)
+
+            def catalog_at_revision(requested_repo, revision, *, repo_name):
+                self.assertEqual(requested_repo, repo)
+                self.assertEqual(repo_name.lower(), "heimgewebe/recovery-evidence-authority")
+                return {"a"*40: head, "b"*40: base}[revision]
+
+            with mock.patch.object(
+                gate, "_required_check_catalog_text_at_revision", side_effect=catalog_at_revision
+            ) as catalog, mock.patch.object(gate, "_workflow_text_at_revision", return_value=None):
+                value = gate.expected_check_names_for_repo(
+                    repo, repo_name=repo_name, head_sha="a"*40, base_sha="b"*40
+                )
+            self.assertCountEqual(
+                [call.args[1] for call in catalog.call_args_list], ["a"*40, "b"*40]
             )
-            self.assertEqual(catalog.call_count, 2)
         return value
 
     def test_exact_protected_base_bootstrap(self):
@@ -30,6 +40,15 @@ class RecoveryRequiredCheckTests(unittest.TestCase):
         self.assertEqual(
             self.expected(head='{"schema_version":1,"required_checks":["fake-green-check"]}'),
             ("security-selftest",),
+        )
+
+    def test_malicious_head_does_not_weaken_stronger_protected_base_catalog(self):
+        self.assertEqual(
+            self.expected(
+                head='{"schema_version":1,"required_checks":["fake-green-check"]}',
+                base='{"schema_version":1,"required_checks":["security-selftest","base-integrity"]}',
+            ),
+            ("security-selftest", "base-integrity"),
         )
 
     def test_authoritative_base_catalog_overrides_bootstrap(self):
@@ -55,6 +74,7 @@ class RecoveryRequiredCheckTests(unittest.TestCase):
             [], [{"name":"fake-green-check","bucket":"pass"}],
             [{"name":"security-selftest","bucket":"failure"}],
             [{"name":"security-selftest","bucket":"skipping"}],
+            [{"name":"security-selftest","bucket":"skipped"}],
             [{"name":"security-selftest","bucket":"pending"}],
             [{"name":"security-selftest","bucket":"pass"},{"name":"security-selftest","bucket":"failure"}],
         ]
@@ -67,6 +87,8 @@ class RecoveryRequiredCheckTests(unittest.TestCase):
         state["checks"] = [{"name":"security-selftest","bucket":"pass"}]
         result = gate.evaluate_review_gate(state, expected_check_names=("security-selftest",))
         self.assertNotIn("expected check(s) missing or non-green: security-selftest", result["failures"])
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertIn("Grabowski self-review evidence is missing", result["failures"])
 
 if __name__ == "__main__":
     unittest.main()
