@@ -5680,8 +5680,12 @@ def _recovered_auto_deploy_source_binding(
 
 
 
-def _release_documentation_raw_paths(raw_records: str) -> list[str]:
-    """Accept only complete NUL-delimited raw Git changes to plain documents."""
+def _release_documentation_raw_paths(raw_records: str) -> tuple[list[str], bool]:
+    """Validate regular-file Git changes and identify executable-mode review scope.
+
+    A regular executable belongs to the mandatory source-review path, never
+    to the 100644-only plain-document exemption. Unsupported types fail closed.
+    """
     if raw_records and not raw_records.endswith("\x00"):
         raise DeploySchedulePreEffectRefusal(
             "release admission blocked: source path boundary is incomplete"
@@ -5692,6 +5696,7 @@ def _release_documentation_raw_paths(raw_records: str) -> list[str]:
             "release admission blocked: source raw diff boundary is incomplete"
         )
     changed_paths: list[str] = []
+    executable_mode_requires_review = False
     for header, path in zip(frames[::2], frames[1::2], strict=True):
         if (
             not path or path.startswith("/") or "\ufffd" in path
@@ -5712,17 +5717,25 @@ def _release_documentation_raw_paths(raw_records: str) -> list[str]:
                 "release admission blocked: source raw modes are unproved"
             )
         old_mode, new_mode, old_oid, new_oid, change = record.groups()
-        safe_transition = {
-            "A": ("000000", "100644"),
-            "D": ("100644", "000000"),
-            "M": ("100644", "100644"),
+        regular_file_transitions = {
+            "A": {("000000", "100644"), ("000000", "100755")},
+            "D": {("100644", "000000"), ("100755", "000000")},
+            "M": {
+                ("100644", "100644"), ("100644", "100755"),
+                ("100755", "100644"), ("100755", "100755"),
+            },
         }
-        if len(old_oid) != len(new_oid) or (old_mode, new_mode) != safe_transition[change]:
+        if (
+            len(old_oid) != len(new_oid)
+            or (old_mode, new_mode) not in regular_file_transitions[change]
+        ):
             raise DeploySchedulePreEffectRefusal(
                 "release admission blocked: source modes are not plain documents"
             )
+        if "100755" in (old_mode, new_mode):
+            executable_mode_requires_review = True
         changed_paths.append(path)
-    return changed_paths
+    return changed_paths, executable_mode_requires_review
 
 
 
@@ -6065,111 +6078,95 @@ def _require_release_source_admission(
         raise DeploySchedulePreEffectRefusal(
             "release admission blocked: complete source diff is unavailable"
         )
-    changed_paths = _release_documentation_raw_paths(observed["stdout"])
-    # Only pure documentation delta is exempt; unknown files, test or CI
-    # policy, executables, tools and runtime sources all fail closed.
-    # Even inside docs/, executable or configuration files are not inherently
-    # review-free; the exemption covers only plain documentation formats.
-    safe_document_extensions = (".md", ".markdown", ".rst", ".txt", ".adoc")
-    if any(
-        not path.startswith("docs/") or not path.endswith(safe_document_extensions)
-        for path in changed_paths
-    ):
-        scope = _CAPTAIN_RUNTIME_RELEASE_SCOPE.get()
-        if not captain_preview:
-            if (
-                not _active_captain_origin_valid(scope, expected_head)
-                or type(scope.get("review_pr")) is not int
-                or scope["review_pr"] <= 0
-            ):
-                raise DeploySchedulePreEffectRefusal(
-                    "release review admission missing: critical source deployment "
-                    "requires an accepted Captain release action"
-                )
-            release_review_pr = scope["review_pr"]
-        if type(release_review_pr) is not int or release_review_pr <= 0:
+    # Validate all Git raw modes and paths, including symlinks, before review.
+    _release_documentation_raw_paths(observed["stdout"])
+    # A regular docs/*.md file may be executed by a trusted Makefile or CI.
+    # A different commit is never review-exempt merely due to its path or mode.
+    scope = _CAPTAIN_RUNTIME_RELEASE_SCOPE.get()
+    if not captain_preview:
+        if (
+            not _active_captain_origin_valid(scope, expected_head)
+            or type(scope.get("review_pr")) is not int
+            or scope["review_pr"] <= 0
+        ):
             raise DeploySchedulePreEffectRefusal(
-                "release review admission missing: exact independent R3 job namespace"
+                "release review admission missing: critical source deployment "
+                "requires an accepted Captain release action"
             )
+        release_review_pr = scope["review_pr"]
+    if type(release_review_pr) is not int or release_review_pr <= 0:
+        raise DeploySchedulePreEffectRefusal(
+            "release review admission missing: exact independent R3 job namespace"
+        )
 
-        def exact_tree(commit: str) -> str:
-            result = _git_result(
-                CANONICAL_REPOSITORY, "rev-parse", f"{commit}^{{tree}}"
-            )
-            if (
-                type(result.get("returncode")) is not int
-                or result["returncode"] != 0
-                or result.get("timed_out") is not False
-                or result.get("stdout_truncated") is not False
-                or result.get("stderr_truncated") is not False
-                or result.get("stderr") != ""
-                or not isinstance(result.get("stdout"), str)
-                or re.fullmatch(r"[0-9a-f]{40}\n?", result["stdout"]) is None
-            ):
-                raise DeploySchedulePreEffectRefusal(
-                    "release admission blocked: exact source tree unavailable"
-                )
-            return result["stdout"].strip()
-
-        raw_diff = _git_result(
-            CANONICAL_REPOSITORY,
-            "diff", "--no-ext-diff", "--no-textconv",
-            "--no-renames", "--ignore-submodules=none",
-            "--raw", "--abbrev=40", "-z",
-            serving_head, expected_head, "--",
-            max_output_bytes=262_144,
+    def exact_tree(commit: str) -> str:
+        result = _git_result(
+            CANONICAL_REPOSITORY, "rev-parse", f"{commit}^{{tree}}"
         )
         if (
-            type(raw_diff.get("returncode")) is not int
-            or raw_diff["returncode"] != 0
-            or raw_diff.get("timed_out") is not False
-            or raw_diff.get("stdout_truncated") is not False
-            or raw_diff.get("stderr_truncated") is not False
-            or raw_diff.get("stderr") != ""
-            or not isinstance(raw_diff.get("stdout"), str)
-            or "\ufffd" in raw_diff["stdout"]
-            or "<REDACTED>" in raw_diff["stdout"]
+            type(result.get("returncode")) is not int
+            or result["returncode"] != 0
+            or result.get("timed_out") is not False
+            or result.get("stdout_truncated") is not False
+            or result.get("stderr_truncated") is not False
+            or result.get("stderr") != ""
+            or not isinstance(result.get("stdout"), str)
+            or re.fullmatch(r"[0-9a-f]{40}\n?", result["stdout"]) is None
         ):
             raise DeploySchedulePreEffectRefusal(
-                "release admission blocked: exact complete raw source diff unavailable"
+                "release admission blocked: exact source tree unavailable"
             )
-        import grabowski_release_admission as release_admission
+        return result["stdout"].strip()
 
-        try:
-            reviewed = release_admission.validate_release(
-                serving_head=serving_head,
-                target_head=expected_head,
-                serving_release_id=release_id,
-                serving_tree=exact_tree(serving_head),
-                target_tree=exact_tree(expected_head),
-                diff_sha256=hashlib.sha256(
-                    raw_diff["stdout"].encode("utf-8")
-                ).hexdigest(),
-                review_pr=release_review_pr,
-            )
-        except (OSError, RuntimeError, TypeError, ValueError) as exc:
-            raise DeploySchedulePreEffectRefusal(
-                "release review admission blocked: " + str(exc)
-            ) from exc
-        if not captain_preview and (
-            reviewed["release_review_identity_sha256"] != scope.get("identity_sha256")
-            or serving_head != scope.get("serving_head")
-            or release_id != scope.get("serving_release_id")
-        ):
-            raise DeploySchedulePreEffectRefusal(
-                "release review admission blocked: Captain-to-dispatch identity drift"
-            )
-        return reviewed
-    # _release_documentation_raw_paths already verified every changed
-    # entry's complete Git raw header, exact OID width, regular-file mode
-    # transition and unambiguous path before the documentation exemption.
-    return {
-        "status": "non-runtime-documentation",
-        "serving_repo_head": serving_head,
-        "target_repo_head": expected_head,
-        "changed_path_count": len(changed_paths),
-        "independent_review_required": False,
-    }
+    raw_diff = _git_result(
+        CANONICAL_REPOSITORY,
+        "diff", "--no-ext-diff", "--no-textconv",
+        "--no-renames", "--ignore-submodules=none",
+        "--raw", "--abbrev=40", "-z",
+        serving_head, expected_head, "--",
+        max_output_bytes=262_144,
+    )
+    if (
+        type(raw_diff.get("returncode")) is not int
+        or raw_diff["returncode"] != 0
+        or raw_diff.get("timed_out") is not False
+        or raw_diff.get("stdout_truncated") is not False
+        or raw_diff.get("stderr_truncated") is not False
+        or raw_diff.get("stderr") != ""
+        or not isinstance(raw_diff.get("stdout"), str)
+        or "\ufffd" in raw_diff["stdout"]
+        or "<REDACTED>" in raw_diff["stdout"]
+    ):
+        raise DeploySchedulePreEffectRefusal(
+            "release admission blocked: exact complete raw source diff unavailable"
+        )
+    import grabowski_release_admission as release_admission
+
+    try:
+        reviewed = release_admission.validate_release(
+            serving_head=serving_head,
+            target_head=expected_head,
+            serving_release_id=release_id,
+            serving_tree=exact_tree(serving_head),
+            target_tree=exact_tree(expected_head),
+            diff_sha256=hashlib.sha256(
+                raw_diff["stdout"].encode("utf-8")
+            ).hexdigest(),
+            review_pr=release_review_pr,
+        )
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise DeploySchedulePreEffectRefusal(
+            "release review admission blocked: " + str(exc)
+        ) from exc
+    if not captain_preview and (
+        reviewed["release_review_identity_sha256"] != scope.get("identity_sha256")
+        or serving_head != scope.get("serving_head")
+        or release_id != scope.get("serving_release_id")
+    ):
+        raise DeploySchedulePreEffectRefusal(
+            "release review admission blocked: Captain-to-dispatch identity drift"
+        )
+    return reviewed
 
 
 

@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -14,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import zipimport
 from typing import Any
 
 TOOLS_DIR = Path(__file__).resolve().parent
@@ -1005,6 +1008,7 @@ def _spawn_validation_process(
     stdin: Any,
     stdout: Any,
     stderr: Any,
+    pass_fds: tuple[int, ...] = (),
 ) -> subprocess.Popen[Any]:
     """Spawn one validation process without leaking the parent's SIGTERM guard."""
     process: subprocess.Popen[Any] | None = None
@@ -1020,6 +1024,7 @@ def _spawn_validation_process(
             stdout=stdout,
             stderr=stderr,
             start_new_session=True,
+            **({"pass_fds": pass_fds} if pass_fds else {}),
         )
         signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
         restored = True
@@ -1041,19 +1046,22 @@ def _run_validation_command(
     check: bool = True,
     capture: bool = False,
     env: dict[str, str],
-) -> subprocess.CompletedProcess[str]:
+    pass_fds: tuple[int, ...] = (),
+    binary: bool = False,
+) -> subprocess.CompletedProcess[str] | subprocess.CompletedProcess[bytes]:
     """Run one validation-bootstrap command in a killable, reapable process group."""
     process = _spawn_validation_process(
         argv,
         cwd=cwd,
         env=env,
-        text=True,
+        text=not binary,
         stdin=None,
         stdout=subprocess.PIPE if capture else None,
         stderr=subprocess.PIPE if capture else None,
+        **({"pass_fds": pass_fds} if pass_fds else {}),
     )
-    stdout: str | None = None
-    stderr: str | None = None
+    stdout: str | bytes | None = None
+    stderr: str | bytes | None = None
     try:
         try:
             if capture:
@@ -1336,7 +1344,259 @@ def _raise_validation_sigterm(signum: int, _frame: Any) -> None:
     raise RuntimeError(f"validate interrupted by signal {signum} (SIGTERM)")
 
 
-def run_streamed(argv: list[str], *, cwd: Path, timeout_seconds: int, phase: str) -> None:
+def _authenticated_deploy_lock_from_git(
+    repo: Path, validation_root: Path, expected_head: str, env: dict[str, str]
+) -> bytes:
+    """Verify the *entire* SHA-1 commit/tree/blob chain, not Git path resolution.
+
+    Git cat-file supplies bytes, not authenticity: a same-UID peer can overwrite
+    loose objects under their original names. The caller's previously pinned
+    expected_head is the only trust anchor. The tree path must be derived from
+    verified parent bytes before admitting any lock hash to pip.
+    """
+    def verified_object(kind: str, oid: str, maximum: int) -> bytes:
+        if not re.fullmatch(r"[0-9a-f]{40}", oid):
+            raise RuntimeError(f"committed deploy-tooling Git {kind} object ID is invalid")
+        result = _run_validation_command(
+            ["/usr/bin/git", "-C", str(repo), "cat-file", kind, oid],
+            timeout=deploy_core.TIMEOUTS["python"],
+            env=env,
+            cwd=validation_root,
+            capture=True,
+            binary=True,
+        )
+        raw = result.stdout
+        if not isinstance(raw, bytes) or not 0 < len(raw) <= maximum:
+            raise RuntimeError(f"committed deploy-tooling Git {kind} object is unsafe")
+        header = kind.encode("ascii") + b" " + str(len(raw)).encode("ascii") + b"\0"
+        if hashlib.sha1(header + raw).hexdigest() != oid:
+            raise RuntimeError(f"committed deploy-tooling Git {kind} object identity mismatch")
+        return raw
+
+    def tree_child(tree_oid: str, name: bytes, required_mode: bytes) -> str:
+        tree = verified_object("tree", tree_oid, 2 * 1024 * 1024)
+        offset = 0
+        target: str | None = None
+        while offset < len(tree):
+            nul = tree.find(b"\0", offset)
+            if nul < 0 or nul + 21 > len(tree):
+                raise RuntimeError("committed deploy-tooling Git tree entry is invalid")
+            mode_and_name = tree[offset:nul]
+            mode, sep, entry_name = mode_and_name.partition(b" ")
+            if not sep or not mode or not entry_name:
+                raise RuntimeError("committed deploy-tooling Git tree entry is invalid")
+            child_oid = tree[nul + 1:nul + 21].hex()
+            offset = nul + 21
+            if entry_name == name:
+                if mode != required_mode or target is not None:
+                    raise RuntimeError("committed deploy-tooling Git tree path is unsafe")
+                target = child_oid
+        if target is None:
+            raise RuntimeError("committed deploy-tooling Git tree path is missing")
+        return target
+
+    commit = verified_object("commit", expected_head, 1024 * 1024)
+    first_line = commit.split(b"\n", 1)[0]
+    if not re.fullmatch(rb"tree [0-9a-f]{40}", first_line):
+        raise RuntimeError("committed deploy-tooling Git commit tree is invalid")
+    root_tree_oid = first_line[5:].decode("ascii")
+    requirements_oid = tree_child(root_tree_oid, b"requirements", b"40000")
+    lock_oid = tree_child(requirements_oid, b"deploy-tooling.lock.txt", b"100644")
+    return verified_object("blob", lock_oid, 128 * 1024)
+
+
+def _bind_hashed_deploy_tooling_yaml(
+    validation_root: Path, *, repo: Path, expected_head: str
+) -> int:
+    """Admit only lock-matching immutable PyYAML wheel bytes, never a mutable site.
+
+    The root-owned system pip downloads a wheel from the validated pinned
+    lock; the original commit's lock bytes and SHA-256 wheel digest are checked
+    before any downloaded package code is imported. A sealed memfd stays open
+    for later relative yaml imports until the scheduled runner exits.
+    """
+    if any(
+        name == "_yaml" or name == "yaml" or name.startswith("yaml.")
+        for name in sys.modules
+    ):
+        raise RuntimeError("deploy worker imported PyYAML before lock validation")
+    for directory in (
+        validation_root,
+        validation_root / "deploy-tooling",
+        validation_root / "deploy-tooling" / ".venv",
+    ):
+        try:
+            metadata = directory.lstat()
+        except OSError as exc:
+            raise RuntimeError("validated deploy-tooling directory is unavailable") from exc
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_mode & 0o022
+        ):
+            raise RuntimeError("validated deploy-tooling site directory is unsafe")
+    if not re.fullmatch(r"[0-9a-f]{40}", expected_head):
+        raise RuntimeError("validated tooling expected commit is invalid")
+    committed_env = _validation_environment(validation_root)
+    for key in list(committed_env):
+        if key.startswith("GIT_"):
+            committed_env.pop(key, None)
+    committed_env.update({
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_SYSTEM": "/dev/null",
+        "GIT_OPTIONAL_LOCKS": "0",
+    })
+    committed_bytes = _authenticated_deploy_lock_from_git(
+        repo, validation_root, expected_head, committed_env,
+    )
+    try:
+        committed = committed_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise RuntimeError("committed deploy-tooling lock is not UTF-8") from exc
+    lock_path = validation_root / "deploy-tooling.lock.txt"
+    lock_fd = os.open(lock_path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        lock_info = os.fstat(lock_fd)
+        if (
+            not stat.S_ISREG(lock_info.st_mode)
+            or lock_info.st_uid != os.getuid()
+            or lock_info.st_nlink != 1
+            or lock_info.st_size > 128 * 1024
+        ):
+            raise RuntimeError("validated deploy-tooling lock copy is unsafe")
+        lock_bytes = os.read(lock_fd, 128 * 1024 + 1)
+    finally:
+        os.close(lock_fd)
+    if lock_bytes != committed_bytes:
+        raise RuntimeError("validated deploy-tooling lock changed from committed source")
+    # The checked pathname is same-UID mutable. Parse and pass only these
+    # already compared bytes to pip: immutable sealed FD survives exec through
+    # the existing isolated validation child, not an attacker-swappable file.
+    lock_memfd = os.memfd_create(
+        "grabowski-committed-tooling-lock",
+        os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING,
+    )
+    try:
+        pending = memoryview(lock_bytes)
+        while pending:
+            written = os.write(lock_memfd, pending)
+            if written <= 0:
+                raise RuntimeError("could not copy committed lock into memfd")
+            pending = pending[written:]
+        seal_bits = (
+            fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW
+            | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL
+        )
+        fcntl.fcntl(lock_memfd, fcntl.F_ADD_SEALS, seal_bits)
+        if fcntl.fcntl(lock_memfd, fcntl.F_GET_SEALS) & seal_bits != seal_bits:
+            raise RuntimeError("committed lock fd is not sealed")
+        immutable_lock = f"/proc/self/fd/{lock_memfd}"
+        pinned = deploy_core.parse_pinned_lock_file(
+            Path(immutable_lock), label="Deploy-Tooling-Lockfile"
+        )
+        if pinned != {"pyyaml": deploy_core.TOOLING_PYYAML_VERSION}:
+            raise RuntimeError("validated tooling lock does not pin only PyYAML")
+        allowed_hashes = set(re.findall(r"--hash=sha256:([0-9a-f]{64})", committed))
+        if not allowed_hashes:
+            raise RuntimeError("validated tooling lock lacks wheel hashes")
+        with tempfile.TemporaryDirectory(prefix="gdw-", dir=validation_root) as wheel_dir:
+            _run_validation_command(
+                [
+                    "/usr/bin/python3", "-I", "-m", "pip", "download",
+                    "--isolated", "--disable-pip-version-check", "--no-input",
+                    "--no-cache-dir", "--dest", wheel_dir,
+                    "-r", immutable_lock,
+                    "--require-hashes", "--no-deps", "--only-binary=:all:",
+                    "--index-url", "https://pypi.org/simple",
+                ],
+                timeout=deploy_core.TIMEOUTS["package_install"],
+                env=_validation_environment(validation_root),
+                cwd=validation_root,
+                pass_fds=(lock_memfd,),
+            )
+            wheels = list(Path(wheel_dir).iterdir())
+            if len(wheels) != 1 or wheels[0].suffix != ".whl":
+                raise RuntimeError("hashed tooling download did not produce exactly one wheel")
+            wheel_fd = os.open(
+                wheels[0], os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+            )
+            try:
+                before = os.fstat(wheel_fd)
+                if (
+                    not stat.S_ISREG(before.st_mode)
+                    or before.st_uid != os.getuid()
+                    or before.st_nlink != 1
+                    or not 0 < before.st_size <= 16 * 1024 * 1024
+                ):
+                    raise RuntimeError("hashed tooling wheel is unsafe")
+                chunks: list[bytes] = []
+                remaining = before.st_size
+                while remaining:
+                    chunk = os.read(wheel_fd, min(1024 * 1024, remaining))
+                    if not chunk:
+                        raise RuntimeError("hashed tooling wheel is incomplete")
+                    chunks.append(chunk)
+                    remaining -= len(chunk)
+                wheel_bytes = b"".join(chunks)
+                after = os.fstat(wheel_fd)
+                if (
+                    (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+                    != (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+                    or hashlib.sha256(wheel_bytes).hexdigest() not in allowed_hashes
+                ):
+                    raise RuntimeError("downloaded PyYAML wheel bytes are not lock-pinned")
+            finally:
+                os.close(wheel_fd)
+    finally:
+        os.close(lock_memfd)
+    sealed_fd = os.memfd_create(
+        "grabowski-locked-pyyaml",
+        os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING,
+    )
+    try:
+        remaining_bytes = memoryview(wheel_bytes)
+        while remaining_bytes:
+            size = os.write(sealed_fd, remaining_bytes)
+            if size <= 0:
+                raise RuntimeError("could not seal hashed tooling wheel")
+            remaining_bytes = remaining_bytes[size:]
+        seals = (
+            fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW
+            | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL
+        )
+        fcntl.fcntl(sealed_fd, fcntl.F_ADD_SEALS, seals)
+        if fcntl.fcntl(sealed_fd, fcntl.F_GET_SEALS) & seals != seals:
+            raise RuntimeError("hashed tooling wheel is not immutable")
+        # Load *only* yaml from this sealed archive. Never prepend an entire
+        # mutable site to sys.path, and never process executable .pth files.
+        wheel_path = f"/proc/self/fd/{sealed_fd}"
+        importer = zipimport.zipimporter(wheel_path)
+        spec = importer.find_spec("yaml")
+        if spec is None or spec.loader is None:
+            raise RuntimeError("sealed PyYAML wheel does not contain a package")
+        yaml = importlib.util.module_from_spec(spec)
+        sys.modules["yaml"] = yaml
+        spec.loader.exec_module(yaml)
+        if (
+            getattr(yaml, "__version__", None) != deploy_core.TOOLING_PYYAML_VERSION
+            or getattr(yaml, "__file__", None) != wheel_path + "/yaml/__init__.py"
+            or yaml.safe_load("locked: true") != {"locked": True}
+        ):
+            raise RuntimeError("worker PyYAML is not from the sealed locked wheel")
+        return sealed_fd
+    except BaseException:
+        for name in list(sys.modules):
+            if name == "yaml" or name.startswith("yaml.") or name == "_yaml":
+                sys.modules.pop(name, None)
+        os.close(sealed_fd)
+        raise
+
+
+def run_streamed(
+    argv: list[str], *, cwd: Path, timeout_seconds: int, phase: str,
+    retain_validation: bool = False,
+) -> tempfile.TemporaryDirectory[str] | None:
     emit(f"{phase}-start", argv=argv)
     environment = child_environment()
     effective_argv = list(argv)
@@ -1403,6 +1663,13 @@ def run_streamed(argv: list[str], *, cwd: Path, timeout_seconds: int, phase: str
         emit(f"{phase}-complete", returncode=returncode)
         if returncode != 0:
             raise RuntimeError(f"{phase} failed with return code {returncode}")
+        if retain_validation:
+            if validation_tmp is None:
+                raise RuntimeError("only hashed-lock validation may retain tooling")
+            retained = validation_tmp
+            validation_tmp = None
+            return retained
+        return None
     finally:
         try:
             if (
@@ -1799,6 +2066,8 @@ def main() -> int:
     binding: dict[str, Any] | None = None
     blue_green_result: dict[str, Any] | None = None
     live: dict[str, Any] | None = None
+    retained_validation: tempfile.TemporaryDirectory[str] | None = None
+    sealed_yaml_fd: int | None = None
     try:
         binding = load_finalization_binding()
         if binding is not None and binding["expected_head"] != args.expected_head:
@@ -1821,12 +2090,24 @@ def main() -> int:
             expected_head=args.expected_head,
             source_identity_sha256=args.source_identity_sha256,
         )
-        run_streamed(["make", "validate"], cwd=repo, timeout_seconds=1_200, phase="validate")
+        retained_validation = run_streamed(
+            ["make", "validate"], cwd=repo, timeout_seconds=1_200,
+            phase="validate", retain_validation=True,
+        )
+        if not isinstance(retained_validation, tempfile.TemporaryDirectory):
+            raise RuntimeError("hashed-lock deploy tooling was not retained")
+        # Do not import any dependency until the validated target source
+        # identity has been checked again after the validation subprocess.
         verify_repository(
             repo,
             args.canonical_repo,
             args.source_kind,
             args.expected_head,
+        )
+        sealed_yaml_fd = _bind_hashed_deploy_tooling_yaml(
+            Path(retained_validation.name),
+            repo=repo,
+            expected_head=args.expected_head,
         )
         recovery_decision = classify_recovery_before_deploy(
             repo=repo, execution_head=args.expected_head
@@ -1957,6 +2238,13 @@ def main() -> int:
                 emit("finalization-receipt-failed", error_type=type(receipt_exc).__name__)
         emit("failed", error_type=type(exc).__name__, error=str(exc))
         return 1
+    finally:
+        if sealed_yaml_fd is not None:
+            os.close(sealed_yaml_fd)
+        if retained_validation is not None and isinstance(
+            retained_validation, tempfile.TemporaryDirectory
+        ):
+            retained_validation.cleanup()
 
 
 if __name__ == "__main__":

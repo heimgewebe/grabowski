@@ -432,6 +432,39 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
         self.assertEqual(outcome["status"], "settled")
         self.assertEqual(outcome["errors"], [])
 
+    def test_v2_429_weekly_time_only_reset_requires_later_real_pass(self) -> None:
+        # This exact 0-token Claude Pro 429 envelope was observed on
+        # 2026-10-19: there is no date before the reset hour.
+        # Zero review work is infrastructure, NOT independent PASS.
+        with tempfile.TemporaryDirectory() as temporary:
+            jobs = Path(temporary) / "jobs"
+            jobs.mkdir(mode=0o700)
+            failed = make_job(
+                jobs, suffix="a88888888888", slot="claude",
+                terminal_status="failed", review_result=None,
+                review_role=True, attempt_bound=True, attempt_epoch=2,
+            )
+            stamp_claude_quota_429(
+                failed, envelope_updates={
+                    "result": "You've hit your weekly limit · resets 10am (UTC)"
+                },
+            )
+            prior = self.reconcile(jobs)
+            self.assertEqual(prior["status"], "blocked")
+            self.assertEqual(prior["attempts"][0]["classification"], "infrastructure_error")
+            self.assertEqual(prior["slots"][0]["independent_pass_count"], 0)
+            make_job(
+                jobs, suffix="b99999999999", slot="claude",
+                terminal_status="succeeded", review_result=None,
+                review_role=True, attempt_bound=True, attempt_epoch=2,
+                created_at_unix=1_787_000_200,
+            )
+            settled = self.reconcile(jobs)
+        self.assertEqual(settled["status"], "settled")
+        self.assertEqual(settled["errors"], [])
+        self.assertEqual(settled["slots"][0]["independent_pass_count"], 1)
+        self.assertEqual(settled["slots"][0]["infrastructure_error_count"], 1)
+
     def test_v2_429_generic_pass_cannot_supersede_independent_claude(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             jobs = Path(temporary) / "jobs"
@@ -549,6 +582,15 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
             }, {}),
             ("quota_reset_with_extra_text", {
                 "result": "You've hit your weekly limit · resets Oct 13, 10am (UTC). REVIEW REJECT",
+            }, {}),
+            ("time_only_reset_with_extra_text", {
+                "result": "You've hit your weekly limit · resets 10am (UTC). REVIEW REJECT",
+            }, {}),
+            ("time_only_reset_invalid_hour", {
+                "result": "You've hit your weekly limit · resets 99am (UTC)",
+            }, {}),
+            ("time_only_reset_missing_timezone", {
+                "result": "You've hit your weekly limit · resets 10am",
             }, {}),
             ("unknown_top_level_review_result", {
                 "review_result": {"verdict": "REJECT_THIS_REVISION", "findings": [{"priority": "P1"}]},
