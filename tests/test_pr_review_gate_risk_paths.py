@@ -147,5 +147,79 @@ class PrReviewGateRiskPathExpansionTests(unittest.TestCase):
         self.assertEqual("0" * 64, audit["diff_sha256"])
 
 
+    def test_heim_pc_nixos_production_input_paths_require_high_critical_review(self) -> None:
+        for path in (
+            "flake.lock",
+            "flake.nix",
+            "nixos/system/flake.nix",
+            "nixos/production/trust-contract-v1.json",
+            "./nixos/production/trust-contract-v1.json",
+        ):
+            with self.subTest(path=path):
+                state = _state(path)
+                state["repoName"] = "heimgewebe/heim-pc"
+                complexity = pr_review_gate.classify_complexity(
+                    state["pr"], None, repo_name=state["repoName"]
+                )
+                self.assertTrue(complexity["high_critical"], complexity)
+                self.assertEqual("high_critical", complexity["review_tier"])
+                self.assertTrue(complexity["independent_review_required"])
+                self.assertFalse(complexity["very_small_uncomplicated"])
+                self.assertGreaterEqual(complexity["minimum_self_review_iterations"], 4)
+                self.assertTrue(
+                    any("NixOS supply-chain source" in reason for reason in complexity["reasons"]),
+                    complexity["reasons"],
+                )
+
+    def test_exact_heim_pc_pr228_production_trust_transition_is_high_critical(self) -> None:
+        state = _state("flake.lock")
+        state["repoName"] = "heimgewebe/heim-pc"
+        paths = [
+            "flake.lock",
+            "flake.nix",
+            "nixos/production/trust-contract-v1.json",
+            "nixos/system/flake.nix",
+            "tests/test_nixos_system_source.py",
+        ]
+        state["pr"]["files"] = [{"path": path} for path in paths]
+        state["pr"]["changedFiles"] = len(paths)
+        state["pr"]["additions"] = 20
+        state["pr"]["deletions"] = 5
+        classified = pr_review_gate.classify_complexity(
+            state["pr"], None, repo_name=state["repoName"]
+        )
+        self.assertEqual("high_critical", classified["review_tier"])
+        self.assertTrue(classified["independent_review_required"])
+        self.assertTrue(any(
+            "NixOS supply-chain source" in reason for reason in classified["high_critical_reasons"]
+        ))
+
+    def test_nix_trust_path_rules_are_repo_scoped_and_do_not_match_lookalikes(self) -> None:
+        for path in (
+            "docs/flake.lock",
+            "flake.lock.example",
+            "flake.nix.bak",
+            "nixos/production/trust-contract-v1.json.bak",
+            "docs/nixos/production/trust-contract-v1.json",
+            "../nixos/production/trust-contract-v1.json",
+            "tests/test_nixos_system_source.py",
+        ):
+            with self.subTest(path=path):
+                state = _state(path)
+                state["repoName"] = "heimgewebe/heim-pc"
+                classified = pr_review_gate.classify_complexity(
+                    state["pr"], None, repo_name=state["repoName"]
+                )
+                self.assertFalse(classified["high_critical"], classified)
+        for path in ("flake.lock", "nixos/production/trust-contract-v1.json"):
+            with self.subTest(other_repo_path=path):
+                state = _state(path)
+                state["repoName"] = "heimgewebe/example-repo"
+                classified = pr_review_gate.classify_complexity(
+                    state["pr"], None, repo_name=state["repoName"]
+                )
+                self.assertFalse(classified["high_critical"], classified)
+
+
 if __name__ == "__main__":
     unittest.main()

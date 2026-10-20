@@ -298,6 +298,13 @@ HIGH_CRITICAL_PATH_PREFIXES = (
     "scripts/migration",
     "tools/pr_review_gate.py",
 )
+HEIM_PC_NIX_SUPPLY_CHAIN_SOURCE_PATHS = frozenset((
+    "flake.lock",
+    "flake.nix",
+    "nixos/system/flake.nix",
+    "nixos/production/trust-contract-v1.json",
+))
+
 HIGH_CRITICAL_PATH_MARKERS = (
     "auth",
     "credential",
@@ -1180,6 +1187,20 @@ def _trivial_exempt_deny_reason(path: str, changed_lines: int) -> str | None:
     return None
 
 
+def _nixos_supply_chain_path_reason(path: str, repo_name: str | None) -> str | None:
+    """Protect exact Heim-PC production flake and input-trust source paths."""
+    if repo_name != "heimgewebe/heim-pc":
+        return None
+    normalized = path.lower()
+    # Strip only actual relative-directory prefixes, not all leading dots:
+    # a full-path lstrip("./") would also silently rewrite path aliases.
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    if normalized in HEIM_PC_NIX_SUPPLY_CHAIN_SOURCE_PATHS:
+        return f"high-critical NixOS supply-chain source path touched: {path}"
+    return None
+
+
 def _high_critical_path_reason(path: str) -> str | None:
     normalized = path.lower().lstrip("./")
     if _is_policy_critical_path(normalized):
@@ -1232,7 +1253,10 @@ def classify_complexity(
         if changed_lines > 500:
             high_critical_reasons.append("large diff")
         for path in paths:
-            reason = _high_critical_path_reason(path)
+            reason = (
+                _nixos_supply_chain_path_reason(path, normalized_repo)
+                or _high_critical_path_reason(path)
+            )
             if reason is not None:
                 high_critical_reasons.append(reason)
     if isinstance(self_review, dict):
@@ -1255,6 +1279,8 @@ def classify_complexity(
             high_critical_reasons.append("many material findings after first review")
 
     high_critical_reasons = list(dict.fromkeys(high_critical_reasons))
+    if high_critical_reasons:
+        very_small_uncomplicated = False
     large_documentation_change = docs_only and (changed_files > 15 or changed_lines > 500)
     if high_critical_reasons:
         review_tier = "high_critical"
