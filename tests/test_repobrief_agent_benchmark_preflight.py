@@ -3618,8 +3618,20 @@ class CodexSameUnitPairContractTests(unittest.TestCase):
                 codex_preflight,
                 "_validated_condition_receipt",
                 side_effect=[
-                    {"receipt_sha256": "1" * 64, "observed_cost_usd": "0.10"},
-                    {"receipt_sha256": "2" * 64, "observed_cost_usd": "0.20"},
+                    {
+                        "receipt_sha256": "1" * 64,
+                        "observed_cost_usd": None,
+                        "observed_cost_status": "not-reported-by-codex-subscription-stream",
+                        "input_tokens": 100,
+                        "output_tokens": 10,
+                    },
+                    {
+                        "receipt_sha256": "2" * 64,
+                        "observed_cost_usd": None,
+                        "observed_cost_status": "not-reported-by-codex-subscription-stream",
+                        "input_tokens": 120,
+                        "output_tokens": 15,
+                    },
                 ],
             ) as validated,
             mock.patch.object(
@@ -3642,7 +3654,9 @@ class CodexSameUnitPairContractTests(unittest.TestCase):
         self.assertEqual(result["status"], "valid")
         self.assertEqual(result["request_sha256"], bindings)
         self.assertEqual(set(result["runs"]), {"baseline", "treatment"})
-        self.assertEqual(result["cost"]["total_observed_usd"], "0.30")
+        self.assertIsNone(result["cost"]["total_observed_usd"])
+        self.assertEqual(result["tokens"]["input_tokens"], 220)
+        self.assertEqual(result["tokens"]["output_tokens"], 25)
         self.assertEqual(validated.call_count, 2)
         ledger.assert_called_once()
         persisted.assert_called_once()
@@ -3741,7 +3755,10 @@ class CodexSameUnitPairContractTests(unittest.TestCase):
                 codex_preflight,
                 "_validated_condition_receipt",
                 return_value={
-                    "observed_cost_usd": "0.10",
+                    "observed_cost_usd": None,
+                    "observed_cost_status": "not-reported-by-codex-subscription-stream",
+                    "input_tokens": 100,
+                    "output_tokens": 25,
                     "receipt_sha256": "a" * 64,
                 },
             ) as validated,
@@ -3803,6 +3820,11 @@ class CodexSameUnitPairContractTests(unittest.TestCase):
             "exit_code": 0,
             "error": None,
             "tool_calls": [],
+            "provider": {
+                "input_tokens": 125,
+                "output_tokens": 12,
+                "token_source": "provider_reported",
+            },
         }
         with (
             mock.patch.object(codex_preflight, "_persist_pair_artifact") as persist,
@@ -3830,7 +3852,9 @@ class CodexSameUnitPairContractTests(unittest.TestCase):
                 transcript_root=Path("/private/transcripts"),
                 validator_command=["/trusted/validator"],
             )
-        self.assertEqual(result["observed_cost_usd"], "0.25")
+        self.assertIsNone(result["observed_cost_usd"])
+        self.assertEqual(result["input_tokens"], 125)
+        self.assertEqual(result["output_tokens"], 12)
         self.assertEqual(
             result["receipt_sha256"], codex_preflight.core._sha256_json(receipt)
         )
@@ -3839,9 +3863,68 @@ class CodexSameUnitPairContractTests(unittest.TestCase):
             validator.call_args.kwargs["request_path"],
             Path("/frozen/requests/baseline.json"),
         )
-        self.assertEqual(cost.call_count, 1)
+        cost.assert_not_called()
         persist.assert_called_once()
         self.assertEqual(persist.call_args.kwargs, {})
+
+    def test_codex_subscription_receipt_rejects_missing_tokens_and_claimed_usd(
+        self,
+    ) -> None:
+        request = {"condition": "baseline", "request_id": "subscription-negative"}
+        base_receipt = {
+            "kind": codex_runner.base.RECEIPT_KIND,
+            "status": "success",
+            "request_id": request["request_id"],
+            "request_sha256": codex_preflight.core._sha256_json(request),
+            "exit_code": 0,
+            "error": None,
+            "tool_calls": [],
+            "provider": {
+                "input_tokens": 125,
+                "output_tokens": 12,
+                "token_source": "provider_reported",
+            },
+        }
+        invalid = (
+            ("missing", {"input_tokens": None}, "token evidence is invalid"),
+            ("boolean", {"input_tokens": True}, "token evidence is invalid"),
+            ("negative", {"output_tokens": -1}, "token evidence is invalid"),
+            ("fraction", {"output_tokens": 1.5}, "token evidence is invalid"),
+            ("untrusted", {"token_source": "estimated"}, "not provider-reported"),
+            ("dollars", {"total_cost_usd": "0.01"}, "USD cost conflicts"),
+        )
+        with (
+            mock.patch.object(codex_preflight, "_persist_pair_artifact") as persist,
+            mock.patch.object(
+                codex_preflight.core,
+                "_request_path",
+                return_value=Path("/frozen/requests/baseline.json"),
+            ),
+            mock.patch.object(
+                codex_preflight.core,
+                "_validate_receipt_external",
+                return_value={"status": "valid", "contract": "bound"},
+            ) as validator,
+        ):
+            for name, fields, error in invalid:
+                with self.subTest(name=name):
+                    receipt = {
+                        **base_receipt,
+                        "provider": {**base_receipt["provider"], **fields},
+                    }
+                    with self.assertRaisesRegex(
+                        codex_preflight.core.PreflightError, error
+                    ):
+                        codex_preflight._validated_condition_receipt(
+                            request=request,
+                            receipt=receipt,
+                            request_root=Path("/frozen/requests"),
+                            evidence_root=Path("/private/evidence"),
+                            transcript_root=Path("/private/transcripts"),
+                            validator_command=["/trusted/validator"],
+                        )
+        self.assertEqual(persist.call_count, len(invalid))
+        self.assertEqual(validator.call_count, len(invalid))
 
     def test_untrusted_or_incomplete_receipt_never_reaches_validator(self) -> None:
         request = {"condition": "baseline", "request_id": "incomplete"}
@@ -4044,11 +4127,12 @@ class CodexSameUnitPairContractTests(unittest.TestCase):
             mock.patch.object(codex_preflight, "_persist_pair_artifact") as persist,
         ):
             with self.assertRaisesRegex(
-                codex_preflight.core.PreflightError, "exceeds authorized budget"
+                codex_preflight.core.PreflightError,
+                "subscription cost evidence is invalid",
             ):
                 codex_preflight.execute_authorized_pair(**self._kwargs())
-            # Pair ceiling is 1.00 USD total: first condition already
-            # exceeded it, so the second must never start.
+            # The subscription stream cannot assert fabricated USD totals.
+            # Reject before the second condition starts.
             self.assertEqual(run.call_count, 1)
             ledger.assert_not_called()
             ledger_terminal.assert_called_once()
@@ -4088,7 +4172,13 @@ class CodexSameUnitPairContractTests(unittest.TestCase):
                 codex_preflight,
                 "_validated_condition_receipt",
                 side_effect=[
-                    {"receipt_sha256": "a" * 64, "observed_cost_usd": "0.75"},
+                    {
+                        "receipt_sha256": "a" * 64,
+                        "observed_cost_usd": None,
+                        "observed_cost_status": "not-reported-by-codex-subscription-stream",
+                        "input_tokens": 120,
+                        "output_tokens": 15,
+                    },
                     {"receipt_sha256": "b" * 64, "observed_cost_usd": "0.40"},
                 ],
             ),
@@ -4101,11 +4191,12 @@ class CodexSameUnitPairContractTests(unittest.TestCase):
             mock.patch.object(codex_preflight, "_persist_pair_artifact") as persist,
         ):
             with self.assertRaisesRegex(
-                codex_preflight.core.PreflightError, "exceeds authorized budget"
+                codex_preflight.core.PreflightError,
+                "subscription cost evidence is invalid",
             ):
                 codex_preflight.execute_authorized_pair(**self._kwargs())
-            # Both conditions are individually within the ceiling,
-            # but together 0.75 + 0.40 exceeds the single pair grant.
+            # The second receipt invents USD, so final pair QC must fail
+            # without claiming subscription spending evidence.
             self.assertEqual(run.call_count, 2)
             ledger.assert_not_called()
             ledger_terminal.assert_called_once()
