@@ -1122,16 +1122,25 @@ def _local_recovery_snapshot_metadata(
     expected_paths = {
         str(operator.HOME / "repos"),
         str(operator.HOME / "artifacts/merges"),
-        str(operator.HOME / ".local/share/schauwerk/fundus"),
         str(operator.HOME / ".local/state/heim-pc-priorities/backup-sentinel.txt"),
     }
-    if not expected_paths.issubset(set(paths)):
+    # Earlier snapshots store Fundus at its original path. The private
+    # staged-source release stores the identical relative file inventory at
+    # a fixed path to prevent Restic symlink races and retention-group drift.
+    allowed_fundus_sources = {
+        str(operator.HOME / ".local/share/schauwerk/fundus"),
+        str(operator.HOME / ".local/state/heim-pc-priorities/.fundus-restic-source"),
+    }
+    matching_sources = allowed_fundus_sources.intersection(paths)
+    if not expected_paths.issubset(set(paths)) or len(matching_sources) != 1:
         raise RuntimeError("local recovery snapshot source contract mismatch")
+    fundus_source_path = next(iter(matching_sources))
     return {
         "snapshot_id": snapshot_id,
         "hostname": "heim-pc",
         "tags": sorted(tags),
         "paths": sorted(paths),
+        "fundus_source_path": fundus_source_path,
         "time": snapshot_time,
         "time_unix": snapshot_time_unix,
     }
@@ -1284,8 +1293,13 @@ def _local_recovery_restore_probe(
     restic_env: dict[str, str],
     durability: dict[str, Any],
     log_path: Path,
+    snapshot_fundus_source: str | None = None,
 ) -> dict[str, Any]:
-    fundus = operator.HOME / ".local/share/schauwerk/fundus"
+    legacy = str(operator.HOME / ".local/share/schauwerk/fundus")
+    staged = str(operator.HOME / ".local/state/heim-pc-priorities/.fundus-restic-source")
+    fundus_source = snapshot_fundus_source or legacy
+    if fundus_source not in {legacy, staged}:
+        raise RuntimeError("local recovery snapshot Fundus source is unsafe")
     with tempfile.TemporaryDirectory(prefix="grabowski-local-recovery-") as raw:
         target = Path(raw)
         _run_logged(
@@ -1298,14 +1312,14 @@ def _local_recovery_restore_probe(
                 "--target",
                 str(target),
                 "--include",
-                str(fundus),
+                fundus_source,
                 "--verify",
             ],
             env=restic_env,
             log=log_path,
             timeout_seconds=SERVER_RECOVERY_TIMEOUT_SECONDS,
         )
-        restored_fundus = target / str(fundus).lstrip("/")
+        restored_fundus = target / fundus_source.lstrip("/")
         inventory = _local_recovery_inventory(restored_fundus)
     if inventory["inventory_sha256"] != durability["inventory_sha256"]:
         raise RuntimeError("local recovery restored Fundus inventory digest mismatch")
@@ -1346,6 +1360,7 @@ def _local_recovery_probe_locked(target_info: dict[str, Any]) -> dict[str, Any]:
         restic_env=restic_env,
         durability=durability,
         log_path=log_path,
+        snapshot_fundus_source=snapshot.get("fundus_source_path"),
     )
     _run_logged(
         [
