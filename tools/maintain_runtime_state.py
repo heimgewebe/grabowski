@@ -1992,7 +1992,9 @@ def _prepare_worker_resets(
         if current != prior:
             raise RuntimeError(f"worker reset evidence drifted before apply: {unit}")
 
-def _prepare_archives(plan: dict[str, Any]) -> tuple[Path, Path, Path, list[dict[str, Any]]]:
+def _prepare_archives(
+    plan: dict[str, Any],
+) -> tuple[Path, Path, Path, list[dict[str, Any]], tuple[int, int]]:
     jobs_root = _private_directory(Path(plan["jobs_root"]))
     archive_root = _private_directory(Path(plan["archive_root"]), create=True)
     receipt_root = _private_directory(Path(plan["receipt_root"]), create=True)
@@ -2090,7 +2092,7 @@ def _prepare_archives(plan: dict[str, Any]) -> tuple[Path, Path, Path, list[dict
     for item in prepared:
         item["jobs_root_identity"] = jobs_identity
         item["archive_root_identity"] = archive_identity
-    return jobs_root, archive_root, receipt_root, prepared
+    return jobs_root, archive_root, receipt_root, prepared, jobs_identity
 
 
 def _append_audit_record(record: dict[str, Any]) -> dict[str, Any]:
@@ -2644,7 +2646,10 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
     import grabowski_self_deploy as self_deploy
 
     with self_deploy._deploy_schedule_lock():
-        jobs_root, archive_root, receipt_root, prepared = _prepare_archives(plan)
+        (
+            jobs_root, archive_root, receipt_root, prepared,
+            prepared_jobs_root_identity,
+        ) = _prepare_archives(plan)
         _prepare_worker_resets(plan)
         receipt_target, attempt, previous_receipt_sha256 = _select_receipt_target(
             receipt_root, plan_sha256=plan["plan_sha256"]
@@ -2658,18 +2663,14 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
         archived: list[dict[str, Any]] = []
         index_root_fd = _archive_open_private_root(jobs_root)
         try:
-            if prepared:
-                # The index reader's FD must be the SAME jobs-root inode
-                # authenticated while preparing the archive sources. A
-                # private-directory swap can otherwise inject an index even
-                # though every individual FD/path consistency check passes.
-                root_stat = os.fstat(index_root_fd)
-                if (root_stat.st_dev, root_stat.st_ino) != prepared[0][
-                    "jobs_root_identity"
-                ]:
-                    raise RuntimeError(
-                        "jobs root identity changed before index read"
-                    )
+            # Preparation pins the jobs root even for reset-only plans with no
+            # archive candidates. Never derive root authority from a later,
+            # attacker-substituted index FD.
+            root_stat = os.fstat(index_root_fd)
+            if (root_stat.st_dev, root_stat.st_ino) != prepared_jobs_root_identity:
+                raise RuntimeError(
+                    "jobs root identity changed before index read"
+                )
             index = _archive_read_deploy_index_pinned(
                 jobs_root, index_root_fd, self_deploy
             )

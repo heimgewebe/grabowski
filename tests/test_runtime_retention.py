@@ -953,7 +953,7 @@ class RuntimeRetentionTests(unittest.TestCase):
                     unit_states=states,
                 )
                 with patch.object(RETENTION, "_systemd_unit_states", return_value=states):
-                    _, _, _, prepared = RETENTION._prepare_archives(plan)
+                    _, _, _, prepared, _ = RETENTION._prepare_archives(plan)
             self.assertEqual([item["unit"] for item in plan["archive_jobs"]], [good_unit])
             self.assertEqual([item["record"]["unit"] for item in prepared], [good_unit])
             self.assertNotIn(bad_unit, plan["reset_failed_units"])
@@ -1086,7 +1086,7 @@ class RuntimeRetentionTests(unittest.TestCase):
                             unit_states=states,
                         )
                         with patch.object(RETENTION, "_systemd_unit_states", return_value=states):
-                            _, _, _, prepared = RETENTION._prepare_archives(plan)
+                            _, _, _, prepared, _ = RETENTION._prepare_archives(plan)
 
                     blocked_reasons = [
                         item["reason"] for item in plan["blocked"]
@@ -1246,7 +1246,7 @@ class RuntimeRetentionTests(unittest.TestCase):
                     unit_states=states,
                 )
                 with patch.object(RETENTION, "_systemd_unit_states", return_value=states):
-                    _, _, _, prepared = RETENTION._prepare_archives(plan)
+                    _, _, _, prepared, _ = RETENTION._prepare_archives(plan)
             self.assertEqual(
                 [item["unit"] for item in plan["archive_jobs"]],
                 [retry_unit, good_unit],
@@ -1307,7 +1307,7 @@ class RuntimeRetentionTests(unittest.TestCase):
                     blocked = [item for item in plan["blocked"] if item["unit"] == bad_unit]
                     self.assertEqual(len(blocked), 1)
                     with patch.object(RETENTION, "_systemd_unit_states", return_value=states):
-                        _, _, _, prepared = RETENTION._prepare_archives(plan)
+                        _, _, _, prepared, _ = RETENTION._prepare_archives(plan)
                     self.assertEqual(
                         [item["record"]["unit"] for item in prepared], [good_unit]
                     )
@@ -3614,6 +3614,99 @@ class RuntimeRetentionTests(unittest.TestCase):
             self.assertEqual(unsafe_path_reads, [])
             self.assertEqual(json.loads(index.read_text())["units"], [])
             self.assertTrue((archive / name / "archive-manifest.json").is_file())
+
+    def test_reset_only_index_read_rejects_foreign_jobs_root(self) -> None:
+        # Codex P1: when no archive candidates exist, the reset-only path
+        # must still bind the first index FD to the jobs-root inode pinned
+        # during _prepare_archives. The attacker can provide a fully private
+        # fake root with valid metadata/index while the canonical index now
+        # protects this young failed job with a pending reservation.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs, archive, receipts = root / "jobs", root / "archive", root / "receipts"
+            name = "grabowski-job-626262626262"
+            unit = name + ".service"
+            observed_now = int(RETENTION.time.time())
+            self._job(jobs, name, observed_now - 400)
+            free_index = {
+                "schema_version": 1, "units": [name],
+                "pending_unit": None, "updated_at_unix": observed_now - 500,
+            }
+            index_path = jobs / "runtime-deploy-index.json"
+            index_path.write_text(json.dumps(free_index) + "\n")
+            index_path.chmod(0o600)
+            plan = RETENTION.build_plan(
+                minimum_job_age_seconds=500, now=observed_now,
+                jobs_root=jobs, archive_root=archive, receipt_root=receipts,
+                task_db=root / "missing.sqlite3", failed_units=[unit],
+                unit_states={unit: self._state(unit)},
+            )
+            self.assertEqual(plan["archive_jobs"], [])
+            self.assertEqual(plan["reset_failed_units"], [unit])
+            protected_index = {**free_index, "pending_unit": name}
+            index_path.write_text(json.dumps(protected_index) + "\n")
+            index_path.chmod(0o600)
+
+            foreign = root / "foreign-jobs"
+            self._job(foreign, name, observed_now - 400)
+            foreign_index_path = foreign / "runtime-deploy-index.json"
+            foreign_index_path.write_text(json.dumps(free_index) + "\n")
+            foreign_index_path.chmod(0o600)
+            hidden = root / "original-jobs"
+            real_prepare = RETENTION._prepare_archives
+            real_open = RETENTION._archive_open_private_root
+            armed, swapped = [False], [False]
+
+            def prepare_then_arm(actual_plan):
+                prepared = real_prepare(actual_plan)
+                armed[0] = True
+                return prepared
+
+            def foreign_root_only_for_index(path):
+                if path == jobs and armed[0] and not swapped[0]:
+                    jobs.rename(hidden)
+                    foreign.rename(jobs)
+                    swapped[0] = True
+                return real_open(path)
+
+            fake_deploy = types.ModuleType("grabowski_self_deploy")
+            fake_deploy.DEPLOY_INDEX_FILENAME = "runtime-deploy-index.json"
+            fake_deploy._deploy_schedule_lock = lambda: nullcontext()
+            fake_base = types.ModuleType("grabowski_mcp")
+            fake_base._append_audit = Mock()
+            fake_base._require_mutations_enabled = Mock()
+            fake_base._require_capability = Mock()
+            reset = Mock(return_value=Mock(returncode=0, stderr=""))
+            try:
+                with patch.dict("sys.modules", {
+                    "grabowski_self_deploy": fake_deploy,
+                    "grabowski_mcp": fake_base,
+                }), patch.object(
+                    RETENTION, "_prepare_archives", side_effect=prepare_then_arm
+                ), patch.object(
+                    RETENTION, "_archive_open_private_root",
+                    side_effect=foreign_root_only_for_index,
+                ), patch.object(
+                    RETENTION, "_run", reset,
+                ), patch.object(
+                    RETENTION, "_systemd_unit_states",
+                    return_value={unit: self._state(unit)},
+                ):
+                    with self.assertRaisesRegex(
+                        RuntimeError, "jobs root identity changed before index read"
+                    ):
+                        RETENTION.apply_plan(
+                            plan, expected_plan_sha256=plan["plan_sha256"]
+                        )
+            finally:
+                if swapped[0]:
+                    jobs.rename(foreign)
+                    hidden.rename(jobs)
+            self.assertTrue(swapped[0])
+            self.assertEqual(json.loads(index_path.read_text()), protected_index)
+            self.assertTrue((jobs / name / "metadata.json").is_file())
+            self.assertFalse((archive / name).exists())
+            reset.assert_not_called()
 
     def test_archive_index_prepared_root_replacement_cannot_spoof_fd_read(self) -> None:
         # A foreign owner-private jobs directory supplies a syntactically
