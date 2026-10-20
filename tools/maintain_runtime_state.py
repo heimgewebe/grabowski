@@ -256,6 +256,72 @@ def _archive_open_private_root(directory: Path) -> int:
     return fd
 
 
+def _archive_open_child_root(parent_fd: int, name: str, path: Path) -> int:
+    """Open a private directory through the held parent, never by path."""
+    if not name or "/" in name or name in {".", ".."}:
+        raise RuntimeError("private child root has invalid basename")
+    descriptor = os.open(
+        name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        dir_fd=parent_fd,
+    )
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or stat.S_IMODE(metadata.st_mode) & 0o077
+    ):
+        os.close(descriptor)
+        raise RuntimeError(f"private child root is not owner-controlled: {path}")
+    return descriptor
+
+
+def _archive_require_child_bound(
+    parent_fd: int, name: str, child_fd: int, path: Path
+) -> None:
+    """A final-component rename must not silently retarget our FD."""
+    expected = os.fstat(child_fd)
+    try:
+        observed = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise RuntimeError(f"private child disappeared: {path}") from exc
+    if (
+        not stat.S_ISDIR(observed.st_mode)
+        or (observed.st_dev, observed.st_ino)
+        != (expected.st_dev, expected.st_ino)
+    ):
+        raise RuntimeError(f"private child root changed: {path}")
+
+
+def _pinned_output_root_fd(plan: "_PinnedRetentionPlan", kind: str) -> int:
+    """Pin archive/receipt root before first use; never adopt a new pathname."""
+    if kind not in {"archive", "receipt"}:
+        raise RuntimeError("invalid retention output root type")
+    root = Path(plan[f"{kind}_root"])
+    parent_fd = getattr(plan, f"{kind}_parent_fd")
+    _archive_require_unchanged_root(root.parent, parent_fd)
+    descriptor = getattr(plan, f"{kind}_fd")
+    if descriptor < 0:
+        # A foreign directory appearing since planning cannot acquire custody.
+        try:
+            os.mkdir(root.name, mode=0o700, dir_fd=parent_fd)
+        except FileExistsError as exc:
+            raise RuntimeError(
+                f"{kind} root appeared since planning; explicit retry required"
+            ) from exc
+        descriptor = _archive_open_child_root(parent_fd, root.name, root)
+        setattr(plan, f"{kind}_fd", descriptor)
+    _archive_require_child_bound(parent_fd, root.name, descriptor, root)
+    return descriptor
+
+
+def _archive_root_fd_for_plan(plan: "_PinnedRetentionPlan") -> int:
+    return _pinned_output_root_fd(plan, "archive")
+
+
+def _receipt_root_fd_for_plan(plan: "_PinnedRetentionPlan") -> int:
+    return _pinned_output_root_fd(plan, "receipt")
+
+
 def _archive_require_unchanged_root(directory: Path, fd: int) -> None:
     """Reject an archive root renamed or replaced during a pinned read."""
     expected = os.fstat(fd)
@@ -328,9 +394,15 @@ def _archive_private_file_digest(
         os.close(fd)
 
 
-def _archive_file_shape_preflight(directory: Path) -> None:
-    """Classify unsafe archive shapes by pinned fd without content hashing."""
-    fd = _archive_open_private_root(directory)
+def _archive_file_shape_preflight(
+    directory: Path, *, jobs_root_fd: int | None = None
+) -> None:
+    """Classify unsafe archive shapes under the originally pinned jobs root."""
+    fd = (
+        _archive_open_child_root(jobs_root_fd, directory.name, directory)
+        if jobs_root_fd is not None
+        else _archive_open_private_root(directory)
+    )
     try:
         files = 0
         for path in _archive_bounded_entries(directory, fd):
@@ -350,7 +422,12 @@ def _archive_file_shape_preflight(directory: Path) -> None:
                 raise RuntimeError(
                     f"file must be one bounded private owner-controlled regular file: {path}"
                 )
-        _archive_require_unchanged_root(directory, fd)
+        if jobs_root_fd is not None:
+            _archive_require_child_bound(
+                jobs_root_fd, directory.name, fd, directory
+            )
+        else:
+            _archive_require_unchanged_root(directory, fd)
     finally:
         os.close(fd)
 
@@ -949,12 +1026,31 @@ def _job_record(
     now: int,
     minimum_age_seconds: int,
     systemd_state: dict[str, str],
+    jobs_root_fd: int | None = None,
 ) -> dict[str, Any]:
     job_name = unit.removesuffix(".service")
-    directory = _private_directory(jobs_root / job_name)
-    if directory.parent != jobs_root:
-        raise RuntimeError(f"job directory escaped jobs root: {job_name}")
-    metadata, metadata_sha256 = _read_json_file(directory / "metadata.json")
+    directory = jobs_root / job_name
+    if jobs_root_fd is None:
+        directory = _private_directory(directory)
+        if directory.parent != jobs_root:
+            raise RuntimeError(f"job directory escaped jobs root: {job_name}")
+        metadata, metadata_sha256 = _read_json_file(directory / "metadata.json")
+    else:
+        directory_fd = _archive_open_child_root(jobs_root_fd, job_name, directory)
+        try:
+            raw, preimage = _archive_pinned_json_preimage(directory_fd, "metadata.json")
+            try:
+                metadata = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise RuntimeError(f"invalid JSON file: {directory / 'metadata.json'}") from exc
+            if not isinstance(metadata, dict):
+                raise RuntimeError(f"JSON file is not an object: {directory / 'metadata.json'}")
+            metadata_sha256 = preimage[-1]
+            _archive_require_child_bound(
+                jobs_root_fd, job_name, directory_fd, directory
+            )
+        finally:
+            os.close(directory_fd)
     if metadata.get("unit") != job_name:
         raise RuntimeError(f"job metadata is not bound to its unit: {job_name}")
     created = metadata.get("created_at_unix")
@@ -1076,6 +1172,38 @@ def _archived_job_receipt(
     }
 
 
+class _PinnedRetentionPlan(dict):
+    """A plan with in-process root custody; JSON rehydration never grants it.
+
+    This closes only descriptors owned by this plan, not externally supplied
+    descriptors. A copied/rehashed plain dictionary deliberately loses custody.
+    """
+
+    jobs_fd: int = -1
+    archive_fd: int = -1
+    archive_parent_fd: int = -1
+    receipt_fd: int = -1
+    receipt_parent_fd: int = -1
+    authorized_sha256: str | None = None
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> dict[str, Any]:
+        from copy import deepcopy
+        return deepcopy(dict(self), memo)
+
+    def __del__(self) -> None:
+        for field in (
+            "jobs_fd", "archive_fd", "archive_parent_fd",
+            "receipt_fd", "receipt_parent_fd",
+        ):
+            descriptor = getattr(self, field, -1)
+            if isinstance(descriptor, int) and descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+                setattr(self, field, -1)
+
+
 def build_plan(
     *,
     minimum_job_age_seconds: int = 86_400,
@@ -1102,42 +1230,69 @@ def build_plan(
         raise ValueError(
             f"max_archive_jobs must be between 1 and {MAX_ARCHIVE_JOBS_PER_PLAN}"
         )
+    # Keep the authentic file descriptors with the plan object until apply.
+    # The serializable plan SHA is drift detection, never root authority.
+    pinned = _PinnedRetentionPlan()
+    pinned.jobs_fd = _archive_open_private_root(jobs_root)
+    root_stat = os.fstat(pinned.jobs_fd)
+    planned_jobs_root_identity = (root_stat.st_dev, root_stat.st_ino)
     jobs_root = _private_directory(jobs_root)
-    # Bind this plan to the canonical root before enumerating job entries.
-    jobs_pin_fd = _archive_open_private_root(jobs_root)
-    try:
-        root_stat = os.fstat(jobs_pin_fd)
-        planned_jobs_root_identity = (root_stat.st_dev, root_stat.st_ino)
-        _archive_require_unchanged_root(jobs_root, jobs_pin_fd)
-    finally:
-        os.close(jobs_pin_fd)
+    _archive_require_unchanged_root(jobs_root, pinned.jobs_fd)
     if archive_root.is_symlink() or receipt_root.is_symlink():
         raise RuntimeError("retention output roots may not be symlinks")
+    pinned.archive_parent_fd = _archive_open_private_root(archive_root.parent)
+    _archive_require_unchanged_root(archive_root.parent, pinned.archive_parent_fd)
+    try:
+        pinned.archive_fd = os.open(
+            archive_root.name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=pinned.archive_parent_fd,
+        )
+    except FileNotFoundError:
+        pinned.archive_fd = -1
+    else:
+        archive_stat = os.fstat(pinned.archive_fd)
+        if (
+            not stat.S_ISDIR(archive_stat.st_mode)
+            or archive_stat.st_uid != os.getuid()
+            or stat.S_IMODE(archive_stat.st_mode) & 0o077
+        ):
+            raise RuntimeError("retention archive root is not private")
+        _archive_require_unchanged_root(archive_root, pinned.archive_fd)
+    pinned.receipt_parent_fd = _archive_open_private_root(receipt_root.parent)
+    _archive_require_unchanged_root(receipt_root.parent, pinned.receipt_parent_fd)
+    try:
+        pinned.receipt_fd = _archive_open_child_root(
+            pinned.receipt_parent_fd, receipt_root.name, receipt_root
+        )
+    except FileNotFoundError:
+        pinned.receipt_fd = -1
+    else:
+        _archive_require_unchanged_root(receipt_root, pinned.receipt_fd)
     observed_now = int(time.time()) if now is None else now
     failed = _failed_units() if failed_units is None else sorted(set(failed_units))
     if len(failed) > MAX_FAILED_UNITS:
         raise RuntimeError("failed-unit inventory exceeds the bounded scan")
 
     registry_entries: list[Path] = []
-    for discovered_count, entry in enumerate(jobs_root.iterdir(), start=1):
-        if discovered_count > MAX_JOB_REGISTRY_ENTRIES:
-            raise RuntimeError("job registry exceeds the bounded discovery limit")
-        if entry.name.startswith("grabowski-job-"):
-            registry_entries.append(entry)
+    with os.scandir(pinned.jobs_fd) as scan:
+        for discovered_count, child in enumerate(scan, start=1):
+            if discovered_count > MAX_JOB_REGISTRY_ENTRIES:
+                raise RuntimeError("job registry exceeds the bounded discovery limit")
+            if child.name.startswith("grabowski-job-"):
+                registry_entries.append(jobs_root / child.name)
     registry_entries.sort(key=lambda entry: entry.name)
     # A missing index is not positive evidence that no deployment is active.
     # Keep archive and job-reset actions out of the plan until the deployment
     # owner has recovered its canonical registry; other independent classes
     # of maintenance may continue without producing partial receipt storms.
-    index_fd = _archive_open_private_root(jobs_root)
-    try:
-        index_root_stat = os.fstat(index_fd)
-        if (index_root_stat.st_dev, index_root_stat.st_ino) != planned_jobs_root_identity:
-            raise RuntimeError("jobs root identity changed before plan index read")
-        deploy_index = _archive_read_deploy_index_pinned(jobs_root, index_fd, None)
-        _archive_require_unchanged_root(jobs_root, index_fd)
-    finally:
-        os.close(index_fd)
+    index_root_stat = os.fstat(pinned.jobs_fd)
+    if (index_root_stat.st_dev, index_root_stat.st_ino) != planned_jobs_root_identity:
+        raise RuntimeError("jobs root identity changed before plan index read")
+    deploy_index = _archive_read_deploy_index_pinned(
+        jobs_root, pinned.jobs_fd, None
+    )
+    _archive_require_unchanged_root(jobs_root, pinned.jobs_fd)
     missing_deploy_index = deploy_index is None
     pending_deploy_job = (
         deploy_index["pending_unit"] if deploy_index is not None else None
@@ -1183,7 +1338,14 @@ def build_plan(
             block(entry.name, "legacy job registry name is outside the typed contract")
             continue
         unit = entry.name + ".service"
-        if entry.is_symlink() or not entry.is_dir():
+        try:
+            entry_stat = os.stat(
+                entry.name, dir_fd=pinned.jobs_fd, follow_symlinks=False
+            )
+        except OSError:
+            block(unit, "job registry entry is missing from the pinned root")
+            continue
+        if not stat.S_ISDIR(entry_stat.st_mode):
             block(unit, "job registry entry is not a real directory")
             continue
         try:
@@ -1193,6 +1355,7 @@ def build_plan(
                 now=observed_now,
                 minimum_age_seconds=minimum_job_age_seconds,
                 systemd_state=states[unit],
+                jobs_root_fd=pinned.jobs_fd,
             )
         except RuntimeError as exc:
             block(unit, str(exc))
@@ -1230,19 +1393,33 @@ def build_plan(
             block(record["unit"], "indexed deployment requires manual archival recovery")
             continue
         destination = archive_root / record["job_name"]
-        if destination.exists() or destination.is_symlink():
-            archive_blocked_units.add(record["unit"])
-            block(record["unit"], "archive destination already exists")
-            continue
+        if pinned.archive_fd >= 0:
+            try:
+                os.stat(
+                    record["job_name"], dir_fd=pinned.archive_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                pass
+            else:
+                archive_blocked_units.add(record["unit"])
+                block(record["unit"], "archive destination already exists")
+                continue
         try:
             source_dir = jobs_root / record["job_name"]
-            _archive_file_shape_preflight(source_dir)
+            _archive_file_shape_preflight(
+                source_dir, jobs_root_fd=pinned.jobs_fd
+            )
             # The future archive-manifest publication must be possible for
             # this source. A blocked job must not starve the whole batch.
-            source_fd = _archive_open_private_root(source_dir)
+            source_fd = _archive_open_child_root(
+                pinned.jobs_fd, source_dir.name, source_dir
+            )
             try:
                 _archive_require_json_temp_capacity(source_fd)
-                _archive_require_unchanged_root(source_dir, source_fd)
+                _archive_require_child_bound(
+                    pinned.jobs_fd, source_dir.name, source_fd, source_dir
+                )
             finally:
                 os.close(source_fd)
         except (RuntimeError, OSError) as exc:
@@ -1374,7 +1551,9 @@ def build_plan(
         "archive_jobs": archive_jobs,
         "blocked": sorted(blocked, key=lambda item: (item["unit"], item["reason"])),
     }
-    return {**material, "plan_sha256": _sha256(material)}
+    pinned.update({**material, "plan_sha256": _sha256(material)})
+    pinned.authorized_sha256 = pinned["plan_sha256"]
+    return pinned
 
 
 def _archive_file_manifest_on_fd(directory: Path, fd: int) -> list[dict[str, Any]]:
@@ -1501,11 +1680,19 @@ def _archive_move_job_pinned(
     jobs_root_identity: tuple[int, int],
     archive_root_identity: tuple[int, int],
     expected_files: list[dict[str, Any]],
+    jobs_root_fd: int | None = None,
+    archive_root_fd: int | None = None,
 ) -> None:
     """Verify the inode before moving; no overwrite, quarantine wrong children."""
-    jobs_fd = _archive_open_private_root(source.parent)
+    jobs_fd = (
+        os.dup(jobs_root_fd) if jobs_root_fd is not None
+        else _archive_open_private_root(source.parent)
+    )
     try:
-        archive_fd = _archive_open_private_root(destination.parent)
+        archive_fd = (
+            os.dup(archive_root_fd) if archive_root_fd is not None
+            else _archive_open_private_root(destination.parent)
+        )
         try:
             for directory, fd, identity in (
                 (source.parent, jobs_fd, jobs_root_identity),
@@ -1515,7 +1702,8 @@ def _archive_move_job_pinned(
                 if (metadata.st_dev, metadata.st_ino) != identity:
                     raise RuntimeError(f"archive root identity changed: {directory}")
                 _archive_require_unchanged_root(directory, fd)
-            _archive_require_pinned_identity(source, source_identity)
+            if jobs_root_fd is None:
+                _archive_require_pinned_identity(source, source_identity)
             # Narrow the basename-swap window with one final openat/fstat.
             source_fd = os.open(
                 source.name,
@@ -1606,7 +1794,7 @@ def _archive_move_job_pinned(
 
 
 def _archive_pinned_json_preimage(
-    directory_fd: int, name: str
+    directory_fd: int, name: str, *, max_bytes: int = MAX_JSON_BYTES
 ) -> tuple[bytes, tuple[int, int, int, int, str]]:
     """Read private JSON bytes and their inode/digest through a pinned root."""
     descriptor = os.open(
@@ -1621,18 +1809,18 @@ def _archive_pinned_json_preimage(
             or before.st_nlink != 1
             or before.st_uid != os.getuid()
             or stat.S_IMODE(before.st_mode) & 0o077
-            or before.st_size > MAX_JSON_BYTES
+            or before.st_size > max_bytes
         ):
             raise RuntimeError("pinned JSON index must be one private regular file")
         data = bytearray()
-        while len(data) <= MAX_JSON_BYTES:
+        while len(data) <= max_bytes:
             chunk = os.read(
-                descriptor, min(64 * 1024, MAX_JSON_BYTES + 1 - len(data))
+                descriptor, min(64 * 1024, max_bytes + 1 - len(data))
             )
             if not chunk:
                 break
             data.extend(chunk)
-        if len(data) > MAX_JSON_BYTES:
+        if len(data) > max_bytes:
             raise RuntimeError("pinned JSON index exceeds its size bound")
         after = os.fstat(descriptor)
         if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
@@ -1710,17 +1898,24 @@ def _write_json_atomic(
     replace_existing: bool = False,
     expected_parent_identity: tuple[int, int] | None = None,
     expected_existing_preimage: tuple[int, int, int, int, str] | None = None,
+    pinned_parent_fd: int | None = None,
 ) -> Path:
     if path.name == "runtime-deploy-index.json":
         # Linux has no atomic rename-if-inode. An EXCHANGE followed by a
         # post-check can briefly publish a stale canonical deployment index.
         # Only the deployment owner may write this control-plane record.
         raise RuntimeError("retention may not publish deployment index")
-    parent = _private_directory(path.parent, create=True)
+    parent = (
+        path.parent if pinned_parent_fd is not None
+        else _private_directory(path.parent, create=True)
+    )
     path = parent / path.name
-    # Pin the verified parent inode for stat/open/replace/unlink/fsync. A
-    # symlink swap after private-directory validation cannot redirect writes.
-    directory_fd = _archive_open_private_root(parent)
+    # All writes and exchanges are relative to the authenticated directory FD.
+    # The caller-owned FD is duplicated so a failed write cannot close custody.
+    directory_fd = (
+        os.dup(pinned_parent_fd) if pinned_parent_fd is not None
+        else _archive_open_private_root(parent)
+    )
     temporary_name: str | None = None
     try:
         if expected_parent_identity is not None:
@@ -1901,6 +2096,16 @@ def _validated_plan(plan: dict[str, Any], expected_plan_sha256: str) -> dict[str
     material = {key: value for key, value in plan.items() if key != "plan_sha256"}
     if _sha256(material) != actual or expected_plan_sha256 != actual:
         raise RuntimeError("retention plan hash mismatch")
+    # A self-hash is drift evidence, not a credential. Detached/rehashed plans
+    # never authorize filesystem moves or systemd reset effects.
+    if (
+        not isinstance(plan, _PinnedRetentionPlan)
+        or plan.authorized_sha256 != actual
+        or plan.jobs_fd < 0
+        or plan.archive_parent_fd < 0
+        or plan.receipt_parent_fd < 0
+    ):
+        raise RuntimeError("retention plan lacks trusted in-process root custody")
     if plan.get("schema_version") != 3:
         raise RuntimeError("retention plan schema is unsupported")
     jobs_identity = plan.get("jobs_root_identity")
@@ -2016,11 +2221,20 @@ def _prepare_archives(
     plan: dict[str, Any],
     *,
     expected_archive_root_identity: tuple[int, int] | None = None,
+    jobs_root_fd: int | None = None,
+    archive_root_fd: int | None = None,
+    source_pins: ExitStack | None = None,
 ) -> tuple[Path, Path, Path, list[dict[str, Any]], tuple[int, int]]:
     # Authenticate both roots BEFORE the record/manifest preflight. The old
     # late first open allowed a foreign same-UID tree to become the authority.
     requested_jobs_root = Path(plan["jobs_root"])
-    jobs_pin_fd = _archive_open_private_root(requested_jobs_root)
+    held = isinstance(plan, _PinnedRetentionPlan)
+    own_jobs = not held and jobs_root_fd is None
+    jobs_pin_fd = (
+        jobs_root_fd if jobs_root_fd is not None
+        else plan.jobs_fd if held
+        else _archive_open_private_root(requested_jobs_root)
+    )
     try:
         start_jobs_stat = os.fstat(jobs_pin_fd)
         initial_jobs_identity = (start_jobs_stat.st_dev, start_jobs_stat.st_ino)
@@ -2029,9 +2243,15 @@ def _prepare_archives(
         jobs_root = _private_directory(requested_jobs_root)
         _archive_require_unchanged_root(jobs_root, jobs_pin_fd)
     finally:
-        os.close(jobs_pin_fd)
-    archive_root = _private_directory(Path(plan["archive_root"]), create=True)
-    archive_pin_fd = _archive_open_private_root(archive_root)
+        if own_jobs:
+            os.close(jobs_pin_fd)
+    own_archive = not held and archive_root_fd is None
+    archive_root = Path(plan["archive_root"])
+    archive_pin_fd = (
+        archive_root_fd if archive_root_fd is not None
+        else _archive_root_fd_for_plan(plan) if held
+        else _archive_open_private_root(_private_directory(archive_root, create=True))
+    )
     try:
         start_archive_stat = os.fstat(archive_pin_fd)
         initial_archive_identity = (start_archive_stat.st_dev, start_archive_stat.st_ino)
@@ -2042,8 +2262,13 @@ def _prepare_archives(
             raise RuntimeError("archive root identity changed before preparation")
         _archive_require_unchanged_root(archive_root, archive_pin_fd)
     finally:
-        os.close(archive_pin_fd)
-    receipt_root = _private_directory(Path(plan["receipt_root"]), create=True)
+        if own_archive:
+            os.close(archive_pin_fd)
+    receipt_root = Path(plan["receipt_root"])
+    if held:
+        _receipt_root_fd_for_plan(plan)
+    else:
+        receipt_root = _private_directory(receipt_root, create=True)
     archive_records = plan["archive_jobs"]
     prepared: list[dict[str, Any]] = []
     expected_keys = {
@@ -2090,27 +2315,46 @@ def _prepare_archives(
             now=int(time.time()),
             minimum_age_seconds=plan["minimum_job_age_seconds"],
             systemd_state=fresh_states[unit],
+            jobs_root_fd=jobs_pin_fd,
         )
         if not fresh_record["terminal"] or not fresh_record["archive"]:
             raise RuntimeError(f"job is no longer archive-eligible: {job_name}")
         if fresh_record["metadata_sha256"] != record["metadata_sha256"]:
             raise RuntimeError(f"job metadata drift before archive: {job_name}")
-        source_dir = _private_directory(jobs_root / job_name)
-        if source_dir.parent != jobs_root:
-            raise RuntimeError(f"archive source escaped jobs root: {job_name}")
+        source_dir = jobs_root / job_name
         destination = archive_root / job_name
-        if destination.exists() or destination.is_symlink():
-            raise RuntimeError(f"archive destination appeared before apply: {job_name}")
-        # Keep the source inode bound across the independent manifest scan.
-        # A same-UID rename or replacement must not retarget later writes.
-        source_fd = _archive_open_private_root(source_dir)
         try:
-            files = _archive_file_manifest(source_dir)
-            _archive_require_unchanged_root(source_dir, source_fd)
+            os.stat(job_name, dir_fd=archive_pin_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise RuntimeError(f"archive destination appeared before apply: {job_name}")
+        # All metadata and file hashes must come from one child of the
+        # authenticated jobs-root FD; path ABA cannot change that parent.
+        source_fd = _archive_open_child_root(
+            jobs_pin_fd, job_name, source_dir
+        )
+        if source_pins is not None:
+            source_pins.callback(os.close, source_fd)
+        try:
+            # The metadata used for terminal/age authorization must be from
+            # THIS source inode. A same-UID peer can rename the basename
+            # between the earlier record read and this source open.
+            _, metadata_digest = _archive_private_file_digest(
+                source_fd, source_dir / "metadata.json",
+                max_bytes=MAX_JSON_BYTES,
+            )
+            if metadata_digest != fresh_record["metadata_sha256"]:
+                raise RuntimeError("archive source metadata inode drift before move")
+            files = _archive_file_manifest_on_fd(source_dir, source_fd)
+            _archive_require_child_bound(
+                jobs_pin_fd, job_name, source_fd, source_dir
+            )
             source_stat = os.fstat(source_fd)
             source_identity = (source_stat.st_dev, source_stat.st_ino)
         finally:
-            os.close(source_fd)
+            if source_pins is None:
+                os.close(source_fd)
         prepared.append(
             {
                 "record": record,
@@ -2118,27 +2362,20 @@ def _prepare_archives(
                 "source_identity": source_identity,
                 "destination": destination,
                 "files": files,
+                **({"source_fd": source_fd} if source_pins is not None else {}),
             }
         )
     # Capture the two root inodes before releasing preflight. The subsequent
     # move must use verified dir_fds, never path-based source/destination roots.
-    jobs_fd = _archive_open_private_root(jobs_root)
-    try:
-        archive_fd = _archive_open_private_root(archive_root)
-        try:
-            _archive_require_unchanged_root(jobs_root, jobs_fd)
-            _archive_require_unchanged_root(archive_root, archive_fd)
-            jobs_stat, archive_stat = os.fstat(jobs_fd), os.fstat(archive_fd)
-            jobs_identity = (jobs_stat.st_dev, jobs_stat.st_ino)
-            archive_identity = (archive_stat.st_dev, archive_stat.st_ino)
-            if jobs_identity != initial_jobs_identity:
-                raise RuntimeError("jobs root identity changed during preparation")
-            if archive_identity != initial_archive_identity:
-                raise RuntimeError("archive root identity changed during preparation")
-        finally:
-            os.close(archive_fd)
-    finally:
-        os.close(jobs_fd)
+    _archive_require_unchanged_root(jobs_root, jobs_pin_fd)
+    _archive_require_unchanged_root(archive_root, archive_pin_fd)
+    jobs_stat, archive_stat = os.fstat(jobs_pin_fd), os.fstat(archive_pin_fd)
+    jobs_identity = (jobs_stat.st_dev, jobs_stat.st_ino)
+    archive_identity = (archive_stat.st_dev, archive_stat.st_ino)
+    if jobs_identity != initial_jobs_identity:
+        raise RuntimeError("jobs root identity changed during preparation")
+    if archive_identity != initial_archive_identity:
+        raise RuntimeError("archive root identity changed during preparation")
     for item in prepared:
         item["jobs_root_identity"] = jobs_identity
         item["archive_root_identity"] = archive_identity
@@ -2579,8 +2816,20 @@ def _verified_partial_receipt(
     plan_sha256: str,
     expected_attempt: int,
     expected_previous_receipt_sha256: str | None,
+    receipt_fd: int | None = None,
 ) -> str:
-    payload, _ = _read_json_file(path, max_bytes=MAX_RETENTION_RECEIPT_BYTES)
+    if receipt_fd is None:
+        payload, _ = _read_json_file(path, max_bytes=MAX_RETENTION_RECEIPT_BYTES)
+    else:
+        raw, _ = _archive_pinned_json_preimage(
+            receipt_fd, path.name, max_bytes=MAX_RETENTION_RECEIPT_BYTES
+        )
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"invalid retention receipt JSON: {path}") from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"invalid retention receipt object: {path}")
     receipt_sha256 = payload.get("receipt_sha256")
     if (
         not isinstance(receipt_sha256, str)
@@ -2616,6 +2865,7 @@ def _select_receipt_target(
     receipt_root: Path,
     *,
     plan_sha256: str,
+    receipt_fd: int | None = None,
 ) -> tuple[Path, int, str | None]:
     previous_receipt_sha256: str | None = None
     for attempt in range(1, MAX_RETENTION_RECEIPT_ATTEMPTS + 1):
@@ -2625,13 +2875,23 @@ def _select_receipt_target(
             else f"{plan_sha256}.retry-{attempt:02d}.json"
         )
         path = receipt_root / name
-        if not path.exists() and not path.is_symlink():
+        if receipt_fd is None:
+            exists = path.exists() or path.is_symlink()
+        else:
+            try:
+                os.stat(name, dir_fd=receipt_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                exists = False
+            else:
+                exists = True
+        if not exists:
             return path, attempt, previous_receipt_sha256
         previous_receipt_sha256 = _verified_partial_receipt(
             path,
             plan_sha256=plan_sha256,
             expected_attempt=attempt,
             expected_previous_receipt_sha256=previous_receipt_sha256,
+            receipt_fd=receipt_fd,
         )
     raise RuntimeError("retention receipt retry bound exhausted")
 
@@ -2698,14 +2958,14 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
     with self_deploy._deploy_schedule_lock(), ExitStack() as root_pins:
         # These descriptors stay open until all archive moves and reset
         # actions finish, so inode reuse cannot substitute a foreign root.
-        jobs_root_pin_fd = _archive_open_private_root(Path(plan["jobs_root"]))
+        jobs_root_pin_fd = os.dup(plan.jobs_fd)
         root_pins.callback(os.close, jobs_root_pin_fd)
         pinned_jobs_stat = os.fstat(jobs_root_pin_fd)
         pinned_jobs_identity = (pinned_jobs_stat.st_dev, pinned_jobs_stat.st_ino)
         if pinned_jobs_identity != tuple(plan["jobs_root_identity"]):
             raise RuntimeError("jobs root identity changed since planning")
-        archive_pin_path = _private_directory(Path(plan["archive_root"]), create=True)
-        archive_root_pin_fd = _archive_open_private_root(archive_pin_path)
+        _archive_require_unchanged_root(Path(plan["jobs_root"]), jobs_root_pin_fd)
+        archive_root_pin_fd = os.dup(_archive_root_fd_for_plan(plan))
         root_pins.callback(os.close, archive_root_pin_fd)
         pinned_archive_stat = os.fstat(archive_root_pin_fd)
         pinned_archive_identity = (pinned_archive_stat.st_dev, pinned_archive_stat.st_ino)
@@ -2714,10 +2974,15 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
             prepared_jobs_root_identity,
         ) = _prepare_archives(
             plan, expected_archive_root_identity=pinned_archive_identity,
+            jobs_root_fd=jobs_root_pin_fd, archive_root_fd=archive_root_pin_fd,
+            source_pins=root_pins,
         )
         _prepare_worker_resets(plan)
+        receipt_pin_fd = os.dup(_receipt_root_fd_for_plan(plan))
+        root_pins.callback(os.close, receipt_pin_fd)
         receipt_target, attempt, previous_receipt_sha256 = _select_receipt_target(
-            receipt_root, plan_sha256=plan["plan_sha256"]
+            receipt_root, plan_sha256=plan["plan_sha256"],
+            receipt_fd=receipt_pin_fd,
         )
         intent_audit = _append_intent_audit(
             plan,
@@ -2726,7 +2991,7 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
         )
 
         archived: list[dict[str, Any]] = []
-        index_root_fd = _archive_open_private_root(jobs_root)
+        index_root_fd = os.dup(jobs_root_pin_fd)
         try:
             # Preparation pins the jobs root even for reset-only plans with no
             # archive candidates. Never derive root authority from a later,
@@ -2778,18 +3043,18 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
         finally:
             os.close(index_root_fd)
         for item in prepared:
-            _archive_require_pinned_identity(
-                item["source_dir"], item["source_identity"]
+            source_dir = item["source_dir"]
+            # The originally authenticated source FD is kept open until
+            # apply_plan exits, preventing inode reuse after preparation.
+            source_fd = item["source_fd"]
+            _archive_require_json_temp_capacity(source_fd)
+            _archive_require_child_bound(
+                jobs_root_pin_fd, source_dir.name, source_fd, source_dir
             )
-            # The future manifest write also needs temp capacity, even when
-            # the old deployment index is never modified by retention.
-            source_fd = _archive_open_private_root(item["source_dir"])
-            try:
-                _archive_require_json_temp_capacity(source_fd)
-                _archive_require_unchanged_root(item["source_dir"], source_fd)
-            finally:
-                os.close(source_fd)
-            current_files = _archive_file_manifest(item["source_dir"])
+            metadata = os.fstat(source_fd)
+            if (metadata.st_dev, metadata.st_ino) != item["source_identity"]:
+                raise RuntimeError("source inode changed before archive")
+            current_files = _archive_file_manifest_on_fd(source_dir, source_fd)
             if current_files != item["files"]:
                 raise RuntimeError(
                     f"job files drifted before archive: {item['record']['job_name']}"
@@ -2813,7 +3078,7 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
             # before the irreversible rename. Retention does not modify the
             # deployment index; a changed identity/content or a newly
             # reserved unit therefore invalidates the entire archive plan.
-            check_fd = _archive_open_private_root(jobs_root)
+            check_fd = os.dup(jobs_root_pin_fd)
             try:
                 # The recheck must be read from the same jobs-root inode
                 # authenticated at preparation. Matching index bytes/inode
@@ -2849,18 +3114,33 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
                 jobs_root_identity=item["jobs_root_identity"],
                 archive_root_identity=item["archive_root_identity"],
                 expected_files=item["files"],
+                jobs_root_fd=jobs_root_pin_fd,
+                archive_root_fd=archive_root_pin_fd,
             )
-            # Fail closed if a peer retargets the destination after the move.
-            # No complete receipt may be published for unverified contents.
-            _archive_require_pinned_identity(
-                destination, item["source_identity"]
-            )
-            _write_json_atomic(
-                destination / "archive-manifest.json",
-                archive_manifest,
-                replace_existing=True,
-                expected_parent_identity=item["source_identity"],
-            )
+            # Manifest publication uses the moved inode under the authenticated
+            # archive root. A competing basename swap cannot redirect writes.
+            moved_fd = os.dup(item["source_fd"])
+            try:
+                _archive_require_child_bound(
+                    archive_root_pin_fd, destination.name, moved_fd, destination
+                )
+                moved_stat = os.fstat(moved_fd)
+                if (moved_stat.st_dev, moved_stat.st_ino) != item["source_identity"]:
+                    raise RuntimeError(
+                        "archive destination inode changed before manifest publication"
+                    )
+                _write_json_atomic(
+                    destination / "archive-manifest.json",
+                    archive_manifest,
+                    replace_existing=True,
+                    expected_parent_identity=item["source_identity"],
+                    pinned_parent_fd=moved_fd,
+                )
+                _archive_require_child_bound(
+                    archive_root_pin_fd, destination.name, moved_fd, destination
+                )
+            finally:
+                os.close(moved_fd)
             archived.append(
                 {
                     "unit": record["unit"],
@@ -2880,12 +3160,30 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
         reset_failures: list[dict[str, str]] = []
         for unit in plan["reset_failed_units"]:
             if JOB_UNIT.fullmatch(unit) and unit in just_archived_units:
+                # A verified archive must still be the very same source inode
+                # at its authenticated destination before the systemd effect.
+                try:
+                    item = next(
+                        item for item in prepared if item["record"]["unit"] == unit
+                    )
+                    archive_destination = item["destination"]
+                    _archive_require_child_bound(
+                        archive_root_pin_fd, archive_destination.name,
+                        item["source_fd"], archive_destination,
+                    )
+                except (RuntimeError, OSError, StopIteration) as exc:
+                    reset_failures.append(
+                        _redacted_reset_failure(
+                            unit=unit, stage="deployment_index_recovery", error=exc
+                        )
+                    )
+                    continue
                 # A same-UID peer may hide the deployment index during the
                 # first read. Even a verified move cannot justify resetting
                 # a unit whose CURRENT pinned index still lists that job.
                 root_fd = None
                 try:
-                    root_fd = _archive_open_private_root(jobs_root)
+                    root_fd = os.dup(jobs_root_pin_fd)
                     root_stat = os.fstat(root_fd)
                     if (root_stat.st_dev, root_stat.st_ino) != index_root_identity:
                         raise RuntimeError(
@@ -2923,7 +3221,9 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
                 job_dir = jobs_root / unit.removesuffix(".service")
                 try:
                     _archive_require_pinned_identity(jobs_root, index_root_identity)
-                    live_fd = _archive_open_private_root(job_dir)
+                    live_fd = _archive_open_child_root(
+                        jobs_root_pin_fd, job_dir.name, job_dir
+                    )
                     state = _systemd_unit_states([unit])[unit]
                     current = _job_record(
                         unit, jobs_root, now=int(time.time()),
@@ -2932,9 +3232,10 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
                             plan["minimum_job_age_seconds"], 86_400
                         ),
                         systemd_state=state,
+                        jobs_root_fd=jobs_root_pin_fd,
                     )
-                    # Match the path-based registry metadata with the inode
-                    # pinned before the read (including A->B->A path swaps).
+                    # Compare two fd-relative metadata reads under the same
+                    # original jobs root, not an attacker-selected path.
                     _, pinned_metadata_sha256 = _archive_private_file_digest(
                         live_fd, job_dir / "metadata.json", max_bytes=MAX_JSON_BYTES
                     )
@@ -2970,7 +3271,7 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
                     _archive_require_pinned_identity(jobs_root, index_root_identity)
                     # Even a live non-archive reset must not conceal a pending
                     # deployment reservation added after plan creation.
-                    live_index_fd = _archive_open_private_root(jobs_root)
+                    live_index_fd = os.dup(jobs_root_pin_fd)
                     try:
                         root_stat = os.fstat(live_index_fd)
                         if (root_stat.st_dev, root_stat.st_ino) != index_root_identity:
@@ -2994,6 +3295,11 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
                             )
                     finally:
                         os.close(live_index_fd)
+                if JOB_UNIT.fullmatch(unit) and unit in just_archived_units:
+                    _archive_require_child_bound(
+                        archive_root_pin_fd, archive_destination.name,
+                        item["source_fd"], archive_destination,
+                    )
                 reset_results.append(_reset_failed(unit))
             except Exception as exc:
                 reset_failures.append(
@@ -3032,7 +3338,9 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
             "completed_at_unix": int(time.time()),
         }
         receipt["receipt_sha256"] = _sha256(receipt)
-        receipt_path = _write_json_atomic(receipt_target, receipt)
+        receipt_path = _write_json_atomic(
+            receipt_target, receipt, pinned_parent_fd=receipt_pin_fd
+        )
         try:
             completion_audit = _append_completion_audit(receipt)
         except Exception as exc:
