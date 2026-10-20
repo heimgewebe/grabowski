@@ -2749,6 +2749,16 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
             # reserved unit therefore invalidates the entire archive plan.
             check_fd = _archive_open_private_root(jobs_root)
             try:
+                # The recheck must be read from the same jobs-root inode
+                # authenticated at preparation. Matching index bytes/inode
+                # alone cannot authenticate a foreign parent directory.
+                check_stat = os.fstat(check_fd)
+                if (check_stat.st_dev, check_stat.st_ino) != item[
+                    "jobs_root_identity"
+                ]:
+                    raise RuntimeError(
+                        "jobs root identity changed before per-job index recheck"
+                    )
                 current_index = _archive_read_deploy_index_pinned(
                     jobs_root, check_fd, self_deploy
                 )
