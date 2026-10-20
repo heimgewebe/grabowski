@@ -23,7 +23,7 @@ def complexity(paths: list[str], *, repo: str = RECOVERY_REPO) -> dict:
         "changedFiles": len(paths),
         "additions": 8,
         "deletions": 2,
-        "files": [{"path": path} for path in paths],
+        "files": [{"path": path, "changeType": "MODIFIED"} for path in paths],
     }
     return gate.classify_complexity(pr, None, repo_name=repo)
 
@@ -87,6 +87,27 @@ class RecoveryEvidenceAuthorityRiskTests(unittest.TestCase):
         }
         result = gate.classify_complexity(pr, None, repo_name=RECOVERY_REPO)
         self.assertEqual(result["review_tier"], "high_critical", result)
+
+    def test_graphql_change_type_renamed_without_source_path_fails_closed(self) -> None:
+        # The authoritative gh pr view --json files projection uses changeType,
+        # not REST's status. A renamed validator can appear as ordinary docs.
+        pr = {
+            "changedFiles": 1, "additions": 1, "deletions": 1,
+            "files": [{"path": "docs/overview.md", "changeType": "RENAMED"}],
+        }
+        result = gate.classify_complexity(pr, None, repo_name=RECOVERY_REPO)
+        self.assertEqual(result["review_tier"], "high_critical", result)
+        self.assertTrue(result["independent_review_required"], result)
+
+    def test_graphql_change_type_without_verified_origin_stays_high_critical(self) -> None:
+        for value in ({}, {"changeType": "UNKNOWN"}, {"changeType": 0}):
+            with self.subTest(value=value):
+                pr = {
+                    "changedFiles": 1, "additions": 1, "deletions": 1,
+                    "files": [{"path": "docs/overview.md", **value}],
+                }
+                result = gate.classify_complexity(pr, None, repo_name=RECOVERY_REPO)
+                self.assertEqual(result["review_tier"], "high_critical", result)
 
     def test_missing_or_incomplete_path_list_is_explicitly_rejected(self) -> None:
         for pr in (

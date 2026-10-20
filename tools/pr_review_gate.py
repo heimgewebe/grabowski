@@ -1080,35 +1080,49 @@ def _recovery_authority_path_reason(path: str) -> str | None:
 def _recovery_authority_reasons(
     pr: dict[str, Any], repo_name: str | None,
 ) -> list[str]:
-    """Policy comes from protected Grabowski source, not the external PR branch."""
+    """Require authenticated change type, including GraphQL rename identity."""
     if repo_name != "heimgewebe/recovery-evidence-authority":
         return []
     raw = pr.get("files")
-    if not isinstance(raw, list):
-        return []
+    if not isinstance(raw, list) or not raw:
+        return ["high-critical recovery authority changed-file metadata unavailable"]
     reasons: list[str] = []
     for entry in raw:
-        if isinstance(entry, str):
-            reason = _recovery_authority_path_reason(entry)
-            if reason is not None:
-                reasons.append(reason)
-            continue
         if not isinstance(entry, dict):
+            reasons.append("high-critical recovery authority changed-file entry is untyped")
             continue
         current = entry.get("path") or entry.get("filename")
-        if isinstance(current, str):
+        if not isinstance(current, str) or not current:
+            reasons.append("high-critical recovery authority changed path unavailable")
+        else:
             reason = _recovery_authority_path_reason(current)
             if reason is not None:
                 reasons.append(reason)
-        status = entry.get("status")
-        if isinstance(status, str) and status.lower() == "renamed":
-            previous = entry.get("previous_filename") or entry.get("previousFilename")
+        # gh pr view --json files emits changeType (e.g. RENAMED), not the
+        # REST 'status' field. GraphQL does not provide the rename origin.
+        change_type = entry.get("changeType")
+        if change_type is None:
+            change_type = entry.get("status")
+        if not isinstance(change_type, str):
+            reasons.append("high-critical recovery authority change type unavailable")
+            continue
+        normalized_type = change_type.lower()
+        if normalized_type in {"added", "modified", "removed", "deleted"}:
+            continue
+        if normalized_type == "renamed":
+            previous = (
+                entry.get("previous_filename")
+                or entry.get("previousFilename")
+                or entry.get("previousPath")
+            )
             if not isinstance(previous, str) or not previous:
                 reasons.append("high-critical recovery authority rename origin unavailable")
             else:
                 reason = _recovery_authority_path_reason(previous)
                 if reason is not None:
                     reasons.append(reason)
+            continue
+        reasons.append("high-critical recovery authority change type not trusted")
     return reasons
 
 
