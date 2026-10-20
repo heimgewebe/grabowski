@@ -2820,6 +2820,11 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
                 root_fd = None
                 try:
                     root_fd = _archive_open_private_root(jobs_root)
+                    root_stat = os.fstat(root_fd)
+                    if (root_stat.st_dev, root_stat.st_ino) != index_root_identity:
+                        raise RuntimeError(
+                            "jobs root identity changed before archived-job reset index read"
+                        )
                     _archive_require_pinned_identity(jobs_root, index_root_identity)
                     current_index = _archive_read_deploy_index_pinned(
                         jobs_root, root_fd, self_deploy
@@ -2901,6 +2906,11 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
                     # deployment reservation added after plan creation.
                     live_index_fd = _archive_open_private_root(jobs_root)
                     try:
+                        root_stat = os.fstat(live_index_fd)
+                        if (root_stat.st_dev, root_stat.st_ino) != index_root_identity:
+                            raise RuntimeError(
+                                "jobs root identity changed before live-job reset index read"
+                            )
                         current_index = _archive_read_deploy_index_pinned(
                             jobs_root, live_index_fd, self_deploy
                         )

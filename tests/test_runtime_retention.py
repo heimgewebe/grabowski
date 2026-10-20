@@ -3826,6 +3826,199 @@ class RuntimeRetentionTests(unittest.TestCase):
             self.assertFalse((archive / name).exists())
             reset.assert_not_called()
 
+    def test_postmove_reset_rejects_index_read_from_foreign_jobs_root(self) -> None:
+        # A peer can exchange jobs_root at the *postmove reset* read,
+        # restore the authentic root only for a separate identity probe,
+        # then return a syntactically valid stale index from another inode.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs, archive, receipts = root / "jobs", root / "archive", root / "receipts"
+            name = "grabowski-job-787878787878"
+            unit = name + ".service"
+            self._job(jobs, name, 100)
+            old_index = {
+                "schema_version": 1, "units": [],
+                "pending_unit": None, "updated_at_unix": 500,
+            }
+            index_path = jobs / "runtime-deploy-index.json"
+            index_path.write_text(json.dumps(old_index) + "\n")
+            index_path.chmod(0o600)
+            foreign = root / "foreign-jobs"
+            foreign.mkdir(mode=0o700)
+            (foreign / index_path.name).write_text(json.dumps(old_index) + "\n")
+            (foreign / index_path.name).chmod(0o600)
+            hidden = root / "hidden-jobs"
+            plan = RETENTION.build_plan(
+                minimum_job_age_seconds=50, now=1000,
+                jobs_root=jobs, archive_root=archive, receipt_root=receipts,
+                task_db=root / "missing.sqlite3", failed_units=[unit],
+                unit_states={unit: self._state(unit)},
+            )
+            fake_deploy = types.ModuleType("grabowski_self_deploy")
+            fake_deploy.DEPLOY_INDEX_FILENAME = "runtime-deploy-index.json"
+            fake_deploy._deploy_schedule_lock = lambda: nullcontext()
+            fake_base = types.ModuleType("grabowski_mcp")
+            fake_base._append_audit = Mock()
+            fake_base._require_mutations_enabled = Mock()
+            fake_base._require_capability = Mock()
+            real_open = RETENTION._archive_open_private_root
+            real_identity = RETENTION._archive_require_pinned_identity
+            swapped = [False]
+            reset = Mock(return_value=Mock(returncode=0, stderr=""))
+
+            def swap_for_postmove_read(path):
+                if path == jobs and not swapped[0] and (archive / name / "archive-manifest.json").is_file():
+                    index_path.write_text(json.dumps({
+                        **old_index, "units": [name],
+                    }) + "\n")
+                    index_path.chmod(0o600)
+                    jobs.rename(hidden)
+                    foreign.rename(jobs)
+                    swapped[0] = True
+                return real_open(path)
+
+            def authenticate_another_root(path, identity):
+                if path == jobs and swapped[0]:
+                    jobs.rename(foreign)
+                    hidden.rename(jobs)
+                    try:
+                        return real_identity(path, identity)
+                    finally:
+                        jobs.rename(hidden)
+                        foreign.rename(jobs)
+                return real_identity(path, identity)
+
+            try:
+                with patch.dict("sys.modules", {
+                    "grabowski_self_deploy": fake_deploy,
+                    "grabowski_mcp": fake_base,
+                }), patch.object(
+                    RETENTION, "_archive_open_private_root",
+                    side_effect=swap_for_postmove_read,
+                ), patch.object(
+                    RETENTION, "_archive_require_pinned_identity",
+                    side_effect=authenticate_another_root,
+                ), patch.object(
+                    RETENTION, "_run", reset,
+                ), patch.object(
+                    RETENTION, "_systemd_unit_states",
+                    return_value={unit: self._state(unit)},
+                ):
+                    with self.assertRaisesRegex(
+                        RuntimeError, "retention reset phase did not complete",
+                    ):
+                        RETENTION.apply_plan(
+                            plan, expected_plan_sha256=plan["plan_sha256"],
+                        )
+            finally:
+                if swapped[0]:
+                    jobs.rename(foreign)
+                    hidden.rename(jobs)
+            self.assertTrue(swapped[0], "attack must reach postmove index read")
+            self.assertEqual(json.loads(index_path.read_text())["units"], [name])
+            self.assertTrue((archive / name / "archive-manifest.json").is_file())
+            reset.assert_not_called()
+
+    def test_live_reset_rejects_index_read_from_foreign_jobs_root(self) -> None:
+        # Even a pinned live job inode is insufficient when the index FD
+        # belongs to a foreign jobs-root during the final pending-unit read.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs, archive, receipts = root / "jobs", root / "archive", root / "receipts"
+            name = "grabowski-job-797979797979"
+            unit = name + ".service"
+            now = int(RETENTION.time.time())
+            source = self._job(jobs, name, now - 400)
+            old_index = {
+                "schema_version": 1, "units": [name],
+                "pending_unit": None, "updated_at_unix": now - 500,
+            }
+            index_path = jobs / "runtime-deploy-index.json"
+            index_path.write_text(json.dumps(old_index) + "\n")
+            index_path.chmod(0o600)
+            foreign = root / "foreign-jobs"
+            foreign.mkdir(mode=0o700)
+            (foreign / index_path.name).write_text(json.dumps(old_index) + "\n")
+            (foreign / index_path.name).chmod(0o600)
+            hidden = root / "hidden-jobs"
+            plan = RETENTION.build_plan(
+                minimum_job_age_seconds=500, now=now,
+                jobs_root=jobs, archive_root=archive, receipt_root=receipts,
+                task_db=root / "missing.sqlite3", failed_units=[unit],
+                unit_states={unit: self._state(unit)},
+            )
+            self.assertEqual(plan["reset_failed_units"], [unit])
+            fake_deploy = types.ModuleType("grabowski_self_deploy")
+            fake_deploy.DEPLOY_INDEX_FILENAME = "runtime-deploy-index.json"
+            fake_deploy._deploy_schedule_lock = lambda: nullcontext()
+            fake_base = types.ModuleType("grabowski_mcp")
+            fake_base._append_audit = Mock()
+            fake_base._require_mutations_enabled = Mock()
+            fake_base._require_capability = Mock()
+            real_open = RETENTION._archive_open_private_root
+            armed, swapped = [False], [False]
+            reset = Mock(return_value=Mock(returncode=0, stderr=""))
+
+            real_record = RETENTION._job_record
+            real_identity = RETENTION._archive_require_pinned_identity
+            live_validated = [False]
+
+            def record_live_registry_validation(*args, **kwargs):
+                result = real_record(*args, **kwargs)
+                if kwargs.get("minimum_age_seconds") == 500:
+                    live_validated[0] = True
+                return result
+
+            def arm_after_authenticated_root(path, identity):
+                result = real_identity(path, identity)
+                if path == jobs and live_validated[0]:
+                    armed[0] = True
+                return result
+
+            def swap_for_live_recheck(path):
+                if path == jobs and armed[0] and not swapped[0]:
+                    index_path.write_text(json.dumps({
+                        **old_index, "pending_unit": name,
+                    }) + "\n")
+                    index_path.chmod(0o600)
+                    jobs.rename(hidden)
+                    foreign.rename(jobs)
+                    swapped[0] = True
+                return real_open(path)
+
+            try:
+                with patch.dict("sys.modules", {
+                    "grabowski_self_deploy": fake_deploy,
+                    "grabowski_mcp": fake_base,
+                }), patch.object(
+                    RETENTION, "_archive_open_private_root",
+                    side_effect=swap_for_live_recheck,
+                ), patch.object(
+                    RETENTION, "_run", reset,
+                ), patch.object(
+                    RETENTION, "_systemd_unit_states",
+                    return_value={unit: self._state(unit)},
+                ), patch.object(
+                    RETENTION, "_job_record", side_effect=record_live_registry_validation,
+                ), patch.object(
+                    RETENTION, "_archive_require_pinned_identity",
+                    side_effect=arm_after_authenticated_root,
+                ):
+                    with self.assertRaisesRegex(
+                        RuntimeError, "retention reset phase did not complete",
+                    ):
+                        RETENTION.apply_plan(
+                            plan, expected_plan_sha256=plan["plan_sha256"],
+                        )
+            finally:
+                if swapped[0]:
+                    jobs.rename(foreign)
+                    hidden.rename(jobs)
+            self.assertTrue(swapped[0], "attack must reach live index read")
+            self.assertEqual(json.loads(index_path.read_text())["pending_unit"], name)
+            self.assertTrue((source / "metadata.json").is_file())
+            reset.assert_not_called()
+
     def test_archive_index_root_swap_never_redirects_index_write(self) -> None:
         # Retention must never attempt a canonical index write. Previously
         # this could redirect through a same-UID jobs-root replacement.
