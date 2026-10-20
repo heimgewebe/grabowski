@@ -829,17 +829,35 @@ def _live_state(repo: Path, repository: str, pr_number: int) -> dict[str, Any]:
         if not diff_bytes.stdout:
             raise SettlementError("current PR diff is empty")
         pull_request["diff_sha256"] = pr_review_gate.github_pr_diff_identity_sha256(diff_bytes.stdout)
-    # A destination-only GraphQL list cannot rule out a high-critical
-    # workflow/action being renamed to an apparently ordinary path.
-    # Resolve provenance from the immutable SHA comparison only when the
-    # destination paths do not already require external review.
-    if not oversized_diff_bound and not _policy(
-        pull_request, repository, explicitly_required=False
-    )["external_review_required"]:
+    # A destination-only GraphQL list cannot prove rename origin, even when
+    # another changed path already demands independent review. Never skip the
+    # immutable compare because of a pre-existing risk tier.
+    if not oversized_diff_bound:
         pinned = _revision_bound_rename_files(repo, repository, pull_request)
         pull_request["files"] = {
             "nodes": pinned, "pageInfo": {"hasNextPage": False}
         }
+        # "gh pr diff" has no revision parameter. In an A->B->A head cycle
+        # it can contain B's bytes while the metadata above describes A.
+        # Bind the *bytes* as well as rename paths to the fixed SHA pair.
+        base, head = _current_base(pull_request), _current_head(pull_request)
+        pinned_diff = subprocess.run(
+            [
+                "gh", "api", "-H", "Accept: application/vnd.github.diff",
+                f"repos/{repository}/compare/{base}...{head}",
+            ],
+            cwd=repo,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=90,
+            env=pr_review_gate._env(),
+        )
+        if pinned_diff.returncode != 0 or not pinned_diff.stdout:
+            raise SettlementError("cannot read revision-bound PR diff")
+        if pinned_diff.stdout != diff_bytes.stdout:
+            raise SettlementError("revision-bound PR diff differs from mutable PR diff")
     return pull_request
 
 def _revision_bound_rename_files(

@@ -156,6 +156,81 @@ class PinnedRenameEvidenceRegressionTests(unittest.TestCase):
         )["external_review_required"])
 
 
+    def test_live_state_binds_critical_rename_when_destination_already_requires_review(self):
+        destination = "src/grabowski_grips.py"
+        pr = base_state(path=destination)
+        original_classify = settlement.pr_review_gate.classify_complexity
+
+        def already_review_required(*args, **kwargs):
+            return {**original_classify(*args, **kwargs),
+                    "external_review_required": True}
+
+        payload = {"data": {"repository": {"pullRequest": pr}}}
+        bound_files = [{
+            "path": destination, "status": "renamed",
+            "previousPath": ".github/workflows/ci.yml",
+        }]
+        with (
+            mock.patch.object(settlement.pr_review_gate, "classify_complexity",
+                              side_effect=already_review_required),
+            mock.patch.object(settlement, "_run_json", return_value=payload),
+            mock.patch.object(settlement, "_collect_files",
+                              return_value=pr["files"]),
+            mock.patch.object(settlement, "_collect_comments",
+                              return_value=pr["comments"]),
+            mock.patch.object(settlement, "_collect_reviews",
+                              return_value=pr["reviews"]),
+            mock.patch.object(settlement, "_collect_review_threads",
+                              return_value=pr["reviewThreads"]),
+            mock.patch.object(settlement.subprocess, "run", return_value=mock.Mock(
+                returncode=0, stdout=b"diff --git a/src/grabowski_grips.py b/src/grabowski_grips.py\n",
+                stderr=b"",
+            )),
+            mock.patch.object(settlement, "_revision_bound_rename_files",
+                              return_value=bound_files) as pinned,
+        ):
+            observed = settlement._live_state(ROOT, REPOSITORY, PR)
+        pinned.assert_called_once()
+        self.assertEqual(bound_files, observed["files"]["nodes"])
+        self.assertEqual("high_critical", settlement._policy(
+            observed, REPOSITORY, explicitly_required=False
+        )["review_tier"])
+
+
+    def test_pinned_raw_diff_rejects_transient_aba_pr_diff(self):
+        # The GraphQL head and immutable rename metadata describe commit A.
+        # A temporary A->B->A ref movement can make mutable gh pr diff
+        # return B while the eventual PR HEAD is again A.
+        pr = base_state(path="docs/ci.md")
+        payload = {"data": {"repository": {"pullRequest": pr}}}
+        evidence = [{
+            "path": "docs/ci.md",
+            "status": "renamed",
+            "previousPath": ".github/workflows/ci.yml",
+        }]
+        transient = b"diff --git a/docs/ci.md b/docs/ci.md\n+version-B\n"
+        pinned = b"diff --git a/docs/ci.md b/docs/ci.md\n+version-A\n"
+        with (
+            mock.patch.object(settlement, "_run_json", return_value=payload),
+            mock.patch.object(settlement, "_collect_files", return_value=pr["files"]),
+            mock.patch.object(settlement, "_collect_comments", return_value=pr["comments"]),
+            mock.patch.object(settlement, "_collect_reviews", return_value=pr["reviews"]),
+            mock.patch.object(settlement, "_collect_review_threads",
+                              return_value=pr["reviewThreads"]),
+            mock.patch.object(settlement, "_revision_bound_rename_files",
+                              return_value=evidence),
+            mock.patch.object(settlement.subprocess, "run", side_effect=[
+                mock.Mock(returncode=0, stdout=transient, stderr=b""),
+                mock.Mock(returncode=0, stdout=pinned, stderr=b""),
+            ]) as read,
+        ):
+            with self.assertRaisesRegex(
+                settlement.SettlementError, "revision-bound.*diff"
+            ):
+                settlement._live_state(ROOT, REPOSITORY, PR)
+        self.assertEqual(read.call_count, 2)
+        self.assertIn(f"{BASE}...{HEAD}", " ".join(read.call_args.args[0]))
+
 def request_comment(
     *,
     actor: str = "alex",
