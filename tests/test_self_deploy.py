@@ -414,12 +414,11 @@ class ReleaseSourceRawModeAdmissionTests(unittest.TestCase):
             self._raw("D", "100755", "000000", "tools/old.py")
         )
 
-    def test_plain_document_still_exempt(self) -> None:
-        admission = self._admit_preview(
+    def test_plain_document_also_requires_review(self) -> None:
+        # A regular docs/ Markdown file may still be executed by validation.
+        self._assert_review_required(
             self._raw("M", "100644", "100644", "docs/release.md")
         )
-        self.assertEqual("non-runtime-documentation", admission["status"])
-        self.assertIs(admission["independent_review_required"], False)
 
     def test_executable_source_with_plain_document_requires_review(self) -> None:
         self._assert_review_required(
