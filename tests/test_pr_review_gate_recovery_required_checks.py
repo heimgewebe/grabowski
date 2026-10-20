@@ -76,6 +76,7 @@ class RecoveryRequiredCheckTests(unittest.TestCase):
             [{"name":"security-selftest","bucket":"skipping"}],
             [{"name":"security-selftest","bucket":"skipped"}],
             [{"name":"security-selftest","bucket":"pending"}],
+            [{"name":"security-selftest","bucket":"pass"},{"name":"security-selftest","bucket":"pass"}],
             [{"name":"security-selftest","bucket":"pass"},{"name":"security-selftest","bucket":"failure"}],
         ]
         for checks in cases:
