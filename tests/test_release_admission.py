@@ -278,15 +278,18 @@ class AuthoritativeCIReadTests(unittest.TestCase):
                 with self.assertRaisesRegex(admission.ReleaseAdmissionDenied, "trusted Validate.*(policy|control|input).*changed"):
                     self.query(pages)
 
-    def test_passive_docs_are_not_validation_policy(self):
+    def test_documentation_and_readme_changes_also_require_r3(self):
+        # Plain Markdown may be executed by Makefile or trusted CI.
         paths, pages = self.fixture()
         for path in ("docs", "README.md"):
             next(e for e in pages[paths["target_tree"]]["tree"]
                  if e["path"] == path)["sha"] = "2" * 40
-        accepted, requests = self.query(pages)
-        self.assertEqual(2, len(accepted["checks"]))
-        self.assertEqual(64, len(accepted["workflow"]["trusted_control_sources_sha256"]))
-        self.assertEqual(13, len(requests))
+        with patch.object(admission, "validate_independent_release_review") as reviewer:
+            with self.assertRaisesRegex(
+                admission.ReleaseAdmissionDenied, "control sources changed.*R3",
+            ):
+                self.query(pages)
+        reviewer.assert_not_called()
 
     def test_executable_src_tree_requires_independent_r3_even_with_green_ci(self):
         # Makefile calls PYTHONPATH=src python -m ...; src/sitecustomize.py
@@ -658,6 +661,42 @@ class AuthoritativeCIReadTests(unittest.TestCase):
         reviewer.assert_called_once()
         self.assertEqual(2, len(result["checks"]))
 
+    def test_mutable_documentation_root_change_requires_independent_full_r3(self):
+        # A trusted Makefile can execute docs/*.md; the docs tree is
+        # therefore not safe as an unreviewed validation input.
+        paths, pages = self.fixture()
+        for entry in pages[paths["target_tree"]]["tree"]:
+            if entry["path"] == "docs":
+                entry["sha"] = "2" * 40
+                break
+        else:
+            self.fail("test fixture lacks docs root")
+        with patch.object(
+            admission, "validate_independent_release_review",
+        ) as reviewer:
+            with self.assertRaisesRegex(
+                admission.ReleaseAdmissionDenied, "control sources changed.*R3",
+            ):
+                self.query(pages)
+        reviewer.assert_not_called()
+
+        proof = {
+            "review_pr": 1452, "review_binding_sha256": "a" * 64,
+            "review_attempts_sha256": "b" * 64, "independent_pass_count": 1,
+            "admissible_slots": ["independent-grok-4.6"],
+        }
+        with patch.object(
+            admission, "validate_independent_release_review", return_value=proof,
+        ) as reviewer:
+            result, _ = self.query(
+                pages, transition_review_pr=1452, transition_diff_sha256=DIFF,
+            )
+        reviewer.assert_called_once_with(
+            serving_head=SERVING, target_head=TARGET,
+            diff_sha256=DIFF, review_pr=1452,
+        )
+        self.assertTrue(result["workflow"]["ci_policy_transition_required"])
+
     def test_target_cannot_make_executable_root_mutable(self):
         # Reviewed target code must not exempt executable src or tests from
         # later serving CI policy validation by widening the mutable roots.
@@ -842,7 +881,6 @@ class AuthoritativeCIReadTests(unittest.TestCase):
             return {
                 row["path"]: [row["type"], row["mode"], row["sha"]]
                 for row in pages[tree_path]["tree"]
-                if row["path"] not in admission.VALIDATION_POLICY_MUTABLE_ROOTS
             }
 
         expected_sha = admission._sha256_json({
@@ -1376,6 +1414,31 @@ class DecisionBoundReleaseReviewTests(unittest.TestCase):
 
 
 class DirectSchedulerDenialTests(unittest.TestCase):
+    def test_claimed_prepolicy_main_cannot_replace_live_serving_identity(self):
+        # A valid historic SHA in the admission code is insufficient:
+        # source truth must come from the deployed manifest AND live process.
+        import grabowski_self_deploy as deploy
+
+        stale = {
+            "completion_status": "complete", "runtime_binding_valid": True,
+            "artifact_integrity_valid": True, "provenance_valid": True,
+            "repo_head": "5a8b193f900ccec78f6c62345bf99f4e89a7734e",
+            "release_id": "wrong-stale-release",
+        }
+        live = {
+            "matches_deployed_manifest": False,
+            "process_release_id": "actual-live-release",
+            "process_repo_head": "dd6dc690285b6a8a0cdbb3c18d84a1681e604923",
+        }
+        with (
+            patch.object(deploy.base, "_deployment_metadata", return_value=stale),
+            patch.object(deploy.serving_process, "identity", return_value=live),
+            patch.object(deploy, "_git_result") as git,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "serving process identity mismatch"):
+                deploy._require_release_source_admission(TARGET, captain_preview=True)
+        git.assert_not_called()
+
     def test_critical_source_cannot_use_review_pr_without_captain_context(self):
         import grabowski_self_deploy as deploy
 

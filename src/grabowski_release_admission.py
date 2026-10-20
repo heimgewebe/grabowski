@@ -405,9 +405,8 @@ def _trusted_validate_control_sources(
         )
         if not target_required.issubset(target):
             raise ReleaseAdmissionDenied("target Validate required roots are missing")
-        # Only existing inert-document exemptions can stay mutable. Widening
-        # the exemption would allow future target-controlled executable roots
-        # to self-grade despite an R3 approving this individual transition.
+        # Target code may not expand mutable roots; every changed Git root
+        # still requires independent whole-release review below.
         if not target_mutable.issubset(serving_mutable) or (
             target_mutable & target_required
         ):
@@ -422,6 +421,10 @@ def _trusted_validate_control_sources(
         elif path in serving_mutable:
             if old[:2] != new[:2]:
                 raise ReleaseAdmissionDenied("trusted Validate control type changed")
+            # Even plain Markdown can be executed by an authenticated
+            # Makefile/CI script; mutable roots never bypass complete R3.
+            if old != new:
+                changed_controls.append(path)
         elif old != new:
             changed_controls.append(path)
     if changed_controls:
@@ -441,10 +444,8 @@ def _trusted_validate_control_sources(
     # Explicit JSON arrays make root identity receipts independent of the
     # JSON encoder's implicit conversion of Python tuples to arrays.
     return _sha256_json({
-        "serving_policy_roots": {p: [*serving[p]] for p in sorted(serving)
-                                 if p not in serving_mutable},
-        "target_policy_roots": {p: [*target[p]] for p in sorted(target)
-                                if p not in serving_mutable},
+        "serving_policy_roots": {p: [*serving[p]] for p in sorted(serving)},
+        "target_policy_roots": {p: [*target[p]] for p in sorted(target)},
         "changed_policy_paths": changed_controls,
     })
 
