@@ -91,8 +91,10 @@ _VERDICTS = frozenset({"PASS_THIS_REVISION", "REJECT_THIS_REVISION"})
 # infrastructure error. Unknown message shapes are ambiguous, never review PASS.
 _CLAUDE_QUOTA_RESULT_RE = re.compile(
     r"\A(?:You've hit your weekly limit"
-    r"(?: · resets (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) "
-    r"(?:[1-9]|[12][0-9]|3[01]), "
+    # Claude also returns "resets 10am (UTC)" without a month/day.
+    # Accept only the exact hour-and-UTC shape, not arbitrary quota prose.
+    r"(?: · resets (?:(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) "
+    r"(?:[1-9]|[12][0-9]|3[01]), )?"
     r"(?:[1-9]|1[0-2])(?::[0-5][0-9])?(?:am|pm) \(UTC\))?"
     r"|You've hit your session limit · resets "
     r"(?:[1-9]|1[0-2])(?::[0-5][0-9])?(?:am|pm) \(UTC\))\Z"
