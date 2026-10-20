@@ -145,19 +145,48 @@ def inventory_readonly_sqlite(
     error_type: type[ChangedError],
     message: str = INVENTORY_CHANGED_MESSAGE,
     allow_wal_copy: bool = True,
+    allow_checkpointed_empty_wal: bool = False,
     max_copy_bytes: int | None = None,
 ) -> Iterator[sqlite3.Connection]:
     wal_path = Path(str(path) + "-wal")
     wal_present = wal_path.exists() or wal_path.is_symlink()
     shm_path = Path(str(path) + "-shm")
-    if not allow_wal_copy and (
+    if not allow_wal_copy and not allow_checkpointed_empty_wal and (
         wal_present or shm_path.exists() or shm_path.is_symlink()
     ):
-        raise _changed(
-            error_type,
-            "Strict read-only snapshot unavailable while SQLite WAL sidecars exist",
-        )
-    if not wal_present:
+        raise _changed(error_type, "Strict read-only snapshot unavailable while SQLite WAL sidecars exist")
+    # Explicit opt-in: a checkpointed, zero-length WAL contains no committed frames.  It can
+    # safely be ignored by the immutable reader, but ONLY if the database and
+    # every pre-existing sidecar retain their exact inode/stat identity through
+    # the observation.  Active/nonempty WAL still fails strict READ_ONLY.
+    empty_wal_identity: FileIdentity | None = None
+    shm_identity: FileIdentity | None = None
+    if not allow_wal_copy:
+        try:
+            if wal_present:
+                wal_status = os.lstat(wal_path)
+                if not stat.S_ISREG(wal_status.st_mode) or wal_status.st_size != 0:
+                    raise _changed(
+                        error_type,
+                        "Strict read-only snapshot unavailable while SQLite WAL sidecars exist",
+                    )
+                empty_wal_identity = status_identity(wal_status)
+            if shm_path.exists() or shm_path.is_symlink():
+                if empty_wal_identity is None:
+                    raise _changed(
+                        error_type,
+                        "Strict read-only snapshot unavailable while SQLite WAL sidecars exist",
+                    )
+                shm_status = os.lstat(shm_path)
+                if not stat.S_ISREG(shm_status.st_mode):
+                    raise _changed(
+                        error_type,
+                        "Strict read-only snapshot unavailable while SQLite WAL sidecars exist",
+                    )
+                shm_identity = status_identity(shm_status)
+        except OSError as exc:
+            raise _changed(error_type, message, cause=exc)
+    if not wal_present or empty_wal_identity is not None:
         before_identity = file_identity(path)
         connection = sqlite3.connect(
             path.absolute().as_uri() + "?mode=ro&immutable=1",
@@ -176,9 +205,19 @@ def inventory_readonly_sqlite(
                 error_type=error_type,
                 message=message,
             )
-            if wal_path.exists() or wal_path.is_symlink():
+            if empty_wal_identity is not None:
+                assert_identity(
+                    wal_path, empty_wal_identity,
+                    error_type=error_type, message=message,
+                )
+            elif wal_path.exists() or wal_path.is_symlink():
                 raise _changed(error_type, message)
-            if not allow_wal_copy and (shm_path.exists() or shm_path.is_symlink()):
+            if shm_identity is not None:
+                assert_identity(
+                    shm_path, shm_identity,
+                    error_type=error_type, message=message,
+                )
+            elif not allow_wal_copy and (shm_path.exists() or shm_path.is_symlink()):
                 raise _changed(error_type, message)
         return
 
