@@ -1201,6 +1201,88 @@ def _nixos_supply_chain_path_reason(path: str, repo_name: str | None) -> str | N
     return None
 
 
+
+def _nixos_supply_chain_rename_reasons(
+    pr: dict[str, Any], repo_name: str | None,
+) -> list[str]:
+    """Fail closed on incomplete or contradictory Heim-PC Nix trust file metadata.
+
+    GraphQL exposes rename changeType without a reliable previousPath. Rename
+    sources must be authenticated separately; missing origins cannot be treated
+    as harmless documentation changes. Validate *all* supplied field aliases
+    rather than trusting whichever alias happens to come first.
+    """
+    if repo_name != "heimgewebe/heim-pc":
+        return []
+    entries = pr.get("files")
+    if not isinstance(entries, list) or not entries:
+        return ["high-critical NixOS supply-chain changed-file metadata unavailable"]
+    reasons: list[str] = []
+    count = pr.get("changedFiles")
+    if type(count) is not int or count != len(entries):
+        reasons.append("high-critical NixOS supply-chain changed-file list incomplete")
+    seen: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            reasons.append("high-critical NixOS supply-chain changed-file entry untyped")
+            continue
+
+        path_aliases = [entry[key] for key in ("path", "filename") if key in entry]
+        valid_paths = [
+            path for path in path_aliases
+            if isinstance(path, str) and bool(path.strip())
+        ]
+        if not path_aliases or len(valid_paths) != len(path_aliases):
+            reasons.append("high-critical NixOS supply-chain changed path unavailable")
+        if len(set(valid_paths)) > 1:
+            reasons.append("high-critical NixOS supply-chain changed path aliases conflict")
+        for current in valid_paths:
+            # Catch a protected destination obscured by a benign primary alias.
+            reason = _nixos_supply_chain_path_reason(current, repo_name)
+            if reason is not None:
+                reasons.append(reason)
+        # Repeated aliases within one entry are valid; only distinct file
+        # entries must not claim the same changed destination.
+        if valid_paths:
+            if valid_paths[0] in seen:
+                reasons.append("high-critical NixOS supply-chain duplicate changed path")
+            seen.add(valid_paths[0])
+
+        types = [entry[key] for key in ("changeType", "status") if key in entry]
+        if not types or any(not isinstance(kind, str) or not kind.strip() for kind in types):
+            reasons.append("high-critical NixOS supply-chain change type unavailable")
+            continue
+        types_normalized = [kind.lower() for kind in types]
+        if len(set(types_normalized)) != 1:
+            reasons.append("high-critical NixOS supply-chain change type aliases conflict")
+        change_type = types_normalized[0]
+
+        origin_fields = ("previous_filename", "previousFilename", "previousPath")
+        origins = [entry[key] for key in origin_fields if key in entry]
+        valid_origins = [
+            origin for origin in origins
+            if isinstance(origin, str) and bool(origin.strip())
+        ]
+        if len(valid_origins) != len(origins):
+            reasons.append("high-critical NixOS supply-chain rename origin invalid")
+        if len(set(valid_origins)) > 1:
+            reasons.append("high-critical NixOS supply-chain rename origin aliases conflict")
+        for origin in valid_origins:
+            reason = _nixos_supply_chain_path_reason(origin, repo_name)
+            if reason is not None:
+                reasons.append(reason)
+
+        if change_type in {"renamed", "copied"}:
+            if not valid_origins:
+                reasons.append("high-critical NixOS supply-chain rename origin unavailable")
+        elif change_type in {"added", "modified", "removed", "deleted", "changed"}:
+            if origins:
+                reasons.append("high-critical NixOS supply-chain unexpected rename origin")
+        else:
+            reasons.append("high-critical NixOS supply-chain change type untrusted")
+    return reasons
+
+
 def _high_critical_path_reason(path: str) -> str | None:
     normalized = path.lower().lstrip("./")
     if _is_policy_critical_path(normalized):
@@ -1239,14 +1321,15 @@ def classify_complexity(
     paths = _paths(pr)
     normalized_repo = _canonical_repo_slug(repo_name)
     recovery_reasons = _recovery_authority_reasons(pr, normalized_repo)
+    nix_supply_reasons = _nixos_supply_chain_rename_reasons(pr, normalized_repo)
     docs_only = (
-        bool(paths) and not recovery_reasons
+        bool(paths) and not recovery_reasons and not nix_supply_reasons
         and all(_is_documentation_path(path) for path in paths)
     )
     very_small_uncomplicated = _is_very_small_uncomplicated_change(paths, changed_files, changed_lines)
     important_repo = normalized_repo in IMPORTANT_REPOS
 
-    high_critical_reasons: list[str] = list(recovery_reasons)
+    high_critical_reasons: list[str] = [*recovery_reasons, *nix_supply_reasons]
     if not docs_only:
         if changed_files > 15:
             high_critical_reasons.append("many files")
