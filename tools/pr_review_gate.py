@@ -1090,6 +1090,7 @@ def _recovery_authority_reasons(
     changed_files = pr.get("changedFiles")
     if type(changed_files) is not int or changed_files != len(raw):
         reasons.append("high-critical recovery authority changed-file list incomplete")
+    seen_paths: set[str] = set()
     for entry in raw:
         if not isinstance(entry, dict):
             reasons.append("high-critical recovery authority changed-file entry is untyped")
@@ -1098,6 +1099,9 @@ def _recovery_authority_reasons(
         if not isinstance(current, str) or not current:
             reasons.append("high-critical recovery authority changed path unavailable")
         else:
+            if current in seen_paths:
+                reasons.append(f"high-critical recovery authority duplicate changed path: {current}")
+            seen_paths.add(current)
             reason = _recovery_authority_path_reason(current)
             if reason is not None:
                 reasons.append(reason)
@@ -1126,6 +1130,8 @@ def _recovery_authority_reasons(
                 reason = _recovery_authority_path_reason(previous)
                 if reason is not None:
                     reasons.append(reason)
+                elif not _is_documentation_path(previous):
+                    reasons.append(f"high-critical recovery authority code/config rename origin: {previous}")
             continue
         reasons.append("high-critical recovery authority change type not trusted")
     return reasons
@@ -1997,7 +2003,6 @@ def _legacy_external_finding_failures(external_review: dict[str, Any]) -> list[s
         if not isinstance(finding, dict) or not _terminal(finding):
             failures.append(f"external_review finding {index} is not terminally triaged")
     return failures
-
 
 def _external_review_count(external_review: Any) -> int | None:
     if not isinstance(external_review, dict):

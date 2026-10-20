@@ -151,6 +151,41 @@ class RecoveryEvidenceAuthorityRiskTests(unittest.TestCase):
         result = complexity(["helper.py"], repo="heimgewebe/unrelated-tool")
         self.assertFalse(result["high_critical"], result)
 
+    def test_nondocumentation_rename_origin_to_docs_remains_high_critical(self) -> None:
+        # Genuine Claude independent review of exact ae24bb8 found that the
+        # prior filename only passed the narrow exact trust-path allowlist.
+        for previous in (
+            "conftest.py", "pyproject.toml", "requirements.txt",
+            "helper.py", "tests/conftest.py",
+        ):
+            for rename_type in ("status", "changeType"):
+                with self.subTest(previous=previous, rename_type=rename_type):
+                    pr = {
+                        "changedFiles": 1, "additions": 1, "deletions": 1,
+                        "files": [{
+                            "path": "docs/overview.md",
+                            rename_type: "RENAMED",
+                            "previous_filename": previous,
+                        }],
+                    }
+                    result = gate.classify_complexity(pr, None, repo_name=RECOVERY_REPO)
+                    self.assertEqual(result["review_tier"], "high_critical", result)
+                    self.assertTrue(result["independent_review_required"], result)
+
+    def test_duplicate_docs_paths_do_not_prove_complete_changed_file_list(self) -> None:
+        # Another genuine independent finding (P3): a repeated path can mask
+        # an unseen signed-evidence validator despite equal raw entry counts.
+        pr = {
+            "changedFiles": 2, "additions": 2, "deletions": 0,
+            "files": [
+                {"path": "docs/overview.md", "changeType": "MODIFIED"},
+                {"path": "docs/overview.md", "changeType": "MODIFIED"},
+            ],
+        }
+        result = gate.classify_complexity(pr, None, repo_name=RECOVERY_REPO)
+        self.assertEqual(result["review_tier"], "high_critical", result)
+        self.assertTrue(result["independent_review_required"], result)
+
     def test_missing_or_incomplete_path_list_is_explicitly_rejected(self) -> None:
         for pr in (
             {"changedFiles": 1, "files": []},
