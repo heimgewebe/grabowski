@@ -369,11 +369,17 @@ def _trusted_validate_control_sources(
     # Imported Python globals are mutable (even through globals()/exec). Read
     # the actual serving policy from its authenticated commit on EVERY
     # admission, not from constants target code may have rebound at import.
-    # The exact currently deployed legacy release predates this policy module.
-    # Give only that proven SHA a conservative migration floor, never a
-    # generic missing-file fallback. This requires an independent full-delta
-    # review below even if the only differences appear to be documentation.
-    legacy_serving = serving_head == "dd6dc690285b6a8a0cdbb3c18d84a1681e604923"
+    # The exact serving release and subsequent verified pre-policy Main
+    # commits retain no policy declarations (23f/3b98/5a8b share the same
+    # authenticated pre-policy Git blob). Only these immutable Git commits may
+    # use the conservative migration floor; unknown sources never qualify.
+    # Every transition still requires independent serving-to-target full-R3.
+    legacy_serving = serving_head in (
+        "dd6dc690285b6a8a0cdbb3c18d84a1681e604923",
+        "23f469b584c3aea3caee71d9c2be3521f7132e8b",
+        "3b98d6a5f6c109632b7e829240b916acb881cf55",
+        "5a8b193f900ccec78f6c62345bf99f4e89a7734e",
+    )
     if legacy_serving:
         serving_required = {
             ".github", ".gitignore", "AGENTS.md", "Makefile", "pyproject.toml",

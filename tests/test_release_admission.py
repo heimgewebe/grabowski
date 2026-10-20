@@ -559,6 +559,51 @@ class AuthoritativeCIReadTests(unittest.TestCase):
         self.assertTrue(result["workflow"]["ci_policy_transition_required"])
         self.assertNotIn(paths["serving_policy"], requests)
 
+    def test_exact_known_prepolicy_main_heads_require_full_delta_r3(self):
+        # These immutable Main revisions retain the same authenticated
+        # pre-policy admission source blob; green target CI is not enough.
+        for legacy in (
+            "23f469b584c3aea3caee71d9c2be3521f7132e8b",
+            "3b98d6a5f6c109632b7e829240b916acb881cf55",
+            "5a8b193f900ccec78f6c62345bf99f4e89a7734e",
+        ):
+            with self.subTest(legacy=legacy):
+                paths, pages = self.fixture(serving_head=legacy)
+                pages.pop(paths["serving_policy"])
+                self._target_policy(
+                    pages, paths, admission.VALIDATION_POLICY_REQUIRED_ROOTS,
+                )
+                with patch.object(
+                    admission, "validate_independent_release_review",
+                ) as reviewer:
+                    with self.assertRaisesRegex(
+                        admission.ReleaseAdmissionDenied, "transition.*R3",
+                    ):
+                        self.query(pages, serving_head=legacy)
+                reviewer.assert_not_called()
+
+                proof = {
+                    "review_pr": 1452,
+                    "review_binding_sha256": "a" * 64,
+                    "review_attempts_sha256": "b" * 64,
+                    "independent_pass_count": 1,
+                    "admissible_slots": ["independent-grok-4.6"],
+                }
+                with patch.object(
+                    admission, "validate_independent_release_review",
+                    return_value=proof,
+                ) as reviewer:
+                    result, requests = self.query(
+                        pages, serving_head=legacy,
+                        transition_review_pr=1452, transition_diff_sha256=DIFF,
+                    )
+                reviewer.assert_called_once_with(
+                    serving_head=legacy, target_head=TARGET,
+                    diff_sha256=DIFF, review_pr=1452,
+                )
+                self.assertTrue(result["workflow"]["ci_policy_transition_required"])
+                self.assertNotIn(paths["serving_policy"], requests)
+
     def test_unrecognized_missing_serving_policy_cannot_use_legacy_transition(self):
         paths, pages = self.fixture()
         pages.pop(paths["serving_policy"])
