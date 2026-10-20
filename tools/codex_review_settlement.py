@@ -883,6 +883,12 @@ def _revision_bound_rename_files(
     )
     if not isinstance(payload, dict):
         raise SettlementError("revision-bound compare response is invalid")
+    # The intentionally *unpaged* GitHub Compare endpoint returns at most
+    # 250 commits, but its final commit is the comparison's newest HEAD
+    # even when total_commits is larger. With page/per_page the last entry
+    # may be an intermediate commit. Do not add pagination here without
+    # separately authenticating the immutable comparison's last HEAD.
+    # https://docs.github.com/en/rest/commits/commits#compare-two-commits
     commits = payload.get("commits")
     if (
         not isinstance(payload.get("base_commit"), dict)

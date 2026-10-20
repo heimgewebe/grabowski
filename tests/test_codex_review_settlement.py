@@ -107,6 +107,37 @@ class PinnedRenameEvidenceRegressionTests(unittest.TestCase):
                 with self.assertRaises(settlement.SettlementError):
                     settlement._revision_bound_rename_files(ROOT, REPOSITORY, pr)
 
+
+    def test_unpaged_compare_commit_cap_keeps_last_head(self):
+        # GitHub's unpaginated Compare response returns at most 250 commits
+        # but keeps the *latest* compared head in the final entry even when
+        # total_commits is larger. Pagination changes that contract.
+        # Primary: docs.github.com/en/rest/commits/commits#compare-two-commits
+        pr = base_state(path="docs/ci.md")
+        for last, accepted in ((HEAD, True), ("e" * 40, False)):
+            comparison = {
+                **self._compare(),
+                "total_commits": 350,
+                "commits": [{"sha": "d" * 40} for _ in range(249)]
+                           + [{"sha": last}],
+            }
+            with self.subTest(last=last), mock.patch.object(
+                settlement, "_run_json", return_value=comparison
+            ) as read:
+                if accepted:
+                    files = settlement._revision_bound_rename_files(
+                        ROOT, REPOSITORY, pr
+                    )
+                    self.assertEqual(files[0]["previousPath"],
+                                     ".github/workflows/ci.yml")
+                else:
+                    with self.assertRaises(settlement.SettlementError):
+                        settlement._revision_bound_rename_files(
+                            ROOT, REPOSITORY, pr
+                        )
+                self.assertEqual(read.call_args.args[1][-1],
+                                 f"repos/{REPOSITORY}/compare/{BASE}...{HEAD}")
+
     def test_partial_or_malformed_pinned_rename_metadata_fails_closed(self):
         pr = base_state(path="docs/ci.md")
         cases = [
