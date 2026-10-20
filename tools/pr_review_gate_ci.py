@@ -661,6 +661,59 @@ def load_live_pr(repo_name: str, pr_number: int) -> dict[str, Any]:
     )
 
 
+def _require_rename_aware_pr(
+    repo_name: str, pr_number: int, pr: dict[str, Any]
+) -> dict[str, Any]:
+    """Verify the complete REST changed-file set before assigning a review tier.
+
+    GraphQL `gh pr view --json files` omits rename status and source paths.
+    Treating those entries as ordinary changes can incorrectly admit a rename
+    out of a security-critical workflow as a documentation-only change.
+    """
+    count = pr.get("changedFiles")
+    if (
+        _normalize_repo(repo_name) != repo_name
+        or type(pr_number) is not int or pr_number <= 0
+        or not isinstance(pr, dict) or pr.get("number") != pr_number
+        or type(count) is not int or count <= 0 or count > 3000
+    ):
+        raise CiEvidenceError("complete rename-aware PR file evidence is missing or invalid")
+    try:
+        rest_files = gate._load_pull_file_evidence(
+            Path.cwd(), repo_slug=repo_name, pr=pr_number
+        )
+    except (RuntimeError, ValueError) as exc:
+        raise CiEvidenceError(
+            "complete rename-aware GitHub REST file evidence unavailable"
+        ) from exc
+    if (
+        not isinstance(rest_files, list)
+        or len(rest_files) != count
+        or gate._complete_pr_diff_paths({
+            "pullFilesEvidenceComplete": True, "files": rest_files
+        }) is None
+    ):
+        raise CiEvidenceError("complete rename-aware GitHub REST file evidence invalid")
+
+    # Compare the GraphQL snapshot to REST when present. GitHub may truncate
+    # GraphQL's list at 100, but even a truncated snapshot may not disagree.
+    graphql_files = pr.get("files")
+    if not isinstance(graphql_files, list) or len(graphql_files) > count:
+        raise CiEvidenceError("complete rename-aware PR GraphQL file evidence invalid")
+    graphql_paths = [
+        item.get("path") for item in graphql_files if isinstance(item, dict)
+    ]
+    rest_paths = {item["path"] for item in rest_files}
+    if (
+        len(graphql_paths) != len(graphql_files)
+        or any(not isinstance(path, str) or not path for path in graphql_paths)
+        or len(set(graphql_paths)) != len(graphql_paths)
+        or not set(graphql_paths).issubset(rest_paths)
+    ):
+        raise CiEvidenceError("complete rename-aware REST/GraphQL path evidence drifted")
+    return {**pr, "files": rest_files, "pullFilesEvidenceComplete": True}
+
+
 def _known_pr_diff_limit_error(message: str, *, changed_files: Any) -> bool:
     """Only GitHub's known 406 line/file limit can use local identity."""
     if type(changed_files) is not int or changed_files < 0:
@@ -1230,8 +1283,13 @@ def evaluate_comment_command(args: argparse.Namespace) -> int:
 
     diff_sha256s = current_diff_sha256s(repo_name, args.pr)
     diff_sha256 = diff_sha256s[0]
-    complexity = gate.classify_complexity(pr, None, repo_name=repo_name)
     failures: list[str] = []
+    complexity: dict[str, Any] | None = None
+    try:
+        pr = _require_rename_aware_pr(repo_name, args.pr, pr)
+        complexity = gate.classify_complexity(pr, None, repo_name=repo_name)
+    except CiEvidenceError as exc:
+        failures.append(str(exc))
     status: dict[str, Any] | None = None
     provenance_verified = False
     try:
@@ -1240,7 +1298,7 @@ def evaluate_comment_command(args: argparse.Namespace) -> int:
         )
     except CiEvidenceError as exc:
         failures.append(str(exc))
-    if status is not None:
+    if status is not None and complexity is not None:
         failures.extend(
             evaluate_status_projection(
                 status,
@@ -1297,6 +1355,8 @@ def evaluate_comment_command(args: argparse.Namespace) -> int:
         failures.append("PR head changed during review-evidence evaluation")
     if initial_base != final_base:
         failures.append("PR base changed during review-evidence evaluation")
+    if final_pr.get("changedFiles") != pr.get("changedFiles"):
+        failures.append("PR changed-file count drifted during review-evidence evaluation")
 
     if args.publish_status and final_head is not None:
         publish_commit_status(
