@@ -1293,13 +1293,13 @@ def _local_recovery_restore_probe(
     restic_env: dict[str, str],
     durability: dict[str, Any],
     log_path: Path,
-    snapshot_fundus_source: str | None = None,
+    snapshot_fundus_source: str,
 ) -> dict[str, Any]:
     legacy = str(operator.HOME / ".local/share/schauwerk/fundus")
     staged = str(operator.HOME / ".local/state/heim-pc-priorities/.fundus-restic-source")
-    fundus_source = snapshot_fundus_source or legacy
-    if fundus_source not in {legacy, staged}:
+    if not isinstance(snapshot_fundus_source, str) or snapshot_fundus_source not in {legacy, staged}:
         raise RuntimeError("local recovery snapshot Fundus source is unsafe")
+    fundus_source = snapshot_fundus_source
     with tempfile.TemporaryDirectory(prefix="grabowski-local-recovery-") as raw:
         target = Path(raw)
         _run_logged(
@@ -1360,7 +1360,7 @@ def _local_recovery_probe_locked(target_info: dict[str, Any]) -> dict[str, Any]:
         restic_env=restic_env,
         durability=durability,
         log_path=log_path,
-        snapshot_fundus_source=snapshot.get("fundus_source_path"),
+        snapshot_fundus_source=snapshot["fundus_source_path"],
     )
     _run_logged(
         [

@@ -111,17 +111,18 @@ class StagedFundusRecoveryTests(unittest.TestCase):
         self.assertEqual(result["inventory_sha256"], digest)
         self.assertEqual(result["file_count"], 1)
 
-    def test_restoring_arbitrary_path_is_rejected_before_restic(self) -> None:
-        with patch.object(recovery, "_run_logged") as run:
-            with self.assertRaisesRegex(RuntimeError, "Fundus source is unsafe"):
-                recovery._local_recovery_restore_probe(
-                    snapshot_id=self.snapshot_id,
-                    restic_env={},
-                    durability={},
-                    log_path=Path("/tmp/mock-recovery.log"),
-                    snapshot_fundus_source="/home/alex/secret-data",
-                )
-        run.assert_not_called()
+    def test_missing_empty_and_arbitrary_sources_are_rejected_before_restic(self) -> None:
+        for invalid in (None, "", "/home/alex/secret-data", [], {}):
+            with self.subTest(source=repr(invalid)), patch.object(recovery, "_run_logged") as run:
+                with self.assertRaisesRegex(RuntimeError, "Fundus source is unsafe"):
+                    recovery._local_recovery_restore_probe(
+                        snapshot_id=self.snapshot_id,
+                        restic_env={},
+                        durability={},
+                        log_path=Path("/tmp/mock-recovery.log"),
+                        snapshot_fundus_source=invalid,
+                    )
+                run.assert_not_called()
 
     def test_full_probe_threads_validated_staged_source_to_restore(self) -> None:
         import tempfile
