@@ -627,8 +627,12 @@ def parse_codex_app_server_observations(
         for item in models
         if isinstance(item, dict) and item.get("id") == CODEX_SPARK_MODEL
     ]
-    spark_efforts = spark[0].get("supportedReasoningEfforts") if len(spark) == 1 else None
-    if (
+    spark_efforts = (
+        spark[0].get("supportedReasoningEfforts") if len(spark) == 1 else None
+    )
+    # Spark is a separate entitlement.  Its absence must not hide an otherwise
+    # valid main subscription quota; a present but malformed Spark remains denied.
+    if spark and (
         len(spark) != 1
         or spark[0].get("model") != CODEX_SPARK_MODEL
         or spark[0].get("hidden") is not False
@@ -647,30 +651,48 @@ def parse_codex_app_server_observations(
         raise ProbeSchedulerError("Codex provider rate-limit map is invalid")
     main_value = by_limit.get("codex")
     spark_value = by_limit.get(CODEX_SPARK_LIMIT_ID)
-    if not isinstance(main_value, dict) or not isinstance(spark_value, dict):
-        raise ProbeSchedulerError("Codex provider required rate limits are missing")
+    if not isinstance(main_value, dict):
+        raise ProbeSchedulerError("Codex provider main rate limit is missing")
     reset_credits = rate_limit_result.get("rateLimitResetCredits")
     if not isinstance(reset_credits, dict):
         raise ProbeSchedulerError("Codex rate-limit reset-credit state is missing")
     available_count = reset_credits.get("availableCount")
-    if isinstance(available_count, bool) or not isinstance(available_count, int) or available_count != 0:
-        raise ProbeSchedulerError("Codex rate-limit reset credits are not eligible for automatic routing")
+    # A banked reset is an optional, separately activated entitlement, not
+    # purchased usage credits.  Merely observing it does not redeem it.
+    if (
+        isinstance(available_count, bool)
+        or not isinstance(available_count, int)
+        or available_count < 0
+    ):
+        raise ProbeSchedulerError("Codex rate-limit reset credit count is invalid")
     main = _provider_limit_observation(
         pool=CODEX_QUOTA_POOL,
         limit_id="codex",
         value=main_value,
         observed_at=stamp,
     )
-    spark_observation = _provider_limit_observation(
-        pool=CODEX_SPARK_QUOTA_POOL,
-        limit_id=CODEX_SPARK_LIMIT_ID,
-        value=spark_value,
-        observed_at=stamp,
-        expected_limit_name=CODEX_SPARK_LIMIT_NAME,
-    )
-    if main["plan_type"] != spark_observation["plan_type"]:
-        raise ProbeSchedulerError("Codex main and Spark plan types differ")
+    if not spark:
+        if spark_value is not None:
+            raise ProbeSchedulerError(
+                "Codex Spark limit is exposed without a visible model"
+            )
+        spark_observation = _unknown_codex_direct_observation(
+            CODEX_SPARK_QUOTA_POOL, "spark_model_not_listed"
+        )
+    else:
+        if not isinstance(spark_value, dict):
+            raise ProbeSchedulerError("Codex visible Spark model has no rate limit")
+        spark_observation = _provider_limit_observation(
+            pool=CODEX_SPARK_QUOTA_POOL,
+            limit_id=CODEX_SPARK_LIMIT_ID,
+            value=spark_value,
+            observed_at=stamp,
+            expected_limit_name=CODEX_SPARK_LIMIT_NAME,
+        )
+        if main["plan_type"] != spark_observation["plan_type"]:
+            raise ProbeSchedulerError("Codex main and Spark plan types differ")
     return {CODEX_QUOTA_POOL: main, CODEX_SPARK_QUOTA_POOL: spark_observation}
+
 
 def read_json(path: Path, *, required: bool = True) -> tuple[dict[str, Any], bytes]:
     flags = os.O_RDONLY | os.O_CLOEXEC
