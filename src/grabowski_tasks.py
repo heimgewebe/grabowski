@@ -1115,11 +1115,27 @@ def _state_releases_resources(state: str) -> bool:
     return _is_terminal_state(state)
 
 
+def _terminal_stdout_receipt_fields(seal: dict[str, Any]) -> dict[str, Any]:
+    """Project the verified transition seal, not later caller-selected bytes."""
+    proof = _validate_terminal_stdout_seal(seal)
+    fields = {
+        "stdout_capture_status": proof["status"],
+        "captured_stdout_sha256": proof.get("sha256"),
+        "captured_stdout_bytes": proof.get("bytes"),
+        "captured_stdout_truncated": proof.get("truncated"),
+        "captured_stdout_authority": proof["authority"],
+    }
+    if proof["status"] == "unproven":
+        fields["stdout_capture_reason"] = proof["reason"]
+    return fields
+
+
 def _read_existing_outcome_receipt(
     path: Path,
     *,
     transition_sha256: str | None,
     allow_legacy: bool,
+    expected_stdout_seal: dict[str, Any] | None = None,
 ) -> str | None:
     existing = json.loads(path.read_text(encoding="utf-8"))
     existing_digest = existing.get("receipt_sha256")
@@ -1134,6 +1150,26 @@ def _read_existing_outcome_receipt(
         isinstance(existing_terminalization, dict)
         and existing_terminalization.get("transition_sha256") == transition_sha256
     ):
+        if expected_stdout_seal is not None:
+            expected_fields = _terminal_stdout_receipt_fields(expected_stdout_seal)
+            for key, value in expected_fields.items():
+                observed = existing.get(key)
+                if (
+                    key not in existing
+                    or type(observed) is not type(value)
+                    or observed != value
+                ):
+                    raise RuntimeError(
+                        "stored task stdout seal conflicts with terminal transition"
+                    )
+            for key in existing:
+                if (
+                    key.startswith("captured_stdout_")
+                    or key.startswith("stdout_capture_")
+                ) and key not in expected_fields:
+                    raise RuntimeError(
+                        "stored task stdout seal conflicts with terminal transition"
+                    )
         return existing_digest
     if allow_legacy and existing.get("schema_version") == 1:
         return None
@@ -1171,6 +1207,34 @@ def _write_outcome_receipt(
             "leases_revoked_at_unix": terminalization["leases_revoked_at_unix"],
             "recovery_status": terminalization["recovery_status"],
         }
+    expected_stdout_seal: dict[str, Any] | None = None
+    if terminalization is not None:
+        projection = terminalization.get("task_projection")
+        if isinstance(projection, dict) and "stdout_seal" in projection:
+            expected_stdout_seal = _validate_terminal_stdout_seal(
+                projection["stdout_seal"]
+            )
+    # Existing exact transition receipts are historical immutable observations.
+    # Reconciliation after authorized output retention/cleanup must reuse the
+    # create-only receipt, never turn a later mutable stdout read into a new
+    # seal. First publication still revalidates stdout below before linking.
+    replay_candidates = [(primary_path, terminalization is not None)]
+    if terminalization is not None:
+        replay_candidates.append(
+            (TASK_OUTCOMES_DIR / f"{record['task_id']}.lifecycle.json", False)
+        )
+    for replay_path, allow_legacy in replay_candidates:
+        if not replay_path.exists():
+            continue
+        existing_digest = _read_existing_outcome_receipt(
+            replay_path,
+            transition_sha256=transition_sha256,
+            allow_legacy=allow_legacy,
+            expected_stdout_seal=expected_stdout_seal,
+        )
+        if existing_digest is not None:
+            return existing_digest
+
     payload = {
         "schema_version": 2 if terminalization is not None else 1,
         "task_id": record["task_id"],
@@ -1190,6 +1254,16 @@ def _write_outcome_receipt(
     if terminalization is not None:
         payload["kind"] = "grabowski_task_lifecycle_receipt"
         payload["terminalization"] = terminalization_payload
+        projection = terminalization.get("task_projection")
+        # Historical v2 transitions had no output seal: never backfill or
+        # silently upgrade their receipts from later mutable stdout reads.
+        if isinstance(projection, dict) and "stdout_seal" in projection:
+            seal = _validate_terminal_stdout_seal(projection["stdout_seal"])
+            if seal["status"] == "sealed":
+                current_seal = _terminal_stdout_seal(record)
+                if current_seal != seal:
+                    raise RuntimeError("task stdout changed since terminal seal")
+            payload.update(_terminal_stdout_receipt_fields(seal))
     payload["receipt_sha256"] = _sha256_json(
         {key: value for key, value in payload.items() if key != "receipt_sha256"}
     )
@@ -1206,6 +1280,7 @@ def _write_outcome_receipt(
             path,
             transition_sha256=transition_sha256,
             allow_legacy=allow_legacy,
+            expected_stdout_seal=expected_stdout_seal,
         )
         if existing_digest is not None:
             return existing_digest
@@ -1228,6 +1303,7 @@ def _write_outcome_receipt(
                     path,
                     transition_sha256=transition_sha256,
                     allow_legacy=allow_legacy,
+                    expected_stdout_seal=expected_stdout_seal,
                 )
                 if existing_digest is not None:
                     return existing_digest
@@ -6312,6 +6388,193 @@ def _revalidate_local_task_output_root(
         raise RuntimeError("task output parent changed identity during read")
 
 
+def _validate_terminal_stdout_seal(seal: Any) -> dict[str, Any]:
+    """Validate immutable transition data; never rederive it from an output reader."""
+    if not isinstance(seal, dict):
+        raise RuntimeError("task terminal stdout seal is invalid")
+    if seal.get("status") == "unproven":
+        if (
+            set(seal) != {"status", "reason", "authority"}
+            or seal.get("reason") not in {
+                "legacy-unmanaged-output",
+                "remote-transport",
+                "host-unresolved",
+                "output-root-missing",
+                "output-directory-missing",
+                "stdout-missing",
+            }
+            or seal.get("authority") != "none"
+        ):
+            raise RuntimeError("task terminal stdout unproven status is invalid")
+    elif seal.get("status") == "sealed":
+        if (
+            set(seal) != {"status", "sha256", "bytes", "truncated", "authority"}
+            or not isinstance(seal.get("sha256"), str)
+            or SHA256.fullmatch(seal["sha256"]) is None
+            or type(seal.get("bytes")) is not int
+            or not 0 <= seal["bytes"] <= TASK_OUTPUT_MAX_BYTES
+            or type(seal.get("truncated")) is not bool
+            or seal.get("authority") != "operator-uid-observation-only"
+        ):
+            raise RuntimeError("task terminal stdout sealed identity is invalid")
+    else:
+        raise RuntimeError("task terminal stdout seal status is invalid")
+    return dict(seal)
+
+
+def _terminal_stdout_seal(record: dict[str, Any]) -> dict[str, Any]:
+    """Seal retained stdout at terminal transition, never at consumer-read time.
+
+    The capture wrapper fsyncs streams and parent before systemd reports exit.
+    This descriptor read binds the retained bytes to the durable transition.
+    Both stdout and receipt live in the same user trust domain: this is NOT
+    independently authenticated collector execution or immutable Day-1 truth.
+    """
+    def unproven(reason: str) -> dict[str, Any]:
+        return {"status": "unproven", "reason": reason, "authority": "none"}
+
+    if _task_output_contract_version(record) != TASK_OUTPUT_CONTRACT_VERSION:
+        return unproven("legacy-unmanaged-output")
+    try:
+        transport = fleet.fleet_host(str(record.get("host", "")))
+    except (RuntimeError, ValueError, KeyError, OSError):
+        return unproven("host-unresolved")
+    if transport.get("transport") != "local":
+        return unproven("remote-transport")
+    paths = _task_output_paths(record)
+    root = paths["directory"].parent
+    if not root.exists():
+        return unproven("output-root-missing")
+    root_fd, root_before = _open_local_task_output_root(root)
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+    file_flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        directory_flags |= os.O_NOFOLLOW
+        file_flags |= os.O_NOFOLLOW
+    try:
+        try:
+            dir_fd = os.open(paths["directory"].name, directory_flags, dir_fd=root_fd)
+        except FileNotFoundError:
+            return unproven("output-directory-missing")
+        except OSError as exc:
+            raise RuntimeError("task stdout directory could not be opened safely") from exc
+        try:
+            directory_before = os.fstat(dir_fd)
+            linked_directory = os.stat(
+                paths["directory"].name, dir_fd=root_fd, follow_symlinks=False
+            )
+            if (
+                not stat.S_ISDIR(directory_before.st_mode)
+                or _task_output_inode_identity(directory_before)
+                != _task_output_inode_identity(linked_directory)
+                or directory_before.st_uid != root_before.st_uid
+                or directory_before.st_gid != root_before.st_gid
+                or directory_before.st_nlink < 1
+                or stat.S_IMODE(directory_before.st_mode) != 0o700
+            ):
+                raise RuntimeError("task stdout directory identity is unsafe")
+            try:
+                stdout_fd = os.open("stdout.log", file_flags, dir_fd=dir_fd)
+            except FileNotFoundError:
+                return unproven("stdout-missing")
+            except OSError as exc:
+                raise RuntimeError("task stdout could not be opened safely") from exc
+            try:
+                before = os.fstat(stdout_fd)
+                linked = os.stat("stdout.log", dir_fd=dir_fd, follow_symlinks=False)
+                if (
+                    not stat.S_ISREG(before.st_mode)
+                    or stat.S_IMODE(before.st_mode) != 0o600
+                    or before.st_uid != directory_before.st_uid
+                    or before.st_gid != directory_before.st_gid
+                    or before.st_nlink != 1
+                    or _task_output_inode_identity(before)
+                    != _task_output_inode_identity(linked)
+                    or not 0 <= before.st_size <= TASK_OUTPUT_MAX_BYTES
+                ):
+                    raise RuntimeError("task stdout identity is unsafe")
+                # A complete capture wrapper always creates stderr too; do not
+                # seal a lone forged stdout file as a complete capture pair.
+                try:
+                    stderr_fd = os.open("stderr.log", file_flags, dir_fd=dir_fd)
+                except OSError as exc:
+                    raise RuntimeError("task stderr could not be opened safely") from exc
+                try:
+                    err = os.fstat(stderr_fd)
+                    err_link = os.stat("stderr.log", dir_fd=dir_fd, follow_symlinks=False)
+                    if (
+                        not stat.S_ISREG(err.st_mode)
+                        or stat.S_IMODE(err.st_mode) != 0o600
+                        or err.st_uid != directory_before.st_uid
+                        or err.st_gid != directory_before.st_gid
+                        or err.st_nlink != 1
+                        or _task_output_inode_identity(err)
+                        != _task_output_inode_identity(err_link)
+                        or not 0 <= err.st_size <= TASK_OUTPUT_MAX_BYTES
+                    ):
+                        raise RuntimeError("task stderr identity is unsafe")
+                finally:
+                    os.close(stderr_fd)
+                digest = hashlib.sha256()
+                remaining = int(before.st_size)
+                marker = b"<GRABOWSKI_TASK_OUTPUT_TRUNCATED stdout total_bytes="
+                suffix = b""
+                truncated = False
+                os.lseek(stdout_fd, 0, os.SEEK_SET)
+                while remaining:
+                    chunk = os.read(stdout_fd, min(65536, remaining))
+                    if not chunk:
+                        raise RuntimeError("task stdout changed during hash")
+                    digest.update(chunk)
+                    if marker in suffix + chunk:
+                        truncated = True
+                    suffix = (suffix + chunk)[-len(marker):]
+                    remaining -= len(chunk)
+                os.fsync(stdout_fd)
+                after = os.fstat(stdout_fd)
+                linked_after = os.stat(
+                    "stdout.log", dir_fd=dir_fd, follow_symlinks=False
+                )
+                if (
+                    _task_output_inode_identity(after)
+                    != _task_output_inode_identity(before)
+                    or _task_output_inode_identity(linked_after)
+                    != _task_output_inode_identity(before)
+                    or after.st_size != before.st_size
+                    or after.st_mtime_ns != before.st_mtime_ns
+                    or after.st_ctime_ns != before.st_ctime_ns
+                    or linked_after.st_size != before.st_size
+                    or linked_after.st_mtime_ns != before.st_mtime_ns
+                    or linked_after.st_ctime_ns != before.st_ctime_ns
+                ):
+                    raise RuntimeError("task stdout changed during hash")
+            finally:
+                os.close(stdout_fd)
+            dir_after = os.fstat(dir_fd)
+            linked_dir_after = os.stat(
+                paths["directory"].name, dir_fd=root_fd, follow_symlinks=False
+            )
+            if (
+                _task_output_inode_identity(dir_after)
+                != _task_output_inode_identity(directory_before)
+                or _task_output_inode_identity(linked_dir_after)
+                != _task_output_inode_identity(directory_before)
+            ):
+                raise RuntimeError("task stdout directory changed during read")
+            _revalidate_local_task_output_root(root, root_fd, root_before)
+            return _validate_terminal_stdout_seal({
+                "status": "sealed",
+                "sha256": digest.hexdigest(),
+                "bytes": int(before.st_size),
+                "truncated": truncated,
+                "authority": "operator-uid-observation-only",
+            })
+        finally:
+            os.close(dir_fd)
+    finally:
+        os.close(root_fd)
+
+
 def _read_local_task_output_files(
     record: dict[str, Any], max_lines: int
 ) -> dict[str, Any] | None:
@@ -6827,6 +7090,11 @@ def _terminal_projection(
     authoritative_unit: str | None = None,
     attempt: int | None = None,
 ) -> dict[str, Any]:
+    capture_record = dict(record)
+    capture_record["attempt"] = int(record["attempt"] if attempt is None else attempt)
+    if launcher is not None:
+        capture_record["launcher_json"] = _canonical_json(launcher)
+    stdout_seal = _terminal_stdout_seal(capture_record)
     return {
         "task_id": record["task_id"],
         "state": state,
@@ -6848,6 +7116,7 @@ def _terminal_projection(
             else _validate_unit(authoritative_unit)
         ),
         "attempt": int(record["attempt"] if attempt is None else attempt),
+        "stdout_seal": stdout_seal,
     }
 
 
@@ -6859,8 +7128,13 @@ def _apply_terminalization_projection(
         "task_id", "state", "updated_at_unix", "launcher_json",
         "last_observation_json", "unit", "authoritative_unit", "attempt",
     }
-    if not isinstance(projection, dict) or set(projection) != required:
+    if (
+        not isinstance(projection, dict)
+        or set(projection) not in (required, required | {"stdout_seal"})
+    ):
         raise RuntimeError("Task terminalization projection is invalid")
+    if "stdout_seal" in projection:
+        _validate_terminal_stdout_seal(projection["stdout_seal"])
     task_id = _validate_task_id(projection["task_id"])
     if task_id != terminalization.get("task_id"):
         raise RuntimeError("Task terminalization projection identity drift")

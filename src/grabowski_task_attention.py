@@ -446,12 +446,28 @@ def _validate_outcome_receipt(
         "observation",
         "receipt_sha256",
     }
+    stdout_seal_extended = False
     schema_version = value.get("schema_version")
     if schema_version == 1:
         if set(value) != base_required:
             raise TaskAttentionIntegrityError("task outcome receipt fields are invalid")
     elif schema_version == 2:
-        if set(value) != base_required | {"kind", "terminalization"}:
+        legacy_fields = base_required | {"kind", "terminalization"}
+        new_stdout_fields = {
+            "stdout_capture_status",
+            "captured_stdout_sha256",
+            "captured_stdout_bytes",
+            "captured_stdout_truncated",
+            "captured_stdout_authority",
+        }
+        if set(value) == legacy_fields:
+            pass  # Existing v2 receipts are historical and not upgraded.
+        elif set(value) in (
+            legacy_fields | new_stdout_fields,
+            legacy_fields | new_stdout_fields | {"stdout_capture_reason"},
+        ):
+            stdout_seal_extended = True
+        else:
             raise TaskAttentionIntegrityError("task lifecycle receipt fields are invalid")
         if value.get("kind") != "grabowski_task_lifecycle_receipt":
             raise TaskAttentionIntegrityError("task lifecycle receipt kind is invalid")
@@ -579,6 +595,91 @@ def _validate_outcome_receipt(
         }:
             raise TaskAttentionIntegrityError("task lifecycle recovery status is invalid")
         task_projection_sha256 = record.get("_task_projection_sha256")
+        if stdout_seal_extended:
+            # Only the durable resource transition owns the new stdout seal.
+            # The task row/receipt is same-UID mutable; neither proves an
+            # independent collector/source authority or a Day-1 binding grant.
+            native = tasks.resources.task_terminalization_record(
+                binding["task_id"], include_projection=True
+            )
+            if (
+                not isinstance(native, dict)
+                or native.get("transition_sha256") != terminalization["transition_sha256"]
+            ):
+                raise TaskAttentionIntegrityError(
+                    "task lifecycle stdout seal has no matching durable transition"
+                )
+            native_projection = native.get("task_projection")
+            native_sha = native.get("task_projection_sha256")
+            expected_projection_keys = {
+                "task_id", "state", "updated_at_unix", "launcher_json",
+                "last_observation_json", "unit", "authoritative_unit",
+                "attempt", "stdout_seal",
+            }
+            if (
+                not isinstance(native_projection, dict)
+                or set(native_projection) != expected_projection_keys
+                or not isinstance(native_sha, str)
+                or SHA256_RE.fullmatch(native_sha) is None
+                or native_sha != _sha256_json(native_projection)
+            ):
+                raise TaskAttentionIntegrityError(
+                    "task lifecycle stdout seal transition projection is invalid"
+                )
+            try:
+                expected_stdout_fields = tasks._terminal_stdout_receipt_fields(
+                    native_projection["stdout_seal"]
+                )
+            except (RuntimeError, ValueError, TypeError) as exc:
+                raise TaskAttentionIntegrityError(
+                    "task lifecycle stdout seal metadata is invalid"
+                ) from exc
+            if set(value) != legacy_fields | set(expected_stdout_fields):
+                raise TaskAttentionIntegrityError(
+                    "task lifecycle stdout seal receipt fields are invalid"
+                )
+            for key, expected in expected_stdout_fields.items():
+                observed = value[key]
+                if type(observed) is not type(expected) or observed != expected:
+                    raise TaskAttentionIntegrityError(
+                        "task lifecycle stdout seal conflicts with durable transition"
+                    )
+            # Bounded attention readers intentionally redact launcher and
+            # observation text. Their projection digest binds the original
+            # eight durable row fields, not the extended stdout-seal projection.
+            # Compare that digest to the native transition's row-only subset;
+            # separately require the full native projection digest above.
+            native_row_projection = {
+                key: item
+                for key, item in native_projection.items()
+                if key != "stdout_seal"
+            }
+            compact_row_sha256 = record.get("_task_projection_sha256")
+            if compact_row_sha256 is not None:
+                if (
+                    not isinstance(compact_row_sha256, str)
+                    or SHA256_RE.fullmatch(compact_row_sha256) is None
+                    or compact_row_sha256 != _sha256_json(native_row_projection)
+                ):
+                    raise TaskAttentionIntegrityError(
+                        "task lifecycle stdout seal row projection hash drift"
+                    )
+            else:
+                expected_row_projection = {
+                    "task_id": record["task_id"],
+                    "state": record["state"],
+                    "updated_at_unix": record["updated_at_unix"],
+                    "launcher_json": record["launcher_json"],
+                    "last_observation_json": record.get("last_observation_json"),
+                    "unit": record["unit"],
+                    "authoritative_unit": tasks._authoritative_unit(record),
+                    "attempt": int(record["attempt"]),
+                }
+                if native_row_projection != expected_row_projection:
+                    raise TaskAttentionIntegrityError(
+                        "task lifecycle stdout seal row projection is invalid"
+                    )
+            task_projection_sha256 = native_sha
         if task_projection_sha256 is None:
             task_projection = {
                 "task_id": record["task_id"],

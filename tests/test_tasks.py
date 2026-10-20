@@ -1624,6 +1624,262 @@ class TaskTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "state does not permit"):
             tasks.server_task_lease_delegation_evidence(owner)
 
+    def _managed_terminal_stdout_fixture(self, retained: bytes) -> tuple[str, Path]:
+        """A managed stdout pair in the exact task-id/attempt output namespace."""
+        item = self._start()
+        identifier = str(item["task"]["task_id"])
+        with tasks._database_connection() as connection:
+            row = connection.execute(
+                "SELECT launcher_json FROM tasks WHERE task_id=?", (identifier,)
+            ).fetchone()
+            launcher = json.loads(str(row["launcher_json"]))
+            launcher[tasks.TASK_OUTPUT_LAUNCHER_BINDING_KEY] = 1
+            connection.execute(
+                "UPDATE tasks SET launcher_json=? WHERE task_id=?",
+                (tasks._canonical_json(launcher), identifier),
+            )
+            connection.commit()
+        paths = tasks._task_output_paths(tasks._row_raw(identifier))
+        directory = paths["directory"]
+        directory.mkdir(mode=0o700)
+        paths["stdout"].write_bytes(retained)
+        paths["stderr"].write_bytes(b"")
+        for stream in ("stdout", "stderr"):
+            os.chmod(paths[stream], 0o600)
+        return identifier, paths["stdout"]
+
+    def test_terminal_stdout_seals_exact_retained_bytes_before_lifecycle_digest(self) -> None:
+        for retained in (
+            b"",
+            b"observed program summary\\n" * 7,
+            b"head\\n<GRABOWSKI_TASK_OUTPUT_TRUNCATED stdout total_bytes=9000000 "
+            b"retained_head_bytes=11 retained_tail_bytes=4>\\ntail",
+        ):
+            with self.subTest(size=len(retained)):
+                identifier, _ = self._managed_terminal_stdout_fixture(retained)
+                with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST):
+                    stored = tasks._set_state(
+                        identifier, "completed",
+                        observation={"state": "completed", "source": "sealed-fixture"},
+                    )
+                receipt = json.loads(
+                    (tasks.TASK_OUTCOMES_DIR / f"{identifier}.json").read_text()
+                )
+                self.assertEqual("sealed", receipt["stdout_capture_status"])
+                self.assertEqual(
+                    hashlib.sha256(retained).hexdigest(),
+                    receipt["captured_stdout_sha256"],
+                )
+                self.assertEqual(len(retained), receipt["captured_stdout_bytes"])
+                self.assertEqual(
+                    b"GRABOWSKI_TASK_OUTPUT_TRUNCATED stdout" in retained,
+                    receipt["captured_stdout_truncated"],
+                )
+                self.assertEqual(
+                    "operator-uid-observation-only",
+                    receipt["captured_stdout_authority"],
+                )
+                self.assertEqual(
+                    tasks._sha256_json(
+                        {key: value for key, value in receipt.items() if key != "receipt_sha256"}
+                    ),
+                    receipt["receipt_sha256"],
+                )
+                self.assertEqual(receipt["receipt_sha256"], stored["lifecycle_receipt_sha256"])
+                self.assertNotIn("observed program summary", str(receipt))
+                transition = tasks.resources.task_terminalization_record(
+                    identifier, include_projection=True
+                )
+                self.assertEqual(
+                    hashlib.sha256(retained).hexdigest(),
+                    transition["task_projection"]["stdout_seal"]["sha256"],
+                )
+
+    def test_terminal_stdout_legacy_and_missing_capture_remain_non_admitting(self) -> None:
+        legacy = self._start()["task"]["task_id"]
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST):
+            tasks._set_state(legacy, "completed")
+        receipt = json.loads(
+            (tasks.TASK_OUTCOMES_DIR / f"{legacy}.json").read_text()
+        )
+        self.assertEqual("unproven", receipt["stdout_capture_status"])
+        self.assertIsNone(receipt["captured_stdout_sha256"])
+        self.assertIsNone(receipt["captured_stdout_bytes"])
+
+        managed, stdout = self._managed_terminal_stdout_fixture(b"secret")
+        stdout.unlink()
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST):
+            tasks._set_state(managed, "completed")
+        receipt = json.loads(
+            (tasks.TASK_OUTCOMES_DIR / f"{managed}.json").read_text()
+        )
+        self.assertEqual("unproven", receipt["stdout_capture_status"])
+        self.assertIsNone(receipt["captured_stdout_sha256"])
+        self.assertEqual("stdout-missing", receipt["stdout_capture_reason"])
+
+    def test_terminal_stdout_symlink_and_hardlink_block_before_terminal_transition(self) -> None:
+        for kind in ("symlink", "hardlink"):
+            with self.subTest(kind=kind):
+                identifier, stdout = self._managed_terminal_stdout_fixture(b"victim")
+                foreign = stdout.with_name("foreign-owner.log")
+                if kind == "symlink":
+                    stdout.unlink()
+                    foreign.write_bytes(b"foreign")
+                    stdout.symlink_to(foreign)
+                else:
+                    os.link(stdout, foreign)
+                with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST):
+                    with self.assertRaisesRegex(RuntimeError, "stdout.*unsafe|stdout.*safely"):
+                        tasks._set_state(identifier, "completed")
+                self.assertEqual("running", tasks._row_raw(identifier)["state"])
+                self.assertIsNone(tasks.resources.task_terminalization_record(identifier))
+
+    def test_terminal_stdout_same_size_mutation_during_hash_fails_closed(self) -> None:
+        identifier, stdout = self._managed_terminal_stdout_fixture(b"original-buffer")
+        original_read = os.read
+        changed = False
+
+        def mutate_on_read(fd: int, size: int) -> bytes:
+            nonlocal changed
+            value = original_read(fd, size)
+            if value and not changed:
+                changed = True
+                stdout.write_bytes(b"replacement-data")
+                current = stdout.stat()
+                os.utime(
+                    stdout,
+                    ns=(current.st_atime_ns, current.st_mtime_ns + 2_000_000_000),
+                )
+            return value
+
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks.os, "read", side_effect=mutate_on_read
+        ):
+            with self.assertRaisesRegex(RuntimeError, "stdout.*changed"):
+                tasks._set_state(identifier, "completed")
+        self.assertTrue(changed)
+        self.assertEqual("running", tasks._row_raw(identifier)["state"])
+        self.assertIsNone(tasks.resources.task_terminalization_record(identifier))
+
+    def test_terminal_stdout_pending_recovery_cannot_reseal_tampered_source(self) -> None:
+        identifier, stdout = self._managed_terminal_stdout_fixture(b"original-record")
+        record = tasks._row_raw(identifier)
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST):
+            projection = tasks._terminal_projection(
+                record, "completed", observation={"state": "completed"}
+            )
+        transition = tasks.resources.begin_task_terminalization(
+            identifier,
+            int(record["attempt"]),
+            record["lease_owner_id"],
+            "completed",
+            tasks._record_resource_keys(record),
+            task_projection=projection,
+            observation_sha256=tasks._sha256_json({"state": "completed"}),
+        )
+        stdout.write_bytes(b"tampered-record")
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST):
+            with self.assertRaisesRegex(RuntimeError, "stdout.*changed"):
+                tasks._apply_terminalization_projection(transition, recovered=True)
+        self.assertIsNone(tasks._row_raw(identifier)["lifecycle_receipt_sha256"])
+        self.assertFalse(
+            (tasks.TASK_OUTCOMES_DIR / f"{identifier}.json").exists()
+        )
+
+    def test_terminal_stdout_existing_sealed_receipt_replays_without_late_reseal(self) -> None:
+        identifier, stdout = self._managed_terminal_stdout_fixture(b"sealed-once")
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST):
+            completed = tasks._set_state(identifier, "completed")
+        receipt_path = tasks.TASK_OUTCOMES_DIR / f"{identifier}.json"
+        original = receipt_path.read_bytes()
+        self.assertEqual(
+            hashlib.sha256(b"sealed-once").hexdigest(),
+            json.loads(original)["captured_stdout_sha256"],
+        )
+        # Post-terminal retention/cleanup may remove mutable output. An
+        # existing canonical receipt is a historical observation, not an
+        # invitation to re-hash or re-attest missing task stdout.
+        stdout.unlink()
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST):
+            replay = tasks._set_state(identifier, "completed")
+        self.assertEqual(completed["lifecycle_receipt_sha256"], replay["lifecycle_receipt_sha256"])
+        self.assertEqual(original, receipt_path.read_bytes())
+
+    def test_terminal_stdout_refuses_incomplete_capture_pair_and_oversized_output(self) -> None:
+        identifier, stdout = self._managed_terminal_stdout_fixture(b"source")
+        stdout.with_name("stderr.log").unlink()
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST):
+            with self.assertRaisesRegex(RuntimeError, "task stderr.*safely"):
+                tasks._set_state(identifier, "completed")
+        self.assertIsNone(tasks.resources.task_terminalization_record(identifier))
+
+        bigger, big_stdout = self._managed_terminal_stdout_fixture(
+            b"x" * (tasks.TASK_OUTPUT_MAX_BYTES + 1)
+        )
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST):
+            with self.assertRaisesRegex(RuntimeError, "task stdout.*unsafe"):
+                tasks._set_state(bigger, "completed")
+        self.assertEqual("running", tasks._row_raw(bigger)["state"])
+
+    def test_terminal_stdout_seal_validator_rejects_forged_status_and_type(self) -> None:
+        valid = {
+            "status": "sealed",
+            "sha256": "f" * 64,
+            "bytes": 0,
+            "truncated": False,
+            "authority": "operator-uid-observation-only",
+        }
+        self.assertEqual(valid, tasks._validate_terminal_stdout_seal(valid))
+        for update in (
+            {"bytes": True},
+            {"bytes": -1},
+            {"sha256": "0" * 63},
+            {"truncated": "false"},
+            {"authority": "independent-root-attested"},
+            {"status": "unproven"},
+        ):
+            with self.subTest(update=update):
+                forged = {**valid, **update}
+                with self.assertRaises(RuntimeError):
+                    tasks._validate_terminal_stdout_seal(forged)
+
+    def test_terminal_stdout_existing_receipt_reseal_cannot_rollback_transition_binding(self) -> None:
+        identifier, _ = self._managed_terminal_stdout_fixture(b"trusted-original")
+        record = tasks._row_raw(identifier)
+        observation = {"state": "completed"}
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST):
+            projection = tasks._terminal_projection(
+                record, "completed", observation=observation
+            )
+            transition = tasks.resources.begin_task_terminalization(
+                identifier,
+                int(record["attempt"]),
+                record["lease_owner_id"],
+                "completed",
+                tasks._record_resource_keys(record),
+                task_projection=projection,
+                observation_sha256=tasks._sha256_json(observation),
+            )
+            tasks._write_outcome_receipt(
+                record, "completed", observation, terminalization=transition
+            )
+        path = tasks.TASK_OUTCOMES_DIR / f"{identifier}.json"
+        attacker = json.loads(path.read_text())
+        self.assertEqual(
+            hashlib.sha256(b"trusted-original").hexdigest(),
+            attacker["captured_stdout_sha256"],
+        )
+        attacker["captured_stdout_sha256"] = "0" * 64
+        attacker["receipt_sha256"] = tasks._sha256_json(
+            {key: value for key, value in attacker.items() if key != "receipt_sha256"}
+        )
+        path.write_text(json.dumps(attacker, sort_keys=True))
+        os.chmod(path, 0o600)
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST):
+            with self.assertRaisesRegex(RuntimeError, "stored task stdout seal.*transition"):
+                tasks._apply_terminalization_projection(transition, recovered=True)
+        self.assertIsNone(tasks._row_raw(identifier)["lifecycle_receipt_sha256"])
+
     def test_terminalization_atomically_revokes_owner_leases_and_binds_lifecycle_receipt(self) -> None:
         result = self._start(
             resource_keys=[
