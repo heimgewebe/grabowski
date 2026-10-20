@@ -631,9 +631,11 @@ def collect_lifecycle_bindings_from_db(
     }
     if not native:
         read_options["temporary_prefix"] = "grabowski-checkout-binding-snapshot."
-        # Public READ_ONLY never copies moving WAL or modifies SQLite SHM.
+        # Public READ_ONLY may replay a byte/hash-verified private tmpfs WAL
+        # copy, never opening the original SQLite SHM for writes.
         # Only explicitly bound internal admission can select the native reader.
         read_options["allow_wal_copy"] = False
+        read_options["allow_private_wal_snapshot"] = True
     # Only a fully validated snapshot rejected on context-manager exit may
     # be retried after a real no-WAL-to-WAL transition.  A malformed schema
     # or partial read is never upgraded into a fresh positive admission.

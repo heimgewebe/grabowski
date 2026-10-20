@@ -18,6 +18,9 @@ INVENTORY_CHANGED_MESSAGE = (
     "Store changed while schema inventory was read; retry inventory"
 )
 COPY_CHUNK_BYTES = 1024 * 1024
+STRICT_PRIVATE_WAL_MAX_BYTES = 2 * 1024 * 1024 * 1024
+STRICT_PRIVATE_WAL_FREE_RESERVE = 64 * 1024 * 1024
+STRICT_PRIVATE_WAL_MAX_WAL_BYTES = 32 * 1024 * 1024
 
 
 def status_identity(status: os.stat_result) -> FileIdentity:
@@ -137,6 +140,296 @@ def readonly_sqlite(path: Path) -> Iterator[sqlite3.Connection]:
         connection.close()
 
 
+
+def _strict_wal_file_fingerprint(
+    path: Path,
+    *,
+    error_type: type[ChangedError],
+    message: str,
+    optional: bool = False,
+) -> tuple[FileIdentity, str] | None:
+    """Pin a named, owner-private regular file and hash actual bytes through its fd."""
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError as exc:
+        if optional and not path.is_symlink():
+            return None
+        raise _changed(error_type, message, cause=exc)
+    except OSError as exc:
+        raise _changed(error_type, message, cause=exc)
+    try:
+        before = os.fstat(descriptor)
+        def identity(info: os.stat_result) -> tuple[FileIdentity, int, int, int]:
+            return (
+                status_identity(info), info.st_uid,
+                stat.S_IMODE(info.st_mode), info.st_nlink,
+            )
+        expected = identity(before)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.geteuid()
+            or before.st_mode & 0o022
+            or (
+                before.st_mode & 0o077
+                and not (
+                    (parent := os.stat(path.parent)).st_uid == os.geteuid()
+                    and stat.S_ISDIR(parent.st_mode)
+                    and not parent.st_mode & 0o077
+                )
+            )
+            or before.st_nlink != 1
+        ):
+            raise _changed(error_type, message)
+        digest = hashlib.sha256()
+        while chunk := os.read(descriptor, COPY_CHUNK_BYTES):
+            digest.update(chunk)
+        try:
+            named = os.lstat(path)
+        except OSError as exc:
+            raise _changed(error_type, message, cause=exc)
+        if identity(os.fstat(descriptor)) != expected or identity(named) != expected:
+            raise _changed(error_type, message)
+        return status_identity(before), digest.hexdigest()
+    finally:
+        os.close(descriptor)
+
+
+def _strict_wal_memory_root(
+    *, error_type: type[ChangedError], message: str,
+) -> Path:
+    """Require private tmpfs with no plaintext disk swap; never fall back to /tmp."""
+    root = Path("/dev/shm")
+    try:
+        info = os.lstat(root)
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != 0
+            or stat.S_IMODE(info.st_mode) != 0o1777
+            or root.resolve(strict=True) != root
+        ):
+            raise _changed(error_type, message)
+        with Path("/proc/self/mountinfo").open(encoding="utf-8") as mounted:
+            tmpfs = any(
+                columns[4] == "/dev/shm" and right.split()[0] == "tmpfs"
+                for line in mounted
+                if " - " in line
+                for left, right in [line.rstrip("\n").split(" - ", 1)]
+                for columns in [left.split()]
+                if len(columns) >= 5 and right.split()
+            )
+        if not tmpfs:
+            raise _changed(error_type, message)
+        with Path("/proc/swaps").open(encoding="utf-8") as swaps:
+            next(swaps)
+            for line in swaps:
+                device = line.split()[0]
+                resolved = Path(os.path.realpath(device))
+                if resolved.name.startswith("zram") and resolved.name[4:].isdigit():
+                    continue
+                if resolved.name.startswith("dm-") and resolved.name[3:].isdigit():
+                    identity = Path("/sys/block") / resolved.name / "dm" / "uuid"
+                    if identity.read_text(encoding="ascii").strip().startswith("CRYPT-"):
+                        continue
+                raise _changed(error_type, message)
+    except (OSError, ValueError, StopIteration) as exc:
+        raise _changed(error_type, message, cause=exc)
+    return root
+
+
+
+def _strict_validate_copied_wal(
+    path: Path, *, error_type: type[ChangedError], message: str,
+) -> None:
+    """Check WAL salts and rolling frame checksums, not just the size/header.
+
+    SQLite can silently ignore a corrupt committed tail and show stale base
+    rows, which is unacceptable for a positive strict READ_ONLY projection.
+    """
+    try:
+        size = path.stat().st_size
+        if size > STRICT_PRIVATE_WAL_MAX_WAL_BYTES or size < 32:
+            raise _changed(error_type, message)
+        with path.open("rb") as source:
+            header = source.read(32)
+            magic = header[:4]
+            order = "little" if magic == bytes.fromhex("377f0682") else "big"
+            page_size = int.from_bytes(header[8:12], "big")
+            if page_size == 1:
+                page_size = 65536
+            if (
+                magic not in (bytes.fromhex("377f0682"), bytes.fromhex("377f0683"))
+                or int.from_bytes(header[4:8], "big") != 3007000
+                or page_size < 512 or page_size > 65536
+                or page_size & (page_size - 1)
+                or size <= 32 or (size - 32) % (page_size + 24) != 0
+            ):
+                raise _changed(error_type, message)
+
+            def roll(data: bytes, first: int, second: int) -> tuple[int, int]:
+                for offset in range(0, len(data), 8):
+                    a = int.from_bytes(data[offset:offset + 4], order)
+                    b = int.from_bytes(data[offset + 4:offset + 8], order)
+                    first = (first + a + second) & 0xffffffff
+                    second = (second + b + first) & 0xffffffff
+                return first, second
+
+            first, second = roll(header[:24], 0, 0)
+            if header[24:32] != first.to_bytes(4, "big") + second.to_bytes(4, "big"):
+                raise _changed(error_type, message)
+            committed = False
+            count = (size - 32) // (page_size + 24)
+            for _ in range(count):
+                frame = source.read(24)
+                page = source.read(page_size)
+                if (
+                    len(frame) != 24 or len(page) != page_size
+                    or frame[8:16] != header[16:24]
+                    or int.from_bytes(frame[0:4], "big") < 1
+                ):
+                    raise _changed(error_type, message)
+                first, second = roll(frame[:8], first, second)
+                first, second = roll(page, first, second)
+                if frame[16:24] != first.to_bytes(4, "big") + second.to_bytes(4, "big"):
+                    raise _changed(error_type, message)
+                committed |= int.from_bytes(frame[4:8], "big") != 0
+            if not committed or source.read(1):
+                raise _changed(error_type, message)
+    except OSError as exc:
+        raise _changed(error_type, message, cause=exc)
+
+
+@contextmanager
+def _strict_private_wal_snapshot(
+    path: Path,
+    *,
+    error_type: type[ChangedError],
+    message: str,
+    max_copy_bytes: int | None,
+) -> Iterator[sqlite3.Connection]:
+    """Replay committed WAL on a private RAM copy, never on original SQLite files.
+
+    Exact named inode/stat AND actual SHA-256 bytes of DB/WAL/SHM must agree
+    before private consumption and after the entire caller observation.
+    Content changes, absent/present transitions and races reject, not retry.
+    Only one large RAM copy at a time is permitted; no disk scratch fallback.
+    """
+    path = path.absolute()
+    if path.resolve(strict=True) != path or path.parent.resolve(strict=True) != path.parent:
+        raise _changed(error_type, message)
+    wal = Path(str(path) + "-wal")
+    shm = Path(str(path) + "-shm")
+    before = {
+        filename: _strict_wal_file_fingerprint(
+            filename, error_type=error_type, message=message,
+            optional=(filename == shm),
+        )
+        for filename in (path, wal, shm)
+    }
+    database_id = before[path]
+    wal_id = before[wal]
+    assert database_id is not None and wal_id is not None
+    wal_size = wal_id[0][2]
+    if wal_size > STRICT_PRIVATE_WAL_MAX_WAL_BYTES:
+        raise _changed(error_type, message)
+    if wal_size <= 32:
+        raise _changed(error_type, message)
+    # Fail closed rather than accepting a truncated WAL that SQLite might ignore.
+    try:
+        with wal.open("rb") as source:
+            header = source.read(32)
+        page = int.from_bytes(header[8:12], "big")
+        if page == 1:
+            page = 65536
+        if (
+            header[:4] not in (bytes.fromhex("377f0682"), bytes.fromhex("377f0683"))
+            or page < 512 or page > 65536 or page & (page - 1)
+            or (wal_size - 32) % (24 + page) != 0
+        ):
+            raise _changed(error_type, message)
+    except OSError as exc:
+        raise _changed(error_type, message, cause=exc)
+    budget = STRICT_PRIVATE_WAL_MAX_BYTES
+    if max_copy_bytes is not None:
+        if not isinstance(max_copy_bytes, int) or max_copy_bytes < 0:
+            raise _changed(error_type, message)
+        budget = min(budget, max_copy_bytes)
+    size = database_id[0][2] + wal_size
+    if size > budget:
+        raise _changed(error_type, message)
+
+    root = _strict_wal_memory_root(error_type=error_type, message=message)
+    directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        try:
+            fcntl.flock(directory_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            raise _changed(error_type, message, cause=exc)
+        stats = os.statvfs(root)
+        if stats.f_bavail * stats.f_frsize < size + STRICT_PRIVATE_WAL_FREE_RESERVE:
+            raise _changed(error_type, message)
+
+        def verify_source() -> None:
+            for filename, fingerprint in before.items():
+                current = _strict_wal_file_fingerprint(
+                    filename, error_type=error_type, message=message,
+                    optional=(filename == shm),
+                )
+                if current != fingerprint:
+                    raise _changed(error_type, message)
+
+        with tempfile.TemporaryDirectory(dir=root, prefix="grabowski-strict-wal-") as directory:
+            snapshot = Path(directory) / path.name
+            snap_wal = Path(str(snapshot) + "-wal")
+            copy_regular_file(
+                path, snapshot, error_type=error_type, message=message,
+                max_bytes=budget,
+            )
+            copy_regular_file(
+                wal, snap_wal, error_type=error_type, message=message,
+                max_bytes=budget - database_id[0][2],
+            )
+            if (
+                _strict_wal_file_fingerprint(
+                    snapshot, error_type=error_type, message=message
+                )[1] != database_id[1]
+                or _strict_wal_file_fingerprint(
+                    snap_wal, error_type=error_type, message=message
+                )[1] != wal_id[1]
+            ):
+                raise _changed(error_type, message)
+            _strict_validate_copied_wal(
+                snap_wal, error_type=error_type, message=message,
+            )
+            verify_source()
+            connection: sqlite3.Connection | None = None
+            try:
+                connection = sqlite3.connect(
+                    snapshot.as_uri() + "?mode=ro", uri=True, timeout=1,
+                )
+                connection.row_factory = sqlite3.Row
+                connection.execute("PRAGMA query_only=ON")
+                connection.execute("PRAGMA trusted_schema=OFF")
+                if connection.execute("PRAGMA journal_mode").fetchone()[0] != "wal":
+                    raise _changed(error_type, message)
+                connection.execute("BEGIN")
+                connection.execute("SELECT name FROM sqlite_master LIMIT 1").fetchall()
+                verify_source()
+                yield connection
+            except sqlite3.Error as exc:
+                raise _changed(error_type, message, cause=exc)
+            finally:
+                if connection is not None:
+                    try:
+                        connection.rollback()
+                    finally:
+                        connection.close()
+                verify_source()
+    finally:
+        os.close(directory_fd)
+
+
+
 @contextmanager
 def inventory_readonly_sqlite(
     path: Path,
@@ -146,12 +439,29 @@ def inventory_readonly_sqlite(
     message: str = INVENTORY_CHANGED_MESSAGE,
     allow_wal_copy: bool = True,
     allow_checkpointed_empty_wal: bool = False,
+    allow_private_wal_snapshot: bool = False,
     max_copy_bytes: int | None = None,
 ) -> Iterator[sqlite3.Connection]:
     wal_path = Path(str(path) + "-wal")
     wal_present = wal_path.exists() or wal_path.is_symlink()
     shm_path = Path(str(path) + "-shm")
-    if not allow_wal_copy and not allow_checkpointed_empty_wal and (
+    if allow_private_wal_snapshot and allow_wal_copy:
+        raise ValueError("Private strict WAL snapshot requires allow_wal_copy=False")
+    if not allow_wal_copy and allow_private_wal_snapshot and wal_present:
+        try:
+            active_wal = os.lstat(wal_path)
+        except OSError as exc:
+            raise _changed(error_type, message, cause=exc)
+        if not stat.S_ISREG(active_wal.st_mode):
+            raise _changed(error_type, message)
+        if active_wal.st_size > 0:
+            with _strict_private_wal_snapshot(
+                path, error_type=error_type, message=message,
+                max_copy_bytes=max_copy_bytes,
+            ) as connection:
+                yield connection
+            return
+    if not allow_wal_copy and not allow_checkpointed_empty_wal and not allow_private_wal_snapshot and (
         wal_present or shm_path.exists() or shm_path.is_symlink()
     ):
         raise _changed(error_type, "Strict read-only snapshot unavailable while SQLite WAL sidecars exist")

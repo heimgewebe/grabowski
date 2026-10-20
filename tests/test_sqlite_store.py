@@ -363,5 +363,203 @@ class SQLiteStoreTests(unittest.TestCase):
             finally:
                 writer.close()
 
+
+    def test_strict_private_wal_snapshot_sees_uncheckpointed_commits_without_source_writes(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "wal-only.sqlite3"
+            writer = sqlite3.connect(database)
+            try:
+                writer.execute("PRAGMA journal_mode=WAL")
+                writer.execute("PRAGMA wal_autocheckpoint=0")
+                writer.execute("CREATE TABLE wal_only(value TEXT)")
+                writer.execute("INSERT INTO wal_only VALUES ('committed')")
+                writer.commit()
+                before = {
+                    p.name: (p.read_bytes(), sqlite_store.status_identity(os.lstat(p)))
+                    for p in root.iterdir()
+                }
+                self.assertIn("wal-only.sqlite3-shm", before)
+                with sqlite_store.inventory_readonly_sqlite(
+                    database,
+                    temporary_prefix="strict-private-wal-test-",
+                    error_type=InventoryChanged,
+                    allow_wal_copy=False,
+                    allow_private_wal_snapshot=True,
+                ) as reader:
+                    self.assertEqual(
+                        "committed",
+                        reader.execute("SELECT value FROM wal_only").fetchone()[0],
+                    )
+                self.assertEqual(
+                    before,
+                    {
+                        p.name: (p.read_bytes(), sqlite_store.status_identity(os.lstat(p)))
+                        for p in root.iterdir()
+                    },
+                )
+            finally:
+                writer.close()
+
+    def test_strict_private_wal_snapshot_rejects_concurrent_commit(self) -> None:
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "race.sqlite3"
+            writer = sqlite3.connect(database)
+            try:
+                writer.execute("PRAGMA journal_mode=WAL")
+                writer.execute("PRAGMA wal_autocheckpoint=0")
+                writer.execute("CREATE TABLE wal_only(value INTEGER)")
+                writer.execute("INSERT INTO wal_only VALUES (1)")
+                writer.commit()
+                with self.assertRaises(InventoryChanged):
+                    with sqlite_store.inventory_readonly_sqlite(
+                        database,
+                        temporary_prefix="strict-private-wal-test-",
+                        error_type=InventoryChanged,
+                        allow_wal_copy=False,
+                        allow_private_wal_snapshot=True,
+                    ) as reader:
+                        self.assertEqual(1, reader.execute("SELECT count(*) FROM wal_only").fetchone()[0])
+                        writer.execute("INSERT INTO wal_only VALUES (2)")
+                        writer.commit()
+            finally:
+                writer.close()
+
+    def test_strict_private_wal_snapshot_rejects_shm_content_mutation(self) -> None:
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "shm-race.sqlite3"
+            writer = sqlite3.connect(database)
+            try:
+                writer.execute("PRAGMA journal_mode=WAL")
+                writer.execute("CREATE TABLE wal_only(value INTEGER)")
+                writer.commit()
+                shm = Path(str(database) + "-shm")
+                with self.assertRaises(InventoryChanged):
+                    with sqlite_store.inventory_readonly_sqlite(
+                        database,
+                        temporary_prefix="strict-private-wal-test-",
+                        error_type=InventoryChanged,
+                        allow_wal_copy=False,
+                        allow_private_wal_snapshot=True,
+                    ) as reader:
+                        self.assertEqual(0, reader.execute("SELECT count(*) FROM wal_only").fetchone()[0])
+                        with shm.open("r+b") as handle:
+                            handle.seek(100)
+                            before_byte = handle.read(1)
+                            handle.seek(100)
+                            handle.write(bytes([before_byte[0] ^ 1]))
+            finally:
+                writer.close()
+
+    def test_strict_private_wal_snapshot_rejects_budget_before_private_copy(self) -> None:
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "budget.sqlite3"
+            writer = sqlite3.connect(database)
+            try:
+                writer.execute("PRAGMA journal_mode=WAL")
+                writer.execute("CREATE TABLE wal_only(value INTEGER)")
+                writer.commit()
+                wal = Path(str(database) + "-wal")
+                budget = database.stat().st_size + wal.stat().st_size - 1
+                with patch.object(
+                    sqlite_store.tempfile,
+                    "TemporaryDirectory",
+                    side_effect=AssertionError("oversize must reject before scratch creation"),
+                ):
+                    with self.assertRaises(InventoryChanged):
+                        with sqlite_store.inventory_readonly_sqlite(
+                            database,
+                            temporary_prefix="strict-private-wal-test-",
+                            error_type=InventoryChanged,
+                            allow_wal_copy=False,
+                            allow_private_wal_snapshot=True,
+                            max_copy_bytes=budget,
+                        ):
+                            pass
+            finally:
+                writer.close()
+
+    def test_strict_private_wal_snapshot_rejects_symlink_sidecar(self) -> None:
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "symlink.sqlite3"
+            writer = sqlite3.connect(database)
+            try:
+                writer.execute("PRAGMA journal_mode=WAL")
+                writer.execute("CREATE TABLE wal_only(value INTEGER)")
+                writer.commit()
+                shm = Path(str(database) + "-shm")
+                shm.rename(Path(str(shm) + ".held"))
+                shm.symlink_to(database)
+                with self.assertRaises(InventoryChanged):
+                    with sqlite_store.inventory_readonly_sqlite(
+                        database,
+                        temporary_prefix="strict-private-wal-test-",
+                        error_type=InventoryChanged,
+                        allow_wal_copy=False,
+                        allow_private_wal_snapshot=True,
+                    ):
+                        pass
+            finally:
+                writer.close()
+
+
+    def test_strict_private_wal_snapshot_rejects_corrupt_header_checksum(self) -> None:
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "bad-header.sqlite3"
+            writer = sqlite3.connect(database)
+            try:
+                writer.execute("PRAGMA journal_mode=WAL")
+                writer.execute("CREATE TABLE rows(value INTEGER)")
+                writer.execute("INSERT INTO rows VALUES (1)")
+                writer.commit()
+                wal = Path(str(database) + "-wal")
+                with wal.open("r+b") as stream:
+                    stream.seek(24)
+                    value = stream.read(1)
+                    stream.seek(24)
+                    stream.write(bytes([value[0] ^ 1]))
+                with self.assertRaises(InventoryChanged):
+                    with sqlite_store.inventory_readonly_sqlite(
+                        database,
+                        temporary_prefix="strict-private-wal-test-",
+                        error_type=InventoryChanged,
+                        allow_wal_copy=False,
+                        allow_private_wal_snapshot=True,
+                    ) as reader:
+                        reader.execute("SELECT count(*) FROM rows").fetchone()
+            finally:
+                writer.close()
+
+    def test_strict_private_wal_snapshot_rejects_corrupt_committed_frame(self) -> None:
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "bad-frame.sqlite3"
+            writer = sqlite3.connect(database)
+            try:
+                writer.execute("PRAGMA journal_mode=WAL")
+                writer.execute("PRAGMA wal_autocheckpoint=0")
+                writer.execute("CREATE TABLE rows(value INTEGER)")
+                writer.execute("INSERT INTO rows VALUES (1)")
+                writer.commit()
+                writer.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                writer.execute("INSERT INTO rows VALUES (2)")
+                writer.commit()
+                wal = Path(str(database) + "-wal")
+                with wal.open("r+b") as stream:
+                    stream.seek(-1, os.SEEK_END)
+                    value = stream.read(1)
+                    stream.seek(-1, os.SEEK_END)
+                    stream.write(bytes([value[0] ^ 1]))
+                with self.assertRaises(InventoryChanged):
+                    with sqlite_store.inventory_readonly_sqlite(
+                        database,
+                        temporary_prefix="strict-private-wal-test-",
+                        error_type=InventoryChanged,
+                        allow_wal_copy=False,
+                        allow_private_wal_snapshot=True,
+                    ) as reader:
+                        reader.execute("SELECT count(*) FROM rows").fetchone()
+            finally:
+                writer.close()
+
 if __name__ == "__main__":
     unittest.main()

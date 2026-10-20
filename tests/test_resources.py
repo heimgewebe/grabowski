@@ -4140,6 +4140,42 @@ class ResourceTests(unittest.TestCase):
         self.assertEqual(before_stat.st_mtime_ns, self.database.stat().st_mtime_ns)
         self.assertEqual(before_files, sorted(p.name for p in self.database.parent.iterdir()))
 
+    def test_resource_readonly_snapshot_replays_active_wal_without_original_sidecar_changes(self) -> None:
+        key = "component:strict-private-resource-snapshot"
+        owner = "operator:strict-private-resource-snapshot"
+        resources.acquire_resources(owner, [key], purpose="before WAL")
+        keeper = sqlite3.connect(self.database)
+        try:
+            self.assertEqual("wal", keeper.execute("PRAGMA journal_mode=WAL").fetchone()[0])
+            keeper.execute("PRAGMA wal_autocheckpoint=0")
+            keeper.execute(
+                "UPDATE leases SET purpose=? WHERE resource_key=?",
+                ("committed in WAL", key),
+            )
+            keeper.commit()
+            wal = Path(str(self.database) + "-wal")
+            self.assertGreater(wal.stat().st_size, 0)
+            before = {
+                file.name: (file.read_bytes(), file.stat().st_mtime_ns)
+                for file in self.database.parent.iterdir()
+            }
+            with patch.object(
+                resources.operator, "_require_operator_mutation",
+                side_effect=AssertionError("READ_ONLY must never enter mutation"),
+            ) as gate:
+                observed = resources.list_resources(owner_id=owner, read_only=True)
+            gate.assert_not_called()
+            self.assertEqual("committed in WAL", observed[0]["purpose"])
+            self.assertEqual(
+                before,
+                {
+                    file.name: (file.read_bytes(), file.stat().st_mtime_ns)
+                    for file in self.database.parent.iterdir()
+                },
+            )
+        finally:
+            keeper.close()
+
     def test_resource_list_denied_mutation_cannot_open_or_migrate_store(self) -> None:
         with (
             patch.object(
