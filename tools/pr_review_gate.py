@@ -1055,6 +1055,63 @@ def _canonical_repo_slug(value: Any) -> str | None:
     return "/".join(parts).lower()
 
 
+def _recovery_authority_path_reason(path: str) -> str | None:
+    """Protect exact external attestation trust paths; never normalize away traversal."""
+    parts = path.split("/")
+    if (
+        path.startswith("/")
+        or "\\" in path
+        or "\x00" in path
+        or any(part in {"", ".", ".."} for part in parts)
+    ):
+        return f"high-critical recovery authority noncanonical changed path: {path}"
+    normalized = path.lower()
+    if normalized in {
+        "validator.py",
+        "ci_selftest.py",
+        "tests/test_validator.py",
+        "tests/test_ci_selftest.py",
+        "keys/allowed_signers",
+    } or normalized.startswith(("keys/", ".github/workflows/")):
+        return f"high-critical recovery authority trust path touched: {path}"
+    return None
+
+
+def _recovery_authority_reasons(
+    pr: dict[str, Any], repo_name: str | None,
+) -> list[str]:
+    """Policy comes from protected Grabowski source, not the external PR branch."""
+    if repo_name != "heimgewebe/recovery-evidence-authority":
+        return []
+    raw = pr.get("files")
+    if not isinstance(raw, list):
+        return []
+    reasons: list[str] = []
+    for entry in raw:
+        if isinstance(entry, str):
+            reason = _recovery_authority_path_reason(entry)
+            if reason is not None:
+                reasons.append(reason)
+            continue
+        if not isinstance(entry, dict):
+            continue
+        current = entry.get("path") or entry.get("filename")
+        if isinstance(current, str):
+            reason = _recovery_authority_path_reason(current)
+            if reason is not None:
+                reasons.append(reason)
+        status = entry.get("status")
+        if isinstance(status, str) and status.lower() == "renamed":
+            previous = entry.get("previous_filename") or entry.get("previousFilename")
+            if not isinstance(previous, str) or not previous:
+                reasons.append("high-critical recovery authority rename origin unavailable")
+            else:
+                reason = _recovery_authority_path_reason(previous)
+                if reason is not None:
+                    reasons.append(reason)
+    return reasons
+
+
 def _is_risk_path(path: str) -> bool:
     normalized = path.lower().lstrip("./")
     return any(normalized == prefix or normalized.startswith(prefix.rstrip("/") + "/") for prefix in RISK_PATH_PREFIXES) or any(marker in normalized for marker in RISK_PATH_MARKERS)
@@ -1133,12 +1190,16 @@ def classify_complexity(
     changed_files = int(pr.get("changedFiles") or 0)
     changed_lines = int(pr.get("additions") or 0) + int(pr.get("deletions") or 0)
     paths = _paths(pr)
-    docs_only = bool(paths) and all(_is_documentation_path(path) for path in paths)
-    very_small_uncomplicated = _is_very_small_uncomplicated_change(paths, changed_files, changed_lines)
     normalized_repo = _canonical_repo_slug(repo_name)
+    recovery_reasons = _recovery_authority_reasons(pr, normalized_repo)
+    docs_only = (
+        bool(paths) and not recovery_reasons
+        and all(_is_documentation_path(path) for path in paths)
+    )
+    very_small_uncomplicated = _is_very_small_uncomplicated_change(paths, changed_files, changed_lines)
     important_repo = normalized_repo in IMPORTANT_REPOS
 
-    high_critical_reasons: list[str] = []
+    high_critical_reasons: list[str] = list(recovery_reasons)
     if not docs_only:
         if changed_files > 15:
             high_critical_reasons.append("many files")
