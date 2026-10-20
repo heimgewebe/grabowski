@@ -1056,6 +1056,88 @@ def _canonical_repo_slug(value: Any) -> str | None:
     return "/".join(parts).lower()
 
 
+def _recovery_authority_path_reason(path: str) -> str | None:
+    """Protect exact external attestation trust paths; never normalize away traversal."""
+    parts = path.split("/")
+    if (
+        path.startswith("/")
+        or "\\" in path
+        or "\x00" in path
+        or any(part in {"", ".", ".."} for part in parts)
+    ):
+        return f"high-critical recovery authority noncanonical changed path: {path}"
+    normalized = path.lower()
+    if normalized in {
+        "validator.py",
+        "ci_selftest.py",
+        "tests/test_validator.py",
+        "tests/test_ci_selftest.py",
+        "keys/allowed_signers",
+    } or normalized.startswith(("keys/", ".github/")):
+        return f"high-critical recovery authority trust path touched: {path}"
+    return None
+
+
+def _recovery_authority_reasons(
+    pr: dict[str, Any], repo_name: str | None,
+) -> list[str]:
+    """Require authenticated change type, including GraphQL rename identity."""
+    if repo_name != "heimgewebe/recovery-evidence-authority":
+        return []
+    raw = pr.get("files")
+    if not isinstance(raw, list) or not raw:
+        return ["high-critical recovery authority changed-file metadata unavailable"]
+    reasons: list[str] = []
+    changed_files = pr.get("changedFiles")
+    if type(changed_files) is not int or changed_files != len(raw):
+        reasons.append("high-critical recovery authority changed-file list incomplete")
+    seen_paths: set[str] = set()
+    for entry in raw:
+        if not isinstance(entry, dict):
+            reasons.append("high-critical recovery authority changed-file entry is untyped")
+            continue
+        current = entry.get("path") or entry.get("filename")
+        if not isinstance(current, str) or not current:
+            reasons.append("high-critical recovery authority changed path unavailable")
+        else:
+            if current in seen_paths:
+                reasons.append(f"high-critical recovery authority duplicate changed path: {current}")
+            seen_paths.add(current)
+            reason = _recovery_authority_path_reason(current)
+            if reason is not None:
+                reasons.append(reason)
+            elif not _is_documentation_path(current):
+                reasons.append(f"high-critical recovery authority code/config path touched: {current}")
+        # gh pr view --json files emits changeType (e.g. RENAMED), not the
+        # REST 'status' field. GraphQL does not provide the rename origin.
+        change_type = entry.get("changeType")
+        if change_type is None:
+            change_type = entry.get("status")
+        if not isinstance(change_type, str):
+            reasons.append("high-critical recovery authority change type unavailable")
+            continue
+        normalized_type = change_type.lower()
+        if normalized_type in {"added", "modified", "removed", "deleted"}:
+            continue
+        if normalized_type == "renamed":
+            previous = (
+                entry.get("previous_filename")
+                or entry.get("previousFilename")
+                or entry.get("previousPath")
+            )
+            if not isinstance(previous, str) or not previous:
+                reasons.append("high-critical recovery authority rename origin unavailable")
+            else:
+                reason = _recovery_authority_path_reason(previous)
+                if reason is not None:
+                    reasons.append(reason)
+                elif not _is_documentation_path(previous):
+                    reasons.append(f"high-critical recovery authority code/config rename origin: {previous}")
+            continue
+        reasons.append("high-critical recovery authority change type not trusted")
+    return reasons
+
+
 def _is_risk_path(path: str) -> bool:
     normalized = path.lower().lstrip("./")
     return any(normalized == prefix or normalized.startswith(prefix.rstrip("/") + "/") for prefix in RISK_PATH_PREFIXES) or any(marker in normalized for marker in RISK_PATH_MARKERS)
@@ -1134,12 +1216,16 @@ def classify_complexity(
     changed_files = int(pr.get("changedFiles") or 0)
     changed_lines = int(pr.get("additions") or 0) + int(pr.get("deletions") or 0)
     paths = _paths(pr)
-    docs_only = bool(paths) and all(_is_documentation_path(path) for path in paths)
-    very_small_uncomplicated = _is_very_small_uncomplicated_change(paths, changed_files, changed_lines)
     normalized_repo = _canonical_repo_slug(repo_name)
+    recovery_reasons = _recovery_authority_reasons(pr, normalized_repo)
+    docs_only = (
+        bool(paths) and not recovery_reasons
+        and all(_is_documentation_path(path) for path in paths)
+    )
+    very_small_uncomplicated = _is_very_small_uncomplicated_change(paths, changed_files, changed_lines)
     important_repo = normalized_repo in IMPORTANT_REPOS
 
-    high_critical_reasons: list[str] = []
+    high_critical_reasons: list[str] = list(recovery_reasons)
     if not docs_only:
         if changed_files > 15:
             high_critical_reasons.append("many files")
@@ -1918,7 +2004,6 @@ def _legacy_external_finding_failures(external_review: dict[str, Any]) -> list[s
         if not isinstance(finding, dict) or not _terminal(finding):
             failures.append(f"external_review finding {index} is not terminally triaged")
     return failures
-
 
 def _external_review_count(external_review: Any) -> int | None:
     if not isinstance(external_review, dict):
