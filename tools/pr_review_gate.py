@@ -1072,7 +1072,7 @@ def _recovery_authority_path_reason(path: str) -> str | None:
         "tests/test_validator.py",
         "tests/test_ci_selftest.py",
         "keys/allowed_signers",
-    } or normalized.startswith(("keys/", ".github/workflows/")):
+    } or normalized.startswith(("keys/", ".github/")):
         return f"high-critical recovery authority trust path touched: {path}"
     return None
 
@@ -1087,6 +1087,9 @@ def _recovery_authority_reasons(
     if not isinstance(raw, list) or not raw:
         return ["high-critical recovery authority changed-file metadata unavailable"]
     reasons: list[str] = []
+    changed_files = pr.get("changedFiles")
+    if type(changed_files) is not int or changed_files != len(raw):
+        reasons.append("high-critical recovery authority changed-file list incomplete")
     for entry in raw:
         if not isinstance(entry, dict):
             reasons.append("high-critical recovery authority changed-file entry is untyped")
@@ -1098,6 +1101,8 @@ def _recovery_authority_reasons(
             reason = _recovery_authority_path_reason(current)
             if reason is not None:
                 reasons.append(reason)
+            elif not _is_documentation_path(current):
+                reasons.append(f"high-critical recovery authority code/config path touched: {current}")
         # gh pr view --json files emits changeType (e.g. RENAMED), not the
         # REST 'status' field. GraphQL does not provide the rename origin.
         change_type = entry.get("changeType")

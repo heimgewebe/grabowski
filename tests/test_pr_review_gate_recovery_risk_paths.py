@@ -109,6 +109,48 @@ class RecoveryEvidenceAuthorityRiskTests(unittest.TestCase):
                 result = gate.classify_complexity(pr, None, repo_name=RECOVERY_REPO)
                 self.assertEqual(result["review_tier"], "high_critical", result)
 
+    def test_incomplete_changed_file_list_is_high_critical_not_documentation(self) -> None:
+        # GitHub's files projection may be partial; an unseen validator is not
+        # ruled out merely because the returned filenames are all docs.
+        pr = {
+            "changedFiles": 2, "additions": 1, "deletions": 1,
+            "files": [{"path": "docs/overview.md", "changeType": "MODIFIED"}],
+        }
+        result = gate.classify_complexity(pr, None, repo_name=RECOVERY_REPO)
+        self.assertEqual(result["review_tier"], "high_critical", result)
+        self.assertTrue(result["independent_review_required"], result)
+
+    def test_invalid_changed_file_count_is_high_critical(self) -> None:
+        for value in (None, True, "1", -1, 0, 2):
+            with self.subTest(changedFiles=value):
+                pr = {
+                    "additions": 1, "deletions": 1,
+                    "files": [{"path": "docs/overview.md", "changeType": "MODIFIED"}],
+                }
+                if value is not None:
+                    pr["changedFiles"] = value
+                result = gate.classify_complexity(pr, None, repo_name=RECOVERY_REPO)
+                self.assertEqual(result["review_tier"], "high_critical", result)
+
+    def test_all_recovery_authority_nondocumentation_paths_are_high_critical(self) -> None:
+        for path in (
+            "conftest.py",
+            "helper.py",
+            "tests/conftest.py",
+            "pyproject.toml",
+            "requirements.txt",
+            ".github/actions/verify/action.yml",
+            ".github/CODEOWNERS",
+            ".github/README.md",
+            "keys/README.md",
+        ):
+            with self.subTest(path=path):
+                self.assert_high_critical([path])
+
+    def test_generic_helper_in_unrelated_repo_remains_standard(self) -> None:
+        result = complexity(["helper.py"], repo="heimgewebe/unrelated-tool")
+        self.assertFalse(result["high_critical"], result)
+
     def test_missing_or_incomplete_path_list_is_explicitly_rejected(self) -> None:
         for pr in (
             {"changedFiles": 1, "files": []},
