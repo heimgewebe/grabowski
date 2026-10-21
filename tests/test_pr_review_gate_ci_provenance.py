@@ -208,6 +208,10 @@ class ReviewEvidenceProvenanceTests(unittest.TestCase):
                 side_effect=[ci.COMMENT_STATE_CURRENT, ci.COMMENT_STATE_CURRENT],
             ),
             mock.patch.object(ci, "current_diff_sha256s", return_value=("b" * 64,)),
+            mock.patch.object(
+                ci.gate, "_load_pull_file_evidence",
+                return_value=[{"path": "src/example.py", "status": "modified"}],
+            ),
             mock.patch.object(ci, "publish_commit_status") as publish,
         ):
             result = ci.evaluate_comment_command(args)
@@ -248,6 +252,10 @@ class ReviewEvidenceProvenanceTests(unittest.TestCase):
                 side_effect=[ci.COMMENT_STATE_CURRENT, ci.COMMENT_STATE_CURRENT],
             ),
             mock.patch.object(ci, "current_diff_sha256s", return_value=("b" * 64,)),
+            mock.patch.object(
+                ci.gate, "_load_pull_file_evidence",
+                return_value=[{"path": "src/example.py", "status": "modified"}],
+            ),
             mock.patch.object(ci, "publish_commit_status") as publish,
         ):
             result = ci.evaluate_comment_command(args)
@@ -294,6 +302,10 @@ class ReviewEvidenceProvenanceTests(unittest.TestCase):
                 side_effect=[ci.COMMENT_STATE_CURRENT, ci.COMMENT_STATE_CURRENT],
             ),
             mock.patch.object(ci, "current_diff_sha256s", return_value=("b" * 64,)),
+            mock.patch.object(
+                ci.gate, "_load_pull_file_evidence",
+                return_value=[{"path": "src/example.py", "status": "modified"}],
+            ),
             mock.patch.object(ci, "publish_commit_status") as publish,
         ):
             result = ci.evaluate_comment_command(args)
