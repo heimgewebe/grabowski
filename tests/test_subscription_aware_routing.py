@@ -91,6 +91,8 @@ class SubscriptionAwareRoutingTests(unittest.TestCase):
         )
 
     def test_live_verified_and_retired_model_availability_is_explicit(self) -> None:
+        # Recent CLI inventory evidence must not post-date the catalog snapshot.
+        self.assertGreaterEqual(self.catalog["observed_at"], "2026-10-21")
         models = self.catalog["models"]
         self.assertEqual(models["claude-opus-5"]["availability"], "live-verified-via-claude-pro")
         self.assertEqual(
