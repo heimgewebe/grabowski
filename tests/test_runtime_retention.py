@@ -4095,6 +4095,8 @@ class RuntimeRetentionTests(unittest.TestCase):
             ROOT / "systemd/grabowski-runtime-retention.service.example"
         ).read_text(encoding="utf-8")
         root = "%h/.local/state/grabowski/retention-receipts"
+        self.assertIn("StateDirectory=grabowski/retention-receipts", unit)
+        self.assertIn("StateDirectoryMode=0700", unit)
         self.assertIn("ExecStartPre=/usr/bin/test -d " + root, unit)
         self.assertIn("ExecStartPre=/usr/bin/test ! -L " + root, unit)
         self.assertNotIn("ExecStartPre=/usr/bin/mkdir", unit)
