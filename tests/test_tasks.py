@@ -1671,10 +1671,9 @@ class TaskTests(unittest.TestCase):
                     receipt["captured_stdout_sha256"],
                 )
                 self.assertEqual(len(retained), receipt["captured_stdout_bytes"])
-                self.assertEqual(
-                    b"GRABOWSKI_TASK_OUTPUT_TRUNCATED stdout" in retained,
-                    receipt["captured_stdout_truncated"],
-                )
+                # A child-authored marker outside the wrapper's reserved layout
+                # must never be accepted as a genuine truncation marker.
+                self.assertFalse(receipt["captured_stdout_truncated"])
                 self.assertEqual(
                     "operator-uid-observation-only",
                     receipt["captured_stdout_authority"],
@@ -1694,6 +1693,45 @@ class TaskTests(unittest.TestCase):
                     hashlib.sha256(retained).hexdigest(),
                     transition["task_projection"]["stdout_seal"]["sha256"],
                 )
+
+    def test_terminal_stdout_truncation_marker_requires_complete_wrapper_layout(self) -> None:
+        # A task may print text that merely *looks* like the wrapper marker.
+        # Only the wrapper's reserved offset plus exact counts and tail form
+        # can establish truncation within the operator-UID observation scope.
+        with patch.object(tasks, "TASK_OUTPUT_MAX_BYTES", 4096), patch.object(
+            tasks, "TASK_OUTPUT_TAIL_BYTES", 512
+        ):
+            head_limit = 4096 - 512 - 256
+            total = 10000
+            genuine_marker = (
+                f"\\n<GRABOWSKI_TASK_OUTPUT_TRUNCATED stdout total_bytes={total} "
+                f"retained_head_bytes={head_limit} retained_tail_bytes=512>\\n"
+            ).encode("ascii").replace(b"\\\\n", b"\\n")
+            cases = (
+                ("wrapper", b"H" * head_limit + genuine_marker + b"T" * 512, True),
+                ("in-head", genuine_marker + b"ordinary output", False),
+                ("wrong-position", b"H" * (head_limit - 1) + genuine_marker + b"T" * 512, False),
+                ("wrong-tail", b"H" * head_limit + genuine_marker + b"T" * 511, False),
+                ("wrong-total", b"H" * head_limit + genuine_marker.replace(
+                    b"total_bytes=10000", b"total_bytes=3000"
+                ) + b"T" * 512, False),
+                ("incomplete", b"H" * head_limit + genuine_marker[:-2] + b"T" * 512, False),
+            )
+            for kind, retained, expected in cases:
+                with self.subTest(kind=kind):
+                    identifier, _ = self._managed_terminal_stdout_fixture(retained)
+                    with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST):
+                        stored = tasks._set_state(identifier, "completed")
+                    self.assertEqual("completed", stored["state"])
+                    receipt = json.loads(
+                        (tasks.TASK_OUTCOMES_DIR / f"{identifier}.json").read_text()
+                    )
+                    self.assertEqual("sealed", receipt["stdout_capture_status"])
+                    self.assertEqual(expected, receipt["captured_stdout_truncated"])
+                    self.assertEqual(
+                        hashlib.sha256(retained).hexdigest(),
+                        receipt["captured_stdout_sha256"],
+                    )
 
     def test_terminal_stdout_legacy_and_missing_capture_remain_non_admitting(self) -> None:
         legacy = self._start()["task"]["task_id"]

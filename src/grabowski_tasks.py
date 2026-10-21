@@ -6538,19 +6538,42 @@ def _terminal_stdout_seal(record: dict[str, Any]) -> dict[str, Any]:
                     os.close(stderr_fd)
                 digest = hashlib.sha256()
                 remaining = int(before.st_size)
-                marker = b"<GRABOWSKI_TASK_OUTPUT_TRUNCATED stdout total_bytes="
-                suffix = b""
                 truncated = False
+                # Only the wrapper may place its marker at this exact offset;
+                # free-form text printed by the child is never a seal flag.
+                marker_reserve = 256
+                marker_offset = (
+                    TASK_OUTPUT_MAX_BYTES - TASK_OUTPUT_TAIL_BYTES - marker_reserve
+                )
                 os.lseek(stdout_fd, 0, os.SEEK_SET)
                 while remaining:
                     chunk = os.read(stdout_fd, min(65536, remaining))
                     if not chunk:
                         return unproven("stdout-changed-during-hash")
                     digest.update(chunk)
-                    if marker in suffix + chunk:
-                        truncated = True
-                    suffix = (suffix + chunk)[-len(marker):]
                     remaining -= len(chunk)
+                if marker_offset > 0 and before.st_size > marker_offset:
+                    marker_window = os.pread(stdout_fd, marker_reserve, marker_offset)
+                    marker_match = re.match(
+                        rb"\\n<GRABOWSKI_TASK_OUTPUT_TRUNCATED stdout "
+                        rb"total_bytes=([1-9][0-9]*) "
+                        rb"retained_head_bytes=([0-9]+) "
+                        rb"retained_tail_bytes=([0-9]+)>\\n",
+                        marker_window,
+                    )
+                    if marker_match:
+                        total_bytes = int(marker_match.group(1))
+                        head_bytes = int(marker_match.group(2))
+                        tail_bytes = int(marker_match.group(3))
+                        truncated = (
+                            head_bytes == marker_offset
+                            and total_bytes > head_bytes
+                            and tail_bytes == min(
+                                TASK_OUTPUT_TAIL_BYTES, total_bytes - head_bytes
+                            )
+                            and before.st_size
+                            == marker_offset + marker_match.end() + tail_bytes
+                        )
                 os.fsync(stdout_fd)
                 after = os.fstat(stdout_fd)
                 try:
