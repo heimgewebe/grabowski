@@ -19,7 +19,7 @@ Codex has a dedicated `codex-sol-review-high` route in addition to its contrast 
 
 ## Verified subscription baselines
 
-The subscription baseline observations date from 2026-07-29; xAI model discovery was refreshed on 2026-08-22. The catalog snapshot dated 2026-09-29 incorporates the recorded Claude Opus 5.5 exact-model and alias-resolution evidence from that day. This scoped Claude refresh does not re-date the other providers’ entitlement or quota observations:
+Subscription baseline observations date from 2026-07-29; xAI model discovery was refreshed on 2026-08-22, and Claude Opus 5.5 exact-model and alias-resolution evidence was recorded on 2026-09-29. The catalog snapshot now dates from 2026-10-21 to include the installed Antigravity CLI model inventory from that date. Updating this aggregate snapshot timestamp does not re-date or revalidate individual providers’ historical entitlement, model access or quota observations:
 
 | Provider | Canonical local plan label | Live evidence | Included routing surface | Excluded cost surfaces |
 | --- | --- | --- | --- | --- |
