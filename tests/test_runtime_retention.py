@@ -4095,10 +4095,17 @@ class RuntimeRetentionTests(unittest.TestCase):
             ROOT / "systemd/grabowski-runtime-retention.service.example"
         ).read_text(encoding="utf-8")
         root = "%h/.local/state/grabowski/retention-receipts"
-        self.assertIn("StateDirectory=grabowski/retention-receipts", unit)
-        self.assertIn("StateDirectoryMode=0700", unit)
-        self.assertIn("ExecStartPre=/usr/bin/test -d " + root, unit)
-        self.assertIn("ExecStartPre=/usr/bin/test ! -L " + root, unit)
+        # systemd 249 resolves StateDirectory in per-user units below
+        # XDG_CONFIG_HOME, not the actual Grabowski state path.
+        self.assertNotIn("StateDirectory=", unit)
+        provision = "ExecStartPre=/usr/bin/install -d -m 0700 -- " + root
+        precheck = "ExecStartPre=/usr/bin/test ! -L " + root
+        verify = "ExecStartPre=/usr/bin/test -d " + root
+        self.assertIn(provision, unit)
+        self.assertIn(verify, unit)
+        self.assertEqual(unit.count(precheck), 2)
+        self.assertLess(unit.index(precheck), unit.index(provision))
+        self.assertLess(unit.index(provision), unit.index(verify))
         self.assertNotIn("ExecStartPre=/usr/bin/mkdir", unit)
 
     def test_missing_receipt_root_never_resets_task_before_failure(self) -> None:
