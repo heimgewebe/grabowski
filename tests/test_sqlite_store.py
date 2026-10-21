@@ -38,6 +38,21 @@ class SQLiteStoreTests(unittest.TestCase):
             self.assertEqual(len(payload), identity[2])
             self.assertEqual(0o600, stat.S_IMODE(target.stat().st_mode))
 
+    def test_copy_regular_file_copies_verified_bounded_prefix_only(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, target = root / "source.wal", root / "private-prefix.wal"
+            original = b"A" * 8192 + b"stale-inactive-physical-tail" * 1024
+            source.write_bytes(original)
+            identity = sqlite_store.copy_regular_file(
+                source, target, error_type=InventoryChanged,
+                max_bytes=8192, copy_bytes=8192,
+            )
+            self.assertEqual(len(original), identity[2])
+            self.assertEqual(original, source.read_bytes())
+            self.assertEqual(original[:8192], target.read_bytes())
+            self.assertEqual(0o600, stat.S_IMODE(target.stat().st_mode))
+
     def test_copy_regular_file_stops_streaming_at_byte_budget(self) -> None:
         with TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -534,6 +549,136 @@ class SQLiteStoreTests(unittest.TestCase):
             finally:
                 writer.close()
 
+    def test_strict_private_wal_snapshot_accepts_restarted_wal_with_stale_tail(self) -> None:
+        # SQLite may checkpoint and reuse the WAL without truncating it.
+        # Physical trailing frames then have obsolete salts, but mxFrame in
+        # the unchanged wal-index identifies the current committed prefix.
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "restarted.sqlite3"
+            writer = sqlite3.connect(database)
+            try:
+                writer.execute("PRAGMA journal_mode=WAL")
+                writer.execute("CREATE TABLE inventory(value TEXT)")
+                writer.executemany(
+                    "INSERT INTO inventory VALUES (?)",
+                    [("payload-" + "x" * 4000,) for _ in range(1400)],
+                )
+                writer.commit()
+                wal = Path(str(database) + "-wal")
+                size_before = wal.stat().st_size
+                self.assertGreater(size_before, 32 + 1000 * (4096 + 24))
+                writer.execute("INSERT INTO inventory VALUES ('restarted-commit')")
+                writer.commit()
+                self.assertEqual(size_before, wal.stat().st_size)
+                self.assertEqual(
+                    1401,
+                    writer.execute("SELECT count(*) FROM inventory").fetchone()[0],
+                )
+                with patch.object(
+                    sqlite_store, "_strict_wal_memory_root", return_value=root,
+                ):
+                    with sqlite_store.inventory_readonly_sqlite(
+                        database,
+                        temporary_prefix="restarted-wal-test-",
+                        error_type=InventoryChanged,
+                        allow_wal_copy=False,
+                        allow_private_wal_snapshot=True,
+                    ) as reader:
+                        self.assertEqual(
+                            1401,
+                            reader.execute("SELECT count(*) FROM inventory").fetchone()[0],
+                        )
+                        self.assertEqual(
+                            "restarted-commit",
+                            reader.execute(
+                                "SELECT value FROM inventory ORDER BY rowid DESC LIMIT 1"
+                            ).fetchone()[0],
+                        )
+            finally:
+                writer.close()
+
+    def test_strict_private_wal_snapshot_accepts_large_inactive_wal_tail(self) -> None:
+        # The 32-MiB limit must apply to *active committed bytes*, not to
+        # stale physical frames left behind after checkpoint/restart.
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "large-tail.sqlite3"
+            writer = sqlite3.connect(database)
+            try:
+                writer.execute("PRAGMA journal_mode=WAL")
+                writer.execute("CREATE TABLE inventory(value TEXT)")
+                writer.executemany(
+                    "INSERT INTO inventory VALUES (?)",
+                    [("physical-tail-" + "z" * 4000,) for _ in range(9000)],
+                )
+                writer.commit()
+                wal = Path(str(database) + "-wal")
+                large_size = wal.stat().st_size
+                self.assertGreater(
+                    large_size, sqlite_store.STRICT_PRIVATE_WAL_MAX_WAL_BYTES,
+                )
+                writer.execute("INSERT INTO inventory VALUES ('latest') ")
+                writer.commit()
+                self.assertEqual(large_size, wal.stat().st_size)
+                with patch.object(
+                    sqlite_store, "_strict_wal_memory_root", return_value=root,
+                ):
+                    with sqlite_store.inventory_readonly_sqlite(
+                        database,
+                        temporary_prefix="large-physical-tail-",
+                        error_type=InventoryChanged,
+                        allow_wal_copy=False,
+                        allow_private_wal_snapshot=True,
+                    ) as reader:
+                        self.assertEqual(
+                            9001,
+                            reader.execute("SELECT count(*) FROM inventory").fetchone()[0],
+                        )
+                        self.assertEqual(
+                            "latest",
+                            reader.execute(
+                                "SELECT value FROM inventory ORDER BY rowid DESC LIMIT 1"
+                            ).fetchone()[0],
+                        )
+            finally:
+                writer.close()
+
+    def test_strict_private_wal_snapshot_rejects_forged_wal_index_header(self) -> None:
+        # A forged wal-index mxFrame is never permission to hide committed
+        # frames. The two copies AND their unkeyed header checksums must match.
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "index-fraud.sqlite3"
+            writer = sqlite3.connect(database)
+            try:
+                writer.execute("PRAGMA journal_mode=WAL")
+                writer.execute("CREATE TABLE inventory(value TEXT)")
+                writer.execute("INSERT INTO inventory VALUES ('committed')")
+                writer.commit()
+                wal = Path(str(database) + "-wal")
+                shm = Path(str(database) + "-shm")
+                standalone = root / "standalone-wal-for-validator"
+                standalone.write_bytes(wal.read_bytes())
+                header = shm.read_bytes()[:96]
+                self.assertEqual(96, len(header))
+                self.assertEqual(header[:48], header[48:])
+                for offsets in ((16,), (16, 64)):
+                    bad = bytearray(header)
+                    for offset in offsets:
+                        bad[offset] ^= 1
+                    with self.subTest(offsets=offsets), self.assertRaises(
+                        InventoryChanged
+                    ):
+                        sqlite_store._strict_validate_copied_wal(
+                            standalone,
+                            error_type=InventoryChanged,
+                            message="forged active frame count",
+                            wal_index_header=bytes(bad),
+                        )
+            finally:
+                writer.close()
+
     def test_strict_private_wal_snapshot_preserves_existing_sqlite_wal_write_lock(self) -> None:
         # POSIX process-scoped fcntl locks disappear when *any* descriptor
         # for the locked -shm inode is closed by the SQLite owning process.
@@ -641,6 +786,7 @@ class SQLiteStoreTests(unittest.TestCase):
                 writer.execute("CREATE TABLE wal_only(value INTEGER)")
                 writer.execute("INSERT INTO wal_only VALUES (1)")
                 writer.commit()
+                entered = False
                 with (
                     patch.object(
                         sqlite_store, "_strict_wal_memory_root",
@@ -655,9 +801,11 @@ class SQLiteStoreTests(unittest.TestCase):
                         allow_wal_copy=False,
                         allow_private_wal_snapshot=True,
                     ) as reader:
+                        entered = True
                         self.assertEqual(1, reader.execute("SELECT count(*) FROM wal_only").fetchone()[0])
                         writer.execute("INSERT INTO wal_only VALUES (2)")
                         writer.commit()
+                self.assertTrue(entered, "race test must reach the live reader")
             finally:
                 writer.close()
 
@@ -670,6 +818,7 @@ class SQLiteStoreTests(unittest.TestCase):
                 writer.execute("CREATE TABLE wal_only(value INTEGER)")
                 writer.commit()
                 shm = Path(str(database) + "-shm")
+                entered = False
                 with (
                     patch.object(
                         sqlite_store, "_strict_wal_memory_root",
@@ -684,12 +833,14 @@ class SQLiteStoreTests(unittest.TestCase):
                         allow_wal_copy=False,
                         allow_private_wal_snapshot=True,
                     ) as reader:
+                        entered = True
                         self.assertEqual(0, reader.execute("SELECT count(*) FROM wal_only").fetchone()[0])
                         with shm.open("r+b") as handle:
                             handle.seek(100)
                             before_byte = handle.read(1)
                             handle.seek(100)
                             handle.write(bytes([before_byte[0] ^ 1]))
+                self.assertTrue(entered, "tamper test must reach the live reader")
             finally:
                 writer.close()
 
@@ -701,8 +852,9 @@ class SQLiteStoreTests(unittest.TestCase):
                 writer.execute("PRAGMA journal_mode=WAL")
                 writer.execute("CREATE TABLE wal_only(value INTEGER)")
                 writer.commit()
-                wal = Path(str(database) + "-wal")
-                budget = database.stat().st_size + wal.stat().st_size - 1
+                # Even the minimum possible committed WAL frame cannot fit.
+                # A large physical stale tail is not itself a memory budget.
+                budget = database.stat().st_size + 31
                 with (
                     patch.object(
                         sqlite_store, "_strict_wal_file_fingerprint",
@@ -740,7 +892,10 @@ class SQLiteStoreTests(unittest.TestCase):
                 shm = Path(str(database) + "-shm")
                 shm.rename(Path(str(shm) + ".held"))
                 shm.symlink_to(database)
-                with self.assertRaises(InventoryChanged):
+                with (
+                    patch.object(sqlite_store, "_strict_wal_memory_root", return_value=Path(directory)),
+                    self.assertRaises(InventoryChanged),
+                ):
                     with sqlite_store.inventory_readonly_sqlite(
                         database,
                         temporary_prefix="strict-private-wal-test-",
@@ -773,10 +928,6 @@ class SQLiteStoreTests(unittest.TestCase):
                         sqlite_store, "_strict_wal_memory_root",
                         return_value=Path(directory),
                     ),
-                    patch.object(
-                        sqlite_store, "_strict_validate_copied_wal",
-                        wraps=sqlite_store._strict_validate_copied_wal,
-                    ) as validated,
                     self.assertRaises(InventoryChanged),
                 ):
                     with sqlite_store.inventory_readonly_sqlite(
@@ -787,7 +938,17 @@ class SQLiteStoreTests(unittest.TestCase):
                         allow_private_wal_snapshot=True,
                     ) as reader:
                         reader.execute("SELECT count(*) FROM rows").fetchone()
-                validated.assert_called_once()
+                # Original validation now runs in an isolated child, not via
+                # a patch of the parent function. Check a disposable WAL copy
+                # directly to prove checksum rejection, without touching a
+                # live SQLite sidecar fd in the assertion.
+                corrupted = Path(directory) / "corrupt-standalone.wal"
+                corrupted.write_bytes(wal.read_bytes())
+                with self.assertRaises(InventoryChanged):
+                    sqlite_store._strict_validate_copied_wal(
+                        corrupted, error_type=InventoryChanged,
+                        message="invalid WAL checksum",
+                    )
             finally:
                 writer.close()
 
@@ -815,10 +976,6 @@ class SQLiteStoreTests(unittest.TestCase):
                         sqlite_store, "_strict_wal_memory_root",
                         return_value=Path(directory),
                     ),
-                    patch.object(
-                        sqlite_store, "_strict_validate_copied_wal",
-                        wraps=sqlite_store._strict_validate_copied_wal,
-                    ) as validated,
                     self.assertRaises(InventoryChanged),
                 ):
                     with sqlite_store.inventory_readonly_sqlite(
@@ -829,7 +986,17 @@ class SQLiteStoreTests(unittest.TestCase):
                         allow_private_wal_snapshot=True,
                     ) as reader:
                         reader.execute("SELECT count(*) FROM rows").fetchone()
-                validated.assert_called_once()
+                # Original validation now runs in an isolated child, not via
+                # a patch of the parent function. Check a disposable WAL copy
+                # directly to prove checksum rejection, without touching a
+                # live SQLite sidecar fd in the assertion.
+                corrupted = Path(directory) / "corrupt-standalone.wal"
+                corrupted.write_bytes(wal.read_bytes())
+                with self.assertRaises(InventoryChanged):
+                    sqlite_store._strict_validate_copied_wal(
+                        corrupted, error_type=InventoryChanged,
+                        message="invalid WAL checksum",
+                    )
             finally:
                 writer.close()
 

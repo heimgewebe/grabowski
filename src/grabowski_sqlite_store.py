@@ -74,6 +74,7 @@ def copy_regular_file(
     error_type: type[ChangedError],
     message: str = INVENTORY_CHANGED_MESSAGE,
     max_bytes: int | None = None,
+    copy_bytes: int | None = None,
 ) -> FileIdentity:
     flags = os.O_RDONLY
     if hasattr(os, "O_CLOEXEC"):
@@ -89,10 +90,31 @@ def copy_regular_file(
         if not stat.S_ISREG(before_status.st_mode):
             raise _changed(error_type, message)
         before = status_identity(before_status)
+        if (
+            copy_bytes is not None
+            and (
+                type(copy_bytes) is not int
+                or copy_bytes < 0
+                or copy_bytes > before_status.st_size
+            )
+        ):
+            raise _changed(error_type, message)
         with os.fdopen(os.dup(descriptor), "rb") as source_handle:
             with target.open("xb") as target_handle:
                 copied = 0
-                while chunk := source_handle.read(COPY_CHUNK_BYTES):
+                while True:
+                    request = (
+                        COPY_CHUNK_BYTES
+                        if copy_bytes is None
+                        else min(COPY_CHUNK_BYTES, copy_bytes - copied)
+                    )
+                    if request == 0:
+                        break
+                    chunk = source_handle.read(request)
+                    if not chunk:
+                        if copy_bytes is not None:
+                            raise _changed(error_type, message)
+                        break
                     # A source that grows while it is streamed never writes
                     # past the caller's budget.
                     copied += len(chunk)
@@ -103,7 +125,9 @@ def copy_regular_file(
         target_status = os.lstat(target)
         if (
             not stat.S_ISREG(target_status.st_mode)
-            or target_status.st_size != before_status.st_size
+            or target_status.st_size != (
+                before_status.st_size if copy_bytes is None else copy_bytes
+            )
         ):
             raise _changed(error_type, message)
         if status_identity(os.fstat(descriptor)) != before:
@@ -250,15 +274,18 @@ def _strict_wal_memory_root(
 
 def _strict_validate_copied_wal(
     path: Path, *, error_type: type[ChangedError], message: str,
-) -> None:
-    """Check WAL salts and rolling frame checksums, not just the size/header.
+    wal_index_header: bytes | None = None,
+) -> int:
+    """Validate committed WAL frames and return the safe private replay length.
 
-    SQLite can silently ignore a corrupt committed tail and show stale base
-    rows, which is unacceptable for a positive strict READ_ONLY projection.
+    SQLite reuses a WAL after checkpoint without truncating its physical tail.
+    A validated -shm WalIndexHdr binds mxFrame to the committed prefix; only
+    that prefix may be replayed. A missing index keeps the older conservative
+    full-file validation, never guessing an active boundary from stale salts.
     """
     try:
         size = path.stat().st_size
-        if size > STRICT_PRIVATE_WAL_MAX_WAL_BYTES or size < 32:
+        if size > STRICT_PRIVATE_WAL_MAX_BYTES or size < 32:
             raise _changed(error_type, message)
         with path.open("rb") as source:
             header = source.read(32)
@@ -267,28 +294,71 @@ def _strict_validate_copied_wal(
             page_size = int.from_bytes(header[8:12], "big")
             if page_size == 1:
                 page_size = 65536
+            frame_size = page_size + 24
             if (
                 magic not in (bytes.fromhex("377f0682"), bytes.fromhex("377f0683"))
                 or int.from_bytes(header[4:8], "big") != 3007000
                 or page_size < 512 or page_size > 65536
                 or page_size & (page_size - 1)
-                or size <= 32 or (size - 32) % (page_size + 24) != 0
+                or size <= 32
             ):
                 raise _changed(error_type, message)
 
-            def roll(data: bytes, first: int, second: int) -> tuple[int, int]:
+            def roll(data: bytes, first: int, second: int, *, byte_order: str) -> tuple[int, int]:
                 for offset in range(0, len(data), 8):
-                    a = int.from_bytes(data[offset:offset + 4], order)
-                    b = int.from_bytes(data[offset + 4:offset + 8], order)
+                    a = int.from_bytes(data[offset:offset + 4], byte_order)
+                    b = int.from_bytes(data[offset + 4:offset + 8], byte_order)
                     first = (first + a + second) & 0xffffffff
                     second = (second + b + first) & 0xffffffff
                 return first, second
 
-            first, second = roll(header[:24], 0, 0)
+            first, second = roll(header[:24], 0, 0, byte_order=order)
             if header[24:32] != first.to_bytes(4, "big") + second.to_bytes(4, "big"):
                 raise _changed(error_type, message)
+
+            if wal_index_header is None:
+                if size > STRICT_PRIVATE_WAL_MAX_WAL_BYTES or (size - 32) % frame_size:
+                    raise _changed(error_type, message)
+                count = (size - 32) // frame_size
+                expected_last_pages = None
+                expected_last_checksum = None
+            else:
+                if (
+                    type(wal_index_header) is not bytes
+                    or len(wal_index_header) != 96
+                    or wal_index_header[:48] != wal_index_header[48:]
+                ):
+                    raise _changed(error_type, message)
+                index = wal_index_header[:48]
+                native = sys.byteorder
+                checksum1, checksum2 = roll(index[:40], 0, 0, byte_order=native)
+                index_page_size = int.from_bytes(index[14:16], native)
+                if index_page_size == 1:
+                    index_page_size = 65536
+                count = int.from_bytes(index[16:20], native)
+                expected_last_pages = int.from_bytes(index[20:24], native)
+                expected_last_checksum = (
+                    int.from_bytes(index[24:28], native),
+                    int.from_bytes(index[28:32], native),
+                )
+                if (
+                    int.from_bytes(index[:4], native) != 3007000
+                    or index[4:8] != b"\x00" * 4
+                    or index[12] != 1
+                    or index[13] != (1 if order == "big" else 0)
+                    or index_page_size != page_size
+                    or index[32:40] != header[16:24]
+                    or index[40:48] != (
+                        checksum1.to_bytes(4, native) + checksum2.to_bytes(4, native)
+                    )
+                    or count < 1 or expected_last_pages < 1
+                    or 32 + count * frame_size > size
+                    or 32 + count * frame_size > STRICT_PRIVATE_WAL_MAX_WAL_BYTES
+                ):
+                    raise _changed(error_type, message)
+
             committed = False
-            count = (size - 32) // (page_size + 24)
+            last_pages = 0
             for _ in range(count):
                 frame = source.read(24)
                 page = source.read(page_size)
@@ -298,13 +368,25 @@ def _strict_validate_copied_wal(
                     or int.from_bytes(frame[0:4], "big") < 1
                 ):
                     raise _changed(error_type, message)
-                first, second = roll(frame[:8], first, second)
-                first, second = roll(page, first, second)
+                first, second = roll(frame[:8], first, second, byte_order=order)
+                first, second = roll(page, first, second, byte_order=order)
                 if frame[16:24] != first.to_bytes(4, "big") + second.to_bytes(4, "big"):
                     raise _changed(error_type, message)
-                committed |= int.from_bytes(frame[4:8], "big") != 0
-            if not committed or source.read(1):
+                last_pages = int.from_bytes(frame[4:8], "big")
+                committed |= last_pages != 0
+            if (
+                not committed
+                or (
+                    expected_last_pages is not None
+                    and (
+                        last_pages != expected_last_pages
+                        or (first, second) != expected_last_checksum
+                    )
+                )
+                or (wal_index_header is None and source.read(1))
+            ):
                 raise _changed(error_type, message)
+            return 32 + count * frame_size
     except OSError as exc:
         raise _changed(error_type, message, cause=exc)
 
@@ -341,20 +423,55 @@ def _strict_wal_worker_main(arguments: list[str]) -> int:
                 or not 0 <= budget <= STRICT_PRIVATE_WAL_MAX_BYTES
                 or before[0] is None or before[1] is None
                 or before[1][0][2] <= 32
-                or before[1][0][2] > STRICT_PRIVATE_WAL_MAX_WAL_BYTES
-                or before[0][0][2] + before[1][0][2] > budget
+                or before[1][0][2] > STRICT_PRIVATE_WAL_MAX_BYTES
+                or before[0][0][2] > budget
             ):
                 raise RuntimeError("unsafe strict WAL worker input")
             snapshot = scratch / database.name
             snap_wal = Path(str(snapshot) + "-wal")
+            # All original WAL/-shm reads remain in this child: the parent
+            # must never close a raw fd and drop live SQLite fcntl locks.
+            wal_index_header = None
+            if before[2] is not None:
+                descriptor = os.open(shm, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+                try:
+                    expected = before[2][0]
+                    if (
+                        status_identity(os.fstat(descriptor)) != expected
+                        or status_identity(os.lstat(shm)) != expected
+                    ):
+                        raise RuntimeError("strict WAL index source changed")
+                    wal_index_header = os.read(descriptor, 96)
+                    if (
+                        len(wal_index_header) != 96
+                        or status_identity(os.fstat(descriptor)) != expected
+                        or status_identity(os.lstat(shm)) != expected
+                    ):
+                        raise RuntimeError("strict WAL index header is invalid")
+                finally:
+                    os.close(descriptor)
+            replay_bytes = _strict_validate_copied_wal(
+                wal, error_type=RuntimeError, message=INVENTORY_CHANGED_MESSAGE,
+                wal_index_header=wal_index_header,
+            )
+            if (
+                replay_bytes > STRICT_PRIVATE_WAL_MAX_WAL_BYTES
+                or before[0][0][2] + replay_bytes > budget
+            ):
+                raise RuntimeError("strict WAL active-prefix budget exceeded")
             copy_regular_file(
                 database, snapshot, error_type=RuntimeError,
                 max_bytes=budget,
             )
             copy_regular_file(
                 wal, snap_wal, error_type=RuntimeError,
-                max_bytes=budget - before[0][0][2],
+                max_bytes=budget - before[0][0][2], copy_bytes=replay_bytes,
             )
+            copied_wal = _strict_wal_file_fingerprint(
+                snap_wal, error_type=RuntimeError, message=INVENTORY_CHANGED_MESSAGE,
+            )
+            if copied_wal is None:
+                raise RuntimeError("strict WAL prefix copy missing")
             after = [
                 _strict_wal_file_fingerprint(
                     source, error_type=RuntimeError,
@@ -366,6 +483,12 @@ def _strict_wal_worker_main(arguments: list[str]) -> int:
                 raise RuntimeError("strict WAL source changed while copying")
         payload = {
             "schema_version": 1,
+            "copied_wal_bytes": replay_bytes if action == "prepare" else None,
+            "copied_wal_sha256": copied_wal[1] if action == "prepare" else None,
+            "wal_index_header": (
+                wal_index_header.hex() if action == "prepare" and wal_index_header is not None
+                else None
+            ),
             "files": [
                 None if observed is None else {
                     "identity": list(observed[0]),
@@ -390,7 +513,10 @@ def _strict_wal_source_worker(
     message: str,
     scratch: Path | None = None,
     budget: int | None = None,
-) -> dict[Path, tuple[FileIdentity, str] | None]:
+) -> tuple[
+    dict[Path, tuple[FileIdentity, str] | None], bytes | None,
+    tuple[int, str] | None,
+]:
     """Isolate all raw original SQLite fd close() calls from the owning process.
 
     POSIX fcntl locks are process-wide. Closing even an unrelated raw -shm
@@ -423,13 +549,43 @@ def _strict_wal_source_worker(
         response = json.loads(result.stdout)
         if (
             not isinstance(response, dict)
-            or set(response) != {"schema_version", "files"}
+            or set(response) != {
+                "schema_version", "files", "wal_index_header",
+                "copied_wal_bytes", "copied_wal_sha256",
+            }
             or type(response["schema_version"]) is not int
             or response["schema_version"] != 1
             or not isinstance(response["files"], list)
             or len(response["files"]) != 3
         ):
             raise ValueError("strict WAL worker result shape is invalid")
+        encoded_header = response["wal_index_header"]
+        if encoded_header is not None and (
+            action != "prepare"
+            or not isinstance(encoded_header, str)
+            or len(encoded_header) != 192
+            or any(character not in "0123456789abcdef" for character in encoded_header)
+        ):
+            raise ValueError("strict WAL index header response is invalid")
+        wal_index_header = (
+            bytes.fromhex(encoded_header) if encoded_header is not None else None
+        )
+        copied_bytes = response["copied_wal_bytes"]
+        copied_sha = response["copied_wal_sha256"]
+        if action == "prepare":
+            if (
+                type(copied_bytes) is not int
+                or not 32 < copied_bytes <= STRICT_PRIVATE_WAL_MAX_WAL_BYTES
+                or not isinstance(copied_sha, str)
+                or len(copied_sha) != 64
+                or any(ch not in "0123456789abcdef" for ch in copied_sha)
+            ):
+                raise ValueError("strict WAL prefix result invalid")
+            copied_wal = (copied_bytes, copied_sha)
+        else:
+            if copied_bytes is not None or copied_sha is not None:
+                raise ValueError("strict WAL fingerprint supplied copy result")
+            copied_wal = None
         fingerprints: dict[Path, tuple[FileIdentity, str] | None] = {}
         for index, (source, item) in enumerate(
             zip((database, wal, shm), response["files"], strict=True)
@@ -451,7 +607,7 @@ def _strict_wal_source_worker(
             fingerprints[source] = (
                 tuple(item["identity"]), item["sha256"],
             )
-        return fingerprints
+        return fingerprints, wal_index_header, copied_wal
     except (OSError, ValueError, TypeError, subprocess.TimeoutExpired) as exc:
         raise _changed(error_type, message, cause=exc)
 
@@ -488,10 +644,12 @@ def _strict_private_wal_snapshot(
     if (
         not stat.S_ISREG(database_status.st_mode)
         or not stat.S_ISREG(wal_status.st_mode)
-        or wal_status.st_size > STRICT_PRIVATE_WAL_MAX_WAL_BYTES
+        or wal_status.st_size > STRICT_PRIVATE_WAL_MAX_BYTES
         or wal_status.st_size <= 32
-        or database_status.st_size + wal_status.st_size > budget
+        or database_status.st_size + min(wal_status.st_size, 32 + 24 + 512) > budget
     ):
+        # A valid committed WAL needs at least one 512-byte frame. Reject
+        # impossible budgets before scratch, even when its old tail is huge.
         raise _changed(error_type, message)
     root = _strict_wal_memory_root(error_type=error_type, message=message)
     directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
@@ -501,22 +659,25 @@ def _strict_private_wal_snapshot(
         except OSError as exc:
             raise _changed(error_type, message, cause=exc)
         stats = os.statvfs(root)
-        total = database_status.st_size + wal_status.st_size
+        # Only committed bytes can enter the private snapshot, never stale tail.
+        total = database_status.st_size + min(
+            wal_status.st_size, STRICT_PRIVATE_WAL_MAX_WAL_BYTES,
+        )
         if stats.f_bavail * stats.f_frsize < total + STRICT_PRIVATE_WAL_FREE_RESERVE:
             raise _changed(error_type, message)
 
         with tempfile.TemporaryDirectory(dir=root, prefix="grabowski-strict-wal-") as directory:
             snapshot = Path(directory) / path.name
             snap_wal = Path(str(snapshot) + "-wal")
-            before = _strict_wal_source_worker(
+            before, wal_index_header, copied_wal = _strict_wal_source_worker(
                 "prepare", database=path, wal=wal, shm=shm,
                 error_type=error_type, message=message,
                 scratch=Path(directory), budget=budget,
             )
             database_id, wal_id = before[path], before[wal]
             if (
-                database_id is None or wal_id is None
-                or database_id[0][2] + wal_id[0][2] > budget
+                database_id is None or wal_id is None or copied_wal is None
+                or database_id[0][2] + copied_wal[0] > budget
                 or database_id[0][2] != database_status.st_size
                 or wal_id[0][2] != wal_status.st_size
             ):
@@ -528,15 +689,21 @@ def _strict_private_wal_snapshot(
                 )[1] != database_id[1]
                 or _strict_wal_file_fingerprint(
                     snap_wal, error_type=error_type, message=message,
-                )[1] != wal_id[1]
+                )[1] != copied_wal[1]
+                or snap_wal.stat().st_size != copied_wal[0]
             ):
                 raise _changed(error_type, message)
-            _strict_validate_copied_wal(
+            replay_bytes = _strict_validate_copied_wal(
                 snap_wal, error_type=error_type, message=message,
+                wal_index_header=wal_index_header,
             )
+            # Exactly the authenticated prefix was copied; SQLite cannot
+            # replay arbitrary stale physical frames from the source tail.
+            if replay_bytes != copied_wal[0]:
+                raise _changed(error_type, message)
 
             def verify_source() -> None:
-                current = _strict_wal_source_worker(
+                current, _, _ = _strict_wal_source_worker(
                     "fingerprint", database=path, wal=wal, shm=shm,
                     error_type=error_type, message=message,
                 )
