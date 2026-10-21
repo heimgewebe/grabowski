@@ -249,8 +249,14 @@ def _archive_internal_manifest_entry(
     return True
 
 
-def _archive_open_private_root(directory: Path) -> int:
-    """Pin a private job-directory inode; never follow its final symlink."""
+def _archive_open_private_root(
+    directory: Path, *, allow_readable_parent: bool = False,
+) -> int:
+    """Pin a root inode; only output parents may be owner-controlled 0755.
+
+    The jobs root and output leaf roots remain fully private (0700). A shared
+    state parent may be readable by other UIDs, but never writable by them.
+    """
     try:
         fd = os.open(
             directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
@@ -261,7 +267,9 @@ def _archive_open_private_root(directory: Path) -> int:
     if (
         not stat.S_ISDIR(metadata.st_mode)
         or metadata.st_uid != os.getuid()
-        or stat.S_IMODE(metadata.st_mode) & 0o077
+        or stat.S_IMODE(metadata.st_mode) & (
+            0o022 if allow_readable_parent else 0o077
+        )
     ):
         os.close(fd)
         raise RuntimeError(f"archive source directory is not private: {directory}")
@@ -1248,28 +1256,39 @@ def build_plan(
     planned_jobs_root_identity = (root_stat.st_dev, root_stat.st_ino)
     jobs_root = _private_directory(jobs_root)
     _archive_require_unchanged_root(jobs_root, pinned.jobs_fd)
-    if archive_root.is_symlink() or receipt_root.is_symlink():
+    authorized_job_effects = _protected_job_retention_authority()
+    if receipt_root.is_symlink() or (
+        authorized_job_effects and archive_root.is_symlink()
+    ):
         raise RuntimeError("retention output roots may not be symlinks")
-    pinned.archive_parent_fd = _archive_open_private_root(archive_root.parent)
-    _archive_require_unchanged_root(archive_root.parent, pinned.archive_parent_fd)
-    try:
-        pinned.archive_fd = os.open(
-            archive_root.name,
-            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
-            dir_fd=pinned.archive_parent_fd,
+    # Automatic job effects have no protected root/index authority yet.
+    # Do not require or open any archive parent during independent task and
+    # worker maintenance. A missing archived-data tree is not task authority.
+    if authorized_job_effects:
+        pinned.archive_parent_fd = _archive_open_private_root(
+            archive_root.parent, allow_readable_parent=True
         )
-    except FileNotFoundError:
-        pinned.archive_fd = -1
-    else:
-        archive_stat = os.fstat(pinned.archive_fd)
-        if (
-            not stat.S_ISDIR(archive_stat.st_mode)
-            or archive_stat.st_uid != os.getuid()
-            or stat.S_IMODE(archive_stat.st_mode) & 0o077
-        ):
-            raise RuntimeError("retention archive root is not private")
-        _archive_require_unchanged_root(archive_root, pinned.archive_fd)
-    pinned.receipt_parent_fd = _archive_open_private_root(receipt_root.parent)
+        _archive_require_unchanged_root(archive_root.parent, pinned.archive_parent_fd)
+        try:
+            pinned.archive_fd = os.open(
+                archive_root.name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=pinned.archive_parent_fd,
+            )
+        except FileNotFoundError:
+            pinned.archive_fd = -1
+        else:
+            archive_stat = os.fstat(pinned.archive_fd)
+            if (
+                not stat.S_ISDIR(archive_stat.st_mode)
+                or archive_stat.st_uid != os.getuid()
+                or stat.S_IMODE(archive_stat.st_mode) & 0o077
+            ):
+                raise RuntimeError("retention archive root is not private")
+            _archive_require_unchanged_root(archive_root, pinned.archive_fd)
+    pinned.receipt_parent_fd = _archive_open_private_root(
+        receipt_root.parent, allow_readable_parent=True
+    )
     _archive_require_unchanged_root(receipt_root.parent, pinned.receipt_parent_fd)
     try:
         pinned.receipt_fd = _archive_open_child_root(
@@ -1296,7 +1315,6 @@ def build_plan(
     # Until a protected broker exists, no job archive/reset is permitted,
     # and malformed or unavailable job-only index data must not stop
     # independent task/worker retention.
-    authorized_job_effects = _protected_job_retention_authority()
     index_root_stat = os.fstat(pinned.jobs_fd)
     if (index_root_stat.st_dev, index_root_stat.st_ino) != planned_jobs_root_identity:
         raise RuntimeError("jobs root identity changed before plan index read")
@@ -2147,7 +2165,7 @@ def _validated_plan(plan: dict[str, Any], expected_plan_sha256: str) -> dict[str
         not isinstance(plan, _PinnedRetentionPlan)
         or plan.authorized_sha256 != actual
         or plan.jobs_fd < 0
-        or plan.archive_parent_fd < 0
+        or (plan.get("archive_jobs") and plan.archive_parent_fd < 0)
         or plan.receipt_parent_fd < 0
     ):
         raise RuntimeError("retention plan lacks trusted in-process root custody")

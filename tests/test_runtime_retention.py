@@ -3821,12 +3821,16 @@ class RuntimeRetentionTests(unittest.TestCase):
                     foreign.rename(jobs)
                     swapped[0] = True
 
-            def restore_before_later_open(path: Path) -> int:
+            def restore_before_later_open(
+                path: Path, *, allow_readable_parent: bool = False,
+            ) -> int:
                 if path == jobs and swapped[0] and not restored[0]:
                     jobs.rename(foreign)
                     hidden.rename(jobs)
                     restored[0] = True
-                return original_open(path)
+                return original_open(
+                    path, allow_readable_parent=allow_readable_parent
+                )
 
             state = {
                 name + ".service": self._state(name + ".service")
@@ -4003,6 +4007,69 @@ class RuntimeRetentionTests(unittest.TestCase):
                 ["systemctl", "--user", "reset-failed", task_unit]
             )
             self.assertFalse(archive.exists())
+
+    def test_world_readable_owner_state_parent_does_not_block_task_reset(self) -> None:
+        # The shared ~/.local/state/grabowski parent may be 0755; it must
+        # not be chmodded or mistaken for the private 0700 receipts leaf.
+        # With production job effects disabled, no archive parent is needed.
+        self._simulated_protected_authority.return_value = False
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.chmod(0o755)
+            jobs, receipts = root / "jobs", root / "receipts"
+            archive = root / "absent-parent" / "job-archive"
+            jobs.mkdir(mode=0o700)
+            receipts.mkdir(mode=0o700)
+            self.assertFalse(archive.parent.exists())
+            unit = "grabowski-task-" + "1" * 24 + "-a1.service"
+            task_db = self._task_db(root / "tasks.sqlite3", unit, "failed")
+            plan = RETENTION.build_plan(
+                minimum_job_age_seconds=50, now=1000,
+                jobs_root=jobs, archive_root=archive,
+                receipt_root=receipts, task_db=task_db,
+                failed_units=[unit], unit_states={},
+            )
+            self.assertEqual(plan["archive_jobs"], [])
+            self.assertEqual(plan["reset_failed_units"], [unit])
+            fake_deploy = types.ModuleType("grabowski_self_deploy")
+            fake_deploy.DEPLOY_INDEX_FILENAME = "runtime-deploy-index.json"
+            fake_deploy._deploy_schedule_lock = lambda: nullcontext()
+            fake_base = types.ModuleType("grabowski_mcp")
+            fake_base._append_audit = Mock()
+            fake_base._require_mutations_enabled = Mock()
+            fake_base._require_capability = Mock()
+            reset = Mock(return_value=Mock(returncode=0, stderr=""))
+            with patch.dict("sys.modules", {
+                "grabowski_self_deploy": fake_deploy, "grabowski_mcp": fake_base,
+            }), patch.object(RETENTION, "_run", reset):
+                receipt = RETENTION.apply_plan(
+                    plan, expected_plan_sha256=plan["plan_sha256"]
+                )
+            self.assertTrue(receipt["completed"])
+            reset.assert_called_once_with(
+                ["systemctl", "--user", "reset-failed", unit]
+            )
+            self.assertEqual(root.stat().st_mode & 0o777, 0o755)
+            self.assertFalse(archive.parent.exists())
+            self.assertEqual(receipts.stat().st_mode & 0o777, 0o700)
+
+    def test_group_writable_state_parent_remains_denied(self) -> None:
+        self._simulated_protected_authority.return_value = False
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.chmod(0o775)
+            jobs, receipts = root / "jobs", root / "receipts"
+            jobs.mkdir(mode=0o700)
+            receipts.mkdir(mode=0o700)
+            unit = "grabowski-task-" + "2" * 24 + "-a1.service"
+            task_db = self._task_db(root / "tasks.sqlite3", unit, "failed")
+            with self.assertRaisesRegex(RuntimeError, "writable|private"):
+                RETENTION.build_plan(
+                    minimum_job_age_seconds=50, now=1000,
+                    jobs_root=jobs, archive_root=root / "archive",
+                    receipt_root=receipts, task_db=task_db,
+                    failed_units=[unit], unit_states={},
+                )
 
     def test_unrelated_receipt_temps_do_not_block_task_reset(self) -> None:
         self._simulated_protected_authority.return_value = False
