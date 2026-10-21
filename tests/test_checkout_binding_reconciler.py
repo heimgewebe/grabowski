@@ -1126,7 +1126,12 @@ class CheckoutBindingLiveIntegrationTests(unittest.TestCase):
                 wal_path = Path(str(path) + "-wal")
                 self.assertGreater(wal_path.stat().st_size, 0)
                 before = {item.name: item.read_bytes() for item in Path(tmp).iterdir()}
-                snapshot = collect_lifecycle_bindings_from_db(path)
+                # A unit fixture can use a private temporary copy root; only
+                # production exercises the separately verified tmpfs boundary.
+                with mock.patch.object(
+                    sqlite_store, "_strict_wal_memory_root", return_value=Path(tmp),
+                ):
+                    snapshot = collect_lifecycle_bindings_from_db(path)
                 self.assertIn("key-wal", [row["checkout_key"] for row in snapshot["bindings"]])
                 self.assertEqual(
                     before,
@@ -1174,9 +1179,14 @@ class CheckoutBindingLiveIntegrationTests(unittest.TestCase):
                 keeper.commit()
                 self.assertGreater(Path(str(path) + "-wal").stat().st_size, 0)
                 before = {item.name: item.read_bytes() for item in Path(tmp).iterdir()}
-                with mock.patch(
-                    "grabowski_checkout_binding_reconciler._database_path",
-                    return_value=path,
+                with (
+                    mock.patch(
+                        "grabowski_checkout_binding_reconciler._database_path",
+                        return_value=path,
+                    ),
+                    mock.patch.object(
+                        sqlite_store, "_strict_wal_memory_root", return_value=Path(tmp),
+                    ),
                 ):
                     payload = current_work_surface._reconciliation_payload([REPO])
                 self.assertIsInstance(payload, dict)

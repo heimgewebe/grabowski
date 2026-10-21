@@ -1998,18 +1998,28 @@ class AgentWorkspaceTests(unittest.TestCase):
                             manifest, writer, snapshot, read_only=False
                         )
 
-                with mock.patch.object(
-                    workspace.operator,
-                    "_require_operator_mutation",
-                    side_effect=AssertionError("READ_ONLY must not enter mutation"),
-                ) as gate:
+                with (
+                    mock.patch.object(
+                        workspace.operator,
+                        "_require_operator_mutation",
+                        side_effect=AssertionError("READ_ONLY must not enter mutation"),
+                    ) as gate,
+                    # CI may lack trusted production tmpfs. Bind only this
+                    # hermetic fixture to a test-owned scratch directory.
+                    mock.patch.object(
+                        workspace.resources.sqlite_store,
+                        "_strict_wal_memory_root",
+                        return_value=self.root,
+                    ),
+                ):
                     strict = workspace._writer_handoff_eligibility(
                         manifest, writer, snapshot, read_only=True
                     )
                 gate.assert_not_called()
                 self.assertIn("work_lane_binding_invalid", strict["reasons"])
                 self.assertIn("checkout_lifecycle_unobservable", strict["reasons"])
-                self.assertIn("workspace_lease_unobservable", strict["reasons"])
+                self.assertNotIn("workspace_lease_unobservable", strict["reasons"])
+                self.assertNotIn("workspace_lease_missing", strict["reasons"])
                 for filename, payload in before.items():
                     self.assertEqual(Path(filename).read_bytes(), payload)
         finally:

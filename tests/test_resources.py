@@ -4159,10 +4159,18 @@ class ResourceTests(unittest.TestCase):
                 file.name: (file.read_bytes(), file.stat().st_mtime_ns)
                 for file in self.database.parent.iterdir()
             }
-            with patch.object(
-                resources.operator, "_require_operator_mutation",
-                side_effect=AssertionError("READ_ONLY must never enter mutation"),
-            ) as gate:
+            with (
+                # Hermetic test-only RAM root: CI host may not provide the
+                # production-vetted /dev/shm mount. Never patch production policy.
+                patch.object(
+                    resources.sqlite_store, "_strict_wal_memory_root",
+                    return_value=self.database.parent,
+                ),
+                patch.object(
+                    resources.operator, "_require_operator_mutation",
+                    side_effect=AssertionError("READ_ONLY must never enter mutation"),
+                ) as gate,
+            ):
                 observed = resources.list_resources(owner_id=owner, read_only=True)
             gate.assert_not_called()
             self.assertEqual("committed in WAL", observed[0]["purpose"])

@@ -380,13 +380,21 @@ class SQLiteStoreTests(unittest.TestCase):
                     for p in root.iterdir()
                 }
                 self.assertIn("wal-only.sqlite3-shm", before)
-                with sqlite_store.inventory_readonly_sqlite(
-                    database,
-                    temporary_prefix="strict-private-wal-test-",
-                    error_type=InventoryChanged,
-                    allow_wal_copy=False,
-                    allow_private_wal_snapshot=True,
-                ) as reader:
+                # The CI runner may not expose the trusted production tmpfs
+                # layout. Verify the replay algorithm in this private fixture;
+                # host admission remains covered by separate fail-closed tests.
+                with (
+                    patch.object(
+                        sqlite_store, "_strict_wal_memory_root", return_value=root,
+                    ),
+                    sqlite_store.inventory_readonly_sqlite(
+                        database,
+                        temporary_prefix="strict-private-wal-test-",
+                        error_type=InventoryChanged,
+                        allow_wal_copy=False,
+                        allow_private_wal_snapshot=True,
+                    ) as reader,
+                ):
                     self.assertEqual(
                         "committed",
                         reader.execute("SELECT value FROM wal_only").fetchone()[0],
@@ -397,6 +405,46 @@ class SQLiteStoreTests(unittest.TestCase):
                         p.name: (p.read_bytes(), sqlite_store.status_identity(os.lstat(p)))
                         for p in root.iterdir()
                     },
+                )
+            finally:
+                writer.close()
+
+    def test_strict_private_wal_snapshot_fails_closed_when_ram_root_unavailable(self) -> None:
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "no-secure-ram.sqlite3"
+            writer = sqlite3.connect(database)
+            try:
+                writer.execute("PRAGMA journal_mode=WAL")
+                writer.execute("CREATE TABLE test(value INTEGER)")
+                writer.execute("INSERT INTO test VALUES (1)")
+                writer.commit()
+                before = {
+                    p.name: p.read_bytes()
+                    for p in Path(directory).iterdir()
+                }
+                with (
+                    patch.object(
+                        sqlite_store, "_strict_wal_memory_root",
+                        side_effect=InventoryChanged("untrusted memory root"),
+                    ),
+                    patch.object(
+                        sqlite_store.tempfile, "TemporaryDirectory",
+                        side_effect=AssertionError("no insecure scratch creation"),
+                    ) as temp,
+                ):
+                    with self.assertRaisesRegex(InventoryChanged, "untrusted memory root"):
+                        with sqlite_store.inventory_readonly_sqlite(
+                            database,
+                            temporary_prefix="must-not-copy-",
+                            error_type=InventoryChanged,
+                            allow_wal_copy=False,
+                            allow_private_wal_snapshot=True,
+                        ):
+                            self.fail("Untrusted scratch root must block")
+                temp.assert_not_called()
+                self.assertEqual(
+                    before,
+                    {p.name: p.read_bytes() for p in Path(directory).iterdir()},
                 )
             finally:
                 writer.close()
