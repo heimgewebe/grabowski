@@ -796,6 +796,15 @@ def _live_state(repo: Path, repository: str, pr_number: int) -> dict[str, Any]:
             or sorted(graphql_paths) != sorted(item["path"] for item in rest_files)
         ):
             raise SettlementError("GraphQL and REST PR file paths or counts drift")
+        # Local Git authenticates the complete changed-path set but not the
+        # pairing of REST rename/copy origins with their destinations. Two
+        # renames can swap previousPath while preserving the same path set.
+        # With an oversized GitHub diff there is no immutable compare pairing:
+        # do not promote mutable REST provenance into a review decision.
+        if any(item.get("status") in {"renamed", "copied"} for item in rest_files):
+            raise SettlementError(
+                "oversized PR diff rename/copy provenance is not authenticated"
+            )
         view = {
             "headRefOid": pull_request["headRefOid"],
             "baseRefOid": pull_request["baseRefOid"],

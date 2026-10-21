@@ -2142,5 +2142,52 @@ class CodexReviewLiveLineLimitTests(unittest.TestCase):
             self._live(diagnostic=b"HTTP 406: gateway overloaded")
 
 
+    def test_codex_line_limit_rejects_unversioned_rename_or_copy_metadata(self) -> None:
+        """File-path set equality cannot authenticate a rename/copy source pair."""
+        diagnostic = (
+            b"HTTP 406: Sorry, the diff exceeded the maximum number of lines (20000)"
+        )
+        state = base_state(path="docs/ci.md")
+        del state["diff_sha256"]
+        payload = {"data": {"repository": {"pullRequest": state}}}
+
+        def fake_json(_repo: Path, argv: list[str]):
+            if argv[:3] == ["gh", "api", "graphql"]:
+                return deepcopy(payload)
+            if argv[:3] == ["gh", "pr", "view"]:
+                return {
+                    key: state[key]
+                    for key in ("headRefOid", "baseRefOid", "changedFiles")
+                }
+            raise AssertionError(argv)
+
+        for kind in ("renamed", "copied"):
+            with self.subTest(kind=kind):
+                rest = [{
+                    "path": "docs/ci.md",
+                    "status": kind,
+                    "previousPath": ".github/workflows/ci.yml",
+                }]
+                with (
+                    mock.patch.object(settlement, "_run_json", side_effect=fake_json),
+                    mock.patch.object(settlement.subprocess, "run", return_value=mock.Mock(
+                        returncode=1, stdout=b"", stderr=diagnostic,
+                    )),
+                    mock.patch.object(
+                        settlement.pr_review_gate, "_load_pull_file_evidence",
+                        return_value=rest,
+                    ),
+                    mock.patch.object(
+                        settlement.pr_review_gate, "_local_bound_pr_diff_bytes",
+                        return_value=b"bound local Git diff",
+                    ) as binder,
+                ):
+                    with self.assertRaisesRegex(
+                        settlement.SettlementError, "rename|copy|provenance"
+                    ):
+                        settlement._live_state(ROOT, REPOSITORY, PR)
+                    binder.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
