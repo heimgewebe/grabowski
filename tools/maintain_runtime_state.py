@@ -1021,12 +1021,32 @@ def build_plan(
         key=lambda record: (record["created_at_unix"], record["unit"]),
     )
     archive_candidates: list[dict[str, Any]] = []
-    archive_collisions: set[str] = set()
+    archive_blocked_units: set[str] = set()
     for record in eligible:
         destination = archive_root / record["job_name"]
         if destination.exists() or destination.is_symlink():
-            archive_collisions.add(record["unit"])
+            archive_blocked_units.add(record["unit"])
             block(record["unit"], "archive destination already exists")
+            continue
+        # Only inspect the existing log inodes/lengths. Hashing them here
+        # would be unbounded work for large registries. The apply-side
+        # manifest still rechecks actual contents before any archive move.
+        source_dir = jobs_root / record["job_name"]
+        try:
+            source_dir = _private_directory(source_dir)
+            for filename in ("stdout.log", "stderr.log"):
+                metadata = (source_dir / filename).lstat()
+                if (
+                    not stat.S_ISREG(metadata.st_mode)
+                    or metadata.st_nlink != 1
+                    or metadata.st_uid != os.getuid()
+                    or stat.S_IMODE(metadata.st_mode) & 0o077
+                    or metadata.st_size > MAX_ARCHIVE_FILE_BYTES
+                ):
+                    raise RuntimeError("log is not one bounded private regular file")
+        except (OSError, RuntimeError) as exc:
+            archive_blocked_units.add(record["unit"])
+            block(record["unit"], f"archive source log preflight blocked: {exc}")
             continue
         archive_candidates.append(record)
     archive_jobs = archive_candidates[:max_archive_jobs]
@@ -1059,7 +1079,7 @@ def build_plan(
             if not record["terminal"]:
                 block(unit, "failed job terminality is not proven")
                 continue
-            if unit in archive_collisions:
+            if unit in archive_blocked_units:
                 continue
             if record["archive"] and unit not in selected_archive_units:
                 deferred_failed_units.append({

@@ -4,6 +4,7 @@ from contextlib import nullcontext
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -908,6 +909,132 @@ class RuntimeRetentionTests(unittest.TestCase):
             self.assertEqual(len(plan["archive_jobs"]), 2)
             self.assertEqual(plan["archive_eligible_count"], 3)
             self.assertEqual(plan["archive_deferred_count"], 1)
+
+    def test_nonregular_fifo_log_is_blocked_without_stalling_safe_job(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs = root / "jobs"
+            bad_name = "grabowski-job-eeeeeeeeeeee"
+            safe_name = "grabowski-job-ffffffffffff"
+            malicious = self._job(jobs, bad_name, 100) / "stderr.log"
+            self._job(jobs, safe_name, 101)
+            malicious.unlink()
+            os.mkfifo(malicious, mode=0o600)
+            plan = RETENTION.build_plan(
+                minimum_job_age_seconds=50, now=1_000,
+                jobs_root=jobs, archive_root=root / "archive",
+                receipt_root=root / "receipts", task_db=root / "missing.sqlite3",
+                failed_units=[],
+                unit_states={
+                    bad_name + ".service": self._state(bad_name + ".service"),
+                    safe_name + ".service": self._state(safe_name + ".service"),
+                },
+            )
+            self.assertEqual(
+                [entry["unit"] for entry in plan["archive_jobs"]],
+                [safe_name + ".service"],
+            )
+            self.assertTrue(malicious.is_fifo())
+            self.assertTrue(any(
+                entry["unit"] == bad_name + ".service"
+                and "bounded" in entry["reason"]
+                for entry in plan["blocked"]
+            ))
+
+    def test_oversized_job_logs_do_not_starve_unrelated_archive_or_reset(self) -> None:
+        # Sparse >128MiB logs model the real production failure without
+        # allocating, rewriting, or deleting source evidence.
+        for log_name in ("stdout.log", "stderr.log"):
+            with self.subTest(log=log_name), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                jobs = root / "jobs"
+                oversized = "grabowski-job-aaaaaaaaaaaa"
+                safe = "grabowski-job-bbbbbbbbbbbb"
+                large_path = self._job(jobs, oversized, 100) / log_name
+                self._job(jobs, safe, 101)
+                with large_path.open("r+b") as stream:
+                    stream.truncate(RETENTION.MAX_ARCHIVE_FILE_BYTES + 1)
+                units = [oversized + ".service", safe + ".service"]
+                task_unit = "grabowski-task-" + "a" * 24 + "-a1.service"
+                task_db = self._task_db(root / "tasks.sqlite3", task_unit, "failed")
+                plan = RETENTION.build_plan(
+                    minimum_job_age_seconds=50, now=1_000,
+                    jobs_root=jobs, archive_root=root / "archive",
+                    receipt_root=root / "receipts", task_db=task_db,
+                    failed_units=[*units, task_unit],
+                    unit_states={unit: self._state(unit) for unit in units},
+                )
+                self.assertEqual(
+                    [entry["unit"] for entry in plan["archive_jobs"]],
+                    [safe + ".service"],
+                )
+                self.assertNotIn(oversized + ".service", plan["reset_failed_units"])
+                self.assertIn(safe + ".service", plan["reset_failed_units"])
+                self.assertIn(task_unit, plan["reset_failed_units"])
+                self.assertTrue(any(
+                    entry["unit"] == oversized + ".service"
+                    and "bounded" in entry["reason"]
+                    for entry in plan["blocked"]
+                ))
+                self.assertEqual(
+                    large_path.stat().st_size, RETENTION.MAX_ARCHIVE_FILE_BYTES + 1
+                )
+
+    def test_oversized_log_kept_when_another_job_archives_and_resets(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs, archive, receipts = root / "jobs", root / "archive", root / "receipts"
+            oversized = "grabowski-job-cccccccccccc"
+            safe = "grabowski-job-dddddddddddd"
+            large_path = self._job(jobs, oversized, 100) / "stderr.log"
+            self._job(jobs, safe, 101)
+            with large_path.open("r+b") as stream:
+                stream.truncate(RETENTION.MAX_ARCHIVE_FILE_BYTES + 1)
+            units = [oversized + ".service", safe + ".service"]
+            states = {unit: self._state(unit) for unit in units}
+            plan = RETENTION.build_plan(
+                minimum_job_age_seconds=50, now=1_000,
+                jobs_root=jobs, archive_root=archive, receipt_root=receipts,
+                task_db=root / "missing.sqlite3",
+                failed_units=units, unit_states=states,
+            )
+            self.assertEqual(
+                [entry["unit"] for entry in plan["archive_jobs"]],
+                [safe + ".service"],
+            )
+            fake_deploy = types.ModuleType("grabowski_self_deploy")
+            fake_deploy._deploy_schedule_lock = lambda: nullcontext()
+            fake_deploy._read_deploy_index = lambda _root: None
+            fake_deploy._write_deploy_index = Mock()
+            audit_records: list[dict[str, object]] = []
+            fake_base = types.ModuleType("grabowski_mcp")
+            fake_base._append_audit = audit_records.append
+            fake_base._require_mutations_enabled = Mock()
+            fake_base._require_capability = Mock()
+            reset = Mock(return_value=Mock(returncode=0, stderr=""))
+            with patch.dict("sys.modules", {
+                "grabowski_self_deploy": fake_deploy, "grabowski_mcp": fake_base,
+            }), patch.object(RETENTION, "_run", reset), patch.object(
+                RETENTION, "_systemd_unit_states", return_value=states,
+            ):
+                receipt = RETENTION.apply_plan(
+                    plan, expected_plan_sha256=plan["plan_sha256"]
+                )
+            self.assertTrue(receipt["completed"])
+            self.assertEqual(
+                [item["unit"] for item in receipt["archived_jobs"]],
+                [safe + ".service"],
+            )
+            self.assertTrue((archive / safe / "archive-manifest.json").is_file())
+            self.assertFalse((archive / oversized).exists())
+            self.assertTrue((jobs / oversized / "metadata.json").is_file())
+            self.assertEqual(
+                large_path.stat().st_size, RETENTION.MAX_ARCHIVE_FILE_BYTES + 1
+            )
+            reset.assert_called_once_with([
+                "systemctl", "--user", "reset-failed", safe + ".service"
+            ])
+            self.assertEqual(len(audit_records), 2)
 
     def test_oversized_job_registry_keeps_task_reset_planning_available(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
