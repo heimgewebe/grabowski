@@ -1959,6 +1959,9 @@ class AgentWorkspaceTests(unittest.TestCase):
         try:
             databases = (workspace.resources.RESOURCE_DB, workspace.checkouts.CHECKOUT_DB)
             for connection in keepers:
+                # Ensure active uncheckpointed WAL, not merely -wal/-shm
+                # files: WAL0 is deliberately rejected by strict READ_ONLY.
+                connection.execute("PRAGMA wal_autocheckpoint=0")
                 connection.execute("BEGIN IMMEDIATE")
                 connection.execute("UPDATE metadata SET value=value WHERE key='schema_version'")
                 connection.commit()
@@ -1998,6 +2001,28 @@ class AgentWorkspaceTests(unittest.TestCase):
                             manifest, writer, snapshot, read_only=False
                         )
 
+                # The authorized mutating checks above can checkpoint or
+                # truncate the WAL. Commit a test-only witness immediately
+                # before READ_ONLY to prove actual WAL frames are observable.
+                keepers[0].execute(
+                    "INSERT OR REPLACE INTO metadata(key,value) VALUES(?,?)",
+                    ("writer_handoff_wal_fixture", "strict-resource-observation"),
+                )
+                keepers[0].commit()
+                resource_wal = Path(str(databases[0]) + "-wal")
+                self.assertGreater(
+                    resource_wal.stat().st_size, 32,
+                    "This test must observe uncheckpointed ResourceStore WAL frames",
+                )
+                before = {
+                    str(path): path.read_bytes()
+                    for database in databases
+                    for path in (
+                        database,
+                        Path(str(database) + "-wal"),
+                        Path(str(database) + "-shm"),
+                    )
+                }
                 with (
                     mock.patch.object(
                         workspace.operator,
