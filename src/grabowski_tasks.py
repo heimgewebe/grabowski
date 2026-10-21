@@ -1358,13 +1358,15 @@ class TaskSchemaInventoryChanged(RuntimeError):
 
 @contextmanager
 def _inventory_readonly_sqlite(
-    path: Path, *, allow_wal_copy: bool = True
+    path: Path, *, allow_wal_copy: bool = True,
+    allow_checkpointed_empty_wal: bool = False,
 ) -> Iterator[sqlite3.Connection]:
     with sqlite_store.inventory_readonly_sqlite(
         path,
         temporary_prefix="grabowski-task-schema-inventory-",
         error_type=TaskSchemaInventoryChanged,
         allow_wal_copy=allow_wal_copy,
+        allow_checkpointed_empty_wal=allow_checkpointed_empty_wal,
     ) as connection:
         yield connection
 
@@ -7626,7 +7628,9 @@ def _task_readonly_snapshot() -> Iterator[sqlite3.Connection]:
     """Read without filesystem writes; refuse active WAL sidecars fail-closed."""
     if TASK_DB.is_symlink() or not TASK_DB.is_file() or TASK_DB.stat().st_size == 0:
         raise RuntimeError("Task store cannot be observed without explicit initialization")
-    with _inventory_readonly_sqlite(TASK_DB, allow_wal_copy=False) as connection:
+    with _inventory_readonly_sqlite(
+        TASK_DB, allow_wal_copy=False, allow_checkpointed_empty_wal=True,
+    ) as connection:
         if _task_schema_version(connection) != TASK_CURRENT_SCHEMA_VERSION:
             raise RuntimeError("Task store requires an explicit schema migration")
         _validate_task_schema_current(connection)

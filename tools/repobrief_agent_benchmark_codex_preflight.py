@@ -464,14 +464,30 @@ def _validated_condition_receipt(
         receipt_path=path,
         transcript_root=transcript_root,
     )
-    observed = core._observed_cost(receipt, transcript_root)
-    if not observed.is_finite() or observed < 0:
-        raise core.PreflightError("paired live cost is not verified")
+    provider = receipt.get("provider")
+    if not isinstance(provider, dict):
+        raise core.PreflightError("paired subscription token evidence is missing")
+    tokens: dict[str, int] = {}
+    for key in ("input_tokens", "output_tokens"):
+        value = provider.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise core.PreflightError("paired subscription token evidence is invalid")
+        tokens[key] = value
+    if provider.get("token_source") != "provider_reported":
+        raise core.PreflightError(
+            "paired subscription tokens are not provider-reported"
+        )
+    if provider.get("total_cost_usd") is not None:
+        raise core.PreflightError(
+            "provider-reported USD cost conflicts with subscription-only receipt"
+        )
     return {
         "receipt_sha256": core._sha256_json(receipt),
         "receipt_path": str(path),
         "validator_sha256": core._sha256_json(validated),
-        "observed_cost_usd": format(observed, "f"),
+        "observed_cost_usd": None,
+        "observed_cost_status": "not-reported-by-codex-subscription-stream",
+        **tokens,
     }
 
 
@@ -626,8 +642,11 @@ def execute_authorized_pair(
         # allowance to double. Never expand an external spending authorization.
         if not max_cost_usd.is_finite() or max_cost_usd <= 0:
             raise core.PreflightError("paired provider cost ceiling is invalid")
-        authorized_total = max_cost_usd
-        observed = Decimal("0")
+        # A subscription-only Codex turn reports tokens, not verified dollars.
+        # Keep the legacy USD field bound for compatibility, but never mistake
+        # it for an enforceable credit reservation or a measured expense.
+        input_tokens = 0
+        output_tokens = 0
         with codex_runner._in_process_pair_dispatch_scope(
             authorization=authorization, ordered=ordered
         ):
@@ -646,21 +665,14 @@ def execute_authorized_pair(
                     transcript_root=transcript_root,
                     validator_command=validator_command,
                 )
-                try:
-                    condition_cost = Decimal(results[condition]["observed_cost_usd"])
-                except (InvalidOperation, TypeError, KeyError, ValueError) as exc:
-                    raise core.PreflightError(
-                        "paired provider cost is not verified"
-                    ) from exc
-                if not condition_cost.is_finite() or condition_cost < 0:
-                    raise core.PreflightError("paired provider cost is not verified")
-                observed += condition_cost
-                # Crucial: reject an overspent first condition BEFORE another
-                # irreversible treatment or baseline provider intent.
-                if not observed.is_finite() or observed > authorized_total:
-                    raise core.PreflightError(
-                        "paired provider cost exceeds authorized budget"
-                    )
+                if (
+                    results[condition]["observed_cost_usd"] is not None
+                    or results[condition]["observed_cost_status"]
+                    != "not-reported-by-codex-subscription-stream"
+                ):
+                    raise core.PreflightError("subscription cost evidence is invalid")
+                input_tokens += results[condition]["input_tokens"]
+                output_tokens += results[condition]["output_tokens"]
         if set(results) != {"baseline", "treatment"}:
             raise core.PreflightError("paired dispatch is incomplete")
         ledger = _attest_completed_pair_ledger(
@@ -684,8 +696,16 @@ def execute_authorized_pair(
             "request_sha256": requests,
             "runs": results,
             "cost": {
-                "total_observed_usd": format(observed, "f"),
-                "total_authorized_usd": format(authorized_total, "f"),
+                "mode": "chatgpt_subscription",
+                "total_observed_usd": None,
+                "observed_cost_status": "not-reported-by-codex-subscription-stream",
+                "legacy_cli_max_cost_usd": format(max_cost_usd, "f"),
+                "additional_credits_authorized": False,
+            },
+            "tokens": {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "source": "provider_reported",
             },
             "dispatch_ledger": ledger,
             "source_after_sha256": core._sha256_json(source_after),
