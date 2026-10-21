@@ -5,6 +5,8 @@ from io import StringIO
 from types import SimpleNamespace
 import sqlite3
 import os
+import subprocess
+import sys
 import stat
 from tempfile import TemporaryDirectory
 import unittest
@@ -531,6 +533,63 @@ class SQLiteStoreTests(unittest.TestCase):
                 )
             finally:
                 writer.close()
+
+    def test_strict_private_wal_snapshot_preserves_existing_sqlite_wal_write_lock(self) -> None:
+        # POSIX process-scoped fcntl locks disappear when *any* descriptor
+        # for the locked -shm inode is closed by the SQLite owning process.
+        # Observe lock ownership from another process, never this process.
+        probe = (
+            "import sqlite3,sys\n"
+            "db=sqlite3.connect(sys.argv[1],timeout=0,isolation_level=None)\n"
+            "try:\n"
+            " db.execute('BEGIN IMMEDIATE')\n"
+            "except sqlite3.OperationalError:\n"
+            " print('BLOCKED')\n"
+            "else:\n"
+            " print('ACQUIRED')\n"
+            "finally:\n"
+            " db.close()\n"
+        )
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "live-lock.sqlite3"
+            keeper = sqlite3.connect(database, timeout=0, isolation_level=None)
+            try:
+                keeper.execute("PRAGMA journal_mode=WAL")
+                keeper.execute("PRAGMA wal_autocheckpoint=0")
+                keeper.execute("CREATE TABLE inventory(value TEXT)")
+                keeper.execute("INSERT INTO inventory VALUES ('committed')")
+                keeper.execute("BEGIN IMMEDIATE")
+
+                def probe_lock() -> str:
+                    result = subprocess.run(
+                        [sys.executable, "-I", "-c", probe, str(database)],
+                        check=True, text=True, capture_output=True, timeout=5,
+                    )
+                    return result.stdout.strip()
+
+                self.assertEqual("BLOCKED", probe_lock())
+                with patch.object(
+                    sqlite_store, "_strict_wal_memory_root",
+                    return_value=Path(directory),
+                ):
+                    with sqlite_store.inventory_readonly_sqlite(
+                        database,
+                        temporary_prefix="lock-preservation-",
+                        error_type=InventoryChanged,
+                        allow_wal_copy=False,
+                        allow_private_wal_snapshot=True,
+                    ) as reader:
+                        self.assertEqual(
+                            "committed",
+                            reader.execute("SELECT value FROM inventory").fetchone()[0],
+                        )
+                self.assertEqual(
+                    "BLOCKED", probe_lock(),
+                    "strict READ_ONLY dropped the live SQLite writer's fcntl lock",
+                )
+            finally:
+                keeper.rollback()
+                keeper.close()
 
     def test_strict_private_wal_snapshot_fails_closed_when_ram_root_unavailable(self) -> None:
         with TemporaryDirectory() as directory:

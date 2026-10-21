@@ -4,7 +4,10 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 import fcntl
 import hashlib
+import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 import sqlite3
 import stat
@@ -306,6 +309,153 @@ def _strict_validate_copied_wal(
         raise _changed(error_type, message, cause=exc)
 
 
+def _strict_wal_worker_main(arguments: list[str]) -> int:
+    """Subprocess-only original source fd reads; never run in the SQLite owner."""
+    if (
+        len(arguments) not in (5, 7)
+        or arguments[0] != "--strict-wal-source-worker"
+        or arguments[1] not in {"prepare", "fingerprint"}
+        or (arguments[1] == "prepare") != (len(arguments) == 7)
+    ):
+        return 2
+    action = arguments[1]
+    database, wal, shm = (Path(value) for value in arguments[2:5])
+    source_paths = (database, wal, shm)
+    try:
+        before = [
+            _strict_wal_file_fingerprint(
+                source, error_type=RuntimeError,
+                message=INVENTORY_CHANGED_MESSAGE, optional=(source == shm),
+            )
+            for source in source_paths
+        ]
+        if action == "prepare":
+            scratch = Path(arguments[5])
+            budget = int(arguments[6])
+            metadata = os.lstat(scratch)
+            if (
+                not stat.S_ISDIR(metadata.st_mode)
+                or metadata.st_uid != os.geteuid()
+                or stat.S_IMODE(metadata.st_mode) & 0o077
+                or scratch.is_symlink()
+                or not 0 <= budget <= STRICT_PRIVATE_WAL_MAX_BYTES
+                or before[0] is None or before[1] is None
+                or before[1][0][2] <= 32
+                or before[1][0][2] > STRICT_PRIVATE_WAL_MAX_WAL_BYTES
+                or before[0][0][2] + before[1][0][2] > budget
+            ):
+                raise RuntimeError("unsafe strict WAL worker input")
+            snapshot = scratch / database.name
+            snap_wal = Path(str(snapshot) + "-wal")
+            copy_regular_file(
+                database, snapshot, error_type=RuntimeError,
+                max_bytes=budget,
+            )
+            copy_regular_file(
+                wal, snap_wal, error_type=RuntimeError,
+                max_bytes=budget - before[0][0][2],
+            )
+            after = [
+                _strict_wal_file_fingerprint(
+                    source, error_type=RuntimeError,
+                    message=INVENTORY_CHANGED_MESSAGE, optional=(source == shm),
+                )
+                for source in source_paths
+            ]
+            if after != before:
+                raise RuntimeError("strict WAL source changed while copying")
+        payload = {
+            "schema_version": 1,
+            "files": [
+                None if observed is None else {
+                    "identity": list(observed[0]),
+                    "sha256": observed[1],
+                }
+                for observed in before
+            ],
+        }
+        sys.stdout.write(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+        return 0
+    except (OSError, RuntimeError, ValueError, TypeError):
+        return 1
+
+
+def _strict_wal_source_worker(
+    action: str,
+    *,
+    database: Path,
+    wal: Path,
+    shm: Path,
+    error_type: type[ChangedError],
+    message: str,
+    scratch: Path | None = None,
+    budget: int | None = None,
+) -> dict[Path, tuple[FileIdentity, str] | None]:
+    """Isolate all raw original SQLite fd close() calls from the owning process.
+
+    POSIX fcntl locks are process-wide. Closing even an unrelated raw -shm
+    descriptor in the SQLite writer process can cancel its live WAL_WRITE_LOCK.
+    A separate exec'ed worker has independent POSIX locks; it cannot cancel
+    the caller's SQLite locks. Do not silently fall back to in-process IO.
+    """
+    if action not in {"prepare", "fingerprint"}:
+        raise _changed(error_type, message)
+    if action == "prepare" and (scratch is None or budget is None):
+        raise _changed(error_type, message)
+    if action == "fingerprint" and (scratch is not None or budget is not None):
+        raise _changed(error_type, message)
+    command = [
+        sys.executable, "-I", str(Path(__file__).resolve(strict=True)),
+        "--strict-wal-source-worker", action,
+        str(database), str(wal), str(shm),
+    ]
+    if action == "prepare":
+        assert scratch is not None and budget is not None
+        command.extend((str(scratch), str(budget)))
+    try:
+        result = subprocess.run(
+            command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, check=False, close_fds=True,
+            timeout=120,
+        )
+        if result.returncode != 0 or not 0 < len(result.stdout) <= 4096:
+            raise ValueError("strict WAL worker did not produce a valid result")
+        response = json.loads(result.stdout)
+        if (
+            not isinstance(response, dict)
+            or set(response) != {"schema_version", "files"}
+            or type(response["schema_version"]) is not int
+            or response["schema_version"] != 1
+            or not isinstance(response["files"], list)
+            or len(response["files"]) != 3
+        ):
+            raise ValueError("strict WAL worker result shape is invalid")
+        fingerprints: dict[Path, tuple[FileIdentity, str] | None] = {}
+        for index, (source, item) in enumerate(
+            zip((database, wal, shm), response["files"], strict=True)
+        ):
+            if item is None and index == 2:
+                fingerprints[source] = None
+                continue
+            if (
+                not isinstance(item, dict)
+                or set(item) != {"identity", "sha256"}
+                or not isinstance(item["identity"], list)
+                or len(item["identity"]) != 5
+                or any(type(value) is not int or value < 0 for value in item["identity"])
+                or not isinstance(item["sha256"], str)
+                or len(item["sha256"]) != 64
+                or any(character not in "0123456789abcdef" for character in item["sha256"])
+            ):
+                raise ValueError("strict WAL source fingerprint is invalid")
+            fingerprints[source] = (
+                tuple(item["identity"]), item["sha256"],
+            )
+        return fingerprints
+    except (OSError, ValueError, TypeError, subprocess.TimeoutExpired) as exc:
+        raise _changed(error_type, message, cause=exc)
+
+
 @contextmanager
 def _strict_private_wal_snapshot(
     path: Path,
@@ -314,12 +464,11 @@ def _strict_private_wal_snapshot(
     message: str,
     max_copy_bytes: int | None,
 ) -> Iterator[sqlite3.Connection]:
-    """Replay committed WAL on a private RAM copy, never on original SQLite files.
+    """Replay committed WAL on tmpfs without original fd opens in SQLite process.
 
-    Exact named inode/stat AND actual SHA-256 bytes of DB/WAL/SHM must agree
-    before private consumption and after the entire caller observation.
-    Content changes, absent/present transitions and races reject, not retry.
-    Only one large RAM copy at a time is permitted; no disk scratch fallback.
+    The subprocess fingerprints DB/WAL/SHM before and after copying. Identical
+    no-effect subprocess fingerprints are checked before/during/after reading
+    the private SQLite copy, including WAL-only commits and live writer races.
     """
     path = path.absolute()
     if path.resolve(strict=True) != path or path.parent.resolve(strict=True) != path.parent:
@@ -331,8 +480,7 @@ def _strict_private_wal_snapshot(
         if not isinstance(max_copy_bytes, int) or isinstance(max_copy_bytes, bool) or max_copy_bytes < 0:
             raise _changed(error_type, message)
         budget = min(budget, max_copy_bytes)
-    # Reject oversized inputs before SHA-256 streaming over gigabytes.
-    # Subsequent fd/name and byte-hash comparison detects races with this preflight.
+    # Never hash gigabytes or allocate scratch before a bounded stat-only check.
     try:
         database_status, wal_status = os.lstat(path), os.lstat(wal)
     except OSError as exc:
@@ -345,40 +493,6 @@ def _strict_private_wal_snapshot(
         or database_status.st_size + wal_status.st_size > budget
     ):
         raise _changed(error_type, message)
-    before = {
-        filename: _strict_wal_file_fingerprint(
-            filename, error_type=error_type, message=message,
-            optional=(filename == shm),
-        )
-        for filename in (path, wal, shm)
-    }
-    database_id = before[path]
-    wal_id = before[wal]
-    assert database_id is not None and wal_id is not None
-    wal_size = wal_id[0][2]
-    if wal_size > STRICT_PRIVATE_WAL_MAX_WAL_BYTES:
-        raise _changed(error_type, message)
-    if wal_size <= 32:
-        raise _changed(error_type, message)
-    # Fail closed rather than accepting a truncated WAL that SQLite might ignore.
-    try:
-        with wal.open("rb") as source:
-            header = source.read(32)
-        page = int.from_bytes(header[8:12], "big")
-        if page == 1:
-            page = 65536
-        if (
-            header[:4] not in (bytes.fromhex("377f0682"), bytes.fromhex("377f0683"))
-            or page < 512 or page > 65536 or page & (page - 1)
-            or (wal_size - 32) % (24 + page) != 0
-        ):
-            raise _changed(error_type, message)
-    except OSError as exc:
-        raise _changed(error_type, message, cause=exc)
-    size = database_id[0][2] + wal_size
-    if size > budget:
-        raise _changed(error_type, message)
-
     root = _strict_wal_memory_root(error_type=error_type, message=message)
     directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
     try:
@@ -387,41 +501,48 @@ def _strict_private_wal_snapshot(
         except OSError as exc:
             raise _changed(error_type, message, cause=exc)
         stats = os.statvfs(root)
-        if stats.f_bavail * stats.f_frsize < size + STRICT_PRIVATE_WAL_FREE_RESERVE:
+        total = database_status.st_size + wal_status.st_size
+        if stats.f_bavail * stats.f_frsize < total + STRICT_PRIVATE_WAL_FREE_RESERVE:
             raise _changed(error_type, message)
-
-        def verify_source() -> None:
-            for filename, fingerprint in before.items():
-                current = _strict_wal_file_fingerprint(
-                    filename, error_type=error_type, message=message,
-                    optional=(filename == shm),
-                )
-                if current != fingerprint:
-                    raise _changed(error_type, message)
 
         with tempfile.TemporaryDirectory(dir=root, prefix="grabowski-strict-wal-") as directory:
             snapshot = Path(directory) / path.name
             snap_wal = Path(str(snapshot) + "-wal")
-            copy_regular_file(
-                path, snapshot, error_type=error_type, message=message,
-                max_bytes=budget,
+            before = _strict_wal_source_worker(
+                "prepare", database=path, wal=wal, shm=shm,
+                error_type=error_type, message=message,
+                scratch=Path(directory), budget=budget,
             )
-            copy_regular_file(
-                wal, snap_wal, error_type=error_type, message=message,
-                max_bytes=budget - database_id[0][2],
-            )
+            database_id, wal_id = before[path], before[wal]
+            if (
+                database_id is None or wal_id is None
+                or database_id[0][2] + wal_id[0][2] > budget
+                or database_id[0][2] != database_status.st_size
+                or wal_id[0][2] != wal_status.st_size
+            ):
+                raise _changed(error_type, message)
+            # These are private copy paths, never original SQLite locks.
             if (
                 _strict_wal_file_fingerprint(
-                    snapshot, error_type=error_type, message=message
+                    snapshot, error_type=error_type, message=message,
                 )[1] != database_id[1]
                 or _strict_wal_file_fingerprint(
-                    snap_wal, error_type=error_type, message=message
+                    snap_wal, error_type=error_type, message=message,
                 )[1] != wal_id[1]
             ):
                 raise _changed(error_type, message)
             _strict_validate_copied_wal(
                 snap_wal, error_type=error_type, message=message,
             )
+
+            def verify_source() -> None:
+                current = _strict_wal_source_worker(
+                    "fingerprint", database=path, wal=wal, shm=shm,
+                    error_type=error_type, message=message,
+                )
+                if current != before:
+                    raise _changed(error_type, message)
+
             verify_source()
             connection: sqlite3.Connection | None = None
             try:
@@ -718,3 +839,8 @@ def database_tables(connection: sqlite3.Connection) -> set[str]:
             "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
         )
     }
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2 or sys.argv[1] != "--strict-wal-source-worker":
+        raise SystemExit(2)
+    raise SystemExit(_strict_wal_worker_main(sys.argv[1:]))
