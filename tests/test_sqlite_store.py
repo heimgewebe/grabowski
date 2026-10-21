@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+from io import StringIO
+from types import SimpleNamespace
 import sqlite3
 import os
 import stat
@@ -364,6 +366,127 @@ class SQLiteStoreTests(unittest.TestCase):
                 writer.close()
 
 
+    def test_private_wal_opt_in_does_not_admit_checkpointed_zero_wal_with_shm(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "zero-wal.sqlite3"
+            keeper = sqlite3.connect(database)
+            try:
+                keeper.execute("PRAGMA journal_mode=WAL")
+                keeper.execute("CREATE TABLE content(value TEXT)")
+                keeper.execute("INSERT INTO content VALUES ('base')")
+                keeper.commit()
+                keeper.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                wal = Path(str(database) + "-wal")
+                shm = Path(str(database) + "-shm")
+                self.assertEqual(0, wal.stat().st_size)
+                self.assertTrue(shm.is_file())
+                before = {p.name: p.read_bytes() for p in root.iterdir()}
+                with (
+                    patch.object(
+                        sqlite_store, "_strict_wal_memory_root",
+                        side_effect=AssertionError("WAL0 must not enter private WAL replay"),
+                    ) as ram_check,
+                    self.assertRaisesRegex(InventoryChanged, "Strict read-only snapshot unavailable"),
+                ):
+                    with sqlite_store.inventory_readonly_sqlite(
+                        database,
+                        temporary_prefix="private-wal0-",
+                        error_type=InventoryChanged,
+                        allow_wal_copy=False,
+                        allow_private_wal_snapshot=True,
+                    ) as connection:
+                        self.fail("A private WAL opt-in cannot admit checkpointed WAL0")
+                ram_check.assert_not_called()
+                self.assertEqual(
+                    before, {p.name: p.read_bytes() for p in root.iterdir()}
+                )
+            finally:
+                keeper.close()
+
+    def test_private_wal_opt_in_does_not_admit_orphaned_shm(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "orphan-shm.sqlite3"
+            with sqlite3.connect(database) as writer:
+                writer.execute("CREATE TABLE content(value INTEGER)")
+                writer.execute("INSERT INTO content VALUES (1)")
+            shm = Path(str(database) + "-shm")
+            shm.write_bytes(b"orphaned-shm")
+            self.assertFalse(Path(str(database) + "-wal").exists())
+            before = {p.name: p.read_bytes() for p in root.iterdir()}
+            with (
+                patch.object(
+                    sqlite_store, "_strict_wal_memory_root",
+                    side_effect=AssertionError("Orphaned SHM must fail before any replay"),
+                ) as ram_check,
+                self.assertRaisesRegex(InventoryChanged, "Strict read-only snapshot unavailable"),
+            ):
+                with sqlite_store.inventory_readonly_sqlite(
+                    database,
+                    temporary_prefix="private-orphan-",
+                    error_type=InventoryChanged,
+                    allow_wal_copy=False,
+                    allow_private_wal_snapshot=True,
+                ):
+                    self.fail("Orphaned SHM must not be ignored")
+            ram_check.assert_not_called()
+            self.assertEqual(before, {p.name: p.read_bytes() for p in root.iterdir()})
+
+    def test_strict_ram_root_rejects_non_tmpfs_overmount(self) -> None:
+        # An older tmpfs entry cannot bless a newer disk-backed /dev/shm mount.
+        actual_open = sqlite_store.Path.open
+        mounts = (
+            "32 20 0:44 / /dev/shm rw - tmpfs tmpfs rw\n"
+            "33 20 8:1 / /dev/shm rw - ext4 /dev/sda rw\n"
+        )
+
+        def fake_open(path, *args, **kwargs):
+            if str(path) == "/proc/self/mountinfo":
+                return StringIO(mounts)
+            return actual_open(path, *args, **kwargs)
+
+        with (
+            patch.object(sqlite_store.Path, "open", fake_open),
+            self.assertRaises(InventoryChanged),
+        ):
+            sqlite_store._strict_wal_memory_root(
+                error_type=InventoryChanged,
+                message="untrusted mount",
+            )
+
+    def test_strict_ram_root_rejects_zram_disk_writeback(self) -> None:
+        actual_open = sqlite_store.Path.open
+        actual_stat = sqlite_store.os.stat
+        mounts = "32 20 0:44 / /dev/shm rw - tmpfs tmpfs rw\n"
+        swaps = "Filename Type Size Used Priority\n/dev/zram0 partition 16384 0 100\n"
+
+        def fake_open(path, *args, **kwargs):
+            if str(path) == "/proc/self/mountinfo":
+                return StringIO(mounts)
+            if str(path) == "/proc/swaps":
+                return StringIO(swaps)
+            return actual_open(path, *args, **kwargs)
+
+        def fake_stat(path, *args, **kwargs):
+            if str(path) == "/dev/zram0":
+                return SimpleNamespace(st_mode=stat.S_IFBLK | 0o600)
+            return actual_stat(path, *args, **kwargs)
+
+        with (
+            patch.object(sqlite_store.Path, "open", fake_open),
+            patch.object(sqlite_store.os, "stat", fake_stat),
+            patch.object(
+                sqlite_store.Path, "read_text", return_value="/dev/sda\n",
+            ) as backing,
+            self.assertRaises(InventoryChanged),
+        ):
+            sqlite_store._strict_wal_memory_root(
+                error_type=InventoryChanged,
+                message="zram writeback must reject",
+            )
+        backing.assert_called_once()
+
     def test_strict_private_wal_snapshot_sees_uncheckpointed_commits_without_source_writes(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -459,7 +582,13 @@ class SQLiteStoreTests(unittest.TestCase):
                 writer.execute("CREATE TABLE wal_only(value INTEGER)")
                 writer.execute("INSERT INTO wal_only VALUES (1)")
                 writer.commit()
-                with self.assertRaises(InventoryChanged):
+                with (
+                    patch.object(
+                        sqlite_store, "_strict_wal_memory_root",
+                        return_value=Path(directory),
+                    ),
+                    self.assertRaises(InventoryChanged),
+                ):
                     with sqlite_store.inventory_readonly_sqlite(
                         database,
                         temporary_prefix="strict-private-wal-test-",
@@ -482,7 +611,13 @@ class SQLiteStoreTests(unittest.TestCase):
                 writer.execute("CREATE TABLE wal_only(value INTEGER)")
                 writer.commit()
                 shm = Path(str(database) + "-shm")
-                with self.assertRaises(InventoryChanged):
+                with (
+                    patch.object(
+                        sqlite_store, "_strict_wal_memory_root",
+                        return_value=Path(directory),
+                    ),
+                    self.assertRaises(InventoryChanged),
+                ):
                     with sqlite_store.inventory_readonly_sqlite(
                         database,
                         temporary_prefix="strict-private-wal-test-",
@@ -509,21 +644,29 @@ class SQLiteStoreTests(unittest.TestCase):
                 writer.commit()
                 wal = Path(str(database) + "-wal")
                 budget = database.stat().st_size + wal.stat().st_size - 1
-                with patch.object(
-                    sqlite_store.tempfile,
-                    "TemporaryDirectory",
-                    side_effect=AssertionError("oversize must reject before scratch creation"),
+                with (
+                    patch.object(
+                        sqlite_store, "_strict_wal_file_fingerprint",
+                        side_effect=AssertionError("oversize must reject before hashing"),
+                    ) as hashing,
+                    patch.object(
+                        sqlite_store.tempfile,
+                        "TemporaryDirectory",
+                        side_effect=AssertionError("oversize must reject before scratch creation"),
+                    ) as scratch,
+                    self.assertRaises(InventoryChanged),
                 ):
-                    with self.assertRaises(InventoryChanged):
-                        with sqlite_store.inventory_readonly_sqlite(
-                            database,
-                            temporary_prefix="strict-private-wal-test-",
-                            error_type=InventoryChanged,
-                            allow_wal_copy=False,
-                            allow_private_wal_snapshot=True,
-                            max_copy_bytes=budget,
-                        ):
-                            pass
+                    with sqlite_store.inventory_readonly_sqlite(
+                        database,
+                        temporary_prefix="strict-private-wal-test-",
+                        error_type=InventoryChanged,
+                        allow_wal_copy=False,
+                        allow_private_wal_snapshot=True,
+                        max_copy_bytes=budget,
+                    ):
+                        pass
+                hashing.assert_not_called()
+                scratch.assert_not_called()
             finally:
                 writer.close()
 
@@ -566,7 +709,17 @@ class SQLiteStoreTests(unittest.TestCase):
                     value = stream.read(1)
                     stream.seek(24)
                     stream.write(bytes([value[0] ^ 1]))
-                with self.assertRaises(InventoryChanged):
+                with (
+                    patch.object(
+                        sqlite_store, "_strict_wal_memory_root",
+                        return_value=Path(directory),
+                    ),
+                    patch.object(
+                        sqlite_store, "_strict_validate_copied_wal",
+                        wraps=sqlite_store._strict_validate_copied_wal,
+                    ) as validated,
+                    self.assertRaises(InventoryChanged),
+                ):
                     with sqlite_store.inventory_readonly_sqlite(
                         database,
                         temporary_prefix="strict-private-wal-test-",
@@ -575,6 +728,7 @@ class SQLiteStoreTests(unittest.TestCase):
                         allow_private_wal_snapshot=True,
                     ) as reader:
                         reader.execute("SELECT count(*) FROM rows").fetchone()
+                validated.assert_called_once()
             finally:
                 writer.close()
 
@@ -597,7 +751,17 @@ class SQLiteStoreTests(unittest.TestCase):
                     value = stream.read(1)
                     stream.seek(-1, os.SEEK_END)
                     stream.write(bytes([value[0] ^ 1]))
-                with self.assertRaises(InventoryChanged):
+                with (
+                    patch.object(
+                        sqlite_store, "_strict_wal_memory_root",
+                        return_value=Path(directory),
+                    ),
+                    patch.object(
+                        sqlite_store, "_strict_validate_copied_wal",
+                        wraps=sqlite_store._strict_validate_copied_wal,
+                    ) as validated,
+                    self.assertRaises(InventoryChanged),
+                ):
                     with sqlite_store.inventory_readonly_sqlite(
                         database,
                         temporary_prefix="strict-private-wal-test-",
@@ -606,6 +770,7 @@ class SQLiteStoreTests(unittest.TestCase):
                         allow_private_wal_snapshot=True,
                     ) as reader:
                         reader.execute("SELECT count(*) FROM rows").fetchone()
+                validated.assert_called_once()
             finally:
                 writer.close()
 

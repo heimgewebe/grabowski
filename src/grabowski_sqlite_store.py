@@ -209,24 +209,31 @@ def _strict_wal_memory_root(
             or root.resolve(strict=True) != root
         ):
             raise _changed(error_type, message)
+        # A later overmount supersedes earlier /dev/shm mountinfo entries.
+        last_mount_type = None
         with Path("/proc/self/mountinfo").open(encoding="utf-8") as mounted:
-            tmpfs = any(
-                columns[4] == "/dev/shm" and right.split()[0] == "tmpfs"
-                for line in mounted
-                if " - " in line
-                for left, right in [line.rstrip("\n").split(" - ", 1)]
-                for columns in [left.split()]
-                if len(columns) >= 5 and right.split()
-            )
-        if not tmpfs:
+            for line in mounted:
+                if " - " not in line:
+                    raise _changed(error_type, message)
+                left, right = line.rstrip("\n").split(" - ", 1)
+                columns, filesystem = left.split(), right.split()
+                if len(columns) < 5 or not filesystem:
+                    raise _changed(error_type, message)
+                if columns[4] == "/dev/shm":
+                    last_mount_type = filesystem[0]
+        if last_mount_type != "tmpfs":
             raise _changed(error_type, message)
         with Path("/proc/swaps").open(encoding="utf-8") as swaps:
             next(swaps)
             for line in swaps:
                 device = line.split()[0]
                 resolved = Path(os.path.realpath(device))
+                if resolved.parent != Path("/dev") or not stat.S_ISBLK(os.stat(resolved).st_mode):
+                    raise _changed(error_type, message)
                 if resolved.name.startswith("zram") and resolved.name[4:].isdigit():
-                    continue
+                    backing = Path("/sys/block") / resolved.name / "backing_dev"
+                    if backing.read_text(encoding="ascii").strip() == "none":
+                        continue
                 if resolved.name.startswith("dm-") and resolved.name[3:].isdigit():
                     identity = Path("/sys/block") / resolved.name / "dm" / "uuid"
                     if identity.read_text(encoding="ascii").strip().startswith("CRYPT-"):
@@ -319,6 +326,25 @@ def _strict_private_wal_snapshot(
         raise _changed(error_type, message)
     wal = Path(str(path) + "-wal")
     shm = Path(str(path) + "-shm")
+    budget = STRICT_PRIVATE_WAL_MAX_BYTES
+    if max_copy_bytes is not None:
+        if not isinstance(max_copy_bytes, int) or isinstance(max_copy_bytes, bool) or max_copy_bytes < 0:
+            raise _changed(error_type, message)
+        budget = min(budget, max_copy_bytes)
+    # Reject oversized inputs before SHA-256 streaming over gigabytes.
+    # Subsequent fd/name and byte-hash comparison detects races with this preflight.
+    try:
+        database_status, wal_status = os.lstat(path), os.lstat(wal)
+    except OSError as exc:
+        raise _changed(error_type, message, cause=exc)
+    if (
+        not stat.S_ISREG(database_status.st_mode)
+        or not stat.S_ISREG(wal_status.st_mode)
+        or wal_status.st_size > STRICT_PRIVATE_WAL_MAX_WAL_BYTES
+        or wal_status.st_size <= 32
+        or database_status.st_size + wal_status.st_size > budget
+    ):
+        raise _changed(error_type, message)
     before = {
         filename: _strict_wal_file_fingerprint(
             filename, error_type=error_type, message=message,
@@ -349,11 +375,6 @@ def _strict_private_wal_snapshot(
             raise _changed(error_type, message)
     except OSError as exc:
         raise _changed(error_type, message, cause=exc)
-    budget = STRICT_PRIVATE_WAL_MAX_BYTES
-    if max_copy_bytes is not None:
-        if not isinstance(max_copy_bytes, int) or max_copy_bytes < 0:
-            raise _changed(error_type, message)
-        budget = min(budget, max_copy_bytes)
     size = database_id[0][2] + wal_size
     if size > budget:
         raise _changed(error_type, message)
@@ -461,7 +482,7 @@ def inventory_readonly_sqlite(
             ) as connection:
                 yield connection
             return
-    if not allow_wal_copy and not allow_checkpointed_empty_wal and not allow_private_wal_snapshot and (
+    if not allow_wal_copy and not allow_checkpointed_empty_wal and (
         wal_present or shm_path.exists() or shm_path.is_symlink()
     ):
         raise _changed(error_type, "Strict read-only snapshot unavailable while SQLite WAL sidecars exist")
