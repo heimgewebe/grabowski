@@ -1824,6 +1824,9 @@ class CodingAgentRouterTests(unittest.TestCase):
             for route in self.catalog["routes"]
             if route["id"] == "antigravity-gemini-pro-low"
         )
+        self.assertFalse(high["enabled"])
+        self.assertIn("unsupported", high["disabled_reason"])
+        self.assertIn("never silently downgrade", high["disabled_reason"])
         self.assertEqual(high["model"], low["model"])
         high_arg = router._configured_model_arg(high)
         low_arg = router._configured_model_arg(low)
@@ -1883,7 +1886,7 @@ class CodingAgentRouterTests(unittest.TestCase):
             self.assertFalse(review["reviewers"][0]["primary_review_authority"])
             self.assertNotEqual(review["reviewers"][0]["provider_family"], "openai")
 
-    def test_external_reviewers_are_bound_to_selected_scoped_writer(self) -> None:
+    def test_disabled_gemini_pro_review_route_preserves_scoped_writer_review_gap(self) -> None:
         for harness, state in self.state["catalog"]["harnesses"].items():
             state["available"] = harness in {"claude", "antigravity"}
         self.state["pools"]["claude-pro"] = {"remaining_ratio": 0.9}
@@ -1902,10 +1905,25 @@ class CodingAgentRouterTests(unittest.TestCase):
         self.assertEqual("claude-opus-5.5-writer-high", result["writer_route"])
         writer = result["scoped_writer"]
         self.assertIsNotNone(writer)
-        reviewer = result["reviewers"][0]
-        self.assertEqual("antigravity-gemini-pro-review-high", reviewer["route"])
-        self.assertNotEqual(writer["independence_group"], reviewer["independence_group"])
-        self.assertNotEqual(writer["provider_family"], reviewer["provider_family"])
+        self.assertEqual([], result["reviewers"])
+        self.assertEqual(1, result["review_gap"])
+        self.assertEqual("no-independent-review-route", result["review_status"])
+        self.assertIn("reviewer:antigravity-gemini-pro-review-high", result["excluded"])
+        self.assertIn(
+            "disabled or controller route",
+            result["excluded"]["reviewer:antigravity-gemini-pro-review-high"],
+        )
+        # Flash is never silently substituted for the unavailable Pro
+        # high-critical reviewer, even when the same harness is healthy.
+        for route_id in (
+            "antigravity-gemini-flash-high",
+            "antigravity-gemini-flash-medium",
+            "antigravity-gemini-flash-low",
+        ):
+            self.assertIn(
+                "task class is outside route affinity",
+                result["excluded"]["reviewer:" + route_id],
+            )
         self.assertIn("reviewer:claude-opus-5.5-high", result["excluded"])
         self.assertIn(
             "reviewer shares the primary model lineage",
@@ -2264,7 +2282,7 @@ class CodingAgentRouterTests(unittest.TestCase):
         self.assertEqual(delivery["review_fallbacks"][0]["route"], "advisory-review")
         self.assertEqual(delivery["review_gap"], 0)
 
-    def test_delivery_effect_profile_requires_and_binds_scoped_writer(self) -> None:
+    def test_delivery_effect_profile_fails_closed_when_independent_model_is_disabled(self) -> None:
         for harness, state in self.state["catalog"]["harnesses"].items():
             state["available"] = harness in {"claude", "antigravity"}
         self.state["pools"]["claude-pro"] = {"remaining_ratio": 0.9}
@@ -2272,18 +2290,20 @@ class CodingAgentRouterTests(unittest.TestCase):
         self.state["pools"]["antigravity-account"] = {"remaining_ratio": 0.9}
         self._write_state()
 
-        result = self._route(
-            "bounded-patch",
-            changed_files=2,
-            duration_minutes=30,
-            novelty="medium",
-            verification_policy="independent_review",
-            effect_profile="delivery",
-        )
-
-        self.assertEqual("scoped_writer", result["executor"])
-        self.assertEqual("delivery", result["effect_profile"])
-        self.assertEqual(result["writer_route"], result["scoped_writer"]["route"])
+        # A healthy writer and Antigravity subscription do not make an
+        # unavailable independent Pro reviewer an authorized fallback.
+        with self.assertRaisesRegex(
+            router.CodingAgentRouterError,
+            "requires an available independent reviewer route",
+        ):
+            self._route(
+                "bounded-patch",
+                changed_files=2,
+                duration_minutes=30,
+                novelty="medium",
+                verification_policy="independent_review",
+                effect_profile="delivery",
+            )
 
     def test_delivery_effect_profile_rejects_deterministic_verification(self) -> None:
         with self.assertRaisesRegex(

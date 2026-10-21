@@ -155,7 +155,6 @@ class SubscriptionAwareRoutingTests(unittest.TestCase):
     def test_independent_subscription_review_routes_are_executable_and_advisory(self) -> None:
         expected = {
             "claude-opus-5.5-high": ("claude", "anthropic-claude-pro"),
-            "antigravity-gemini-pro-review-high": ("antigravity", "google-gemini-pro"),
             "grok-4.6-review-high": ("grok", "xai-grok-4.6"),
         }
         for route_id, (harness, group) in expected.items():
@@ -167,6 +166,17 @@ class SubscriptionAwareRoutingTests(unittest.TestCase):
                 self.assertEqual(route["independence_group"], group)
                 self.assertIn("independent-review", route["task_classes"])
                 self.assertIn("critical-review", route["task_classes"])
+
+        # Live CLI rejects the configured Pro model, so this precise
+        # independent review route is unusable until it is re-verified.
+        disabled = self.routes["antigravity-gemini-pro-review-high"]
+        self.assertFalse(disabled["enabled"])
+        self.assertTrue(disabled["review_only"])
+        self.assertEqual(disabled["harness"], "antigravity")
+        self.assertEqual(disabled["independence_group"], "google-gemini-pro")
+        self.assertIn("independent-review", disabled["task_classes"])
+        self.assertIn("critical-review", disabled["task_classes"])
+        self.assertIn("never silently downgrade", disabled["disabled_reason"])
 
     def test_opus_has_separate_escalation_writer_and_review_route(self) -> None:
         writer = self.routes["claude-opus-5.5-writer-high"]
