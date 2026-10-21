@@ -3948,6 +3948,190 @@ class RuntimeRetentionTests(unittest.TestCase):
             self.assertTrue((jobs / job / "metadata.json").is_file())
             self.assertFalse((root / "archive" / job).exists())
 
+    def test_corrupt_deploy_index_does_not_block_unrelated_task_plan(self) -> None:
+        self._simulated_protected_authority.return_value = False
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs = root / "jobs"
+            jobs.mkdir(mode=0o700)
+            index = jobs / "runtime-deploy-index.json"
+            index.write_text("{invalid-json\n", encoding="utf-8")
+            index.chmod(0o600)
+            task_unit = "grabowski-task-" + "c" * 24 + "-a1.service"
+            task_db = self._task_db(root / "tasks.sqlite3", task_unit, "failed")
+            plan = RETENTION.build_plan(
+                minimum_job_age_seconds=50, now=1000,
+                jobs_root=jobs, archive_root=root / "archive",
+                receipt_root=root / "receipts", task_db=task_db,
+                failed_units=[task_unit], unit_states={},
+            )
+            self.assertEqual(plan["archive_jobs"], [])
+            self.assertEqual(plan["reset_failed_units"], [task_unit])
+
+    def test_missing_archive_root_does_not_block_task_only_reset(self) -> None:
+        self._simulated_protected_authority.return_value = False
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs, archive, receipts = root / "jobs", root / "archive", root / "receipts"
+            jobs.mkdir(mode=0o700)
+            receipts.mkdir(mode=0o700)
+            self.assertFalse(archive.exists())
+            task_unit = "grabowski-task-" + "d" * 24 + "-a1.service"
+            task_db = self._task_db(root / "tasks.sqlite3", task_unit, "failed")
+            plan = RETENTION.build_plan(
+                minimum_job_age_seconds=50, now=1000,
+                jobs_root=jobs, archive_root=archive, receipt_root=receipts,
+                task_db=task_db, failed_units=[task_unit], unit_states={},
+            )
+            self.assertEqual(plan["reset_failed_units"], [task_unit])
+            fake_deploy = types.ModuleType("grabowski_self_deploy")
+            fake_deploy.DEPLOY_INDEX_FILENAME = "runtime-deploy-index.json"
+            fake_deploy._deploy_schedule_lock = lambda: nullcontext()
+            fake_base = types.ModuleType("grabowski_mcp")
+            fake_base._append_audit = Mock()
+            fake_base._require_mutations_enabled = Mock()
+            fake_base._require_capability = Mock()
+            reset = Mock(return_value=Mock(returncode=0, stderr=""))
+            with patch.dict("sys.modules", {
+                "grabowski_self_deploy": fake_deploy, "grabowski_mcp": fake_base,
+            }), patch.object(RETENTION, "_run", reset):
+                receipt = RETENTION.apply_plan(
+                    plan, expected_plan_sha256=plan["plan_sha256"]
+                )
+            self.assertTrue(receipt["completed"])
+            reset.assert_called_once_with(
+                ["systemctl", "--user", "reset-failed", task_unit]
+            )
+            self.assertFalse(archive.exists())
+
+    def test_unrelated_receipt_temps_do_not_block_task_reset(self) -> None:
+        self._simulated_protected_authority.return_value = False
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs, archive, receipts = root / "jobs", root / "archive", root / "receipts"
+            jobs.mkdir(mode=0o700)
+            archive.mkdir(mode=0o700)
+            receipts.mkdir(mode=0o700)
+            for index in range(1, 5):
+                (receipts / (".unrelated.json.1." + str(index) + ".tmp")).write_text("")
+            task_unit = "grabowski-task-" + "e" * 24 + "-a1.service"
+            task_db = self._task_db(root / "tasks.sqlite3", task_unit, "failed")
+            plan = RETENTION.build_plan(
+                minimum_job_age_seconds=50, now=1000,
+                jobs_root=jobs, archive_root=archive, receipt_root=receipts,
+                task_db=task_db, failed_units=[task_unit], unit_states={},
+            )
+            fake_deploy = types.ModuleType("grabowski_self_deploy")
+            fake_deploy.DEPLOY_INDEX_FILENAME = "runtime-deploy-index.json"
+            fake_deploy._deploy_schedule_lock = lambda: nullcontext()
+            fake_base = types.ModuleType("grabowski_mcp")
+            fake_base._append_audit = Mock()
+            fake_base._require_mutations_enabled = Mock()
+            fake_base._require_capability = Mock()
+            reset = Mock(return_value=Mock(returncode=0, stderr=""))
+            with patch.dict("sys.modules", {
+                "grabowski_self_deploy": fake_deploy, "grabowski_mcp": fake_base,
+            }), patch.object(RETENTION, "_run", reset), patch.object(
+                RETENTION, "MAX_JOB_REGISTRY_ENTRIES", 3
+            ), patch.object(RETENTION, "MAX_RETAINED_JSON_TEMPS", 3):
+                receipt = RETENTION.apply_plan(
+                    plan, expected_plan_sha256=plan["plan_sha256"]
+                )
+            self.assertTrue(receipt["completed"])
+            reset.assert_called_once()
+            for index in range(1, 5):
+                self.assertTrue(
+                    (receipts / (".unrelated.json.1." + str(index) + ".tmp")).exists()
+                )
+
+    def test_receipt_temp_capacity_preflight_precedes_task_reset(self) -> None:
+        self._simulated_protected_authority.return_value = False
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs, archive, receipts = root / "jobs", root / "archive", root / "receipts"
+            jobs.mkdir(mode=0o700)
+            archive.mkdir(mode=0o700)
+            receipts.mkdir(mode=0o700)
+            task_unit = "grabowski-task-" + "f" * 24 + "-a1.service"
+            task_db = self._task_db(root / "tasks.sqlite3", task_unit, "failed")
+            plan = RETENTION.build_plan(
+                minimum_job_age_seconds=50, now=1000,
+                jobs_root=jobs, archive_root=archive, receipt_root=receipts,
+                task_db=task_db, failed_units=[task_unit], unit_states={},
+            )
+            for index in range(1, 4):
+                (receipts / (
+                    "." + plan["plan_sha256"] + ".json.1."
+                    + str(index) + ".tmp"
+                )).write_text("")
+            fake_deploy = types.ModuleType("grabowski_self_deploy")
+            fake_deploy.DEPLOY_INDEX_FILENAME = "runtime-deploy-index.json"
+            fake_deploy._deploy_schedule_lock = lambda: nullcontext()
+            fake_base = types.ModuleType("grabowski_mcp")
+            fake_base._append_audit = Mock()
+            fake_base._require_mutations_enabled = Mock()
+            fake_base._require_capability = Mock()
+            reset = Mock(return_value=Mock(returncode=0, stderr=""))
+            with patch.dict("sys.modules", {
+                "grabowski_self_deploy": fake_deploy, "grabowski_mcp": fake_base,
+            }), patch.object(RETENTION, "_run", reset), patch.object(
+                RETENTION, "MAX_RETAINED_JSON_TEMPS", 3
+            ):
+                with self.assertRaisesRegex(RuntimeError, "retained atomic temp bound"):
+                    RETENTION.apply_plan(
+                        plan, expected_plan_sha256=plan["plan_sha256"]
+                    )
+            reset.assert_not_called()
+            for index in range(1, 4):
+                self.assertTrue(
+                    (receipts / (
+                        "." + plan["plan_sha256"] + ".json.1."
+                        + str(index) + ".tmp"
+                    )).exists()
+                )
+
+    def test_systemd_retention_requires_preprovisioned_receipt_root(self) -> None:
+        unit = (
+            ROOT / "systemd/grabowski-runtime-retention.service.example"
+        ).read_text(encoding="utf-8")
+        root = "%h/.local/state/grabowski/retention-receipts"
+        self.assertIn("ExecStartPre=/usr/bin/test -d " + root, unit)
+        self.assertIn("ExecStartPre=/usr/bin/test ! -L " + root, unit)
+        self.assertNotIn("ExecStartPre=/usr/bin/mkdir", unit)
+
+    def test_missing_receipt_root_never_resets_task_before_failure(self) -> None:
+        self._simulated_protected_authority.return_value = False
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs, archive, receipts = root / "jobs", root / "archive", root / "receipts"
+            jobs.mkdir(mode=0o700)
+            archive.mkdir(mode=0o700)
+            self.assertFalse(receipts.exists())
+            task_unit = "grabowski-task-" + "a" * 24 + "-a1.service"
+            task_db = self._task_db(root / "tasks.sqlite3", task_unit, "failed")
+            plan = RETENTION.build_plan(
+                minimum_job_age_seconds=50, now=1000,
+                jobs_root=jobs, archive_root=archive, receipt_root=receipts,
+                task_db=task_db, failed_units=[task_unit], unit_states={},
+            )
+            fake_deploy = types.ModuleType("grabowski_self_deploy")
+            fake_deploy.DEPLOY_INDEX_FILENAME = "runtime-deploy-index.json"
+            fake_deploy._deploy_schedule_lock = lambda: nullcontext()
+            fake_base = types.ModuleType("grabowski_mcp")
+            fake_base._append_audit = Mock()
+            fake_base._require_mutations_enabled = Mock()
+            fake_base._require_capability = Mock()
+            reset = Mock(return_value=Mock(returncode=0, stderr=""))
+            with patch.dict("sys.modules", {
+                "grabowski_self_deploy": fake_deploy, "grabowski_mcp": fake_base,
+            }), patch.object(RETENTION, "_run", reset):
+                with self.assertRaisesRegex(RuntimeError, "receipt root absent"):
+                    RETENTION.apply_plan(
+                        plan, expected_plan_sha256=plan["plan_sha256"]
+                    )
+            reset.assert_not_called()
+            self.assertFalse(receipts.exists())
+
     def test_jobs_root_forged_before_initial_fd_never_resets_pending_unit(self) -> None:
         # Until the broker can authenticate roots, the real security outcome
         # is fail-closed, not acceptance of a forged first-opened directory.

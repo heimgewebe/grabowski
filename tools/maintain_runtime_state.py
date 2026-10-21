@@ -1292,15 +1292,17 @@ def build_plan(
             if child.name.startswith("grabowski-job-"):
                 registry_entries.append(jobs_root / child.name)
     registry_entries.sort(key=lambda entry: entry.name)
-    # A missing index is not positive evidence that no deployment is active.
-    # Keep archive and job-reset actions out of the plan until the deployment
-    # owner has recovered its canonical registry; other independent classes
-    # of maintenance may continue without producing partial receipt storms.
+    # Deployment index is only a control-plane authority for job effects.
+    # Until a protected broker exists, no job archive/reset is permitted,
+    # and malformed or unavailable job-only index data must not stop
+    # independent task/worker retention.
+    authorized_job_effects = _protected_job_retention_authority()
     index_root_stat = os.fstat(pinned.jobs_fd)
     if (index_root_stat.st_dev, index_root_stat.st_ino) != planned_jobs_root_identity:
         raise RuntimeError("jobs root identity changed before plan index read")
-    deploy_index = _archive_read_deploy_index_pinned(
-        jobs_root, pinned.jobs_fd, None
+    deploy_index = (
+        _archive_read_deploy_index_pinned(jobs_root, pinned.jobs_fd, None)
+        if authorized_job_effects else None
     )
     _archive_require_unchanged_root(jobs_root, pinned.jobs_fd)
     missing_deploy_index = deploy_index is None
@@ -1385,7 +1387,6 @@ def build_plan(
     )
     archive_candidates: list[dict[str, Any]] = []
     archive_blocked_units: set[str] = set()
-    authorized_job_effects = _protected_job_retention_authority()
     for record in eligible:
         if not authorized_job_effects:
             archive_blocked_units.add(record["unit"])
@@ -1868,18 +1869,29 @@ def _archive_pinned_json_preimage(
         os.close(descriptor)
 
 
-def _archive_require_json_temp_capacity(directory_fd: int) -> None:
-    """Refuse an irreversible move when the future index write lacks space.
+def _archive_require_json_temp_capacity(
+    directory_fd: int, *, target_basename: str | None = None,
+) -> None:
+    """Check retained temps under the pinned output root, never unlink them.
 
-    Count EVERY retained JSON temp in this pinned directory. Same-UID
-    substitutions are never silently unlinked; the bound is fail-closed.
+    Source/archive preflight still has a bounded global scan. Receipt writes
+    use the selected receipt basename: earlier unrelated receipts and their
+    retained temp evidence must not permanently block a fresh receipt.
     """
+    if target_basename is not None and (
+        not target_basename or "/" in target_basename
+        or target_basename in {".", ".."}
+    ):
+        raise RuntimeError("retained atomic temp target is invalid")
+    prefix = f".{target_basename}." if target_basename is not None else None
     retained_temps = 0
     scanned_entries = 0
     with os.scandir(directory_fd) as entries:
         for entry in entries:
+            if prefix is not None and not entry.name.startswith(prefix):
+                continue
             scanned_entries += 1
-            if scanned_entries > MAX_JOB_REGISTRY_ENTRIES:
+            if prefix is None and scanned_entries > MAX_JOB_REGISTRY_ENTRIES:
                 raise RuntimeError("retained atomic temp scan bound exceeded")
             if re.fullmatch(
                 r"\..+\.[1-9][0-9]{0,11}\.[1-9][0-9]{0,19}\.tmp",
@@ -1928,6 +1940,7 @@ def _write_json_atomic(
     expected_parent_identity: tuple[int, int] | None = None,
     expected_existing_preimage: tuple[int, int, int, int, str] | None = None,
     pinned_parent_fd: int | None = None,
+    target_scoped_temp_capacity: bool = False,
 ) -> Path:
     if path.name == "runtime-deploy-index.json":
         # Linux has no atomic rename-if-inode. An EXCHANGE followed by a
@@ -1982,7 +1995,10 @@ def _write_json_atomic(
             json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2).encode("utf-8")
             + b"\n"
         )
-        _archive_require_json_temp_capacity(directory_fd)
+        _archive_require_json_temp_capacity(
+            directory_fd,
+            target_basename=path.name if target_scoped_temp_capacity else None,
+        )
         _archive_require_unchanged_root(parent, directory_fd)
         candidate_name = f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp"
         descriptor = os.open(
@@ -2291,6 +2307,19 @@ def _prepare_archives(
     finally:
         if own_jobs:
             os.close(jobs_pin_fd)
+    # Archive authority is irrelevant when this plan has no archive
+    # candidates. Requiring an archive/ inode here would strand otherwise
+    # independent task and worker resets on fresh installations.
+    if not plan["archive_jobs"]:
+        receipt_root = Path(plan["receipt_root"])
+        if held:
+            _receipt_root_fd_for_plan(plan)
+        else:
+            receipt_root = _private_directory(receipt_root, create=True)
+        return (
+            jobs_root, Path(plan["archive_root"]), receipt_root, [],
+            initial_jobs_identity,
+        )
     own_archive = not held and archive_root_fd is None
     archive_root = Path(plan["archive_root"])
     archive_pin_fd = (
@@ -3020,10 +3049,15 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
         if pinned_jobs_identity != tuple(plan["jobs_root_identity"]):
             raise RuntimeError("jobs root identity changed since planning")
         _archive_require_unchanged_root(Path(plan["jobs_root"]), jobs_root_pin_fd)
-        archive_root_pin_fd = os.dup(_archive_root_fd_for_plan(plan))
-        root_pins.callback(os.close, archive_root_pin_fd)
-        pinned_archive_stat = os.fstat(archive_root_pin_fd)
-        pinned_archive_identity = (pinned_archive_stat.st_dev, pinned_archive_stat.st_ino)
+        archive_root_pin_fd: int | None = None
+        pinned_archive_identity: tuple[int, int] | None = None
+        if plan["archive_jobs"]:
+            archive_root_pin_fd = os.dup(_archive_root_fd_for_plan(plan))
+            root_pins.callback(os.close, archive_root_pin_fd)
+            pinned_archive_stat = os.fstat(archive_root_pin_fd)
+            pinned_archive_identity = (
+                pinned_archive_stat.st_dev, pinned_archive_stat.st_ino
+            )
         (
             jobs_root, archive_root, receipt_root, prepared,
             prepared_jobs_root_identity,
@@ -3038,6 +3072,11 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
         receipt_target, attempt, previous_receipt_sha256 = _select_receipt_target(
             receipt_root, plan_sha256=plan["plan_sha256"],
             receipt_fd=receipt_pin_fd,
+        )
+        # Fail before even attempting systemd resets if the exact receipt
+        # publication cannot fit among its own retained temporary evidence.
+        _archive_require_json_temp_capacity(
+            receipt_pin_fd, target_basename=receipt_target.name,
         )
         intent_audit = _append_intent_audit(
             plan,
@@ -3056,8 +3095,13 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
                 raise RuntimeError(
                     "jobs root identity changed before index read"
                 )
-            index = _archive_read_deploy_index_pinned(
-                jobs_root, index_root_fd, self_deploy
+            index = (
+                _archive_read_deploy_index_pinned(
+                    jobs_root, index_root_fd, self_deploy
+                )
+                if prepared or any(
+                    JOB_UNIT.fullmatch(unit) for unit in plan["reset_failed_units"]
+                ) else None
             )
             _archive_require_unchanged_root(jobs_root, index_root_fd)
             index_root_stat = os.fstat(index_root_fd)
@@ -3394,7 +3438,8 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
         }
         receipt["receipt_sha256"] = _sha256(receipt)
         receipt_path = _write_json_atomic(
-            receipt_target, receipt, pinned_parent_fd=receipt_pin_fd
+            receipt_target, receipt, pinned_parent_fd=receipt_pin_fd,
+            target_scoped_temp_capacity=True,
         )
         try:
             completion_audit = _append_completion_audit(receipt)
