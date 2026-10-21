@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import ExitStack, contextmanager, nullcontext
 import hashlib
+import io
 import importlib.util
 import json
 import os
@@ -13,6 +14,7 @@ import tempfile
 import types
 from typing import get_args
 import unittest
+import zipfile
 from unittest import mock
 from unittest.mock import Mock, call, patch
 
@@ -333,6 +335,120 @@ def _unpersisted_outcome_unknown_blue_green_result(
         "receipt": receipt,
         "summary": summary,
     }
+
+
+class ReleaseSourceRawModeAdmissionTests(unittest.TestCase):
+    """Source Git mode evidence must route executables through genuine R3."""
+
+    @staticmethod
+    def _raw(change: str, old_mode: str, new_mode: str, path: str) -> str:
+        return (
+            f":{old_mode} {new_mode} {'a' * 40} {'b' * 40} {change}"
+            f"\x00{path}\x00"
+        )
+
+    def _admit_preview(self, raw: str) -> dict[str, object]:
+        serving, target, release_id = "a" * 40, "b" * 40, "release-a"
+
+        def read_git(_repository, *args, **_kwargs):
+            if args[:2] == ("merge-base", "--is-ancestor"):
+                return _result()
+            if args and args[0] == "diff" and "--no-abbrev" in args:
+                return _result(raw)
+            self.fail(f"unexpected Git request: {args!r}")
+
+        with (
+            patch.object(
+                SELF_DEPLOY.base, "_deployment_metadata",
+                return_value={
+                    "completion_status": "complete", "runtime_binding_valid": True,
+                    "artifact_integrity_valid": True, "provenance_valid": True,
+                    "repo_head": serving, "release_id": release_id,
+                },
+                create=True,
+            ),
+            patch.object(
+                SELF_DEPLOY.serving_process, "identity",
+                return_value={
+                    "matches_deployed_manifest": True,
+                    "process_release_id": release_id,
+                    "process_repo_head": serving,
+                },
+            ),
+            patch.object(SELF_DEPLOY, "_git_result", side_effect=read_git),
+        ):
+            return SELF_DEPLOY._require_release_source_admission(
+                target, captain_preview=True,
+            )
+
+    def _assert_review_required(self, raw: str) -> None:
+        with self.assertRaises(
+            SELF_DEPLOY.DeploySchedulePreEffectRefusal
+        ) as failure:
+            self._admit_preview(raw)
+        self.assertIn(
+            "release review admission missing: exact independent R3 job namespace",
+            str(failure.exception),
+        )
+
+    def test_executable_modify_uses_review_required_path(self) -> None:
+        self._assert_review_required(
+            self._raw("M", "100755", "100755", "tools/release_probe.py")
+        )
+
+    def test_regular_to_executable_mode_change_requires_review(self) -> None:
+        self._assert_review_required(
+            self._raw("M", "100644", "100755", "docs/release.md")
+        )
+
+    def test_executable_doc_is_never_exempt(self) -> None:
+        self._assert_review_required(
+            self._raw("M", "100755", "100755", "docs/release.md")
+        )
+
+    def test_added_and_deleted_executables_require_review(self) -> None:
+        self._assert_review_required(
+            self._raw("A", "000000", "100755", "tools/new.py")
+        )
+        self._assert_review_required(
+            self._raw("D", "100755", "000000", "tools/old.py")
+        )
+
+    def test_plain_document_also_requires_review(self) -> None:
+        # A regular docs/ Markdown file may still be executed by validation.
+        self._assert_review_required(
+            self._raw("M", "100644", "100644", "docs/release.md")
+        )
+
+    def test_executable_source_with_plain_document_requires_review(self) -> None:
+        self._assert_review_required(
+            self._raw("M", "100644", "100644", "docs/release.md")
+            + self._raw("M", "100755", "100755", "tools/verify.py")
+        )
+
+    def test_symlinks_submodules_and_ambiguous_modes_stay_denied(self) -> None:
+        for old_mode, new_mode in (
+            ("120000", "120000"),
+            ("160000", "160000"),
+            ("100755", "120000"),
+            ("100664", "100664"),
+        ):
+            with self.subTest(old_mode=old_mode, new_mode=new_mode):
+                with self.assertRaises(
+                    SELF_DEPLOY.DeploySchedulePreEffectRefusal
+                ) as failure:
+                    self._admit_preview(
+                        self._raw("M", old_mode, new_mode, "docs/release.md")
+                    )
+                self.assertIn("source modes are not plain documents", str(failure.exception))
+
+    def test_invalid_path_and_incomplete_raw_record_still_denied(self) -> None:
+        for raw in (
+            self._raw("M", "100755", "100755", "../escape.py"),
+            self._raw("M", "100755", "100755", "tools/release.py")[:-1],
+        ):
+            with self.assertRaises(SELF_DEPLOY.DeploySchedulePreEffectRefusal):
+                self._admit_preview(raw)
 
 
 class SelfDeployToolTests(unittest.TestCase):
@@ -8211,8 +8327,424 @@ class SelfDeployToolTests(unittest.TestCase):
                         pass
 
 
+def _fake_retained_validation(*args, **kwargs):
+    # Synthetic successful validation only; production never uses this mock.
+    if kwargs.get("retain_validation") is True:
+        return tempfile.TemporaryDirectory(prefix="grabowski-hashed-tooling-test-")
+    return None
+
+
+class HashedDeployToolingBindingTests(unittest.TestCase):
+    """Authenticate complete wheel bytes before any downloaded code executes."""
+
+    def setUp(self) -> None:
+        self._saved_yaml_modules = {
+            name: module for name, module in sys.modules.items()
+            if name == "_yaml" or name == "yaml" or name.startswith("yaml.")
+        }
+        for name in self._saved_yaml_modules:
+            del sys.modules[name]
+        self.addCleanup(self._restore_yaml)
+
+    def _restore_yaml(self) -> None:
+        for name in list(sys.modules):
+            if name == "_yaml" or name == "yaml" or name.startswith("yaml."):
+                del sys.modules[name]
+        sys.modules.update(self._saved_yaml_modules)
+
+    @staticmethod
+    def _git_oid(kind: str, raw: bytes) -> str:
+        # Let Git calculate its native object ID, rather than using an ad hoc
+        # digest implementation on test fixture content. The repository's Git
+        # object format, not this test, determines the hash algorithm.
+        return subprocess.run(
+            ["/usr/bin/git", "hash-object", "-t", kind, "--stdin"],
+            input=raw, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True,
+        ).stdout.decode("ascii").strip()
+
+    def _prepare(self, root: Path, *, tamper: bool = False,
+                 version: str = "6.0.3"):
+        (root / "deploy-tooling" / ".venv").mkdir(parents=True)
+        site = root / "deploy-tooling" / ".venv" / "site-packages"
+        site.mkdir()
+        (site / "untrusted.pth").write_text(
+            "import os; os.environ['GRABOWSKI_UNTRUSTED_PTH']='1'" + chr(10)
+        )
+        (site / "os.py").write_text("raise AssertionError('shadow stdlib')")
+        package_source = chr(10).join([
+            f'__version__ = "{version}"',
+            'def safe_load(value):',
+            '    return {"locked": True} if value == "locked: true" else {}',
+            '',
+        ])
+        output = io.BytesIO()
+        with zipfile.ZipFile(output, "w") as archive:
+            archive.writestr("yaml/__init__.py", package_source)
+        wheel = output.getvalue()
+        wheel_hash = hashlib.sha256(wheel).hexdigest()
+        lock_text = (
+            "pyyaml==6.0.3 " + chr(92) + chr(10)
+            + "    --hash=sha256:" + wheel_hash + chr(10)
+        )
+        (root / "deploy-tooling.lock.txt").write_text(lock_text, encoding="utf-8")
+        lock_bytes = lock_text.encode("utf-8")
+        blob_oid = self._git_oid("blob", lock_bytes)
+        requirements_tree = (
+            b"100644 deploy-tooling.lock.txt\0" + bytes.fromhex(blob_oid)
+        )
+        requirements_oid = self._git_oid("tree", requirements_tree)
+        root_tree = b"40000 requirements\0" + bytes.fromhex(requirements_oid)
+        root_oid = self._git_oid("tree", root_tree)
+        commit = (
+            b"tree " + root_oid.encode("ascii") + b"\n"
+            b"author Fixture <fixture@example.invalid> 0 +0000\n"
+            b"committer Fixture <fixture@example.invalid> 0 +0000\n"
+            b"\nfixture commit\n"
+        )
+        expected_head = self._git_oid("commit", commit)
+        objects = {
+            ("commit", expected_head): commit,
+            ("tree", root_oid): root_tree,
+            ("tree", requirements_oid): requirements_tree,
+            ("blob", blob_oid): lock_bytes,
+        }
+        calls: list[list[str]] = []
+
+        def command(argv, **kwargs):
+            calls.append(list(argv))
+            if argv[:1] == ["/usr/bin/git"]:
+                if "cat-file" in argv:
+                    offset = argv.index("cat-file")
+                    kind, oid = argv[offset + 1:offset + 3]
+                    return subprocess.CompletedProcess(
+                        argv, 0, objects[(kind, oid)], b"",
+                    )
+                if "rev-parse" in argv:
+                    return subprocess.CompletedProcess(
+                        argv, 0, blob_oid + "\n", "",
+                    )
+                if "show" in argv:
+                    return subprocess.CompletedProcess(argv, 0, lock_text, "")
+                raise AssertionError("unexpected git request: " + repr(argv))
+            if argv[:4] == ["/usr/bin/python3", "-I", "-m", "pip"]:
+                dest = Path(argv[argv.index("--dest") + 1])
+                (dest / "PyYAML-6.0.3-py3-none-any.whl").write_bytes(
+                    wheel + (b"altered" if tamper else b"")
+                )
+                return subprocess.CompletedProcess(argv, 0, None, None)
+            raise AssertionError("unexpected trusted child command: " + repr(argv))
+        return command, calls, expected_head, objects
+
+    def test_bind_rejects_already_loaded_untrusted_yaml(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(
+            sys.modules, {"yaml": types.SimpleNamespace(__version__="6.0.3")}
+        ):
+            with self.assertRaisesRegex(RuntimeError, "before lock validation"):
+                RUNNER._bind_hashed_deploy_tooling_yaml(
+                    Path(temporary), repo=Path(temporary), expected_head="a" * 40
+                )
+
+    def test_bind_rejects_symlinked_tooling_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            outside = root / "other"
+            outside.mkdir()
+            (root / "deploy-tooling").symlink_to(outside, target_is_directory=True)
+            with self.assertRaisesRegex(RuntimeError, "directory is unsafe"):
+                RUNNER._bind_hashed_deploy_tooling_yaml(
+                    root, repo=root, expected_head="a" * 40
+                )
+
+    @unittest.skipUnless(
+        hasattr(os, "memfd_create") and sys.platform == "linux",
+        "sealed memfd is required on the production Linux host",
+    )
+    def test_bind_imports_only_sealed_wheel_not_mutable_site(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            command, calls, head, _ = self._prepare(root)
+            previous_path = sys.path[:]
+            fd = None
+            try:
+                with patch.object(RUNNER, "_run_validation_command", side_effect=command):
+                    fd = RUNNER._bind_hashed_deploy_tooling_yaml(
+                        root, repo=root, expected_head=head
+                    )
+                yaml = sys.modules["yaml"]
+                self.assertEqual(yaml.__version__, "6.0.3")
+                self.assertEqual(yaml.safe_load("locked: true"), {"locked": True})
+                self.assertEqual(yaml.__file__, f"/proc/self/fd/{fd}/yaml/__init__.py")
+                self.assertEqual(sys.path, previous_path)
+                self.assertNotIn("GRABOWSKI_UNTRUSTED_PTH", os.environ)
+                self.assertTrue(any(x[:1] == ["/usr/bin/git"] for x in calls))
+                self.assertTrue(any(
+                    x[:4] == ["/usr/bin/python3", "-I", "-m", "pip"] for x in calls
+                ))
+            finally:
+                if fd is not None:
+                    os.close(fd)
+
+    def test_bind_rejects_modified_wheel_before_import(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            command, _, head, _ = self._prepare(root, tamper=True)
+            with patch.object(RUNNER, "_run_validation_command", side_effect=command):
+                with self.assertRaisesRegex(RuntimeError, "not lock-pinned"):
+                    RUNNER._bind_hashed_deploy_tooling_yaml(
+                        root, repo=root, expected_head=head
+                    )
+            self.assertNotIn("yaml", sys.modules)
+
+    def test_bind_rejects_invalid_module_and_evicts_yaml_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            command, _, head, _ = self._prepare(root, version="6.0.2")
+            with patch.object(RUNNER, "_run_validation_command", side_effect=command):
+                with self.assertRaisesRegex(RuntimeError, "sealed locked wheel"):
+                    RUNNER._bind_hashed_deploy_tooling_yaml(
+                        root, repo=root, expected_head=head
+                    )
+            self.assertFalse(any(
+                name == "yaml" or name.startswith("yaml.")
+                for name in sys.modules
+            ))
+
+    def test_bind_pip_uses_immutable_authenticated_lock_after_path_swap(self) -> None:
+        # RED: a peer can replace the checked lock file just before pip
+        # parses -r. Hashing the returned wheel is too late if a malicious
+        # requirements option makes pip execute an attacker sdist backend.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            original_command, _, head, _ = self._prepare(root)
+            trusted = (root / "deploy-tooling.lock.txt").read_bytes()
+            untrusted = (
+                b"--no-binary=:all:\n--find-links=/untrusted-wheels\n"
+                b"pyyaml==6.0.3 --hash=sha256:" + b"0" * 64 + b"\n"
+            )
+            seen: list[str] = []
+
+            def replace_just_before_pip(argv, **kwargs):
+                if argv[:4] == ["/usr/bin/python3", "-I", "-m", "pip"]:
+                    (root / "deploy-tooling.lock.txt").write_bytes(untrusted)
+                    requirement = argv[argv.index("-r") + 1]
+                    seen.append(requirement)
+                    self.assertTrue(requirement.startswith("/proc/self/fd/"))
+                    self.assertEqual(Path(requirement).read_bytes(), trusted)
+                    self.assertEqual(len(kwargs.get("pass_fds", ())), 1)
+                    self.assertIn("require-hashes", " ".join(argv))
+                return original_command(argv, **kwargs)
+
+            previous = sys.path[:]
+            fd = None
+            try:
+                with patch.object(
+                    RUNNER, "_run_validation_command",
+                    side_effect=replace_just_before_pip,
+                ):
+                    fd = RUNNER._bind_hashed_deploy_tooling_yaml(
+                        root, repo=root, expected_head=head,
+                    )
+                self.assertEqual(len(seen), 1)
+                self.assertEqual(sys.modules["yaml"].__version__, "6.0.3")
+                self.assertEqual(sys.path, previous)
+            finally:
+                if fd is not None:
+                    os.close(fd)
+
+    def test_bind_rejects_forged_git_blob_even_when_lock_copy_matches(self) -> None:
+        # RED: a same-UID peer can replace a loose Git blob and the retained
+        # lock copy with mutually matching untrusted bytes, while HEAD and
+        # the commit tree still name the original blob's object ID.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            trusted_command, calls, head, _ = self._prepare(root)
+            authentic = (root / "deploy-tooling.lock.txt").read_text()
+            self.assertIn("--hash=sha256:", authentic)
+            original_hash = authentic.split("--hash=sha256:", 1)[1][:64]
+            forged = authentic.replace(
+                "--hash=sha256:" + original_hash, "--hash=sha256:" + "0" * 64
+            )
+            def corrupted_git_show(argv, **kwargs):
+                if argv[:1] == ["/usr/bin/git"] and (
+                    "show" in argv or (
+                        "cat-file" in argv and argv[argv.index("cat-file") + 1] == "blob"
+                    )
+                ):
+                    (root / "deploy-tooling.lock.txt").write_text(forged)
+                    return subprocess.CompletedProcess(
+                        argv, 0, forged.encode("utf-8") if "cat-file" in argv else forged,
+                        b"" if "cat-file" in argv else "",
+                    )
+                return trusted_command(argv, **kwargs)
+
+            with patch.object(
+                RUNNER, "_run_validation_command",
+                side_effect=corrupted_git_show,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "Git blob|object identity"):
+                    RUNNER._bind_hashed_deploy_tooling_yaml(
+                        root, repo=root, expected_head=head,
+                    )
+            self.assertNotIn("yaml", sys.modules)
+            self.assertFalse(any(
+                args[:4] == ["/usr/bin/python3", "-I", "-m", "pip"]
+                for args in calls
+            ))
+
+    def test_authenticated_lock_chain_reads_real_git_objects(self) -> None:
+        # Verify Git's binary cat-file behavior, including raw tree entries.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repo = root / "repo"
+            repo.mkdir()
+            lock = repo / "requirements" / "deploy-tooling.lock.txt"
+            lock.parent.mkdir()
+            lock.write_text(
+                "pyyaml==6.0.3 --hash=sha256:" + "1" * 64 + "\n",
+                encoding="utf-8",
+            )
+            def git(*args: str) -> str:
+                result = subprocess.run(
+                    ["/usr/bin/git", *args],
+                    cwd=repo, check=True, text=True, capture_output=True,
+                )
+                return result.stdout.strip()
+
+            git("init", "-q")
+            git("add", "requirements/deploy-tooling.lock.txt")
+            git("-c", "user.name=Fixture", "-c", "user.email=test@example.invalid",
+                "commit", "-qm", "fixture lock")
+            expected_head = git("rev-parse", "HEAD")
+            environment = RUNNER._validation_environment(root)
+            environment["GIT_NO_REPLACE_OBJECTS"] = "1"
+            environment["GIT_CONFIG_GLOBAL"] = "/dev/null"
+            environment["GIT_CONFIG_SYSTEM"] = "/dev/null"
+            self.assertEqual(
+                RUNNER._authenticated_deploy_lock_from_git(
+                    repo, root, expected_head, environment
+                ),
+                lock.read_bytes(),
+            )
+
+    def test_bind_rejects_forged_parent_tree_before_pip(self) -> None:
+        # Same-UID replacement of an existing requirements tree makes Git's
+        # path-oriented show/rev-parse collude on a valid *other* lock blob.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            authentic_command, calls, head, objects = self._prepare(root)
+            trusted = (root / "deploy-tooling.lock.txt").read_text()
+            trusted_hash = trusted.split("--hash=sha256:", 1)[1][:64]
+            forged = trusted.replace(trusted_hash, "0" * 64)
+            forged_blob = self._git_oid("blob", forged.encode("utf-8"))
+            forged_tree = (
+                b"100644 deploy-tooling.lock.txt\0" + bytes.fromhex(forged_blob)
+            )
+            original_tree_oid = next(
+                oid for (kind, oid), data in objects.items()
+                if kind == "tree" and b"deploy-tooling.lock.txt" in data
+            )
+
+            def colluding_git(argv, **kwargs):
+                if argv[:1] == ["/usr/bin/git"]:
+                    if "cat-file" in argv:
+                        offset = argv.index("cat-file")
+                        if argv[offset + 1:offset + 3] == ["tree", original_tree_oid]:
+                            return subprocess.CompletedProcess(argv, 0, forged_tree, b"")
+                    if "show" in argv:
+                        (root / "deploy-tooling.lock.txt").write_text(forged)
+                        return subprocess.CompletedProcess(argv, 0, forged, "")
+                    if "rev-parse" in argv:
+                        return subprocess.CompletedProcess(argv, 0, forged_blob + "\n", "")
+                if argv[:4] == ["/usr/bin/python3", "-I", "-m", "pip"]:
+                    raise AssertionError("pip ran before authenticating Git parent tree")
+                return authentic_command(argv, **kwargs)
+
+            with patch.object(RUNNER, "_run_validation_command", side_effect=colluding_git):
+                with self.assertRaisesRegex(RuntimeError, "Git tree object identity mismatch"):
+                    RUNNER._bind_hashed_deploy_tooling_yaml(
+                        root, repo=root, expected_head=head
+                    )
+            self.assertNotIn("yaml", sys.modules)
+            self.assertFalse(any(
+                args[:4] == ["/usr/bin/python3", "-I", "-m", "pip"] for args in calls
+            ))
+
+    def test_bind_rejects_forged_commit_before_pip(self) -> None:
+        # The original expected_head is a trusted external anchor. Never take
+        # a root-tree pointer from a commit whose content no longer hashes to it.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            authentic_command, calls, head, objects = self._prepare(root)
+            original_commit = objects[("commit", head)]
+            trusted = (root / "deploy-tooling.lock.txt").read_text()
+            trusted_hash = trusted.split("--hash=sha256:", 1)[1][:64]
+            forged = trusted.replace(trusted_hash, "0" * 64)
+            forged_blob = self._git_oid("blob", forged.encode("utf-8"))
+            forged_requirements_tree = (
+                b"100644 deploy-tooling.lock.txt\0" + bytes.fromhex(forged_blob)
+            )
+            forged_requirements_oid = self._git_oid("tree", forged_requirements_tree)
+            forged_root_tree = (
+                b"40000 requirements\0" + bytes.fromhex(forged_requirements_oid)
+            )
+            forged_root_oid = self._git_oid("tree", forged_root_tree)
+            original_root_oid = original_commit.split(b"\n", 1)[0][5:]
+            bad_commit = original_commit.replace(
+                original_root_oid, forged_root_oid.encode("ascii"), 1
+            )
+            self.assertEqual(
+                len(original_commit), len(bad_commit),
+                "Forged Git commit remains well-formed with same byte length",
+            )
+            self.assertNotEqual(self._git_oid("commit", bad_commit), head)
+
+            def colluding_git(argv, **kwargs):
+                if argv[:1] == ["/usr/bin/git"]:
+                    if "cat-file" in argv:
+                        offset = argv.index("cat-file")
+                        if argv[offset + 1:offset + 3] == ["commit", head]:
+                            return subprocess.CompletedProcess(argv, 0, bad_commit, b"")
+                    if "show" in argv:
+                        (root / "deploy-tooling.lock.txt").write_text(forged)
+                        return subprocess.CompletedProcess(argv, 0, forged, "")
+                    if "rev-parse" in argv:
+                        return subprocess.CompletedProcess(argv, 0, forged_blob + "\n", "")
+                if argv[:4] == ["/usr/bin/python3", "-I", "-m", "pip"]:
+                    raise AssertionError("pip ran before authenticating expected commit")
+                return authentic_command(argv, **kwargs)
+
+            with patch.object(RUNNER, "_run_validation_command", side_effect=colluding_git):
+                with self.assertRaisesRegex(RuntimeError, "Git commit object identity mismatch"):
+                    RUNNER._bind_hashed_deploy_tooling_yaml(
+                        root, repo=root, expected_head=head
+                    )
+            self.assertNotIn("yaml", sys.modules)
+            self.assertFalse(any(
+                args[:4] == ["/usr/bin/python3", "-I", "-m", "pip"] for args in calls
+            ))
+
+    def test_bind_rejects_changed_lock_snapshot_before_download(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            command, calls, head, _ = self._prepare(root)
+            (root / "deploy-tooling.lock.txt").write_text("invalid override")
+            with patch.object(RUNNER, "_run_validation_command", side_effect=command):
+                with self.assertRaisesRegex(RuntimeError, "changed from committed source"):
+                    RUNNER._bind_hashed_deploy_tooling_yaml(
+                        root, repo=root, expected_head=head
+                    )
+            self.assertFalse(any(
+                x[:4] == ["/usr/bin/python3", "-I", "-m", "pip"] for x in calls
+            ))
+
+
 class ScheduledDeployRunnerTests(unittest.TestCase):
     def setUp(self) -> None:
+        self._yaml_binding_patch = patch.object(
+            RUNNER, "_bind_hashed_deploy_tooling_yaml", return_value=None
+        )
+        self.yaml_binding_mock = self._yaml_binding_patch.start()
+        self.addCleanup(self._yaml_binding_patch.stop)
         self.productive_blue_green = patch.object(
             RUNNER,
             "run_productive_blue_green",
@@ -8995,7 +9527,7 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
                 RUNNER, "load_finalization_binding", return_value=None
             ), patch.object(RUNNER.time, "sleep") as sleep, patch.object(
                 RUNNER, "verify_repository"
-            ) as verify, patch.object(RUNNER, "run_streamed") as streamed:
+            ) as verify, patch.object(RUNNER, "run_streamed", side_effect=_fake_retained_validation) as streamed:
                 self.assertEqual(RUNNER.main(), 1)
             sleep.assert_not_called()
             verify.assert_not_called()
@@ -9249,6 +9781,30 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
             "5",
         ]
 
+    def test_main_source_drift_after_validation_blocks_tooling_yaml_import(self) -> None:
+        repo = Path("/tmp/repository")
+        expected = "f" * 40
+        with patch.object(
+            sys, "argv", self._runner_argv(repo, expected)
+        ), patch.object(
+            RUNNER, "load_finalization_binding", return_value=None
+        ), patch.object(
+            RUNNER.time, "sleep"
+        ), patch.object(
+            RUNNER, "verify_repository",
+            side_effect=[None, RuntimeError("source drift after validate")],
+        ) as verify, patch.object(
+            RUNNER, "deployment_contention_preflight",
+            return_value=_contention_result(),
+        ), patch.object(
+            RUNNER, "run_streamed", side_effect=_fake_retained_validation
+        ) as streamed:
+            self.assertEqual(RUNNER.main(), 1)
+        self.assertEqual(verify.call_count, 2)
+        streamed.assert_called_once()
+        self.yaml_binding_mock.assert_not_called()
+        self.productive_blue_green_mock.assert_not_called()
+
     def test_main_retries_only_contention_and_then_succeeds(self) -> None:
         repo = Path("/tmp/repository")
         expected = "f" * 40
@@ -9266,9 +9822,7 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
                 _contention_result(decision="defer"),
                 _contention_result(),
             ],
-        ) as preflight, patch.object(
-            RUNNER, "run_streamed"
-        ) as streamed, patch.object(
+        ) as preflight, patch.object(RUNNER, "run_streamed", side_effect=_fake_retained_validation) as streamed, patch.object(
             RUNNER,
             "verify_live_manifest",
             return_value={
@@ -9290,6 +9844,12 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
             cwd=repo,
             timeout_seconds=1200,
             phase="validate",
+            retain_validation=True,
+        )
+        self.yaml_binding_mock.assert_called_once()
+        self.assertEqual(
+            self.yaml_binding_mock.call_args.kwargs,
+            {"repo": repo, "expected_head": expected},
         )
         self.assertEqual(self.productive_blue_green_mock.call_count, 1)
 
@@ -9306,7 +9866,7 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
             RUNNER,
             "deployment_contention_preflight",
             return_value=_contention_result(decision="defer"),
-        ) as preflight, patch.object(RUNNER, "run_streamed") as streamed:
+        ) as preflight, patch.object(RUNNER, "run_streamed", side_effect=_fake_retained_validation) as streamed:
             self.assertEqual(RUNNER.main(), 1)
         self.assertEqual(
             preflight.call_count, RUNNER.DEPLOYMENT_CONTENTION_MAX_ATTEMPTS
@@ -9334,7 +9894,7 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
             RUNNER,
             "deployment_contention_preflight",
             return_value=_contention_result(decision="defer"),
-        ) as preflight, patch.object(RUNNER, "run_streamed") as streamed:
+        ) as preflight, patch.object(RUNNER, "run_streamed", side_effect=_fake_retained_validation) as streamed:
             self.assertEqual(RUNNER.main(), 1)
         self.assertEqual(verify.call_count, 2)
         preflight.assert_called_once()
@@ -9354,7 +9914,7 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
             RUNNER,
             "deployment_contention_preflight",
             side_effect=RuntimeError("metrics probe failed"),
-        ) as preflight, patch.object(RUNNER, "run_streamed") as streamed:
+        ) as preflight, patch.object(RUNNER, "run_streamed", side_effect=_fake_retained_validation) as streamed:
             self.assertEqual(RUNNER.main(), 1)
         verify.assert_called_once()
         preflight.assert_called_once()
@@ -9374,7 +9934,7 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
             RUNNER,
             "deployment_contention_preflight",
             return_value=_contention_result(decision="unknown"),
-        ) as preflight, patch.object(RUNNER, "run_streamed") as streamed:
+        ) as preflight, patch.object(RUNNER, "run_streamed", side_effect=_fake_retained_validation) as streamed:
             self.assertEqual(RUNNER.main(), 1)
         verify.assert_called_once()
         preflight.assert_called_once()
@@ -9384,7 +9944,7 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
     def test_main_validates_before_deploying(self) -> None:
         repo = Path("/tmp/repository")
         expected = "f" * 40
-        with patch.object(sys, "argv", ["runner", "--repo", str(repo), "--canonical-repo", str(repo), "--source-kind", "canonical-main", "--source-identity-sha256", "0" * 64, "--expected-head", expected, "--delay-seconds", "5"]), patch.object(RUNNER, "load_finalization_binding", return_value=None), patch.object(RUNNER.time, "sleep"), patch.object(RUNNER, "verify_repository") as verify, patch.object(RUNNER, "deployment_contention_preflight", return_value=_contention_result()), patch.object(RUNNER, "run_streamed") as streamed, patch.object(RUNNER, "verify_live_manifest", return_value={"release_id": "r", "repo_head": expected, "completion_status": "complete"}), patch.object(RUNNER, "reconcile_coding_agent_sidecars", return_value=_sidecar_reconciliation(expected)):
+        with patch.object(sys, "argv", ["runner", "--repo", str(repo), "--canonical-repo", str(repo), "--source-kind", "canonical-main", "--source-identity-sha256", "0" * 64, "--expected-head", expected, "--delay-seconds", "5"]), patch.object(RUNNER, "load_finalization_binding", return_value=None), patch.object(RUNNER.time, "sleep"), patch.object(RUNNER, "verify_repository") as verify, patch.object(RUNNER, "deployment_contention_preflight", return_value=_contention_result()), patch.object(RUNNER, "run_streamed", side_effect=_fake_retained_validation) as streamed, patch.object(RUNNER, "verify_live_manifest", return_value={"release_id": "r", "repo_head": expected, "completion_status": "complete"}), patch.object(RUNNER, "reconcile_coding_agent_sidecars", return_value=_sidecar_reconciliation(expected)):
             self.assertEqual(RUNNER.main(), 0)
         self.assertEqual(verify.call_count, 4)
         self.assertEqual(streamed.call_args_list[0].args[0], ["make", "validate"])
@@ -9413,7 +9973,7 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
             RUNNER,
             "deployment_contention_preflight",
             return_value=_contention_result(),
-        ), patch.object(RUNNER, "run_streamed") as streamed, patch.object(
+        ), patch.object(RUNNER, "run_streamed", side_effect=_fake_retained_validation) as streamed, patch.object(
             RUNNER,
             "verify_live_manifest",
             return_value={
@@ -9431,6 +9991,7 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
             cwd=repo,
             timeout_seconds=1200,
             phase="validate",
+            retain_validation=True,
         )
         self.productive_blue_green_mock.assert_called_once()
         reconcile.assert_not_called()
@@ -9559,7 +10120,7 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
         repo = Path("/tmp/repository")
         expected = "f" * 40
         binding = {"expected_head": expected}
-        with patch.object(sys, "argv", ["runner", "--repo", str(repo), "--canonical-repo", str(repo), "--source-kind", "canonical-main", "--source-identity-sha256", "0" * 64, "--expected-head", expected, "--delay-seconds", "5"]), patch.object(RUNNER, "load_finalization_binding", return_value=binding), patch.object(RUNNER.time, "sleep"), patch.object(RUNNER, "verify_repository"), patch.object(RUNNER, "deployment_contention_preflight", return_value=_contention_result()), patch.object(RUNNER, "run_streamed"), patch.object(RUNNER, "verify_live_manifest", return_value={"release_id": "release", "repo_head": expected, "completion_status": "complete"}), patch.object(RUNNER, "reconcile_coding_agent_sidecars", return_value=_sidecar_reconciliation(expected)), patch.object(RUNNER, "write_finalization_receipt") as write:
+        with patch.object(sys, "argv", ["runner", "--repo", str(repo), "--canonical-repo", str(repo), "--source-kind", "canonical-main", "--source-identity-sha256", "0" * 64, "--expected-head", expected, "--delay-seconds", "5"]), patch.object(RUNNER, "load_finalization_binding", return_value=binding), patch.object(RUNNER.time, "sleep"), patch.object(RUNNER, "verify_repository"), patch.object(RUNNER, "deployment_contention_preflight", return_value=_contention_result()), patch.object(RUNNER, "run_streamed", side_effect=_fake_retained_validation), patch.object(RUNNER, "verify_live_manifest", return_value={"release_id": "release", "repo_head": expected, "completion_status": "complete"}), patch.object(RUNNER, "reconcile_coding_agent_sidecars", return_value=_sidecar_reconciliation(expected)), patch.object(RUNNER, "write_finalization_receipt") as write:
             self.assertEqual(RUNNER.main(), 0)
         write.assert_called_once_with(
             binding,
@@ -9585,7 +10146,7 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
             RUNNER,
             "deployment_contention_preflight",
             return_value=_contention_result(),
-        ), patch.object(RUNNER, "run_streamed"), patch.object(
+        ), patch.object(RUNNER, "run_streamed", side_effect=_fake_retained_validation), patch.object(
             RUNNER, "run_productive_blue_green", return_value=blue_green
         ), patch.object(
             RUNNER,
@@ -9627,7 +10188,7 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
             RUNNER,
             "deployment_contention_preflight",
             return_value=_contention_result(),
-        ), patch.object(RUNNER, "run_streamed"), patch.object(
+        ), patch.object(RUNNER, "run_streamed", side_effect=_fake_retained_validation), patch.object(
             RUNNER, "run_productive_blue_green", return_value=blue_green
         ), patch.object(
             RUNNER, "verify_live_manifest"
@@ -9662,7 +10223,7 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
             RUNNER,
             "deployment_contention_preflight",
             return_value=_contention_result(),
-        ), patch.object(RUNNER, "run_streamed"), patch.object(
+        ), patch.object(RUNNER, "run_streamed", side_effect=_fake_retained_validation), patch.object(
             RUNNER,
             "verify_live_manifest",
             return_value={

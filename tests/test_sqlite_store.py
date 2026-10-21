@@ -208,5 +208,160 @@ class SQLiteStoreTests(unittest.TestCase):
                 os.chmod(root, 0o700)
 
 
+    def test_strict_observer_reads_checkpointed_empty_wal_with_existing_shm(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "checkpointed.sqlite3"
+            writer = sqlite3.connect(database)
+            try:
+                writer.execute("PRAGMA journal_mode=WAL")
+                writer.execute("PRAGMA wal_autocheckpoint=0")
+                writer.execute("CREATE TABLE sample(value TEXT)")
+                writer.execute("INSERT INTO sample VALUES ('checkpointed')")
+                writer.commit()
+                writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                wal = Path(str(database) + "-wal")
+                shm = Path(str(database) + "-shm")
+                self.assertTrue(shm.is_file())
+                self.assertTrue(wal.is_file())
+                self.assertEqual(0, wal.stat().st_size)
+                before = {item.name: item.read_bytes() for item in root.iterdir()}
+                with patch.object(
+                    sqlite_store.tempfile,
+                    "TemporaryDirectory",
+                    side_effect=AssertionError("zero-frame WAL must not be copied"),
+                ) as temporary:
+                    with sqlite_store.inventory_readonly_sqlite(
+                        database,
+                        temporary_prefix="not-allowed-to-copy-",
+                        error_type=InventoryChanged,
+                        allow_wal_copy=False,
+                        allow_checkpointed_empty_wal=True,
+                    ) as reader:
+                        self.assertEqual(
+                            "checkpointed",
+                            reader.execute("SELECT value FROM sample").fetchone()[0],
+                        )
+                temporary.assert_not_called()
+                self.assertEqual(
+                    before, {item.name: item.read_bytes() for item in root.iterdir()},
+                )
+            finally:
+                writer.close()
+
+    def test_strict_observer_rejects_empty_wal_modified_during_observation(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "changed.sqlite3"
+            writer = sqlite3.connect(database)
+            try:
+                writer.execute("PRAGMA journal_mode=WAL")
+                writer.execute("CREATE TABLE sample(value INTEGER)")
+                writer.commit()
+                writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                wal = Path(str(database) + "-wal")
+                self.assertEqual(0, wal.stat().st_size)
+                with self.assertRaises(InventoryChanged):
+                    with sqlite_store.inventory_readonly_sqlite(
+                        database,
+                        temporary_prefix="not-allowed-to-copy-",
+                        error_type=InventoryChanged,
+                        allow_wal_copy=False,
+                        allow_checkpointed_empty_wal=True,
+                    ) as reader:
+                        reader.execute("SELECT count(*) FROM sample").fetchone()
+                        wal.write_bytes(b"unsafe-new-wal-content")
+            finally:
+                writer.close()
+
+    def test_strict_observer_rejects_new_wal_commit_during_immutable_read(self) -> None:
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "racing.sqlite3"
+            writer = sqlite3.connect(database)
+            try:
+                writer.execute("PRAGMA journal_mode=WAL")
+                writer.execute("PRAGMA wal_autocheckpoint=0")
+                writer.execute("CREATE TABLE sample(value INTEGER)")
+                writer.commit()
+                writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                self.assertEqual(0, Path(str(database) + "-wal").stat().st_size)
+                with self.assertRaises(InventoryChanged):
+                    with sqlite_store.inventory_readonly_sqlite(
+                        database,
+                        temporary_prefix="not-allowed-to-copy-",
+                        error_type=InventoryChanged,
+                        allow_wal_copy=False,
+                        allow_checkpointed_empty_wal=True,
+                    ) as reader:
+                        self.assertEqual(
+                            0, reader.execute("SELECT count(*) FROM sample").fetchone()[0],
+                        )
+                        writer.execute("INSERT INTO sample VALUES (1)")
+                        writer.commit()
+            finally:
+                writer.close()
+
+    def test_strict_observer_rejects_symlinked_empty_wal(self) -> None:
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "linked.sqlite3"
+            with sqlite3.connect(database) as writer:
+                writer.execute("CREATE TABLE sample(value INTEGER)")
+                writer.commit()
+            target = Path(directory) / "empty-wal"
+            target.write_bytes(b"")
+            Path(str(database) + "-wal").symlink_to(target)
+            with self.assertRaises(InventoryChanged):
+                with sqlite_store.inventory_readonly_sqlite(
+                    database,
+                    temporary_prefix="not-allowed-to-copy-",
+                    error_type=InventoryChanged,
+                    allow_wal_copy=False,
+                    allow_checkpointed_empty_wal=True,
+                ):
+                    self.fail("symlinked sidecars must never be trusted")
+
+
+    def test_strict_observer_rejects_orphaned_shm_without_wal(self) -> None:
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "orphaned.sqlite3"
+            with sqlite3.connect(database) as writer:
+                writer.execute("CREATE TABLE sample(value INTEGER)")
+                writer.commit()
+            orphaned = Path(str(database) + "-shm")
+            orphaned.write_bytes(b"former-shm-without-wal")
+            before = orphaned.read_bytes()
+            with self.assertRaisesRegex(InventoryChanged, "Strict read-only"):
+                with sqlite_store.inventory_readonly_sqlite(
+                    database,
+                    temporary_prefix="not-allowed-to-copy-",
+                    error_type=InventoryChanged,
+                    allow_wal_copy=False,
+                    allow_checkpointed_empty_wal=True,
+                ):
+                    self.fail("orphaned SHM does not prove successful WAL checkpoint")
+            self.assertEqual(before, orphaned.read_bytes())
+
+    def test_strict_observer_default_denies_zero_length_wal_and_shm(self) -> None:
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "denied.sqlite3"
+            writer = sqlite3.connect(database)
+            try:
+                writer.execute("PRAGMA journal_mode=WAL")
+                writer.execute("PRAGMA wal_autocheckpoint=0")
+                writer.execute("CREATE TABLE sample(value INTEGER)")
+                writer.commit()
+                writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                self.assertEqual(0, Path(str(database) + "-wal").stat().st_size)
+                with self.assertRaisesRegex(InventoryChanged, "Strict read-only snapshot unavailable"):
+                    with sqlite_store.inventory_readonly_sqlite(
+                        database,
+                        temporary_prefix="no-implicit-wal0-",
+                        error_type=InventoryChanged,
+                        allow_wal_copy=False,
+                    ):
+                        self.fail("Zero-length WAL alone cannot grant global strict-read permission")
+            finally:
+                writer.close()
+
 if __name__ == "__main__":
     unittest.main()

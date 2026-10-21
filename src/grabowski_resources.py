@@ -69,6 +69,8 @@ SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 BRANCH_MUTATION_ATTEMPT_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}\Z")
 BRANCH_MUTATION_ATTEMPT_SCHEMA_VERSION = 1
 BRANCH_MUTATION_ATTEMPT_METADATA_KEY = "branch_mutation_attempt"
+WORK_LANE_OWNER_RE = re.compile(r"lane:[0-9a-f]{32}\Z")
+SERVER_LEASE_GENERATION_NONCE_KEY = "_server_lease_generation_nonce_v1"
 TASK_ID_RE = re.compile(r"[0-9a-f]{24}\Z")
 MIN_TTL_SECONDS = 30
 MAX_TTL_SECONDS = 7 * 24 * 60 * 60
@@ -1445,7 +1447,7 @@ def _row_metadata(row: sqlite3.Row) -> dict[str, Any]:
 def _lease_identity_metadata(
     metadata: dict[str, Any], *, preserve_task_attempt: bool
 ) -> dict[str, Any]:
-    ignored = {"work_admission"}
+    ignored = {"work_admission", SERVER_LEASE_GENERATION_NONCE_KEY}
     if preserve_task_attempt:
         ignored.update({"attempt", "recovered_after_expiry"})
     return {key: value for key, value in metadata.items() if key not in ignored}
@@ -6038,6 +6040,7 @@ def acquire_resources(
     admission_assessor: Any | None = None,
     _work_admission_mode: str = "normal",
     _preserve_live_same_owner: bool = False,
+    _work_lane_no_renew_preserved: bool = False,
     _commit_precondition: Any | None = None,
     _user_systemd_stop_recovery_fence_id: str | None = None,
 ) -> dict[str, Any]:
@@ -6056,6 +6059,10 @@ def acquire_resources(
         raise ValueError("_commit_precondition must be callable")
     if _preserve_live_same_owner and task_owner_match is None:
         raise PermissionError("live lease preservation requires a task owner")
+    if not isinstance(_work_lane_no_renew_preserved, bool):
+        raise ValueError("_work_lane_no_renew_preserved must be boolean")
+    if _work_lane_no_renew_preserved and re.fullmatch(r"lane:[0-9a-f]{32}", owner) is None:
+        raise PermissionError("non-renewing Work Lane acquisition requires a lane owner")
     normalized_metadata: dict[str, Any] = {} if metadata is None else dict(metadata)
     if _user_systemd_stop_recovery_fence_id is not None:
         if (
@@ -6079,6 +6086,8 @@ def acquire_resources(
             )
     if "lease_mode" in normalized_metadata:
         raise ValueError("metadata.lease_mode is not an authority surface")
+    if SERVER_LEASE_GENERATION_NONCE_KEY in normalized_metadata:
+        raise ValueError("metadata lease generation nonce is server-owned")
     if "work_admission" in normalized_metadata:
         raise ValueError("metadata.work_admission is not a public authority surface")
     if "scope_manifest" in normalized_metadata:
@@ -6410,7 +6419,14 @@ def acquire_resources(
                         )
                     acquired = int(row["acquired_at_unix"])
                     current_expires = int(row["expires_at_unix"])
-                    lease_expires = max(current_expires, expires)
+                    # Across multiple atomic Work Lane batches, a preserved
+                    # same-owner lease cannot be extended and left behind by
+                    # compensation when a subsequent batch conflicts.
+                    lease_expires = (
+                        current_expires
+                        if _work_lane_no_renew_preserved
+                        else max(current_expires, expires)
+                    )
                     updated = (
                         now
                         if lease_expires > current_expires
@@ -6425,6 +6441,14 @@ def acquire_resources(
                     acquired = now
                     updated = now
                     lease_expires = expires
+                    # Detect same-owner release/reacquire within one clock second.
+                    # Keep the generation in server metadata, never caller input.
+                    # A live same-owner reentry preserves its exact prior hash.
+                    if WORK_LANE_OWNER_RE.fullmatch(owner) is not None:
+                        stored_metadata_json, stored_metadata_sha256 = _metadata({
+                            **persisted_metadata,
+                            SERVER_LEASE_GENERATION_NONCE_KEY: os.urandom(16).hex(),
+                        })
                     if row is not None:
                         previous_owner = row["owner_id"]
                         reclaimed_from_owner = previous_owner
@@ -7931,6 +7955,91 @@ def renew_resources(
     }
 
 
+def restore_renewed_work_lane_leases(
+    owner_id: str,
+    resource_keys: Iterable[str],
+    *,
+    expected_renewed_leases: list[dict[str, Any]],
+    original_leases: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """CAS-restore only a Work Lane's own preserved lease renewal.
+
+    This is deliberately not a public MCP mutation surface. No new owner,
+    resource or metadata authority is granted. An ABA or any newer generation
+    invalidates the entire <=64-key rollback transaction.
+    """
+    owner = _owner(owner_id)
+    if WORK_LANE_OWNER_RE.fullmatch(owner) is None:
+        raise PermissionError("preserved renewal rollback requires a lane owner")
+    keys = normalize_resource_keys(resource_keys)
+    renewed = _normalize_mutation_lease_snapshots(
+        expected_renewed_leases, expected_owner_id=owner, resource_keys=keys,
+    )
+    original = _normalize_mutation_lease_snapshots(
+        original_leases, expected_owner_id=owner, resource_keys=keys,
+    )
+    for before, after in zip(original, renewed):
+        if (
+            before["resource_key"] != after["resource_key"]
+            or before["acquired_at_unix"] != after["acquired_at_unix"]
+            or before["metadata_sha256"] != after["metadata_sha256"]
+            or before["updated_at_unix"] > after["updated_at_unix"]
+            or before["expires_at_unix"] > after["expires_at_unix"]
+        ):
+            raise ValueError("preserved renewal rollback generations are incompatible")
+    with closing(_database()) as connection, connection:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            rows = connection.execute(
+                f"SELECT * FROM leases WHERE resource_key IN ({','.join('?' for _ in keys)})",
+                keys,
+            ).fetchall()
+            existing = {row["resource_key"]: row for row in rows}
+            for item in renewed:
+                key = item["resource_key"]
+                row = existing.get(key)
+                if row is None:
+                    raise RuntimeError(f"renewed Work Lane lease disappeared: {key}")
+                if row["owner_id"] != owner:
+                    raise PermissionError(f"renewed Work Lane lease is foreign: {key}")
+                if _release_lease_snapshot(row) != item:
+                    raise RuntimeError(f"renewed Work Lane generation changed: {key}")
+                row_metadata = _row_metadata(row)
+                _, observed_sha256 = _metadata(row_metadata)
+                if observed_sha256 != row["metadata_sha256"]:
+                    raise RuntimeError(f"renewed Work Lane metadata changed: {key}")
+                if BRANCH_MUTATION_ATTEMPT_METADATA_KEY in row_metadata:
+                    raise RuntimeError(
+                        f"active branch mutation attempt prevents lease rollback: {key}"
+                    )
+            connection.executemany(
+                "UPDATE leases SET updated_at_unix=?, expires_at_unix=? "
+                "WHERE resource_key=? AND owner_id=?",
+                [
+                    (item["updated_at_unix"], item["expires_at_unix"],
+                     item["resource_key"], owner)
+                    for item in original
+                ],
+            )
+            restored_rows = connection.execute(
+                f"SELECT * FROM leases WHERE resource_key IN ({','.join('?' for _ in keys)}) "
+                "ORDER BY resource_key", keys,
+            ).fetchall()
+            restored = [_public(row) for row in restored_rows]
+            if [_release_lease_snapshot(row) for row in restored] != original:
+                raise RuntimeError("preserved renewal rollback changed generations")
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+    return {
+        "owner_id": owner,
+        "resource_keys": keys,
+        "snapshot_guarded": True,
+        "restored": restored,
+    }
+
+
 def release_resources(
     owner_id: str,
     resource_keys: Iterable[str],
@@ -8099,9 +8208,17 @@ def list_resources(
     include_expired: bool = False,
     limit: int = 200,
     read_only: bool = False,
+    start_after_key: str | None = None,
 ) -> list[dict[str, Any]]:
     if not isinstance(limit, int) or not 1 <= limit <= 1000:
         raise ValueError("limit must be between 1 and 1000")
+    if start_after_key is not None and (
+        not isinstance(start_after_key, str)
+        or not start_after_key
+        or "\x00" in start_after_key
+        or len(start_after_key.encode("utf-8")) > 8192
+    ):
+        raise ValueError("start_after_key must be a bounded opaque resource key")
     parameters: list[Any] = []
     clauses: list[str] = []
     if owner_id is not None:
@@ -8111,6 +8228,9 @@ def list_resources(
         now = _now()
         clauses.append("typeof(expires_at_unix)='integer' AND expires_at_unix>?")
         parameters.append(now)
+    if start_after_key is not None:
+        clauses.append("resource_key>?")
+        parameters.append(start_after_key)
     where = " WHERE " + " AND ".join(clauses) if clauses else ""
     parameters.append(limit)
     if not isinstance(read_only, bool):

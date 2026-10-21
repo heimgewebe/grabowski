@@ -443,10 +443,12 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
                 ]),
             ):
                 if allowed:
-                    self.assertEqual(
-                        "non-runtime-documentation",
-                        deploy._require_release_source_admission("b"*40)["status"],
-                    )
+                    # Regular Git modes are not proof of inert validation input.
+                    with self.assertRaisesRegex(
+                        deploy.DeploySchedulePreEffectRefusal,
+                        "release review admission missing",
+                    ):
+                        deploy._require_release_source_admission("b" * 40)
                 else:
                     with self.assertRaises(deploy.DeploySchedulePreEffectRefusal):
                         deploy._require_release_source_admission("b"*40)
@@ -642,8 +644,11 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
                 side_effect=[self._git_success(""), self._git_success(self._raw_change('docs/guide.md'))],
             ),
         ):
-            record = deploy._require_release_source_admission("b" * 40)
-        self.assertEqual("non-runtime-documentation", record["status"])
+            with self.assertRaisesRegex(
+                deploy.DeploySchedulePreEffectRefusal,
+                "release review admission missing",
+            ):
+                deploy._require_release_source_admission("b" * 40)
 
     def test_missing_serving_process_provenance_blocks(self) -> None:
         import grabowski_self_deploy as deploy
