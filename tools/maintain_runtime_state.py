@@ -312,6 +312,49 @@ def _archive_require_child_bound(
         raise RuntimeError(f"private child root changed: {path}")
 
 
+def provision_receipt_root(*, receipt_root: Path = RECEIPT_ROOT) -> dict[str, Any]:
+    """Create only the private receipt leaf through one no-follow parent FD.
+
+    This explicit pre-effect provisioning never touches pre-existing leaves,
+    other directories, logs, or job/index authority. Same-UID path swaps may
+    cause a fail-closed error but can never make this operation chmod or unlink
+    a substituted inode.
+    """
+    root = Path(receipt_root)
+    if not root.name or root.name in {".", ".."}:
+        raise RuntimeError("receipt root basename is invalid")
+    parent_fd = _archive_open_private_root(
+        root.parent, allow_readable_parent=True
+    )
+    try:
+        _archive_require_unchanged_root(root.parent, parent_fd)
+        created = False
+        try:
+            os.mkdir(root.name, mode=0o700, dir_fd=parent_fd)
+            created = True
+        except FileExistsError:
+            # EEXIST includes a final-component symlink. Never chmod it,
+            # recursively adopt it, replace it, or follow it.
+            pass
+        leaf_fd = _archive_open_child_root(parent_fd, root.name, root)
+        try:
+            _archive_require_child_bound(parent_fd, root.name, leaf_fd, root)
+            _archive_require_unchanged_root(root.parent, parent_fd)
+            if created:
+                os.fsync(parent_fd)
+        finally:
+            os.close(leaf_fd)
+    finally:
+        os.close(parent_fd)
+    return {
+        "schema_version": 1,
+        "operation": "grabowski-retention-receipt-root-provision",
+        "created": created,
+        "status": "passed",
+        "path": str(root),
+    }
+
+
 def _pinned_output_root_fd(plan: "_PinnedRetentionPlan", kind: str) -> int:
     """Pin archive/receipt root before first use; never adopt a new pathname."""
     if kind not in {"archive", "receipt"}:
@@ -3713,6 +3756,7 @@ def main() -> int:
     )
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--expected-plan-sha256")
+    parser.add_argument("--provision-receipt-root", action="store_true")
     parser.add_argument("--periodic-apply", action="store_true")
     parser.add_argument("--worktree-hygiene-repo", action="append", default=[])
     parser.add_argument(
@@ -3733,6 +3777,24 @@ def main() -> int:
     parser.add_argument("--attempt", type=int)
     args = parser.parse_args()
     try:
+        if args.provision_receipt_root:
+            if (
+                args.apply or args.periodic_apply or args.legacy_archive_status
+                or args.reconcile_completion_audit
+                or args.expected_plan_sha256
+                or args.intent_record_sha256
+                or args.receipt_path
+                or args.expected_receipt_sha256
+                or args.attempt is not None
+                or args.worktree_hygiene_repo
+                or args.worktree_hygiene_allowed_root
+            ):
+                raise ValueError(
+                    "--provision-receipt-root cannot be combined with apply "
+                    "or maintenance/reconciliation actions"
+                )
+            print(json.dumps(provision_receipt_root(), sort_keys=True))
+            return 0
         if args.reconcile_completion_audit:
             if (
                 args.apply

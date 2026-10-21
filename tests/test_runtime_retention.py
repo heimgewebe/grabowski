@@ -4165,15 +4165,68 @@ class RuntimeRetentionTests(unittest.TestCase):
         # systemd 249 resolves StateDirectory in per-user units below
         # XDG_CONFIG_HOME, not the actual Grabowski state path.
         self.assertNotIn("StateDirectory=", unit)
-        provision = "ExecStartPre=/usr/bin/install -d -m 0700 -- " + root
-        precheck = "ExecStartPre=/usr/bin/test ! -L " + root
-        verify = "ExecStartPre=/usr/bin/test -d " + root
+        provision = (
+            "ExecStartPre=%h/.local/share/grabowski-mcp/.venv/bin/python "
+            "%h/.local/share/grabowski-mcp/tools/maintain_runtime_state.py "
+            "--provision-receipt-root"
+        )
         self.assertIn(provision, unit)
-        self.assertIn(verify, unit)
-        self.assertEqual(unit.count(precheck), 2)
-        self.assertLess(unit.index(precheck), unit.index(provision))
-        self.assertLess(unit.index(provision), unit.index(verify))
+        self.assertNotIn("ExecStartPre=/usr/bin/install", unit)
         self.assertNotIn("ExecStartPre=/usr/bin/mkdir", unit)
+        self.assertLess(unit.index(provision), unit.index("ExecStart="))
+
+    def test_provision_receipt_root_is_private_idempotent_and_parent_unchanged(self) -> None:
+        self._simulated_protected_authority.return_value = False
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary)
+            parent.chmod(0o755)
+            receipts = parent / "retention-receipts"
+            self.assertFalse(receipts.exists())
+            jobs = parent / "jobs"
+            jobs.mkdir(mode=0o700)
+            first = RETENTION.provision_receipt_root(receipt_root=receipts)
+            plan_before = RETENTION.build_plan(
+                minimum_job_age_seconds=50, now=1000,
+                jobs_root=jobs, archive_root=parent / "absent" / "archive",
+                receipt_root=receipts, task_db=parent / "missing.sqlite3",
+                failed_units=[], unit_states={},
+            )
+            second = RETENTION.provision_receipt_root(receipt_root=receipts)
+            plan_after = RETENTION.build_plan(
+                minimum_job_age_seconds=50, now=1000,
+                jobs_root=jobs, archive_root=parent / "absent" / "archive",
+                receipt_root=receipts, task_db=parent / "missing.sqlite3",
+                failed_units=[], unit_states={},
+            )
+            self.assertEqual(plan_before["plan_sha256"], plan_after["plan_sha256"])
+            self.assertTrue(first["created"])
+            self.assertFalse(second["created"])
+            self.assertEqual(receipts.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(parent.stat().st_mode & 0o777, 0o755)
+
+    def test_provision_receipt_root_never_follows_raced_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary)
+            other = parent / "outside"
+            other.mkdir(mode=0o755)
+            other.chmod(0o755)
+            link = parent / "retention-receipts"
+            link.symlink_to(other, target_is_directory=True)
+            with self.assertRaises((OSError, RuntimeError)):
+                RETENTION.provision_receipt_root(receipt_root=link)
+            self.assertTrue(link.is_symlink())
+            self.assertEqual(other.stat().st_mode & 0o777, 0o755)
+            self.assertEqual(list(other.iterdir()), [])
+
+    def test_manual_check_and_apply_provision_before_hash_bound_plan(self) -> None:
+        source = (ROOT / "Makefile").read_text(encoding="utf-8")
+        for target in ("runtime-retention-check", "runtime-retention-apply"):
+            block = source.split(target + ": context-check", 1)[1].split("\n\n", 1)[0]
+            self.assertIn("--provision-receipt-root", block)
+            self.assertLess(
+                block.index("--provision-receipt-root"),
+                block.index("--minimum-job-age-seconds"),
+            )
 
     def test_missing_receipt_root_never_resets_task_before_failure(self) -> None:
         self._simulated_protected_authority.return_value = False
