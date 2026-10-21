@@ -5,6 +5,7 @@ import base64
 from collections.abc import Iterator
 from contextlib import closing, contextmanager, nullcontext
 from datetime import datetime, timezone
+import errno
 import fcntl
 import functools
 import hashlib
@@ -1217,7 +1218,7 @@ def _write_outcome_receipt(
     # Existing exact transition receipts are historical immutable observations.
     # Reconciliation after authorized output retention/cleanup must reuse the
     # create-only receipt, never turn a later mutable stdout read into a new
-    # seal. First publication still revalidates stdout below before linking.
+    # seal. Publication must not reread mutable output after the transition.
     replay_candidates = [(primary_path, terminalization is not None)]
     if terminalization is not None:
         replay_candidates.append(
@@ -1259,10 +1260,6 @@ def _write_outcome_receipt(
         # silently upgrade their receipts from later mutable stdout reads.
         if isinstance(projection, dict) and "stdout_seal" in projection:
             seal = _validate_terminal_stdout_seal(projection["stdout_seal"])
-            if seal["status"] == "sealed":
-                current_seal = _terminal_stdout_seal(record)
-                if current_seal != seal:
-                    raise RuntimeError("task stdout changed since terminal seal")
             payload.update(_terminal_stdout_receipt_fields(seal))
     payload["receipt_sha256"] = _sha256_json(
         {key: value for key, value in payload.items() if key != "receipt_sha256"}
@@ -6404,6 +6401,11 @@ def _validate_terminal_stdout_seal(seal: Any) -> dict[str, Any]:
                 "output-root-missing",
                 "output-directory-missing",
                 "stdout-missing",
+                "output-directory-unsafe",
+                "stdout-unsafe",
+                "stderr-missing",
+                "stderr-unsafe",
+                "stdout-changed-during-hash",
             }
             or seal.get("authority") != "none"
         ):
@@ -6459,6 +6461,8 @@ def _terminal_stdout_seal(record: dict[str, Any]) -> dict[str, Any]:
         except FileNotFoundError:
             return unproven("output-directory-missing")
         except OSError as exc:
+            if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                return unproven("output-directory-unsafe")
             raise RuntimeError("task stdout directory could not be opened safely") from exc
         try:
             directory_before = os.fstat(dir_fd)
@@ -6466,24 +6470,32 @@ def _terminal_stdout_seal(record: dict[str, Any]) -> dict[str, Any]:
                 paths["directory"].name, dir_fd=root_fd, follow_symlinks=False
             )
             if (
-                not stat.S_ISDIR(directory_before.st_mode)
-                or _task_output_inode_identity(directory_before)
+                _task_output_inode_identity(directory_before)
                 != _task_output_inode_identity(linked_directory)
+            ):
+                raise RuntimeError("task stdout directory changed identity before read")
+            if (
+                not stat.S_ISDIR(directory_before.st_mode)
                 or directory_before.st_uid != root_before.st_uid
                 or directory_before.st_gid != root_before.st_gid
                 or directory_before.st_nlink < 1
                 or stat.S_IMODE(directory_before.st_mode) != 0o700
             ):
-                raise RuntimeError("task stdout directory identity is unsafe")
+                return unproven("output-directory-unsafe")
             try:
                 stdout_fd = os.open("stdout.log", file_flags, dir_fd=dir_fd)
             except FileNotFoundError:
                 return unproven("stdout-missing")
             except OSError as exc:
+                if exc.errno == errno.ELOOP:
+                    return unproven("stdout-unsafe")
                 raise RuntimeError("task stdout could not be opened safely") from exc
             try:
                 before = os.fstat(stdout_fd)
-                linked = os.stat("stdout.log", dir_fd=dir_fd, follow_symlinks=False)
+                try:
+                    linked = os.stat("stdout.log", dir_fd=dir_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    return unproven("stdout-unsafe")
                 if (
                     not stat.S_ISREG(before.st_mode)
                     or stat.S_IMODE(before.st_mode) != 0o600
@@ -6494,16 +6506,23 @@ def _terminal_stdout_seal(record: dict[str, Any]) -> dict[str, Any]:
                     != _task_output_inode_identity(linked)
                     or not 0 <= before.st_size <= TASK_OUTPUT_MAX_BYTES
                 ):
-                    raise RuntimeError("task stdout identity is unsafe")
+                    return unproven("stdout-unsafe")
                 # A complete capture wrapper always creates stderr too; do not
                 # seal a lone forged stdout file as a complete capture pair.
                 try:
                     stderr_fd = os.open("stderr.log", file_flags, dir_fd=dir_fd)
+                except FileNotFoundError:
+                    return unproven("stderr-missing")
                 except OSError as exc:
+                    if exc.errno == errno.ELOOP:
+                        return unproven("stderr-unsafe")
                     raise RuntimeError("task stderr could not be opened safely") from exc
                 try:
                     err = os.fstat(stderr_fd)
-                    err_link = os.stat("stderr.log", dir_fd=dir_fd, follow_symlinks=False)
+                    try:
+                        err_link = os.stat("stderr.log", dir_fd=dir_fd, follow_symlinks=False)
+                    except FileNotFoundError:
+                        return unproven("stderr-missing")
                     if (
                         not stat.S_ISREG(err.st_mode)
                         or stat.S_IMODE(err.st_mode) != 0o600
@@ -6514,7 +6533,7 @@ def _terminal_stdout_seal(record: dict[str, Any]) -> dict[str, Any]:
                         != _task_output_inode_identity(err_link)
                         or not 0 <= err.st_size <= TASK_OUTPUT_MAX_BYTES
                     ):
-                        raise RuntimeError("task stderr identity is unsafe")
+                        return unproven("stderr-unsafe")
                 finally:
                     os.close(stderr_fd)
                 digest = hashlib.sha256()
@@ -6526,7 +6545,7 @@ def _terminal_stdout_seal(record: dict[str, Any]) -> dict[str, Any]:
                 while remaining:
                     chunk = os.read(stdout_fd, min(65536, remaining))
                     if not chunk:
-                        raise RuntimeError("task stdout changed during hash")
+                        return unproven("stdout-changed-during-hash")
                     digest.update(chunk)
                     if marker in suffix + chunk:
                         truncated = True
@@ -6534,9 +6553,12 @@ def _terminal_stdout_seal(record: dict[str, Any]) -> dict[str, Any]:
                     remaining -= len(chunk)
                 os.fsync(stdout_fd)
                 after = os.fstat(stdout_fd)
-                linked_after = os.stat(
-                    "stdout.log", dir_fd=dir_fd, follow_symlinks=False
-                )
+                try:
+                    linked_after = os.stat(
+                        "stdout.log", dir_fd=dir_fd, follow_symlinks=False
+                    )
+                except FileNotFoundError:
+                    return unproven("stdout-changed-during-hash")
                 if (
                     _task_output_inode_identity(after)
                     != _task_output_inode_identity(before)
@@ -6549,7 +6571,7 @@ def _terminal_stdout_seal(record: dict[str, Any]) -> dict[str, Any]:
                     or linked_after.st_mtime_ns != before.st_mtime_ns
                     or linked_after.st_ctime_ns != before.st_ctime_ns
                 ):
-                    raise RuntimeError("task stdout changed during hash")
+                    return unproven("stdout-changed-during-hash")
             finally:
                 os.close(stdout_fd)
             dir_after = os.fstat(dir_fd)

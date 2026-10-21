@@ -1717,7 +1717,8 @@ class TaskTests(unittest.TestCase):
         self.assertIsNone(receipt["captured_stdout_sha256"])
         self.assertEqual("stdout-missing", receipt["stdout_capture_reason"])
 
-    def test_terminal_stdout_symlink_and_hardlink_block_before_terminal_transition(self) -> None:
+
+    def test_terminal_stdout_symlink_and_hardlink_are_unproven_but_terminal(self) -> None:
         for kind in ("symlink", "hardlink"):
             with self.subTest(kind=kind):
                 identifier, stdout = self._managed_terminal_stdout_fixture(b"victim")
@@ -1729,12 +1730,16 @@ class TaskTests(unittest.TestCase):
                 else:
                     os.link(stdout, foreign)
                 with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST):
-                    with self.assertRaisesRegex(RuntimeError, "stdout.*unsafe|stdout.*safely"):
-                        tasks._set_state(identifier, "completed")
-                self.assertEqual("running", tasks._row_raw(identifier)["state"])
-                self.assertIsNone(tasks.resources.task_terminalization_record(identifier))
+                    stored = tasks._set_state(identifier, "completed")
+                self.assertEqual("completed", stored["state"])
+                self.assertEqual("projected", tasks.resources.task_terminalization_record(identifier)["phase"])
+                receipt = json.loads((tasks.TASK_OUTCOMES_DIR / f"{identifier}.json").read_text())
+                self.assertEqual("unproven", receipt["stdout_capture_status"])
+                self.assertEqual("stdout-unsafe", receipt["stdout_capture_reason"])
+                self.assertIsNone(receipt["captured_stdout_sha256"])
 
-    def test_terminal_stdout_same_size_mutation_during_hash_fails_closed(self) -> None:
+
+    def test_terminal_stdout_same_size_mutation_during_hash_is_unproven(self) -> None:
         identifier, stdout = self._managed_terminal_stdout_fixture(b"original-buffer")
         original_read = os.read
         changed = False
@@ -1755,36 +1760,50 @@ class TaskTests(unittest.TestCase):
         with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
             tasks.os, "read", side_effect=mutate_on_read
         ):
-            with self.assertRaisesRegex(RuntimeError, "stdout.*changed"):
-                tasks._set_state(identifier, "completed")
+            stored = tasks._set_state(identifier, "completed")
         self.assertTrue(changed)
-        self.assertEqual("running", tasks._row_raw(identifier)["state"])
-        self.assertIsNone(tasks.resources.task_terminalization_record(identifier))
+        self.assertEqual("completed", stored["state"])
+        receipt = json.loads((tasks.TASK_OUTCOMES_DIR / f"{identifier}.json").read_text())
+        self.assertEqual("unproven", receipt["stdout_capture_status"])
+        self.assertEqual("stdout-changed-during-hash", receipt["stdout_capture_reason"])
+        self.assertIsNone(receipt["captured_stdout_sha256"])
 
-    def test_terminal_stdout_pending_recovery_cannot_reseal_tampered_source(self) -> None:
-        identifier, stdout = self._managed_terminal_stdout_fixture(b"original-record")
-        record = tasks._row_raw(identifier)
-        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST):
-            projection = tasks._terminal_projection(
-                record, "completed", observation={"state": "completed"}
-            )
-        transition = tasks.resources.begin_task_terminalization(
-            identifier,
-            int(record["attempt"]),
-            record["lease_owner_id"],
-            "completed",
-            tasks._record_resource_keys(record),
-            task_projection=projection,
-            observation_sha256=tasks._sha256_json({"state": "completed"}),
-        )
-        stdout.write_bytes(b"tampered-record")
-        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST):
-            with self.assertRaisesRegex(RuntimeError, "stdout.*changed"):
-                tasks._apply_terminalization_projection(transition, recovered=True)
-        self.assertIsNone(tasks._row_raw(identifier)["lifecycle_receipt_sha256"])
-        self.assertFalse(
-            (tasks.TASK_OUTCOMES_DIR / f"{identifier}.json").exists()
-        )
+
+    def test_terminal_stdout_pending_recovery_uses_durable_seal_after_change_or_unlink(self) -> None:
+        for mutation in ("changed", "removed"):
+            with self.subTest(mutation=mutation):
+                identifier, stdout = self._managed_terminal_stdout_fixture(b"original-record")
+                record = tasks._row_raw(identifier)
+                launcher = json.loads(record["launcher_json"])
+                launcher["recovered_terminal_marker"] = mutation
+                observation = {"state": "failed", "source": "recovered"}
+                with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST):
+                    projection = tasks._terminal_projection(
+                        record, "failed", launcher=launcher, observation=observation
+                    )
+                transition = tasks.resources.begin_task_terminalization(
+                    identifier, int(record["attempt"]), record["lease_owner_id"],
+                    "failed", tasks._record_resource_keys(record),
+                    task_projection=projection,
+                    observation_sha256=tasks._sha256_json(observation),
+                )
+                if mutation == "changed":
+                    stdout.write_bytes(b"tampered-record")
+                else:
+                    stdout.unlink()
+                with patch.object(tasks, "_terminal_stdout_seal", side_effect=AssertionError(
+                    "No mutable stdout reread after durable transition"
+                )):
+                    stored = tasks._apply_terminalization_projection(transition, recovered=True)
+                self.assertEqual("failed", stored["state"])
+                self.assertEqual(tasks._canonical_json(launcher), stored["launcher_json"])
+                self.assertEqual(int(projection["attempt"]), stored["attempt"])
+                receipt = json.loads((tasks.TASK_OUTCOMES_DIR / f"{identifier}.json").read_text())
+                self.assertEqual(hashlib.sha256(b"original-record").hexdigest(),
+                                 receipt["captured_stdout_sha256"])
+                self.assertEqual("sealed", receipt["stdout_capture_status"])
+                self.assertEqual(receipt["receipt_sha256"], stored["lifecycle_receipt_sha256"])
+                self.assertEqual("projected", tasks.resources.task_terminalization_record(identifier)["phase"])
 
     def test_terminal_stdout_existing_sealed_receipt_replays_without_late_reseal(self) -> None:
         identifier, stdout = self._managed_terminal_stdout_fixture(b"sealed-once")
@@ -1805,21 +1824,60 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(completed["lifecycle_receipt_sha256"], replay["lifecycle_receipt_sha256"])
         self.assertEqual(original, receipt_path.read_bytes())
 
-    def test_terminal_stdout_refuses_incomplete_capture_pair_and_oversized_output(self) -> None:
+
+    def test_terminal_stdout_incomplete_pair_and_oversize_are_unproven(self) -> None:
         identifier, stdout = self._managed_terminal_stdout_fixture(b"source")
         stdout.with_name("stderr.log").unlink()
         with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST):
-            with self.assertRaisesRegex(RuntimeError, "task stderr.*safely"):
-                tasks._set_state(identifier, "completed")
-        self.assertIsNone(tasks.resources.task_terminalization_record(identifier))
+            failed = tasks._set_state(identifier, "failed")
+        self.assertEqual("failed", failed["state"])
+        receipt = json.loads((tasks.TASK_OUTCOMES_DIR / f"{identifier}.json").read_text())
+        self.assertEqual("unproven", receipt["stdout_capture_status"])
+        self.assertEqual("stderr-missing", receipt["stdout_capture_reason"])
+        self.assertIsNone(receipt["captured_stdout_sha256"])
 
-        bigger, big_stdout = self._managed_terminal_stdout_fixture(
+        bigger, _ = self._managed_terminal_stdout_fixture(
             b"x" * (tasks.TASK_OUTPUT_MAX_BYTES + 1)
         )
         with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST):
-            with self.assertRaisesRegex(RuntimeError, "task stdout.*unsafe"):
-                tasks._set_state(bigger, "completed")
-        self.assertEqual("running", tasks._row_raw(bigger)["state"])
+            cancelled = tasks._set_state(bigger, "cancelled")
+        self.assertEqual("cancelled", cancelled["state"])
+        receipt = json.loads((tasks.TASK_OUTCOMES_DIR / f"{bigger}.json").read_text())
+        self.assertEqual("unproven", receipt["stdout_capture_status"])
+        self.assertEqual("stdout-unsafe", receipt["stdout_capture_reason"])
+        self.assertEqual("projected", tasks.resources.task_terminalization_record(bigger)["phase"])
+
+    def test_terminal_stdout_modes_stderr_links_and_unknown_io(self) -> None:
+        for stream, kind in (("stdout", "mode"), ("stderr", "mode"),
+                             ("stderr", "symlink"), ("stderr", "hardlink")):
+            with self.subTest(stream=stream, kind=kind):
+                identifier, stdout = self._managed_terminal_stdout_fixture(b"source")
+                target = stdout if stream == "stdout" else stdout.with_name("stderr.log")
+                foreign = stdout.with_name("foreign-owner.log")
+                if kind == "mode":
+                    os.chmod(target, 0o644)
+                elif kind == "symlink":
+                    target.unlink()
+                    foreign.write_bytes(b"foreign")
+                    target.symlink_to(foreign)
+                else:
+                    os.link(target, foreign)
+                with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST):
+                    stored = tasks._set_state(identifier, "failed")
+                self.assertEqual("failed", stored["state"])
+                receipt = json.loads((tasks.TASK_OUTCOMES_DIR / f"{identifier}.json").read_text())
+                self.assertEqual("unproven", receipt["stdout_capture_status"])
+                self.assertEqual(f"{stream}-unsafe", receipt["stdout_capture_reason"])
+                self.assertIsNone(receipt["captured_stdout_sha256"])
+
+        identifier, _ = self._managed_terminal_stdout_fixture(b"source")
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks.os, "read", side_effect=OSError(5, "EIO")
+        ):
+            with self.assertRaises(OSError):
+                tasks._set_state(identifier, "failed")
+        self.assertEqual("running", tasks._row_raw(identifier)["state"])
+        self.assertIsNone(tasks.resources.task_terminalization_record(identifier))
 
     def test_terminal_stdout_seal_validator_rejects_forged_status_and_type(self) -> None:
         valid = {
