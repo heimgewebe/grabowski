@@ -3658,19 +3658,15 @@ class RuntimeRetentionTests(unittest.TestCase):
             self.assertTrue((archive / name / "archive-manifest.json").is_file())
 
 
-    def test_archive_root_swap_before_first_pin_never_redirects_archive(self) -> None:
-        # RED for material P2-A. Never trust two root FDs both opened after
-        # a same-UID peer replaced the canonical archive path.
+    def test_archive_root_swap_after_plan_before_apply_must_fail_closed(self) -> None:
+        # A real swap, not a mock hook that might never be invoked. Both
+        # directories are user-private; the original plan held the first FD.
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             jobs, archive, receipts = root / "jobs", root / "archive", root / "receipts"
             name = "grabowski-job-a2a2a2a2a2a2"
             unit = name + ".service"
             self._job(jobs, name, 100)
-            archive.mkdir(mode=0o700, exist_ok=True)
-            foreign = root / "foreign-archive"
-            foreign.mkdir(mode=0o700)
-            hidden = root / "genuine-archive"
             plan = RETENTION.build_plan(
                 minimum_job_age_seconds=50, now=1000,
                 jobs_root=jobs, archive_root=archive, receipt_root=receipts,
@@ -3678,17 +3674,11 @@ class RuntimeRetentionTests(unittest.TestCase):
                 unit_states={unit: self._state(unit)},
             )
             self.assertEqual(len(plan["archive_jobs"]), 1)
-            original_private = RETENTION._private_directory
-            swapped = [False]
-
-            def swap_after_private(path: Path, *, create: bool = False) -> Path:
-                checked = original_private(path, create=create)
-                if path == archive and create and not swapped[0]:
-                    archive.rename(hidden)
-                    foreign.rename(archive)
-                    swapped[0] = True
-                return checked
-
+            foreign = root / "foreign-archive"
+            foreign.mkdir(mode=0o700)
+            hidden = root / "authentic-archive"
+            archive.rename(hidden)
+            foreign.rename(archive)
             fake_deploy = types.ModuleType("grabowski_self_deploy")
             fake_deploy.DEPLOY_INDEX_FILENAME = "runtime-deploy-index.json"
             fake_deploy._deploy_schedule_lock = lambda: nullcontext()
@@ -3697,30 +3687,27 @@ class RuntimeRetentionTests(unittest.TestCase):
             fake_base._require_mutations_enabled = Mock()
             fake_base._require_capability = Mock()
             reset = Mock(return_value=Mock(returncode=0, stderr=""))
-            redirected = False
             try:
                 with patch.dict("sys.modules", {
                     "grabowski_self_deploy": fake_deploy, "grabowski_mcp": fake_base,
                 }), patch.object(
-                    RETENTION, "_private_directory", side_effect=swap_after_private
-                ), patch.object(
                     RETENTION, "_systemd_unit_states",
                     return_value={unit: self._state(unit)},
                 ), patch.object(RETENTION, "_run", reset):
-                    try:
+                    with self.assertRaisesRegex(
+                        RuntimeError, "root changed|source directory changed",
+                    ):
                         RETENTION.apply_plan(
                             plan, expected_plan_sha256=plan["plan_sha256"]
                         )
-                    except (RuntimeError, OSError):
-                        pass  # Fail-closed is acceptable.
-            finally:
-                if swapped[0]:
-                    redirected = (archive / name / "archive-manifest.json").is_file()
-                    archive.rename(foreign)
-                    hidden.rename(archive)
-            self.assertFalse(redirected, "job archived into injected foreign root")
-            if (jobs / name).is_dir():
+                self.assertFalse((archive / name).exists())
+                self.assertFalse((hidden / name).exists())
+                self.assertTrue((jobs / name / "metadata.json").is_file())
                 reset.assert_not_called()
+                fake_base._append_audit.assert_not_called()
+            finally:
+                archive.rename(foreign)
+                hidden.rename(archive)
 
     def test_prepare_swap_and_back_must_not_use_foreign_file_manifest(self) -> None:
         # RED for material P2-B: a held root FD is security-relevant only if
@@ -5044,6 +5031,48 @@ class RuntimeRetentionTests(unittest.TestCase):
             (root / "link").symlink_to(root / "real")
             with self.assertRaisesRegex(RuntimeError, "symlink"):
                 RETENTION._archive_file_manifest(root)
+
+    def test_plan_hash_binds_existing_archive_and_receipt_root_identities(self) -> None:
+        # Output roots may be replaced *between* the two periodic snapshots.
+        # Identical jobs and a self-hash without these identities otherwise
+        # pass the double-plan check despite writing to a different directory.
+        for kind in ("archive", "receipts"):
+            with self.subTest(root=kind), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                jobs, archive, receipts = root / "jobs", root / "archive", root / "receipts"
+                name = "grabowski-job-aaaaaaaaaaaa"
+                unit = name + ".service"
+                self._job(jobs, name, 100)
+                kwargs = {
+                    "minimum_job_age_seconds": 50,
+                    "now": 1000,
+                    "jobs_root": jobs,
+                    "archive_root": archive,
+                    "receipt_root": receipts,
+                    "task_db": root / "missing.sqlite3",
+                    "failed_units": [],
+                    "unit_states": {unit: self._state(unit)},
+                }
+                first = RETENTION.build_plan(**kwargs)
+                original = root / f"authentic-{kind}"
+                replacement = root / f"foreign-{kind}"
+                replacement.mkdir(mode=0o700)
+                target = root / kind
+                target.rename(original)
+                replacement.rename(target)
+                try:
+                    second = RETENTION.build_plan(**kwargs)
+                    binding_key = (
+                        "archive_root_identity" if kind == "archive"
+                        else "receipt_root_identity"
+                    )
+                    self.assertNotEqual(first[binding_key], second[binding_key])
+                    self.assertNotEqual(first["plan_sha256"], second["plan_sha256"])
+                    self.assertEqual(first["jobs_root_identity"], second["jobs_root_identity"])
+                finally:
+                    target.rename(replacement)
+                    original.rename(target)
+                self.assertTrue((jobs / name / "metadata.json").is_file())
 
     def test_periodic_apply_rejects_plan_drift_before_mutation(self) -> None:
         first = {

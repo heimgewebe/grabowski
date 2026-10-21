@@ -1518,7 +1518,18 @@ def build_plan(
         "jobs_root": str(jobs_root),
         "jobs_root_identity": list(planned_jobs_root_identity),
         "archive_root": str(archive_root),
+        # A preview/current plan must drift when the *output* root inode
+        # changes, not just when the jobs registry changes. This is continuity,
+        # not proof that the first-opened root was originally authentic.
+        "archive_root_identity": (
+            list((os.fstat(pinned.archive_fd).st_dev, os.fstat(pinned.archive_fd).st_ino))
+            if pinned.archive_fd >= 0 else None
+        ),
         "receipt_root": str(receipt_root),
+        "receipt_root_identity": (
+            list((os.fstat(pinned.receipt_fd).st_dev, os.fstat(pinned.receipt_fd).st_ino))
+            if pinned.receipt_fd >= 0 else None
+        ),
         "task_db": str(task_db),
         "worker_db": str(worker_db),
         "resource_db": str(resource_db),
@@ -2113,6 +2124,23 @@ def _validated_plan(plan: dict[str, Any], expected_plan_sha256: str) -> dict[str
         or any(type(value) is not int or value < 0 for value in jobs_identity)
     ):
         raise RuntimeError("retention plan jobs root identity is invalid")
+    for kind in ("archive", "receipt"):
+        identity = plan.get(f"{kind}_root_identity")
+        fd = getattr(plan, f"{kind}_fd")
+        if identity is None:
+            if fd >= 0:
+                raise RuntimeError(f"{kind} root identity mismatch with plan")
+            continue
+        if (
+            not isinstance(identity, list)
+            or len(identity) != 2
+            or any(type(component) is not int or component < 0 for component in identity)
+            or fd < 0
+        ):
+            raise RuntimeError(f"{kind} root identity binding is invalid")
+        pinned_stat = os.fstat(fd)
+        if (pinned_stat.st_dev, pinned_stat.st_ino) != tuple(identity):
+            raise RuntimeError(f"{kind} root FD differs from planned identity")
     minimum_job_age_seconds = plan.get("minimum_job_age_seconds")
     if type(minimum_job_age_seconds) is not int or not 0 <= minimum_job_age_seconds <= 31_536_000:
         raise RuntimeError("retention plan age bound is invalid")
