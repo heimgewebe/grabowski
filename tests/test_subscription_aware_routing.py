@@ -178,6 +178,22 @@ class SubscriptionAwareRoutingTests(unittest.TestCase):
         self.assertIn("critical-review", disabled["task_classes"])
         self.assertIn("never silently downgrade", disabled["disabled_reason"])
 
+    def test_retired_gemini_pro_writer_routes_are_disabled_without_downgrade(self) -> None:
+        # Missing exact CLI model IDs cannot be replaced by Gemini Flash or
+        # an independent provider while keeping old Pro route provenance.
+        for route_id, exact_arg in (
+            ("antigravity-gemini-pro-low", "gemini-3.1-pro-low"),
+            ("antigravity-gemini-pro-high", "gemini-3.1-pro-high"),
+        ):
+            route = self.routes[route_id]
+            with self.subTest(route_id=route_id):
+                self.assertFalse(route["enabled"])
+                self.assertEqual("antigravity", route["harness"])
+                self.assertEqual("gemini-3.1-pro", route["model"])
+                self.assertEqual(["agy", "--model", exact_arg], route["argv_prefix"])
+                self.assertEqual("google-gemini-pro", route["independence_group"])
+                self.assertIn("never silently downgrade", route["disabled_reason"])
+
     def test_opus_has_separate_escalation_writer_and_review_route(self) -> None:
         writer = self.routes["claude-opus-5.5-writer-high"]
         reviewer = self.routes["claude-opus-5.5-high"]

@@ -1607,13 +1607,15 @@ class CodingAgentRouterTests(unittest.TestCase):
 
     def test_parent_quota_pool_is_enforced_even_when_route_omits_it(self) -> None:
         catalog = json.loads(json.dumps(self.catalog))
+        # Keep exercising parent enforcement with a currently enabled route;
+        # retired Gemini Pro routes may not serve as quota-gate fixtures.
         route = next(
-            item for item in catalog["routes"] if item["id"] == "antigravity-gemini-pro-high"
+            item for item in catalog["routes"] if item["id"] == "antigravity-claude-sonnet-thinking"
         )
-        route["quota_pools"] = ["antigravity-gemini"]
+        route["quota_pools"] = ["antigravity-claude"]
         self.assertEqual(
             router._route_quota_pools(route, catalog),
-            ["antigravity-gemini", "antigravity-account"],
+            ["antigravity-claude", "antigravity-account"],
         )
 
         blocked_parent_states = (

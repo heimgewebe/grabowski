@@ -25,10 +25,10 @@ The subscription baseline observations date from 2026-07-29; xAI model discovery
 | --- | --- | --- | --- | --- |
 | OpenAI | ChatGPT Pro | owner assertion; `codex login status` reports ChatGPT login; `gpt-5.6-sol` xhigh smoke passed | Codex CLI review and contrast | OpenAI API, purchased Codex credits |
 | Anthropic | Claude Pro | `claude auth status` reports `subscriptionType: pro`; Sonnet 5 and Opus 5 smokes passed; recorded Opus 5.5 exact-model and alias evidence refreshed on 2026-09-29 | Claude Code review and contrast | Anthropic API, usage credits |
-| Google | Google AI subscription | owner assertion; Antigravity `gemini-3.1-pro-high` smoke passed | Antigravity and Jules baseline | Vertex AI API, Google AI Studio API, purchased AI credits |
+| Google | Google AI subscription | owner assertion; historical 2026-07-29 `gemini-3.1-pro-high` smoke, no longer current model support evidence | Antigravity only for separately verified available model routes; Jules baseline | Vertex AI API, Google AI Studio API, purchased AI credits |
 | xAI | SuperGrok | Grok authentication reports `subscription_tier: SuperGrok`; authenticated `grok models` readback exposes `grok-4.6` | Grok Build review and contrast | xAI API, extra usage credits, pay-as-you-go overage |
 
-The exact Google AI tier is not exposed by the local harness. The catalog therefore records the subscription family and the verified Antigravity entitlement without inventing a narrower tier.
+The exact Google AI tier is not exposed by the local harness. The catalog records the subscription family and dated earlier Antigravity evidence without inventing a narrower tier. On 2026-10-21, the installed Antigravity CLI 1.4.4 `agy models` inventory did not list either `gemini-3.1-pro-low` or `gemini-3.1-pro-high`; the read-only probe also reported no active Antigravity login. These observations do not prove current authenticated entitlement or an executable Gemini Pro route. The old Pro model identities remain in the catalog for history, but all three matching Pro routes (the low/high routes and the dedicated high-critical reviewer) are disabled until exact model capability and authentication are reverified. No automatic substitution to Gemini Flash or a different provider is permitted.
 
 The user-facing phrase “Claude Plus” is normalized to the server-reported product label **Claude Pro**.
 
@@ -39,7 +39,7 @@ The live harness probes supersede stale catalog generations:
 - Claude alias `opus` resolves to Claude Opus 5.5.
 - Claude alias `sonnet` resolves to Claude Sonnet 5.
 - Fable 5 returns `usage-credits-required`; it is not part of the Claude Pro baseline.
-- Antigravity exposes Gemini 3.1 Pro and Gemini 3.6 Flash.
+- Historical Antigravity observations reported Gemini 3.1 Pro and Gemini 3.6 Flash. The 2026-10-21 local CLI inventory instead lists Gemini 3.8 Flash low/medium/high, but its unauthenticated readback cannot establish availability for execution; Gemini 3.1 Pro low/high were not listed and their routes are disabled.
 - Codex resolves its current high-end subscription route to GPT-5.6 Sol.
 - The authenticated Grok CLI model listing exposes `grok-4.6` for the SuperGrok account.
 
@@ -61,7 +61,7 @@ Provider diversity is used only when it improves independence or technical cover
 ### Review routes
 
 - `claude-opus-5.5-high`: judgment-heavy, security, architecture, and critical review through the Claude Pro baseline.
-- `antigravity-gemini-pro-review-high`: independent Google-family review through the Google AI baseline.
+- `antigravity-gemini-pro-review-high`: **disabled**; the configured `agy --model gemini-3.1-pro-high` was rejected by the installed CLI. No Google-Pro independent review can be claimed through this route until an authenticated exact-model and review-quality verification is recorded.
 - `grok-4.6-review-high`: independent xAI review through SuperGrok; one turn, no web search, no subagents, no memory, no tools, and schema-constrained structured output.
 - `codex-sol-review-high`: GPT-5.6 Sol review through the ChatGPT Pro Codex baseline; it is a real reviewer route, but same-OpenAI-provider work is excluded by the existing independence gate.
 
@@ -69,7 +69,7 @@ All direct Claude Pro routes use the same `anthropic-claude-pro` independence gr
 
 ### Contrast routes
 
-Codex implementation/competition routes remain contrast-only; `codex-sol-review-high` is the separate review-only route. Legacy Gemini Pro and Grok high routes remain contrast-only; dedicated review routes carry review semantics separately.
+Codex implementation/competition routes remain contrast-only; `codex-sol-review-high` is the separate review-only route. Both historical Gemini Pro writer/contrast routes are disabled alongside their dedicated review route; their retained model IDs are not executable claims. Grok high contrast and dedicated review routes retain distinct roles.
 
 ### Paid-only routes
 
