@@ -661,6 +661,111 @@ def load_live_pr(repo_name: str, pr_number: int) -> dict[str, Any]:
     )
 
 
+def _revision_bound_pr_file_evidence(
+    repo_name: str, pr: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Bind security-sensitive file status/rename origin to immutable Git SHAs.
+
+    The PR-number-only REST files endpoint can briefly serve a different head
+    after A -> B -> A; equal paths and counts do not authenticate rename origins.
+    The unpaged Compare response must identify the exact initially observed
+    base/head. Ambiguous merge bases and the Compare files cap fail closed.
+    """
+    base = _normalize_git_sha(pr.get("baseRefOid"))
+    head = _normalize_git_sha(pr.get("headRefOid"))
+    count = pr.get("changedFiles")
+    if base is None or head is None or type(count) is not int or not 1 <= count <= 300:
+        raise CiEvidenceError("revision-bound rename evidence identity or file count invalid")
+    try:
+        payload = _run_json(["gh", "api", f"repos/{repo_name}/compare/{base}...{head}"])
+    except CiEvidenceError as exc:
+        raise CiEvidenceError("revision-bound rename evidence unavailable") from exc
+    commits = payload.get("commits") if isinstance(payload, dict) else None
+    if (
+        not isinstance(payload, dict)
+        or not isinstance(payload.get("base_commit"), dict)
+        or payload["base_commit"].get("sha") != base
+        or not isinstance(commits, list)
+        or not commits
+        or not isinstance(commits[-1], dict)
+        or commits[-1].get("sha") != head
+    ):
+        raise CiEvidenceError("revision-bound compare base/head identity drifted")
+    files = payload.get("files")
+    evidence = gate._pull_file_evidence([files])
+    if (
+        evidence is None
+        or len(evidence) != count
+        or gate._complete_pr_diff_paths({
+            "pullFilesEvidenceComplete": True, "files": evidence,
+        }) is None
+    ):
+        raise CiEvidenceError("revision-bound compare file/rename evidence incomplete")
+    return evidence
+
+
+def _require_rename_aware_pr(
+    repo_name: str, pr_number: int, pr: dict[str, Any]
+) -> dict[str, Any]:
+    """Verify the complete REST changed-file set before assigning a review tier.
+
+    GraphQL `gh pr view --json files` omits rename status and source paths.
+    Treating those entries as ordinary changes can incorrectly admit a rename
+    out of a security-critical workflow as a documentation-only change.
+    """
+    count = pr.get("changedFiles")
+    if (
+        _normalize_repo(repo_name) != repo_name
+        or type(pr_number) is not int or pr_number <= 0
+        or not isinstance(pr, dict) or pr.get("number") != pr_number
+        or type(count) is not int or count <= 0 or count > 3000
+    ):
+        raise CiEvidenceError("complete rename-aware PR file evidence is missing or invalid")
+    try:
+        rest_files = gate._load_pull_file_evidence(
+            Path.cwd(), repo_slug=repo_name, pr=pr_number
+        )
+    except (RuntimeError, ValueError) as exc:
+        raise CiEvidenceError(
+            "complete rename-aware GitHub REST file evidence unavailable"
+        ) from exc
+    if (
+        not isinstance(rest_files, list)
+        or len(rest_files) != count
+        or gate._complete_pr_diff_paths({
+            "pullFilesEvidenceComplete": True, "files": rest_files
+        }) is None
+    ):
+        raise CiEvidenceError("complete rename-aware GitHub REST file evidence invalid")
+
+    # Compare the GraphQL snapshot to REST when present. GitHub may truncate
+    # GraphQL's list at 100, but even a truncated snapshot may not disagree.
+    graphql_files = pr.get("files")
+    if not isinstance(graphql_files, list) or len(graphql_files) > count:
+        raise CiEvidenceError("complete rename-aware PR GraphQL file evidence invalid")
+    graphql_paths = [
+        item.get("path") for item in graphql_files if isinstance(item, dict)
+    ]
+    rest_paths = {item["path"] for item in rest_files}
+    if (
+        len(graphql_paths) != len(graphql_files)
+        or any(not isinstance(path, str) or not path for path in graphql_paths)
+        or len(set(graphql_paths)) != len(graphql_paths)
+        or not set(graphql_paths).issubset(rest_paths)
+    ):
+        raise CiEvidenceError("complete rename-aware REST/GraphQL path evidence drifted")
+    # Revision-pinned status and previousPath are the classification authority.
+    # REST is used only as a completeness/consistency witness, never alone.
+    pinned_files = _revision_bound_pr_file_evidence(repo_name, pr)
+    if (
+        len(pinned_files) != len(rest_files)
+        or {item["path"]: item for item in pinned_files}
+        != {item["path"]: item for item in rest_files}
+    ):
+        raise CiEvidenceError("complete rename-aware REST/revision-bound compare metadata drifted")
+    return {**pr, "files": pinned_files, "pullFilesEvidenceComplete": True}
+
+
 def _known_pr_diff_limit_error(message: str, *, changed_files: Any) -> bool:
     """Only GitHub's known 406 line/file limit can use local identity."""
     if type(changed_files) is not int or changed_files < 0:
@@ -1230,8 +1335,13 @@ def evaluate_comment_command(args: argparse.Namespace) -> int:
 
     diff_sha256s = current_diff_sha256s(repo_name, args.pr)
     diff_sha256 = diff_sha256s[0]
-    complexity = gate.classify_complexity(pr, None, repo_name=repo_name)
     failures: list[str] = []
+    complexity: dict[str, Any] | None = None
+    try:
+        pr = _require_rename_aware_pr(repo_name, args.pr, pr)
+        complexity = gate.classify_complexity(pr, None, repo_name=repo_name)
+    except CiEvidenceError as exc:
+        failures.append(str(exc))
     status: dict[str, Any] | None = None
     provenance_verified = False
     try:
@@ -1240,7 +1350,7 @@ def evaluate_comment_command(args: argparse.Namespace) -> int:
         )
     except CiEvidenceError as exc:
         failures.append(str(exc))
-    if status is not None:
+    if status is not None and complexity is not None:
         failures.extend(
             evaluate_status_projection(
                 status,
@@ -1297,6 +1407,8 @@ def evaluate_comment_command(args: argparse.Namespace) -> int:
         failures.append("PR head changed during review-evidence evaluation")
     if initial_base != final_base:
         failures.append("PR base changed during review-evidence evaluation")
+    if final_pr.get("changedFiles") != pr.get("changedFiles"):
+        failures.append("PR changed-file count drifted during review-evidence evaluation")
 
     if args.publish_status and final_head is not None:
         publish_commit_status(
