@@ -2150,6 +2150,7 @@ def _apply_periodic_worktree_hygiene(
         return {
             "schema_version": 1,
             "operation": "grabowski-worktree-hygiene-periodic-noop",
+            "status": "passed",
             "completed": True,
             "mutated": False,
             "actions": 0,
@@ -2174,6 +2175,7 @@ def _apply_periodic_worktree_hygiene(
         return {
             "schema_version": 1,
             "operation": "grabowski-worktree-hygiene-periodic-noop",
+            "status": "passed",
             "completed": True,
             "mutated": False,
             "actions": 0,
@@ -2307,17 +2309,22 @@ def apply_periodic_plan(
     )
     if not worktree_hygiene_repositories:
         return runtime_result
+    # Only the two effect-bound receipts establish actual health. A runtime
+    # apply may complete while recording a failed reset not in plan["blocked"].
+    # Do not turn that partial/degraded outcome into a healthy timer exit.
+    composite_passed = (
+        runtime_result.get("status") == "passed"
+        and hygiene_result.get("status") == "passed"
+        and runtime_result.get("completed") is True
+        and hygiene_result.get("completed") is True
+        and not blocked
+    )
     return {
         "schema_version": 1,
         "operation": "grabowski-runtime-retention-convergence-periodic",
         "plan_sha256": current["plan_sha256"],
-        "completed": bool(runtime_result.get("completed"))
-        and bool(hygiene_result.get("completed"))
-        and not blocked,
-        "status": (
-            "degraded" if blocked or not runtime_result.get("completed")
-            or not hygiene_result.get("completed") else "passed"
-        ),
+        "completed": composite_passed,
+        "status": "passed" if composite_passed else "degraded",
         "preserved_blocked_units": blocked,
         "mutated": bool(runtime_result.get("mutated"))
         or bool(hygiene_result.get("mutated")),

@@ -1869,6 +1869,46 @@ class RuntimeRetentionTests(unittest.TestCase):
         self.assertEqual(result["status"], "degraded")
         self.assertTrue(result["mutated"])
 
+    def test_periodic_failed_reset_cannot_be_hidden_by_passed_hygiene(self) -> None:
+        # A completed apply can still report degraded when one reset failed,
+        # even if its plan carried no blocked jobs. The periodic timer must
+        # propagate the authenticated child receipt, not infer health from
+        # a completed flag or the plan's blocked list.
+        unit = "grabowski-task-" + "4" * 24 + "-a1.service"
+        plan = {
+            "plan_sha256": "4" * 64, "reset_failed_units": [unit],
+            "archive_jobs": [], "blocked": [],
+        }
+        runtime = {
+            "schema_version": 1, "plan_sha256": plan["plan_sha256"],
+            "status": "degraded", "completed": True, "mutated": True,
+            "reset_failed": [], "failed_resets": [{"unit": unit}],
+            "preserved_blocked_units": [],
+        }
+        hygiene = {
+            "schema_version": 1, "status": "passed",
+            "completed": True, "mutated": True,
+        }
+        with patch.object(
+            RETENTION, "build_plan", side_effect=[plan, plan]
+        ), patch.object(
+            RETENTION, "apply_plan", return_value=runtime
+        ) as apply, patch.object(
+            RETENTION, "_apply_periodic_worktree_hygiene", return_value=hygiene
+        ):
+            result = RETENTION.apply_periodic_plan(
+                worktree_hygiene_repositories=["/unused"]
+            )
+        apply.assert_called_once_with(
+            plan, expected_plan_sha256=plan["plan_sha256"]
+        )
+        self.assertEqual(result["runtime_retention"], runtime)
+        self.assertEqual(result["worktree_hygiene"], hygiene)
+        self.assertEqual(result["status"], "degraded")
+        self.assertFalse(result["completed"])
+        self.assertTrue(result["mutated"])
+        self.assertEqual(result["preserved_blocked_units"], [])
+
     def test_periodic_hygiene_projection_retains_runtime_blocked_status(self) -> None:
         blocked = [{"unit": "grabowski-job-aaaaaaaaaaaa.service",
                     "reason": "archive source log preflight blocked: oversized"}]
