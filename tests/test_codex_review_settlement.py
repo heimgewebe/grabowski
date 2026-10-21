@@ -2092,6 +2092,12 @@ class CodexReviewLiveLineLimitTests(unittest.TestCase):
             del repo
             if argv[:3] == ["gh", "api", "graphql"]:
                 return deepcopy(pr_payload)
+            if argv == ["gh", "api", f"repos/{REPOSITORY}/compare/{BASE}...{HEAD}"]:
+                return {
+                    "base_commit": {"sha": BASE},
+                    "commits": [{"sha": HEAD}],
+                    "files": [{"filename": "assets/a.js", "status": "modified"}],
+                }
             if argv[:3] == ["gh", "pr", "view"]:
                 result = {key: state[key] for key in ("headRefOid", "baseRefOid", "changedFiles")}
                 if refreshed_head is not None:
@@ -2187,6 +2193,93 @@ class CodexReviewLiveLineLimitTests(unittest.TestCase):
                     ):
                         settlement._live_state(ROOT, REPOSITORY, PR)
                     binder.assert_not_called()
+
+
+    def test_line_limit_uses_pinned_rename_source_when_rest_omits_status(self) -> None:
+        """Mutable REST 'added' must not hide a source trusted by immutable Compare."""
+        diagnostic = b"HTTP 406: Sorry, the diff exceeded the maximum number of lines (20000)"
+        state = base_state(path="docs/ci.md")
+        del state["diff_sha256"]
+        payload = {"data": {"repository": {"pullRequest": state}}}
+        pinned = [{
+            "path": "docs/ci.md", "status": "renamed",
+            "previousPath": ".github/workflows/ci.yml",
+        }]
+
+        def fake_json(_repo: Path, argv: list[str]):
+            if argv[:3] == ["gh", "api", "graphql"]:
+                return deepcopy(payload)
+            if argv[:3] == ["gh", "pr", "view"]:
+                return {
+                    field: state[field]
+                    for field in ("headRefOid", "baseRefOid", "changedFiles")
+                }
+            raise AssertionError(argv)
+
+        def verified_local_diff(_repo: Path, view: dict) -> bytes:
+            self.assertEqual(view["files"], pinned)
+            return b"immutable Git-diff bytes"
+
+        with (
+            mock.patch.object(settlement, "_run_json", side_effect=fake_json),
+            mock.patch.object(settlement.subprocess, "run", return_value=mock.Mock(
+                returncode=1, stdout=b"", stderr=diagnostic,
+            )),
+            mock.patch.object(
+                settlement.pr_review_gate, "_load_pull_file_evidence",
+                return_value=[{"path": "docs/ci.md", "status": "added"}],
+            ),
+            mock.patch.object(
+                settlement, "_revision_bound_rename_files", return_value=pinned,
+            ) as compare,
+            mock.patch.object(
+                settlement.pr_review_gate, "_local_bound_pr_diff_bytes",
+                side_effect=verified_local_diff,
+            ),
+        ):
+            result = settlement._live_state(ROOT, REPOSITORY, PR)
+        compare.assert_called_once()
+        self.assertEqual(result["files"]["nodes"], pinned)
+
+    def test_line_limit_fails_closed_when_immutable_rename_evidence_is_unavailable(self) -> None:
+        """An apparently benign REST status cannot bypass an unavailable pinned Compare."""
+        diagnostic = b"HTTP 406: Sorry, the diff exceeded the maximum number of lines (20000)"
+        state = base_state(path="docs/ci.md")
+        del state["diff_sha256"]
+        payload = {"data": {"repository": {"pullRequest": state}}}
+
+        def fake_json(_repo: Path, argv: list[str]):
+            if argv[:3] == ["gh", "api", "graphql"]:
+                return deepcopy(payload)
+            if argv[:3] == ["gh", "pr", "view"]:
+                return {
+                    field: state[field]
+                    for field in ("headRefOid", "baseRefOid", "changedFiles")
+                }
+            raise AssertionError(argv)
+
+        with (
+            mock.patch.object(settlement, "_run_json", side_effect=fake_json),
+            mock.patch.object(settlement.subprocess, "run", return_value=mock.Mock(
+                returncode=1, stdout=b"", stderr=diagnostic,
+            )),
+            mock.patch.object(
+                settlement.pr_review_gate, "_load_pull_file_evidence",
+                return_value=[{"path": "docs/ci.md", "status": "added"}],
+            ),
+            mock.patch.object(
+                settlement, "_revision_bound_rename_files",
+                side_effect=settlement.SettlementError("immutable compare unavailable"),
+            ),
+            mock.patch.object(
+                settlement.pr_review_gate, "_local_bound_pr_diff_bytes",
+            ) as binder,
+        ):
+            with self.assertRaisesRegex(
+                settlement.SettlementError, "immutable compare unavailable"
+            ):
+                settlement._live_state(ROOT, REPOSITORY, PR)
+            binder.assert_not_called()
 
 
 if __name__ == "__main__":
