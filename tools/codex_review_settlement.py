@@ -855,7 +855,9 @@ def _live_state(repo: Path, repository: str, pr_number: int) -> dict[str, Any]:
         }
         # "gh pr diff" has no revision parameter. In an A->B->A head cycle
         # it can contain B's bytes while the metadata above describes A.
-        # Bind the *bytes* as well as rename paths to the fixed SHA pair.
+        # Bind the canonical patch identity as well as rename origins to the
+        # exact SHA pair. Index abbreviation and optional hunk labels are
+        # presentation details, not new source identities.
         base, head = _current_base(pull_request), _current_head(pull_request)
         pinned_diff = subprocess.run(
             [
@@ -872,7 +874,10 @@ def _live_state(repo: Path, repository: str, pr_number: int) -> dict[str, Any]:
         )
         if pinned_diff.returncode != 0 or not pinned_diff.stdout:
             raise SettlementError("cannot read revision-bound PR diff")
-        if pinned_diff.stdout != diff_bytes.stdout:
+        if (
+            pr_review_gate.github_pr_diff_identity_sha256(pinned_diff.stdout)
+            != pull_request["diff_sha256"]
+        ):
             raise SettlementError("revision-bound PR diff differs from mutable PR diff")
     return pull_request
 

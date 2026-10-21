@@ -262,6 +262,43 @@ class PinnedRenameEvidenceRegressionTests(unittest.TestCase):
         self.assertEqual(read.call_count, 2)
         self.assertIn(f"{BASE}...{HEAD}", " ".join(read.call_args.args[0]))
 
+
+    def test_pinned_diff_accepts_canonical_equivalent_rendering(self):
+        """Different OID abbreviations and hunk labels are not source drift."""
+        pr = base_state(path="docs/ci.md")
+        payload = {"data": {"repository": {"pullRequest": pr}}}
+        pinned_files = [{"path": "docs/ci.md", "status": "modified"}]
+        raw = (
+            b"diff --git a/docs/ci.md b/docs/ci.md\n"
+            b"index 1234567..7654321 100644\n"
+            b"--- a/docs/ci.md\n+++ b/docs/ci.md\n"
+            b"@@ -1 +1 @@ original context\n-old\n+new\n"
+        )
+        pinned = (
+            b"diff --git a/docs/ci.md b/docs/ci.md\n"
+            b"index 123456789abc..7654321abcdef 100644\n"
+            b"--- a/docs/ci.md\n+++ b/docs/ci.md\n"
+            b"@@ -1 +1 @@\n-old\n+new\n"
+        )
+        self.assertNotEqual(raw, pinned)
+        digest = settlement.pr_review_gate.github_pr_diff_identity_sha256
+        self.assertEqual(digest(raw), digest(pinned))
+        with (
+            mock.patch.object(settlement, "_run_json", return_value=payload),
+            mock.patch.object(settlement, "_collect_files", return_value=pr["files"]),
+            mock.patch.object(settlement, "_collect_comments", return_value=pr["comments"]),
+            mock.patch.object(settlement, "_collect_reviews", return_value=pr["reviews"]),
+            mock.patch.object(settlement, "_collect_review_threads", return_value=pr["reviewThreads"]),
+            mock.patch.object(settlement, "_revision_bound_rename_files", return_value=pinned_files),
+            mock.patch.object(settlement.subprocess, "run", side_effect=[
+                mock.Mock(returncode=0, stdout=raw, stderr=b""),
+                mock.Mock(returncode=0, stdout=pinned, stderr=b""),
+            ]),
+        ):
+            observed = settlement._live_state(ROOT, REPOSITORY, PR)
+        self.assertEqual(observed["diff_sha256"], digest(raw))
+
+
 def request_comment(
     *,
     actor: str = "alex",
