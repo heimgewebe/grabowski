@@ -1021,6 +1021,8 @@ class RuntimeRetentionTests(unittest.TestCase):
                     plan, expected_plan_sha256=plan["plan_sha256"]
                 )
             self.assertTrue(receipt["completed"])
+            self.assertEqual(receipt["status"], "degraded")
+            self.assertEqual(receipt["preserved_blocked_units"], plan["blocked"])
             self.assertEqual(
                 [item["unit"] for item in receipt["archived_jobs"]],
                 [safe + ".service"],
@@ -1808,7 +1810,66 @@ class RuntimeRetentionTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertTrue(first["completed"])
         self.assertFalse(first["mutated"])
+        self.assertEqual(first["status"], "passed")
+        self.assertEqual(first["preserved_blocked_units"], [])
         apply.assert_not_called()
+
+    def test_periodic_only_oversized_log_reports_degraded_not_healthy_noop(self) -> None:
+        blocked = [{"unit": "grabowski-job-aaaaaaaaaaaa.service",
+                    "reason": "archive source log preflight blocked: oversized"}]
+        plan = {"plan_sha256": "7" * 64, "reset_failed_units": [],
+                "archive_jobs": [], "blocked": blocked}
+        with patch.object(
+            RETENTION, "build_plan", side_effect=[plan, plan]
+        ), patch.object(RETENTION, "apply_plan") as apply:
+            result = RETENTION.apply_periodic_plan()
+        apply.assert_not_called()
+        self.assertEqual(result["preserved_blocked_units"], blocked)
+        self.assertEqual(result["status"], "degraded")
+        self.assertFalse(result["completed"])
+        self.assertFalse(result["mutated"])
+
+    def test_periodic_oversized_log_with_safe_actions_is_degraded(self) -> None:
+        blocked = [{"unit": "grabowski-job-aaaaaaaaaaaa.service",
+                    "reason": "archive source log preflight blocked: oversized"}]
+        plan = {"plan_sha256": "8" * 64,
+                "reset_failed_units": ["grabowski-task-" + "8" * 24 + "-a1.service"],
+                "archive_jobs": [], "blocked": blocked}
+        applied = {"plan_sha256": plan["plan_sha256"], "completed": True,
+                   "mutated": True, "preserved_blocked_units": blocked,
+                   "status": "degraded"}
+        with patch.object(
+            RETENTION, "build_plan", side_effect=[plan, plan]
+        ), patch.object(
+            RETENTION, "apply_plan", return_value=applied
+        ) as apply:
+            result = RETENTION.apply_periodic_plan()
+        apply.assert_called_once_with(
+            plan, expected_plan_sha256=plan["plan_sha256"]
+        )
+        self.assertEqual(result["preserved_blocked_units"], blocked)
+        self.assertEqual(result["status"], "degraded")
+        self.assertTrue(result["mutated"])
+
+    def test_periodic_hygiene_projection_retains_runtime_blocked_status(self) -> None:
+        blocked = [{"unit": "grabowski-job-aaaaaaaaaaaa.service",
+                    "reason": "archive source log preflight blocked: oversized"}]
+        plan = {"plan_sha256": "9" * 64, "reset_failed_units": [],
+                "archive_jobs": [], "blocked": blocked}
+        hygiene = {"completed": True, "mutated": True}
+        with patch.object(
+            RETENTION, "build_plan", side_effect=[plan, plan]
+        ), patch.object(
+            RETENTION, "_apply_periodic_worktree_hygiene", return_value=hygiene
+        ):
+            result = RETENTION.apply_periodic_plan(
+                worktree_hygiene_repositories=["/unused"]
+            )
+        self.assertEqual(result["preserved_blocked_units"], blocked)
+        self.assertEqual(result["runtime_retention"]["preserved_blocked_units"], blocked)
+        self.assertEqual(result["status"], "degraded")
+        self.assertFalse(result["completed"])
+        self.assertTrue(result["mutated"])
 
     def test_periodic_apply_reuses_hash_bound_apply_contract(self) -> None:
         plan = {

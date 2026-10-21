@@ -2047,6 +2047,10 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
             "worker_reset_evidence": plan.get("worker_reset_evidence", []),
             "archived_jobs": archived,
             "preserved_blocked_units": plan.get("blocked", []),
+            "status": (
+                "degraded" if plan.get("blocked") or failed_resets or reset_failures
+                else "passed"
+            ),
             "archive_deferred_count": plan.get("archive_deferred_count", 0),
             "protected_nonterminal_jobs": plan.get(
                 "protected_nonterminal_jobs", []
@@ -2272,13 +2276,16 @@ def apply_periodic_plan(
     )
     if current["plan_sha256"] != preview["plan_sha256"]:
         raise RuntimeError("retention plan drifted between periodic snapshots")
+    blocked = current.get("blocked", [])
     if not current["reset_failed_units"] and not current["archive_jobs"]:
         runtime_result = {
             "schema_version": 1,
             "operation": "grabowski-runtime-state-retention-periodic-noop",
             "plan_sha256": current["plan_sha256"],
-            "completed": True,
+            "completed": not bool(blocked),
             "mutated": False,
+            "status": "degraded" if blocked else "passed",
+            "preserved_blocked_units": blocked,
         }
     else:
         runtime_result = apply_plan(
@@ -2298,7 +2305,13 @@ def apply_periodic_plan(
         "operation": "grabowski-runtime-retention-convergence-periodic",
         "plan_sha256": current["plan_sha256"],
         "completed": bool(runtime_result.get("completed"))
-        and bool(hygiene_result.get("completed")),
+        and bool(hygiene_result.get("completed"))
+        and not blocked,
+        "status": (
+            "degraded" if blocked or not runtime_result.get("completed")
+            or not hygiene_result.get("completed") else "passed"
+        ),
+        "preserved_blocked_units": blocked,
         "mutated": bool(runtime_result.get("mutated"))
         or bool(hygiene_result.get("mutated")),
         "runtime_retention": runtime_result,
