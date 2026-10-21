@@ -878,7 +878,11 @@ def _live_state(repo: Path, repository: str, pr_number: int) -> dict[str, Any]:
             pr_review_gate.github_pr_diff_identity_sha256(pinned_diff.stdout)
             != pull_request["diff_sha256"]
         ):
-            raise SettlementError("revision-bound PR diff differs from mutable PR diff")
+            raise SettlementError(
+                "revision-bound PR diff differs from mutable PR diff: "
+                "possible PR/Compare merge-base divergence; fail closed and "
+                "use CAS-bound pr-base-converge only after fresh authority checks"
+            )
     return pull_request
 
 def _revision_bound_rename_files(

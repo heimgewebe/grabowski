@@ -6,7 +6,9 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+import subprocess
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -297,6 +299,113 @@ class PinnedRenameEvidenceRegressionTests(unittest.TestCase):
         ):
             observed = settlement._live_state(ROOT, REPOSITORY, PR)
         self.assertEqual(observed["diff_sha256"], digest(raw))
+
+
+    def test_historical_anchor_real_git_dag_changes_critical_rename_identity(self):
+        """Git objects demonstrate anchor-dependent rename origin, not GitHub PR choice."""
+        with tempfile.TemporaryDirectory(prefix="grabowski-pr-base-dag-") as tmp:
+            repo = Path(tmp)
+
+            def git(*args: str) -> str:
+                result = subprocess.run(
+                    ["git", "-c", "user.name=Fixture",
+                     "-c", "user.email=fixture@example.invalid", *args],
+                    cwd=repo, check=True, capture_output=True, text=True,
+                    timeout=20,
+                )
+                return result.stdout.strip()
+
+            git("init", "-q")
+            workflow = repo / ".github/workflows/ci.yml"
+            workflow.parent.mkdir(parents=True)
+            workflow.write_text("a\nb\nc\nd\ne\nf\n", encoding="utf-8")
+            git("add", ".")
+            git("commit", "-qm", "initial critical workflow")
+            origin = git("rev-parse", "HEAD")
+
+            docs = repo / "docs/ci.md"
+            docs.parent.mkdir(parents=True)
+            git("mv", ".github/workflows/ci.yml", "docs/ci.md")
+            git("commit", "-qm", "feature rename")
+            first_feature = git("rev-parse", "HEAD")
+            git("branch", "feature")
+            git("switch", "-qc", "base-after-rename")
+            (repo / "README.md").write_text("advance base\n", encoding="utf-8")
+            git("add", "README.md")
+            git("commit", "-qm", "base advanced")
+            advanced_base = git("rev-parse", "HEAD")
+
+            git("switch", "-q", "feature")
+            docs.write_text("a\nb\nc\nd\ne\nf\nfeature\n", encoding="utf-8")
+            git("add", "docs/ci.md")
+            git("commit", "-qm", "feature change")
+            head = git("rev-parse", "HEAD")
+
+            self.assertEqual(first_feature, git("merge-base", advanced_base, head))
+            old_anchor = git("diff", "--name-status", "--find-renames=40%",
+                             origin, head)
+            new_anchor = git("diff", "--name-status", "--find-renames=40%",
+                             first_feature, head)
+            self.assertRegex(
+                old_anchor,
+                r"^R\d+\s+\.github/workflows/ci\.yml\s+docs/ci\.md$",
+            )
+            self.assertEqual("M\tdocs/ci.md", new_anchor)
+
+    def test_historical_pr_rename_vs_same_path_compare_stays_fail_closed(self):
+        """Same destination/count cannot make PR and pinned Compare diff equivalent."""
+        pr = base_state(path="docs/ci.md")
+        gql = {"data": {"repository": {"pullRequest": pr}}}
+        # The PR uses a historical anchor with a critical workflow rename.
+        pr_diff = (
+            b"diff --git a/.github/workflows/ci.yml b/docs/ci.md\n"
+            b"similarity index 60%\n"
+            b"rename from .github/workflows/ci.yml\n"
+            b"rename to docs/ci.md\n"
+            b"--- a/.github/workflows/ci.yml\n"
+            b"+++ b/docs/ci.md\n"
+            b"@@ -1 +1 @@\n-workflow: true\n+text: true\n"
+        )
+        # A later valid Compare anchor sees the same destination as modified.
+        compare_diff = (
+            b"diff --git a/docs/ci.md b/docs/ci.md\n"
+            b"--- a/docs/ci.md\n+++ b/docs/ci.md\n"
+            b"@@ -1 +1 @@\n-old text\n+new text\n"
+        )
+        self.assertNotEqual(
+            settlement.pr_review_gate.github_pr_diff_identity_sha256(pr_diff),
+            settlement.pr_review_gate.github_pr_diff_identity_sha256(compare_diff),
+        )
+        with (
+            mock.patch.object(settlement, "_run_json", side_effect=[
+                gql, self._compare(filename="docs/ci.md",
+                                   previous=None, status="modified"),
+            ]) as api,
+            mock.patch.object(settlement, "_collect_files",
+                              return_value=pr["files"]),
+            mock.patch.object(settlement, "_collect_comments",
+                              return_value=pr["comments"]),
+            mock.patch.object(settlement, "_collect_reviews",
+                              return_value=pr["reviews"]),
+            mock.patch.object(settlement, "_collect_review_threads",
+                              return_value=pr["reviewThreads"]),
+            mock.patch.object(settlement.subprocess, "run", side_effect=[
+                mock.Mock(returncode=0, stdout=pr_diff, stderr=b""),
+                mock.Mock(returncode=0, stdout=compare_diff, stderr=b""),
+            ]) as diff_read,
+            mock.patch.object(settlement.pr_review_gate, "classify_complexity",
+                              side_effect=AssertionError("unsafe classification")),
+        ):
+            with self.assertRaisesRegex(
+                settlement.SettlementError, r"merge-base.*pr-base-converge"
+            ):
+                settlement._live_state(ROOT, REPOSITORY, PR)
+        self.assertEqual(2, api.call_count)
+        self.assertEqual(2, diff_read.call_count)
+        self.assertEqual(
+            f"repos/{REPOSITORY}/compare/{BASE}...{HEAD}",
+            api.call_args.args[1][-1],
+        )
 
 
 def request_comment(
