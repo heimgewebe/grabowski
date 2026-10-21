@@ -39,7 +39,7 @@ def _state(path: str) -> dict:
             "changedFiles": 1,
             "additions": 3,
             "deletions": 1,
-            "files": [{"path": path}],
+            "files": [{"path": path, "changeType": "MODIFIED"}],
             "reviews": [{"author": {"login": "chatgpt-codex-connector"}, "commit_id": HEAD}],
             "latestReviews": [],
             "comments": [],
@@ -145,6 +145,192 @@ class PrReviewGateRiskPathExpansionTests(unittest.TestCase):
         self.assertEqual(HEAD, audit["head_sha"])
         self.assertEqual(BASE, audit["base_sha"])
         self.assertEqual("0" * 64, audit["diff_sha256"])
+
+
+    def test_heim_pc_nixos_production_input_paths_require_high_critical_review(self) -> None:
+        for path in (
+            "flake.lock",
+            "flake.nix",
+            "nixos/system/flake.nix",
+            "nixos/production/trust-contract-v1.json",
+            "./nixos/production/trust-contract-v1.json",
+        ):
+            with self.subTest(path=path):
+                state = _state(path)
+                state["repoName"] = "heimgewebe/heim-pc"
+                complexity = pr_review_gate.classify_complexity(
+                    state["pr"], None, repo_name=state["repoName"]
+                )
+                self.assertTrue(complexity["high_critical"], complexity)
+                self.assertEqual("high_critical", complexity["review_tier"])
+                self.assertTrue(complexity["independent_review_required"])
+                self.assertFalse(complexity["very_small_uncomplicated"])
+                self.assertGreaterEqual(complexity["minimum_self_review_iterations"], 4)
+                self.assertTrue(
+                    any("NixOS supply-chain source" in reason for reason in complexity["reasons"]),
+                    complexity["reasons"],
+                )
+
+    def test_exact_heim_pc_pr228_production_trust_transition_is_high_critical(self) -> None:
+        state = _state("flake.lock")
+        state["repoName"] = "heimgewebe/heim-pc"
+        paths = [
+            "flake.lock",
+            "flake.nix",
+            "nixos/production/trust-contract-v1.json",
+            "nixos/system/flake.nix",
+            "tests/test_nixos_system_source.py",
+        ]
+        state["pr"]["files"] = [{"path": path, "changeType": "MODIFIED"} for path in paths]
+        state["pr"]["changedFiles"] = len(paths)
+        state["pr"]["additions"] = 20
+        state["pr"]["deletions"] = 5
+        classified = pr_review_gate.classify_complexity(
+            state["pr"], None, repo_name=state["repoName"]
+        )
+        self.assertEqual("high_critical", classified["review_tier"])
+        self.assertTrue(classified["independent_review_required"])
+        self.assertTrue(any(
+            "NixOS supply-chain source" in reason for reason in classified["high_critical_reasons"]
+        ))
+
+    def test_nix_trust_path_rules_are_repo_scoped_and_do_not_match_lookalikes(self) -> None:
+        for path in (
+            "docs/flake.lock",
+            "flake.lock.example",
+            "flake.nix.bak",
+            "nixos/production/trust-contract-v1.json.bak",
+            "docs/nixos/production/trust-contract-v1.json",
+            "../nixos/production/trust-contract-v1.json",
+            "tests/test_nixos_system_source.py",
+        ):
+            with self.subTest(path=path):
+                state = _state(path)
+                state["repoName"] = "heimgewebe/heim-pc"
+                classified = pr_review_gate.classify_complexity(
+                    state["pr"], None, repo_name=state["repoName"]
+                )
+                self.assertFalse(classified["high_critical"], classified)
+        for path in ("flake.lock", "nixos/production/trust-contract-v1.json"):
+            with self.subTest(other_repo_path=path):
+                state = _state(path)
+                state["repoName"] = "heimgewebe/example-repo"
+                classified = pr_review_gate.classify_complexity(
+                    state["pr"], None, repo_name=state["repoName"]
+                )
+                self.assertFalse(classified["high_critical"], classified)
+
+
+    def test_nix_trust_rename_out_of_source_requires_independent_review(self) -> None:
+        protected = (
+            "flake.lock",
+            "flake.nix",
+            "nixos/system/flake.nix",
+            "nixos/production/trust-contract-v1.json",
+        )
+        for old_path in protected:
+            for old_field in ("previous_filename", "previousFilename", "previousPath"):
+                with self.subTest(source=old_path, field=old_field):
+                    state = _state("docs/benign.md")
+                    state["repoName"] = "heimgewebe/heim-pc"
+                    state["pr"]["files"] = [
+                        {"path": "docs/benign.md", "changeType": "RENAMED", old_field: old_path}
+                    ]
+                    result = pr_review_gate.classify_complexity(
+                        state["pr"], None, repo_name=state["repoName"]
+                    )
+                    self.assertTrue(result["high_critical"], result)
+                    self.assertTrue(result["independent_review_required"])
+                    self.assertFalse(result["docs_only"])
+                    self.assertTrue(any(
+                        "NixOS supply-chain source" in reason for reason in result["reasons"]
+                    ), result["reasons"])
+
+    def test_nix_trust_rename_without_source_or_unknown_type_blocks(self) -> None:
+        for entry in (
+            {"path": "docs/innocent.md", "changeType": "RENAMED"},
+            {"path": "docs/innocent.md", "status": "renamed", "previous_filename": ""},
+            {"path": "docs/innocent.md"},
+            {"path": "docs/innocent.md", "changeType": "UNKNOWN"},
+        ):
+            with self.subTest(entry=entry):
+                state = _state("docs/innocent.md")
+                state["repoName"] = "heimgewebe/heim-pc"
+                state["pr"]["files"] = [entry]
+                result = pr_review_gate.classify_complexity(
+                    state["pr"], None, repo_name=state["repoName"]
+                )
+                self.assertEqual("high_critical", result["review_tier"], result)
+                self.assertTrue(result["independent_review_required"])
+
+    def test_nix_trust_rename_metadata_incomplete_list_is_fail_closed(self) -> None:
+        state = _state("docs/benign.md")
+        state["repoName"] = "heimgewebe/heim-pc"
+        state["pr"]["files"] = [{"path": "docs/benign.md", "changeType": "MODIFIED"}]
+        state["pr"]["changedFiles"] = 2
+        result = pr_review_gate.classify_complexity(
+            state["pr"], None, repo_name=state["repoName"]
+        )
+        self.assertTrue(result["high_critical"])
+        self.assertTrue(result["independent_review_required"])
+
+    def test_nix_trust_conflicting_change_file_aliases_fail_closed(self) -> None:
+        # A protected source must not be hidden behind a benign first alias.
+        examples = (
+            {"path": "docs/new.md", "filename": "flake.lock", "changeType": "MODIFIED"},
+            {"path": "docs/new.md", "filename": "", "changeType": "MODIFIED"},
+            {"path": "docs/new.md", "changeType": "RENAMED",
+             "previous_filename": "docs/old.md", "previousPath": "flake.lock"},
+            {"path": "docs/new.md", "changeType": "RENAMED",
+             "previous_filename": "docs/old.md", "previousFilename": "flake.lock"},
+            {"path": "docs/new.md", "changeType": "RENAMED",
+             "previous_filename": "docs/old.md", "previousPath": "docs/other.md"},
+            {"path": "docs/new.md", "changeType": "RENAMED",
+             "previous_filename": "docs/old.md", "previousPath": ""},
+            {"path": "docs/new.md", "changeType": "RENAMED",
+             "previous_filename": "docs/old.md", "previousPath": 123},
+            {"path": "docs/new.md", "changeType": "MODIFIED", "status": "RENAMED"},
+            {"path": "docs/new.md", "changeType": "RENAMED", "status": "MODIFIED",
+             "previous_filename": "docs/old.md"},
+            {"path": "docs/new.md", "changeType": "MODIFIED", "previousPath": ""},
+            {"filename": "docs/new.md", "changeType": "RENAMED", "previousPath": "flake.lock"},
+        )
+        for entry in examples:
+            with self.subTest(entry=entry):
+                state = _state("docs/new.md")
+                state["repoName"] = "heimgewebe/heim-pc"
+                state["pr"]["files"] = [entry]
+                result = pr_review_gate.classify_complexity(
+                    state["pr"], None, repo_name=state["repoName"]
+                )
+                self.assertEqual("high_critical", result["review_tier"], result)
+                self.assertTrue(result["independent_review_required"])
+
+    def test_nix_trust_consistent_duplicate_aliases_remain_documentation(self) -> None:
+        state = _state("docs/new.md")
+        state["repoName"] = "heimgewebe/heim-pc"
+        state["pr"]["files"] = [{
+            "path": "docs/new.md", "filename": "docs/new.md",
+            "changeType": "RENAMED", "status": "renamed",
+            "previous_filename": "docs/old.md",
+            "previousFilename": "docs/old.md", "previousPath": "docs/old.md",
+        }]
+        result = pr_review_gate.classify_complexity(
+            state["pr"], None, repo_name=state["repoName"]
+        )
+        self.assertEqual("documentation", result["review_tier"], result)
+
+    def test_unrelated_documentation_rename_remains_documentation_tier(self) -> None:
+        state = _state("docs/new.md")
+        state["repoName"] = "heimgewebe/heim-pc"
+        state["pr"]["files"] = [
+            {"path": "docs/new.md", "changeType": "RENAMED", "previousPath": "docs/old.md"}
+        ]
+        result = pr_review_gate.classify_complexity(
+            state["pr"], None, repo_name=state["repoName"]
+        )
+        self.assertEqual("documentation", result["review_tier"], result)
+        self.assertFalse(result["independent_review_required"])
 
 
 if __name__ == "__main__":

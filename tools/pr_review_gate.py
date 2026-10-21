@@ -115,6 +115,7 @@ BOOTSTRAP_EXPECTED_CHECK_NAMES_BY_REPO = {
     "alexdermohr/mark-api": ("verify",),
     "heimgewebe/metarepo": ("ci (ubuntu-latest)", "ci (macos-latest)"),
     "heimgewebe/mitschreiber": ("ci / reusable-ci",),
+    "heimgewebe/nixer": ("nixer-ci",),
     "heimgewebe/systemkatalog": ("Repository Contract", "Secret Scan"),
     "heimgewebe/weltgewebe": ("Detect docs updates", "Core Guard Tests"),
 }
@@ -297,6 +298,13 @@ HIGH_CRITICAL_PATH_PREFIXES = (
     "scripts/migration",
     "tools/pr_review_gate.py",
 )
+HEIM_PC_NIX_SUPPLY_CHAIN_SOURCE_PATHS = frozenset((
+    "flake.lock",
+    "flake.nix",
+    "nixos/system/flake.nix",
+    "nixos/production/trust-contract-v1.json",
+))
+
 HIGH_CRITICAL_PATH_MARKERS = (
     "auth",
     "credential",
@@ -1055,6 +1063,88 @@ def _canonical_repo_slug(value: Any) -> str | None:
     return "/".join(parts).lower()
 
 
+def _recovery_authority_path_reason(path: str) -> str | None:
+    """Protect exact external attestation trust paths; never normalize away traversal."""
+    parts = path.split("/")
+    if (
+        path.startswith("/")
+        or "\\" in path
+        or "\x00" in path
+        or any(part in {"", ".", ".."} for part in parts)
+    ):
+        return f"high-critical recovery authority noncanonical changed path: {path}"
+    normalized = path.lower()
+    if normalized in {
+        "validator.py",
+        "ci_selftest.py",
+        "tests/test_validator.py",
+        "tests/test_ci_selftest.py",
+        "keys/allowed_signers",
+    } or normalized.startswith(("keys/", ".github/")):
+        return f"high-critical recovery authority trust path touched: {path}"
+    return None
+
+
+def _recovery_authority_reasons(
+    pr: dict[str, Any], repo_name: str | None,
+) -> list[str]:
+    """Require authenticated change type, including GraphQL rename identity."""
+    if repo_name != "heimgewebe/recovery-evidence-authority":
+        return []
+    raw = pr.get("files")
+    if not isinstance(raw, list) or not raw:
+        return ["high-critical recovery authority changed-file metadata unavailable"]
+    reasons: list[str] = []
+    changed_files = pr.get("changedFiles")
+    if type(changed_files) is not int or changed_files != len(raw):
+        reasons.append("high-critical recovery authority changed-file list incomplete")
+    seen_paths: set[str] = set()
+    for entry in raw:
+        if not isinstance(entry, dict):
+            reasons.append("high-critical recovery authority changed-file entry is untyped")
+            continue
+        current = entry.get("path") or entry.get("filename")
+        if not isinstance(current, str) or not current:
+            reasons.append("high-critical recovery authority changed path unavailable")
+        else:
+            if current in seen_paths:
+                reasons.append(f"high-critical recovery authority duplicate changed path: {current}")
+            seen_paths.add(current)
+            reason = _recovery_authority_path_reason(current)
+            if reason is not None:
+                reasons.append(reason)
+            elif not _is_documentation_path(current):
+                reasons.append(f"high-critical recovery authority code/config path touched: {current}")
+        # gh pr view --json files emits changeType (e.g. RENAMED), not the
+        # REST 'status' field. GraphQL does not provide the rename origin.
+        change_type = entry.get("changeType")
+        if change_type is None:
+            change_type = entry.get("status")
+        if not isinstance(change_type, str):
+            reasons.append("high-critical recovery authority change type unavailable")
+            continue
+        normalized_type = change_type.lower()
+        if normalized_type in {"added", "modified", "removed", "deleted"}:
+            continue
+        if normalized_type == "renamed":
+            previous = (
+                entry.get("previous_filename")
+                or entry.get("previousFilename")
+                or entry.get("previousPath")
+            )
+            if not isinstance(previous, str) or not previous:
+                reasons.append("high-critical recovery authority rename origin unavailable")
+            else:
+                reason = _recovery_authority_path_reason(previous)
+                if reason is not None:
+                    reasons.append(reason)
+                elif not _is_documentation_path(previous):
+                    reasons.append(f"high-critical recovery authority code/config rename origin: {previous}")
+            continue
+        reasons.append("high-critical recovery authority change type not trusted")
+    return reasons
+
+
 def _is_risk_path(path: str) -> bool:
     normalized = path.lower().lstrip("./")
     return any(normalized == prefix or normalized.startswith(prefix.rstrip("/") + "/") for prefix in RISK_PATH_PREFIXES) or any(marker in normalized for marker in RISK_PATH_MARKERS)
@@ -1097,6 +1187,102 @@ def _trivial_exempt_deny_reason(path: str, changed_lines: int) -> str | None:
     return None
 
 
+def _nixos_supply_chain_path_reason(path: str, repo_name: str | None) -> str | None:
+    """Protect exact Heim-PC production flake and input-trust source paths."""
+    if repo_name != "heimgewebe/heim-pc":
+        return None
+    normalized = path.lower()
+    # Strip only actual relative-directory prefixes, not all leading dots:
+    # a full-path lstrip("./") would also silently rewrite path aliases.
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    if normalized in HEIM_PC_NIX_SUPPLY_CHAIN_SOURCE_PATHS:
+        return f"high-critical NixOS supply-chain source path touched: {path}"
+    return None
+
+
+
+def _nixos_supply_chain_rename_reasons(
+    pr: dict[str, Any], repo_name: str | None,
+) -> list[str]:
+    """Fail closed on incomplete or contradictory Heim-PC Nix trust file metadata.
+
+    GraphQL exposes rename changeType without a reliable previousPath. Rename
+    sources must be authenticated separately; missing origins cannot be treated
+    as harmless documentation changes. Validate *all* supplied field aliases
+    rather than trusting whichever alias happens to come first.
+    """
+    if repo_name != "heimgewebe/heim-pc":
+        return []
+    entries = pr.get("files")
+    if not isinstance(entries, list) or not entries:
+        return ["high-critical NixOS supply-chain changed-file metadata unavailable"]
+    reasons: list[str] = []
+    count = pr.get("changedFiles")
+    if type(count) is not int or count != len(entries):
+        reasons.append("high-critical NixOS supply-chain changed-file list incomplete")
+    seen: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            reasons.append("high-critical NixOS supply-chain changed-file entry untyped")
+            continue
+
+        path_aliases = [entry[key] for key in ("path", "filename") if key in entry]
+        valid_paths = [
+            path for path in path_aliases
+            if isinstance(path, str) and bool(path.strip())
+        ]
+        if not path_aliases or len(valid_paths) != len(path_aliases):
+            reasons.append("high-critical NixOS supply-chain changed path unavailable")
+        if len(set(valid_paths)) > 1:
+            reasons.append("high-critical NixOS supply-chain changed path aliases conflict")
+        for current in valid_paths:
+            # Catch a protected destination obscured by a benign primary alias.
+            reason = _nixos_supply_chain_path_reason(current, repo_name)
+            if reason is not None:
+                reasons.append(reason)
+        # Repeated aliases within one entry are valid; only distinct file
+        # entries must not claim the same changed destination.
+        if valid_paths:
+            if valid_paths[0] in seen:
+                reasons.append("high-critical NixOS supply-chain duplicate changed path")
+            seen.add(valid_paths[0])
+
+        types = [entry[key] for key in ("changeType", "status") if key in entry]
+        if not types or any(not isinstance(kind, str) or not kind.strip() for kind in types):
+            reasons.append("high-critical NixOS supply-chain change type unavailable")
+            continue
+        types_normalized = [kind.lower() for kind in types]
+        if len(set(types_normalized)) != 1:
+            reasons.append("high-critical NixOS supply-chain change type aliases conflict")
+        change_type = types_normalized[0]
+
+        origin_fields = ("previous_filename", "previousFilename", "previousPath")
+        origins = [entry[key] for key in origin_fields if key in entry]
+        valid_origins = [
+            origin for origin in origins
+            if isinstance(origin, str) and bool(origin.strip())
+        ]
+        if len(valid_origins) != len(origins):
+            reasons.append("high-critical NixOS supply-chain rename origin invalid")
+        if len(set(valid_origins)) > 1:
+            reasons.append("high-critical NixOS supply-chain rename origin aliases conflict")
+        for origin in valid_origins:
+            reason = _nixos_supply_chain_path_reason(origin, repo_name)
+            if reason is not None:
+                reasons.append(reason)
+
+        if change_type in {"renamed", "copied"}:
+            if not valid_origins:
+                reasons.append("high-critical NixOS supply-chain rename origin unavailable")
+        elif change_type in {"added", "modified", "removed", "deleted", "changed"}:
+            if origins:
+                reasons.append("high-critical NixOS supply-chain unexpected rename origin")
+        else:
+            reasons.append("high-critical NixOS supply-chain change type untrusted")
+    return reasons
+
+
 def _high_critical_path_reason(path: str) -> str | None:
     normalized = path.lower().lstrip("./")
     if _is_policy_critical_path(normalized):
@@ -1133,19 +1319,27 @@ def classify_complexity(
     changed_files = int(pr.get("changedFiles") or 0)
     changed_lines = int(pr.get("additions") or 0) + int(pr.get("deletions") or 0)
     paths = _paths(pr)
-    docs_only = bool(paths) and all(_is_documentation_path(path) for path in paths)
-    very_small_uncomplicated = _is_very_small_uncomplicated_change(paths, changed_files, changed_lines)
     normalized_repo = _canonical_repo_slug(repo_name)
+    recovery_reasons = _recovery_authority_reasons(pr, normalized_repo)
+    nix_supply_reasons = _nixos_supply_chain_rename_reasons(pr, normalized_repo)
+    docs_only = (
+        bool(paths) and not recovery_reasons and not nix_supply_reasons
+        and all(_is_documentation_path(path) for path in paths)
+    )
+    very_small_uncomplicated = _is_very_small_uncomplicated_change(paths, changed_files, changed_lines)
     important_repo = normalized_repo in IMPORTANT_REPOS
 
-    high_critical_reasons: list[str] = []
+    high_critical_reasons: list[str] = [*recovery_reasons, *nix_supply_reasons]
     if not docs_only:
         if changed_files > 15:
             high_critical_reasons.append("many files")
         if changed_lines > 500:
             high_critical_reasons.append("large diff")
         for path in paths:
-            reason = _high_critical_path_reason(path)
+            reason = (
+                _nixos_supply_chain_path_reason(path, normalized_repo)
+                or _high_critical_path_reason(path)
+            )
             if reason is not None:
                 high_critical_reasons.append(reason)
     if isinstance(self_review, dict):
@@ -1168,6 +1362,8 @@ def classify_complexity(
             high_critical_reasons.append("many material findings after first review")
 
     high_critical_reasons = list(dict.fromkeys(high_critical_reasons))
+    if high_critical_reasons:
+        very_small_uncomplicated = False
     large_documentation_change = docs_only and (changed_files > 15 or changed_lines > 500)
     if high_critical_reasons:
         review_tier = "high_critical"
@@ -1917,7 +2113,6 @@ def _legacy_external_finding_failures(external_review: dict[str, Any]) -> list[s
         if not isinstance(finding, dict) or not _terminal(finding):
             failures.append(f"external_review finding {index} is not terminally triaged")
     return failures
-
 
 def _external_review_count(external_review: Any) -> int | None:
     if not isinstance(external_review, dict):

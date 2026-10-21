@@ -509,9 +509,980 @@ class WorkAcquireTests(unittest.TestCase):
         )
         self.assertEqual(result["decision"], "AUTO_PREPARE_AND_EXECUTE")
 
+    def test_large_scope_duplicate_keys_bound_by_normalized_manifest(self) -> None:
+        params = self.parameters()
+        paths = [f"src/part-{i:03d}.py" for i in range(256)]
+        params["write_paths"] = paths
+        params["resource_keys"] = [f"path:{self.repo / item}" for item in paths]
+        inputs = work_acquire._normalize(params)
+        self.assertEqual(len(inputs["resource_keys"]), 258)
+        plan = work_acquire._resource_acquisition_plan(inputs["resource_keys"])
+        self.assertEqual([len(g["resource_keys"]) for g in plan], [64,64,64,64,2])
+        self.assertEqual(len(work_acquire._normalize_lane_resource_keys(
+            [f"component:unique-{i:03d}" for i in range(512)])), 512)
+        with self.assertRaisesRegex(ValueError, "normalized"):
+            work_acquire._normalize_lane_resource_keys(
+                [f"component:unique-{i:03d}" for i in range(513)])
+        with self.assertRaisesRegex(ValueError, "bounded input"):
+            work_acquire._normalize_lane_resource_keys(["component:duplicate"]*1025)
+
+    def test_oversized_bureau_partition_fails_before_acquire(self) -> None:
+        bureau = work_acquire.resources.bureau_leases
+        root = bureau.BUREAU_REPOSITORY_ROOT
+        middle = [f"path:{root}/.bureau-scopes/neutral-{i:03d}"
+                  for i in range(70)]
+        for resources in (
+            [bureau.BUREAU_MERGE_GATE_KEY, *middle,
+             bureau.BUREAU_WORKTREE_ADMIN_KEY],
+            middle,
+        ):
+            with self.subTest(count=len(resources)):
+                params = self.parameters()
+                params["resource_keys"] = resources
+                acquire = Mock(side_effect=AssertionError("unsafe Bureau grant"))
+                ensure = Mock()
+                with self.assertRaisesRegex(ValueError, "Bureau"):
+                    work_acquire.acquire_work(
+                        params, acquire_resources_fn=acquire,
+                        release_resources_fn=Mock(),
+                        inspect_resource_fn=Mock(),
+                        ensure_worktree_fn=ensure, runner=Mock(),
+                    )
+                acquire.assert_not_called()
+                ensure.assert_not_called()
+
+    def test_multi_repository_across_atomic_groups_is_denied(self) -> None:
+        params = self.parameters()
+        params["resource_keys"] = [
+            *(f"component:two-repos-{i:03d}" for i in range(62)),
+            f"repo:{self.repo}:branch:foreign-scope",
+        ]
+        inputs = work_acquire._normalize(params)
+        self.assertEqual(len(inputs["resource_keys"]), 65)
+        acquire = Mock(side_effect=AssertionError("multi-repo lease granted"))
+        ensure = Mock()
+        with self.assertRaisesRegex(ValueError, "one repository at a time"):
+            work_acquire.acquire_work(
+                params, acquire_resources_fn=acquire,
+                release_resources_fn=Mock(), inspect_resource_fn=Mock(),
+                ensure_worktree_fn=ensure, runner=Mock(),
+            )
+        acquire.assert_not_called()
+        ensure.assert_not_called()
+
+    def test_multibatch_expired_owner_lease_blocks_before_worktree(self) -> None:
+        params = self.parameters()
+        params["resource_keys"] = [f"component:expiry-{i:03d}" for i in range(76)]
+        receipts = []
+        def acquire(owner, keys, **_kwargs):
+            result = self.acquired(owner, keys)
+            receipts.extend(result["leases"])
+            return result
+        def expired_inventory(**_kwargs):
+            return [
+                {**lease, "expires_at_unix": int(time.time()) + 5}
+                if lease["resource_key"] == "component:expiry-000" else lease
+                for lease in receipts
+            ]
+        ensure = Mock(return_value={
+            "result_state": "CREATED", "durable_receipt_sha256": "b" * 64,
+            "post_state": {"target_registered": True, "target_path_exists": True},
+        })
+        release = Mock(side_effect=self.release)
+        with patch.object(work_acquire.resources, "list_resources",
+                          side_effect=expired_inventory):
+            result = work_acquire.acquire_work(
+                params, acquire_resources_fn=acquire,
+                release_resources_fn=release, inspect_resource_fn=Mock(),
+                ensure_worktree_fn=ensure, runner=Mock(),
+            )
+        self.assertIn(result["state"], ("blocked", "outcome_unknown"))
+        self.assertEqual(result["decision"], "HARD_BLOCK")
+        ensure.assert_not_called()
+
+    def test_multibatch_owner_readback_pages_full_1000_and_hard_limit(self) -> None:
+        owner = "lane:" + "d" * 32
+        required = [f"component:required-{i:03d}" for i in range(78)]
+        receipt = self.acquired(owner, required)
+        acquisitions = [{"receipt": receipt}]
+        for total in (1000, 1001, 4096, 4097):
+            with self.subTest(total=total):
+                other_keys = [
+                    f"component:extra-{i:04d}" for i in range(total - len(required))
+                ]
+                live = sorted(
+                    self.acquired(owner, other_keys)["leases"] + receipt["leases"],
+                    key=lambda lease: lease["resource_key"],
+                )
+                observed_pages: list[tuple[int, str | None]] = []
+
+                def inventory(*, owner_id, limit, start_after_key=None, **_kwargs):
+                    self.assertEqual(owner_id, owner)
+                    observed_pages.append((limit, start_after_key))
+                    return [
+                        row for row in live
+                        if start_after_key is None or row["resource_key"] > start_after_key
+                    ][:limit]
+
+                if total > work_acquire.MAX_TERMINAL_OWNER_OBSERVED_LEASES:
+                    with self.assertRaisesRegex(
+                        work_acquire.LeaseAcquisitionOutcomeUnknown,
+                        "exceeds bounded view",
+                    ):
+                        work_acquire._verify_multibatch_live_lease_generations(
+                            owner_id=owner, required_keys=required,
+                            acquisitions=acquisitions, inventory_fn=inventory,
+                        )
+                else:
+                    work_acquire._verify_multibatch_live_lease_generations(
+                        owner_id=owner, required_keys=required,
+                        acquisitions=acquisitions, inventory_fn=inventory,
+                    )
+                self.assertEqual(1000, observed_pages[0][0])
+                self.assertEqual(1000, len(live[:1000]))
+                self.assertGreaterEqual(len(observed_pages), 2)
+                self.assertEqual(live[999]["resource_key"], observed_pages[1][1])
+
+    def test_multibatch_readback_pages_after_full_8192_byte_key(self) -> None:
+        owner = "lane:" + "e" * 32
+        required = [f"component:required-{i:03d}" for i in range(78)]
+        long_key = "path:/" + "x" * (8192 - len("path:/"))
+        prefix = [f"component:earlier-{i:04d}" for i in range(921)]
+        live = sorted(
+            self.acquired(owner, required + prefix + [long_key, "port:4321"])["leases"],
+            key=lambda lease: lease["resource_key"],
+        )
+        self.assertEqual(1001, len(live))
+        self.assertEqual(long_key, live[999]["resource_key"])
+        cursors = []
+
+        def inventory(*, limit, start_after_key=None, **_kwargs):
+            cursors.append(start_after_key)
+            return [
+                lease for lease in live
+                if start_after_key is None or lease["resource_key"] > start_after_key
+            ][:limit]
+
+        work_acquire._verify_multibatch_live_lease_generations(
+            owner_id=owner,
+            required_keys=required,
+            acquisitions=[{"receipt": self.acquired(owner, required)}],
+            inventory_fn=inventory,
+        )
+        self.assertEqual([None, long_key], cursors)
+
+    def test_multibatch_preserved_lease_renews_after_success_and_restores_on_rejection(self) -> None:
+        for accept in (True, False):
+            with self.subTest(accept=accept):
+                params = self.parameters()
+                params["resource_keys"] = [
+                    f"component:renew-lane-{i:03d}" for i in range(76)
+                ]
+                params["idempotency_key"] = f"preserved-renewal-{accept}"
+                live: dict[str, dict[str, object]] = {}
+                events: list[str] = []
+                restored = Mock()
+
+                def acquire(owner, keys, **_kwargs):
+                    events.append("acquire")
+                    result = self.acquired(
+                        owner, keys, preserved=[keys[0]] if not live else [],
+                    )
+                    if not live:
+                        result["leases"][0]["expires_at_unix"] = int(time.time()) + 35
+                    for row in result["leases"]:
+                        live[row["resource_key"]] = row
+                    return result
+
+                def renew(owner, keys, *, ttl_seconds, expected_leases):
+                    events.append("renew")
+                    self.assertEqual(2, events.count("acquire"))
+                    self.assertEqual(["component:renew-lane-000"], keys)
+                    self.assertEqual(1, len(expected_leases))
+                    result_rows = []
+                    now = int(time.time())
+                    for old in expected_leases:
+                        key = old["resource_key"]
+                        self.assertEqual(
+                            work_acquire._lease_snapshot(live[key], owner_id=owner),
+                            old,
+                        )
+                        updated = {
+                            **live[key],
+                            "updated_at_unix": now,
+                            "expires_at_unix": now + ttl_seconds,
+                        }
+                        live[key] = updated
+                        result_rows.append(updated)
+                    return {
+                        "owner_id": owner, "snapshot_guarded": True,
+                        "leases": result_rows,
+                    }
+
+                def restore(owner, keys, *, original_leases, expected_renewed_leases):
+                    events.append("restore")
+                    restored()
+                    for before, after in zip(original_leases, expected_renewed_leases):
+                        self.assertEqual(
+                            work_acquire._lease_snapshot(live[before["resource_key"]],
+                                                         owner_id=owner),
+                            after,
+                        )
+                        live[before["resource_key"]] = before
+                    return {
+                        "owner_id": owner, "snapshot_guarded": True,
+                        "restored": original_leases,
+                    }
+
+                def release(owner, keys, *, expected_leases):
+                    events.append("release")
+                    for row in expected_leases:
+                        key = row["resource_key"]
+                        self.assertEqual(
+                            work_acquire._lease_snapshot(live[key], owner_id=owner),
+                            row,
+                        )
+                        live.pop(key)
+                    return self.released(owner, expected_leases)
+
+                def inventory(*, limit, start_after_key=None, **_kwargs):
+                    return [
+                        live[key] for key in sorted(live)
+                        if start_after_key is None or key > start_after_key
+                    ][:limit]
+
+                def ensure(*_args):
+                    events.append("ensure")
+                    self.assertGreaterEqual(
+                        live["component:renew-lane-000"]["expires_at_unix"],
+                        int(time.time()) + 1195,
+                    )
+                    if accept:
+                        return {
+                            "result_state": "CREATED",
+                            "durable_receipt_sha256": "b" * 64,
+                            "post_state": {
+                                "target_registered": True,
+                                "target_path_exists": True,
+                            },
+                        }
+                    return {
+                        "result_state": "NOT_ACCEPTED",
+                        "post_state": {
+                            "target_registered": False,
+                            "target_path_exists": False,
+                            "branch_ref_head": None,
+                        },
+                    }
+
+                with patch.object(
+                    work_acquire.resources,
+                    "restore_renewed_work_lane_leases",
+                    side_effect=restore,
+                ):
+                    outcome = work_acquire.acquire_work(
+                        params,
+                        acquire_resources_fn=acquire,
+                        renew_resources_fn=renew,
+                        release_resources_fn=release,
+                        inspect_resource_fn=Mock(),
+                        lease_inventory_fn=inventory,
+                        ensure_worktree_fn=ensure,
+                        runner=Mock(),
+                    )
+                self.assertEqual(["acquire", "acquire", "renew", "ensure"],
+                                 events[:4])
+                if accept:
+                    self.assertEqual("ready", outcome["state"])
+                    restored.assert_not_called()
+                else:
+                    self.assertEqual("blocked", outcome["state"])
+                    self.assertEqual("complete", outcome["compensation"]["state"])
+                    self.assertEqual(1, len(
+                        outcome["compensation"]["restored_preserved_groups"]
+                    ))
+                    restored.assert_called_once()
+                    self.assertEqual(
+                        ["component:renew-lane-000"], sorted(live),
+                    )
+
+    def test_multibatch_sqlite_preserved_renewal_compensation_and_lost_reply(self) -> None:
+        for mode in ("success", "rejection", "lost_reply"):
+            with self.subTest(mode=mode):
+                params = self.parameters()
+                keys = [f"component:sqlite-preserved-{i:03d}" for i in range(76)]
+                params["resource_keys"] = keys
+                params["idempotency_key"] = "sqlite-preserved-" + mode
+                inputs = work_acquire._normalize(params)
+                owner = str(inputs["lease_owner_id"])
+                metadata = {
+                    "schema_version": 1,
+                    "kind": work_acquire.LANE_KIND,
+                    "lane_id": inputs["lane_id"],
+                    "controller_actor": inputs["controller"]["actor"],
+                    "controller_role": "controller",
+                    "scoped_writer_actor": (inputs["scoped_writer"] or {}).get("actor"),
+                    "source": inputs["source"],
+                    "lifecycle_source": work_acquire._lifecycle_source(inputs),
+                    "repo": inputs["repo"],
+                    "branch": inputs["branch"],
+                    "target_path": inputs["target_path"],
+                }
+                ensure_calls: list[str] = []
+                renewal_calls: list[list[str]] = []
+                with patch.object(
+                    work_acquire.resources, "RESOURCE_DB",
+                    self.state / ("sqlite-preserved-" + mode + ".sqlite3"),
+                ):
+                    # A live preserved generation has only 35 seconds left,
+                    # although this Work Lane has requested a 1200-second TTL.
+                    with patch.object(
+                        work_acquire.resources, "_now",
+                        return_value=int(time.time()) - 25,
+                    ):
+                        original = work_acquire.resources.acquire_resources(
+                            owner, [keys[0]], purpose=str(params["purpose"]),
+                            ttl_seconds=60, metadata=metadata,
+                        )["leases"][0]
+                    foreign_key = "component:sqlite-preserved-foreign"
+                    foreign = work_acquire.resources.acquire_resources(
+                        "operator:sqlite-preserved-foreign", [foreign_key],
+                        purpose="unrelated-owner",
+                    )["leases"][0]
+                    native_renew = work_acquire.resources.renew_resources
+
+                    def renew(owner_id, renew_keys, **kwargs):
+                        renewal_calls.append(list(renew_keys))
+                        receipt = native_renew(owner_id, renew_keys, **kwargs)
+                        if mode == "lost_reply":
+                            raise ConnectionError("reply lost after SQLite COMMIT")
+                        return receipt
+
+                    def ensure(*_args):
+                        ensure_calls.append("ensure")
+                        live = work_acquire.resources.inspect_resource(keys[0])
+                        self.assertIsNotNone(live)
+                        self.assertEqual(
+                            original["metadata_sha256"], live["metadata_sha256"]
+                        )
+                        self.assertGreaterEqual(
+                            live["expires_at_unix"], original["expires_at_unix"] + 1000
+                        )
+                        self.assertGreater(
+                            live["expires_at_unix"], int(time.time()) + 30
+                        )
+                        if mode == "rejection":
+                            return {
+                                "result_state": "NOT_ACCEPTED",
+                                "post_state": {
+                                    "target_registered": False,
+                                    "target_path_exists": False,
+                                    "branch_ref_head": None,
+                                },
+                            }
+                        return {
+                            "result_state": "CREATED",
+                            "durable_receipt_sha256": "b" * 64,
+                            "post_state": {
+                                "target_registered": True,
+                                "target_path_exists": True,
+                            },
+                        }
+
+                    result = work_acquire.acquire_work(
+                        params, renew_resources_fn=renew,
+                        ensure_worktree_fn=ensure, runner=Mock(),
+                    )
+                    self.assertEqual([[keys[0]]], renewal_calls)
+                    self.assertEqual(
+                        foreign, work_acquire.resources.inspect_resource(foreign_key)
+                    )
+                    if mode == "success":
+                        self.assertEqual("ready", result["state"], (
+                            result.get("error_class"), result.get("error"),
+                            result.get("next_action"),
+                        ))
+                        self.assertEqual(["ensure"], ensure_calls)
+                        self.assertEqual(
+                            len(inputs["resource_keys"]),
+                            work_acquire.resources.count_resources(owner_id=owner)
+                        )
+                        renewed = work_acquire.resources.inspect_resource(keys[0])
+                        self.assertEqual(
+                            original["acquired_at_unix"], renewed["acquired_at_unix"]
+                        )
+                    elif mode == "rejection":
+                        self.assertEqual("blocked", result["state"])
+                        self.assertEqual("complete", result["compensation"]["state"])
+                        self.assertEqual(["ensure"], ensure_calls)
+                        self.assertEqual(
+                            original, work_acquire.resources.inspect_resource(keys[0])
+                        )
+                        self.assertEqual(
+                            1, work_acquire.resources.count_resources(owner_id=owner)
+                        )
+                    else:
+                        self.assertEqual("outcome_unknown", result["state"])
+                        self.assertEqual([], ensure_calls)
+                        self.assertEqual(
+                            "preserved_renewal_in_flight",
+                            result["acquisition"]["state"],
+                        )
+                        self.assertEqual(
+                            [keys[0]], result["acquisition"]["resource_keys"]
+                        )
+                        live = work_acquire.resources.inspect_resource(keys[0])
+                        self.assertGreaterEqual(
+                            live["expires_at_unix"], original["expires_at_unix"] + 1000
+                        )
+                        self.assertGreater(
+                            live["expires_at_unix"], int(time.time()) + 30
+                        )
+                        replay = work_acquire.acquire_work(
+                            params, renew_resources_fn=renew,
+                            ensure_worktree_fn=ensure, runner=Mock(),
+                        )
+                        self.assertTrue(replay["replayed"])
+                        self.assertEqual("outcome_unknown", replay["state"])
+                        self.assertEqual([[keys[0]]], renewal_calls)
+                        self.assertEqual([], ensure_calls)
+
+    def test_multibatch_preserved_renewal_lost_reply_keeps_in_flight_snapshots(self) -> None:
+        params = self.parameters()
+        params["resource_keys"] = [
+            f"component:lost-renewal-{i:03d}" for i in range(76)
+        ]
+        params["idempotency_key"] = "preserved-renewal-lost-reply"
+        acquired_groups: list[list[str]] = []
+        renew = Mock(side_effect=OSError("renewal response lost after possible commit"))
+        ensure = Mock()
+
+        def acquire(owner, keys, **_kwargs):
+            acquired_groups.append(list(keys))
+            receipt = self.acquired(
+                owner, keys, preserved=[keys[0]] if len(acquired_groups) == 1 else [],
+            )
+            if len(acquired_groups) == 1:
+                receipt["leases"][0]["expires_at_unix"] = int(time.time()) + 35
+            return receipt
+
+        outcome = work_acquire.acquire_work(
+            params, acquire_resources_fn=acquire,
+            renew_resources_fn=renew, ensure_worktree_fn=ensure,
+            runner=Mock(),
+        )
+        self.assertEqual("outcome_unknown", outcome["state"])
+        self.assertEqual("HARD_BLOCK", outcome["decision"])
+        self.assertEqual(
+            "preserved_renewal_in_flight", outcome["acquisition"]["state"]
+        )
+        self.assertEqual(
+            ["component:lost-renewal-000"],
+            outcome["acquisition"]["resource_keys"],
+        )
+        self.assertEqual(1, len(outcome["acquisition"]["expected_leases"]))
+        self.assertEqual(
+            outcome["acquisition"],
+            work_acquire._read_state(
+                Path(outcome["durable_receipt_path"])
+            )["acquisition"],
+        )
+        self.assertEqual(2, len(acquired_groups))
+        ensure.assert_not_called()
+        renew.assert_called_once()
+
+        replay = work_acquire.acquire_work(
+            params, acquire_resources_fn=acquire,
+            renew_resources_fn=renew, ensure_worktree_fn=ensure,
+            runner=Mock(),
+        )
+        self.assertEqual("outcome_unknown", replay["state"])
+        self.assertTrue(replay["replayed"])
+        renew.assert_called_once()
+        self.assertEqual(2, len(acquired_groups))
+        ensure.assert_not_called()
+
+    def test_multibatch_preserved_sqlite_success_compensation_and_late_conflict(self) -> None:
+        for mode in ("ready", "worktree_rejected", "late_conflict"):
+            with self.subTest(mode=mode):
+                params = self.parameters()
+                params["resource_keys"] = [
+                    f"component:sqlite-preserved-{mode}-{i:03d}"
+                    for i in range(76)
+                ]
+                params["idempotency_key"] = f"sqlite-preserved-{mode}"
+                normalized = work_acquire._normalize(params)
+                owner = normalized["lease_owner_id"]
+                first_key = params["resource_keys"][0]
+                foreign_key = f"component:sqlite-foreign-{mode}"
+                created_preserved = []
+                acquisitions = []
+                ensure_calls = []
+                renew_calls = []
+                original = work_acquire.resources.acquire_resources
+                native_renew = work_acquire.resources.renew_resources
+
+                def acquire(who, keys, **kwargs):
+                    acquisitions.append(list(keys))
+                    if len(acquisitions) == 1:
+                        created_preserved.append(original(
+                            who, [keys[0]], purpose=kwargs["purpose"],
+                            ttl_seconds=45, metadata=kwargs["metadata"],
+                        )["leases"][0])
+                    elif mode == "late_conflict":
+                        original(
+                            "operator:sqlite-foreign-owner", [keys[0]],
+                            purpose="foreign lease conflict", ttl_seconds=3600,
+                        )
+                    return original(who, keys, **kwargs)
+
+                def renew(who, keys, **kwargs):
+                    renew_calls.append(list(keys))
+                    return native_renew(who, keys, **kwargs)
+
+                def ensure(*_args):
+                    ensure_calls.append(True)
+                    renewed = work_acquire.resources.inspect_resource(first_key)
+                    self.assertIsNotNone(renewed)
+                    self.assertGreaterEqual(
+                        renewed["expires_at_unix"],
+                        created_preserved[0]["expires_at_unix"] + 1000,
+                    )
+                    if mode == "ready":
+                        return {
+                            "result_state": "CREATED",
+                            "durable_receipt_sha256": "b" * 64,
+                            "post_state": {
+                                "target_registered": True,
+                                "target_path_exists": True,
+                            },
+                        }
+                    return {
+                        "result_state": "NOT_ACCEPTED",
+                        "post_state": {
+                            "target_registered": False,
+                            "target_path_exists": False,
+                            "branch_ref_head": None,
+                        },
+                    }
+
+                with patch.object(
+                    work_acquire.resources, "RESOURCE_DB",
+                    self.state / f"sqlite-preserved-{mode}.sqlite3",
+                ):
+                    foreign = original(
+                        "operator:sqlite-foreign-owner", [foreign_key],
+                        purpose="foreign unaffected", ttl_seconds=3600,
+                    )["leases"][0]
+                    outcome = work_acquire.acquire_work(
+                        params, acquire_resources_fn=acquire,
+                        renew_resources_fn=renew,
+                        ensure_worktree_fn=ensure,
+                        lease_inventory_fn=work_acquire.resources.list_resources,
+                        runner=Mock(),
+                    )
+                    self.assertEqual(2, len(acquisitions))
+                    self.assertEqual(1, len(created_preserved))
+                    self.assertEqual(
+                        foreign,
+                        work_acquire.resources.inspect_resource(foreign_key),
+                    )
+                    if mode == "ready":
+                        self.assertEqual("ready", outcome["state"])
+                        self.assertEqual([[first_key]], renew_calls)
+                        self.assertEqual(1, len(ensure_calls))
+                        current = work_acquire.resources.inspect_resource(first_key)
+                        self.assertGreaterEqual(
+                            current["expires_at_unix"],
+                            created_preserved[0]["expires_at_unix"] + 1000,
+                        )
+                        self.assertEqual(
+                            len(normalized["resource_keys"]),
+                            work_acquire.resources.count_resources(owner_id=owner),
+                        )
+                    else:
+                        self.assertEqual("blocked", outcome["state"])
+                        self.assertEqual("complete", outcome["compensation"]["state"])
+                        self.assertEqual(
+                            created_preserved[0],
+                            work_acquire.resources.inspect_resource(first_key),
+                        )
+                        self.assertEqual(
+                            1, work_acquire.resources.count_resources(owner_id=owner),
+                        )
+                        self.assertEqual(
+                            [first_key],
+                            [item["resource_key"] for item in
+                             work_acquire.resources.list_resources(owner_id=owner)],
+                        )
+                        if mode == "late_conflict":
+                            self.assertEqual([], renew_calls)
+                            self.assertEqual([], ensure_calls)
+                            self.assertIsNotNone(
+                                work_acquire.resources.inspect_resource(
+                                    params["resource_keys"][64]
+                                )
+                            )
+                        else:
+                            self.assertEqual([[first_key]], renew_calls)
+                            self.assertEqual(1, len(ensure_calls))
+                            self.assertEqual(
+                                1, len(outcome["compensation"]["restored_preserved_groups"])
+                            )
+
+    def test_multibatch_sqlite_second_renewal_commits_then_loses_reply(self) -> None:
+        params = self.parameters()
+        params["resource_keys"] = [
+            f"component:sqlite-lost-renew-{i:03d}" for i in range(76)
+        ]
+        params["idempotency_key"] = "sqlite-lost-second-renewal"
+        owner = work_acquire._normalize(params)["lease_owner_id"]
+        native_acquire = work_acquire.resources.acquire_resources
+        native_renew = work_acquire.resources.renew_resources
+        groups = []
+        renew_calls = []
+        originals = {}
+        ensure = Mock()
+
+        def acquire(who, keys, **kwargs):
+            groups.append(list(keys))
+            original_row = native_acquire(
+                who, [keys[0]], purpose=kwargs["purpose"],
+                ttl_seconds=45, metadata=kwargs["metadata"],
+            )["leases"][0]
+            originals[keys[0]] = original_row
+            return native_acquire(who, keys, **kwargs)
+
+        def renew(who, keys, **kwargs):
+            renew_calls.append(list(keys))
+            outcome = native_renew(who, keys, **kwargs)
+            if len(renew_calls) == 2:
+                raise OSError("reply lost after SQLite renewal committed")
+            return outcome
+
+        with patch.object(
+            work_acquire.resources, "RESOURCE_DB",
+            self.state / "sqlite-lost-renewal.sqlite3",
+        ):
+            outcome = work_acquire.acquire_work(
+                params, acquire_resources_fn=acquire,
+                renew_resources_fn=renew,
+                ensure_worktree_fn=ensure,
+                lease_inventory_fn=work_acquire.resources.list_resources,
+                runner=Mock(),
+            )
+            self.assertEqual("outcome_unknown", outcome["state"])
+            self.assertEqual("HARD_BLOCK", outcome["decision"])
+            self.assertEqual(2, len(groups))
+            self.assertEqual(
+                [[groups[0][0]], [groups[1][0]]], renew_calls,
+            )
+            self.assertEqual(
+                "preserved_renewal_in_flight", outcome["acquisition"]["state"],
+            )
+            self.assertEqual(1, outcome["acquisition"]["group_index"])
+            self.assertEqual(
+                work_acquire._lease_snapshot(originals[groups[1][0]], owner_id=owner),
+                outcome["acquisition"]["expected_leases"][0],
+            )
+            first_evidence = outcome["lease_acquisition_groups"][0]
+            self.assertIn("preserved_renewal", first_evidence)
+            self.assertEqual(
+                work_acquire._lease_snapshot(
+                    work_acquire.resources.inspect_resource(groups[0][0]),
+                    owner_id=owner,
+                ),
+                first_evidence["preserved_renewal"]["current_leases"][0],
+            )
+            self.assertGreater(
+                work_acquire.resources.inspect_resource(groups[1][0])["expires_at_unix"],
+                originals[groups[1][0]]["expires_at_unix"],
+            )
+            self.assertEqual(
+                outcome["acquisition"],
+                work_acquire._read_state(
+                    Path(outcome["durable_receipt_path"])
+                )["acquisition"],
+            )
+            ensure.assert_not_called()
+            replay = work_acquire.acquire_work(
+                params, acquire_resources_fn=acquire,
+                renew_resources_fn=renew,
+                ensure_worktree_fn=ensure,
+                lease_inventory_fn=work_acquire.resources.list_resources,
+                runner=Mock(),
+            )
+            self.assertTrue(replay["replayed"])
+            self.assertEqual("outcome_unknown", replay["state"])
+            self.assertEqual(2, len(groups))
+            self.assertEqual(2, len(renew_calls))
+            ensure.assert_not_called()
+
+    def test_multibatch_preserved_short_lease_does_not_renew_before_later_group_conflict(self) -> None:
+        params = self.parameters()
+        params["resource_keys"] = [f"component:late-denial-{i:03d}" for i in range(76)]
+        params["idempotency_key"] = "preserved-late-acquire-denial"
+        acquired = []
+        live = {}
+        renew = Mock()
+        ensure = Mock()
+
+        def take(owner, keys, **_kwargs):
+            acquired.append(list(keys))
+            if len(acquired) == 2:
+                raise ValueError("later resource group denied")
+            receipt = self.acquired(owner, keys, preserved=[keys[0]])
+            receipt["leases"][0]["expires_at_unix"] = int(time.time()) + 35
+            for row in receipt["leases"]:
+                live[row["resource_key"]] = row
+            return receipt
+
+        def release(owner, keys, *, expected_leases):
+            self.assertNotIn("component:late-denial-000", keys)
+            for row in expected_leases:
+                key = row["resource_key"]
+                self.assertEqual(
+                    work_acquire._lease_snapshot(live[key], owner_id=owner),
+                    row,
+                )
+                live.pop(key)
+            return self.released(owner, expected_leases)
+
+        result = work_acquire.acquire_work(
+            params, acquire_resources_fn=take,
+            renew_resources_fn=renew, release_resources_fn=release,
+            ensure_worktree_fn=ensure, runner=Mock(),
+        )
+        self.assertEqual(2, len(acquired))
+        self.assertEqual("blocked", result["state"])
+        self.assertEqual("complete", result["compensation"]["state"])
+        renew.assert_not_called()
+        ensure.assert_not_called()
+        self.assertEqual(["component:late-denial-000"], sorted(live))
+        self.assertLess(live["component:late-denial-000"]["expires_at_unix"],
+                        int(time.time()) + 60)
+
+    def test_multibatch_preserved_second_renewal_lost_reply_retains_all_evidence(self) -> None:
+        params = self.parameters()
+        keys = [f"component:partial-renewal-{i:03d}" for i in range(76)]
+        params["resource_keys"] = keys
+        params["idempotency_key"] = "partial-renewal-reply-lost"
+        taken: list[list[str]] = []
+        renewed_groups: list[list[str]] = []
+        live: dict[str, dict] = {}
+        ensure = Mock()
+
+        def acquire(owner, group, **_kwargs):
+            taken.append(list(group))
+            result = self.acquired(owner, group, preserved=[group[0]])
+            result["leases"][0]["expires_at_unix"] = int(time.time()) + 35
+            for row in result["leases"]:
+                live[row["resource_key"]] = row
+            return result
+
+        def renew(owner, group, *, ttl_seconds, expected_leases):
+            renewed_groups.append(list(group))
+            self.assertEqual(1, len(group))
+            self.assertEqual(1, len(expected_leases))
+            changed = []
+            for snapshot in expected_leases:
+                key = snapshot["resource_key"]
+                self.assertEqual(
+                    snapshot,
+                    work_acquire._lease_snapshot(live[key], owner_id=owner),
+                )
+                row = {
+                    **live[key],
+                    "updated_at_unix": int(time.time()),
+                    "expires_at_unix": int(time.time()) + ttl_seconds,
+                }
+                live[key] = row
+                changed.append(row)
+            if len(renewed_groups) == 2:
+                raise ConnectionError("second group committed; reply lost")
+            return {
+                "owner_id": owner, "snapshot_guarded": True, "leases": changed,
+            }
+
+        result = work_acquire.acquire_work(
+            params, acquire_resources_fn=acquire,
+            renew_resources_fn=renew, ensure_worktree_fn=ensure,
+            runner=Mock(),
+        )
+        self.assertEqual([[keys[0]], [keys[64]]], renewed_groups)
+        self.assertEqual("outcome_unknown", result["state"])
+        self.assertEqual("HARD_BLOCK", result["decision"])
+        self.assertEqual("preserved_renewal_in_flight", result["acquisition"]["state"])
+        self.assertEqual(1, result["acquisition"]["group_index"])
+        self.assertEqual([keys[64]], result["acquisition"]["resource_keys"])
+        groups = result["lease_acquisition_groups"]
+        self.assertIn("preserved_renewal", groups[0])
+        self.assertNotIn("preserved_renewal", groups[1])
+        self.assertGreaterEqual(
+            live[keys[0]]["expires_at_unix"], int(time.time()) + 1190,
+        )
+        self.assertGreaterEqual(
+            live[keys[64]]["expires_at_unix"], int(time.time()) + 1190,
+        )
+        self.assertEqual(
+            result["acquisition"],
+            work_acquire._read_state(
+                Path(result["durable_receipt_path"])
+            )["acquisition"],
+        )
+        ensure.assert_not_called()
+        replay = work_acquire.acquire_work(
+            params, acquire_resources_fn=acquire,
+            renew_resources_fn=renew, ensure_worktree_fn=ensure,
+            runner=Mock(),
+        )
+        self.assertTrue(replay["replayed"])
+        self.assertEqual("outcome_unknown", replay["state"])
+        self.assertEqual(2, len(taken))
+        self.assertEqual(2, len(renewed_groups))
+        ensure.assert_not_called()
+
+    def test_large_scope_atomic_batches(self) -> None:
+        for total in (63, 64, 65, 78):
+            with self.subTest(total=total):
+                params = self.parameters()
+                params["resource_keys"] = [
+                    f"component:scope-{i:03d}" for i in range(total - 2)
+                ]
+                params["idempotency_key"] = f"large-scope-{total}"
+                calls = []
+                live_leases = []
+                def acquire(owner, keys, **_kwargs):
+                    self.assertLessEqual(len(keys), 64)
+                    calls.append((owner, list(keys)))
+                    receipt = self.acquired(owner, keys)
+                    live_leases.extend(receipt['leases'])
+                    return receipt
+                ensure = Mock(return_value={
+                    "result_state": "CREATED", "durable_receipt_sha256": "b" * 64,
+                    "post_state": {"target_registered": True, "target_path_exists": True},
+                })
+                result = work_acquire.acquire_work(
+                    params, acquire_resources_fn=acquire,
+                    release_resources_fn=Mock(), inspect_resource_fn=Mock(),
+                    lease_inventory_fn=lambda **_: live_leases,
+                    ensure_worktree_fn=ensure, runner=Mock(),
+                )
+                self.assertEqual(result["state"], "ready")
+                ensure.assert_called_once()
+                self.assertEqual(
+                    [len(keys) for _, keys in calls],
+                    [min(64, total)] + ([total - 64] if total > 64 else []),
+                )
+                self.assertEqual(
+                    sorted(key for _, keys in calls for key in keys),
+                    result["inputs"]["resource_keys"],
+                )
+                self.assertEqual({owner for owner, _ in calls},
+                                 {result["inputs"]["lease_owner_id"]})
+                if total > 64:
+                    bundle = result["lease_receipt"]
+                    self.assertEqual(bundle["kind"], "grabowski.work_lane.lease_bundle")
+                    self.assertEqual(bundle["resource_classes"]["standard"],
+                                     result["inputs"]["resource_keys"])
+                    self.assertEqual(len(bundle["acquisitions"]), 2)
+
+    def test_large_scope_later_conflict_compensates_only_owned_first_batch(self) -> None:
+        params = self.parameters()
+        params["resource_keys"] = [f"component:conflict-{i:03d}" for i in range(76)]
+        first = []
+        def acquire(owner, keys, **_kwargs):
+            self.assertLessEqual(len(keys), 64)
+            if not first:
+                first.extend(self.acquired(owner, keys)["leases"])
+                return self.acquired(owner, keys)
+            raise work_acquire.resources.ResourceConflict(
+                keys[0], "foreign-owner", int(time.time()) + 1200,
+            )
+        release = Mock(side_effect=self.release)
+        ensure = Mock()
+        result = work_acquire.acquire_work(
+            params, acquire_resources_fn=acquire,
+            release_resources_fn=release, inspect_resource_fn=Mock(),
+            ensure_worktree_fn=ensure, runner=Mock(),
+        )
+        self.assertEqual(result["state"], "blocked")
+        self.assertEqual(result["compensation"]["state"], "complete")
+        self.assertEqual(result["acquisition"]["group_index"], 1)
+        ensure.assert_not_called()
+        release.assert_called_once()
+        self.assertEqual(len(release.call_args.args[1]), 64)
+        self.assertEqual(
+            [row["resource_key"] for row in release.call_args.kwargs["expected_leases"]],
+            [row["resource_key"] for row in first],
+        )
+
+    def test_multibatch_preserved_same_owner_is_never_renewed_before_later_conflict(self) -> None:
+        params = self.parameters()
+        params["resource_keys"] = [f"component:preserved-{i:03d}" for i in range(76)]
+        first_keys = []
+        no_renew_guards = []
+        def acquire(owner, keys, **kwargs):
+            no_renew_guards.append(kwargs.get("_work_lane_no_renew_preserved"))
+            if not first_keys:
+                first_keys.extend(keys)
+                return self.acquired(owner, keys, preserved=list(keys))
+            raise work_acquire.resources.ResourceConflict(
+                keys[0], "foreign-owner", int(time.time()) + 1200,
+            )
+        release = Mock(side_effect=self.release)
+        ensure = Mock()
+        result = work_acquire.acquire_work(
+            params, acquire_resources_fn=acquire,
+            release_resources_fn=release, inspect_resource_fn=Mock(),
+            ensure_worktree_fn=ensure, runner=Mock(),
+        )
+        self.assertEqual(result["state"], "blocked")
+        self.assertEqual(result["compensation"]["state"], "complete")
+        self.assertEqual(result["compensation"]["preserved_resource_keys"], first_keys)
+        self.assertEqual(no_renew_guards, [True, True])
+        release.assert_not_called()
+        ensure.assert_not_called()
+
+    def test_large_scope_lost_second_response_never_starts_writer(self) -> None:
+        params = self.parameters()
+        params["resource_keys"] = [f"component:unknown-{i:03d}" for i in range(76)]
+        acquire = Mock()
+        def acquire_group(owner, keys, **_kwargs):
+            if acquire.call_count == 1:
+                return self.acquired(owner, keys)
+            raise RuntimeError("response lost")
+        acquire.side_effect = acquire_group
+        ensure = Mock()
+        release = Mock(side_effect=self.release)
+        kwargs = dict(acquire_resources_fn=acquire, release_resources_fn=release,
+                      inspect_resource_fn=Mock(), ensure_worktree_fn=ensure, runner=Mock())
+        first = work_acquire.acquire_work(params, **kwargs)
+        second = work_acquire.acquire_work(params, **kwargs)
+        self.assertEqual(first["state"], "outcome_unknown")
+        self.assertEqual(first["decision"], "HARD_BLOCK")
+        self.assertTrue(second["replayed"])
+        self.assertEqual(acquire.call_count, 2)
+        ensure.assert_not_called()
+
+    def test_large_scope_terminal_inventory_can_exceed_atomic_batch(self) -> None:
+        params = self.parameters()
+        params["resource_keys"] = [f"component:terminal-{i:03d}" for i in range(76)]
+        inputs = work_acquire._normalize(params)
+        inputs.pop("_scoped_writer_argv")
+        record = {"lane_id": inputs["lane_id"], "inputs": inputs}
+        with patch.object(work_acquire.resources, "list_resources", return_value=[]), \
+             patch.object(work_acquire.resources, "count_resources", return_value=0):
+            result = work_acquire._converge_terminal_resource_leases(
+                record, assessment={"phase": "terminal", "lease_release_ready": True},
+            )
+        self.assertEqual(result["state"], "already_absent")
+        self.assertEqual(result["registered_resource_key_count"], 78)
+
     def test_bureau_path_and_branch_use_same_owner_separate_contract_groups(self) -> None:
         calls: list[dict[str, object]] = []
         events: list[str] = []
+        live_leases = []
 
         def acquire(
             owner: str, keys: list[str], **kwargs: object
@@ -526,7 +1497,7 @@ class WorkAcquireTests(unittest.TestCase):
                     "contract_group": contract_group,
                 }
             )
-            return self.acquired(
+            receipt = self.acquired(
                 owner,
                 keys,
                 bureau_contract=(
@@ -535,6 +1506,8 @@ class WorkAcquireTests(unittest.TestCase):
                     else None
                 ),
             )
+            live_leases.extend(receipt["leases"])
+            return receipt
 
         def ensure(*_args: object) -> dict[str, object]:
             events.append("ensure")
@@ -557,6 +1530,7 @@ class WorkAcquireTests(unittest.TestCase):
                 acquire_resources_fn=acquire,
                 release_resources_fn=Mock(),
                 inspect_resource_fn=Mock(),
+                lease_inventory_fn=lambda **_: live_leases,
                 ensure_worktree_fn=ensure,
                 runner=Mock(),
             )
@@ -696,6 +1670,10 @@ class WorkAcquireTests(unittest.TestCase):
                 acquire_resources_fn=acquire,
                 release_resources_fn=release,
                 inspect_resource_fn=Mock(),
+                lease_inventory_fn=lambda **_: [
+                    lease for receipt in acquired_receipts.values()
+                    for lease in receipt['leases']
+                ],
                 ensure_worktree_fn=ensure,
                 runner=Mock(),
             )
@@ -7051,7 +8029,10 @@ class WorkAcquireTests(unittest.TestCase):
             patch.object(
                 work_acquire.resources,
                 "list_resources",
-                side_effect=[[own_lease, late_lease], []],
+                side_effect=[
+                    sorted([own_lease, late_lease], key=lambda item: item["resource_key"]),
+                    [],
+                ],
             ) as listing,
             patch.object(
                 work_acquire.resources,
@@ -7144,6 +8125,97 @@ class WorkAcquireTests(unittest.TestCase):
         self.assertFalse(release.call_args_list[1].kwargs["force"])
         self.assertEqual(first, release.call_args_list[0].kwargs["expected_leases"])
         self.assertEqual(second, release.call_args_list[1].kwargs["expected_leases"])
+
+    def test_terminal_513_sqlite_lease_closeout_keeps_foreign_owner(self) -> None:
+        inputs = work_acquire._normalize(self.parameters())
+        inputs.pop("_scoped_writer_argv")
+        owner = str(inputs["lease_owner_id"])
+        record = {"lane_id": inputs["lane_id"], "inputs": inputs}
+        own_keys = [f"component:sqlite-terminal-{i:04d}" for i in range(513)]
+        foreign_key = "component:sqlite-terminal-foreign"
+        native_release = work_acquire.resources.release_resources
+        with (
+            patch.object(work_acquire.resources, "RESOURCE_DB",
+                         self.state / "sqlite-terminal-resources.sqlite3"),
+            patch.object(work_acquire.resources, "grabowski_resource_release",
+                         side_effect=native_release),
+        ):
+            for start in range(0, len(own_keys), 64):
+                work_acquire.resources.acquire_resources(
+                    owner, own_keys[start:start + 64], purpose="terminal sqlite fixture",
+                )
+            foreign = work_acquire.resources.acquire_resources(
+                "operator:sqlite-foreign", [foreign_key], purpose="foreign fixture",
+            )["leases"][0]
+            self.assertEqual(513, work_acquire.resources.count_resources(owner_id=owner))
+            result = work_acquire._converge_terminal_resource_leases(
+                record, assessment={"phase": "terminal", "lease_release_ready": True},
+            )
+            self.assertEqual(0, work_acquire.resources.count_resources(owner_id=owner))
+            self.assertEqual(foreign, work_acquire.resources.inspect_resource(foreign_key))
+        self.assertEqual(513, len(result["released_resource_keys"]))
+        self.assertEqual(9, result["release_batch_count"])
+
+    def test_terminal_resource_convergence_releases_513_owner_leases(self) -> None:
+        params = self.parameters()
+        params["resource_keys"] = [f"component:registered-{i:03d}" for i in range(510)]
+        inputs = work_acquire._normalize(params)
+        inputs.pop("_scoped_writer_argv")
+        owner = str(inputs["lease_owner_id"])
+        leases = self.acquired(
+            owner, [f"operation:late-owner-{i:04d}" for i in range(513)]
+        )["leases"]
+        held = {item["resource_key"]: item for item in leases}
+        record = {"lane_id": inputs["lane_id"], "inputs": inputs}
+        def inventory(*, limit, start_after_key=None, **_kwargs):
+            return [held[k] for k in sorted(held) if start_after_key is None
+                    or k > start_after_key][:limit]
+        def release_batch(who, keys, *, force, expected_leases):
+            self.assertEqual(who, owner)
+            self.assertFalse(force)
+            for key, expected in zip(keys, expected_leases):
+                self.assertEqual(work_acquire._lease_snapshot(held[key], owner_id=owner), expected)
+            for key in keys:
+                held.pop(key)
+            return self.released(owner, expected_leases)
+        with (
+            patch.object(work_acquire.resources, "list_resources", side_effect=inventory),
+            patch.object(work_acquire.resources, "count_resources", side_effect=lambda **_: len(held)),
+            patch.object(work_acquire.resources, "grabowski_resource_release",
+                         side_effect=release_batch) as release,
+        ):
+            outcome = work_acquire._converge_terminal_resource_leases(
+                record, assessment={"phase": "terminal", "lease_release_ready": True},
+            )
+        self.assertEqual("released", outcome["state"])
+        self.assertEqual(513, len(outcome["released_resource_keys"]))
+        self.assertEqual(9, outcome["release_batch_count"])
+        self.assertEqual(9, release.call_count)
+        self.assertFalse(held)
+
+    def test_terminal_owner_inventory_keyset_paginates_1001_leases(self) -> None:
+        inputs = work_acquire._normalize(self.parameters())
+        inputs.pop("_scoped_writer_argv")
+        owner = str(inputs["lease_owner_id"])
+        leases = self.acquired(
+            owner, [f"operation:page-{i:04d}" for i in range(1001)]
+        )["leases"]
+        calls = []
+        def inventory(*, limit, start_after_key=None, **_kwargs):
+            calls.append((limit, start_after_key))
+            return [item for item in leases if start_after_key is None
+                    or item["resource_key"] > start_after_key][:limit]
+        with (
+            patch.object(work_acquire.resources, "list_resources", side_effect=inventory),
+            patch.object(work_acquire.resources, "count_resources", return_value=1001),
+        ):
+            _owner, _registered, snapshots = work_acquire._terminal_lane_resource_observation(
+                {"lane_id": inputs["lane_id"], "inputs": inputs},
+            )
+        self.assertEqual(1001, len(snapshots))
+        self.assertEqual(2, len(calls))
+        self.assertEqual((1000, None), calls[0])
+        self.assertEqual((1000, leases[999]["resource_key"]), calls[1])
 
     def test_terminal_resource_convergence_stops_between_batches_on_owner_drift(self) -> None:
         params = self.parameters()
