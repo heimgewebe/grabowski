@@ -661,6 +661,49 @@ def load_live_pr(repo_name: str, pr_number: int) -> dict[str, Any]:
     )
 
 
+def _revision_bound_pr_file_evidence(
+    repo_name: str, pr: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Bind security-sensitive file status/rename origin to immutable Git SHAs.
+
+    The PR-number-only REST files endpoint can briefly serve a different head
+    after A -> B -> A; equal paths and counts do not authenticate rename origins.
+    The unpaged Compare response must identify the exact initially observed
+    base/head. Ambiguous merge bases and the Compare files cap fail closed.
+    """
+    base = _normalize_git_sha(pr.get("baseRefOid"))
+    head = _normalize_git_sha(pr.get("headRefOid"))
+    count = pr.get("changedFiles")
+    if base is None or head is None or type(count) is not int or not 1 <= count <= 300:
+        raise CiEvidenceError("revision-bound rename evidence identity or file count invalid")
+    try:
+        payload = _run_json(["gh", "api", f"repos/{repo_name}/compare/{base}...{head}"])
+    except CiEvidenceError as exc:
+        raise CiEvidenceError("revision-bound rename evidence unavailable") from exc
+    commits = payload.get("commits") if isinstance(payload, dict) else None
+    if (
+        not isinstance(payload, dict)
+        or not isinstance(payload.get("base_commit"), dict)
+        or payload["base_commit"].get("sha") != base
+        or not isinstance(commits, list)
+        or not commits
+        or not isinstance(commits[-1], dict)
+        or commits[-1].get("sha") != head
+    ):
+        raise CiEvidenceError("revision-bound compare base/head identity drifted")
+    files = payload.get("files")
+    evidence = gate._pull_file_evidence([files])
+    if (
+        evidence is None
+        or len(evidence) != count
+        or gate._complete_pr_diff_paths({
+            "pullFilesEvidenceComplete": True, "files": evidence,
+        }) is None
+    ):
+        raise CiEvidenceError("revision-bound compare file/rename evidence incomplete")
+    return evidence
+
+
 def _require_rename_aware_pr(
     repo_name: str, pr_number: int, pr: dict[str, Any]
 ) -> dict[str, Any]:
@@ -711,7 +754,16 @@ def _require_rename_aware_pr(
         or not set(graphql_paths).issubset(rest_paths)
     ):
         raise CiEvidenceError("complete rename-aware REST/GraphQL path evidence drifted")
-    return {**pr, "files": rest_files, "pullFilesEvidenceComplete": True}
+    # Revision-pinned status and previousPath are the classification authority.
+    # REST is used only as a completeness/consistency witness, never alone.
+    pinned_files = _revision_bound_pr_file_evidence(repo_name, pr)
+    if (
+        len(pinned_files) != len(rest_files)
+        or {item["path"]: item for item in pinned_files}
+        != {item["path"]: item for item in rest_files}
+    ):
+        raise CiEvidenceError("complete rename-aware REST/revision-bound compare metadata drifted")
+    return {**pr, "files": pinned_files, "pullFilesEvidenceComplete": True}
 
 
 def _known_pr_diff_limit_error(message: str, *, changed_files: Any) -> bool:
