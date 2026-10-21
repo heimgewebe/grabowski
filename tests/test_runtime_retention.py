@@ -1910,6 +1910,35 @@ class RuntimeRetentionTests(unittest.TestCase):
                 self.assertEqual(returned, expected_exit)
                 self.assertEqual(json.loads(output.getvalue()), receipt)
 
+    def test_explicit_apply_cli_signals_degraded_after_safe_actions(self) -> None:
+        plan_hash = "6" * 64
+        plan = {"plan_sha256": plan_hash}
+        for status, completed, expected_exit in (
+            ("passed", True, 0),
+            ("degraded", True, 2),
+            ("degraded", False, 2),
+        ):
+            receipt = {"status": status, "completed": completed,
+                       "mutated": True, "preserved_blocked_units": [
+                           {"unit": "grabowski-job-aaaaaaaaaaaa.service", "reason": "oversize"}
+                       ] if status == "degraded" else []}
+            with self.subTest(status=status, completed=completed), patch.object(
+                RETENTION.sys, "argv", [
+                    "maintain_runtime_state", "--apply",
+                    "--expected-plan-sha256", plan_hash,
+                ]
+            ), patch.object(
+                RETENTION, "build_plan", return_value=plan
+            ), patch.object(
+                RETENTION, "apply_plan", return_value=receipt
+            ) as apply, patch.object(
+                RETENTION.sys, "stdout", new_callable=io.StringIO
+            ) as output:
+                returned = RETENTION.main()
+            apply.assert_called_once_with(plan, expected_plan_sha256=plan_hash)
+            self.assertEqual(returned, expected_exit)
+            self.assertEqual(json.loads(output.getvalue()), receipt)
+
     def test_periodic_failed_unit_scan_excludes_own_degraded_service(self) -> None:
         unit = "grabowski-task-" + "a" * 24 + "-a1.service"
         listing = (

@@ -2443,7 +2443,8 @@ def main() -> int:
             raise ValueError("--expected-plan-sha256 is required with --apply")
         receipt = apply_plan(plan, expected_plan_sha256=args.expected_plan_sha256)
         print(json.dumps(receipt, ensure_ascii=False, sort_keys=True, indent=2))
-        return 0
+        healthy = receipt.get("status") == "passed" and receipt.get("completed") is True
+        return 0 if healthy else 2
     except Exception as exc:
         print(
             json.dumps(
