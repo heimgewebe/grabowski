@@ -1230,9 +1230,11 @@ def _proven_grok_quota_failure_before_review(
         or receipt.get("verdict") != "INVALID"
         or receipt.get("findings") != []
         or receipt.get("failure_classification") != "invalid_review_output"
-        or receipt.get("returncode") != 126
+        or type(receipt.get("returncode")) is not int
+        or receipt["returncode"] != 126
         or receipt.get("error") != "Grok review stream used unsupported event type: error"
-        or receipt.get("review_document_bytes") != 0
+        or type(receipt.get("review_document_bytes")) is not int
+        or receipt["review_document_bytes"] != 0
         or receipt.get("review_document_sha256") is not None
         or receipt.get("review_document_normalizations") != []
         or receipt.get("review_findings_normalized") is not False
@@ -1267,7 +1269,8 @@ def _proven_grok_quota_failure_before_review(
         {key for key in receipt if key.startswith("review_provider_")} != provider_fields
         or receipt.get("review_provider_stream_contract")
         != "grok-streaming-json-bound-diff-review-v2"
-        or receipt.get("review_provider_stream_events") != 3
+        or type(receipt.get("review_provider_stream_events")) is not int
+        or receipt["review_provider_stream_events"] != 3
         # The original parser returns on the unsupported "error" event
         # before committing its in-progress available-command count.
         or type(receipt.get("review_provider_available_commands_events")) is not int

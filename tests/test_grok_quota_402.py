@@ -210,6 +210,10 @@ class GrokQuota402Tests(unittest.TestCase):
             "wrong_stream_digest": {"review_provider_stream_sha256": "f" * 64},
             "wrong_stream_length": {"review_provider_stream_bytes": 1},
             "false_event_count": {"review_provider_stream_events": 4},
+            "float_event_count": {"review_provider_stream_events": 3.0},
+            "float_returncode": {"returncode": 126.0},
+            "boolean_document_bytes": {"review_document_bytes": False},
+            "float_document_bytes": {"review_document_bytes": 0.0},
             "completed_tool": {"review_provider_completed_tool_calls": 1},
             "tool_catalog": {"review_provider_available_tools": ["terminal"]},
             "document": {"review_document_bytes": 1},
@@ -234,18 +238,44 @@ class GrokQuota402Tests(unittest.TestCase):
                 )
 
     def test_duplicate_json_member_is_never_accepted_as_quota_proof(self):
-        raw = payload().replace(
-            '{"type":"error","message":',
-            '{"type":"error","type":"available_commands","message":',
-        )
-        with tempfile.TemporaryDirectory() as temp:
-            jobs = Path(temp) / "jobs"
-            jobs.mkdir(mode=0o700)
-            failed = make_grok_job(jobs, "a00000000402", created=1787000100, failed=True)
-            amend_private_receipt(failed, raw=raw)
-            make_grok_job(jobs, "b00000000402", created=1787000200)
-            result = reconcile(jobs)
-            self.assertEqual(result["status"], "blocked")
+        original = payload()
+        # These duplicate members MUST parse as the accepted quota stream under
+        # last-member-wins json.loads. The security test would fail if the
+        # duplicate-rejection hook were ever removed.
+        variants = {
+            "error_type": original.replace(
+                '{"type":"error","message":',
+                '{"type":"text","type":"error","message":',
+            ),
+            "command_tools": original.replace(
+                '"tools":[]', '"tools":["terminal"],"tools":[]', 1,
+            ),
+            "command_list": original.replace(
+                '"commands":', '"commands":["untrusted"],"commands":', 1,
+            ),
+        }
+        accepted_without_duplicate_protection = [
+            json.loads(line) for line in original.splitlines()
+        ]
+        for name, raw in variants.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temp:
+                self.assertNotEqual(raw, original)
+                self.assertEqual(
+                    [json.loads(line) for line in raw.splitlines()],
+                    accepted_without_duplicate_protection,
+                    "The negative test must distinguish duplicate-key rejection",
+                )
+                jobs = Path(temp) / "jobs"
+                jobs.mkdir(mode=0o700)
+                failed = make_grok_job(jobs, "a00000000402", created=1787000100, failed=True)
+                amend_private_receipt(failed, raw=raw)
+                make_grok_job(jobs, "b00000000402", created=1787000200)
+                result = reconcile(jobs)
+                self.assertEqual(result["status"], "blocked", name)
+                self.assertIn(
+                    "decision_review_result_invalid:grabowski-job-a00000000402:InvalidReviewDocument",
+                    result["errors"], name,
+                )
 
     def test_wrong_provider_family_is_not_recognized_as_grok_quota(self):
         with tempfile.TemporaryDirectory() as temp:
