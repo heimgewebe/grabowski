@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import select
+import sqlite3
 import stat
 import subprocess
 import time
@@ -3349,41 +3350,109 @@ def _group_evidence_fields(
 @contextmanager
 def _native_owner_inventory_pagination_guard(
     inventory_fn: Callable[..., Any],
-) -> Iterator[None]:
-    """Fence native cross-connection pages against concurrent SQLite commits."""
+) -> Iterator[Callable[..., Any]]:
+    """Read native owner pages from one inode-bound connection; deny live changes."""
     if inventory_fn is not resources.list_resources:
-        # Explicit injected inventories are owned by their test/caller contract.
-        yield
+        # Test-injected inventories retain their caller-defined semantics.
+        yield inventory_fn
         return
-    before = os.stat(resources.RESOURCE_DB, follow_symlinks=False)
-    with closing(resources._connect_existing_resource_database()) as observer:
-        opened = os.stat(resources.RESOURCE_DB, follow_symlinks=False)
-        before_identity = (before.st_dev, before.st_ino)
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(resources.RESOURCE_DB, flags)
+    try:
+        pinned = os.fstat(descriptor)
+        identity = (pinned.st_dev, pinned.st_ino)
         if (
-            before_identity != (opened.st_dev, opened.st_ino)
-            or not stat.S_ISREG(opened.st_mode)
+            not stat.S_ISREG(pinned.st_mode)
+            or pinned.st_uid != os.geteuid()
+            or pinned.st_nlink != 1
+            or pinned.st_mode & 0o022
         ):
-            raise LeaseAcquisitionOutcomeUnknown(
-                "lease inventory source changed before pagination"
-            )
-        version = observer.execute("PRAGMA data_version").fetchone()
-        if version is None or type(version[0]) is not int:
-            raise LeaseAcquisitionOutcomeUnknown(
-                "lease inventory revision cannot be established"
-            )
-        yield
-        after_version = observer.execute("PRAGMA data_version").fetchone()
-        after = os.stat(resources.RESOURCE_DB, follow_symlinks=False)
-        if (
-            after_version is None
-            or type(after_version[0]) is not int
-            or after_version[0] != version[0]
-            or (after.st_dev, after.st_ino) != before_identity
-            or not stat.S_ISREG(after.st_mode)
-        ):
-            raise LeaseAcquisitionOutcomeUnknown(
-                "lease inventory changed during pagination"
-            )
+            raise LeaseAcquisitionOutcomeUnknown("lease inventory source is unsafe")
+
+        def verify_source() -> None:
+            observed = os.stat(resources.RESOURCE_DB, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(observed.st_mode)
+                or (observed.st_dev, observed.st_ino) != identity
+            ):
+                raise LeaseAcquisitionOutcomeUnknown(
+                    "lease inventory source changed during pagination"
+                )
+
+        verify_source()
+        # SQLite resolves the proc-fd URI to the file held by our descriptor;
+        # a path rename cannot redirect this reader to a replacement store.
+        uri = f"file:/proc/self/fd/{descriptor}?mode=ro"
+        with closing(sqlite3.connect(uri, uri=True, timeout=10, isolation_level=None)) as observer:
+            observer.row_factory = sqlite3.Row
+            observer.execute("PRAGMA query_only=ON")
+            observer.execute("PRAGMA trusted_schema=OFF")
+            attached = observer.execute("PRAGMA database_list").fetchall()
+            if len(attached) != 1 or attached[0][1] != "main":
+                raise LeaseAcquisitionOutcomeUnknown(
+                    "lease inventory opened SQLite source is ambiguous"
+                )
+            opened = os.stat(attached[0][2], follow_symlinks=False)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or (opened.st_dev, opened.st_ino) != identity
+            ):
+                raise LeaseAcquisitionOutcomeUnknown(
+                    "lease inventory opened SQLite source identity differs"
+                )
+            verify_source()
+            original_version = observer.execute("PRAGMA data_version").fetchone()
+            if original_version is None or type(original_version[0]) is not int:
+                raise LeaseAcquisitionOutcomeUnknown(
+                    "lease inventory revision cannot be established"
+                )
+
+            def pinned_page(
+                *, owner_id: str, include_expired: bool, limit: int,
+                start_after_key: str | None = None,
+            ) -> list[dict[str, Any]]:
+                if (
+                    include_expired is not False
+                    or type(limit) is not int
+                    or not 1 <= limit <= MAX_OWNER_LEASE_LIST_PAGE
+                    or (start_after_key is not None and (
+                        not isinstance(start_after_key, str)
+                        or not start_after_key
+                        or "\x00" in start_after_key
+                        or len(start_after_key.encode("utf-8")) > 8192
+                    ))
+                ):
+                    raise LeaseAcquisitionOutcomeUnknown(
+                        "lease inventory page contract is invalid"
+                    )
+                args: list[Any] = [resources._owner(owner_id), resources._now()]
+                where = (
+                    "owner_id=? AND typeof(expires_at_unix)='integer' "
+                    "AND expires_at_unix>?"
+                )
+                if start_after_key is not None:
+                    where += " AND resource_key>?"
+                    args.append(start_after_key)
+                args.append(limit)
+                rows = observer.execute(
+                    f"SELECT * FROM leases WHERE {where} ORDER BY resource_key LIMIT ?",
+                    args,
+                ).fetchall()
+                return [resources._public(row) for row in rows]
+
+            yield pinned_page
+            updated_version = observer.execute("PRAGMA data_version").fetchone()
+            verify_source()
+            if (
+                updated_version is None
+                or type(updated_version[0]) is not int
+                or updated_version[0] != original_version[0]
+            ):
+                raise LeaseAcquisitionOutcomeUnknown(
+                    "lease inventory changed during pagination"
+                )
+    finally:
+        os.close(descriptor)
 
 
 def _verify_multibatch_live_lease_generations(
@@ -3401,7 +3470,7 @@ def _verify_multibatch_live_lease_generations(
             expected[key] = snapshot
     if sorted(expected) != required_keys:
         raise LeaseAcquisitionOutcomeUnknown("multi-batch lease receipts are incomplete")
-    with _native_owner_inventory_pagination_guard(inventory_fn):
+    with _native_owner_inventory_pagination_guard(inventory_fn) as read_page:
         observed: dict[str, dict[str, Any]] = {}
         start_after_key: str | None = None
         while True:
@@ -3414,7 +3483,7 @@ def _verify_multibatch_live_lease_generations(
             }
             if start_after_key is not None:
                 kwargs["start_after_key"] = start_after_key
-            page = inventory_fn(**kwargs)
+            page = read_page(**kwargs)
             if not isinstance(page, list) or len(page) > limit:
                 raise LeaseAcquisitionOutcomeUnknown("live owner lease page is invalid")
             if remaining == 0:
