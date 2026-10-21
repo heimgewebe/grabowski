@@ -90,7 +90,7 @@ class SubscriptionAwareRoutingTests(unittest.TestCase):
             "quality_and_task_fit_within_remaining_subscription_baselines",
         )
 
-    def test_live_verified_models_replace_stale_generation_defaults(self) -> None:
+    def test_live_verified_and_retired_model_availability_is_explicit(self) -> None:
         models = self.catalog["models"]
         self.assertEqual(models["claude-opus-5"]["availability"], "live-verified-via-claude-pro")
         self.assertEqual(
@@ -98,10 +98,10 @@ class SubscriptionAwareRoutingTests(unittest.TestCase):
             "live-verified-via-claude-pro",
         )
         self.assertEqual(models["claude-sonnet-5"]["availability"], "live-verified-via-claude-pro")
-        self.assertEqual(models["gemini-3.1-pro"]["availability"], "live-verified-via-google-ai")
+        self.assertEqual(models["gemini-3.1-pro"]["availability"], "route-stale-disabled")
         self.assertEqual(models["gpt-5.6-sol"]["availability"], "live-verified-via-chatgpt-pro")
         self.assertEqual(models["grok-4.6"]["availability"], "live-verified-via-supergrok")
-        self.assertEqual(models["gemini-3.6-flash"]["availability"], "live-listed")
+        self.assertEqual(models["gemini-3.6-flash"]["availability"], "route-stale-disabled")
         self.assertEqual(models["claude-opus-4.8"]["availability"], "compatibility-only-superseded")
 
     def test_astra_is_attested_frontier_contrast_without_promotion(self) -> None:
@@ -194,6 +194,18 @@ class SubscriptionAwareRoutingTests(unittest.TestCase):
                 self.assertEqual("google-gemini-pro", route["independence_group"])
                 self.assertIn("never silently downgrade", route["disabled_reason"])
 
+    def test_retired_gemini_flash_routes_are_disabled_without_model_alias_substitution(self) -> None:
+        for suffix in ("low", "medium", "high"):
+            route = self.routes["antigravity-gemini-flash-" + suffix]
+            with self.subTest(suffix=suffix):
+                self.assertFalse(route["enabled"])
+                self.assertEqual(route["harness"], "antigravity")
+                self.assertEqual(route["model"], "gemini-3.6-flash")
+                self.assertEqual(route["argv_prefix"], ["agy", "--model", "gemini-3.6-flash-" + suffix])
+                self.assertEqual(route["independence_group"], "google-gemini-flash")
+                self.assertIn("never silently downgrade", route["disabled_reason"])
+                self.assertIn("unauthenticated", route["disabled_reason"])
+
     def test_opus_has_separate_escalation_writer_and_review_route(self) -> None:
         writer = self.routes["claude-opus-5.5-writer-high"]
         reviewer = self.routes["claude-opus-5.5-high"]
@@ -227,6 +239,9 @@ class SubscriptionAwareRoutingTests(unittest.TestCase):
         self.assertEqual(frontier["top_contrast_routes"], ["codex-sol-high"])
         self.assertIn("codex-astra-review-high", frontier["upper_review_or_contrast_routes"])
         self.assertNotIn("claude-opus-5.5-writer-high", frontier["upper_review_or_contrast_routes"])
+        self.assertNotIn("antigravity-gemini-pro-review-high", frontier["upper_review_or_contrast_routes"])
+        for review_id in frontier["upper_review_or_contrast_routes"]:
+            self.assertTrue(self.routes[review_id]["enabled"], review_id)
         grok_writer = self.routes["grok-4.6-high"]
         grok_reviewer = self.routes["grok-4.6-review-high"]
         self.assertTrue(grok_writer["enabled"])

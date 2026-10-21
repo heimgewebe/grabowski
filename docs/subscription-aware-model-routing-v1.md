@@ -39,7 +39,7 @@ The live harness probes supersede stale catalog generations:
 - Claude alias `opus` resolves to Claude Opus 5.5.
 - Claude alias `sonnet` resolves to Claude Sonnet 5.
 - Fable 5 returns `usage-credits-required`; it is not part of the Claude Pro baseline.
-- Historical Antigravity observations reported Gemini 3.1 Pro and Gemini 3.6 Flash. The 2026-10-21 local CLI inventory instead lists Gemini 3.8 Flash low/medium/high, but its unauthenticated readback cannot establish availability for execution; Gemini 3.1 Pro low/high were not listed and their routes are disabled.
+- Historical Antigravity observations reported Gemini 3.1 Pro and Gemini 3.6 Flash. The 2026-10-21 installed CLI 1.4.4 lists Gemini 3.8 Flash low/medium/high instead; exact Gemini 3.1 Pro low/high and Gemini 3.6 Flash low/medium/high model identifiers are absent. All corresponding routes are therefore disabled, with their original identities retained. This unauthenticated local inventory does not establish available remote inference, quota or model-quality equivalence; no automatic rebind to Gemini 3.8 Flash or another provider is authorized.
 - Codex resolves its current high-end subscription route to GPT-5.6 Sol.
 - The authenticated Grok CLI model listing exposes `grok-4.6` for the SuperGrok account.
 

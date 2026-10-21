@@ -1010,10 +1010,14 @@ class CodingAgentRouterTests(unittest.TestCase):
         self.assertEqual(codex["harness"], "codex")
         self.assertEqual(codex["argv_prefix"], ["codex", "--model", "gpt-5.6-sol", "-c", 'model_reasoning_effort="high"'])
         self.assertFalse(codex["paid_only"])
-        antigravity = router.contrast_route_execution_contract("antigravity-gemini-flash-medium")
+        antigravity = router.contrast_route_execution_contract("antigravity-claude-sonnet-thinking")
         self.assertEqual(antigravity["harness"], "antigravity")
         self.assertEqual(antigravity["argv_prefix"][:2], ["agy", "--model"])
         self.assertFalse(antigravity["paid_only"])
+        # A formerly configured Gemini 3.6 Flash route is not executable just
+        # because Antigravity lists a newer, unauthenticated 3.8 identity.
+        with self.assertRaisesRegex(router.CodingAgentRouterError, "enabled contrast route"):
+            router.contrast_route_execution_contract("antigravity-gemini-flash-medium")
         self.assertEqual(
             codex["route_contract_sha256"],
             router._canonical_sha256(
@@ -1923,7 +1927,7 @@ class CodingAgentRouterTests(unittest.TestCase):
             "antigravity-gemini-flash-low",
         ):
             self.assertIn(
-                "task class is outside route affinity",
+                "disabled or controller route",
                 result["excluded"]["reviewer:" + route_id],
             )
         self.assertIn("reviewer:claude-opus-5.5-high", result["excluded"])

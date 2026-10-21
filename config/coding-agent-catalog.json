@@ -269,9 +269,9 @@
       }
     },
     "gemini-3.1-pro": {
-      "availability": "live-verified-via-google-ai",
+      "availability": "route-stale-disabled",
       "base_quality_rank": 76,
-      "evidence": "antigravity-gemini-3.1-pro-high-smoke-2026-07-29",
+      "evidence": "historical-antigravity-gemini-3.1-pro-high-smoke-2026-07-29; exact Pro route IDs absent from agy-1.4.4 models on 2026-10-21",
       "family": "google-gemini-pro",
       "identity_kind": "model",
       "name": "Gemini 3.1 Pro",
@@ -651,9 +651,9 @@
       "alias_resolution_observed_at": "2026-09-29T14:47:00Z"
     },
     "gemini-3.6-flash": {
-      "availability": "live-listed",
+      "availability": "route-stale-disabled",
       "base_quality_rank": 67,
-      "evidence": "antigravity-model-list-1.1.8-2026-07-29",
+      "evidence": "historical-antigravity-model-list-1.1.8-2026-07-29; exact gemini-3.6-flash route IDs absent from agy-1.4.4 models on 2026-10-21",
       "family": "google-gemini-flash",
       "identity_kind": "model",
       "name": "Gemini 3.6 Flash",
@@ -812,8 +812,7 @@
         "claude-opus-5.5-high",
         "codex-terra-high",
         "claude-sonnet-5-high",
-        "grok-4.6-review-high",
-        "antigravity-gemini-pro-review-high"
+        "grok-4.6-review-high"
       ],
       "paid_contrast_routes": [
         "claude-fable-5-contrast-high"
@@ -2155,8 +2154,9 @@
       "burn_weight": 0.4,
       "contrast_only": true,
       "delegation_overhead_minutes": 4,
+      "disabled_reason": "Installed Antigravity CLI 1.4.4 'agy models' on 2026-10-21 does not list exact gemini-3.6-flash-low; it lists gemini-3.8-flash variants instead. Probe reports unauthenticated session, so no execution entitlement or safe quality-equivalent substitution is claimed. Keep this historical Gemini 3.6 Flash route disabled until exact model identity, authentication and provider-quality verification; never silently downgrade or substitute another model/provider.",
       "effort": "low",
-      "enabled": true,
+      "enabled": false,
       "harness": "antigravity",
       "harness_quality": 6,
       "id": "antigravity-gemini-flash-low",
@@ -2187,8 +2187,9 @@
       "burn_weight": 0.8,
       "contrast_only": true,
       "delegation_overhead_minutes": 4,
+      "disabled_reason": "Installed Antigravity CLI 1.4.4 'agy models' on 2026-10-21 does not list exact gemini-3.6-flash-medium; it lists gemini-3.8-flash variants instead. Probe reports unauthenticated session, so no execution entitlement or safe quality-equivalent substitution is claimed. Keep this historical Gemini 3.6 Flash route disabled until exact model identity, authentication and provider-quality verification; never silently downgrade or substitute another model/provider.",
       "effort": "medium",
-      "enabled": true,
+      "enabled": false,
       "harness": "antigravity",
       "harness_quality": 6,
       "id": "antigravity-gemini-flash-medium",
@@ -2220,8 +2221,9 @@
       "burn_weight": 1.2,
       "contrast_only": true,
       "delegation_overhead_minutes": 4,
+      "disabled_reason": "Installed Antigravity CLI 1.4.4 'agy models' on 2026-10-21 does not list exact gemini-3.6-flash-high; it lists gemini-3.8-flash variants instead. Probe reports unauthenticated session, so no execution entitlement or safe quality-equivalent substitution is claimed. Keep this historical Gemini 3.6 Flash route disabled until exact model identity, authentication and provider-quality verification; never silently downgrade or substitute another model/provider.",
       "effort": "high",
-      "enabled": true,
+      "enabled": false,
       "harness": "antigravity",
       "harness_quality": 6,
       "id": "antigravity-gemini-flash-high",
