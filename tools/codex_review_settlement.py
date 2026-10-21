@@ -799,17 +799,24 @@ def _live_state(repo: Path, repository: str, pr_number: int) -> dict[str, Any]:
         # Local Git authenticates the complete changed-path set but not the
         # pairing of REST rename/copy origins with their destinations. Two
         # renames can swap previousPath while preserving the same path set.
-        # With an oversized GitHub diff there is no immutable compare pairing:
-        # do not promote mutable REST provenance into a review decision.
+        # Do not promote mutable REST rename/copy provenance into a decision.
+        # Even a benign-looking REST status cannot establish the origin pair.
         if any(item.get("status") in {"renamed", "copied"} for item in rest_files):
             raise SettlementError(
                 "oversized PR diff rename/copy provenance is not authenticated"
             )
+        # HTTP 406 affects the mutable raw PR diff, not necessarily the
+        # commit-pinned Compare file inventory. A->B->A can make REST claim
+        # "added"/"modified" while the exact SHA pair still contains a rename
+        # or copy from a high-critical trust path. Use only that immutable
+        # pairing as the fallback's review and local-Git binding authority.
+        # Missing/truncated Compare evidence must fail closed.
+        pinned_files = _revision_bound_rename_files(repo, repository, pull_request)
         view = {
             "headRefOid": pull_request["headRefOid"],
             "baseRefOid": pull_request["baseRefOid"],
             "pullFilesEvidenceComplete": True,
-            "files": rest_files,
+            "files": pinned_files,
         }
         try:
             local_diff = pr_review_gate._local_bound_pr_diff_bytes(repo, view)
@@ -828,10 +835,10 @@ def _live_state(repo: Path, repository: str, pr_number: int) -> dict[str, Any]:
         ):
             raise SettlementError("PR head, base or file count drifted during local diff readback")
         pull_request["diff_sha256"] = pr_review_gate.github_pr_diff_identity_sha256(local_diff)
-        # The existing exact-Git-object fallback has already reconciled
-        # complete REST file evidence with the immutable raw local diff.
+        # The exact local diff is bound to complete revision-pinned origin
+        # evidence, not the mutable REST statuses used for count/path comparison.
         pull_request["files"] = {
-            "nodes": rest_files, "pageInfo": {"hasNextPage": False}
+            "nodes": pinned_files, "pageInfo": {"hasNextPage": False}
         }
         oversized_diff_bound = True
     else:
