@@ -1333,15 +1333,27 @@ def _proven_grok_quota_failure_before_review(
         ]
     except (ValueError, UnicodeError):
         return False
-    commands = [
+    six_commands = [
         "compact", "always-approve", "context",
         "session-info", "feedback", "goal",
     ]
-    return events == [
-        {"type": "available_commands", "tools": [], "commands": commands},
-        {"type": "available_commands", "tools": [], "commands": commands},
-        {"type": "error", "message": wrapped},
-    ]
+    # Both complete CLI command catalogs have been observed in genuine,
+    # origin-bound pre-result 402 streams. Never accept an arbitrary subset
+    # or a mixed preflight: either full order is required in both events.
+    known_commands = (
+        six_commands,
+        [*six_commands[:2], "memory", *six_commands[2:]],
+    )
+    return (
+        events[2] == {"type": "error", "message": wrapped}
+        and any(
+            events[:2] == [
+                {"type": "available_commands", "tools": [], "commands": commands},
+                {"type": "available_commands", "tools": [], "commands": commands},
+            ]
+            for commands in known_commands
+        )
+    )
 
 
 def _validated_review_role_evidence(
