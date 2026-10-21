@@ -75,6 +75,18 @@ LEGACY_SELF_DEPLOY_REASON = (
 )
 
 
+def _protected_job_retention_authority() -> bool:
+    """No protected root/index transaction exists for automatic job effects.
+
+    Same-UID owner/mode checks and in-process FD pins cannot authenticate an
+    already replaced jobs/archive root or serialize an index reservation with
+    an archive rename. Until a separately privileged implementation exists,
+    automatic job moves and systemd job resets must remain disabled.
+    This is not a runtime configuration switch or a security attestation.
+    """
+    return False
+
+
 def _canonical_json(value: Any) -> bytes:
     return json.dumps(
         value,
@@ -1373,7 +1385,12 @@ def build_plan(
     )
     archive_candidates: list[dict[str, Any]] = []
     archive_blocked_units: set[str] = set()
+    authorized_job_effects = _protected_job_retention_authority()
     for record in eligible:
+        if not authorized_job_effects:
+            archive_blocked_units.add(record["unit"])
+            block(record["unit"], "automatic job archive requires protected root/index authority")
+            continue
         if missing_deploy_index:
             archive_blocked_units.add(record["unit"])
             block(record["unit"], "canonical deployment index absent; explicit recovery required")
@@ -1435,6 +1452,9 @@ def build_plan(
     worker_reset_evidence: list[dict[str, Any]] = []
     for unit in failed:
         if JOB_UNIT.fullmatch(unit):
+            if not authorized_job_effects:
+                block(unit, "automatic job reset requires protected root/index authority")
+                continue
             if missing_deploy_index:
                 block(unit, "canonical deployment index absent; explicit recovery required")
                 continue
@@ -2967,6 +2987,15 @@ def _archive_read_deploy_index_pinned(
 
 def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, Any]:
     plan = _validated_plan(plan, expected_plan_sha256)
+    # Enforce at the effect boundary as well as at planning: a synthesized
+    # or previously captured plan must never authorize a job move/reset.
+    if (
+        plan["archive_jobs"]
+        or any(JOB_UNIT.fullmatch(unit) for unit in plan["reset_failed_units"])
+    ) and not _protected_job_retention_authority():
+        raise RuntimeError(
+            "automatic job archive/reset requires protected root/index authority"
+        )
     source = str(SRC)
     if source not in sys.path:
         sys.path.insert(0, source)
