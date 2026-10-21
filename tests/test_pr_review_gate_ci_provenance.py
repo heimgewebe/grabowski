@@ -81,6 +81,17 @@ class ReviewEvidenceProvenanceTests(unittest.TestCase):
         self._generate_key(self.other_key)
         self._write_allowed(self.allowed, self.key)
         self._write_allowed(self.other_allowed, self.other_key)
+        # Older attestation fixtures inject REST metadata; make their immutable
+        # comparison witness match explicitly. Dedicated adversarial tests in
+        # test_pr_review_gate_ci exercise the actual SHA-pinned Compare call.
+        self._pinned_fixture = mock.patch.object(
+            ci, "_revision_bound_pr_file_evidence",
+            side_effect=lambda repo_name, pr: ci.gate._load_pull_file_evidence(
+                Path.cwd(), repo_slug=repo_name, pr=pr["number"]
+            ),
+        )
+        self._pinned_fixture.start()
+        self.addCleanup(self._pinned_fixture.stop)
 
     def tearDown(self) -> None:
         self.tempdir.cleanup()
@@ -208,6 +219,10 @@ class ReviewEvidenceProvenanceTests(unittest.TestCase):
                 side_effect=[ci.COMMENT_STATE_CURRENT, ci.COMMENT_STATE_CURRENT],
             ),
             mock.patch.object(ci, "current_diff_sha256s", return_value=("b" * 64,)),
+            mock.patch.object(
+                ci.gate, "_load_pull_file_evidence",
+                return_value=[{"path": "src/example.py", "status": "modified"}],
+            ),
             mock.patch.object(ci, "publish_commit_status") as publish,
         ):
             result = ci.evaluate_comment_command(args)
@@ -248,6 +263,10 @@ class ReviewEvidenceProvenanceTests(unittest.TestCase):
                 side_effect=[ci.COMMENT_STATE_CURRENT, ci.COMMENT_STATE_CURRENT],
             ),
             mock.patch.object(ci, "current_diff_sha256s", return_value=("b" * 64,)),
+            mock.patch.object(
+                ci.gate, "_load_pull_file_evidence",
+                return_value=[{"path": "src/example.py", "status": "modified"}],
+            ),
             mock.patch.object(ci, "publish_commit_status") as publish,
         ):
             result = ci.evaluate_comment_command(args)
@@ -294,6 +313,10 @@ class ReviewEvidenceProvenanceTests(unittest.TestCase):
                 side_effect=[ci.COMMENT_STATE_CURRENT, ci.COMMENT_STATE_CURRENT],
             ),
             mock.patch.object(ci, "current_diff_sha256s", return_value=("b" * 64,)),
+            mock.patch.object(
+                ci.gate, "_load_pull_file_evidence",
+                return_value=[{"path": "src/example.py", "status": "modified"}],
+            ),
             mock.patch.object(ci, "publish_commit_status") as publish,
         ):
             result = ci.evaluate_comment_command(args)
