@@ -400,6 +400,7 @@ class RecoveryToolTests(unittest.TestCase):
                 restic_env={},
                 durability=durability,
                 log_path=Path("/tmp/recovery.log"),
+                snapshot_fundus_source=str(recovery.operator.HOME / ".local/share/schauwerk/fundus"),
             )
         self.assertEqual(result["inventory_sha256"], inventory_sha256)
         self.assertEqual(result["file_count"], 1)
@@ -552,6 +553,7 @@ class RecoveryToolTests(unittest.TestCase):
             "hostname": "heim-pc",
             "tags": ["daily"],
             "paths": [],
+            "fundus_source_path": str(recovery.operator.HOME / ".local/share/schauwerk/fundus"),
             "time": "1970-01-01T00:03:00+00:00",
             "time_unix": 180,
         }
