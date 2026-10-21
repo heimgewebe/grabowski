@@ -505,6 +505,78 @@ else:
         self.assertFalse(spark["paid_fallback_authorized"])
         self.assertEqual(0, spark["model_invocations"])
 
+    def test_codex_main_quota_survives_absent_spark_and_banked_reset(self) -> None:
+        # Live Prolite metadata can show the main Codex pool, no Spark, and
+        # an optional banked weekly reset. Observing it never redeems a reset.
+        model_result, rate_result = self.direct_codex_results()
+        model_result["data"] = []
+        rate_result["rateLimitsByLimitId"].pop(SCHEDULER.CODEX_SPARK_LIMIT_ID)
+        main = rate_result["rateLimitsByLimitId"]["codex"]
+        main["primary"]["usedPercent"] = 37
+        main["primary"]["resetsAt"] = int(
+            (datetime.now(timezone.utc) + timedelta(days=5)).timestamp()
+        )
+        main["rateLimitReachedType"] = None
+        rate_result["rateLimitResetCredits"]["availableCount"] = 1
+
+        direct = SCHEDULER.parse_codex_app_server_observations(
+            model_result, rate_result
+        )
+        primary = direct[SCHEDULER.CODEX_QUOTA_POOL]
+        self.assertEqual("available", primary["status"])
+        self.assertAlmostEqual(0.63, primary["remaining_ratio"])
+        self.assertEqual("prolite", primary["plan_type"])
+        self.assertFalse(primary["paid_fallback_authorized"])
+        self.assertEqual(0, primary["model_invocations"])
+        self.assertEqual(1, rate_result["rateLimitResetCredits"]["availableCount"])
+        spark = direct[SCHEDULER.CODEX_SPARK_QUOTA_POOL]
+        self.assertEqual("unknown", spark["status"])
+        self.assertEqual("spark_model_not_listed", spark["reason"])
+        self.assertNotIn("remaining_ratio", spark)
+        self.assertFalse(spark["paid_fallback_authorized"])
+
+        self.write_router(spark_configured=True)
+        with mock.patch.object(
+            SCHEDULER, "collect_codex_app_server_observations", return_value=direct
+        ):
+            result = SCHEDULER.main(self.arguments())
+        self.assertEqual(0, result)
+        after = json.loads(self.state.read_text(encoding="utf-8"))
+        receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
+        self.assertEqual(
+            "available", after["pools"][SCHEDULER.CODEX_QUOTA_POOL]["status"]
+        )
+        self.assertAlmostEqual(
+            0.63, after["pools"][SCHEDULER.CODEX_QUOTA_POOL]["remaining_ratio"]
+        )
+        self.assertEqual(
+            "unknown", after["pools"][SCHEDULER.CODEX_SPARK_QUOTA_POOL]["status"]
+        )
+        self.assertEqual(0, receipt["model_invocations"])
+        self.assertEqual(0, receipt["paid_api_requests_authorized"])
+        self.assertEqual(1, rate_result["rateLimitResetCredits"]["availableCount"])
+
+    def test_codex_main_quota_denies_inconsistent_spark_and_paid_credits(self) -> None:
+        for missing in ("model", "rate_limit"):
+            with self.subTest(missing=missing):
+                model_result, rate_result = self.direct_codex_results()
+                if missing == "model":
+                    model_result["data"] = []
+                else:
+                    rate_result["rateLimitsByLimitId"].pop(
+                        SCHEDULER.CODEX_SPARK_LIMIT_ID
+                    )
+                with self.assertRaises(SCHEDULER.ProbeSchedulerError):
+                    SCHEDULER.parse_codex_app_server_observations(
+                        model_result, rate_result
+                    )
+        model_result, rate_result = self.direct_codex_results()
+        model_result["data"] = []
+        rate_result["rateLimitsByLimitId"].pop(SCHEDULER.CODEX_SPARK_LIMIT_ID)
+        rate_result["rateLimitsByLimitId"]["codex"]["credits"]["hasCredits"] = True
+        with self.assertRaisesRegex(SCHEDULER.ProbeSchedulerError, "purchased-credit"):
+            SCHEDULER.parse_codex_app_server_observations(model_result, rate_result)
+
     def test_codex_app_server_parser_uses_most_restrictive_provider_window(self) -> None:
         model_result, rate_result = self.direct_codex_results()
         main = rate_result["rateLimitsByLimitId"]["codex"]
@@ -622,10 +694,11 @@ for line in sys.stdin:
             "planType"
         ] = "enterprise"
         cases.append((model_result, mismatched_plan))
-        model_result, rate_result = self.direct_codex_results()
-        reset_credits = json.loads(json.dumps(rate_result))
-        reset_credits["rateLimitResetCredits"]["availableCount"] = 1
-        cases.append((model_result, reset_credits))
+        for count in (-1, True, None):
+            model_result, rate_result = self.direct_codex_results()
+            reset_credits = json.loads(json.dumps(rate_result))
+            reset_credits["rateLimitResetCredits"]["availableCount"] = count
+            cases.append((model_result, reset_credits))
         for candidate_model, candidate_rate in cases:
             with self.subTest(candidate_rate=candidate_rate):
                 with self.assertRaises(SCHEDULER.ProbeSchedulerError):
