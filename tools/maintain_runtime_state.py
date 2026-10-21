@@ -197,7 +197,9 @@ def _failed_units() -> list[str]:
     units = []
     for line in result.stdout.splitlines():
         fields = line.split()
-        if fields:
+        if fields and fields[0] != "grabowski-runtime-retention.service":
+            # A degraded periodic run deliberately exits nonzero; its own
+            # service must not enter the job/task/worker reset inventory.
             units.append(fields[0])
     if len(units) > MAX_FAILED_UNITS:
         raise RuntimeError("failed-unit inventory exceeds the bounded scan")
@@ -2046,6 +2048,9 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
             "reset_failures": reset_failures,
             "worker_reset_evidence": plan.get("worker_reset_evidence", []),
             "archived_jobs": archived,
+            "mutated": bool(
+                archived or any(result["returncode"] == 0 for result in reset_results)
+            ),
             "preserved_blocked_units": plan.get("blocked", []),
             "status": (
                 "degraded" if plan.get("blocked") or failed_resets or reset_failures
@@ -2231,10 +2236,12 @@ def _apply_periodic_worktree_hygiene(
         remaining -= actions
         receipts.append(receipt)
 
+    blocked_hygiene = any(receipt["status"] == "blocked" for receipt in receipts)
     return {
         "schema_version": 1,
         "operation": "grabowski-worktree-hygiene-periodic",
-        "completed": True,
+        "completed": not blocked_hygiene,
+        "status": "degraded" if blocked_hygiene else "passed",
         "mutated": action_count > 0,
         "actions": action_count,
         "maximum_actions": max_actions,
@@ -2417,7 +2424,10 @@ def main() -> int:
                     receipt, ensure_ascii=False, sort_keys=True, indent=2
                 )
             )
-            return 0
+            # The JSON remains machine-readable, and exit-code/systemd health
+            # cannot report success while any evidence remains blocked.
+            healthy = receipt.get("status") == "passed" and receipt.get("completed") is True
+            return 0 if healthy else 2
         if args.worktree_hygiene_repo or args.worktree_hygiene_allowed_root:
             raise ValueError(
                 "worktree hygiene arguments require --periodic-apply"

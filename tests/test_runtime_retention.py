@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+import io
 import hashlib
 import importlib.util
 import json
@@ -1022,6 +1023,7 @@ class RuntimeRetentionTests(unittest.TestCase):
                 )
             self.assertTrue(receipt["completed"])
             self.assertEqual(receipt["status"], "degraded")
+            self.assertTrue(receipt["mutated"])
             self.assertEqual(receipt["preserved_blocked_units"], plan["blocked"])
             self.assertEqual(
                 [item["unit"] for item in receipt["archived_jobs"]],
@@ -1037,6 +1039,22 @@ class RuntimeRetentionTests(unittest.TestCase):
                 "systemctl", "--user", "reset-failed", safe + ".service"
             ])
             self.assertEqual(len(audit_records), 2)
+            # Composite projection must reflect the real, already hash-bound
+            # apply receipt rather than a mock inventing mutated=True.
+            with patch.object(
+                RETENTION, "build_plan", side_effect=[plan, plan]
+            ), patch.object(
+                RETENTION, "apply_plan", return_value=receipt
+            ), patch.object(
+                RETENTION, "_apply_periodic_worktree_hygiene",
+                return_value={"completed": True, "mutated": False},
+            ):
+                composite = RETENTION.apply_periodic_plan(
+                    worktree_hygiene_repositories=["/unused"]
+                )
+            self.assertTrue(composite["mutated"])
+            self.assertEqual(composite["status"], "degraded")
+            self.assertEqual(composite["preserved_blocked_units"], plan["blocked"])
 
     def test_oversized_job_registry_keeps_task_reset_planning_available(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1871,6 +1889,38 @@ class RuntimeRetentionTests(unittest.TestCase):
         self.assertFalse(result["completed"])
         self.assertTrue(result["mutated"])
 
+    def test_periodic_cli_reports_degraded_as_nonzero_exit(self) -> None:
+        for status, completed, mutated, expected_exit in (
+            ("passed", True, False, 0),
+            ("degraded", False, False, 2),
+            ("degraded", True, True, 2),
+        ):
+            with self.subTest(status=status, completed=completed, mutated=mutated):
+                receipt = {"schema_version": 1, "status": status,
+                           "completed": completed, "mutated": mutated,
+                           "preserved_blocked_units": [] if status == "passed" else [
+                               {"unit": "grabowski-job-aaaaaaaaaaaa.service",
+                                "reason": "oversized log"}]}
+                with patch.object(
+                    RETENTION.sys, "argv", ["maintain_runtime_state", "--periodic-apply"]
+                ), patch.object(
+                    RETENTION, "apply_periodic_plan", return_value=receipt
+                ), patch.object(RETENTION.sys, "stdout", new_callable=io.StringIO) as output:
+                    returned = RETENTION.main()
+                self.assertEqual(returned, expected_exit)
+                self.assertEqual(json.loads(output.getvalue()), receipt)
+
+    def test_periodic_failed_unit_scan_excludes_own_degraded_service(self) -> None:
+        unit = "grabowski-task-" + "a" * 24 + "-a1.service"
+        listing = (
+            "grabowski-runtime-retention.service loaded failed failed\n"
+            + unit + " loaded failed failed\n"
+        )
+        with patch.object(
+            RETENTION, "_run", return_value=Mock(returncode=0, stdout=listing)
+        ):
+            self.assertEqual(RETENTION._failed_units(), [unit])
+
     def test_periodic_apply_reuses_hash_bound_apply_contract(self) -> None:
         plan = {
             "plan_sha256": "d" * 64,
@@ -1959,8 +2009,10 @@ class RuntimeRetentionTests(unittest.TestCase):
                     worktree_hygiene_allowed_roots=[str(allowed)],
                     worktree_hygiene_runner=runner,
                 )
-        self.assertTrue(result["completed"])
+        self.assertFalse(result["completed"])
         self.assertFalse(result["mutated"])
+        self.assertEqual(result["status"], "degraded")
+        self.assertFalse(result["worktree_hygiene"]["completed"])
         self.assertEqual(
             result["worktree_hygiene"]["receipts"][0]["status"],
             "blocked",
