@@ -643,6 +643,59 @@ class WorkAcquireTests(unittest.TestCase):
                 self.assertGreaterEqual(len(observed_pages), 2)
                 self.assertEqual(live[999]["resource_key"], observed_pages[1][1])
 
+    def test_multibatch_native_sqlite_rejects_cross_page_generation_replacement(self) -> None:
+        owner = "lane:" + "c" * 32
+        required = ["component:snapshot-0000", "component:snapshot-1000"]
+        keys = [f"component:snapshot-{i:04d}" for i in range(1001)]
+        with patch.object(
+            work_acquire.resources, "RESOURCE_DB",
+            self.state / "multibatch-generation-race.sqlite3",
+        ):
+            acquired = {}
+            for start in range(0, len(keys), 64):
+                rows = work_acquire.resources.acquire_resources(
+                    owner, keys[start:start + 64],
+                    purpose="native owner snapshot race regression",
+                    ttl_seconds=3600,
+                )["leases"]
+                acquired.update((item["resource_key"], item) for item in rows)
+            originals = [acquired[key] for key in required]
+            native_inventory = work_acquire.resources.list_resources
+            pages = []
+
+            def mutate_after_first_page(**kwargs):
+                page = native_inventory(**kwargs)
+                pages.append(len(page))
+                if len(pages) == 1:
+                    old = work_acquire.resources.inspect_resource(required[0])
+                    work_acquire.resources.release_resources(
+                        owner, [required[0]], expected_leases=[old],
+                    )
+                    new = work_acquire.resources.acquire_resources(
+                        owner, [required[0]],
+                        purpose="same-owner replacement with new generation",
+                        ttl_seconds=3600,
+                    )["leases"][0]
+                    self.assertNotEqual(
+                        old["metadata_sha256"], new["metadata_sha256"],
+                    )
+                return page
+
+            with patch.object(
+                work_acquire.resources, "list_resources",
+                side_effect=mutate_after_first_page,
+            ):
+                with self.assertRaisesRegex(
+                    work_acquire.LeaseAcquisitionOutcomeUnknown,
+                    "inventory changed during pagination",
+                ):
+                    work_acquire._verify_multibatch_live_lease_generations(
+                        owner_id=owner, required_keys=required,
+                        acquisitions=[{"receipt": {"leases": originals}}],
+                        inventory_fn=work_acquire.resources.list_resources,
+                    )
+            self.assertEqual([1000, 1], pages)
+
     def test_multibatch_readback_pages_after_full_8192_byte_key(self) -> None:
         owner = "lane:" + "e" * 32
         required = [f"component:required-{i:03d}" for i in range(78)]

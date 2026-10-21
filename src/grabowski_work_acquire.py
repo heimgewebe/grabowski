@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 import fcntl
 import hashlib
 import json
@@ -3346,6 +3346,46 @@ def _group_evidence_fields(
     }
 
 
+@contextmanager
+def _native_owner_inventory_pagination_guard(
+    inventory_fn: Callable[..., Any],
+) -> Iterator[None]:
+    """Fence native cross-connection pages against concurrent SQLite commits."""
+    if inventory_fn is not resources.list_resources:
+        # Explicit injected inventories are owned by their test/caller contract.
+        yield
+        return
+    before = os.stat(resources.RESOURCE_DB, follow_symlinks=False)
+    with closing(resources._connect_existing_resource_database()) as observer:
+        opened = os.stat(resources.RESOURCE_DB, follow_symlinks=False)
+        before_identity = (before.st_dev, before.st_ino)
+        if (
+            before_identity != (opened.st_dev, opened.st_ino)
+            or not stat.S_ISREG(opened.st_mode)
+        ):
+            raise LeaseAcquisitionOutcomeUnknown(
+                "lease inventory source changed before pagination"
+            )
+        version = observer.execute("PRAGMA data_version").fetchone()
+        if version is None or type(version[0]) is not int:
+            raise LeaseAcquisitionOutcomeUnknown(
+                "lease inventory revision cannot be established"
+            )
+        yield
+        after_version = observer.execute("PRAGMA data_version").fetchone()
+        after = os.stat(resources.RESOURCE_DB, follow_symlinks=False)
+        if (
+            after_version is None
+            or type(after_version[0]) is not int
+            or after_version[0] != version[0]
+            or (after.st_dev, after.st_ino) != before_identity
+            or not stat.S_ISREG(after.st_mode)
+        ):
+            raise LeaseAcquisitionOutcomeUnknown(
+                "lease inventory changed during pagination"
+            )
+
+
 def _verify_multibatch_live_lease_generations(
     *, owner_id: str, required_keys: list[str],
     acquisitions: list[dict[str, Any]], inventory_fn: Callable[..., Any],
@@ -3361,50 +3401,51 @@ def _verify_multibatch_live_lease_generations(
             expected[key] = snapshot
     if sorted(expected) != required_keys:
         raise LeaseAcquisitionOutcomeUnknown("multi-batch lease receipts are incomplete")
-    observed: dict[str, dict[str, Any]] = {}
-    start_after_key: str | None = None
-    while True:
-        remaining = MAX_TERMINAL_OWNER_OBSERVED_LEASES - len(observed)
-        # Probe one extra row at the hard owner bound: exactly 4096 valid
-        # generations are allowed, but a truncated 4097th must fail closed.
-        limit = min(MAX_OWNER_LEASE_LIST_PAGE, max(1, remaining))
-        kwargs: dict[str, Any] = {
-            "owner_id": owner_id, "include_expired": False, "limit": limit,
-        }
-        if start_after_key is not None:
-            kwargs["start_after_key"] = start_after_key
-        page = inventory_fn(**kwargs)
-        if not isinstance(page, list) or len(page) > limit:
-            raise LeaseAcquisitionOutcomeUnknown("live owner lease page is invalid")
-        if remaining == 0:
-            if page:
-                raise LeaseAcquisitionOutcomeUnknown(
-                    "live owner lease inventory exceeds bounded view"
-                )
-            break
-        page_snapshots = sorted(
-            (_lease_snapshot(row, owner_id=owner_id) for row in page),
-            key=lambda item: item["resource_key"],
-        )
-        for snapshot in page_snapshots:
-            key = snapshot["resource_key"]
-            if (start_after_key is not None and key <= start_after_key) or key in observed:
-                raise LeaseAcquisitionOutcomeUnknown(
-                    "live owner lease inventory contains duplicate or unordered keys"
-                )
-            observed[key] = snapshot
-            start_after_key = key
-        if len(page) < limit:
-            break
-    now = int(time.time())
-    for key, snapshot in expected.items():
-        if (
-            observed.get(key) != snapshot
-            or snapshot["expires_at_unix"] <= now + 30
-        ):
-            raise LeaseAcquisitionOutcomeUnknown(
-                "multi-batch lease missing, changed, or too near expiry"
+    with _native_owner_inventory_pagination_guard(inventory_fn):
+        observed: dict[str, dict[str, Any]] = {}
+        start_after_key: str | None = None
+        while True:
+            remaining = MAX_TERMINAL_OWNER_OBSERVED_LEASES - len(observed)
+            # Probe one extra row at the hard owner bound: exactly 4096 valid
+            # generations are allowed, but a truncated 4097th must fail closed.
+            limit = min(MAX_OWNER_LEASE_LIST_PAGE, max(1, remaining))
+            kwargs: dict[str, Any] = {
+                "owner_id": owner_id, "include_expired": False, "limit": limit,
+            }
+            if start_after_key is not None:
+                kwargs["start_after_key"] = start_after_key
+            page = inventory_fn(**kwargs)
+            if not isinstance(page, list) or len(page) > limit:
+                raise LeaseAcquisitionOutcomeUnknown("live owner lease page is invalid")
+            if remaining == 0:
+                if page:
+                    raise LeaseAcquisitionOutcomeUnknown(
+                        "live owner lease inventory exceeds bounded view"
+                    )
+                break
+            page_snapshots = sorted(
+                (_lease_snapshot(row, owner_id=owner_id) for row in page),
+                key=lambda item: item["resource_key"],
             )
+            for snapshot in page_snapshots:
+                key = snapshot["resource_key"]
+                if (start_after_key is not None and key <= start_after_key) or key in observed:
+                    raise LeaseAcquisitionOutcomeUnknown(
+                        "live owner lease inventory contains duplicate or unordered keys"
+                    )
+                observed[key] = snapshot
+                start_after_key = key
+            if len(page) < limit:
+                break
+        now = int(time.time())
+        for key, snapshot in expected.items():
+            if (
+                observed.get(key) != snapshot
+                or snapshot["expires_at_unix"] <= now + 30
+            ):
+                raise LeaseAcquisitionOutcomeUnknown(
+                    "multi-batch lease missing, changed, or too near expiry"
+                )
 
 
 def _definite_acquisition_failure(exc: Exception) -> bool:
