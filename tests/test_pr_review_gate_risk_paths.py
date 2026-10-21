@@ -103,6 +103,126 @@ class PrReviewGateRiskPathExpansionTests(unittest.TestCase):
                 self.assertTrue(result["review_sources"]["independent_review_required"])
                 self.assertTrue(result["complexity"]["independent_review_required"])
 
+    def test_dot_github_workflows_and_actions_require_high_critical_review(self) -> None:
+        # The real heim-pc #225 GitHub changed-file path begins with a dot.
+        # str.lstrip("./") must not strip that dot or downgrade CI authority.
+        for path in (
+            ".github/workflows/heim-pc-nix-cache-publish.yml",
+            "./.github/workflows/ci.yml",
+            ".github/actions/identity/action.yml",
+        ):
+            with self.subTest(path=path):
+                state = _state(path)
+                complexity = pr_review_gate.classify_complexity(
+                    state["pr"], None, repo_name="heimgewebe/heim-pc"
+                )
+                self.assertEqual("high_critical", complexity["review_tier"])
+                self.assertTrue(complexity["independent_review_required"])
+                self.assertGreaterEqual(complexity["minimum_self_review_iterations"], 4)
+                self.assertTrue(
+                    any("high-critical path touched" in reason
+                        for reason in complexity["high_critical_reasons"]),
+                    complexity["high_critical_reasons"],
+                )
+                self.assertEqual(
+                    "BLOCK",
+                    pr_review_gate.evaluate_review_gate(
+                        state, self_review=_self_review(path)
+                    )["verdict"],
+                    "a one-pass standard self-review cannot satisfy this gate",
+                )
+
+    def test_dot_github_lookalikes_are_not_silently_rewritten(self) -> None:
+        for path in (
+            "github/workflows/ci.yml",
+            ".githubish/workflows/ci.yml",
+            "/.github/workflows/ci.yml",
+            "../../.github/workflows/ci.yml",
+        ):
+            with self.subTest(path=path):
+                complexity = pr_review_gate.classify_complexity(
+                    _state(path)["pr"], None, repo_name="heimgewebe/heim-pc"
+                )
+                self.assertFalse(complexity["high_critical"], complexity)
+
+    def test_renamed_critical_source_paths_remain_high_critical(self) -> None:
+        # GitHub supplies both path (destination) and previousPath (source).
+        # A rename out of .github must not look like documentation-only work.
+        for previous in (
+            ".github/workflows/ci.yml",
+            ".github/actions/identity/action.yml",
+        ):
+            with self.subTest(previous=previous):
+                state = _state("docs/ci.md")
+                state["repoName"] = "heimgewebe/heim-pc"
+                state["pr"]["files"] = [
+                    {"path": "docs/ci.md", "status": "renamed", "previousPath": previous}
+                ]
+                complexity = pr_review_gate.classify_complexity(
+                    state["pr"], None, repo_name=state["repoName"]
+                )
+                self.assertEqual("high_critical", complexity["review_tier"])
+                self.assertTrue(complexity["independent_review_required"])
+                self.assertTrue(any(previous in reason for reason in
+                                    complexity["high_critical_reasons"]))
+                paths, failures = pr_review_gate._current_pr_paths_failures(state["pr"])
+                self.assertEqual(["docs/ci.md"], paths)
+                self.assertEqual([], failures)
+                self.assertEqual("BLOCK", pr_review_gate.evaluate_review_gate(
+                    state, self_review=_self_review("docs/ci.md")
+                )["verdict"])
+
+    def test_renamed_previous_filename_fallback_is_security_relevant(self) -> None:
+        state = _state("docs/ci.md")
+        state["repoName"] = "heimgewebe/heim-pc"
+        state["pr"]["files"] = [{
+            "path": "docs/ci.md", "status": "renamed",
+            "previous_filename": ".github/workflows/ci.yml",
+        }]
+        result = pr_review_gate.classify_complexity(
+            state["pr"], None, repo_name=state["repoName"]
+        )
+        self.assertEqual("high_critical", result["review_tier"])
+        self.assertTrue(result["independent_review_required"])
+
+    def test_renamed_missing_or_invalid_source_fails_closed(self) -> None:
+        for previous in (None, "", 42, "/.github/workflows/ci.yml",
+                         "../.github/workflows/ci.yml"):
+            with self.subTest(previous=previous):
+                state = _state("docs/ci.md")
+                state["repoName"] = "heimgewebe/heim-pc"
+                item = {"path": "docs/ci.md", "status": "renamed"}
+                if previous is not None:
+                    item["previousPath"] = previous
+                state["pr"]["files"] = [item]
+                _, failures = pr_review_gate._current_pr_paths_failures(state["pr"])
+                self.assertTrue(any("renamed source path" in failure
+                                    for failure in failures), failures)
+                complexity = pr_review_gate.classify_complexity(
+                    state["pr"], None, repo_name=state["repoName"]
+                )
+                self.assertTrue(complexity["independent_review_required"])
+                result = pr_review_gate.evaluate_review_gate(
+                    state, self_review=_self_review("docs/ci.md")
+                )
+                self.assertEqual("BLOCK", result["verdict"])
+                self.assertTrue(any("renamed source path" in failure
+                                    for failure in result["failures"]), result["failures"])
+
+    def test_benign_documentation_rename_keeps_documentation_tier(self) -> None:
+        state = _state("docs/new.md")
+        state["repoName"] = "heimgewebe/example"
+        state["pr"]["files"] = [{
+            "path": "docs/new.md", "status": "renamed",
+            "previousPath": "docs/old.md",
+        }]
+        complexity = pr_review_gate.classify_complexity(
+            state["pr"], None, repo_name=state["repoName"]
+        )
+        self.assertEqual("documentation", complexity["review_tier"])
+        self.assertFalse(complexity["independent_review_required"])
+        self.assertEqual([], pr_review_gate._current_pr_paths_failures(state["pr"])[1])
+
     def test_unrelated_plain_python_module_keeps_standard_review_floor(self) -> None:
         state = _state("src/grabowski_plain_helper.py")
         complexity = pr_review_gate.classify_complexity(
