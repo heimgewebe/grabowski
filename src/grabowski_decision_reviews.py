@@ -1333,15 +1333,25 @@ def _proven_grok_quota_failure_before_review(
         ]
     except (ValueError, UnicodeError):
         return False
-    commands = [
+    six_commands = [
         "compact", "always-approve", "context",
         "session-info", "feedback", "goal",
     ]
-    return events == [
-        {"type": "available_commands", "tools": [], "commands": commands},
-        {"type": "available_commands", "tools": [], "commands": commands},
-        {"type": "error", "message": wrapped},
-    ]
+    # These are the only two complete provider preflight sequences proven
+    # in immutable, origin-bound failed review receipts. Do not accept subsets,
+    # mixed lists, reordered commands or any additional result/tool events.
+    known_commands = (
+        six_commands,
+        [*six_commands[:2], "memory", *six_commands[2:]],
+    )
+    return any(
+        events == [
+            {"type": "available_commands", "tools": [], "commands": commands},
+            {"type": "available_commands", "tools": [], "commands": commands},
+            {"type": "error", "message": wrapped},
+        ]
+        for commands in known_commands
+    )
 
 
 def _validated_review_role_evidence(
