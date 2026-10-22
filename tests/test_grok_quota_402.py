@@ -181,6 +181,46 @@ class GrokQuota402Tests(unittest.TestCase):
                     outcome["errors"], name,
                 )
 
+    def test_seven_command_stream_rejects_extra_or_truncated_events(self):
+        """The three-line guard also bounds the parsed event list itself.
+
+        A claimed three-event role receipt cannot turn additional real
+        model/tool/result events into a pre-result 402, nor may a truncated
+        stream raise IndexError during reconciliation.
+        """
+        original = [
+            {"type": "available_commands", "tools": [], "commands": COMMANDS_WITH_MEMORY},
+            {"type": "available_commands", "tools": [], "commands": COMMANDS_WITH_MEMORY},
+            {"type": "error", "message": RECEIVER_ERROR},
+        ]
+        invalid = {
+            "trailing_reject": original + [
+                {"type": "result", "verdict": "REJECT_THIS_REVISION"}
+            ],
+            "trailing_tool": original + [{"type": "tool_call", "name": "terminal"}],
+            "duplicate_error": original + [original[-1]],
+            "trailing_thought": original + [{"type": "thought", "data": "analysis"}],
+            "two_events": original[:2],
+            "one_event": original[:1],
+        }
+        for name, events in invalid.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temp:
+                jobs = Path(temp) / "jobs"
+                jobs.mkdir(mode=0o700)
+                failed = make_grok_job(jobs, "a00000000402", created=1787000100, failed=True)
+                # Deliberately maintain the claimed provider event count=3
+                # even when the authenticated stream bytes contain 1/2/4 events.
+                amend_private_receipt(failed, events=events)
+                make_grok_job(jobs, "b00000000402", created=1787000200)
+                result = reconcile(jobs)
+                self.assertEqual(result["status"], "blocked", name)
+                self.assertEqual(result["attempts"][0]["classification"], "invalid_result", name)
+                self.assertIn(
+                    "decision_review_result_invalid:grabowski-job-a00000000402:InvalidReviewDocument",
+                    result["errors"], name,
+                )
+                self.assertTrue(failed.is_dir())
+
     def test_old_pass_or_different_provider_cannot_satisfy_latest_grok_quota(self):
         with tempfile.TemporaryDirectory() as temp:
             jobs = Path(temp) / "jobs"
