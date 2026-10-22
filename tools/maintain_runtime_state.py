@@ -3519,6 +3519,13 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
             "reset_failures": reset_failures,
             "worker_reset_evidence": plan.get("worker_reset_evidence", []),
             "archived_jobs": archived,
+            "mutated": bool(
+                archived or any(item["returncode"] == 0 for item in reset_results)
+            ),
+            "status": (
+                "degraded" if plan.get("blocked") or failed_resets or reset_failures
+                else "passed"
+            ),
             "preserved_blocked_units": plan.get("blocked", []),
             "archive_deferred_count": plan.get("archive_deferred_count", 0),
             "protected_nonterminal_jobs": plan.get(
@@ -3528,7 +3535,7 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
                 "recovered_archived_failed_units", []
             ),
             "deferred_failed_units": plan.get("deferred_failed_units", []),
-            "completed": not failed_resets and not reset_failures,
+            "completed": not bool(plan.get("blocked") or failed_resets or reset_failures),
             "retry": {
                 "required": bool(failed_resets or reset_failures),
                 "strategy": "rebuild_live_plan_and_chain_partial_receipt",
@@ -3617,6 +3624,7 @@ def _apply_periodic_worktree_hygiene(
         return {
             "schema_version": 1,
             "operation": "grabowski-worktree-hygiene-periodic-noop",
+            "status": "passed",
             "completed": True,
             "mutated": False,
             "actions": 0,
@@ -3641,6 +3649,7 @@ def _apply_periodic_worktree_hygiene(
         return {
             "schema_version": 1,
             "operation": "grabowski-worktree-hygiene-periodic-noop",
+            "status": "passed",
             "completed": True,
             "mutated": False,
             "actions": 0,
@@ -3703,10 +3712,12 @@ def _apply_periodic_worktree_hygiene(
         remaining -= actions
         receipts.append(receipt)
 
+    blocked_hygiene = any(item["status"] == "blocked" for item in receipts)
     return {
         "schema_version": 1,
         "operation": "grabowski-worktree-hygiene-periodic",
-        "completed": True,
+        "completed": not blocked_hygiene,
+        "status": "degraded" if blocked_hygiene else "passed",
         "mutated": action_count > 0,
         "actions": action_count,
         "maximum_actions": max_actions,
@@ -3748,14 +3759,16 @@ def apply_periodic_plan(
     )
     if current["plan_sha256"] != preview["plan_sha256"]:
         raise RuntimeError("retention plan drifted between periodic snapshots")
+    blocked = current.get("blocked", [])
     if not current["reset_failed_units"] and not current["archive_jobs"]:
         runtime_result = {
             "schema_version": 1,
             "operation": "grabowski-runtime-state-retention-periodic-noop",
             "plan_sha256": current["plan_sha256"],
-            "completed": True,
+            "completed": not bool(blocked),
+            "status": "degraded" if blocked else "passed",
             "mutated": False,
-            "preserved_blocked_units": current.get("blocked", []),
+            "preserved_blocked_units": blocked,
         }
     else:
         runtime_result = apply_plan(
@@ -3770,12 +3783,22 @@ def apply_periodic_plan(
     )
     if not worktree_hygiene_repositories:
         return runtime_result
+    # Never promote an already-degraded child receipt to success merely
+    # because its safe partial actions completed. Both outcomes are binding.
+    composite_passed = (
+        runtime_result.get("status") == "passed"
+        and hygiene_result.get("status") == "passed"
+        and runtime_result.get("completed") is True
+        and hygiene_result.get("completed") is True
+        and not blocked
+    )
     return {
         "schema_version": 1,
         "operation": "grabowski-runtime-retention-convergence-periodic",
         "plan_sha256": current["plan_sha256"],
-        "completed": bool(runtime_result.get("completed"))
-        and bool(hygiene_result.get("completed")),
+        "completed": composite_passed,
+        "status": "passed" if composite_passed else "degraded",
+        "preserved_blocked_units": blocked,
         "mutated": bool(runtime_result.get("mutated"))
         or bool(hygiene_result.get("mutated")),
         "runtime_retention": runtime_result,
@@ -3900,7 +3923,8 @@ def main() -> int:
                     receipt, ensure_ascii=False, sort_keys=True, indent=2
                 )
             )
-            return 0
+            healthy = receipt.get("status") == "passed" and receipt.get("completed") is True
+            return 0 if healthy else 2
         if args.worktree_hygiene_repo or args.worktree_hygiene_allowed_root:
             raise ValueError(
                 "worktree hygiene arguments require --periodic-apply"
@@ -3916,7 +3940,8 @@ def main() -> int:
             raise ValueError("--expected-plan-sha256 is required with --apply")
         receipt = apply_plan(plan, expected_plan_sha256=args.expected_plan_sha256)
         print(json.dumps(receipt, ensure_ascii=False, sort_keys=True, indent=2))
-        return 0
+        healthy = receipt.get("status") == "passed" and receipt.get("completed") is True
+        return 0 if healthy else 2
     except Exception as exc:
         print(
             json.dumps(
