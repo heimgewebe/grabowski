@@ -7,6 +7,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import pwd
 from pathlib import Path
 import re
 import selectors
@@ -621,10 +622,67 @@ def _git_prefix(repo: Path) -> list[str]:
     ]
 
 
+def _verified_git_environment() -> dict[str, str]:
+    """Isolate Git identity/config and executable search at the verification effect."""
+    try:
+        home = pwd.getpwuid(os.geteuid()).pw_dir
+    except (KeyError, OSError) as exc:
+        raise RuntimeError("verified Git account home unavailable") from exc
+    if not os.path.isabs(home) or not os.path.isdir(home):
+        raise RuntimeError("verified Git account home invalid")
+    return {
+        "HOME": home,
+        "PATH": "/usr/bin:/bin",
+        "LC_ALL": "C",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_ATTR_NOSYSTEM": "1",
+    }
+
+
+def _reject_repository_git_filters(repo: Path) -> None:
+    """Deny configured executable filter drivers before dirty-state Git commands.
+
+    This is an admission check, not an atomic guard against another writer
+    changing Git configuration between the check and a later Git invocation.
+    """
+    try:
+        process = subprocess.Popen(
+            [
+                *_git_prefix(repo),
+                "config", "--includes", "--get-regexp",
+                r"^filter\..*\.(clean|smudge|process|required)$",
+            ],
+            cwd=repo,
+            env=_verified_git_environment(),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        stdout, stderr, timed_out, stdout_truncated, stderr_truncated = (
+            read_limited_process_pipes(
+                process, timeout_seconds=10, max_output_bytes=MAX_CAPTURE_BYTES
+            )
+        )
+    except OSError as exc:
+        raise RuntimeError("source repository Git filter audit unavailable") from exc
+    if timed_out or stdout_truncated or stderr_truncated:
+        raise RuntimeError("source repository Git filter audit unavailable")
+    if process.returncode == 0:
+        raise RuntimeError("source repository has executable Git filter configuration")
+    if process.returncode != 1 or stdout or stderr:
+        raise RuntimeError("source repository Git filter audit unavailable")
+
+
 def _git_common_directory(repo: Path) -> Path:
     raw = run_capture(
         [*_git_prefix(repo), "rev-parse", "--git-common-dir"],
         cwd=repo,
+        environment=_verified_git_environment(),
     )
     candidate = Path(raw)
     if not candidate.is_absolute():
@@ -659,21 +717,31 @@ def verify_repository(
     )
     if source_common != canonical_common:
         raise RuntimeError("source repository does not share the canonical Git common directory")
+    _reject_repository_git_filters(source)
+    if source != canonical:
+        _reject_repository_git_filters(canonical)
     expected_kind = "canonical-main" if source == canonical else "detached-worktree"
     if source_kind != expected_kind:
         raise RuntimeError(
             f"source kind drift: expected {expected_kind}, found {source_kind}"
         )
     git_prefix = _git_prefix(source)
-    head = run_capture([*git_prefix, "rev-parse", "--verify", "HEAD"], cwd=source)
-    branch = run_capture([*git_prefix, "rev-parse", "--abbrev-ref", "HEAD"], cwd=source)
+    environment = _verified_git_environment()
+    head = run_capture(
+        [*git_prefix, "rev-parse", "--verify", "HEAD"],
+        cwd=source, environment=environment,
+    )
+    branch = run_capture(
+        [*git_prefix, "rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=source, environment=environment,
+    )
     origin_main = run_capture(
         [*git_prefix, "rev-parse", "--verify", "refs/remotes/origin/main"],
-        cwd=source,
+        cwd=source, environment=environment,
     )
     status = run_capture(
         [*git_prefix, "status", "--porcelain=v1", "--untracked-files=normal"],
-        cwd=source,
+        cwd=source, environment=environment,
     )
     if head != expected_head:
         raise RuntimeError(f"HEAD drift: expected {expected_head}, found {head}")
