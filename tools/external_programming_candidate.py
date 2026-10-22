@@ -38,6 +38,8 @@ DEFAULT_FORBIDDEN_COMPONENTS = frozenset({
     ".git", ".hg", ".svn", ".venv", "venv", "node_modules", "__pycache__",
     ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox", ".nox", "build", "dist", "target",
 })
+# Mirror the controller's exact source admission in the isolated reviewer runner.
+EXACT_BUILD_DIAGNOSTICS_SOURCE = "apps/web/src/routes/build/+page.svelte"
 SENSITIVE_EXACT_COMPONENTS = frozenset({
     "secret", "secrets", "credential", "credentials", "private_key", "cookies",
     "login data", "web data", "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa",
@@ -163,6 +165,8 @@ def cleanup_stale_scratch(directory: Path, *, now_unix: int | None = None) -> di
 
 
 def path_has_default_forbidden_component(path: str) -> bool:
+    if path == EXACT_BUILD_DIAGNOSTICS_SOURCE:
+        return False
     return any(part.casefold() in DEFAULT_FORBIDDEN_COMPONENTS for part in PurePosixPath(path).parts)
 
 
@@ -722,6 +726,10 @@ def validate_packet(packet: dict[str, Any]) -> dict[str, Any]:
         total_context += len(raw)
         if len(raw) > 120_000 or total_context > 500_000 or digest != sha256_bytes(raw):
             raise CandidateError("context content is too large or hash-mismatched")
+    if EXACT_BUILD_DIAGNOSTICS_SOURCE in allowed and not any(
+        item["path"] == EXACT_BUILD_DIAGNOSTICS_SOURCE for item in context
+    ):
+        raise CandidateError("special build source admission requires exact committed context")
     summary = packet["primary_summary"]
     if not isinstance(summary, str) or "\x00" in summary or len(summary.encode("utf-8")) > 32_000:
         raise CandidateError("primary_summary is invalid")

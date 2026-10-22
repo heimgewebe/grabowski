@@ -75,6 +75,8 @@ DEFAULT_FORBIDDEN_COMPONENTS = frozenset({
     ".git", ".hg", ".svn", ".venv", "venv", "node_modules", "__pycache__",
     ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox", ".nox", "build", "dist", "target",
 })
+# Single explicitly admitted versioned source route; generated build trees stay forbidden.
+EXACT_BUILD_DIAGNOSTICS_SOURCE = "apps/web/src/routes/build/+page.svelte"
 SENSITIVE_EXACT_COMPONENTS = frozenset({
     "secret", "secrets", "credential", "credentials", "private_key", "cookies",
     "login data", "web data", "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa",
@@ -730,6 +732,8 @@ def _commit_blob(repo: Path, head: str, relative: str) -> bytes:
     fields = metadata.split()
     if len(fields) != 3 or fields[1] != b"blob" or re.fullmatch(rb"[0-9a-f]{40,64}", fields[2]) is None:
         raise AgentCompetitionError(f"context path metadata is invalid at expected_head: {relative}")
+    if fields[0] not in {b"100644", b"100755"}:
+        raise AgentCompetitionError(f"context path is not a regular tracked file at expected_head: {relative}")
     try:
         observed_path = raw_path.decode("utf-8")
     except UnicodeDecodeError as exc:
@@ -756,6 +760,8 @@ def _path_in_scope(path: str, roots: list[str]) -> bool:
 
 
 def _path_has_default_forbidden_component(path: str) -> bool:
+    if path == EXACT_BUILD_DIAGNOSTICS_SOURCE:
+        return False
     return any(part.casefold() in DEFAULT_FORBIDDEN_COMPONENTS for part in PurePosixPath(path).parts)
 
 
@@ -1067,6 +1073,8 @@ def _validated_packet(identifier: str) -> dict[str, Any]:
             or digest != _sha256_bytes(raw)
         ):
             raise AgentCompetitionError("candidate packet context content is too large or hash-mismatched")
+    if EXACT_BUILD_DIAGNOSTICS_SOURCE in allowed and EXACT_BUILD_DIAGNOSTICS_SOURCE not in seen:
+        raise AgentCompetitionError("special build source admission requires exact committed context")
     summary = packet["primary_summary"]
     nonce = packet["packet_nonce"]
     if (
@@ -2366,6 +2374,8 @@ def grabowski_agent_competition_start(
     sensitive_allowed = [path for path in allowed if _path_is_sensitive(path)]
     if sensitive_allowed:
         raise AgentCompetitionError(f"sensitive-looking allowed paths are not exportable: {sensitive_allowed}")
+    if EXACT_BUILD_DIAGNOSTICS_SOURCE in allowed and EXACT_BUILD_DIAGNOSTICS_SOURCE not in context_paths:
+        raise AgentCompetitionError("special build source admission requires exact committed context")
     contexts = _context(repo, head, context_paths, allowed, forbidden)
     execution_binary = (
         route_contract["argv_prefix"][0]
