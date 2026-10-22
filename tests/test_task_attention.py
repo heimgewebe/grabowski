@@ -298,6 +298,75 @@ class TaskAttentionTests(unittest.TestCase):
         legacy["receipt_sha256"] = attention._sha256_json(legacy)
         return legacy
 
+    def test_stdout_seal_extended_receipt_is_native_attention_readable(self) -> None:
+        record = self._failed_task()
+        receipt, digest, _file_digest = attention._read_valid_outcome(
+            record, expected_receipt_sha256=None
+        )
+        self.assertEqual(digest, receipt["receipt_sha256"])
+        self.assertEqual("unproven", receipt["stdout_capture_status"])
+        self.assertIsNone(receipt["captured_stdout_sha256"])
+        self.assertEqual(
+            record["lifecycle_receipt_sha256"], digest
+        )
+
+    def test_stdout_seal_attention_compact_projection_matches_transition(self) -> None:
+        record = self._failed_task()
+        compact = tasks._task_attention_record(tasks._row_raw(str(record["task_id"])))
+        self.assertNotIn("last_observation_json", compact)
+        self.assertIsNone(compact["launcher_json"])
+        receipt, digest, _file_digest = attention._read_valid_outcome(
+            compact, expected_receipt_sha256=None
+        )
+        self.assertEqual(record["lifecycle_receipt_sha256"], digest)
+        self.assertEqual("unproven", receipt["stdout_capture_status"])
+
+        tampered_projection = {**compact, "_task_projection_sha256": "0" * 64}
+        with self.assertRaisesRegex(
+            attention.TaskAttentionIntegrityError, "projection"
+        ):
+            attention._read_valid_outcome(
+                tampered_projection, expected_receipt_sha256=None
+            )
+
+    def test_stdout_seal_attention_requires_existing_native_transition(self) -> None:
+        record = self._failed_task()
+        compact = tasks._task_attention_record(tasks._row_raw(str(record["task_id"])))
+        for missing in (None, {"transition_sha256": "0" * 64}):
+            with patch.object(
+                tasks.resources, "task_terminalization_record", return_value=missing
+            ):
+                with self.assertRaisesRegex(
+                    attention.TaskAttentionIntegrityError, "no matching durable transition"
+                ):
+                    attention._read_valid_outcome(
+                        compact, expected_receipt_sha256=None
+                    )
+
+    def test_stdout_seal_attention_rejects_same_uid_receipt_rehash(self) -> None:
+        record = self._failed_task()
+        identifier = str(record["task_id"])
+        path = self.outcomes / f"{identifier}.json"
+        forged = json.loads(path.read_text(encoding="utf-8"))
+        forged["captured_stdout_authority"] = "independent-root-attested"
+        forged["receipt_sha256"] = attention._sha256_json(
+            {key: value for key, value in forged.items() if key != "receipt_sha256"}
+        )
+        path.write_text(json.dumps(forged, sort_keys=True), encoding="utf-8")
+        with tasks._database_connection() as connection:
+            connection.execute(
+                "UPDATE tasks SET lifecycle_receipt_sha256=? WHERE task_id=?",
+                (forged["receipt_sha256"], identifier),
+            )
+            connection.commit()
+        compact = tasks._task_attention_record(tasks._row_raw(identifier))
+        with self.assertRaisesRegex(
+            attention.TaskAttentionIntegrityError, "stdout seal.*transition"
+        ):
+            attention._read_valid_outcome(
+                compact, expected_receipt_sha256=None
+            )
+
     def test_decision_is_private_create_only_and_idempotent(self) -> None:
         record = self._failed_task()
         parameters = self._parameters(record)
