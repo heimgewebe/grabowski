@@ -493,17 +493,32 @@ def _archive_file_shape_preflight(
         os.close(fd)
 
 
-def _failed_units() -> list[str]:
-    result = _run(["systemctl", "--user", "--failed", "--no-legend", "--plain"])
+def _failed_units(*, job_authority: bool = True) -> list[str]:
+    # Without protected archive/reset authority, failed job units accumulate.
+    # Ask systemd only for independently actionable task/worker failures.
+    if not isinstance(job_authority, bool):
+        raise ValueError("job_authority must be boolean")
+    command = ["systemctl", "--user", "--failed", "--no-legend", "--plain"]
+    if not job_authority:
+        command = [
+            "systemctl", "--user", "list-units", "--failed", "--no-legend", "--plain",
+            "grabowski-task-*.service", "grabowski-browser-worker-*.service",
+            "grabowski-gui-worker-*.service",
+        ]
+    result = _run(command)
     if result.returncode not in {0, 1}:
         raise RuntimeError(result.stderr.strip() or "failed-unit inventory failed")
     units = []
     for line in result.stdout.splitlines():
         fields = line.split()
         if fields:
-            units.append(fields[0])
-    if len(units) > MAX_FAILED_UNITS:
-        raise RuntimeError("failed-unit inventory exceeds the bounded scan")
+            unit = fields[0]
+            # Never accept a job returned despite the restricted pattern.
+            if not job_authority and JOB_UNIT.fullmatch(unit):
+                continue
+            units.append(unit)
+            if len(units) > MAX_FAILED_UNITS:
+                raise RuntimeError("failed-unit inventory exceeds the bounded scan")
     return sorted(set(units))
 
 
@@ -1342,15 +1357,28 @@ def build_plan(
     else:
         _archive_require_unchanged_root(receipt_root, pinned.receipt_fd)
     observed_now = int(time.time()) if now is None else now
-    failed = _failed_units() if failed_units is None else sorted(set(failed_units))
+    failed = (
+        _failed_units(job_authority=authorized_job_effects)
+        if failed_units is None else sorted(set(failed_units))
+    )
+    if not authorized_job_effects:
+        # Even caller-supplied job failures cannot exhaust the independent
+        # task/worker budget or enable any protected job effect.
+        failed = [unit for unit in failed if not JOB_UNIT.fullmatch(unit)]
     if len(failed) > MAX_FAILED_UNITS:
         raise RuntimeError("failed-unit inventory exceeds the bounded scan")
 
     registry_entries: list[Path] = []
+    job_registry_discovery_truncated = False
     with os.scandir(pinned.jobs_fd) as scan:
         for discovered_count, child in enumerate(scan, start=1):
             if discovered_count > MAX_JOB_REGISTRY_ENTRIES:
-                raise RuntimeError("job registry exceeds the bounded discovery limit")
+                if authorized_job_effects:
+                    raise RuntimeError("job registry exceeds the bounded discovery limit")
+                # No job effects are authorized: preserve uninspected evidence,
+                # but do not deny independently safe task/worker maintenance.
+                job_registry_discovery_truncated = True
+                break
             if child.name.startswith("grabowski-job-"):
                 registry_entries.append(jobs_root / child.name)
     registry_entries.sort(key=lambda entry: entry.name)
@@ -1381,8 +1409,9 @@ def build_plan(
         if entry.name in failed_job_names:
             selected_by_name[entry.name] = entry
     entries = sorted(selected_by_name.values(), key=lambda entry: entry.name)
-    job_scan_truncated = len(registry_entries) > len(entries)
-    job_scan_deferred_count = len(registry_entries) - len(entries)
+    job_scan_truncated = job_registry_discovery_truncated or len(registry_entries) > len(entries)
+    # When discovery truncates, this deferred count is only a lower bound.
+    job_scan_deferred_count = len(registry_entries) - len(entries) + int(job_registry_discovery_truncated)
     typed_entries = [entry for entry in entries if JOB_NAME.fullmatch(entry.name)]
     job_units = [entry.name + ".service" for entry in typed_entries]
     worker_units = [unit for unit in failed if WORKER_UNIT.fullmatch(unit)]
@@ -1402,6 +1431,12 @@ def build_plan(
         if key not in blocked_keys:
             blocked_keys.add(key)
             blocked.append({"unit": unit, "reason": reason})
+
+    if job_registry_discovery_truncated:
+        block(
+            "grabowski-job-registry",
+            "job registry exceeded bounded discovery limit; uninspected job evidence preserved",
+        )
 
     records: list[dict[str, Any]] = []
     records_by_unit: dict[str, dict[str, Any]] = {}
@@ -1430,7 +1465,9 @@ def build_plan(
                 systemd_state=states[unit],
                 jobs_root_fd=pinned.jobs_fd,
             )
-        except RuntimeError as exc:
+        except (RuntimeError, OSError) as exc:
+            # An unsafe per-job metadata/open failure must not stop
+            # independently authorized task/worker maintenance.
             block(unit, str(exc))
             continue
         records.append(record)
@@ -1616,6 +1653,7 @@ def build_plan(
         "worker_db": str(worker_db),
         "resource_db": str(resource_db),
         "job_registry_entry_count": len(registry_entries),
+        "job_registry_discovery_truncated": job_registry_discovery_truncated,
         "job_scan_count": len(entries),
         "job_scan_truncated": job_scan_truncated,
         "job_scan_deferred_count": job_scan_deferred_count,

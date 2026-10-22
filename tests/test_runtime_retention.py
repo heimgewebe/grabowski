@@ -3907,6 +3907,93 @@ class RuntimeRetentionTests(unittest.TestCase):
             self.assertTrue((jobs / name / "metadata.json").is_file())
             self.assertFalse((root / "archive" / name).exists())
 
+    def test_untrusted_missing_or_symlinked_job_metadata_preserves_task_plan(self) -> None:
+        self._simulated_protected_authority.return_value = False
+        for shape in ("missing", "symlink"):
+            with self.subTest(shape=shape), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                jobs = root / "jobs"
+                name = "grabowski-job-" + "a" * 12
+                unit = name + ".service"
+                source = self._job(jobs, name, 100)
+                metadata = source / "metadata.json"
+                metadata.unlink()
+                if shape == "symlink":
+                    metadata.symlink_to(source / "stdout.log")
+                task_unit = "grabowski-task-" + "d" * 24 + "-a1.service"
+                task_db = self._task_db(root / "tasks.sqlite3", task_unit, "failed")
+                plan = RETENTION.build_plan(
+                    minimum_job_age_seconds=50, now=1000,
+                    jobs_root=jobs, archive_root=root / "archive",
+                    receipt_root=root / "receipts", task_db=task_db,
+                    failed_units=[unit, task_unit],
+                    unit_states={unit: self._state(unit)},
+                )
+                self.assertEqual(plan["reset_failed_units"], [task_unit])
+                self.assertEqual(plan["archive_jobs"], [])
+                self.assertTrue(any(row["unit"] == unit for row in plan["blocked"]))
+                self.assertEqual(metadata.is_symlink(), shape == "symlink")
+                self.assertTrue(source.is_dir())
+
+    def test_untrusted_overflowed_job_inventory_keeps_task_plan_bounded(self) -> None:
+        self._simulated_protected_authority.return_value = False
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs = root / "jobs"
+            states = {}
+            failed_jobs = []
+            for number in range(4):
+                name = f"grabowski-job-{number + 1:012x}"
+                unit = name + ".service"
+                self._job(jobs, name, 100)
+                failed_jobs.append(unit)
+                states[unit] = self._state(unit, active="failed", load="loaded", result="exit-code")
+            task_unit = "grabowski-task-" + "e" * 24 + "-a1.service"
+            task_db = self._task_db(root / "tasks.sqlite3", task_unit, "failed")
+            with (
+                patch.object(RETENTION, "MAX_JOB_REGISTRY_ENTRIES", 2),
+                patch.object(RETENTION, "MAX_FAILED_UNITS", 2),
+            ):
+                plan = RETENTION.build_plan(
+                    minimum_job_age_seconds=50, now=1000,
+                    jobs_root=jobs, archive_root=root / "archive",
+                    receipt_root=root / "receipts", task_db=task_db,
+                    failed_units=[*failed_jobs, task_unit],
+                    unit_states=states,
+                )
+            self.assertEqual(plan["reset_failed_units"], [task_unit])
+            self.assertEqual(plan["archive_jobs"], [])
+            self.assertTrue(plan["job_registry_discovery_truncated"])
+            self.assertTrue(plan["job_scan_truncated"])
+            self.assertFalse(plan["archive_inventory_complete"])
+            self.assertTrue(any(
+                "bounded discovery limit" in row["reason"] for row in plan["blocked"]
+            ))
+            for number in range(4):
+                self.assertTrue((jobs / f"grabowski-job-{number + 1:012x}").is_dir())
+
+    def test_untrusted_failed_unit_discovery_excludes_job_units_server_side(self) -> None:
+        self._simulated_protected_authority.return_value = False
+        task_unit = "grabowski-task-" + "f" * 24 + "-a1.service"
+        job_units = [f"grabowski-job-{number + 1:012x}.service" for number in range(4)]
+        systemd_output = "\n".join(
+            f"{unit} loaded failed failed evidence" for unit in [*job_units, task_unit]
+        ) + "\n"
+        with (
+            patch.object(RETENTION, "_run", return_value=Mock(
+                returncode=0, stdout=systemd_output, stderr=""
+            )) as runner,
+            patch.object(RETENTION, "MAX_FAILED_UNITS", 1),
+        ):
+            self.assertEqual(
+                RETENTION._failed_units(job_authority=False), [task_unit]
+            )
+        runner.assert_called_once_with([
+            "systemctl", "--user", "list-units", "--failed", "--no-legend", "--plain",
+            "grabowski-task-*.service", "grabowski-browser-worker-*.service",
+            "grabowski-gui-worker-*.service",
+        ])
+
     def test_untrusted_job_retention_still_resets_independent_terminal_task(self) -> None:
         self._simulated_protected_authority.return_value = False
         with tempfile.TemporaryDirectory() as temporary:
