@@ -89,11 +89,13 @@ deploy: context-check chronik-runtime-contract
 
 runtime-retention-check: context-check
 >test -x "$(GRABOWSKI_RUNTIME_PYTHON)"
+>"$(GRABOWSKI_RUNTIME_PYTHON)" tools/maintain_runtime_state.py --provision-receipt-root
 >"$(GRABOWSKI_RUNTIME_PYTHON)" tools/maintain_runtime_state.py --minimum-job-age-seconds "$(RETENTION_MIN_AGE_SECONDS)" --max-archive-jobs "$(RETENTION_MAX_ARCHIVE_JOBS)"
 
 runtime-retention-apply: context-check
 >test -x "$(GRABOWSKI_RUNTIME_PYTHON)"
 >test -n "$(RETENTION_PLAN_SHA256)"
+>"$(GRABOWSKI_RUNTIME_PYTHON)" tools/maintain_runtime_state.py --provision-receipt-root
 >"$(GRABOWSKI_RUNTIME_PYTHON)" tools/maintain_runtime_state.py --minimum-job-age-seconds "$(RETENTION_MIN_AGE_SECONDS)" --max-archive-jobs "$(RETENTION_MAX_ARCHIVE_JOBS)" --apply --expected-plan-sha256 "$(RETENTION_PLAN_SHA256)"
 
 runtime-legacy-status: context-check
