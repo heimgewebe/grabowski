@@ -120,6 +120,10 @@ class TaskAttentionConflictError(TaskAttentionError):
     pass
 
 
+class TaskArchiveRetirementPending(TaskAttentionConflictError):
+    """Host-bound restart exclusion has not been independently established."""
+
+
 def _canonical_bytes(value: Any) -> bytes:
     return json.dumps(
         value,
@@ -2191,6 +2195,37 @@ def _save_task_output_cleanup_attempt_cursor(
         )
 
 
+def _task_output_retirement_deferred(
+    record: dict[str, Any], *, retention_boundary_unix: int
+) -> dict[str, Any]:
+    """No output, lease, unit, or task mutation while retirement is unproven."""
+    binding = _task_binding(record)
+    return {
+        "status": "deferred",
+        "reason": "host_retirement_proof_required",
+        "task_binding": binding,
+        "attempt_count": int(binding["attempt"]),
+        "attempt_batch_size": TASK_OUTPUT_CLEANUP_ATTEMPT_BATCH_SIZE,
+        "attempts_scanned": 0,
+        "attempt_cursor_before": None,
+        "attempt_cursor_after": None,
+        "attempt_cycle_completed": False,
+        "attempt_results": [],
+        "counts": {"deleted": 0, "deferred": 0, "not_present": 0, "errors": 0},
+        "retention_boundary_unix": retention_boundary_unix,
+        "retention_boundaries_unix": [],
+        "eligible_at_unix": None,
+        "deleted_attempts": [],
+        "not_present_attempts": [],
+        "does_not_establish": [
+            "task_output_deleted",
+            "task_output_absent",
+            "resource_lease_released",
+            "authenticated_restart_exclusion",
+        ],
+    }
+
+
 def _task_output_cleanup_all_attempts_after_archive(
     record: dict[str, Any],
     *,
@@ -2198,6 +2233,14 @@ def _task_output_cleanup_all_attempts_after_archive(
     projection: dict[str, Any],
     retention_boundary_unix: int,
 ) -> dict[str, Any]:
+    # The background reconciler also enters here; do not let historical
+    # archived rows bypass the new archive admission hold via output deletion.
+    try:
+        _require_host_authenticated_archive_retirement(record)
+    except TaskArchiveRetirementPending:
+        return _task_output_retirement_deferred(
+            record, retention_boundary_unix=retention_boundary_unix
+        )
     archived_binding = _task_binding(record)
     final_attempt = int(archived_binding["attempt"])
     task_id = str(archived_binding["task_id"])
@@ -2717,7 +2760,7 @@ def _require_host_authenticated_archive_retirement(_record: dict[str, Any]) -> N
     never restart. Existing archive replay is handled before this gate.
     No external host or root probe is allowed as a substitute for this proof.
     """
-    raise TaskAttentionConflictError(
+    raise TaskArchiveRetirementPending(
         "independently authenticated task retirement proof is required (#1556)"
     )
 
@@ -2787,22 +2830,39 @@ def execute_closeout_archive(parameters: dict[str, Any]) -> dict[str, Any]:
             verified_segment["manifest"],
             record_sha256=record_sha256,
         )
-        resource_release = _release_owned_archive_resources(
-            owner,
-            resources_to_hold,
-        )
-        if resource_release.get("status") not in {"released", "not_required"}:
-            raise TaskAttentionConflictError(
-                "task archive resources could not be released before output cleanup"
+        # Earlier immutable archive switches are still authentic history,
+        # not proof that every originating manager will refuse a future start.
+        # A replay must never release a stranded lease or delete private output
+        # based only on old TaskStore/SQLite/unit liveness observations.
+        try:
+            _require_host_authenticated_archive_retirement(record)
+        except TaskArchiveRetirementPending:
+            resource_release = {
+                "status": "deferred",
+                "released": [],
+                "reason": "host_retirement_proof_required",
+            }
+            task_output_cleanup = _task_output_retirement_deferred(
+                record,
+                retention_boundary_unix=proposed_task_output_retention_boundary_unix,
             )
-        task_output_cleanup = _task_output_cleanup_all_attempts_after_archive(
-            record,
-            archive_binding=archive_binding,
-            projection=existing_projection,
-            retention_boundary_unix=(
-                proposed_task_output_retention_boundary_unix
-            ),
-        )
+        else:
+            resource_release = _release_owned_archive_resources(
+                owner,
+                resources_to_hold,
+            )
+            if resource_release.get("status") not in {"released", "not_required"}:
+                raise TaskAttentionConflictError(
+                    "task archive resources could not be released before output cleanup"
+                )
+            task_output_cleanup = _task_output_cleanup_all_attempts_after_archive(
+                record,
+                archive_binding=archive_binding,
+                projection=existing_projection,
+                retention_boundary_unix=(
+                    proposed_task_output_retention_boundary_unix
+                ),
+            )
         task_output_retention_boundary_unix = int(
             task_output_cleanup["retention_boundary_unix"]
         )
@@ -2822,6 +2882,11 @@ def execute_closeout_archive(parameters: dict[str, Any]) -> dict[str, Any]:
             "projection": existing_projection,
             "task_output_cleanup": task_output_cleanup,
             "resource_release": resource_release,
+            "retirement_proof_status": (
+                "pending"
+                if resource_release.get("status") == "deferred"
+                else "checked"
+            ),
             "does_not_establish": [
                 "physical_task_row_deletion",
                 "workspace_cleanup_authority",
