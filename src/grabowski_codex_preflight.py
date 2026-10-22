@@ -127,6 +127,66 @@ class _Rpc:
                 raise CodexPreflightDenied("oversized_or_mixed_output")
             self.pending += data
 
+    def finish(self) -> None:
+        """Require graceful EOF after stdin close; accept no semantic tail.
+
+        A zero-time poll after the last model/list reply is not an identity
+        or inference boundary. The app-server must finish its metadata stream
+        and close all writers before a reviewer job can be admitted.
+        """
+        try:
+            assert self.process.stdin is not None
+            self.process.stdin.close()
+        except (OSError, ValueError):
+            raise CodexPreflightDenied("transport_closed") from None
+        while True:
+            while b"\n" in self.pending:
+                raw, self.pending = self.pending.split(b"\n", 1)
+                self.count += 1
+                if self.count > MAX_MESSAGES or not raw or len(raw) > 65536:
+                    raise CodexPreflightDenied("unexpected_trailing_output")
+                try:
+                    item = json.loads(raw)
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    raise CodexPreflightDenied("unexpected_trailing_output") from None
+                if (
+                    not isinstance(item, dict)
+                    or item.get("jsonrpc", "2.0") != "2.0"
+                    or "id" in item
+                    or not isinstance(item.get("method"), str)
+                    or item["method"] not in ALLOWED_NOTIFICATIONS
+                ):
+                    raise CodexPreflightDenied("unexpected_trailing_output")
+            remaining = self.deadline - time.monotonic()
+            if remaining <= 0:
+                raise CodexPreflightDenied("timeout")
+            try:
+                assert self.process.stdout is not None
+                readable, _, _ = select.select(
+                    [self.process.stdout.fileno()], [], [], remaining
+                )
+                if not readable:
+                    raise CodexPreflightDenied("timeout")
+                chunk = os.read(self.process.stdout.fileno(), 16384)
+            except (OSError, ValueError):
+                raise CodexPreflightDenied("transport_error") from None
+            if not chunk:
+                if self.pending:
+                    raise CodexPreflightDenied("unexpected_trailing_output")
+                try:
+                    returncode = self.process.wait(
+                        timeout=max(0, self.deadline - time.monotonic())
+                    )
+                except subprocess.TimeoutExpired:
+                    raise CodexPreflightDenied("timeout") from None
+                if returncode != 0:
+                    raise CodexPreflightDenied("transport_closed")
+                return
+            self.total += len(chunk)
+            if self.total > MAX_OUTPUT_BYTES:
+                raise CodexPreflightDenied("oversized_or_mixed_output")
+            self.pending += chunk
+
 
 def _check_protocol(argv: list[str], *, model: str, effort: str, deadline_seconds: int = PREFLIGHT_SECONDS) -> dict[str, Any]:
     """Only supported non-model metadata RPCs, with bounded owner process lifetime."""
@@ -148,7 +208,9 @@ def _check_protocol(argv: list[str], *, model: str, effort: str, deadline_second
         if not isinstance(init.get("userAgent"), str) and not isinstance(init.get("serverInfo"), dict):
             raise CodexPreflightDenied("handshake_identity_missing")
         rpc.notify("initialized")
-        account = rpc.call(2, "account/read", {"refreshToken": True})
+        # Do not force a write/rotation of the shared dedicated refresh token.
+        # The following usage RPC authenticates against the remote provider.
+        account = rpc.call(2, "account/read", {"refreshToken": False})
         if not isinstance(account.get("account"), dict) or account["account"].get("type") != "chatgpt":
             raise CodexPreflightDenied("chatgpt_auth_unavailable")
         if account.get("requiresOpenaiAuth") is not True:
@@ -194,12 +256,9 @@ def _check_protocol(argv: list[str], *, model: str, effort: str, deadline_second
             cursor = next_cursor
         if not matched:
             raise CodexPreflightDenied("exact_model_unavailable")
-        # A terminal metadata reply must not conceal buffered model turns,
-        # malformed extensions or unsolicited semantic notifications.
-        if rpc.pending:
-            raise CodexPreflightDenied("unexpected_trailing_output")
-        if process.stdout is not None and select.select([process.stdout.fileno()], [], [], 0)[0]:
-            raise CodexPreflightDenied("unexpected_trailing_output")
+        # No approval until the complete bounded metadata stream terminates
+        # at EOF without any deferred semantic response or malformed extension.
+        rpc.finish()
         return {
             "kind": "grabowski.codex_preinference_preflight",
             "schema_version": 1,
@@ -220,11 +279,23 @@ def _check_protocol(argv: list[str], *, model: str, effort: str, deadline_second
     finally:
         try:
             os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
+        except OSError:
+            # Failure to signal the process group must never skip wait and
+            # closure. The bwrap child is also --die-with-parent protected.
             pass
         try:
             process.wait(timeout=2)
-        except (OSError, subprocess.TimeoutExpired):
+        except subprocess.TimeoutExpired:
+            # Best-effort direct parent fallback when group signalling failed.
+            try:
+                process.kill()
+            except OSError:
+                pass
+            try:
+                process.wait(timeout=1)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        except OSError:
             pass
         for pipe in (process.stdin, process.stdout):
             if pipe is not None:
@@ -237,6 +308,8 @@ def _check_protocol(argv: list[str], *, model: str, effort: str, deadline_second
 def require_codex_review_preflight(command: list[str], route: dict[str, Any]) -> dict[str, Any] | None:
     """Invoke identical durable reviewer auth in a minimal isolated preflight sandbox."""
     if not command or Path(command[0]).name != "codex":
+        if route.get("provider_family") == "openai":
+            raise CodexPreflightDenied("not_codex")
         return None
     model, effort = _exact_reviewer_model(command, route)
     try:

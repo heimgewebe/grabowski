@@ -8185,7 +8185,7 @@ def _start_job(
         if provenance is not None:
             separator = command.index("--")
             reviewer_argv = command[separator + 1:]
-            if reviewer_argv and Path(reviewer_argv[0]).name == "codex":
+            if provenance["review_route"].get("provider_family") == "openai":
                 from grabowski_codex_preflight import (
                     CodexPreflightDenied, require_codex_review_preflight,
                 )

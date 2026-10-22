@@ -49,7 +49,9 @@ for line in sys.stdin:
     if mode == "large" and method == "initialize":
         sys.stdout.write("x" * 140000 + "\n")
         sys.stdout.flush()
-    if mode == "revoked" and method == "account/read":
+    if mode == "refresh_forbidden" and method == "account/read" and request["params"].get("refreshToken") is not False:
+        response = {"jsonrpc": "2.0", "id": request["id"], "error": {"code": 409, "message": "forced token refresh forbidden"}}
+    elif mode == "revoked" and method == "account/read":
         response = {"jsonrpc": "2.0", "id": request["id"], "error": {"code": 401, "message": "token_revoked"}}
     elif mode in {"transient", "cached_model"} and method == "account/rateLimits/read":
         response = {"jsonrpc": "2.0", "id": request["id"], "error": {"code": -32000, "message": "network failed"}}
@@ -100,6 +102,15 @@ for line in sys.stdin:
         continue
     sys.stdout.write(json.dumps(response, separators=(",", ":")) + "\n")
     sys.stdout.flush()
+    if method == "model/list" and mode in {"trailing_delayed", "trailing_allowed_delayed"}:
+        time.sleep(0.06)
+        event = "item/reasoning/textDelta" if mode == "trailing_delayed" else "remoteControl/status/changed"
+        sys.stdout.write(json.dumps({"jsonrpc": "2.0", "method": event, "params": {}}) + "\n")
+        sys.stdout.flush()
+    if method == "model/list" and mode == "exit_nonzero_after_reply":
+        sys.exit(2)
+    if method == "model/list" and mode == "hold_open_after_reply":
+        time.sleep(5)
 """
 
 
@@ -139,6 +150,25 @@ class CodexPreflightProtocolTests(unittest.TestCase):
 
     def test_trailing_semantic_output_after_model_list_denied(self):
         self.assert_denied("trailing_semantic", "unexpected_trailing_output")
+
+    def test_delayed_trailing_semantic_event_is_denied_before_metadata_acceptance(self):
+        self.assert_denied("trailing_delayed", "unexpected_trailing_output")
+
+    def test_appserver_that_never_closes_after_stdin_eof_is_denied(self):
+        self.assert_denied("hold_open_after_reply", "timeout", timeout=1)
+
+    def test_late_allowed_status_notification_is_drained_before_acceptance(self):
+        self.assertEqual("metadata_accepted", self.probe("trailing_allowed_delayed")["status"])
+
+    def test_exit_nonzero_after_complete_model_list_fails_closed(self):
+        self.assert_denied("exit_nonzero_after_reply", "transport_closed")
+
+    def test_killpg_permission_failure_does_not_skip_cleanup(self):
+        with mock.patch.object(preflight.os, "killpg", side_effect=PermissionError("synthetic deny")):
+            self.assertEqual("metadata_accepted", self.probe()["status"])
+
+    def test_preflight_never_forces_shared_auth_refresh(self):
+        self.assertEqual("metadata_accepted", self.probe("refresh_forbidden")["status"])
 
     def test_revoked_token_blocks(self):
         self.assert_denied("revoked", "invalid_rpc_reply")
@@ -192,7 +222,14 @@ class CodexPreflightBindingTests(unittest.TestCase):
     ]
 
     def test_non_codex_provider_skipped(self):
-        self.assertIsNone(preflight.require_codex_review_preflight(["claude", "review"], self.route))
+        self.assertIsNone(preflight.require_codex_review_preflight(
+            ["claude", "review"], {"provider_family": "anthropic", "model": "claude-opus-5.5"}
+        ))
+
+    def test_codex_bound_route_cannot_skip_preflight_via_renamed_executable(self):
+        with self.assertRaises(preflight.CodexPreflightDenied) as caught:
+            preflight.require_codex_review_preflight(["/usr/bin/custom-codex-wrapper", "review"], self.route)
+        self.assertEqual("not_codex", caught.exception.code)
 
     def test_catalogue_model_provider_and_effort_exact(self):
         self.assertEqual(("gpt-5.6-sol", "high"), preflight._exact_reviewer_model(self.command, self.route))
@@ -282,6 +319,38 @@ class CodexPreflightAdmissionTests(unittest.TestCase):
             self.assertFalse(receipt["provider_thread_request_sent"])
             self.assertEqual("invalid_rpc_reply", receipt["failure_classification"])
 
+
+    def test_openai_bound_role_non_codex_argv_rejected_before_job_directory(self):
+        import tempfile
+        from test_operator_contract import _load_operator_module
+        operator = _load_operator_module()
+        binding = {
+            "schema_version": 1, "kind": "grabowski_decision_review_binding",
+            "repo": "heimgewebe/grabowski", "pr": 1616,
+            "head_sha": "a" * 40, "base_sha": "b" * 40,
+            "diff_sha256": "c" * 64, "slot": "independent-codex",
+        }
+        args = ["python", "-I", "-m", "grabowski_agent_role",
+                "--role", "review", "--", "renamed-openai-client"]
+        with tempfile.TemporaryDirectory() as directory:
+            jobs = pathlib.Path(directory) / "jobs"
+            jobs.mkdir()
+            with mock.patch.object(operator, "_jobs_root", return_value=jobs), \
+                 mock.patch.object(operator, "_validate_argv", return_value=args), \
+                 mock.patch.object(operator, "_cleanup_stale_job_metadata_temps", return_value=[]), \
+                 mock.patch.object(operator, "_job_directory", side_effect=AssertionError("registered")) as created, \
+                 mock.patch.object(operator, "_append_effect_audit", return_value="d"*64) as audit, \
+                 mock.patch.object(operator.decision_reviews, "bind_job_review_role_argv", return_value=args), \
+                 mock.patch.object(operator.decision_reviews, "review_role_provenance", return_value={
+                     "review_route": {"provider_family": "openai", "model": "gpt-5.6-sol"}
+                 }), \
+                 mock.patch.object(operator.decision_reviews, "normalize_binding", return_value=binding):
+                with self.assertRaisesRegex(ValueError, "prelaunch admission denied: not_codex"):
+                    operator._start_job(args, cwd=directory, runtime_seconds=60,
+                                        decision_review_binding=binding)
+            created.assert_not_called()
+            self.assertEqual([], list(jobs.iterdir()))
+            self.assertEqual("not_codex", audit.call_args.args[0]["failure_classification"])
 
     def test_head_or_workspace_drift_after_metadata_blocks_job(self):
         import tempfile
