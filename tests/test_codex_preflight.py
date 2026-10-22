@@ -1,4 +1,6 @@
 """Synthetic app-server regression tests: no real credentials or provider calls."""
+import hashlib
+import json
 import pathlib
 import sys
 import unittest
@@ -182,8 +184,13 @@ class CodexPreflightProtocolTests(unittest.TestCase):
         signal_group.assert_not_called()
 
     def test_killpg_permission_failure_does_not_skip_cleanup(self):
-        with mock.patch.object(preflight.os, "killpg", side_effect=PermissionError("synthetic deny")):
-            self.assertEqual("metadata_accepted", self.probe()["status"])
+        # Trigger an actual preflight timeout, where the leader still exists,
+        # rather than a success path that must never signal a reaped PGID.
+        with mock.patch.object(
+            preflight.os, "killpg", side_effect=PermissionError("synthetic deny"),
+        ) as blocked:
+            self.assert_denied("timeout", "timeout", timeout=1)
+        blocked.assert_called_once()
 
     def test_preflight_never_forces_shared_auth_refresh(self):
         self.assertEqual("metadata_accepted", self.probe("refresh_forbidden")["status"])
@@ -232,12 +239,19 @@ class CodexPreflightProtocolTests(unittest.TestCase):
 
 
 class CodexPreflightBindingTests(unittest.TestCase):
-    route = {"provider_family": "openai", "model": "gpt-5.6-sol"}
     command = [
         "codex", "--model", "gpt-5.6-sol", "-c",
         'model_reasoning_effort="high"', "--sandbox", "read-only",
         "--ask-for-approval", "never", "Read-only review",
     ]
+    route = {
+        "provider_family": "openai",
+        "model": "gpt-5.6-sol",
+        "argv_prefix_sha256": hashlib.sha256(json.dumps(
+            command[:-1], ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")).hexdigest(),
+    }
 
     def test_non_codex_provider_skipped(self):
         self.assertIsNone(preflight.require_codex_review_preflight(
@@ -254,6 +268,7 @@ class CodexPreflightBindingTests(unittest.TestCase):
         for command, route, expected in (
             (self.command, {"provider_family": "other", "model": "gpt-5.6-sol"}, "provider_mismatch"),
             (self.command, {"provider_family": "openai", "model": "gpt-6-astra"}, "model_identity_mismatch"),
+            (["/tmp/rogue/codex", *self.command[1:]], self.route, "not_codex"),
             (["codex", "--model", "gpt-5.6-sol", "review"], self.route, "effort_identity_unavailable"),
             (["codex", "--model", "gpt-5.6-sol", "--model", "other", "-c",
               'model_reasoning_effort="high"', "review"], self.route, "model_identity_unavailable"),
@@ -273,6 +288,10 @@ class CodexPreflightBindingTests(unittest.TestCase):
             ["-p", "other"],
             ["--oss"],
             ["-m", "gpt-5.6-luna"],
+            ["-mgpt-5.6-luna"],
+            ["-pevil"],
+            ["--local-provider", "ollama"],
+            ["--local-provider=ollama"],
             ["--model=gpt-5.6-luna"],
             ["-c", "model_provider=evil"],
         ]
@@ -283,15 +302,31 @@ class CodexPreflightBindingTests(unittest.TestCase):
                     preflight._exact_reviewer_model(command, self.route)
                 self.assertEqual("unsupported_reviewer_config", caught.exception.code)
 
+    def test_override_as_trailing_argv_is_denied_not_treated_as_prompt(self):
+        for option in ("--oss", "--profile=evil", "--config=model_provider=evil",
+                       "-cmodel_provider=evil", "--model=other", "-pevil", "-mfoo"):
+            with self.subTest(option=option):
+                with self.assertRaises(preflight.CodexPreflightDenied) as caught:
+                    preflight._exact_reviewer_model([*self.command, option], self.route)
+                self.assertEqual("unsupported_reviewer_config", caught.exception.code)
+
+    def test_missing_or_different_catalogue_prefix_is_denied(self):
+        changed = [*self.command[:-1], "--sandbox", "workspace-write", self.command[-1]]
+        with self.assertRaises(preflight.CodexPreflightDenied) as caught:
+            preflight._exact_reviewer_model(changed, self.route)
+        self.assertEqual("route_identity_mismatch", caught.exception.code)
+        with self.assertRaises(preflight.CodexPreflightDenied) as caught:
+            preflight._exact_reviewer_model(self.command, {"provider_family": "openai", "model": "gpt-5.6-sol"})
+        self.assertEqual("route_identity_unavailable", caught.exception.code)
+
     def test_effort_key_whitespace_is_normalized_and_revalidated(self):
         original = list(self.command)
         pos = original.index("model_reasoning_effort=\"high\"")
         original[pos] = 'model_reasoning_effort = "low"'
         # Whitespace-normalized effort may never masquerade as catalogue high.
-        self.assertEqual(
-            ("gpt-5.6-sol", "low"),
-            preflight._exact_reviewer_model(original, self.route),
-        )
+        with self.assertRaises(preflight.CodexPreflightDenied) as caught:
+            preflight._exact_reviewer_model(original, self.route)
+        self.assertEqual("route_identity_mismatch", caught.exception.code)
 
     def test_owner_dedicated_sandbox_binding_and_no_direct_provider_argv(self):
         from grabowski_agent_sandbox import PreparedSandboxCommand
@@ -302,7 +337,9 @@ class CodexPreflightBindingTests(unittest.TestCase):
             extra_directories=(pathlib.Path("/tmp/.codex"),),
         )
         with mock.patch("grabowski_agent_sandbox.prepare_external_agent_command", return_value=fake) as prepare, \
-             mock.patch("grabowski_agent_sandbox.minimal_sandbox_argv", return_value=["bounded-bwrap"]) as sandbox, \
+             mock.patch("grabowski_agent_sandbox.minimal_sandbox_argv", return_value=[
+                 "bounded-bwrap", "--unshare-pid", "--die-with-parent",
+             ]) as sandbox, \
              mock.patch("grabowski_agent_sandbox.runtime_sandbox_argv", side_effect=lambda x: x), \
              mock.patch.object(preflight, "_check_protocol", return_value={"status": "metadata_accepted"}) as rpc:
             self.assertEqual(
@@ -312,7 +349,31 @@ class CodexPreflightBindingTests(unittest.TestCase):
         self.assertEqual(["codex", "--model", "gpt-5.6-sol", "app-server"], prepare.call_args.args[0])
         self.assertFalse(sandbox.call_args.kwargs["workspace_writable"])
         self.assertEqual(fake.extra_read_write, sandbox.call_args.kwargs["extra_read_write"])
-        self.assertEqual(["bounded-bwrap"], rpc.call_args.args[0])
+        self.assertEqual(
+            ["bounded-bwrap", "--unshare-pid", "--die-with-parent"],
+            rpc.call_args.args[0],
+        )
+
+    def test_missing_pid_namespace_refuses_preflight_before_provider_start(self):
+        from grabowski_agent_sandbox import PreparedSandboxCommand
+        fake = PreparedSandboxCommand(
+            command=("authenticated-launch", "app-server"),
+            extra_read_only=(), extra_read_write=(), extra_directories=(),
+        )
+        with mock.patch(
+            "grabowski_agent_sandbox.prepare_external_agent_command",
+            return_value=fake,
+        ), mock.patch(
+            "grabowski_agent_sandbox.minimal_sandbox_argv",
+            return_value=["bounded-bwrap", "--die-with-parent"],
+        ), mock.patch(
+            "grabowski_agent_sandbox.runtime_sandbox_argv",
+            side_effect=lambda x: x,
+        ), mock.patch.object(preflight, "_check_protocol") as called:
+            with self.assertRaises(preflight.CodexPreflightDenied) as caught:
+                preflight.require_codex_review_preflight(self.command, self.route)
+        self.assertEqual("sandbox_unavailable", caught.exception.code)
+        called.assert_not_called()
 
     def test_missing_private_auth_fails_closed_without_host_login(self):
         from grabowski_agent_sandbox import AgentSandboxError

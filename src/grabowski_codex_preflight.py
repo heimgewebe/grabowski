@@ -7,6 +7,7 @@ No provider output, account ID, token or raw error is retained.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -37,7 +38,7 @@ class CodexPreflightDenied(RuntimeError):
 
 
 def _exact_reviewer_model(command: list[str], route: dict[str, Any]) -> tuple[str, str]:
-    if not command or Path(command[0]).name != "codex":
+    if not command or command[0] != "codex":
         raise CodexPreflightDenied("not_codex")
     if route.get("provider_family") != "openai":
         raise CodexPreflightDenied("provider_mismatch")
@@ -47,16 +48,23 @@ def _exact_reviewer_model(command: list[str], route: dict[str, Any]) -> tuple[st
     model = command[model_flags[0] + 1]
     if model != route.get("model") or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{1,99}", model) is None:
         raise CodexPreflightDenied("model_identity_mismatch")
-    # A review may not silently override the preflight's default provider,
-    # profile, model or effort through alternate Codex CLI option spellings.
-    forbidden = {"--config", "--profile", "-p", "--oss", "-m"}
+    # The exact catalogue argv prefix is stronger than a CLI-option
+    # denylist: no alternative model, profile, provider or effort can enter
+    # after preflight, including attached short flags and future spellings.
+    # The final positional prompt must not itself be an override option.
+    if not command[-1].strip() or command[-1].startswith("-"):
+        raise CodexPreflightDenied("unsupported_reviewer_config")
+    forbidden_prefixes = (
+        "--config", "--profile", "--oss", "--local-provider",
+        "--model=", "-p", "-m", "-c",
+    )
     efforts = []
     index = 0
     while index < len(command) - 1:
         arg = command[index]
         if (
-            arg in forbidden or arg.startswith(("--config=", "--profile=", "-c", "--model="))
-            and arg != "-c"
+            (arg.startswith(forbidden_prefixes) and arg != "-c")
+            or arg in {"-p", "-m"}
         ):
             raise CodexPreflightDenied("unsupported_reviewer_config")
         if arg == "-c":
@@ -72,6 +80,15 @@ def _exact_reviewer_model(command: list[str], route: dict[str, Any]) -> tuple[st
         index += 1
     if len(efforts) != 1 or efforts[0] not in {"low", "medium", "high", "xhigh"}:
         raise CodexPreflightDenied("effort_identity_unavailable")
+    expected_prefix = route.get("argv_prefix_sha256")
+    if not isinstance(expected_prefix, str) or re.fullmatch(r"[0-9a-f]{64}", expected_prefix) is None:
+        raise CodexPreflightDenied("route_identity_unavailable")
+    observed_prefix = hashlib.sha256(json.dumps(
+        command[:-1], ensure_ascii=False, sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    if observed_prefix != expected_prefix:
+        raise CodexPreflightDenied("route_identity_mismatch")
     return model, efforts[0]
 
 
@@ -333,7 +350,7 @@ def _check_protocol(argv: list[str], *, model: str, effort: str, deadline_second
 
 def require_codex_review_preflight(command: list[str], route: dict[str, Any]) -> dict[str, Any] | None:
     """Invoke identical durable reviewer auth in a minimal isolated preflight sandbox."""
-    if not command or Path(command[0]).name != "codex":
+    if not command or command[0] != "codex":
         if route.get("provider_family") == "openai":
             raise CodexPreflightDenied("not_codex")
         return None
@@ -354,6 +371,11 @@ def require_codex_review_preflight(command: list[str], route: dict[str, Any]) ->
                 extra_read_write=prepared.extra_read_write,
                 extra_directories=prepared.extra_directories,
             ))
+            # A reaped preflight leader must not leave token-using children
+            # alive. Rely on the pre-existing private PID namespace and
+            # die-with-parent fence, never kill a recycled process group.
+            if "--unshare-pid" not in argv or "--die-with-parent" not in argv:
+                raise CodexPreflightDenied("sandbox_unavailable")
             return _check_protocol(argv, model=model, effort=effort)
     except CodexPreflightDenied:
         raise
