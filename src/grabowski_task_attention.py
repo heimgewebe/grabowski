@@ -2709,6 +2709,19 @@ def reconcile_archived_task_outputs(
             )
 
 
+def _require_host_authenticated_archive_retirement(_record: dict[str, Any]) -> None:
+    """Deny NEW immutable archives until independent restart exclusion exists.
+
+    A terminal TaskStore row, today's Fleet route, inactive systemd status and
+    same-UID launch markers cannot prove that historical task attempts will
+    never restart. Existing archive replay is handled before this gate.
+    No external host or root probe is allowed as a substitute for this proof.
+    """
+    raise TaskAttentionConflictError(
+        "independently authenticated task retirement proof is required (#1556)"
+    )
+
+
 def execute_closeout_archive(parameters: dict[str, Any]) -> dict[str, Any]:
     import grabowski_lifecycle_archive as lifecycle
     import grabowski_lifecycle_effect_plan as effect_plan
@@ -2817,6 +2830,10 @@ def execute_closeout_archive(parameters: dict[str, Any]) -> dict[str, Any]:
                 "blind_retry_after_recovery_required",
             ],
         }
+
+    # Existing archived projection replay above needs no NEW retirement claim.
+    # Deny new irreversible switches before liveness probes, locks or writes.
+    _require_host_authenticated_archive_retirement(record)
 
     now_unix = int(time.time())
     retention_boundary_unix = _assert_task_archive_retention(

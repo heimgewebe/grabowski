@@ -224,6 +224,16 @@ class TaskAttentionTests(unittest.TestCase):
         value.update(overrides)
         return value
 
+    def _archive_with_test_only_retirement_authority(
+        self, parameters: dict[str, object]
+    ) -> dict[str, object]:
+        # Synthetic lifecycle setup only: never production retirement evidence.
+        with patch.object(
+            attention, "_require_host_authenticated_archive_retirement",
+            return_value=None,
+        ):
+            return attention.execute_closeout_archive(parameters)
+
     @staticmethod
     def _inactive_process_observation() -> dict[str, object]:
         return {
@@ -1929,6 +1939,71 @@ class TaskAttentionTests(unittest.TestCase):
         self.assertTrue(result["cycle_completed"])
         self.assertIsNone(result["cursor_after"])
 
+    def test_new_archive_requires_independent_retirement_before_external_probe(self) -> None:
+        record = self._completed_task()
+        before = self.database.read_bytes()
+        with (
+            patch.object(tasks, "_observe", side_effect=AssertionError("must not probe")) as probe,
+            patch.object(
+                attention, "_assert_no_live_task_process",
+                side_effect=AssertionError("must not observe processes"),
+            ) as process,
+            self.assertRaisesRegex(
+                attention.TaskAttentionConflictError,
+                "independently authenticated task retirement proof is required",
+            ),
+        ):
+            attention.execute_closeout_archive(self._archive_parameters(record))
+        probe.assert_not_called()
+        process.assert_not_called()
+        self.assertEqual(before, self.database.read_bytes())
+        self.assertFalse(self.archive_root.exists())
+        self.assertFalse(self.projection_root.exists())
+
+    def test_new_archive_does_not_trust_remote_or_root_unit_liveness(self) -> None:
+        record = self._completed_task()
+        before = self.database.read_bytes()
+        for remote, privileged in ((True, False), (False, True)):
+            with self.subTest(remote=remote, privileged=privileged):
+                with (
+                    patch.object(tasks, "_is_root_systemd_backend", return_value=privileged),
+                    patch.object(
+                        tasks, "_resolve_task_dispatch_host",
+                        return_value=(
+                            "remote" if remote else "local",
+                            {"transport": "ssh" if remote else "local"},
+                            False,
+                        ),
+                    ) as host,
+                    patch.object(
+                        tasks, "_observe", side_effect=AssertionError("must not probe")
+                    ) as probe,
+                    self.assertRaisesRegex(
+                        attention.TaskAttentionConflictError,
+                        "independently authenticated task retirement proof is required",
+                    ),
+                ):
+                    attention.execute_closeout_archive(self._archive_parameters(record))
+                host.assert_not_called()
+                probe.assert_not_called()
+                self.assertEqual(before, self.database.read_bytes())
+                self.assertFalse(self.archive_root.exists())
+                self.assertFalse(self.projection_root.exists())
+
+    def test_existing_archive_replay_does_not_need_new_retirement(self) -> None:
+        record = self._completed_task()
+        parameters = self._archive_parameters(record)
+        with patch.object(tasks, "_observe", return_value=self._inactive_process_observation()):
+            fixture = self._archive_with_test_only_retirement_authority(parameters)
+            replay = attention.execute_closeout_archive(parameters)
+        self.assertFalse(fixture["already_archived"])
+        self.assertTrue(replay["already_archived"])
+        self.assertTrue(replay["idempotent_replay"])
+        self.assertEqual(
+            fixture["projection"]["projection_sha256"],
+            replay["projection"]["projection_sha256"],
+        )
+
     def test_closeout_archive_completed_task_writes_segment_and_projection_idempotently(self) -> None:
         record = self._completed_task()
         parameters = self._archive_parameters(record)
@@ -1938,8 +2013,8 @@ class TaskAttentionTests(unittest.TestCase):
             "_observe",
             return_value=self._inactive_process_observation(),
         ):
-            first = attention.execute_closeout_archive(parameters)
-            second = attention.execute_closeout_archive(parameters)
+            first = self._archive_with_test_only_retirement_authority(parameters)
+            second = self._archive_with_test_only_retirement_authority(parameters)
 
         self.assertFalse(first["already_archived"])
         self.assertEqual("released", first["resource_release"]["status"])
@@ -1986,7 +2061,7 @@ class TaskAttentionTests(unittest.TestCase):
             "_task_output_cleanup_all_attempts_after_archive",
             side_effect=cleanup,
         ):
-            result = attention.execute_closeout_archive(parameters)
+            result = self._archive_with_test_only_retirement_authority(parameters)
 
         self.assertEqual("released", result["resource_release"]["status"])
         self.assertEqual([None, None, None], observed)
@@ -2016,7 +2091,7 @@ class TaskAttentionTests(unittest.TestCase):
                 attention.TaskAttentionConflictError,
                 "could not be released before output cleanup",
             ):
-                attention.execute_closeout_archive(parameters)
+                self._archive_with_test_only_retirement_authority(parameters)
 
         cleanup.assert_not_called()
 
@@ -2030,12 +2105,12 @@ class TaskAttentionTests(unittest.TestCase):
             "_observe",
             return_value=self._inactive_process_observation(),
         ):
-            first = attention.execute_closeout_archive(
+            first = self._archive_with_test_only_retirement_authority(
                 self._archive_parameters(
                     first_record, execution_id=shared_execution_id
                 )
             )
-            second = attention.execute_closeout_archive(
+            second = self._archive_with_test_only_retirement_authority(
                 self._archive_parameters(
                     second_record, execution_id=shared_execution_id
                 )
@@ -2065,7 +2140,7 @@ class TaskAttentionTests(unittest.TestCase):
             "_observe",
             return_value=self._inactive_process_observation(),
         ):
-            first = attention.execute_closeout_archive(parameters)
+            first = self._archive_with_test_only_retirement_authority(parameters)
 
         owner = (
             "operator:task-closeout-archive:"
@@ -2085,7 +2160,7 @@ class TaskAttentionTests(unittest.TestCase):
             ttl_seconds=60,
         )
 
-        replay = attention.execute_closeout_archive(parameters)
+        replay = self._archive_with_test_only_retirement_authority(parameters)
 
         self.assertTrue(replay["already_archived"])
         self.assertEqual("released", replay["resource_release"]["status"])
@@ -2104,7 +2179,7 @@ class TaskAttentionTests(unittest.TestCase):
             "_observe",
             return_value=self._inactive_process_observation(),
         ):
-            first = attention.execute_closeout_archive(parameters)
+            first = self._archive_with_test_only_retirement_authority(parameters)
 
         owner = (
             "operator:task-closeout-archive:"
@@ -2138,7 +2213,7 @@ class TaskAttentionTests(unittest.TestCase):
             "_task_output_cleanup_all_attempts_after_archive",
             side_effect=cleanup,
         ):
-            replay = attention.execute_closeout_archive(parameters)
+            replay = self._archive_with_test_only_retirement_authority(parameters)
 
         self.assertTrue(replay["already_archived"])
         self.assertEqual("released", replay["resource_release"]["status"])
@@ -2152,7 +2227,7 @@ class TaskAttentionTests(unittest.TestCase):
             "_observe",
             return_value=self._inactive_process_observation(),
         ):
-            attention.execute_closeout_archive(parameters)
+            self._archive_with_test_only_retirement_authority(parameters)
 
         with patch.object(
             attention,
@@ -2171,7 +2246,7 @@ class TaskAttentionTests(unittest.TestCase):
                 attention.TaskAttentionConflictError,
                 "could not be released before output cleanup",
             ):
-                attention.execute_closeout_archive(parameters)
+                self._archive_with_test_only_retirement_authority(parameters)
 
         cleanup.assert_not_called()
 
@@ -2182,7 +2257,7 @@ class TaskAttentionTests(unittest.TestCase):
             attention.TaskAttentionConflictError,
             "not ready for archival",
         ):
-            attention.execute_closeout_archive(self._archive_parameters(record))
+            self._archive_with_test_only_retirement_authority(self._archive_parameters(record))
 
     def test_closeout_archive_failed_task_accepts_closed_decision(self) -> None:
         record = self._failed_task()
@@ -2193,7 +2268,7 @@ class TaskAttentionTests(unittest.TestCase):
             "_observe",
             return_value=self._inactive_process_observation(),
         ):
-            result = attention.execute_closeout_archive(
+            result = self._archive_with_test_only_retirement_authority(
                 self._archive_parameters(record)
             )
 
@@ -2208,7 +2283,7 @@ class TaskAttentionTests(unittest.TestCase):
             attention.TaskAttentionConflictError,
             "minimum retention",
         ):
-            attention.execute_closeout_archive(
+            self._archive_with_test_only_retirement_authority(
                 self._archive_parameters(record, minimum_age_seconds=10**9)
             )
 
@@ -2230,7 +2305,7 @@ class TaskAttentionTests(unittest.TestCase):
             attention.TaskAttentionConflictError,
             "still live",
         ):
-            attention.execute_closeout_archive(self._archive_parameters(record))
+            self._archive_with_test_only_retirement_authority(self._archive_parameters(record))
 
     def test_closeout_archive_blocks_reacquired_task_resource_lease(self) -> None:
         resource_key = "component:test-task-closeout-archive"
@@ -2251,7 +2326,7 @@ class TaskAttentionTests(unittest.TestCase):
                 attention.TaskAttentionConflictError,
                 "active task resource leases",
             ):
-                attention.execute_closeout_archive(self._archive_parameters(record))
+                self._archive_with_test_only_retirement_authority(self._archive_parameters(record))
         finally:
             tasks.resources.release_resources(foreign_owner, [resource_key])
 
