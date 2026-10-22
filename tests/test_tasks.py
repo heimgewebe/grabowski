@@ -4,6 +4,7 @@ import ast
 import asyncio
 from contextlib import closing, contextmanager
 import base64
+import errno
 import hashlib
 import inspect
 import io
@@ -1986,6 +1987,87 @@ class TaskTests(unittest.TestCase):
                 self.assertEqual("unproven", receipt["stdout_capture_status"])
                 self.assertEqual(expected, receipt["stdout_capture_reason"])
                 self.assertIsNone(receipt["captured_stdout_sha256"])
+
+    def test_terminal_stdout_lease_conflict_never_blocks_terminal_state(self) -> None:
+        # O_NONBLOCK on a Linux write-leased regular file may raise EAGAIN
+        # rather than block. The task's output observation is then unproven.
+        for stream in ("stdout", "stderr"):
+            for code in (errno.EAGAIN, errno.ETXTBSY):
+                with self.subTest(stream=stream, errno=code):
+                    identifier, _ = self._managed_terminal_stdout_fixture(b"source")
+                    original_open = os.open
+                    target_name = f"{stream}.log"
+
+                    def denied_open(path, flags, *args, **kwargs):
+                        if path == target_name:
+                            raise BlockingIOError(code, "write lease conflicts with read", target_name)
+                        return original_open(path, flags, *args, **kwargs)
+
+                    with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+                        tasks.os, "open", side_effect=denied_open
+                    ):
+                        stored = tasks._set_state(identifier, "failed")
+                    self.assertEqual("failed", stored["state"])
+                    self.assertEqual(
+                        "projected", tasks.resources.task_terminalization_record(identifier)["phase"]
+                    )
+                    receipt = json.loads(
+                        (tasks.TASK_OUTCOMES_DIR / f"{identifier}.json").read_text()
+                    )
+                    self.assertEqual("unproven", receipt["stdout_capture_status"])
+                    self.assertEqual(f"{stream}-unsafe", receipt["stdout_capture_reason"])
+
+    def test_terminal_stdout_root_symlink_and_writable_mode_are_unproven(self) -> None:
+        for kind in ("symlink", "world-writable"):
+            with self.subTest(kind=kind):
+                identifier, stdout = self._managed_terminal_stdout_fixture(b"source")
+                root = stdout.parent.parent
+                saved = root.with_name(root.name + "-original")
+                if kind == "symlink":
+                    root.rename(saved)
+                    root.symlink_to(saved, target_is_directory=True)
+                else:
+                    os.chmod(root, 0o777)
+                try:
+                    with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST):
+                        stored = tasks._set_state(identifier, "failed")
+                finally:
+                    if kind == "symlink":
+                        root.unlink()
+                        saved.rename(root)
+                    else:
+                        os.chmod(root, 0o700)
+                self.assertEqual("failed", stored["state"])
+                receipt = json.loads(
+                    (tasks.TASK_OUTCOMES_DIR / f"{identifier}.json").read_text()
+                )
+                self.assertEqual("unproven", receipt["stdout_capture_status"])
+                self.assertEqual("output-root-unsafe", receipt["stdout_capture_reason"])
+                self.assertEqual(
+                    "projected", tasks.resources.task_terminalization_record(identifier)["phase"]
+                )
+
+    def test_managed_task_output_reader_rejects_fifo_without_blocking(self) -> None:
+        for stream in ("stdout", "stderr"):
+            with self.subTest(stream=stream):
+                identifier, stdout = self._managed_terminal_stdout_fixture(b"read")
+                target = stdout if stream == "stdout" else stdout.with_name("stderr.log")
+                target.unlink()
+                os.mkfifo(target, 0o600)
+                original_open = os.open
+
+                def guarded_open(path, flags, *args, **kwargs):
+                    if path == target.name and not flags & os.O_NONBLOCK:
+                        raise AssertionError("reader would block on a FIFO")
+                    return original_open(path, flags, *args, **kwargs)
+
+                with patch.object(tasks.os, "open", side_effect=guarded_open):
+                    with self.assertRaisesRegex(
+                        RuntimeError, f"task {stream} output identity is unsafe"
+                    ):
+                        tasks._read_local_task_output_files(
+                            tasks._row_raw(identifier), max_lines=20
+                        )
 
     def test_terminal_stdout_seal_validator_rejects_forged_status_and_type(self) -> None:
         valid = {

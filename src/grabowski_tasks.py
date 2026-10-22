@@ -6358,6 +6358,10 @@ def _ensure_local_task_output_root() -> None:
         os.close(parent_fd)
 
 
+class _TaskOutputRootUnsafeMetadata(RuntimeError):
+    """Stable but unsafe capture-root metadata, not an identity race."""
+
+
 def _open_local_task_output_root(root: Path) -> tuple[int, os.stat_result]:
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
     if hasattr(os, "O_NOFOLLOW"):
@@ -6369,17 +6373,21 @@ def _open_local_task_output_root(root: Path) -> tuple[int, os.stat_result]:
     opened = os.fstat(descriptor)
     linked = root.lstat()
     if (
+        _task_output_inode_identity(opened)
+        != _task_output_inode_identity(linked)
+        or opened.st_nlink < 1
+    ):
+        os.close(descriptor)
+        raise RuntimeError("task output parent changed identity during read")
+    if (
         not stat.S_ISDIR(opened.st_mode)
         or stat.S_ISLNK(linked.st_mode)
-        or _task_output_inode_identity(opened)
-        != _task_output_inode_identity(linked)
         or opened.st_uid != os.geteuid()
         or opened.st_gid != os.getegid()
-        or opened.st_nlink < 1
         or (stat.S_IMODE(opened.st_mode) & 0o022) != 0
     ):
         os.close(descriptor)
-        raise RuntimeError("task output parent identity is unsafe")
+        raise _TaskOutputRootUnsafeMetadata("task output parent identity is unsafe")
     return descriptor, opened
 
 
@@ -6458,15 +6466,25 @@ def _terminal_stdout_seal(record: dict[str, Any]) -> dict[str, Any]:
         return unproven("remote-transport")
     paths = _task_output_paths(record)
     root = paths["directory"].parent
-    if not root.exists():
+    try:
+        root_present = root.exists()
+    except OSError as exc:
+        if exc.errno in {errno.EACCES, errno.EPERM, errno.ELOOP, errno.ENOTDIR}:
+            return unproven("output-root-unsafe")
+        raise
+    if not root_present:
         return unproven("output-root-missing")
     try:
         root_fd, root_before = _open_local_task_output_root(root)
+    except _TaskOutputRootUnsafeMetadata:
+        return unproven("output-root-unsafe")
     except RuntimeError as exc:
-        # Known permission denial only degrades output evidence. Other
-        # root or identity/I/O errors remain fail-closed.
+        # No bytes were read. Known path-denial errors only degrade output
+        # evidence; ambiguous inode races and EIO remain fail-closed.
         cause = exc.__cause__
-        if isinstance(cause, OSError) and cause.errno in {errno.EACCES, errno.EPERM}:
+        if isinstance(cause, OSError) and cause.errno in {
+            errno.EACCES, errno.EPERM, errno.ELOOP, errno.ENOTDIR
+        }:
             return unproven("output-root-unsafe")
         raise
     # Non-regular same-UID capture entries (notably FIFOs) must never stall
@@ -6508,7 +6526,7 @@ def _terminal_stdout_seal(record: dict[str, Any]) -> dict[str, Any]:
             except FileNotFoundError:
                 return unproven("stdout-missing")
             except OSError as exc:
-                if exc.errno in {errno.ELOOP, errno.EACCES, errno.EPERM, errno.ENXIO}:
+                if exc.errno in {errno.ELOOP, errno.EACCES, errno.EPERM, errno.ENXIO, errno.EAGAIN, errno.EWOULDBLOCK, errno.ETXTBSY}:
                     return unproven("stdout-unsafe")
                 raise RuntimeError("task stdout could not be opened safely") from exc
             try:
@@ -6535,7 +6553,7 @@ def _terminal_stdout_seal(record: dict[str, Any]) -> dict[str, Any]:
                 except FileNotFoundError:
                     return unproven("stderr-missing")
                 except OSError as exc:
-                    if exc.errno in {errno.ELOOP, errno.EACCES, errno.EPERM, errno.ENXIO}:
+                    if exc.errno in {errno.ELOOP, errno.EACCES, errno.EPERM, errno.ENXIO, errno.EAGAIN, errno.EWOULDBLOCK, errno.ETXTBSY}:
                         return unproven("stderr-unsafe")
                     raise RuntimeError("task stderr could not be opened safely") from exc
                 try:
@@ -6690,7 +6708,7 @@ def _read_local_task_output_files(
                 path = paths[stream]
                 if path.parent != directory:
                     raise RuntimeError("task output path escaped its directory")
-                flags = os.O_RDONLY | os.O_CLOEXEC
+                flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
                 if hasattr(os, "O_NOFOLLOW"):
                     flags |= os.O_NOFOLLOW
                 try:
