@@ -369,25 +369,38 @@ def require_codex_review_preflight(command: list[str], route: dict[str, Any]) ->
     model, effort = _exact_reviewer_model(command, route)
     try:
         from grabowski_agent_sandbox import (
-            prepare_external_agent_command, minimal_sandbox_argv, runtime_sandbox_argv,
+            BWRAP, prepare_external_agent_command, minimal_sandbox_argv,
+            runtime_sandbox_argv,
         )
         # The same dedicated, owner-private auth file and serialized lock as
         # the real Codex reviewer; never fall back to the host ~/.codex.
         prepared = prepare_external_agent_command(["codex", "--model", model, "app-server"])
         with tempfile.TemporaryDirectory(prefix="grabowski-codex-preflight-") as directory:
-            argv = runtime_sandbox_argv(minimal_sandbox_argv(
+            sandbox_argv = minimal_sandbox_argv(
                 workspace=Path(directory),
                 command=list(prepared.command),
                 workspace_writable=False,
                 extra_read_only=prepared.extra_read_only,
                 extra_read_write=prepared.extra_read_write,
                 extra_directories=prepared.extra_directories,
-            ))
-            # A reaped preflight leader must not leave token-using children
-            # alive. Rely on the pre-existing private PID namespace and
-            # die-with-parent fence, never kill a recycled process group.
-            if "--unshare-pid" not in argv or "--die-with-parent" not in argv:
+            )
+            # Check the actual bwrap control-options section, never flags
+            # injected into the inner command after the "--" separator.
+            try:
+                command_start = sandbox_argv.index("--")
+            except ValueError:
+                raise CodexPreflightDenied("sandbox_unavailable") from None
+            if (
+                not sandbox_argv
+                or sandbox_argv[0] != str(BWRAP)
+                or "--unshare-pid" not in sandbox_argv[1:command_start]
+                or "--die-with-parent" not in sandbox_argv[1:command_start]
+            ):
                 raise CodexPreflightDenied("sandbox_unavailable")
+            # Runtime resolution pins argv[0] to the verified bwrap binary.
+            # Its --unshare-pid/--die-with-parent gate prevents descendants
+            # outliving the leader even when the launcher is reaped.
+            argv = runtime_sandbox_argv(sandbox_argv)
             return _check_protocol(argv, model=model, effort=effort)
     except CodexPreflightDenied:
         raise

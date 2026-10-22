@@ -355,7 +355,7 @@ class CodexPreflightBindingTests(unittest.TestCase):
         self.assertEqual("route_identity_mismatch", caught.exception.code)
 
     def test_owner_dedicated_sandbox_binding_and_no_direct_provider_argv(self):
-        from grabowski_agent_sandbox import PreparedSandboxCommand
+        from grabowski_agent_sandbox import PreparedSandboxCommand, BWRAP
         fake = PreparedSandboxCommand(
             command=("authenticated-launch", "app-server"),
             extra_read_only=((pathlib.Path("/usr/bin/true"), pathlib.Path("/opt/codex")),),
@@ -364,7 +364,8 @@ class CodexPreflightBindingTests(unittest.TestCase):
         )
         with mock.patch("grabowski_agent_sandbox.prepare_external_agent_command", return_value=fake) as prepare, \
              mock.patch("grabowski_agent_sandbox.minimal_sandbox_argv", return_value=[
-                 "bounded-bwrap", "--unshare-pid", "--die-with-parent",
+                 str(BWRAP), "--unshare-pid", "--die-with-parent",
+                 "--", "authenticated-launch",
              ]) as sandbox, \
              mock.patch("grabowski_agent_sandbox.runtime_sandbox_argv", side_effect=lambda x: x), \
              mock.patch.object(preflight, "_check_protocol", return_value={"status": "metadata_accepted"}) as rpc:
@@ -376,12 +377,13 @@ class CodexPreflightBindingTests(unittest.TestCase):
         self.assertFalse(sandbox.call_args.kwargs["workspace_writable"])
         self.assertEqual(fake.extra_read_write, sandbox.call_args.kwargs["extra_read_write"])
         self.assertEqual(
-            ["bounded-bwrap", "--unshare-pid", "--die-with-parent"],
+            [str(BWRAP), "--unshare-pid", "--die-with-parent",
+             "--", "authenticated-launch"],
             rpc.call_args.args[0],
         )
 
     def test_missing_pid_namespace_refuses_preflight_before_provider_start(self):
-        from grabowski_agent_sandbox import PreparedSandboxCommand
+        from grabowski_agent_sandbox import PreparedSandboxCommand, BWRAP
         fake = PreparedSandboxCommand(
             command=("authenticated-launch", "app-server"),
             extra_read_only=(), extra_read_write=(), extra_directories=(),
@@ -391,7 +393,7 @@ class CodexPreflightBindingTests(unittest.TestCase):
             return_value=fake,
         ), mock.patch(
             "grabowski_agent_sandbox.minimal_sandbox_argv",
-            return_value=["bounded-bwrap", "--die-with-parent"],
+            return_value=[str(BWRAP), "--die-with-parent", "--", "authenticated-launch"],
         ), mock.patch(
             "grabowski_agent_sandbox.runtime_sandbox_argv",
             side_effect=lambda x: x,
@@ -400,6 +402,35 @@ class CodexPreflightBindingTests(unittest.TestCase):
                 preflight.require_codex_review_preflight(self.command, self.route)
         self.assertEqual("sandbox_unavailable", caught.exception.code)
         called.assert_not_called()
+
+    def test_pid_flags_after_sandbox_separator_or_non_bwrap_wrapper_are_denied(self):
+        from grabowski_agent_sandbox import PreparedSandboxCommand, BWRAP
+        fake = PreparedSandboxCommand(
+            command=("authenticated-launch", "app-server"),
+            extra_read_only=(), extra_read_write=(), extra_directories=(),
+        )
+        variants = (
+            [str(BWRAP), "--", "authenticated-launch",
+             "--unshare-pid", "--die-with-parent"],
+            ["/tmp/not-bwrap", "--unshare-pid", "--die-with-parent",
+             "--", "authenticated-launch"],
+        )
+        for fake_argv in variants:
+            with self.subTest(fake_argv=fake_argv):
+                with mock.patch(
+                    "grabowski_agent_sandbox.prepare_external_agent_command",
+                    return_value=fake,
+                ), mock.patch(
+                    "grabowski_agent_sandbox.minimal_sandbox_argv",
+                    return_value=fake_argv,
+                ), mock.patch(
+                    "grabowski_agent_sandbox.runtime_sandbox_argv",
+                    side_effect=lambda x: x,
+                ), mock.patch.object(preflight, "_check_protocol") as called:
+                    with self.assertRaises(preflight.CodexPreflightDenied) as caught:
+                        preflight.require_codex_review_preflight(self.command, self.route)
+                self.assertEqual("sandbox_unavailable", caught.exception.code)
+                called.assert_not_called()
 
     def test_missing_private_auth_fails_closed_without_host_login(self):
         from grabowski_agent_sandbox import AgentSandboxError
@@ -640,6 +671,30 @@ class CodexPreflightRealBindingTests(unittest.TestCase):
             with self.assertRaises(preflight.CodexPreflightDenied) as caught:
                 preflight._exact_reviewer_model(changed, provenance["review_route"])
             self.assertEqual("route_identity_mismatch", caught.exception.code)
+            # A real canonical role cannot be paired with a different CLI
+            # executable or provider slot. No mocked provenance is involved.
+            sep = second.index("--")
+            for bad in (
+                ["env", "codex", *command[1:]],
+                ["codex-x86_64-unknown-linux-musl", *command[1:]],
+                ["node", "/tmp/codex.js", *command[1:]],
+                ["/usr/local/bin/codex", *command[1:]],
+                ["cdx", *command[1:]],
+            ):
+                with self.subTest(bad=bad):
+                    spoofed = [*second[:sep + 1], *bad]
+                    self.assertIsNone(reviews.review_role_provenance(
+                        spoofed, binding, cwd=repo, attempt_directory=attempt,
+                    ))
+                    with self.assertRaises(ValueError):
+                        reviews.bind_job_review_role_argv(
+                            spoofed, binding, cwd=repo, attempt_directory=attempt,
+                        )
+            wrong_provider = {**binding, "slot": "independent-claude"}
+            with self.assertRaises(ValueError):
+                reviews.bind_job_review_role_argv(
+                    second, wrong_provider, cwd=repo, attempt_directory=attempt,
+                )
 
 if __name__ == "__main__":
     unittest.main()
