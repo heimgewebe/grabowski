@@ -53,6 +53,35 @@ else:
 
 
 class AgentCompetitionTests(unittest.TestCase):
+    def test_build_source_requires_explicit_file_scope_not_ancestor(self) -> None:
+        source = "apps/web/src/routes/build/+page.svelte"
+        file = self.repo / source
+        file.parent.mkdir(parents=True)
+        file.write_text("<h1>Build diagnostics</h1>\n", encoding="utf-8")
+        subprocess.run(["git", "add", "--", source], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-qm", "add special source"], cwd=self.repo, check=True)
+        head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.repo, text=True).strip()
+        with (
+            mock.patch.object(
+                competition.tasks, "grabowski_task_start",
+                return_value=self._task_start("unexpected-build-export"),
+            ) as start,
+            self.assertRaisesRegex(competition.AgentCompetitionError, "explicit build source"),
+        ):
+            self._authorized_start(
+                request_id="implicit-build-source",
+                provider="claude",
+                mode="competitor",
+                repository=str(self.repo),
+                expected_head=head,
+                task="Attempt export via broad ancestor scope",
+                allowed_paths=["apps/web/src/routes"],
+                context_paths=[source],
+                forbidden_paths=[],
+                timeout_seconds=120,
+            )
+        start.assert_not_called()
+
     def test_review_export_admits_only_exact_build_diagnostics_source_route(self) -> None:
         source = "apps/web/src/routes/build/+page.svelte"
         self.assertFalse(competition._path_has_default_forbidden_component(source))

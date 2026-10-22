@@ -170,6 +170,11 @@ def path_has_default_forbidden_component(path: str) -> bool:
     return any(part.casefold() in DEFAULT_FORBIDDEN_COMPONENTS for part in PurePosixPath(path).parts)
 
 
+def explicit_build_source_scope(path: str, allowed: list[str]) -> bool:
+    # Do not infer permission for this exceptional file from its parent directory.
+    return path != EXACT_BUILD_DIAGNOSTICS_SOURCE or path in allowed
+
+
 def path_is_sensitive(path: str) -> bool:
     for raw_part in PurePosixPath(path).parts:
         part = raw_part.casefold()
@@ -714,6 +719,8 @@ def validate_packet(packet: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(item, dict) or set(item) != {"path", "sha256", "text"}:
             raise CandidateError(f"context item {index} is invalid")
         path = normalize_relative(item["path"], label=f"context[{index}].path")
+        if not explicit_build_source_scope(path, allowed):
+            raise CandidateError("explicit build source allowed path is required")
         if not path_in_scope(path, allowed) or path_in_scope(path, forbidden):
             raise CandidateError(f"context path is outside scope: {path}")
         if path_has_default_forbidden_component(path) or path_is_sensitive(path):
@@ -986,6 +993,8 @@ def validate_candidate(
     if len(set(normalized_changed)) != len(normalized_changed):
         raise CandidateError("candidate changed_paths contains duplicates")
     for path in normalized_changed:
+        if not explicit_build_source_scope(path, packet["allowed_paths"]):
+            raise CandidateError("explicit build source allowed path is required")
         if not path_in_scope(path, packet["allowed_paths"]) or path_in_scope(path, packet["forbidden_paths"]):
             raise CandidateError(f"candidate changed path is outside scope: {path}")
         if path_has_default_forbidden_component(path) or path_is_sensitive(path):
@@ -1009,6 +1018,8 @@ def validate_candidate(
     if not set(parsed_paths).issubset(set(normalized_changed)):
         raise CandidateError("patch paths are not declared in changed_paths")
     for path in parsed_paths:
+        if not explicit_build_source_scope(path, packet["allowed_paths"]):
+            raise CandidateError("explicit build source allowed path is required")
         if not path_in_scope(path, packet["allowed_paths"]) or path_in_scope(path, packet["forbidden_paths"]):
             raise CandidateError(f"patch path is outside scope: {path}")
         if path_has_default_forbidden_component(path) or path_is_sensitive(path):
