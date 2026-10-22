@@ -52,7 +52,10 @@ def _exact_reviewer_model(command: list[str], route: dict[str, Any]) -> tuple[st
     # denylist: no alternative model, profile, provider or effort can enter
     # after preflight, including attached short flags and future spellings.
     # The final positional prompt must not itself be an override option.
-    if not command[-1].strip() or command[-1].startswith("-"):
+    prompt = command[-1].strip()
+    if not prompt or prompt.startswith("-") or " " not in prompt:
+        # One-word positional tokens can be parsed by clap as subcommands
+        # such as 'logout' rather than the intended review prompt.
         raise CodexPreflightDenied("unsupported_reviewer_config")
     forbidden_prefixes = (
         "--config", "--profile", "--oss", "--local-provider",
@@ -141,7 +144,12 @@ class _Rpc:
                     if "id" in item or not isinstance(notification, str) or not self._allowed_notification(notification):
                         raise CodexPreflightDenied("unexpected_notification")
                     continue
-                if item.get("id") != request_id or "error" in item or set(item) - {"jsonrpc", "id", "result"}:
+                if (
+                    type(item.get("id")) is not int
+                    or item["id"] != request_id
+                    or "error" in item
+                    or set(item) - {"jsonrpc", "id", "result"}
+                ):
                     raise CodexPreflightDenied("invalid_rpc_reply")
                 result = item.get("result")
                 if not isinstance(result, dict):
@@ -351,7 +359,11 @@ def _check_protocol(argv: list[str], *, model: str, effort: str, deadline_second
 def require_codex_review_preflight(command: list[str], route: dict[str, Any]) -> dict[str, Any] | None:
     """Invoke identical durable reviewer auth in a minimal isolated preflight sandbox."""
     if not command or command[0] != "codex":
-        if route.get("provider_family") == "openai":
+        if route.get("provider_family") == "openai" or (
+            command and Path(command[0]).name == "codex"
+        ):
+            # A path-qualified Codex on a mismatched provider route is not
+            # a non-Codex reviewer: it must never bypass admission preflight.
             raise CodexPreflightDenied("not_codex")
         return None
     model, effort = _exact_reviewer_model(command, route)

@@ -95,6 +95,10 @@ for line in sys.stdin:
         }}
     else:
         sys.exit(6)
+    if mode == "boolean_rpc_id" and method == "initialize":
+        response["id"] = True
+    if mode == "float_rpc_id" and method == "model/list":
+        response["id"] = float(request["id"])
     if mode == "unversioned":
         response.pop("jsonrpc", None)
     if mode == "trailing_semantic" and method == "model/list":
@@ -146,6 +150,10 @@ class CodexPreflightProtocolTests(unittest.TestCase):
 
     def test_authoritative_unversioned_json_rpc_reply(self):
         self.assertEqual("metadata_accepted", self.probe("unversioned")["status"])
+
+    def test_json_rpc_reply_id_requires_integer_type_not_boolean_or_float(self):
+        self.assert_denied("boolean_rpc_id", "invalid_rpc_reply")
+        self.assert_denied("float_rpc_id", "invalid_rpc_reply")
 
     def test_real_app_server_remote_control_status_notification_is_nonsemantic(self):
         self.assertEqual("metadata_accepted", self.probe("remote_notification")["status"])
@@ -257,6 +265,14 @@ class CodexPreflightBindingTests(unittest.TestCase):
         self.assertIsNone(preflight.require_codex_review_preflight(
             ["claude", "review"], {"provider_family": "anthropic", "model": "claude-opus-5.5"}
         ))
+        # A path-qualified Codex must not skip the preflight when the
+        # advertised provider-family is inconsistent with that executable.
+        with self.assertRaises(preflight.CodexPreflightDenied) as caught:
+            preflight.require_codex_review_preflight(
+                ["/usr/local/bin/codex", *self.command[1:]],
+                {"provider_family": "anthropic", "model": "claude-opus-5.5"},
+            )
+        self.assertEqual("not_codex", caught.exception.code)
 
     def test_codex_bound_route_cannot_skip_preflight_via_renamed_executable(self):
         with self.assertRaises(preflight.CodexPreflightDenied) as caught:
@@ -269,7 +285,7 @@ class CodexPreflightBindingTests(unittest.TestCase):
             (self.command, {"provider_family": "other", "model": "gpt-5.6-sol"}, "provider_mismatch"),
             (self.command, {"provider_family": "openai", "model": "gpt-6-astra"}, "model_identity_mismatch"),
             (["/tmp/rogue/codex", *self.command[1:]], self.route, "not_codex"),
-            (["codex", "--model", "gpt-5.6-sol", "review"], self.route, "effort_identity_unavailable"),
+            (["codex", "--model", "gpt-5.6-sol", "Read-only review"], self.route, "effort_identity_unavailable"),
             (["codex", "--model", "gpt-5.6-sol", "--model", "other", "-c",
               'model_reasoning_effort="high"', "review"], self.route, "model_identity_unavailable"),
         ):
@@ -300,6 +316,16 @@ class CodexPreflightBindingTests(unittest.TestCase):
                 command = [*self.command[:-1], *extra, self.command[-1]]
                 with self.assertRaises(preflight.CodexPreflightDenied) as caught:
                     preflight._exact_reviewer_model(command, self.route)
+                self.assertEqual("unsupported_reviewer_config", caught.exception.code)
+
+    def test_codex_subcommands_cannot_masquerade_as_review_prompt(self):
+        for command in ("logout", "login", "exec", "app-server", "mcp-server",
+                        "resume", "apply", "cloud", "sandbox"):
+            with self.subTest(command=command):
+                with self.assertRaises(preflight.CodexPreflightDenied) as caught:
+                    preflight._exact_reviewer_model(
+                        [*self.command[:-1], command], self.route,
+                    )
                 self.assertEqual("unsupported_reviewer_config", caught.exception.code)
 
     def test_override_as_trailing_argv_is_denied_not_treated_as_prompt(self):
@@ -592,6 +618,28 @@ class CodexPreflightRealBindingTests(unittest.TestCase):
                 second, binding, cwd=repo, attempt_directory=attempt,
             )
             self.assertEqual("openai", provenance["review_route"]["provider_family"])
+            # Independent positive evidence: the advertised prefix SHA came
+            # from the immutable catalogue, not the caller's parsed argv.
+            import grabowski_coding_agent_catalog_data as catalogue
+            routes = json.loads(catalogue.CATALOG_JSON)["routes"]
+            canon = next(row["argv_prefix"] for row in routes
+                         if row.get("id") == "codex-sol-review-high")
+            self.assertEqual(
+                reviews.sha256_json(canon),
+                provenance["review_route"]["argv_prefix_sha256"],
+            )
+            self.assertEqual(
+                ("gpt-5.6-sol", "high"),
+                preflight._exact_reviewer_model(
+                    second[second.index("--") + 1:], provenance["review_route"],
+                ),
+            )
+            command = CodexPreflightBindingTests.command
+            changed = [*command[:-1], "--sandbox",
+                       "workspace-write", command[-1]]
+            with self.assertRaises(preflight.CodexPreflightDenied) as caught:
+                preflight._exact_reviewer_model(changed, provenance["review_route"])
+            self.assertEqual("route_identity_mismatch", caught.exception.code)
 
 if __name__ == "__main__":
     unittest.main()
