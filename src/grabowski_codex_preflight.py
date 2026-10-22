@@ -23,7 +23,7 @@ MAX_OUTPUT_BYTES = 131072
 MAX_MESSAGES = 64
 MAX_MODEL_PAGES = 5
 PREFLIGHT_SECONDS = 20
-ALLOWED_NOTIFICATIONS = frozenset({"account/updated", "remoteControl/status/changed"})
+ALLOWED_NOTIFICATIONS = frozenset({"remoteControl/status/changed"})
 
 
 class CodexPreflightDenied(RuntimeError):
@@ -47,12 +47,29 @@ def _exact_reviewer_model(command: list[str], route: dict[str, Any]) -> tuple[st
     model = command[model_flags[0] + 1]
     if model != route.get("model") or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{1,99}", model) is None:
         raise CodexPreflightDenied("model_identity_mismatch")
+    # A review may not silently override the preflight's default provider,
+    # profile, model or effort through alternate Codex CLI option spellings.
+    forbidden = {"--config", "--profile", "-p", "--oss", "-m"}
     efforts = []
-    for index, arg in enumerate(command[:-1]):
-        if arg == "-c" and index + 1 < len(command):
+    index = 0
+    while index < len(command) - 1:
+        arg = command[index]
+        if (
+            arg in forbidden or arg.startswith(("--config=", "--profile=", "-c", "--model="))
+            and arg != "-c"
+        ):
+            raise CodexPreflightDenied("unsupported_reviewer_config")
+        if arg == "-c":
+            if index + 1 >= len(command) - 1:
+                raise CodexPreflightDenied("effort_identity_unavailable")
             candidate = command[index + 1]
-            if candidate.startswith("model_reasoning_effort="):
-                efforts.append(candidate.split("=", 1)[1].strip('"'))
+            key, separator, value = candidate.partition("=")
+            if not separator or key.strip() != "model_reasoning_effort":
+                raise CodexPreflightDenied("unsupported_reviewer_config")
+            efforts.append(value.strip().strip('"').strip("'"))
+            index += 2
+            continue
+        index += 1
     if len(efforts) != 1 or efforts[0] not in {"low", "medium", "high", "xhigh"}:
         raise CodexPreflightDenied("effort_identity_unavailable")
     return model, efforts[0]
@@ -65,6 +82,12 @@ class _Rpc:
         self.pending = b""
         self.total = 0
         self.count = 0
+        self.account_observed = False
+
+    def _allowed_notification(self, method: str) -> bool:
+        return method in ALLOWED_NOTIFICATIONS or (
+            method == "account/updated" and not self.account_observed
+        )
 
     def notify(self, method: str) -> None:
         self._send({"jsonrpc": "2.0", "method": method, "params": {}})
@@ -98,7 +121,7 @@ class _Rpc:
                     raise CodexPreflightDenied("malformed_output")
                 if "method" in item:
                     notification = item["method"]
-                    if "id" in item or not isinstance(notification, str) or notification not in ALLOWED_NOTIFICATIONS:
+                    if "id" in item or not isinstance(notification, str) or not self._allowed_notification(notification):
                         raise CodexPreflightDenied("unexpected_notification")
                     continue
                 if item.get("id") != request_id or "error" in item or set(item) - {"jsonrpc", "id", "result"}:
@@ -154,7 +177,7 @@ class _Rpc:
                     or item.get("jsonrpc", "2.0") != "2.0"
                     or "id" in item
                     or not isinstance(item.get("method"), str)
-                    or item["method"] not in ALLOWED_NOTIFICATIONS
+                    or not self._allowed_notification(item["method"])
                 ):
                     raise CodexPreflightDenied("unexpected_trailing_output")
             remaining = self.deadline - time.monotonic()
@@ -218,6 +241,8 @@ def _check_protocol(argv: list[str], *, model: str, effort: str, deadline_second
         routing = account.get("workspaceRouting")
         if not isinstance(routing, dict) or not isinstance(routing.get("chatgptAccountId"), str) or not routing["chatgptAccountId"]:
             raise CodexPreflightDenied("workspace_identity_unavailable")
+        # Any subsequent account/updated invalidates the bound identity.
+        rpc.account_observed = True
         limits = rpc.call(3, "account/rateLimits/read", {
             "supportsLunaReserve": False, "excludeResetCreditDetails": True,
         })
@@ -277,12 +302,13 @@ def _check_protocol(argv: list[str], *, model: str, effort: str, deadline_second
             ],
         }
     finally:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except OSError:
-            # Failure to signal the process group must never skip wait and
-            # closure. The bwrap child is also --die-with-parent protected.
-            pass
+        if process.returncode is None:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except OSError:
+                # Failures must not skip reaping. Never signal a PGID after the
+                # leader was already reaped by a successful EOF/exit wait.
+                pass
         try:
             process.wait(timeout=2)
         except subprocess.TimeoutExpired:

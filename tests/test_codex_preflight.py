@@ -107,6 +107,12 @@ for line in sys.stdin:
         event = "item/reasoning/textDelta" if mode == "trailing_delayed" else "remoteControl/status/changed"
         sys.stdout.write(json.dumps({"jsonrpc": "2.0", "method": event, "params": {}}) + "\n")
         sys.stdout.flush()
+    if method == "account/read" and mode == "account_changed_after_auth":
+        sys.stdout.write(json.dumps({"jsonrpc": "2.0", "method": "account/updated", "params": {}}) + "\n")
+        sys.stdout.flush()
+    if method == "model/list" and mode == "account_changed_after_model":
+        sys.stdout.write(json.dumps({"jsonrpc": "2.0", "method": "account/updated", "params": {}}) + "\n")
+        sys.stdout.flush()
     if method == "model/list" and mode == "exit_nonzero_after_reply":
         sys.exit(2)
     if method == "model/list" and mode == "hold_open_after_reply":
@@ -162,6 +168,18 @@ class CodexPreflightProtocolTests(unittest.TestCase):
 
     def test_exit_nonzero_after_complete_model_list_fails_closed(self):
         self.assert_denied("exit_nonzero_after_reply", "transport_closed")
+
+    def test_account_update_after_identity_snapshot_rejects_admission(self):
+        self.assert_denied("account_changed_after_auth", "unexpected_notification")
+        self.assert_denied("account_changed_after_model", "unexpected_trailing_output")
+
+    def test_successful_preflight_does_not_kill_reaped_process_group(self):
+        with mock.patch.object(
+            preflight.os, "killpg",
+            side_effect=AssertionError("reaped PGID must never be targeted"),
+        ) as signal_group:
+            self.assertEqual("metadata_accepted", self.probe()["status"])
+        signal_group.assert_not_called()
 
     def test_killpg_permission_failure_does_not_skip_cleanup(self):
         with mock.patch.object(preflight.os, "killpg", side_effect=PermissionError("synthetic deny")):
@@ -244,6 +262,36 @@ class CodexPreflightBindingTests(unittest.TestCase):
                 with self.assertRaises(preflight.CodexPreflightDenied) as caught:
                     preflight._exact_reviewer_model(command, route)
                 self.assertEqual(expected, caught.exception.code)
+
+    def test_alternate_config_and_profile_overrides_are_denied(self):
+        variants = [
+            ["--config", "model_provider=evil"],
+            ["--config=model_provider=evil"],
+            ["-cmodel_reasoning_effort=low"],
+            ["--profile", "other"],
+            ["--profile=other"],
+            ["-p", "other"],
+            ["--oss"],
+            ["-m", "gpt-5.6-luna"],
+            ["--model=gpt-5.6-luna"],
+            ["-c", "model_provider=evil"],
+        ]
+        for extra in variants:
+            with self.subTest(extra=extra):
+                command = [*self.command[:-1], *extra, self.command[-1]]
+                with self.assertRaises(preflight.CodexPreflightDenied) as caught:
+                    preflight._exact_reviewer_model(command, self.route)
+                self.assertEqual("unsupported_reviewer_config", caught.exception.code)
+
+    def test_effort_key_whitespace_is_normalized_and_revalidated(self):
+        original = list(self.command)
+        pos = original.index("model_reasoning_effort=\"high\"")
+        original[pos] = 'model_reasoning_effort = "low"'
+        # Whitespace-normalized effort may never masquerade as catalogue high.
+        self.assertEqual(
+            ("gpt-5.6-sol", "low"),
+            preflight._exact_reviewer_model(original, self.route),
+        )
 
     def test_owner_dedicated_sandbox_binding_and_no_direct_provider_argv(self):
         from grabowski_agent_sandbox import PreparedSandboxCommand
@@ -383,6 +431,106 @@ class CodexPreflightAdmissionTests(unittest.TestCase):
             self.assertFalse(list(jobs.iterdir()))
             self.assertEqual("workspace_identity_drift", audit.call_args.args[0]["failure_classification"])
 
+
+    def test_codex_argv_cannot_skip_preflight_on_non_openai_route(self):
+        import tempfile
+        from test_operator_contract import _load_operator_module
+        operator = _load_operator_module()
+        binding = {
+            "schema_version": 1, "kind": "grabowski_decision_review_binding",
+            "repo": "heimgewebe/grabowski", "pr": 1616,
+            "head_sha": "a" * 40, "base_sha": "b" * 40,
+            "diff_sha256": "c" * 64, "slot": "independent-codex",
+        }
+        args = ["python", "-I", "-m", "grabowski_agent_role",
+                "--role", "review", "--", *CodexPreflightBindingTests.command]
+        with tempfile.TemporaryDirectory() as directory:
+            jobs = pathlib.Path(directory) / "jobs"
+            jobs.mkdir()
+            with mock.patch.object(operator, "_jobs_root", return_value=jobs), \
+                 mock.patch.object(operator, "_validate_argv", return_value=args), \
+                 mock.patch.object(operator, "_cleanup_stale_job_metadata_temps", return_value=[]), \
+                 mock.patch.object(operator, "_job_directory", side_effect=AssertionError("registered")) as created, \
+                 mock.patch.object(operator, "_append_effect_audit", return_value="d" * 64) as audit, \
+                 mock.patch.object(operator.decision_reviews, "bind_job_review_role_argv", return_value=args), \
+                 mock.patch.object(operator.decision_reviews, "review_role_provenance", return_value={
+                     "review_route": {"provider_family": "anthropic", "model": "gpt-5.6-sol"}
+                 }), \
+                 mock.patch.object(operator.decision_reviews, "normalize_binding", return_value=binding):
+                with self.assertRaisesRegex(ValueError, "prelaunch admission denied: provider_mismatch"):
+                    operator._start_job(
+                        args, cwd=directory, runtime_seconds=60,
+                        decision_review_binding=binding,
+                    )
+            created.assert_not_called()
+            self.assertEqual([], list(jobs.iterdir()))
+            self.assertEqual("provider_mismatch", audit.call_args.args[0]["failure_classification"])
+
+class CodexPreflightRealBindingTests(unittest.TestCase):
+    def test_real_catalogue_role_binding_is_idempotent_without_provider_call(self):
+        import subprocess
+        import tempfile
+        import grabowski_agent_role as role
+        import grabowski_decision_reviews as reviews
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo = pathlib.Path(directory) / "repo"
+            repo.mkdir()
+            def git(*args):
+                return subprocess.check_output(
+                    ["git", "-C", str(repo), *args], timeout=15,
+                    stderr=subprocess.STDOUT,
+                ).decode().strip()
+            git("init", "-q")
+            (repo / "tracked.txt").write_text("before\n", encoding="utf-8")
+            git("add", "tracked.txt")
+            git("-c", "user.name=Tests", "-c", "user.email=tests@example.invalid",
+                "commit", "-qm", "base")
+            base = git("rev-parse", "HEAD")
+            (repo / "tracked.txt").write_text("after\n", encoding="utf-8")
+            git("add", "tracked.txt")
+            git("-c", "user.name=Tests", "-c", "user.email=tests@example.invalid",
+                "commit", "-qm", "candidate")
+            head, fingerprint, dirty = role.current_binding(repo, base)
+            self.assertFalse(dirty)
+            jobs = pathlib.Path(directory) / "jobs"
+            attempt = jobs / "grabowski-job-0123456789ab"
+            attempt.mkdir(parents=True)
+            binding = {
+                "schema_version": 1,
+                "kind": "grabowski_decision_bound_review",
+                "repo": "heimgewebe/grabowski", "pr": 1616,
+                "head_sha": head, "base_sha": base,
+                "diff_sha256": "c" * 64,
+                "slot": "independent-codex",
+            }
+            command = [
+                *reviews.REVIEW_ROLE_LAUNCHER_PREFIX,
+                "--role", "review",
+                "--repository", str(repo),
+                "--expected-head", head,
+                "--expected-base-head", base,
+                "--expected-diff-sha256", fingerprint,
+                "--expected-dirty", "false",
+                "--output", str(jobs / "temporary-result.json"),
+                "--",
+                *CodexPreflightBindingTests.command,
+            ]
+            first = reviews.bind_job_review_role_argv(
+                command, binding, cwd=repo, attempt_directory=attempt,
+            )
+            second = reviews.bind_job_review_role_argv(
+                first, binding, cwd=repo, attempt_directory=attempt,
+            )
+            self.assertEqual(first, second)
+            self.assertEqual(
+                str(attempt / reviews.REVIEW_ROLE_ATTEMPT_RECEIPT_NAME),
+                first[first.index("--output") + 1],
+            )
+            provenance = reviews.review_role_provenance(
+                second, binding, cwd=repo, attempt_directory=attempt,
+            )
+            self.assertEqual("openai", provenance["review_route"]["provider_family"])
 
 if __name__ == "__main__":
     unittest.main()
