@@ -14,6 +14,7 @@ import uuid
 from typing import Any, Iterable, Iterator, Mapping
 
 import grabowski_consumer_surface as consumer_surface
+import grabowski_fleet_mutation as fleet_mutation
 import grabowski_private_io as private_io
 import grabowski_tasks as tasks
 import grabowski_terminal_convergence as terminal_convergence
@@ -1339,8 +1340,24 @@ def _assert_no_live_task_process(record: dict[str, Any]) -> dict[str, Any]:
     probe = observation.get("probe")
     if not isinstance(properties, dict) or not isinstance(probe, dict):
         raise TaskAttentionIntegrityError("task archive process observation is incomplete")
-    if probe.get("outcome_unknown"):
-        raise TaskAttentionIntegrityError("task archive process observation outcome is unknown")
+    # A failed, incomplete or truncated systemd show response can contain
+    # plausible inactive properties in its prefix; it is not liveness truth.
+    if (
+        type(probe.get("returncode")) is not int
+        or probe["returncode"] != 0
+        # operator._run omits outcome_unknown on local user-systemd probes.
+        # The privileged root broker must explicitly attest a known result.
+        or (probe.get("outcome_unknown") is not None
+            and probe.get("outcome_unknown") is not False)
+        or (tasks._is_root_systemd_backend(record)
+            and probe.get("outcome_unknown") is not False)
+        or probe.get("timed_out") is not False
+        or probe.get("stdout_truncated") is not False
+        or probe.get("stderr_truncated") is not False
+    ):
+        raise TaskAttentionIntegrityError(
+            "task archive process observation outcome is unknown or incomplete"
+        )
     active_state = properties.get("ActiveState")
     if active_state in {"active", "activating", "reloading", "deactivating"}:
         raise TaskAttentionConflictError(
@@ -1359,6 +1376,148 @@ def _assert_no_live_task_process(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _require_host_authenticated_archive_retirement(_record: dict[str, Any]) -> None:
+    """Fail closed until #1556 provides independent, durable restart exclusion.
+
+    Mutable TaskStore launch fields, today's Fleet mapping and inactive unit
+    observations cannot attest the earlier host/attempt/scope/epoch or prevent
+    the original manager restarting a supposedly archived task. No root/SSH
+    effects are permitted on the READ_ONLY path or at archive admission merely
+    to manufacture a positive certificate. Existing archived replay remains
+    separate; new irreversible switches require externally authenticated
+    retirement authority, which is not yet installed.
+    """
+    raise TaskAttentionConflictError(
+        "independently authenticated task retirement proof is required (#1556)"
+    )
+
+
+def _require_safe_archive_transport(record: dict[str, Any]) -> None:
+    """Do not create an archive that READ_ONLY can never certify.
+
+    Until #1556 supplies an authorized retirement/compaction protocol,
+    Rootbroker or SSH terminal task archival can permanently strand global
+    readiness. Their live process checks would also require external effects.
+    Preserve idempotent replay of pre-existing archives. Until the actual
+    external retirement authority is installed, reject ALL new irreversible
+    archive projection switches, including apparently local launch records.
+    """
+    if (
+        tasks._is_root_systemd_backend(record)
+        or tasks._execution_backend(record) != "systemd-user"
+        or tasks._systemd_scope(record) != "user"
+    ):
+        raise TaskAttentionConflictError(
+            "privileged task archive retirement proof is required (#1556)"
+        )
+    # Recorded negative transport evidence survives Fleet remapping. Before
+    # the local-only dispatch fix a launch could cross to SSH, even when a
+    # pre-dispatch local marker was already persisted. Do not archive an
+    # explicitly nonlocal historic attempt merely because the CURRENT host
+    # now resolves locally. This is a rejector, NOT positive provenance for
+    # unmarked rows or for legacy records marked local.
+    launcher_text = record.get("launcher_json")
+    try:
+        launcher = json.loads(launcher_text) if isinstance(launcher_text, str) else None
+    except (ValueError, TypeError):
+        launcher = None
+    if not isinstance(launcher, dict):
+        raise TaskAttentionIntegrityError(
+            "task archive persisted launch history is invalid"
+        )
+    if (
+        "task_launch_transport" in launcher
+        and launcher["task_launch_transport"] != "local"
+    ):
+        raise TaskAttentionConflictError(
+            "historical remote task launch retirement proof is required (#1556)"
+        )
+    # The TaskStore retains only the latest launcher. A local retry can replace
+    # an earlier SSH launch without retiring its independently restartable unit.
+    # Single-attempt/prospective direct-local markers are useful negative
+    # filters but can be forged by the same UID and never by themselves grant
+    # a NEW immutable archive switch. Only independent host retirement can.
+    attempt = record.get("attempt")
+    if isinstance(attempt, bool) or attempt != 1:
+        raise TaskAttentionConflictError(
+            "historical earlier attempts require retirement proof (#1556)"
+        )
+    managed_from = launcher.get(tasks.TASK_OUTPUT_LAUNCHER_BINDING_KEY)
+    if (
+        launcher.get("task_launch_transport") != "local"
+        or launcher.get("task_launch_provenance")
+        != tasks.TASK_LOCAL_DISPATCH_PROVENANCE
+        or isinstance(managed_from, bool)
+        or managed_from != 1
+    ):
+        raise TaskAttentionConflictError(
+            "task archive local dispatch provenance is unverified (#1556)"
+        )
+    try:
+        _, target, _ = tasks._resolve_task_dispatch_host(str(record["host"]))
+    except (RuntimeError, ValueError, TypeError, KeyError, OSError) as exc:
+        raise TaskAttentionIntegrityError(
+            "task archive host authority is unavailable"
+        ) from exc
+    if target.get("transport") != "local":
+        raise TaskAttentionConflictError(
+            "remote task archive retirement proof is required (#1556)"
+        )
+    # Negative local-transport filters are not permission to archive.
+    _require_host_authenticated_archive_retirement(record)
+
+
+@contextmanager
+def _archive_local_fleet_route_guard(record: dict[str, Any]) -> Iterator[None]:
+    """Serialize the irreversible switch with authorized Fleet writers.
+
+    The Fleet mutator holds LOCK_EX on this same lock file throughout its
+    registry replacement. A final transport check outside this shared lock
+    would still race with that replacement.
+    """
+    directory = (
+        fleet_mutation.STATE_ROOT
+        / fleet_mutation.MUTATION_STATE_DIRECTORY_NAME
+    )
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    metadata = directory.lstat()
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_mode & 0o022
+    ):
+        raise TaskAttentionIntegrityError("Fleet archive lock directory is unsafe")
+    lock_path = directory / fleet_mutation.LOCK_NAME
+    descriptor = os.open(
+        lock_path,
+        os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
+        0o600,
+    )
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_mode & 0o022
+        ):
+            raise TaskAttentionIntegrityError("Fleet archive lock file is unsafe")
+        deadline = time.monotonic() + LOCK_TIMEOUT_SECONDS
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                break
+            except BlockingIOError as exc:
+                if time.monotonic() >= deadline:
+                    raise TaskAttentionConflictError(
+                        "Fleet route mutation lock is busy"
+                    ) from exc
+                time.sleep(LOCK_POLL_SECONDS)
+        _require_safe_archive_transport(record)
+        yield
+    finally:
+        os.close(descriptor)
+
+
 def _task_archive_classification(
     record: dict[str, Any],
     *,
@@ -1368,6 +1527,9 @@ def _task_archive_classification(
 ) -> dict[str, Any]:
     import grabowski_lifecycle_evidence as lifecycle_evidence
 
+    # New immutable projection switches must never bypass transport admission.
+    # Existing archived replay returns before this classification is invoked.
+    _require_safe_archive_transport(record)
     archive_record, record_sha256, _source_store_sha256 = _task_archive_source_binding(record)
     now_unix = int(time.time())
     lease_source = _assert_no_live_task_resource_leases(record, now_unix=now_unix)
@@ -2201,6 +2363,33 @@ def _task_output_cleanup_all_attempts_after_archive(
     archived_binding = _task_binding(record)
     final_attempt = int(archived_binding["attempt"])
     task_id = str(archived_binding["task_id"])
+    # Both idempotent archive replay and scheduled archived-output cleanup
+    # reach this helper. A stale inactive systemd/SSH probe cannot authorize
+    # irreversible deletion when the original host may restart an old unit.
+    # Preserve archive/receipt/projection reads, but leave all outputs and the
+    # per-attempt cursor unchanged until independently enforced retirement is
+    # authenticated. Failures of the external authority are not success.
+    try:
+        _require_host_authenticated_archive_retirement(record)
+    except TaskAttentionConflictError:
+        return {
+            "status": "deferred",
+            "reason": "external_retirement_unverified",
+            "task_binding": archived_binding,
+            "attempt_count": final_attempt,
+            "attempts_scanned": 0,
+            "attempt_cycle_completed": False,
+            "attempt_results": [],
+            "counts": {"deleted": 0, "deferred": 0, "not_present": 0, "errors": 0},
+            "retention_boundary_unix": retention_boundary_unix,
+            "eligible_at_unix": None,
+            "deleted_attempts": [],
+            "not_present_attempts": [],
+            "does_not_establish": [
+                "safe_to_delete_archived_output",
+                "historic_host_or_unit_nonrestartability",
+            ],
+        }
     resource_key = "component:grabowski-task-output-cleanup-task:" + task_id
     owner = tasks.resources._owner(
         "operator:task-output-cleanup-task:"
@@ -2818,6 +3007,10 @@ def execute_closeout_archive(parameters: dict[str, Any]) -> dict[str, Any]:
             ],
         }
 
+    # Keep the already-archived replay path above available for recovery.
+    # A new unsupported projection switch would permanently block read-only
+    # operator readiness, even after the systemd unit has become quiescent.
+    _require_safe_archive_transport(record)
     now_unix = int(time.time())
     retention_boundary_unix = _assert_task_archive_retention(
         record,
@@ -3010,13 +3203,16 @@ def execute_closeout_archive(parameters: dict[str, Any]) -> dict[str, Any]:
                 raise TaskAttentionConflictError(
                     "task archive projection revalidation is not ready"
                 )
-            projection_effect = lifecycle_projection.apply_task_archive_projection_switch(
-                Path(str(archive_effect["segment_dir"])),
-                projection_root=projection_root,
-                plan=projection_plan,
-                revalidation=projection_revalidation,
-                applied_at_unix=int(time.time()),
-            )
+            # Hold the same Fleet lock as the authorized CAS registry writer
+            # from the final route check through the irreversible switch.
+            with _archive_local_fleet_route_guard(projection_revalidated_record):
+                projection_effect = lifecycle_projection.apply_task_archive_projection_switch(
+                    Path(str(archive_effect["segment_dir"])),
+                    projection_root=projection_root,
+                    plan=projection_plan,
+                    revalidation=projection_revalidation,
+                    applied_at_unix=int(time.time()),
+                )
 
         final_projection = _existing_task_projection_binding(
             task_id,

@@ -864,7 +864,7 @@ class ConsumerSurfaceTests(unittest.TestCase):
         self.assertIn("archiv", next_action)
         self.assertNotIn("reconcile live task outcomes", next_action)
 
-    def test_overview_local_terminal_budget_recommends_verified_archival_not_reconcile_loop(self) -> None:
+    def test_overview_local_terminal_budget_requires_retirement_before_archive(self) -> None:
         fake_tasks = SimpleNamespace(
             grabowski_task_list=lambda **_kwargs: {
                 "state_counts": {"completed": 33},
@@ -913,10 +913,12 @@ class ConsumerSurfaceTests(unittest.TestCase):
         next_action = result["recommended_next_action"].lower()
         self.assertIn("local terminal", next_action)
         self.assertIn("authorized live observation", next_action)
-        self.assertIn("task-closeout-archive", next_action)
+        self.assertNotIn("task-closeout-archive", next_action)
         self.assertNotIn("reconcile live task outcomes", next_action)
         self.assertIn("only the excess", next_action)
         self.assertIn("no more", next_action)
+        self.assertIn("do not archive", next_action)
+        self.assertIn("restart-exclusion", next_action)
 
         # Archived rows stay in the task table and still count toward the
         # scan budget, so archival must not be recommended for it.
@@ -954,7 +956,7 @@ class ConsumerSurfaceTests(unittest.TestCase):
         self.assertNotIn("task-closeout-archive", scan_action)
         self.assertNotIn("reconcile live task outcomes", scan_action)
 
-    def test_overview_local_terminal_observation_names_exact_archive_excess(self) -> None:
+    def test_overview_local_terminal_observation_counts_excess_without_archive_admission(self) -> None:
         fake_tasks = SimpleNamespace(
             grabowski_task_list=lambda **_kwargs: {
                 "state_counts": {"completed": 40},
@@ -998,8 +1000,11 @@ class ConsumerSurfaceTests(unittest.TestCase):
                 },
             )
         next_action = result["recommended_next_action"].lower()
-        self.assertIn("archive exactly 8 independently verified", next_action)
+        self.assertIn("exactly 8", next_action)
         self.assertIn("no more", next_action)
+        self.assertIn("do not archive", next_action)
+        self.assertIn("restart-exclusion", next_action)
+        self.assertNotIn("task-closeout-archive", next_action)
         self.assertFalse(result["operator_ready"])
 
         # An excess beyond the archive headroom cannot be archived away.
@@ -1081,7 +1086,9 @@ class ConsumerSurfaceTests(unittest.TestCase):
         next_action = result["recommended_next_action"].lower()
         self.assertIn("remote", next_action)
         self.assertIn("live", next_action)
-        self.assertIn("task-closeout-archive", next_action)
+        self.assertIn("restart-exclusion", next_action)
+        self.assertIn("do not archive", next_action)
+        self.assertNotIn("task-closeout-archive", next_action)
         self.assertNotIn("reconcile live task outcomes", next_action)
 
     def test_overview_remote_archival_requires_verified_sufficient_headroom(self) -> None:
@@ -1135,6 +1142,55 @@ class ConsumerSurfaceTests(unittest.TestCase):
                 action = result["recommended_next_action"].lower()
                 self.assertIn("remote", action)
                 self.assertIn("do not archive", action)
+                self.assertIn(expected, action)
+                self.assertNotIn("task-closeout-archive", action)
+
+    def test_overview_archived_terminal_liveness_blocks_readiness(self) -> None:
+        for status, expected in (
+            ("archived_task_unit_live_unverified", "stop"),
+            ("archived_task_unit_observation_unavailable", "authorized"),
+            ("archived_terminal_transport_unverified", "authorized"),
+            ("retained_inventory_changed", "changing"),
+            ("retained_attempt_authority_unverified", "must not be backfilled"),
+        ):
+            with self.subTest(status=status):
+                fake_tasks = SimpleNamespace(
+                    grabowski_task_list=lambda **_kwargs: {
+                        "state_counts": {"completed": 1},
+                        "projection_counts": {"active": 0, "terminal": 1, "attention": 0},
+                        "projection_counts_overlap": False,
+                        "unknown_state_count": 0,
+                        "state_counts_complete": True,
+                        "reconciliation_performed": False,
+                        "reconciliation_evidence": {"status": status},
+                    },
+                )
+                fake_resources = SimpleNamespace(count_resources=lambda **_kwargs: 0)
+                fake_obligations = SimpleNamespace(
+                    list_obligations=lambda _parameters: {
+                        "record_count": 0, "integrity_errors": [],
+                        "scan_truncated": False,
+                    },
+                )
+                with mock.patch.dict("sys.modules", {
+                    "grabowski_tasks": fake_tasks,
+                    "grabowski_resources": fake_resources,
+                    "grabowski_operator_obligation": fake_obligations,
+                }):
+                    result = grabowski_mcp._operator_system_overview(
+                        runtime_healthy=True,
+                        normal_mutation_path_ready=True,
+                        coding_agent_catalog={"ready": True, "source": "deployment_catalog"},
+                        client_snapshot={
+                            "observable": True, "fresh": True, "matched": True,
+                            "server_loopback_schema_contract_matches": True,
+                            "platform_publication_state": "platform_converged",
+                            "platform_publication_pending": False,
+                        },
+                    )
+                self.assertFalse(result["operator_ready"])
+                self.assertFalse(result["readiness"]["truth_model_ready"])
+                action = result["recommended_next_action"].lower()
                 self.assertIn(expected, action)
                 self.assertNotIn("task-closeout-archive", action)
 

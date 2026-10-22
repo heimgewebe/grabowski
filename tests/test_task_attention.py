@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -68,6 +69,8 @@ def _launcher(returncode: int = 0) -> dict[str, object]:
         "timed_out": False,
         "stdout_truncated": False,
         "stderr_truncated": False,
+        "task_launch_transport": "local",
+        "task_launch_provenance": tasks.TASK_LOCAL_DISPATCH_PROVENANCE,
     }
 
 
@@ -86,10 +89,35 @@ class TaskAttentionTests(unittest.TestCase):
         self.archive_root = self.root / "state" / "task-archives"
         self.archive_effect_root = self.root / "state" / "task-archive-effects"
         self.projection_root = self.root / "state" / "task-projection"
+        # Existing artifact/closeout tests model an externally authorized
+        # retirement witness in this hermetic fixture only. Production has
+        # no such authority and MUST fail closed; a separate integration
+        # negative test below restores and exercises the actual gate.
+        self.production_archive_retirement_gate = (
+            attention._require_host_authenticated_archive_retirement
+        )
         self.patches = [
+            patch.object(
+                attention, "_require_host_authenticated_archive_retirement",
+                return_value=None,
+            ),
             patch.object(tasks, "TASK_DB", self.database),
             patch.object(tasks, "TASK_OUTCOMES_DIR", self.outcomes),
             patch.object(tasks.resources, "RESOURCE_DB", self.resource_database),
+            # Archive admission resolves the stored host outside task start.
+            # Keep that local test authority explicit and hermetic.
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            # Production managed-local launches bypass _dispatch and call
+            # real user systemd. Test fixtures below patch _dispatch; bridge
+            # that same mock to the private local launch path, as TaskTests
+            # does, so results are independent of host systemd availability.
+            patch.object(
+                tasks, "_dispatch_managed_local_task",
+                side_effect=lambda host, argv: tasks._dispatch(
+                    host, argv, timeout_seconds=60
+                ),
+            ),
+            patch.object(attention.fleet_mutation, "STATE_ROOT", self.root / "state"),
             patch.object(tasks.base, "AUDIT_LOG", self.audit_log),
             patch.object(attention.alert_outbox, "enqueue_and_schedule"),
             patch.object(
@@ -232,7 +260,11 @@ class TaskAttentionTests(unittest.TestCase):
                 "ActiveState": "inactive",
                 "SubState": "dead",
             },
-            "probe": {"returncode": 0, "outcome_unknown": False},
+            "probe": {
+                "returncode": 0, "outcome_unknown": False,
+                "timed_out": False, "stdout_truncated": False,
+                "stderr_truncated": False,
+            },
         }
 
     def _parameters(self, record: dict[str, object], **overrides: object) -> dict[str, object]:
@@ -1929,6 +1961,444 @@ class TaskAttentionTests(unittest.TestCase):
         self.assertTrue(result["cycle_completed"])
         self.assertIsNone(result["cursor_after"])
 
+    def test_closeout_archive_rejects_privileged_task_before_external_probe(self) -> None:
+        record = self._completed_task()
+        before = self.database.read_bytes()
+        with (
+            patch.object(tasks, "_is_root_systemd_backend", return_value=True),
+            patch.object(
+                tasks, "_observe",
+                side_effect=AssertionError("must not probe unsupported archive target"),
+            ) as probe,
+            self.assertRaisesRegex(
+                attention.TaskAttentionConflictError, "retirement.*required",
+            ),
+        ):
+            attention.execute_closeout_archive(self._archive_parameters(record))
+        probe.assert_not_called()
+        self.assertEqual(before, self.database.read_bytes())
+        self.assertFalse(self.archive_root.exists())
+        self.assertFalse(self.projection_root.exists())
+
+    def test_closeout_archive_rejects_ssh_task_before_external_probe(self) -> None:
+        record = self._completed_task()
+        before = self.database.read_bytes()
+        with (
+            patch.object(
+                tasks, "_resolve_task_dispatch_host",
+                return_value=("remote", {"transport": "ssh"}, False),
+            ),
+            patch.object(
+                tasks, "_observe",
+                side_effect=AssertionError("must not dispatch unsupported archive target"),
+            ) as probe,
+            self.assertRaisesRegex(
+                attention.TaskAttentionConflictError, "retirement.*required",
+            ),
+        ):
+            attention.execute_closeout_archive(self._archive_parameters(record))
+        probe.assert_not_called()
+        self.assertEqual(before, self.database.read_bytes())
+        self.assertFalse(self.archive_root.exists())
+        self.assertFalse(self.projection_root.exists())
+
+    def test_archive_guard_rejects_known_historical_ssh_and_malformed_launcher(self) -> None:
+        # A pre-fix attempt with a recorded remote launch must not become
+        # archive-eligible only because the same Fleet host now maps local.
+        # Invalid launcher history also cannot be promoted into authority.
+        record = self._completed_task()
+        raw = tasks._row_raw(str(record["task_id"]))
+        original = json.loads(raw["launcher_json"])
+        before = self.database.read_bytes()
+        for value, expected_type, diagnostic in (
+            ({**original, "task_launch_transport": "ssh"},
+             attention.TaskAttentionConflictError, "historical.*retirement proof"),
+            ({**original, "task_launch_transport": True},
+             attention.TaskAttentionConflictError, "historical.*retirement proof"),
+            ("not-json", attention.TaskAttentionIntegrityError,
+             "persisted launch history is invalid"),
+        ):
+            with self.subTest(launcher=value):
+                historical = {
+                    **raw,
+                    "launcher_json": (
+                        value if isinstance(value, str) else json.dumps(value)
+                    ),
+                }
+                with (
+                    patch.object(
+                        tasks, "_resolve_task_dispatch_host",
+                        return_value=("local", {"transport": "local"}, False),
+                    ) as resolve,
+                    patch.object(
+                        tasks, "_observe",
+                        side_effect=AssertionError("unsafe SSH archive must not probe"),
+                    ) as probe,
+                    self.assertRaisesRegex(expected_type, diagnostic),
+                ):
+                    attention._require_safe_archive_transport(historical)
+                resolve.assert_not_called()
+                probe.assert_not_called()
+        self.assertEqual(before, self.database.read_bytes())
+        self.assertFalse(self.archive_root.exists())
+        self.assertFalse(self.projection_root.exists())
+
+    def test_closeout_archive_rejects_historical_ssh_launch_despite_local_fleet(self) -> None:
+        # Simulate the original local-to-SSH dispatch race with a successful
+        # persisted launcher result, not a post-terminal database rewrite.
+        # The subsequent terminal lifecycle and its receipt are genuine.
+        with patch.object(
+            tasks, "_dispatch_managed_local_task",
+            return_value={**_launcher(), "task_launch_transport": "ssh"},
+        ):
+            started = self._start()["task"]
+        task_id = str(started["task_id"])
+        tasks._set_state(
+            task_id, "completed", observation={"state": "completed"},
+        )
+        record = tasks._row(task_id)
+        raw = tasks._row_raw(task_id)
+        self.assertEqual("completed", record["state"])
+        self.assertEqual(
+            "ssh", json.loads(raw["launcher_json"])["task_launch_transport"]
+        )
+        self.assertTrue(attention.terminal_closeout_plan(raw)["archive_ready"])
+        before = self.database.read_bytes()
+        with (
+            patch.object(tasks, "_resolve_task_dispatch_host",
+                         return_value=("local", {"transport": "local"}, False)),
+            patch.object(tasks, "_observe",
+                         side_effect=AssertionError("remote must not probe")) as probe,
+            self.assertRaisesRegex(
+                attention.TaskAttentionConflictError,
+                "historical.*retirement proof",
+            ),
+        ):
+            attention.execute_closeout_archive(self._archive_parameters(record))
+        probe.assert_not_called()
+        self.assertEqual(before, self.database.read_bytes())
+        self.assertFalse(self.archive_root.exists())
+        self.assertFalse(self.projection_root.exists())
+
+    def test_closeout_archive_rejects_earlier_ssh_attempt_hidden_by_local_resume(self) -> None:
+        # A historic SSH launch must not be forgotten when a later local
+        # resume replaces the same persisted task row's launcher_json.
+        with patch.object(
+            tasks, "_dispatch_managed_local_task",
+            return_value={**_launcher(), "task_launch_transport": "ssh"},
+        ):
+            started = self._start()["task"]
+        task_id = str(started["task_id"])
+        with (
+            patch.object(tasks, "_require_recovery_gate", return_value={"checked_at_unix": 123}),
+            patch.object(tasks, "_observe", return_value={"state": "failed"}),
+            patch.object(tasks, "_dispatch_managed_local_task",
+                         return_value={**_launcher(), "task_launch_transport": "local"}),
+            patch.object(tasks.operator, "_require_operator_mutation"),
+            patch.object(tasks.base, "_append_audit"),
+        ):
+            resumed = tasks.grabowski_task_resume(task_id)["task"]
+        self.assertEqual(2, resumed["attempt"])
+        self.assertEqual(
+            "local", json.loads(tasks._row_raw(task_id)["launcher_json"])["task_launch_transport"],
+        )
+        tasks._set_state(task_id, "completed", observation={"state": "completed"})
+        record = tasks._row(task_id)
+        before = self.database.read_bytes()
+        with (
+            patch.object(tasks, "_resolve_task_dispatch_host",
+                         return_value=("local", {"transport": "local"}, False)) as route,
+            patch.object(tasks, "_observe",
+                         side_effect=AssertionError("historic SSH may still restart")) as probe,
+            self.assertRaisesRegex(attention.TaskAttentionConflictError,
+                                   "earlier attempts.*retirement proof"),
+        ):
+            attention.execute_closeout_archive(self._archive_parameters(record))
+        route.assert_not_called()
+        probe.assert_not_called()
+        self.assertEqual(before, self.database.read_bytes())
+        self.assertFalse(self.archive_root.exists())
+        self.assertFalse(self.projection_root.exists())
+
+    def test_archive_guard_rejects_legacy_marker_one_without_direct_dispatch_proof(self) -> None:
+        record = self._completed_task()
+        raw = tasks._row_raw(str(record["task_id"]))
+        original = json.loads(raw["launcher_json"])
+        original.pop("task_launch_provenance", None)
+        historical = {
+            **raw,
+            "launcher_json": json.dumps({
+                **original,
+                "task_launch_transport": "local",
+                # A pre-fix local marker and launcher transport report are
+                # not a trustworthy proof of physical local execution.
+            }),
+        }
+        with (
+            patch.object(tasks, "_resolve_task_dispatch_host",
+                         return_value=("local", {"transport": "local"}, False)) as route,
+            self.assertRaisesRegex(attention.TaskAttentionConflictError,
+                                   "local dispatch provenance.*unverified"),
+        ):
+            attention._require_safe_archive_transport(historical)
+        route.assert_not_called()
+
+    def test_unverified_single_local_marker_cannot_create_archive(self) -> None:
+        # Old and forged same-UID launchers can contain all three local
+        # markers. Without independently authenticated host retirement they
+        # may never authorize a NEW immutable archive projection switch.
+        record = self._completed_task()
+        raw = tasks._row_raw(str(record["task_id"]))
+        launcher = json.loads(raw["launcher_json"])
+        self.assertEqual(1, raw["attempt"])
+        self.assertEqual("local", launcher["task_launch_transport"])
+        self.assertEqual(tasks.TASK_LOCAL_DISPATCH_PROVENANCE,
+                         launcher["task_launch_provenance"])
+        self.assertEqual(1, launcher[tasks.TASK_OUTPUT_LAUNCHER_BINDING_KEY])
+        before = self.database.read_bytes()
+        with (
+            patch.object(
+                attention, "_require_host_authenticated_archive_retirement",
+                self.production_archive_retirement_gate,
+            ),
+            patch.object(tasks, "_observe",
+                         side_effect=AssertionError("unsafe archive must not probe")) as probe,
+            self.assertRaisesRegex(attention.TaskAttentionConflictError,
+                                   "authenticated.*retirement proof"),
+        ):
+            attention.execute_closeout_archive(self._archive_parameters(record))
+        probe.assert_not_called()
+        self.assertEqual(before, self.database.read_bytes())
+        self.assertFalse(self.archive_root.exists())
+        self.assertFalse(self.projection_root.exists())
+
+    def test_archive_classification_rejects_persisted_ssh_launch_before_external_sources(self) -> None:
+        record = self._completed_task()
+        raw = tasks._row_raw(str(record["task_id"]))
+        historical = {**raw, "launcher_json": json.dumps({
+            "task_launch_transport": "ssh",
+        })}
+        with (
+            patch.object(tasks, "_resolve_task_dispatch_host",
+                         return_value=("local", {"transport": "local"}, False)),
+            patch.object(attention, "_assert_no_live_task_resource_leases",
+                         side_effect=AssertionError("must not check leases")),
+            patch.object(attention, "_assert_no_live_task_process",
+                         side_effect=AssertionError("must not probe task")),
+            self.assertRaisesRegex(attention.TaskAttentionConflictError,
+                                   "historical.*retirement proof"),
+        ):
+            attention._task_archive_classification(
+                historical,
+                expected_lifecycle_receipt_sha256=record["lifecycle_receipt_sha256"],
+                archived=False,
+            )
+
+    def test_archive_classification_rejects_remote_before_external_sources(self) -> None:
+        record = self._completed_task()
+        with (
+            patch.object(
+                tasks, "_resolve_task_dispatch_host",
+                return_value=("remote", {"transport": "ssh"}, False),
+            ),
+            patch.object(
+                attention, "_assert_no_live_task_resource_leases",
+                side_effect=AssertionError("must not probe resource leases"),
+            ),
+            patch.object(
+                attention, "_assert_no_live_task_process",
+                side_effect=AssertionError("must not probe remote unit"),
+            ),
+            self.assertRaisesRegex(
+                attention.TaskAttentionConflictError, "retirement.*required",
+            ),
+        ):
+            attention._task_archive_classification(
+                record,
+                expected_lifecycle_receipt_sha256=record["lifecycle_receipt_sha256"],
+                archived=False,
+            )
+
+    def test_closeout_archive_rechecks_transport_before_projection_switch(self) -> None:
+        import grabowski_lifecycle_effect_plan as effect_plan
+
+        record = self._completed_task()
+        parameters = self._archive_parameters(record)
+        task_db_before = self.database.read_bytes()
+        routing = {"transport": "local"}
+        original_revalidate = effect_plan.revalidate_effect_plan
+
+        def fleet_switch_after_revalidation(*args: object, **kwargs: object) -> dict:
+            result = original_revalidate(*args, **kwargs)
+            self.assertTrue(result["ready_for_effect"])
+            routing["transport"] = "ssh"
+            return result
+
+        def dispatch_host(host: str) -> tuple[str, dict, bool]:
+            return host, {"transport": routing["transport"]}, False
+
+        with (
+            patch.object(tasks, "_resolve_task_dispatch_host", side_effect=dispatch_host),
+            patch.object(tasks, "_observe", return_value=self._inactive_process_observation()),
+            patch.object(effect_plan, "revalidate_effect_plan", side_effect=fleet_switch_after_revalidation),
+            self.assertRaisesRegex(attention.TaskAttentionConflictError, "remote.*retirement proof"),
+        ):
+            attention.execute_closeout_archive(parameters)
+        self.assertEqual("ssh", routing["transport"])
+        # An archive segment may already exist, but no irreversible current
+        # projection switch may exclude a now-remote task from readiness.
+        self.assertTrue(self.archive_root.exists())
+        self.assertFalse(self.projection_root.exists())
+        self.assertEqual(task_db_before, self.database.read_bytes())
+
+    def test_archive_projection_switch_holds_shared_fleet_mutation_lock(self) -> None:
+        import grabowski_lifecycle_projection as lifecycle_projection
+
+        record = self._completed_task()
+        original_switch = lifecycle_projection.apply_task_archive_projection_switch
+        lock_path = (
+            attention.fleet_mutation.STATE_ROOT
+            / attention.fleet_mutation.MUTATION_STATE_DIRECTORY_NAME
+            / attention.fleet_mutation.LOCK_NAME
+        )
+
+        def inspect_during_switch(*args: object, **kwargs: object) -> dict:
+            # Fleet's authorized CAS worker acquires LOCK_EX. It must not
+            # replace local routing until the irreversible switch commits.
+            descriptor = os.open(lock_path, os.O_RDWR | os.O_NOFOLLOW)
+            try:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(descriptor)
+            return original_switch(*args, **kwargs)
+
+        with (
+            patch.object(tasks, "_observe", return_value=self._inactive_process_observation()),
+            patch.object(lifecycle_projection, "apply_task_archive_projection_switch",
+                         side_effect=inspect_during_switch) as switched,
+        ):
+            result = attention.execute_closeout_archive(self._archive_parameters(record))
+        switched.assert_called_once()
+        self.assertFalse(result["already_archived"])
+        descriptor = os.open(lock_path, os.O_RDWR | os.O_NOFOLLOW)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(descriptor)
+
+    def test_closeout_archive_existing_projection_replays_after_transport_change(self) -> None:
+        record = self._completed_task()
+        parameters = self._archive_parameters(record)
+        with patch.object(
+            tasks, "_observe", return_value=self._inactive_process_observation(),
+        ):
+            first = attention.execute_closeout_archive(parameters)
+        self.assertFalse(first["already_archived"])
+        with (
+            patch.object(
+                tasks, "_resolve_task_dispatch_host",
+                return_value=("remote", {"transport": "ssh"}, False),
+            ),
+            patch.object(
+                tasks, "_observe",
+                side_effect=AssertionError("idempotent replay must not reprobe"),
+            ) as probe,
+        ):
+            again = attention.execute_closeout_archive(parameters)
+        probe.assert_not_called()
+        self.assertTrue(again["already_archived"])
+        self.assertTrue(again["idempotent_replay"])
+        self.assertEqual(
+            first["projection"]["projection_sha256"],
+            again["projection"]["projection_sha256"],
+        )
+
+    def test_archived_replay_defers_output_cleanup_without_external_retirement(self) -> None:
+        record = self._completed_task()
+        parameters = self._archive_parameters(record)
+        with patch.object(
+            tasks, "_observe", return_value=self._inactive_process_observation(),
+        ):
+            first = attention.execute_closeout_archive(parameters)
+        self.assertFalse(first["already_archived"])
+        prior_projection = first["projection"]["projection_sha256"]
+        before = self.database.read_bytes()
+        # Current Fleet could be remapped after the irreversible historical
+        # archive. Replay is permitted to VERIFY its immutable projection, not
+        # to delete further task outputs based on today's SSH show/stop.
+        with (
+            patch.object(
+                attention, "_require_host_authenticated_archive_retirement",
+                self.production_archive_retirement_gate,
+            ),
+            # Ensure the replay reaches the eligible output deletion path.
+            patch.object(
+                attention, "_task_output_cleanup_now_unix",
+                return_value=2_000_000_000,
+            ),
+            patch.object(
+                tasks, "_resolve_task_dispatch_host",
+                return_value=("remote", {"transport": "ssh"}, False),
+            ),
+            patch.object(
+                attention, "_assert_no_live_task_process",
+                side_effect=AssertionError("must not probe old remote unit"),
+            ) as probe,
+            patch.object(
+                tasks, "_task_output_cleanup_run",
+                side_effect=AssertionError("must not delete archived output"),
+            ) as deletion,
+        ):
+            replay = attention.execute_closeout_archive(parameters)
+        probe.assert_not_called()
+        deletion.assert_not_called()
+        self.assertTrue(replay["already_archived"])
+        self.assertTrue(replay["idempotent_replay"])
+        self.assertEqual(prior_projection, replay["projection"]["projection_sha256"])
+        self.assertEqual("deferred", replay["task_output_cleanup"]["status"])
+        self.assertEqual(
+            "external_retirement_unverified", replay["task_output_cleanup"]["reason"]
+        )
+        self.assertEqual(before, self.database.read_bytes())
+
+    def test_archive_output_reconcile_defers_without_external_retirement(self) -> None:
+        record = self._completed_task()
+        with patch.object(
+            tasks, "_observe", return_value=self._inactive_process_observation(),
+        ):
+            first = attention.execute_closeout_archive(self._archive_parameters(record))
+        self.assertFalse(first["already_archived"])
+        with (
+            patch.object(
+                attention, "_require_host_authenticated_archive_retirement",
+                self.production_archive_retirement_gate,
+            ),
+            # Force the real cleanup eligibility boundary to have passed:
+            # otherwise a retention defer would mask the unsafe replay path.
+            patch.object(
+                attention, "_task_output_cleanup_now_unix",
+                return_value=2_000_000_000,
+            ),
+            patch.object(
+                attention, "_assert_no_live_task_process",
+                side_effect=AssertionError("must not probe unknown host"),
+            ) as probe,
+            patch.object(
+                tasks, "_task_output_cleanup_run",
+                side_effect=AssertionError("must not inspect/delete without retirement"),
+            ) as deletion,
+        ):
+            result = attention.reconcile_archived_task_outputs(limit=1)
+        probe.assert_not_called()
+        deletion.assert_not_called()
+        self.assertEqual("ok", result["status"])
+        self.assertEqual(1, result["counts"]["deferred"])
+        self.assertEqual("deferred", result["results"][0]["status"])
+        self.assertEqual(
+            "external_retirement_unverified", result["results"][0]["reason"]
+        )
+
     def test_closeout_archive_completed_task_writes_segment_and_projection_idempotently(self) -> None:
         record = self._completed_task()
         parameters = self._archive_parameters(record)
@@ -2223,7 +2693,11 @@ class TaskAttentionTests(unittest.TestCase):
                 "ActiveState": "active",
                 "SubState": "running",
             },
-            "probe": {"returncode": 0, "outcome_unknown": False},
+            "probe": {
+                "returncode": 0, "outcome_unknown": False,
+                "timed_out": False, "stdout_truncated": False,
+                "stderr_truncated": False,
+            },
         }
 
         with patch.object(tasks, "_observe", return_value=live), self.assertRaisesRegex(
@@ -2231,6 +2705,56 @@ class TaskAttentionTests(unittest.TestCase):
             "still live",
         ):
             attention.execute_closeout_archive(self._archive_parameters(record))
+
+    def test_archive_liveness_rejects_incomplete_systemd_probes(self) -> None:
+        record = self._completed_task()
+        observation = self._inactive_process_observation()
+        before = self.database.read_bytes()
+        for field, invalid_value in (
+            ("returncode", 1),
+            ("timed_out", True),
+            ("stdout_truncated", True),
+            ("stderr_truncated", True),
+            ("outcome_unknown", True),
+        ):
+            with self.subTest(invalid_field=field):
+                failed_probe = {**observation["probe"], field: invalid_value}
+                with patch.object(tasks, "_observe", return_value={
+                    **observation, "probe": failed_probe,
+                }), self.assertRaises(attention.TaskAttentionIntegrityError):
+                    attention._assert_no_live_task_process(record)
+        for missing_field in (
+            "returncode", "timed_out", "stdout_truncated",
+            "stderr_truncated",
+        ):
+            with self.subTest(missing_field=missing_field):
+                incomplete_probe = dict(observation["probe"])
+                del incomplete_probe[missing_field]
+                with patch.object(tasks, "_observe", return_value={
+                    **observation, "probe": incomplete_probe,
+                }), self.assertRaises(attention.TaskAttentionIntegrityError):
+                    attention._assert_no_live_task_process(record)
+        # Local operator._run has no outcome_unknown field; a complete
+        # successful local systemctl show is still usable for closeout.
+        local_observation = {
+            **observation,
+            "probe": {k: v for k, v in observation["probe"].items()
+                      if k != "outcome_unknown"},
+        }
+        with patch.object(tasks, "_observe", return_value=local_observation):
+            verified = attention._assert_no_live_task_process(record)
+        self.assertFalse(verified["active_process"])
+        self.assertEqual(before, self.database.read_bytes())
+
+    def test_closeout_archive_local_probe_without_optional_outcome_unknown(self) -> None:
+        record = self._completed_task()
+        observation = self._inactive_process_observation()
+        observation["probe"].pop("outcome_unknown")
+        with patch.object(tasks, "_observe", return_value=observation):
+            archived = attention.execute_closeout_archive(self._archive_parameters(record))
+        self.assertFalse(archived["already_archived"])
+        self.assertTrue(self.archive_root.exists())
+        self.assertTrue(self.projection_root.exists())
 
     def test_closeout_archive_blocks_reacquired_task_resource_lease(self) -> None:
         resource_key = "component:test-task-closeout-archive"

@@ -5886,6 +5886,10 @@ def _dispatch(
 
 
 def _task_output_managed_from_attempt(record: dict[str, Any]) -> int | None:
+    # This prelaunch marker constrains future routing; it is not historical
+    # transport evidence. Legacy marker=1 rows could have crossed to SSH after
+    # persistence. This fix neither backfills nor verifies their old attempts;
+    # v4 readiness's marker-only index cannot establish that provenance.
     raw = record.get("launcher_json")
     if not isinstance(raw, str):
         return None
@@ -6745,6 +6749,54 @@ def _root_task_payload(record: dict[str, Any], operation: str, **extra: Any) -> 
     return {"operation": operation, "unit": _authoritative_unit(record), **extra}
 
 
+def _task_launch_error(
+    exc: Exception, *, outcome_unknown: bool = False
+) -> dict[str, Any]:
+    return {
+        "returncode": 1,
+        "stdout": "",
+        "stderr": _redact_reason(f"{type(exc).__name__}: {exc}"),
+        "timed_out": False,
+        "stdout_truncated": False,
+        "stderr_truncated": False,
+        "root_truth_observable": False,
+        "outcome_unknown": outcome_unknown,
+        "launch_not_dispatched": not outcome_unknown,
+        "privileged_broker": None,
+    }
+
+
+# This is emitted only by the direct managed-local systemd code path. It
+# does not certify any earlier attempt or provide independent root authority.
+TASK_LOCAL_DISPATCH_PROVENANCE = "direct-user-systemd-invocation-v1"
+
+
+def _dispatch_managed_local_task(host: str, argv: list[str]) -> dict[str, Any]:
+    """Revalidate authority, then physically dispatch only to local user systemd."""
+    try:
+        if fleet.fleet_host(host)["transport"] != "local":
+            raise RuntimeError("Managed local task launch requires current local transport")
+    except (OSError, RuntimeError, ValueError) as exc:
+        return _task_launch_error(exc)
+    # Do not pass this launch through _dispatch/run_fleet_host: another Fleet
+    # lookup could switch to SSH after validation and export local privileges.
+    # Once _run begins, an exception cannot prove that the unit was not started.
+    try:
+        result = operator._run(
+            argv,
+            cwd=operator.HOME,
+            timeout_seconds=60,
+            max_output_bytes=operator.DEFAULT_OUTPUT_BYTES,
+        )
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
+        result = _task_launch_error(exc, outcome_unknown=True)
+    if result.get("timed_out"):
+        result = {**result, "outcome_unknown": True}
+    # Evidence for this dispatch attempt only, including ambiguous outcomes.
+    # It does not upgrade the provenance of earlier attempts on the same row.
+    return {**result, "task_launch_transport": "local", "task_launch_provenance": TASK_LOCAL_DISPATCH_PROVENANCE}
+
+
 def _launch(record: dict[str, Any]) -> dict[str, Any]:
     if _is_root_systemd_backend(record):
         try:
@@ -6771,33 +6823,30 @@ def _launch(record: dict[str, Any]) -> dict[str, Any]:
                 "launch_not_dispatched": True,
                 "privileged_broker": None,
             }
-    target = fleet.fleet_host(record["host"])
     try:
+        target = fleet.fleet_host(record["host"])
+        managed_local = (
+            _task_output_contract_version(record) == TASK_OUTPUT_CONTRACT_VERSION
+        )
+        if managed_local and target["transport"] != "local":
+            raise RuntimeError("Managed local task launch requires current local transport")
         _stage_task_output_capture_script(
             record["host"], transport=target["transport"]
+        )
+        argv = _launch_argv(
+            record,
+            include_managed_runtime=target["transport"] == "local",
         )
     except (OSError, PermissionError, RuntimeError, ValueError) as exc:
         # The row is already committed as launching and its leases are held.
         # Raising here would strand it, so report the same undispatched shape
         # the root launch path uses and let the caller release the attempt.
-        return {
-            "returncode": 1,
-            "stdout": "",
-            "stderr": _redact_reason(f"{type(exc).__name__}: {exc}"),
-            "timed_out": False,
-            "stdout_truncated": False,
-            "stderr_truncated": False,
-            "root_truth_observable": False,
-            "outcome_unknown": False,
-            "launch_not_dispatched": True,
-            "privileged_broker": None,
-        }
+        return _task_launch_error(exc)
+    if managed_local:
+        return _dispatch_managed_local_task(record["host"], argv)
     return _dispatch(
         record["host"],
-        _launch_argv(
-            record,
-            include_managed_runtime=target["transport"] == "local",
-        ),
+        argv,
         timeout_seconds=60,
     )
 
@@ -7719,10 +7768,117 @@ def grabowski_task_peek(task_id: str) -> dict[str, Any]:
         }
         result["reconcile_required"] = True
         return result
-    result["state"] = _effective_observed_state(record, observation["state"])
+    observed_state = str(observation["state"])
     result["last_observation"] = observation
     result["observation_mode"] = "unpersisted_readonly_probe"
-    result["reconcile_required"] = result["state"] != record["state"]
+    # A transient terminal unit can be garbage-collected by the user manager.
+    # Its synthetic successful systemctl result is not historical task truth.
+    # Only a complete, fresh, bound local unit-absent probe permits retaining
+    # the immutable stored terminal outcome without reconciliation effects.
+    props = observation.get("properties")
+    if (
+        _is_terminal_state(str(record["state"]))
+        and observed_state != "running"
+        and isinstance(props, dict)
+        and props.get("LoadState") == "not-found"
+    ):
+        if (
+            observed_state not in {"completed", "outcome_unknown"}
+            or not _task_reconcile_ready_local_terminal_observed(record, observation)
+        ):
+            result["state"] = "observation_error"
+            result["observation_unavailable_reason"] = "local_terminal_absence_unverified"
+            result["systemd_unit_health"] = {
+                "status": "unknown",
+                "reason": "local_terminal_absence_unverified",
+            }
+            result["reconcile_required"] = True
+            return result
+        result["state"] = str(record["state"])
+        result["systemd_unit_health"] = {"status": "not_applicable"}
+        result["reconcile_required"] = False
+        return result
+    # A stored successful terminal result must not mask a new, contradictory
+    # terminal systemd result. Preserve the stored audit truth separately but
+    # expose the conflict as nonterminal until authorized reconciliation.
+    if (
+        _is_terminal_state(str(record["state"]))
+        and observed_state not in {"running", str(record["state"])}
+        # Cancellation is a policy result, not a systemd Result. A coherent
+        # quiescent terminal unit may report any actual systemd terminal
+        # outcome; unknown/active observations remain untrusted.
+        and not (
+            record["state"] == "cancelled"
+            and observed_state in {"completed", "failed", "signalled", "timed_out"}
+            and _task_reconcile_ready_local_terminal_observed(
+                record, observation, cancelled_quiescence_only=True
+            )
+        )
+    ):
+        result["state"] = "observation_error"
+        result["observation_unavailable_reason"] = "persisted_terminal_outcome_conflict"
+        result["systemd_unit_health"] = {
+            "status": "unknown",
+            "reason": "persisted_terminal_outcome_conflict",
+        }
+        result["reconcile_required"] = True
+        return result
+    # _classify_observation reports running for an active-looking prefix
+    # before it inspects a failed systemctl probe. A launching -> running
+    # exception is safe only for one fresh, complete, bound local observation.
+    if record["state"] == "launching" and observed_state == "running":
+        props = observation.get("properties")
+        probe = observation.get("probe")
+        observer = observation.get("observer")
+        observed_at = observation.get("observed_at_unix")
+        observed_now = _now()
+        unit = _authoritative_unit(record)
+        valid_launch_observation = (
+            isinstance(props, dict)
+            and isinstance(probe, dict)
+            and isinstance(observer, dict)
+            and observer.get("kind") == "bound-local-user-systemd-show-v1"
+            and observer.get("transport") == "local"
+            and type(probe.get("returncode")) is int
+            and probe["returncode"] == 0
+            and probe.get("timed_out") is False
+            and probe.get("stdout_truncated") is False
+            and probe.get("stderr_truncated") is False
+            and (
+                probe.get("outcome_unknown") is None
+                or probe.get("outcome_unknown") is False
+            )
+            and type(observed_at) is int
+            and 0 <= observed_now - observed_at <= 30
+            and props.get("LoadState") == "loaded"
+            and props.get("ActiveState") in {"active", "activating", "reloading"}
+            and props.get("SubState") in {"running", "start", "start-post"}
+            and ("Id" not in props or props["Id"] == unit)
+            and ("Names" not in props or unit in str(props["Names"]).split())
+        )
+        if not valid_launch_observation:
+            result["state"] = "observation_error"
+            result["observation_unavailable_reason"] = "local_running_probe_unverified"
+            result["systemd_unit_health"] = {
+                "status": "unknown",
+                "reason": "local_running_probe_unverified",
+            }
+            result["reconcile_required"] = True
+            return result
+    result["state"] = _effective_observed_state(record, observed_state)
+    result["systemd_unit_health"] = _task_systemd_unit_health(
+        result["state"], observation
+    )
+    # A verified launching -> running transition remains active throughout.
+    # It does not create an uncertain prior outcome or justify blocking a
+    # sibling Workspace role, and a READ_ONLY peek must not persist it.
+    result["reconcile_required"] = (
+        result["state"] != record["state"]
+        and not (
+            record["state"] == "launching"
+            and result["state"] == "running"
+        )
+    )
     return result
 
 
@@ -10031,6 +10187,7 @@ def grabowski_task_start(
         "unit": unit,
         "launcher_returncode": launcher["returncode"],
         "launcher_outcome_unknown": bool(launcher.get("outcome_unknown")),
+        "task_launch_transport": launcher.get("task_launch_transport"),
         "task_output_managed_from_attempt": task_output_managed_from_attempt,
         "recovery_required": recovery_gate.get("required", False),
         "recovery_checked_at_unix": recovery_gate.get("checked_at_unix"),
@@ -10554,6 +10711,7 @@ def grabowski_task_resume(
         "systemd_scope": _systemd_scope(record),
         "launcher_returncode": launcher["returncode"],
         "launcher_outcome_unknown": bool(launcher.get("outcome_unknown")),
+        "task_launch_transport": launcher.get("task_launch_transport"),
         "task_output_managed_from_attempt": task_output_managed_from_attempt,
         "recovery_required": recovery_gate.get("required", False),
         "recovery_checked_at_unix": recovery_gate.get("checked_at_unix"),
@@ -11728,6 +11886,456 @@ TASK_RECONCILE_READY_PRIVILEGED_INDEX_SQL = (
 )
 TASK_RECONCILE_READY_SCOPE = "quiescent-privileged-terminal-observations-v2"
 
+# This covering index witnesses *all retained rows*, without archive exclusion.
+# Seek past each equal prefix instead of DISTINCT/GROUP BY (which scan history).
+TASK_RECONCILE_READY_RETAINED_INDEX = "tasks_reconcile_ready_retained_idx"
+TASK_RECONCILE_READY_RETAINED_INDEX_SQL = (
+    "CREATE INDEX tasks_reconcile_ready_retained_idx "
+    "ON tasks(host,execution_backend,systemd_scope,state)"
+)
+TASK_RECONCILE_READY_UNBOUND_ORIGIN_INDEX = "tasks_reconcile_ready_unbound_origin_idx"
+# The managed-output binding is established only on local user-task creation;
+# resume preserves it and rejects a non-local target. A binding from attempt
+# 2 or later cannot exclude an earlier SSH attempt. Never infer origin from
+# today's fleet mapping alone, or backfill this marker during reconciliation.
+TASK_RECONCILE_READY_UNBOUND_ORIGIN_PREDICATE = (
+    "CASE WHEN json_valid(launcher_json) THEN "
+    "(json_type(launcher_json,'$.task_output_managed_from_attempt') IS NOT 'integer' "
+    "OR json_extract(launcher_json,'$.task_output_managed_from_attempt') IS NOT 1) "
+    "ELSE 1 END"
+)
+TASK_RECONCILE_READY_UNBOUND_ORIGIN_INDEX_SQL = (
+    "CREATE INDEX tasks_reconcile_ready_unbound_origin_idx ON tasks(task_id) WHERE "
+    + TASK_RECONCILE_READY_UNBOUND_ORIGIN_PREDICATE
+)
+TASK_RECONCILE_READY_RETAINED_SCOPE = "retained-attempt-inventory-v1"
+TASK_RECONCILE_READY_RETAINED_COHORT_LIMIT = 64
+# Versioned activation boundary, independent of legacy observer budget knobs.
+TASK_RECONCILE_READY_RETAINED_MIN_ROWS = 8225
+# Separate finite DDL budget; this does not change the READ_ONLY VM budget.
+TASK_RECONCILE_READY_INDEX_BUILD_VM_CALLBACK_LIMIT = 16000
+
+
+@contextmanager
+def _task_readiness_sql_budget(connection: sqlite3.Connection) -> Iterator[None]:
+    if TASK_RECONCILE_READY_SQL_VM_CALLBACK_LIMIT <= 0:
+        raise RuntimeError("Readiness SQLite work budget is exhausted")
+    callbacks = 0
+    deadline = time.monotonic() + 5
+
+    def exceeded() -> int:
+        nonlocal callbacks
+        callbacks += 1
+        return int(
+            callbacks > TASK_RECONCILE_READY_SQL_VM_CALLBACK_LIMIT
+            or time.monotonic() > deadline
+        )
+
+    connection.set_progress_handler(exceeded, 1000)
+    try:
+        yield
+    finally:
+        connection.set_progress_handler(None, 0)
+
+
+def _task_retained_index_present(
+    connection: sqlite3.Connection, *,
+    name: str = TASK_RECONCILE_READY_RETAINED_INDEX,
+    sql: str = TASK_RECONCILE_READY_RETAINED_INDEX_SQL,
+) -> bool:
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='index' AND name=?",
+        (name,),
+    ).fetchone()
+    if row is None:
+        return False
+    if _normalize_reconcile_contract_sql(str(row[0])) != _normalize_reconcile_contract_sql(
+        sql
+    ):
+        raise RuntimeError("Retained readiness index contract is invalid")
+    return True
+
+
+def _task_retained_cohorts(connection: sqlite3.Connection) -> list[list[str]]:
+    missing_indexes = [sql for name, sql in (
+        (TASK_RECONCILE_READY_RETAINED_INDEX, TASK_RECONCILE_READY_RETAINED_INDEX_SQL),
+        (TASK_RECONCILE_READY_UNBOUND_ORIGIN_INDEX, TASK_RECONCILE_READY_UNBOUND_ORIGIN_INDEX_SQL),
+    ) if not _task_retained_index_present(connection, name=name, sql=sql)]
+    if missing_indexes:
+        raise RuntimeError("Retained readiness index requires authorized installation")
+    cohorts: list[list[str]] = []
+    columns = ("host", "execution_backend", "systemd_scope", "state")
+    with _task_readiness_sql_budget(connection):
+        for _ in range(TASK_RECONCILE_READY_RETAINED_COHORT_LIMIT + 1):
+            query = (
+                "SELECT host,execution_backend,systemd_scope,state FROM tasks "
+                f"INDEXED BY {TASK_RECONCILE_READY_RETAINED_INDEX} "
+            )
+            if not cohorts:
+                row = connection.execute(
+                    query + "ORDER BY host,execution_backend,systemd_scope,state LIMIT 1"
+                ).fetchone()
+            else:
+                # A row-value > comparison still walks duplicate equal keys
+                # in SQLite. Each explicit equality-prefix/range query seeks
+                # directly beyond its entire cohort, including 97010 equals.
+                row = None
+                for pivot in range(3, -1, -1):
+                    predicates = [f"{column}=?" for column in columns[:pivot]]
+                    predicates.append(f"{columns[pivot]}>?")
+                    row = connection.execute(
+                        query + "WHERE " + " AND ".join(predicates)
+                        + " ORDER BY " + ",".join(columns[pivot:]) + " LIMIT 1",
+                        tuple(cohorts[-1][:pivot + 1]),
+                    ).fetchone()
+                    if row is not None:
+                        break
+            if row is None:
+                return cohorts
+            values = list(row)
+            if any(not isinstance(value, str) or not 0 < len(value) <= 256 for value in values):
+                raise RuntimeError("Retained readiness cohort is invalid")
+            cohorts.append(values)
+    raise RuntimeError("Retained readiness cohort budget exceeded")
+
+
+def _task_reconcile_archive_projection_sha256(connection: sqlite3.Connection) -> str:
+    """Validate bounded immutable archives and their exact retained task rows.
+
+    This is integrity evidence only: no archived row is excluded from the
+    retained cohort, origin or live-attempt inventory proofs.
+    """
+    projection = _task_current_projection(readiness_bounded=True)
+    with _task_readiness_sql_budget(connection):
+        _projected_task_state_counts(connection, projection)
+    digest = projection.get("projection_sha256")
+    if not isinstance(digest, str) or not SHA256.fullmatch(digest):
+        raise RuntimeError("Readiness archive projection digest is invalid")
+    return digest
+
+
+def _prepare_task_reconcile_retained_evidence(
+    connection: sqlite3.Connection,
+) -> dict[str, Any] | None:
+    operator._require_operator_mutation("durable_job")
+    missing_indexes = [sql for name, sql in (
+        (TASK_RECONCILE_READY_RETAINED_INDEX, TASK_RECONCILE_READY_RETAINED_INDEX_SQL),
+        (TASK_RECONCILE_READY_UNBOUND_ORIGIN_INDEX, TASK_RECONCILE_READY_UNBOUND_ORIGIN_INDEX_SQL),
+    ) if not _task_retained_index_present(connection, name=name, sql=sql)]
+    if missing_indexes:
+        # One-time authorized index construction has its own finite deadline.
+        # It never occurs in READ_ONLY. Failure rolls back the transaction.
+        deadline = time.monotonic() + 30
+        callbacks = 0
+        def exceeded() -> int:
+            nonlocal callbacks
+            callbacks += 1
+            return int(callbacks > TASK_RECONCILE_READY_INDEX_BUILD_VM_CALLBACK_LIMIT
+                       or time.monotonic() > deadline)
+        connection.set_progress_handler(exceeded, 1000)
+        try:
+            for sql in missing_indexes:
+                connection.execute(sql)
+        finally:
+            connection.set_progress_handler(None, 0)
+    cohorts = _task_retained_cohorts(connection)
+    if any(row[3] not in TASK_STATE_PROJECTIONS["terminal"] for row in cohorts):
+        return None
+    with resources._resource_readonly_snapshot() as resource_connection:
+        with _task_readiness_sql_budget(resource_connection):
+            revision = resources._resource_reconcile_revision_contract(resource_connection)
+            pending = resource_connection.execute(
+                "SELECT 1 FROM task_terminalizations WHERE phase='leases_revoked' LIMIT 1"
+            ).fetchone()
+    if revision is None or pending is not None:
+        return None
+    return {"retained_history": {
+        "schema_version": 4,
+        "scope": TASK_RECONCILE_READY_RETAINED_SCOPE,
+        "task_revision": _task_reconcile_revision_contract(connection)["revision"],
+        "resource_revision": revision["revision"],
+        "cohorts_sha256": _sha256_json(cohorts),
+        "archive_projection_sha256": _task_reconcile_archive_projection_sha256(connection),
+    }}
+
+
+def _publish_task_reconcile_retained_evidence(prepared: dict[str, Any]) -> None:
+    # No unit is stopped, retired or observed by this publisher. Root/SSH
+    # history remains blocked even when it has been archived or shown before.
+    with _task_mutation_lock():
+        operator._require_operator_mutation("durable_job")
+        with _database_connection() as connection:
+            current = _prepare_task_reconcile_retained_evidence(connection)
+            if current != {"retained_history": prepared}:
+                return
+            material = {**prepared, "reconciled_at_unix": _now()}
+            # Bind the exact witness to a durable audit record before publishing.
+            witness_sha256 = _sha256_json(material)
+            audit_sha256 = base._append_audit_with_digest({
+                "timestamp_unix": material["reconciled_at_unix"],
+                "operation": "task-reconcile-retained-witness-prepared",
+                "witness_sha256": witness_sha256,
+                "task_revision": material["task_revision"],
+                "resource_revision": material["resource_revision"],
+                "archive_projection_sha256": material["archive_projection_sha256"],
+                "scope": material["scope"],
+            })
+            material["audit_record_sha256"] = audit_sha256
+            proof = {**material, "evidence_sha256": _sha256_json(material)}
+            connection.execute(
+                "INSERT INTO metadata(key,value) VALUES(?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (TASK_RECONCILE_READY_EVIDENCE_METADATA_KEY, _canonical_json(proof)),
+            )
+
+
+TASK_RECONCILE_READY_AUDIT_RECORD_LIMIT = 65536
+
+
+def _task_retained_audit_witness(
+    proof: dict[str, Any], *, deadline: float,
+) -> tuple[Any, ...]:
+    """Uncached, effect-free membership proof in the existing active audit head.
+
+    This unkeyed same-UID hash chain is integrity evidence, NOT cryptographic
+    publisher authentication against an actor able to rewrite that chain. Bind
+    only the exact publisher event; unrelated audit events are not signers.
+    Rotated-out events require an authorized republish, never archive searches
+    or READ_ONLY backfill. Do not call audit helpers that create paths/locks.
+    """
+    def budget() -> None:
+        if time.monotonic() > deadline:
+            raise RuntimeError("Retained audit witness deadline exceeded")
+
+    def identity(s: os.stat_result) -> tuple[int, ...]:
+        stable = (s.st_dev, s.st_ino, s.st_mode, s.st_uid, s.st_gid)
+        if stat.S_ISDIR(s.st_mode):
+            # Sibling create/delete activity changes directory nlink, size,
+            # mtime and ctime without replacing an ancestor or audit record.
+            # Bind directory inode, type, owner and mode instead. The target
+            # regular file still binds the full stat identity and byte hash.
+            return stable
+        return (*stable, s.st_nlink, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+
+    budget()
+    path = Path(base.AUDIT_LOG)
+    if not path.is_absolute() or ".." in path.parts or not 2 <= len(path.parts) <= 64:
+        raise RuntimeError("Unsafe retained audit path")
+    required_flags = ("O_NOATIME", "O_NONBLOCK", "O_NOFOLLOW", "O_CLOEXEC", "O_PATH", "O_DIRECTORY")
+    if any(not getattr(os, name, 0) for name in required_flags):
+        raise RuntimeError("Effect-free audit observation is unsupported")
+    flags = os.O_RDONLY | os.O_NOATIME | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
+    # O_PATH ancestors neither read directory contents nor update atime. Walk
+    # each component through stable descriptors so ancestor symlinks fail too.
+    descriptors: list[int] = []
+    bindings: list[tuple[int, str, int, tuple[int, ...]]] = []
+    try:
+        parent = os.open(path.anchor, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        descriptors.append(parent)
+        for index, component in enumerate(path.parts[1:-1], start=1):
+            budget()
+            directory_flags = flags if index == len(path.parts) - 2 else os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC
+            descriptor = os.open(component, directory_flags | os.O_DIRECTORY, dir_fd=parent)
+            descriptors.append(descriptor)
+            observed = os.fstat(descriptor)
+            bindings.append((parent, component, descriptor, identity(observed)))
+            parent = descriptor
+        directory = os.fstat(parent)
+        if (not stat.S_ISDIR(directory.st_mode) or directory.st_uid != os.getuid()
+                or directory.st_gid != os.getgid() or stat.S_IMODE(directory.st_mode) != 0o700):
+            raise RuntimeError("Unsafe retained audit directory")
+        linked = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+        if (not stat.S_ISREG(linked.st_mode) or linked.st_nlink != 1
+                or linked.st_uid != os.getuid() or linked.st_gid != os.getgid()
+                or stat.S_IMODE(linked.st_mode) != 0o600):
+            raise RuntimeError("Unsafe retained audit file")
+        # No fallback without O_NOATIME, including EPERM/EINVAL. NONBLOCK keeps
+        # a concurrent FIFO replacement from hanging; never read a changed inode.
+        descriptor = os.open(path.name, flags, dir_fd=parent)
+        descriptors.append(descriptor)
+        observed = os.fstat(descriptor)
+        if identity(observed) != identity(linked):
+            raise RuntimeError("Retained audit identity changed during open")
+        bindings.append((parent, path.name, descriptor, identity(observed)))
+        if not 0 < observed.st_size <= base.MAX_AUDIT_BYTES:
+            raise RuntimeError("Retained audit byte budget exceeded")
+        chunks = []
+        size = 0
+        while True:
+            budget()
+            chunk = os.read(descriptor, min(65536, base.MAX_AUDIT_BYTES + 1 - size))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+            if size > base.MAX_AUDIT_BYTES:
+                raise RuntimeError("Retained audit byte budget exceeded")
+        data = b"".join(chunks)
+        # Bound splitlines allocation too, including CR separators in hostile
+        # bytes, before handing the bounded snapshot to the pure chain parser.
+        if (not data.endswith(b"\n") or data.count(b"\n") + data.count(b"\r")
+                > TASK_RECONCILE_READY_AUDIT_RECORD_LIMIT):
+            raise RuntimeError("Retained audit record budget or completeness failure")
+        lines = data.splitlines(keepends=True)
+        if any(len(line) > base.MAX_AUDIT_RECORD_BYTES for line in lines):
+            raise RuntimeError("Retained audit line budget exceeded")
+        budget()
+        if base._verify_audit_bytes(path, data, exists=True).get("valid") is not True:
+            raise RuntimeError("Retained audit chain is invalid")
+        budget()
+        matches = []
+        for line in lines:
+            budget()
+            record = json.loads(line)
+            if record.get("record_sha256") == proof["audit_record_sha256"]:
+                matches.append(record)
+        material = {key: value for key, value in proof.items()
+                    if key not in {"audit_record_sha256", "evidence_sha256"}}
+        if len(matches) != 1:
+            raise RuntimeError("Retained publisher event unavailable in active audit head")
+        record = matches[0]
+        if (type(record.get("audit_schema_version")) is not int or record["audit_schema_version"] != 2
+                or base._audit_record_hash(record) != proof["audit_record_sha256"]
+                or record.get("operation") != "task-reconcile-retained-witness-prepared"
+                or record.get("witness_sha256") != _sha256_json(material)
+                or type(record.get("timestamp_unix")) is not int
+                or record["timestamp_unix"] != proof["reconciled_at_unix"]
+                or any(record.get(key) != proof[key] for key in (
+                    "task_revision", "resource_revision", "archive_projection_sha256", "scope"))):
+            raise RuntimeError("Retained publisher event does not bind this witness")
+        for parent_fd, name, fd, original in bindings:
+            budget()
+            if (identity(os.fstat(fd)) != original
+                    or identity(os.stat(name, dir_fd=parent_fd, follow_symlinks=False)) != original):
+                raise RuntimeError("Retained audit identity changed")
+        budget()
+        return (tuple(original for _, _, _, original in bindings), hashlib.sha256(data).hexdigest())
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def _task_reconcile_retained_evidence_snapshot(
+    connection: sqlite3.Connection, proof: dict[str, Any],
+) -> dict[str, Any]:
+    deadline = time.monotonic() + 60
+    expected = {"schema_version", "scope", "task_revision", "resource_revision",
+                "cohorts_sha256", "archive_projection_sha256", "reconciled_at_unix",
+                "audit_record_sha256", "evidence_sha256"}
+    if set(proof) != expected or type(proof["schema_version"]) is not int:
+        return {"status": "invalid"}
+    material = {key: value for key, value in proof.items() if key != "evidence_sha256"}
+    timestamp = proof["reconciled_at_unix"]
+    if (
+        proof["scope"] != TASK_RECONCILE_READY_RETAINED_SCOPE
+        or type(timestamp) is not int
+        or not 0 <= _now() - timestamp <= TASK_RECONCILE_READY_MAX_AGE_SECONDS
+        or any(not isinstance(proof[key], str) or not SHA256.fullmatch(proof[key])
+               for key in ("task_revision", "resource_revision", "cohorts_sha256",
+                           "archive_projection_sha256", "audit_record_sha256", "evidence_sha256"))
+        or proof["evidence_sha256"] != _sha256_json(material)
+    ):
+        return {"status": "invalid_or_stale"}
+    try:
+        audit_identity = _task_retained_audit_witness(proof, deadline=deadline)
+    except (OSError, RuntimeError, ValueError, TypeError):
+        return {"status": "retained_audit_witness_unavailable"}
+    cohorts = _task_retained_cohorts(connection)
+    if _sha256_json(cohorts) != proof["cohorts_sha256"]:
+        return {"status": "stale"}
+    if any(row[3] not in TASK_STATE_PROJECTIONS["terminal"] for row in cohorts):
+        return {"status": "active_tasks"}
+
+    def revisions_match(task_reader: sqlite3.Connection) -> bool:
+        with _task_readiness_sql_budget(task_reader):
+            task_revision = _task_reconcile_revision_contract(task_reader)["revision"]
+        with resources._resource_readonly_snapshot() as reader:
+            with _task_readiness_sql_budget(reader):
+                revision = resources._resource_reconcile_revision_contract(reader)
+                pending = reader.execute(
+                    "SELECT 1 FROM task_terminalizations WHERE phase='leases_revoked' LIMIT 1"
+                ).fetchone()
+        return (
+            task_revision == proof["task_revision"] and revision is not None
+            and revision["revision"] == proof["resource_revision"] and pending is None
+            # Archive files can change independently of either SQLite revision.
+            # Validate exact bound rows and digest on both sides of inventory.
+            and _task_reconcile_archive_projection_sha256(task_reader)
+            == proof["archive_projection_sha256"]
+        )
+
+    if not revisions_match(connection):
+        return {"status": "stale"}
+    if any(row[1] == "systemd-root-broker" or row[2] == "system" for row in cohorts):
+        return {"status": "privileged_live_unverified"}
+
+    def local_targets() -> list[str] | None:
+        identities = []
+        for host, backend, scope, _state in cohorts:
+            if backend != "systemd-user" or scope != "user":
+                raise RuntimeError("Unsupported retained task authority")
+            resolved, target, _ = _resolve_task_dispatch_host(host)
+            if target.get("transport") != "local":
+                return None
+            identities.append(_sha256_json([host, resolved, target]))
+        return identities
+
+    targets = local_targets()
+    if targets is None:
+        return {"status": "local_terminal_transport_unverified"}
+    if not _task_retained_index_present(
+        connection, name=TASK_RECONCILE_READY_UNBOUND_ORIGIN_INDEX,
+        sql=TASK_RECONCILE_READY_UNBOUND_ORIGIN_INDEX_SQL,
+    ):
+        return {"status": "retained_attempt_authority_unverified"}
+    with _task_readiness_sql_budget(connection):
+        unbound = connection.execute(
+            f"SELECT 1 FROM tasks INDEXED BY {TASK_RECONCILE_READY_UNBOUND_ORIGIN_INDEX} "
+            "WHERE " + TASK_RECONCILE_READY_UNBOUND_ORIGIN_PREDICATE + " LIMIT 1"
+        ).fetchone()
+    if unbound is not None:
+        return {"status": "retained_attempt_authority_unverified"}
+    prior = None
+    for _ in range(2):
+        try:
+            inventory = _task_reconcile_ready_user_unit_inventory(deadline=deadline)
+            if not inventory["live"]:
+                inventory["epochs_sha256"] = _task_retained_unit_epochs(inventory, deadline=deadline)
+        except (RuntimeError, OSError, ValueError, TypeError):
+            return {"status": "archived_task_unit_observation_unavailable"}
+        if inventory["live"]:
+            return {"status": "archived_task_unit_live_unverified"}
+        if prior is not None and prior != inventory:
+            return {"status": "retained_inventory_changed"}
+        prior = inventory
+        # The final SQL reads follow inventory: launching can commit before
+        # systemd-run makes a new attempt visible to list-units.
+        with _task_readonly_snapshot() as fresh:
+            if not revisions_match(fresh):
+                return {"status": "stale"}
+        if local_targets() != targets:
+            return {"status": "stale"}
+    try:
+        if _task_retained_audit_witness(proof, deadline=deadline) != audit_identity:
+            return {"status": "retained_audit_witness_changed"}
+    except (OSError, RuntimeError, ValueError, TypeError):
+        return {"status": "retained_audit_witness_unavailable"}
+    if (time.monotonic() > deadline
+            or not 0 <= _now() - timestamp <= TASK_RECONCILE_READY_MAX_AGE_SECONDS):
+        return {"status": "invalid_or_stale"}
+    # Retained local-output marker=1 was persisted before dispatch. Before
+    # the local-only dispatcher fix, that exact row could still have started
+    # over SSH. Neither today's Fleet mapping, the final launcher JSON, nor
+    # an empty local user-systemd inventory proves the provenance of every
+    # historical attempt (including earlier attempts after a resume).
+    #
+    # The bounded origin index is only a fast rejector. Positive authority
+    # requires immutable host/transport/attempt-bound launch evidence plus
+    # enforced external restart exclusion; neither exists for this v4 scope.
+    # Preserve the observations above for diagnostics but never certify
+    # global quiescence from this historical evidence alone.
+    return {"status": "retained_attempt_authority_unverified"}
+
 
 def _task_reconcile_ready_index_present(connection: sqlite3.Connection) -> bool:
     """Verify the exact partial index, never trust an index name alone."""
@@ -11881,7 +12489,16 @@ def _task_reconcile_ready_rootbroker_terminal_observed(
         return False
     if not isinstance(probe, dict) or type(probe.get("returncode")) is not int:
         return False
-    if probe["returncode"] != 0 or probe.get("outcome_unknown"):
+    # The broker may return an apparently coherent prefix even when its
+    # response was truncated or its privileged truth was unobservable.
+    if (
+        probe["returncode"] != 0
+        or probe.get("outcome_unknown") is not False
+        or probe.get("timed_out") is not False
+        or probe.get("stdout_truncated") is not False
+        or probe.get("stderr_truncated") is not False
+        or probe.get("root_truth_observable") is not True
+    ):
         return False
     observed_at = observed.get("observed_at_unix")
     now = _now()
@@ -12130,6 +12747,15 @@ def _prepare_task_reconcile_ready_evidence(
             connection, result, prior_epoch=prior_epoch
         ):
             return None
+        # Preserve the legacy per-task outcome checks for small cohorts. Large
+        # history uses a new audited contract, never a relaxed legacy receipt.
+        with _task_readiness_sql_budget(connection):
+            large_history = connection.execute(
+                "SELECT 1 FROM tasks INDEXED BY tasks_created_task_idx LIMIT 1 OFFSET ?",
+                (TASK_RECONCILE_READY_RETAINED_MIN_ROWS - 1,),
+            ).fetchone() is not None
+        if large_history:
+            return _prepare_task_reconcile_retained_evidence(connection)
         # A schema index is installed only on this mutation-authorized path.
         # READ_ONLY snapshots can only use an existing verified index.
         _ensure_task_reconcile_ready_index(connection)
@@ -12172,6 +12798,9 @@ def _publish_task_reconcile_ready_evidence(
 ) -> None:
     """Observe without locks, then CAS-validate before persisting proof."""
     if prepared is None:
+        return
+    if "retained_history" in prepared:
+        _publish_task_reconcile_retained_evidence(prepared["retained_history"])
         return
     records = prepared["privileged_records"]
     # Rootbroker show may take 30s per unit. Hold neither a task SQLite
@@ -12245,6 +12874,9 @@ def _publish_task_reconcile_ready_evidence(
 # Bound the terminal-row stream and the number of potentially running units
 # that may be examined by local systemctl without dispatch or lease mutation.
 TASK_RECONCILE_READY_LOCAL_TERMINAL_LIMIT = 32
+# Loaded attempts can outlive their task's current row, and several attempts
+# may belong to one task. Budget these observations independently.
+TASK_RECONCILE_READY_LOADED_ATTEMPT_LIMIT = 256
 
 
 class TaskReconcileReadyLocalTerminalBudgetExceeded(RuntimeError):
@@ -12258,7 +12890,7 @@ class TaskReconcileReadyLocalTerminalBudgetExceeded(RuntimeError):
 
 def _task_reconcile_ready_local_terminal_rows(
     connection: sqlite3.Connection,
-) -> tuple[list[dict[str, Any]], int, int]:
+) -> tuple[list[dict[str, Any]], int, int, int]:
     projection = _task_current_projection(readiness_bounded=True)
     bindings = projection.get("archived_task_bindings")
     if not isinstance(bindings, dict) or len(bindings) > TASK_RECONCILE_READY_PRIVILEGED_HISTORY_LIMIT:
@@ -12292,6 +12924,7 @@ def _task_reconcile_ready_local_terminal_rows(
     selected: list[dict[str, Any]] = []
     current_local = 0
     non_local = 0
+    archived_unobservable = 0
     host_transports: dict[str, str] = {}
     try:
         for examined, raw in enumerate(cursor, start=1):
@@ -12303,7 +12936,25 @@ def _task_reconcile_ready_local_terminal_rows(
             current = lifecycle_projection.bounded_current_task_projection(
                 [_task_archive_record(record)], projection=projection,
             )
-            if not current or _is_root_systemd_backend(record):
+            if not current:
+                # Projection exclusion cannot prove a retained systemd unit
+                # is not still restartable. Root or remote units cannot be
+                # certified from a local read-only systemctl inventory.
+                if (
+                    _is_root_systemd_backend(record)
+                    or _execution_backend(record) != "systemd-user"
+                    or _systemd_scope(record) != "user"
+                ):
+                    archived_unobservable += 1
+                else:
+                    host = str(record["host"])
+                    if host not in host_transports:
+                        _, target, _ = _resolve_task_dispatch_host(host)
+                        host_transports[host] = str(target.get("transport") or "")
+                    if host_transports[host] != "local":
+                        archived_unobservable += 1
+                continue
+            if _is_root_systemd_backend(record):
                 continue
             if _execution_backend(record) != "systemd-user" or _systemd_scope(record) != "user":
                 raise RuntimeError("Local terminal task has unsupported systemd authority")
@@ -12329,7 +12980,7 @@ def _task_reconcile_ready_local_terminal_rows(
     if not 0 <= headroom <= TASK_RECONCILE_READY_PRIVILEGED_HISTORY_LIMIT:
         raise RuntimeError("Readiness archive history exceeds safety budget")
     if non_local:
-        return selected, non_local, headroom
+        return selected, non_local, headroom, archived_unobservable
     if current_local > TASK_RECONCILE_READY_LOCAL_TERMINAL_LIMIT:
         raise TaskReconcileReadyLocalTerminalBudgetExceeded(
             "observation",
@@ -12337,11 +12988,151 @@ def _task_reconcile_ready_local_terminal_rows(
             archive_excess=current_local - TASK_RECONCILE_READY_LOCAL_TERMINAL_LIMIT,
             archive_headroom=headroom,
         )
-    return selected, 0, headroom
+    return selected, 0, headroom, archived_unobservable
+
+
+# The bounded complete inventory must fit the same maximum cohort that
+# readiness permits in the archive and current-local terminal projections.
+# Restrict every line before parsing so even an adversarial unit description
+# cannot defeat the finite output cap. The total stays below the ordinary
+# 2,000,000-byte operator subprocess limit across access profiles.
+TASK_RECONCILE_READY_USER_UNIT_INVENTORY_MAX_LINE_BYTES = 240
+TASK_RECONCILE_READY_USER_UNIT_INVENTORY_MAX_LINES = (
+    TASK_RECONCILE_READY_PRIVILEGED_HISTORY_LIMIT
+    + TASK_RECONCILE_READY_LOCAL_TERMINAL_LIMIT + 2
+)
+TASK_RECONCILE_READY_USER_UNIT_INVENTORY_MAX_BYTES = (
+    TASK_RECONCILE_READY_USER_UNIT_INVENTORY_MAX_LINES
+    * (TASK_RECONCILE_READY_USER_UNIT_INVENTORY_MAX_LINE_BYTES + 1)
+)
+
+
+def _task_reconcile_ready_user_unit_inventory(*, deadline: float | None = None) -> dict[str, Any]:
+    """Observe a bounded user-systemd unit inventory without dispatch or writes.
+
+    A local archived task may be restarted without changing its SQLite row or
+    reconciliation revision. One local-only inventory covers loaded task units,
+    including those absent from the current archive projection; any ambiguous
+    or truncated output fails closed rather than certifying readiness.
+    """
+    timeout = 30 if deadline is None else min(30, int(deadline - time.monotonic()))
+    if timeout <= 0:
+        raise RuntimeError("Archived task unit inventory deadline exceeded")
+    result = operator._run(
+        [
+            "systemctl", "--user", "list-units", "--all", "--full",
+            "--type=service", "--no-legend", "--plain", "--no-pager",
+            "grabowski-task-*.service",
+        ],
+        cwd=operator.HOME,
+        timeout_seconds=timeout,
+        max_output_bytes=TASK_RECONCILE_READY_USER_UNIT_INVENTORY_MAX_BYTES,
+    )
+    if deadline is not None and time.monotonic() >= deadline:
+        raise RuntimeError("Archived task unit inventory deadline exceeded")
+    if (
+        not isinstance(result, dict)
+        or type(result.get("returncode")) is not int
+        or result["returncode"] != 0
+        or result.get("timed_out") is not False
+        or result.get("outcome_unknown")
+        or result.get("stdout_truncated") is not False
+        or result.get("stderr_truncated") is not False
+        or not isinstance(result.get("stdout"), str)
+        or len(result["stdout"].encode("utf-8")) > TASK_RECONCILE_READY_USER_UNIT_INVENTORY_MAX_BYTES
+    ):
+        raise RuntimeError("Archived task unit inventory is unavailable")
+    units: dict[str, list[str]] = {}
+    live = False
+    for inspected, raw in enumerate(result["stdout"].splitlines(), start=1):
+        if (
+            inspected > TASK_RECONCILE_READY_USER_UNIT_INVENTORY_MAX_LINES
+            or len(raw.encode("utf-8")) > TASK_RECONCILE_READY_USER_UNIT_INVENTORY_MAX_LINE_BYTES
+        ):
+            raise RuntimeError("Archived task unit inventory exceeds bounded line budget")
+        line = raw.strip()
+        if not line:
+            continue
+        if re.fullmatch(r"[0-9]+ loaded units listed\.", line):
+            continue
+        fields = line.split(maxsplit=5)
+        if fields and fields[0] == "●":
+            fields.pop(0)
+        if len(fields) < 4 or re.fullmatch(
+            r"grabowski-task-[0-9a-f]{24}-a[1-9][0-9]*\.service",
+            fields[0],
+        ) is None:
+            raise RuntimeError("Archived task unit inventory is ambiguous")
+        _unit, load, active, sub = fields[:4]
+        if _unit in units:
+            raise RuntimeError("Archived task unit inventory has duplicate identities")
+        units[_unit] = [load, active, sub]
+        if active in {"active", "activating", "reloading", "deactivating"}:
+            live = True
+            continue
+        if active not in {"inactive", "failed"} or sub not in {"dead", "failed"}:
+            raise RuntimeError("Archived task unit state is ambiguous")
+        if load not in {"loaded", "not-found", "masked", "bad-setting"}:
+            raise RuntimeError("Archived task unit load state is ambiguous")
+    return {"live": live, "units_sha256": _sha256_json(units),
+            "unit_count": len(units), "units": units}
+
+
+def _task_retained_unit_epochs(inventory: dict[str, Any], *, deadline: float) -> str:
+    """Bind every loaded attempt, including older attempts, to its invocation.
+
+    This is a local snapshot observation, never restart exclusion. The cap is
+    on loaded attempts rather than the number of historical SQLite rows.
+    """
+    units = inventory["units"]
+    if len(units) > TASK_RECONCILE_READY_LOADED_ATTEMPT_LIMIT:
+        raise RuntimeError("Loaded task attempt epoch budget exceeded")
+    epochs = {}
+    for unit, expected_states in sorted(units.items()):
+        timeout = min(5, int(deadline - time.monotonic()))
+        if timeout <= 0:
+            raise RuntimeError("Loaded task attempt epoch deadline exceeded")
+        result = operator._run(
+            ["systemctl", "--user", "show", unit, "--no-pager",
+             "--property=Id,LoadState,ActiveState,SubState,InvocationID"],
+            cwd=operator.HOME, timeout_seconds=timeout, max_output_bytes=4096,
+        )
+        if time.monotonic() >= deadline:
+            raise RuntimeError("Loaded task attempt epoch deadline exceeded")
+        if (
+            not isinstance(result, dict) or type(result.get("returncode")) is not int
+            or result["returncode"] != 0 or result.get("timed_out") is not False
+            or result.get("outcome_unknown") not in (None, False)
+            or result.get("stdout_truncated") is not False
+            or result.get("stderr_truncated") is not False
+            or not isinstance(result.get("stdout"), str)
+            or len(result["stdout"].encode("utf-8")) > 4096
+        ):
+            raise RuntimeError("Loaded task attempt epoch is unavailable")
+        props = {}
+        for line in result["stdout"].splitlines():
+            key, separator, value = line.partition("=")
+            if not separator or key in props:
+                raise RuntimeError("Loaded task attempt epoch is ambiguous")
+            props[key] = value
+        if (
+            set(props) != {"Id", "LoadState", "ActiveState", "SubState", "InvocationID"}
+            or props["Id"] != unit
+            or [props["LoadState"], props["ActiveState"], props["SubState"]] != expected_states
+            or re.fullmatch(r"[0-9a-f]{32}", props["InvocationID"]) is None
+        ):
+            raise RuntimeError("Loaded task attempt epoch or identity changed")
+        epochs[unit] = props["InvocationID"]
+    return _sha256_json(epochs)
+
+
+def _task_reconcile_ready_archived_user_unit_live() -> bool:
+    return bool(_task_reconcile_ready_user_unit_inventory()["live"])
 
 
 def _task_reconcile_ready_local_terminal_observed(
-    record: dict[str, Any], observed: Any,
+    record: dict[str, Any], observed: Any, *,
+    cancelled_quiescence_only: bool = False,
 ) -> bool:
     if not isinstance(observed, dict):
         return False
@@ -12355,8 +13146,14 @@ def _task_reconcile_ready_local_terminal_observed(
         or not isinstance(probe, dict)
         or type(probe.get("returncode")) is not int
         or probe["returncode"] != 0
-        or probe.get("timed_out")
-        or probe.get("outcome_unknown")
+        or probe.get("timed_out") is not False
+        # Only local operator._run lacks outcome_unknown; it still returns
+        # explicit timeout and truncation completeness fields.
+        or probe.get("outcome_unknown") not in (None, False)
+        # A partial systemctl show response cannot prove quiescence even if
+        # its prefix contains plausible ActiveState/Result properties.
+        or probe.get("stdout_truncated") is not False
+        or probe.get("stderr_truncated") is not False
         or not isinstance(props, dict)
     ):
         return False
@@ -12389,6 +13186,16 @@ def _task_reconcile_ready_local_terminal_observed(
     ):
         return False
     result = props.get("Result")
+    if cancelled_quiescence_only:
+        # A cancelled task's policy outcome is already historical truth.
+        # For a confirmed quiescent bound unit, do not narrow the accepted
+        # systemd failure reasons to the separate readiness whitelist:
+        # oom-kill, start-limit-hit and future terminal reasons are not live.
+        return (
+            record.get("state") == "cancelled"
+            and isinstance(result, str)
+            and bool(result)
+        )
     allowed = {
         "completed": {"success"},
         "failed": {"exit-code", "resources", "protocol", "watchdog"},
@@ -12410,9 +13217,11 @@ def _task_reconcile_ready_evidence_snapshot(
         ).fetchall()
         if not rows:
             return {"status": "missing"}
-        if len(rows) != 1 or not isinstance(rows[0][0], str):
+        if len(rows) != 1 or not isinstance(rows[0][0], str) or len(rows[0][0]) > 4096:
             return {"status": "invalid"}
         proof = json.loads(rows[0][0])
+        if isinstance(proof, dict) and proof.get("schema_version") == 4:
+            return _task_reconcile_retained_evidence_snapshot(task_connection, proof)
         expected_fields = {
             "schema_version", "task_revision", "resource_revision",
             "reconciled_at_unix", "scope", "evidence_sha256",
@@ -12487,7 +13296,25 @@ def _task_reconcile_ready_evidence_snapshot(
         # fresh, strictly non-dispatching read-only observation.
         (
             local_terminal_records, non_local_terminal_count, archive_headroom,
+            archived_unobservable,
         ) = _task_reconcile_ready_local_terminal_rows(task_connection)
+        if archived_unobservable:
+            # Rootbroker and SSH observations would have effects that READ_ONLY
+            # is not authorized to perform. Never certify those archived units.
+            return {
+                "status": "archived_terminal_transport_unverified",
+                "archived_unobservable_count": archived_unobservable,
+            }
+        # A drained or absent archive projection does not prove that no
+        # user-systemd task unit was left behind after a reset or closeout.
+        # Always observe one bounded complete local unit inventory.
+        archive_inventory_probed = True
+        if archive_inventory_probed:
+            try:
+                if _task_reconcile_ready_archived_user_unit_live():
+                    return {"status": "archived_task_unit_live_unverified"}
+            except (RuntimeError, OSError, ValueError, TypeError):
+                return {"status": "archived_task_unit_observation_unavailable"}
         if non_local_terminal_count:
             # No remote execution or dispatch in a READ_ONLY readiness query.
             # A valid remote closeout requires an authorized fresh live probe.
@@ -12500,7 +13327,7 @@ def _task_reconcile_ready_evidence_snapshot(
             observed = _observe(record, bound_local_user=True)
             if not _task_reconcile_ready_local_terminal_observed(record, observed):
                 return {"status": "local_terminal_live_unverified"}
-        if local_terminal_records:
+        if local_terminal_records or archive_inventory_probed:
             # External probes run after the first SQLite snapshot; a resume
             # during the probe must not be certified using an old task row.
             with _task_readonly_snapshot() as fresh:
@@ -12519,11 +13346,88 @@ def _task_reconcile_ready_evidence_snapshot(
                 )
             if resource_now is None or resource_now["revision"] != proof["resource_revision"]:
                 return {"status": "stale"}
-        # External systemd probes can outlast the proof TTL. Recheck the
-        # proof age after all live observations and revision validations.
+        # Systemd can restart an archived unit without changing either
+        # SQLite revision. A first inventory read cannot certify the interval
+        # spent observing up to 32 retained terminal units or rereading DBs.
+        # Recheck the single bounded local inventory immediately before
+        # certification; missing/ambiguous output remains fail-closed.
+        if archive_inventory_probed:
+            try:
+                if _task_reconcile_ready_archived_user_unit_live():
+                    return {"status": "archived_task_unit_live_unverified"}
+            except (RuntimeError, OSError, ValueError, TypeError):
+                return {"status": "archived_task_unit_observation_unavailable"}
+        # A task start may commit its launching row during the final
+        # systemd inventory, before the new unit appears in list-units.
+        # Only fresh READ_ONLY revisions after that external probe can
+        # certify that the proof still describes both task and lease stores.
+        if archive_inventory_probed:
+            with _task_readonly_snapshot() as final_tasks:
+                final_task_revision = _task_reconcile_revision_contract(final_tasks)
+            if final_task_revision["revision"] != proof["task_revision"]:
+                return {"status": "stale"}
+            with resources._resource_readonly_snapshot() as final_resources:
+                final_resource_revision = resources._resource_reconcile_revision_contract(
+                    final_resources
+                )
+                final_pending = final_resources.execute(
+                    "SELECT 1 FROM task_terminalizations "
+                    "WHERE phase='leases_revoked' LIMIT 1"
+                ).fetchone()
+            if (
+                final_resource_revision is None
+                or final_pending is not None
+                or final_resource_revision["revision"] != proof["resource_revision"]
+            ):
+                return {"status": "stale"}
+        # The second inventory cannot cover a systemd-only restart during
+        # the last (possibly slow) task/resource SQLite rechecks above.
+        # Make the final external operation one more bounded local inventory;
+        # a live unit at that observation must never yield verified.
+        if archive_inventory_probed:
+            try:
+                if _task_reconcile_ready_archived_user_unit_live():
+                    return {"status": "archived_task_unit_live_unverified"}
+            except (RuntimeError, OSError, ValueError, TypeError):
+                return {"status": "archived_task_unit_observation_unavailable"}
+        # The last systemd inventory can precede the systemd-run unit when
+        # grabowski_task_start commits a launching row concurrently. Re-read
+        # BOTH store revisions after that inventory, without writing anything.
+        # A mixed pre-/post-launch snapshot must never certify operator_ready.
+        if archive_inventory_probed:
+            with _task_readonly_snapshot() as post_inventory_tasks:
+                post_task_revision = _task_reconcile_revision_contract(
+                    post_inventory_tasks
+                )
+            if post_task_revision["revision"] != proof["task_revision"]:
+                return {"status": "stale"}
+            with resources._resource_readonly_snapshot() as post_inventory_resources:
+                post_resource_revision = resources._resource_reconcile_revision_contract(
+                    post_inventory_resources
+                )
+                post_pending = post_inventory_resources.execute(
+                    "SELECT 1 FROM task_terminalizations "
+                    "WHERE phase='leases_revoked' LIMIT 1"
+                ).fetchone()
+            if (
+                post_resource_revision is None
+                or post_pending is not None
+                or post_resource_revision["revision"] != proof["resource_revision"]
+            ):
+                return {"status": "stale"}
+        # Every external systemd observation may outlast the proof TTL;
+        # this remains a fresh read-only snapshot, not a future guarantee.
         if not 0 <= _now() - timestamp <= TASK_RECONCILE_READY_MAX_AGE_SECONDS:
             return {"status": "invalid_or_stale"}
-        return {"status": "verified", "reconciled_at_unix": timestamp}
+        # The legacy v3 observer has no authoritative history of launch
+        # transports or enforced root/SSH restart exclusion. A task that
+        # originally ran over SSH can now resolve locally, and an *empty*
+        # TaskStore may have been replaced while still-restartable external
+        # units from an older store remain. Local user-systemd observations
+        # cannot certify either case. Never promote this v3 evidence to
+        # operator_ready, including for the zero-row cohort. A future positive
+        # result requires independent, host-bound retirement authority.
+        return {"status": "retained_attempt_authority_unverified"}
     except TaskReconcileReadyLocalTerminalBudgetExceeded as exc:
         # Unobserved units are never ready. Repeating reconciliation cannot
         # shrink either budget. Archiving verified terminal tasks shrinks the

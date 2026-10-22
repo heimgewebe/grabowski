@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
-from contextlib import closing, contextmanager
+from contextlib import closing, contextmanager, ExitStack
 import base64
 import hashlib
 import inspect
@@ -194,8 +194,37 @@ class TaskTests(unittest.TestCase):
         self.resource_patch.start()
         self.admission_patch.start()
         self.start_counter = 0
+        # Isolated task stores must not depend on production user-systemd
+        # activity. Inventory-specific tests explicitly override operator._run
+        # and continue to exercise live, malformed and truncated responses.
+        original_run = tasks.operator._run
+
+        def isolated_unit_inventory(argv, *args, **kwargs):
+            if argv == [
+                "systemctl", "--user", "list-units", "--all", "--full",
+                "--type=service", "--no-legend", "--plain", "--no-pager",
+                "grabowski-task-*.service",
+            ]:
+                return _launcher()
+            return original_run(argv, *args, **kwargs)
+
+        self.unit_inventory_patch = patch.object(
+            tasks.operator, "_run", side_effect=isolated_unit_inventory,
+        )
+        self.unit_inventory_patch.start()
+        # Store/lifecycle tests already replace _dispatch to simulate launches.
+        # Keep that same mock boundary for the new private local path. The
+        # ManagedLocalLaunchTests below disable this adapter and test the real
+        # dispatcher with inert _run and Fleet transports.
+        self.managed_local_dispatch_patch = patch.object(
+            tasks, "_dispatch_managed_local_task",
+            side_effect=lambda host, argv: tasks._dispatch(host, argv, timeout_seconds=60),
+        )
+        self.managed_local_dispatch_patch.start()
 
     def tearDown(self) -> None:
+        self.managed_local_dispatch_patch.stop()
+        self.unit_inventory_patch.stop()
         self.admission_patch.stop()
         self.resource_patch.stop()
         self.capture_script_root_patch.stop()
@@ -206,7 +235,9 @@ class TaskTests(unittest.TestCase):
         self.audit_patch.stop()
         self.temporary.cleanup()
 
-    def _archive_and_project_tasks(self, task_ids: list[str]) -> dict[str, object]:
+    def _archive_and_project_tasks(
+        self, task_ids: list[str], *, source_store_sha256: str = "c" * 64,
+    ) -> dict[str, object]:
         lifecycle_evidence = tasks.lifecycle_projection.effect_plan.lifecycle_evidence
         records: list[dict[str, object]] = []
         for task_id in task_ids:
@@ -221,7 +252,7 @@ class TaskTests(unittest.TestCase):
         archived = tasks.lifecycle_projection.lifecycle.write_task_archive_segment(
             records,
             archive_root=self.task_archive_root,
-            source_store_sha256="c" * 64,
+            source_store_sha256=source_store_sha256,
             source_schema_version="5",
             plan_sha256="d" * 64,
         )
@@ -5817,6 +5848,7 @@ class TaskTests(unittest.TestCase):
             )
         )
 
+    @patch.object(tasks, "_task_reconcile_ready_archived_user_unit_live", new=lambda: False)
     def test_reconcile_ready_rejects_previous_complete_phase_restarted_before_other_phases_finish(self) -> None:
         with tasks._database_connection():
             pass
@@ -5878,7 +5910,7 @@ class TaskTests(unittest.TestCase):
             tasks._task_reconcile_refresh_after_guard("")
         with tasks._task_readonly_snapshot() as reader:
             self.assertEqual(
-                "verified", tasks._task_reconcile_ready_evidence_snapshot(reader)["status"]
+                "retained_attempt_authority_unverified", tasks._task_reconcile_ready_evidence_snapshot(reader)["status"]
             )
 
     def test_reconcile_ready_rejects_privileged_archive_history_scan_overflow(self) -> None:
@@ -5969,7 +6001,11 @@ class TaskTests(unittest.TestCase):
             return {
                 "state": "completed",
                 "observer": {"kind": "root-systemd-broker-show-v1"},
-                "probe": {"returncode": 0, "outcome_unknown": False},
+                "probe": {
+                    "returncode": 0, "outcome_unknown": False,
+                    "timed_out": False, "stdout_truncated": False,
+                    "stderr_truncated": False, "root_truth_observable": True,
+                },
                 "observed_at_unix": tasks._now(),
                 "properties": {
                     "LoadState": "loaded", "ActiveState": "inactive",
@@ -6030,7 +6066,11 @@ class TaskTests(unittest.TestCase):
             return {
                 "state": "completed",
                 "observer": {"kind": "root-systemd-broker-show-v1"},
-                "probe": {"returncode": 0, "outcome_unknown": False},
+                "probe": {
+                    "returncode": 0, "outcome_unknown": False,
+                    "timed_out": False, "stdout_truncated": False,
+                    "stderr_truncated": False, "root_truth_observable": True,
+                },
                 "observed_at_unix": tasks._now(),
                 "properties": {
                     "LoadState": "loaded", "ActiveState": "inactive",
@@ -6108,7 +6148,7 @@ class TaskTests(unittest.TestCase):
                 tasks.TASK_RECONCILE_READY_PRIVILEGED_INDEX_NAME in str(row[3])
                 for row in plan
             ), plan)
-            self.assertEqual("verified", tasks._task_reconcile_ready_evidence_snapshot(reader)["status"])
+            self.assertEqual("retained_attempt_authority_unverified", tasks._task_reconcile_ready_evidence_snapshot(reader)["status"])
 
     def test_reconcile_ready_rejects_spoofed_privileged_index(self) -> None:
         with tasks._database_connection() as writer:
@@ -6176,7 +6216,11 @@ class TaskTests(unittest.TestCase):
             return {
                 "state": "completed",
                 "observer": {"kind": "root-systemd-broker-show-v1"},
-                "probe": {"returncode": 0, "outcome_unknown": False},
+                "probe": {
+                    "returncode": 0, "outcome_unknown": False,
+                    "timed_out": False, "stdout_truncated": False,
+                    "stderr_truncated": False, "root_truth_observable": True,
+                },
                 "observed_at_unix": tasks._now(),
                 "properties": {
                     "LoadState": "loaded", "ActiveState": "inactive",
@@ -6272,7 +6316,8 @@ class TaskTests(unittest.TestCase):
                     "LoadState": "loaded", "ActiveState": "inactive",
                     "SubState": "dead", "Result": "success",
                 },
-                "probe": {"returncode": 0, "timed_out": False},
+                "probe": {"returncode": 0, "timed_out": False,
+                        "stdout_truncated": False, "stderr_truncated": False},
                 "observer": {
                     "kind": "bound-local-user-systemd-show-v1",
                     "transport": "local",
@@ -6289,7 +6334,7 @@ class TaskTests(unittest.TestCase):
                 with tasks._task_readonly_snapshot() as connection:
                     return tasks._task_reconcile_ready_evidence_snapshot(connection)["status"]
 
-        self.assertEqual("verified", run_pages(mutate_between=False))
+        self.assertEqual("retained_attempt_authority_unverified", run_pages(mutate_between=False))
         self.assertNotEqual("verified", run_pages(mutate_between=True))
         self.assertNotEqual(
             "verified",
@@ -6336,7 +6381,7 @@ class TaskTests(unittest.TestCase):
             tasks._task_reconcile_refresh_after_guard("")
             with tasks._task_readonly_snapshot() as reader:
                 self.assertEqual(
-                    "verified", tasks._task_reconcile_ready_evidence_snapshot(reader)["status"]
+                    "retained_attempt_authority_unverified", tasks._task_reconcile_ready_evidence_snapshot(reader)["status"]
                 )
 
         # An error on any earlier page must poison the cumulative proof.
@@ -6383,7 +6428,11 @@ class TaskTests(unittest.TestCase):
                            "Names": tasks._row_raw(task_id)["unit"],
                            "InvocationID": "a" * 32},
             "observer": {"kind": "root-systemd-broker-show-v1"},
-            "probe": {"returncode": 0, "outcome_unknown": False},
+            "probe": {
+                "returncode": 0, "outcome_unknown": False,
+                "timed_out": False, "stdout_truncated": False,
+                "stderr_truncated": False, "root_truth_observable": True,
+            },
             "observed_at_unix": tasks._now(),
         }
         with (
@@ -6524,7 +6573,7 @@ class TaskTests(unittest.TestCase):
             tasks._task_reconcile_refresh_after_guard("")
         with tasks._task_readonly_snapshot() as connection:
             proof = tasks._task_reconcile_ready_evidence_snapshot(connection)
-        self.assertEqual("verified", proof["status"])
+        self.assertEqual("retained_attempt_authority_unverified", proof["status"])
 
         # Finishing a later page does not prove earlier pages were successful.
         later_page = {**result, "batch": {
@@ -6552,12 +6601,18 @@ class TaskTests(unittest.TestCase):
         # the two reconciliations may cross a clock-second boundary.
         with tasks._task_readonly_snapshot() as connection:
             latest_proof = tasks._task_reconcile_ready_evidence_snapshot(connection)
-        self.assertEqual("verified", latest_proof["status"])
-        self.assertIsInstance(latest_proof["reconciled_at_unix"], int)
+            # v3 freshness checks still apply; an empty TaskStore cannot
+            # certify authority over externally retained root/SSH units.
+            latest_stamp = json.loads(connection.execute(
+                "SELECT value FROM metadata WHERE key=?",
+                (tasks.TASK_RECONCILE_READY_EVIDENCE_METADATA_KEY,),
+            ).fetchone()[0])["reconciled_at_unix"]
+        self.assertEqual("retained_attempt_authority_unverified", latest_proof["status"])
+        self.assertIsInstance(latest_stamp, int)
 
         with patch.object(
             tasks, "_now",
-            return_value=latest_proof["reconciled_at_unix"] + tasks.TASK_RECONCILE_READY_MAX_AGE_SECONDS + 1,
+            return_value=latest_stamp + tasks.TASK_RECONCILE_READY_MAX_AGE_SECONDS + 1,
         ):
             with tasks._task_readonly_snapshot() as connection:
                 self.assertEqual(
@@ -6623,7 +6678,8 @@ class TaskTests(unittest.TestCase):
                     "LoadState": "loaded", "ActiveState": "inactive",
                     "SubState": "dead", "Result": "success",
                 },
-                "probe": {"returncode": 0, "timed_out": False},
+                "probe": {"returncode": 0, "timed_out": False,
+                        "stdout_truncated": False, "stderr_truncated": False},
                 "observer": {
                     "kind": "bound-local-user-systemd-show-v1",
                     "transport": "local",
@@ -6691,7 +6747,8 @@ class TaskTests(unittest.TestCase):
                 "SubState": "dead",
                 "Result": "success",
             },
-            "probe": {"returncode": 0, "timed_out": False},
+            "probe": {"returncode": 0, "timed_out": False,
+                        "stdout_truncated": False, "stderr_truncated": False},
             "observer": {
                 "kind": "bound-local-user-systemd-show-v1",
                 "transport": "local",
@@ -6723,7 +6780,7 @@ class TaskTests(unittest.TestCase):
         ):
             with tasks._task_readonly_snapshot() as reader:
                 status = tasks._task_reconcile_ready_evidence_snapshot(reader)
-        self.assertEqual("verified", status["status"])
+        self.assertEqual("retained_attempt_authority_unverified", status["status"])
         dispatch.assert_not_called()
         broker.assert_not_called()
         persist.assert_not_called()
@@ -6768,7 +6825,8 @@ class TaskTests(unittest.TestCase):
                 "SubState": "dead", "Result": "success",
                 "ExecMainCode": "0", "ExecMainStatus": "0",
             },
-            "probe": {"returncode": 0, "timed_out": False},
+            "probe": {"returncode": 0, "timed_out": False,
+                        "stdout_truncated": False, "stderr_truncated": False},
             "observer": {
                 "kind": "bound-local-user-systemd-show-v1", "transport": "local",
             },
@@ -6791,7 +6849,7 @@ class TaskTests(unittest.TestCase):
         ):
             with tasks._task_readonly_snapshot() as reader:
                 status = tasks._task_reconcile_ready_evidence_snapshot(reader)
-        self.assertEqual("verified", status["status"])
+        self.assertEqual("retained_attempt_authority_unverified", status["status"])
         probe.assert_called_once()
         dispatch.assert_not_called()
         persist.assert_not_called()
@@ -6877,7 +6935,8 @@ class TaskTests(unittest.TestCase):
                 "LoadState": "loaded", "ActiveState": "inactive",
                 "SubState": "dead", "Result": "success",
             },
-            "probe": {"returncode": 0, "timed_out": False},
+            "probe": {"returncode": 0, "timed_out": False,
+                        "stdout_truncated": False, "stderr_truncated": False},
             "observer": {
                 "kind": "bound-local-user-systemd-show-v1", "transport": "local",
             },
@@ -6902,11 +6961,1040 @@ class TaskTests(unittest.TestCase):
                 status = tasks._task_reconcile_ready_evidence_snapshot(reader)
         return status, probe
 
+    def _retained_epoch_result(self, unit, epoch="1" * 32, *, failed=False):
+        active, sub = ("failed", "failed") if failed else ("inactive", "dead")
+        return {**_launcher(), "stdout": (
+            f"Id={unit}\nLoadState=loaded\nActiveState={active}\nSubState={sub}\nInvocationID={epoch}\n"
+        )}
+
+    def _retained_history_snapshot(self, inventory=None, *, probe=None):
+        result = {**_launcher(), "stdout": inventory or ""}
+        def run(argv, **_kwargs):
+            return self._retained_epoch_result(argv[3]) if argv[2] == "show" else result
+        with (
+            patch.object(tasks, "_resolve_task_dispatch_host",
+                         return_value=("local", {"transport": "local"}, False)),
+            patch.object(tasks.operator, "_run", side_effect=probe or run),
+            patch.object(tasks, "_dispatch", side_effect=AssertionError("no dispatch")),
+            patch.object(tasks, "_observe", side_effect=AssertionError("no per-row probes")),
+            patch.object(tasks.operator, "_require_operator_mutation",
+                         side_effect=AssertionError("no read-only mutation")),
+        ):
+            with tasks._task_readonly_snapshot() as reader:
+                return tasks._task_reconcile_ready_evidence_snapshot(reader)
+
+    def test_retained_audit_fabricated_digest_with_recomputed_checksum_is_rejected(self) -> None:
+        self._retained_archive_witness()
+        with tasks._database_connection() as writer:
+            proof = json.loads(writer.execute(
+                "SELECT value FROM metadata WHERE key=?",
+                (tasks.TASK_RECONCILE_READY_EVIDENCE_METADATA_KEY,),
+            ).fetchone()[0])
+            proof["audit_record_sha256"] = "f" * 64
+            proof["evidence_sha256"] = tasks._sha256_json({
+                key: value for key, value in proof.items() if key != "evidence_sha256"
+            })
+            writer.execute("UPDATE metadata SET value=? WHERE key=?", (
+                tasks._canonical_json(proof), tasks.TASK_RECONCILE_READY_EVIDENCE_METADATA_KEY,
+            ))
+        self._assert_retained_audit_rejected_before_inventory()
+
+    def _assert_retained_audit_rejected_before_inventory(self):
+        with patch.object(tasks, "_task_reconcile_ready_user_unit_inventory",
+                          side_effect=AssertionError("reject audit before inventory")) as inventory:
+            status = self._retained_history_snapshot()
+        self.assertEqual("retained_audit_witness_unavailable", status["status"])
+        inventory.assert_not_called()
+
+    def _retained_audit_store_proof(self, proof):
+        proof = {key: value for key, value in proof.items() if key != "evidence_sha256"}
+        proof["evidence_sha256"] = tasks._sha256_json(proof)
+        with tasks._database_connection() as writer:
+            writer.execute("UPDATE metadata SET value=? WHERE key=?", (
+                tasks._canonical_json(proof), tasks.TASK_RECONCILE_READY_EVIDENCE_METADATA_KEY,
+            ))
+
+    def test_retained_audit_rejects_unrelated_valid_event(self) -> None:
+        _task_id, proof = self._retained_archive_witness()
+        proof["audit_record_sha256"] = tasks.base._append_audit_with_digest({
+            "operation": "unrelated-event", "timestamp_unix": proof["reconciled_at_unix"],
+        })
+        self.assertTrue(tasks.base._verify_audit_bytes(
+            self.audit_log, self.audit_log.read_bytes(), exists=True)["valid"])
+        self._retained_audit_store_proof(proof)
+        self._assert_retained_audit_rejected_before_inventory()
+
+    def test_retained_audit_binds_exact_v2_publisher_fields(self) -> None:
+        _task_id, proof = self._retained_archive_witness()
+        original = self.audit_log.read_bytes()
+        changes = {
+            "operation": "unrelated-event", "witness_sha256": "0" * 64,
+            "task_revision": "0" * 64, "resource_revision": "0" * 64,
+            "archive_projection_sha256": "0" * 64, "scope": "unrelated-scope",
+            "timestamp_unix": proof["reconciled_at_unix"] + 1, "audit_schema_version": 1,
+        }
+        for field, value in changes.items():
+            with self.subTest(field=field):
+                records = [json.loads(line) for line in original.splitlines()]
+                previous = None
+                candidate = dict(proof)
+                for record in records:
+                    matching = record["record_sha256"] == proof["audit_record_sha256"]
+                    if matching:
+                        record[field] = value
+                    record["previous_record_sha256"] = previous
+                    record["record_sha256"] = tasks.base._audit_record_hash(record)
+                    previous = record["record_sha256"]
+                    if matching:
+                        candidate["audit_record_sha256"] = previous
+                data = b"".join(tasks.base._canonical_json_line(record) for record in records)
+                self.assertTrue(tasks.base._verify_audit_bytes(self.audit_log, data, exists=True)["valid"])
+                self.audit_log.write_bytes(data)
+                self._retained_audit_store_proof(candidate)
+                self._assert_retained_audit_rejected_before_inventory()
+
+    def test_retained_audit_missing_deleted_modified_incomplete_and_corrupt(self) -> None:
+        _task_id, proof = self._retained_archive_witness()
+        original = self.audit_log.read_bytes()
+        deleted = b"".join(line + b"\n" for line in original.splitlines()
+                           if json.loads(line)["record_sha256"] != proof["audit_record_sha256"])
+        # A valid new active head cannot prove an event that rotated out, even
+        # if its old bytes are still present elsewhere. No archive discovery.
+        self.audit_log.with_name("rotated-audit").write_bytes(original)
+        new_head = {"audit_schema_version": 2, "sequence": 1,
+                    "previous_record_sha256": None, "operation": "unrelated-event"}
+        new_head["record_sha256"] = tasks.base._audit_record_hash(new_head)
+        new_head_bytes = tasks.base._canonical_json_line(new_head)
+        self.assertTrue(tasks.base._verify_audit_bytes(self.audit_log, new_head_bytes, exists=True)["valid"])
+        for data in (None, deleted, new_head_bytes, original[:-1], original + b"{", b"\xff\n",
+                     original + b"\n", original.replace(b"witness-prepared", b"witness-tampered")):
+            with self.subTest(data=data and data[-30:]):
+                if data is None:
+                    self.audit_log.unlink()
+                else:
+                    self.audit_log.write_bytes(data)
+                    self.audit_log.chmod(0o600)
+                self._assert_retained_audit_rejected_before_inventory()
+
+    def test_retained_audit_symlink_hardlink_fifo_and_unsafe_modes(self) -> None:
+        self._retained_archive_witness()
+        original = self.audit_log.read_bytes()
+        target = self.audit_log.with_name("other-audit")
+        target.write_bytes(original)
+        target.chmod(0o600)
+        for kind in ("symlink", "hardlink", "fifo", "mode", "directory-mode", "directory-symlink"):
+            with self.subTest(kind=kind):
+                self.audit_log.unlink()
+                if kind == "symlink":
+                    self.audit_log.symlink_to(target)
+                elif kind == "hardlink":
+                    os.link(target, self.audit_log)
+                elif kind == "fifo":
+                    os.mkfifo(self.audit_log, 0o600)
+                else:
+                    self.audit_log.write_bytes(original)
+                    self.audit_log.chmod(0o644 if kind == "mode" else 0o600)
+                if kind == "directory-mode":
+                    self.audit_log.parent.chmod(0o750)
+                alias = self.root / "audit-parent-link"
+                if kind == "directory-symlink":
+                    alias.symlink_to(self.audit_log.parent, target_is_directory=True)
+                try:
+                    with (patch.object(tasks.base, "AUDIT_LOG", alias / self.audit_log.name if
+                                       kind == "directory-symlink" else self.audit_log),
+                          patch.object(tasks.os, "open", wraps=os.open) as opened):
+                        self._assert_retained_audit_rejected_before_inventory()
+                    self.assertFalse(any(str(call.args[0]) == self.audit_log.name
+                                         for call in opened.call_args_list))
+                finally:
+                    self.audit_log.parent.chmod(0o700)
+                    if alias.is_symlink():
+                        alias.unlink()
+
+    def test_retained_audit_owner_and_group_mismatch(self) -> None:
+        self._retained_archive_witness()
+        original_fstat = os.fstat
+        for inode in (self.audit_log.stat().st_ino, self.audit_log.parent.stat().st_ino):
+            for field in ("st_uid", "st_gid"):
+                with self.subTest(inode=inode, field=field):
+                    def observed(fd):
+                        value = original_fstat(fd)
+                        if value.st_ino == inode:
+                            values = {name: getattr(value, name) for name in dir(value) if name.startswith("st_")}
+                            values[field] += 1
+                            return types.SimpleNamespace(**values)
+                        return value
+                    with patch.object(tasks.os, "fstat", side_effect=observed):
+                        self._assert_retained_audit_rejected_before_inventory()
+
+    def test_retained_audit_noatime_unsupported_or_denied_never_falls_back(self) -> None:
+        self._retained_archive_witness()
+        original_open = os.open
+        attempts = []
+        def denied(path, flags, *args, **kwargs):
+            if str(path) == self.audit_log.name:
+                attempts.append(flags)
+                raise PermissionError("simulated O_NOATIME denial")
+            return original_open(path, flags, *args, **kwargs)
+        with patch.object(tasks.os, "open", side_effect=denied):
+            self._assert_retained_audit_rejected_before_inventory()
+        self.assertEqual(1, len(attempts))
+        self.assertTrue(attempts[0] & os.O_NOATIME)
+        with patch.object(tasks.os, "O_NOATIME", 0):
+            self._assert_retained_audit_rejected_before_inventory()
+
+    def test_retained_audit_append_during_each_inventory_window(self) -> None:
+        self._retained_archive_witness()
+        for window in (1, 2):
+            with self.subTest(window=window):
+                calls = 0
+                def inventory(_argv, **_kwargs):
+                    nonlocal calls
+                    calls += 1
+                    if calls == window:
+                        tasks.base._append_audit_with_digest({"operation": "concurrent-append"})
+                    return _launcher()
+                self.assertEqual("retained_audit_witness_changed",
+                                 self._retained_history_snapshot(probe=inventory)["status"])
+                self.assertEqual(2, calls)
+                self.assertEqual("retained_attempt_authority_unverified", self._retained_history_snapshot()["status"])
+
+    def test_retained_audit_rotation_missing_or_corrupt_after_inventory(self) -> None:
+        self._retained_archive_witness()
+        original = self.audit_log.read_bytes()
+        for kind in ("replace", "missing", "corrupt"):
+            with self.subTest(kind=kind):
+                calls = 0
+                def inventory(_argv, **_kwargs):
+                    nonlocal calls
+                    calls += 1
+                    if calls == 2:
+                        self.audit_log.unlink()
+                        if kind != "missing":
+                            self.audit_log.write_bytes(original if kind == "replace" else b"corrupt\n")
+                            self.audit_log.chmod(0o600)
+                    return _launcher()
+                self.assertNotEqual("verified", self._retained_history_snapshot(probe=inventory)["status"])
+                self.audit_log.write_bytes(original)
+                self.audit_log.chmod(0o600)
+
+    def test_retained_audit_identity_change_during_verification(self) -> None:
+        self._retained_archive_witness()
+        verify = tasks.base._verify_audit_bytes
+        original = self.audit_log.read_bytes()
+        def changed(*args, **kwargs):
+            result = verify(*args, **kwargs)
+            self.audit_log.unlink()
+            self.audit_log.write_bytes(original)
+            self.audit_log.chmod(0o600)
+            return result
+        with patch.object(tasks.base, "_verify_audit_bytes", side_effect=changed):
+            self._assert_retained_audit_rejected_before_inventory()
+
+    def test_retained_audit_byte_line_record_budgets_and_shared_deadline(self) -> None:
+        self._retained_archive_witness()
+        for target, name, limit in ((tasks.base, "MAX_AUDIT_BYTES", self.audit_log.stat().st_size - 1),
+                                    (tasks.base, "MAX_AUDIT_RECORD_BYTES", 1),
+                                    (tasks, "TASK_RECONCILE_READY_AUDIT_RECORD_LIMIT", 0)):
+            with self.subTest(budget=name), patch.object(target, name, limit):
+                self._assert_retained_audit_rejected_before_inventory()
+        verify = tasks.base._verify_audit_bytes
+        for slow_call in (1, 2):
+            clock = [time.monotonic()]
+            deadlines = []
+            calls = 0
+            def slow(*args, **kwargs):
+                nonlocal calls
+                calls += 1
+                result = verify(*args, **kwargs)
+                if calls == slow_call:
+                    clock[0] += 61
+                return result
+            def inventory(_argv, **kwargs):
+                deadlines.append(kwargs["timeout_seconds"])
+                return _launcher()
+            with (self.subTest(slow_call=slow_call),
+                  patch.object(tasks.time, "monotonic", side_effect=lambda: clock[0]),
+                  patch.object(tasks.base, "_verify_audit_bytes", side_effect=slow)):
+                self.assertEqual("retained_audit_witness_unavailable",
+                                 self._retained_history_snapshot(probe=inventory)["status"])
+            self.assertEqual(slow_call, calls)
+            self.assertEqual(0 if slow_call == 1 else 2, len(deadlines))
+
+    def test_retained_audit_valid_event_without_writes_locks_or_atime_changes(self) -> None:
+        self._retained_archive_witness()
+        lock = self.audit_log.with_name(self.audit_log.name + ".lock")
+        lock.unlink(missing_ok=True)
+        os.utime(self.audit_log, ns=(1, self.audit_log.stat().st_mtime_ns))
+        before = self.audit_log.stat()
+        names_before = sorted(str(p) for p in self.root.rglob("*"))
+        os.utime(self.audit_log.parent, ns=(1, self.audit_log.parent.stat().st_mtime_ns))
+        directory_before = self.audit_log.parent.stat()
+        original_open = os.open
+        original_builtin_open, original_io_open = open, io.open
+        opens = []
+        def readonly_open(path, flags, *args, **kwargs):
+            self.assertFalse(flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND))
+            opens.append((str(path), flags))
+            return original_open(path, flags, *args, **kwargs)
+        def forbidden(*_args, **_kwargs):
+            raise AssertionError("READ_ONLY effect attempted")
+        def readonly_python_open(original):
+            def observed(path, mode="r", *args, **kwargs):
+                self.assertFalse(any(flag in mode for flag in "wax+"))
+                return original(path, mode, *args, **kwargs)
+            return observed
+        with ExitStack() as guards:
+            guards.enter_context(patch.object(tasks.os, "open", side_effect=readonly_open))
+            guards.enter_context(patch("builtins.open", side_effect=readonly_python_open(original_builtin_open)))
+            guards.enter_context(patch.object(io, "open", side_effect=readonly_python_open(original_io_open)))
+            for name in ("write", "mkdir", "chmod", "fchmod", "chown", "fchown", "utime",
+                         "fsync", "fdatasync", "ftruncate", "unlink", "rename", "replace"):
+                guards.enter_context(patch.object(tasks.os, name, side_effect=forbidden))
+            guards.enter_context(patch.object(tasks.fcntl, "flock", side_effect=forbidden))
+            for name in ("_audit_records_snapshot", "_verify_audit_log", "_capture_verified_audit_head",
+                         "_read_audit_status_snapshot", "_audit_coordination_lock", "_audit_parent", "_state_root"):
+                guards.enter_context(patch.object(tasks.base, name, side_effect=forbidden))
+            self.assertEqual("retained_attempt_authority_unverified", self._retained_history_snapshot()["status"])
+        self.assertFalse(lock.exists())
+        self.assertEqual(before, self.audit_log.stat())
+        self.assertEqual(before.st_atime_ns, self.audit_log.stat().st_atime_ns)
+        self.assertEqual(directory_before, self.audit_log.parent.stat())
+        self.assertEqual(directory_before.st_atime_ns, self.audit_log.parent.stat().st_atime_ns)
+        self.assertEqual(names_before, sorted(str(p) for p in self.root.rglob("*")))
+        audit_opens = [flags for name, flags in opens if name == self.audit_log.name]
+        self.assertEqual(2, len(audit_opens))
+        required = os.O_NOATIME | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+        self.assertTrue(all(flags & required == required for flags in audit_opens))
+
+    def test_retained_audit_ignores_unrelated_ancestor_mtime_changes(self) -> None:
+        # The root and audit-parent directory can change because an unrelated
+        # process creates a sibling; it does not replace the bound directories
+        # or alter the exact audit head. READ_ONLY must not mistake the changed
+        # directory mtime/ctime for a replaced publisher audit record.
+        self._local_terminal_readiness_store(8225)
+        audit_bytes = self.audit_log.read_bytes()
+        audit_stat = self.audit_log.stat()
+        parent = self.audit_log.parent
+        before = parent.stat()
+        calls = []
+        def unrelated_directory_change(_argv, **_kwargs):
+            calls.append(True)
+            if len(calls) == 1:
+                os.utime(parent, ns=(
+                    before.st_atime_ns, before.st_mtime_ns + 1_000_000_000
+                ))
+            return _launcher()
+        try:
+            status = self._retained_history_snapshot(
+                probe=unrelated_directory_change
+            )
+        finally:
+            os.utime(parent, ns=(before.st_atime_ns, before.st_mtime_ns))
+        self.assertEqual(2, len(calls))
+        self.assertEqual("retained_attempt_authority_unverified", status["status"])
+        self.assertEqual(audit_bytes, self.audit_log.read_bytes())
+        self.assertEqual(audit_stat.st_ino, self.audit_log.stat().st_ino)
+        self.assertEqual(audit_stat.st_mtime_ns, self.audit_log.stat().st_mtime_ns)
+
+    def _retained_archive_witness(self):
+        archive_env = patch.dict(os.environ, {
+            "GRABOWSKI_TASK_ARCHIVE_ROOT": str(self.task_archive_root),
+            "GRABOWSKI_TASK_PROJECTION_ROOT": str(self.task_projection_root),
+        })
+        archive_env.start()
+        self.addCleanup(archive_env.stop)
+        task_id = self._start()["task"]["task_id"]
+        self._archive_and_project_tasks([task_id])
+        with patch.object(tasks.operator, "_require_operator_mutation"):
+            with tasks._database_connection() as writer:
+                prepared = tasks._prepare_task_reconcile_retained_evidence(writer)
+            tasks._publish_task_reconcile_ready_evidence(prepared)
+        with tasks._task_readonly_snapshot() as reader:
+            proof = json.loads(reader.execute(
+                "SELECT value FROM metadata WHERE key=?",
+                (tasks.TASK_RECONCILE_READY_EVIDENCE_METADATA_KEY,),
+            ).fetchone()[0])
+        self.assertEqual(4, proof["schema_version"])
+        # A consistent archived witness is not per-attempt transport provenance;
+        # historical v4 can validate integrity but cannot authorize readiness.
+        self.assertEqual("retained_attempt_authority_unverified", self._retained_history_snapshot()["status"])
+        return task_id, proof
+
+    def _retained_archive_readonly_status(self):
+        def snapshot():
+            return {
+                str(path.relative_to(self.root)): (
+                    stat.S_IMODE(path.stat().st_mode),
+                    path.read_bytes() if path.is_file() else None,
+                ) for path in self.root.rglob("*")
+            }
+        before = snapshot()
+        status = self._retained_history_snapshot()
+        self.assertEqual(before, snapshot(), "READ_ONLY must preserve databases, archives and sidecars")
+        return status
+
+    def test_retained_archived_ssh_attempt_survives_current_local_fleet_drift(self) -> None:
+        # Regression for already-existing historical archive switches. The
+        # pre-fix Fleet race could dispatch over SSH even with both
+        # marker=1 and a later launcher transport='local'. An archive of that
+        # row must never erase its physical historical attempt or let today's
+        # local-only inventory prove global readiness.
+        # This does NOT authorize creating new archives on an unproven route.
+        with patch.dict(os.environ, {
+            "GRABOWSKI_TASK_ARCHIVE_ROOT": str(self.task_archive_root),
+            "GRABOWSKI_TASK_PROJECTION_ROOT": str(self.task_projection_root),
+        }):
+            task_id = self._start()["task"]["task_id"]
+            unit = tasks._task_unit(task_id, 1)
+            with tasks._database_connection() as writer:
+                writer.execute(
+                    "UPDATE tasks SET launcher_json=? WHERE task_id=?",
+                    (json.dumps({
+                        "task_output_managed_from_attempt": 1,
+                        "task_launch_transport": "local",
+                    }), task_id),
+                )
+            self._archive_and_project_tasks([task_id])
+            with patch.object(tasks.operator, "_require_operator_mutation"):
+                with tasks._database_connection() as writer:
+                    prepared = tasks._prepare_task_reconcile_retained_evidence(writer)
+                tasks._publish_task_reconcile_ready_evidence(prepared)
+            projection = tasks._task_current_projection(readiness_bounded=True)
+            self.assertIn(task_id, projection["archived_task_bindings"])
+            with tasks._task_readonly_snapshot() as reader:
+                row = reader.execute(
+                    "SELECT attempt, launcher_json, state FROM tasks WHERE task_id=?",
+                    (task_id,),
+                ).fetchone()
+                cohorts = tasks._task_retained_cohorts(reader)
+            self.assertIsNotNone(row)
+            self.assertEqual(1, row["attempt"])
+            self.assertEqual("local", json.loads(row["launcher_json"])["task_launch_transport"])
+            self.assertIn(["local", "systemd-user", "user", "completed"], cohorts)
+            self.assertEqual("completed", row["state"])
+
+            remote_active = {unit: "active"}
+            with (
+                patch.object(tasks.fleet, "run_fleet_host",
+                             side_effect=AssertionError("READ_ONLY cannot SSH")),
+                patch.object(tasks.privileged, "root_task_systemd_request",
+                             side_effect=AssertionError("READ_ONLY cannot probe root")),
+            ):
+                status = self._retained_archive_readonly_status()
+            self.assertEqual("active", remote_active[unit])
+            self.assertEqual("retained_attempt_authority_unverified", status["status"])
+            self.assertNotEqual("verified", status["status"])
+            self.assertEqual(
+                tasks.lifecycle_projection.lifecycle.sha256_json(
+                    tasks._task_archive_record(tasks._row_raw(task_id))
+                ),
+                projection["archived_task_bindings"][task_id]["record_sha256"],
+            )
+
+    def test_retained_archive_minimal_witness_binds_validated_projection(self) -> None:
+        task_id, proof = self._retained_archive_witness()
+        projection = tasks._task_current_projection(readiness_bounded=True)
+        self.assertEqual([task_id], list(projection["archived_task_bindings"]))
+        self.assertEqual(projection["projection_sha256"], proof["archive_projection_sha256"])
+        with (
+            patch.object(tasks, "_projected_task_state_counts",
+                         wraps=tasks._projected_task_state_counts) as bindings,
+            patch.object(tasks, "_subtract_projected_task_counts",
+                         side_effect=AssertionError("archive must not exclude retained rows")),
+        ):
+            self.assertEqual("retained_attempt_authority_unverified", self._retained_archive_readonly_status()["status"])
+        self.assertEqual(3, bindings.call_count)
+        self.assertTrue(all(list(call.args[1]["archived_task_bindings"]) == [task_id]
+                            for call in bindings.call_args_list))
+
+    def test_retained_archive_files_and_roots_missing_or_corrupt_fail_closed(self) -> None:
+        self._retained_archive_witness()
+        switch = next(self.task_projection_root.iterdir())
+        segment = next(self.task_archive_root.iterdir())
+        for path in (switch, segment / "manifest.json", segment / "records.jsonl"):
+            original = path.read_bytes()
+            for effect in ("corrupt", "missing"):
+                with self.subTest(path=path.name, effect=effect):
+                    try:
+                        if effect == "corrupt":
+                            path.write_bytes(b"corrupt archive evidence\n")
+                        else:
+                            path.unlink()
+                        self.assertIn(self._retained_archive_readonly_status()["status"],
+                                      {"stale", "unavailable"})
+                    finally:
+                        path.write_bytes(original)
+        # A missing projection root is empty only when the witness is empty.
+        for root in (self.task_projection_root, self.task_archive_root):
+            hidden = root.with_name(root.name + "-removed")
+            with self.subTest(missing_root=root.name):
+                root.rename(hidden)
+                try:
+                    self.assertIn(self._retained_archive_readonly_status()["status"],
+                                  {"stale", "unavailable"})
+                finally:
+                    hidden.rename(root)
+
+    def test_retained_archive_binding_row_mismatch_rejects_new_and_existing_witness(self) -> None:
+        task_id, _proof = self._retained_archive_witness()
+        for sql in ("UPDATE tasks SET attempt=attempt+1 WHERE task_id=?",
+                    "DELETE FROM tasks WHERE task_id=?"):
+            with self.subTest(sql=sql):
+                with tasks._database_connection() as writer:
+                    writer.execute("BEGIN IMMEDIATE")
+                    writer.execute(sql, (task_id,))
+                    with self.assertRaises(tasks.lifecycle_projection.LifecycleProjectionIntegrityError):
+                        tasks._prepare_task_reconcile_retained_evidence(writer)
+                    writer.rollback()
+        with tasks._database_connection() as writer:
+            writer.execute("UPDATE tasks SET attempt=attempt+1 WHERE task_id=?", (task_id,))
+        with tasks._task_readonly_snapshot() as reader:
+            with self.assertRaises(tasks.lifecycle_projection.LifecycleProjectionIntegrityError):
+                tasks._task_reconcile_archive_projection_sha256(reader)
+        self.assertNotEqual("verified", self._retained_archive_readonly_status()["status"])
+
+    def test_retained_archive_added_switch_without_store_revision_is_stale(self) -> None:
+        task_id, proof = self._retained_archive_witness()
+        self._archive_and_project_tasks([task_id], source_store_sha256="e" * 64)
+        with tasks._task_readonly_snapshot() as reader:
+            self.assertEqual(proof["task_revision"], tasks._task_reconcile_revision_contract(reader)["revision"])
+        self.assertEqual(2, len(list(self.task_projection_root.iterdir())))
+        self.assertEqual("stale", self._retained_archive_readonly_status()["status"])
+
+    def test_retained_archive_drift_during_each_inventory_window_fails_closed(self) -> None:
+        self._retained_archive_witness()
+        switch = next(self.task_projection_root.iterdir())
+        original = switch.read_bytes()
+        for window in (1, 2):
+            with self.subTest(window=window):
+                calls = 0
+                before = {path: path.read_bytes() for path in (self.database, self.resource_database)}
+                def inventory(_argv, **_kwargs):
+                    nonlocal calls
+                    calls += 1
+                    if calls == window:
+                        switch.unlink()
+                    return _launcher()
+                try:
+                    self.assertEqual("stale", self._retained_history_snapshot(probe=inventory)["status"])
+                    self.assertEqual(window, calls)
+                    self.assertEqual(before, {path: path.read_bytes() for path in before})
+                finally:
+                    switch.write_bytes(original)
+
+    def test_retained_archive_publish_revalidates_prepared_projection(self) -> None:
+        task_id, proof = self._retained_archive_witness()
+        with tasks._database_connection() as writer:
+            prepared = tasks._prepare_task_reconcile_retained_evidence(writer)
+        self._archive_and_project_tasks([task_id], source_store_sha256="e" * 64)
+        with patch.object(tasks.base, "_append_audit_with_digest") as audit:
+            tasks._publish_task_reconcile_ready_evidence(prepared)
+        audit.assert_not_called()
+        with tasks._task_readonly_snapshot() as reader:
+            current = json.loads(reader.execute(
+                "SELECT value FROM metadata WHERE key=?",
+                (tasks.TASK_RECONCILE_READY_EVIDENCE_METADATA_KEY,),
+            ).fetchone()[0])
+        self.assertEqual(proof, current)
+        self.assertEqual("stale", self._retained_archive_readonly_status()["status"])
+
+    def test_retained_archive_old_v4_without_projection_binding_is_invalid(self) -> None:
+        _task_id, proof = self._retained_archive_witness()
+        del proof["archive_projection_sha256"]
+        proof["evidence_sha256"] = tasks._sha256_json({
+            key: value for key, value in proof.items() if key != "evidence_sha256"
+        })
+        with tasks._database_connection() as writer:
+            writer.execute("UPDATE metadata SET value=? WHERE key=?", (
+                json.dumps(proof), tasks.TASK_RECONCILE_READY_EVIDENCE_METADATA_KEY,
+            ))
+        self.assertEqual("invalid", self._retained_archive_readonly_status()["status"])
+
+    def test_retained_archive_integrity_budget_exhaustion_fails_closed(self) -> None:
+        self._retained_archive_witness()
+        with patch.object(tasks, "TASK_RECONCILE_READY_PRIVILEGED_HISTORY_LIMIT", 0):
+            self.assertEqual("unavailable", self._retained_archive_readonly_status()["status"])
+
+    def test_retained_archive_integrity_uses_inventory_deadline(self) -> None:
+        self._retained_archive_witness()
+        clock = [0.0]
+        load = tasks._task_current_projection
+        def slow_archive(**kwargs):
+            projection = load(**kwargs)
+            clock[0] = 61.0
+            return projection
+        with (
+            patch.object(tasks.time, "monotonic", side_effect=lambda: clock[0]),
+            patch.object(tasks, "_task_current_projection", side_effect=slow_archive),
+        ):
+            self.assertNotEqual("verified", self._retained_archive_readonly_status()["status"])
+
+    def test_retained_archive_corruption_after_witness_fails_closed(self) -> None:
+        self._retained_archive_witness()
+        switch = next(self.task_projection_root.iterdir())
+        switch.write_text("corrupt archive switch\n")
+        before = {str(path): path.read_bytes() for path in self.root.rglob("*") if path.is_file()}
+        status = self._retained_history_snapshot()
+        after = {str(path): path.read_bytes() for path in self.root.rglob("*") if path.is_file()}
+        self.assertEqual(before, after, "READ_ONLY must preserve databases, archives and sidecars")
+        self.assertNotEqual("verified", status["status"])
+
+    def test_retained_history_readiness_scales_to_97010_without_row_scan(self) -> None:
+        self._local_terminal_readiness_store(97010)
+        # Integrity is bounded independently of retained history. Cohort and
+        # origin proofs must still include all 97010 rows, with no row scan.
+        queries = []
+        snapshot = tasks._task_readonly_snapshot
+        @contextmanager
+        def traced_snapshot():
+            with snapshot() as reader:
+                reader.set_trace_callback(queries.append)
+                yield reader
+        with (
+            patch.object(tasks, "_task_readonly_snapshot", traced_snapshot),
+            patch.object(tasks.lifecycle_projection, "load_task_archive_projection",
+                         wraps=tasks.lifecycle_projection.load_task_archive_projection) as archive,
+            patch.object(tasks, "_projected_task_state_counts",
+                         wraps=tasks._projected_task_state_counts) as bindings,
+            patch.object(tasks, "_subtract_projected_task_counts",
+                         side_effect=AssertionError("no archive exclusion")),
+        ):
+            status = self._retained_history_snapshot()
+        self.assertEqual("retained_attempt_authority_unverified", status["status"])
+        self.assertNotIn("verification_scope", status)
+        self.assertEqual(3, archive.call_count)
+        self.assertEqual(3, bindings.call_count)
+        for call in archive.call_args_list:
+            self.assertEqual(8192, call.kwargs["max_switches"])
+            self.assertEqual(8192, call.kwargs["max_archived_bindings"])
+            self.assertEqual(128 * 1024 * 1024, call.kwargs["max_total_records_bytes"])
+            self.assertEqual(64 * 1024 * 1024, call.kwargs["max_total_manifest_bytes"])
+            self.assertEqual(64 * 1024 * 1024, call.kwargs["max_total_switch_bytes"])
+        self.assertFalse(any(re.search(r"SELECT\s+\*\s+FROM\s+tasks", sql, re.I) for sql in queries))
+        self.assertTrue(any("INDEXED BY tasks_reconcile_ready_retained_idx" in sql for sql in queries))
+        self.assertTrue(any("INDEXED BY tasks_reconcile_ready_unbound_origin_idx" in sql for sql in queries))
+        self.assertEqual(tasks._sha256_json([]), tasks._task_current_projection(
+            readiness_bounded=True)["projection_sha256"])
+        with tasks._task_readonly_snapshot() as reader:
+            with patch.object(tasks, "TASK_RECONCILE_READY_SQL_VM_CALLBACK_LIMIT", 0):
+                self.assertEqual("unavailable", tasks._task_reconcile_ready_evidence_snapshot(reader)["status"])
+
+    def test_retained_history_readiness_97010_rows_with_124_failed_attempts(self) -> None:
+        self._local_terminal_readiness_store(97010)
+        # Multiple retained attempts of one historical task are independent
+        # from the 32 current-task observation slots.
+        units = [f"grabowski-task-{'1' * 24}-a{attempt}.service" for attempt in range(1, 125)]
+        inventory = "".join(f"{unit} loaded failed failed retained\n" for unit in units)
+        shows = []
+        inventories = []
+        def run(argv, **kwargs):
+            if argv[2] == "show":
+                shows.append(argv[3])
+                self.assertLessEqual(kwargs["timeout_seconds"], 5)
+                return self._retained_epoch_result(argv[3], failed=True)
+            inventories.append(argv)
+            return {**_launcher(), "stdout": inventory}
+        with patch.object(tasks, "_task_current_projection",
+                          wraps=tasks._task_current_projection) as projection:
+            status = self._retained_history_snapshot(probe=run)
+        self.assertEqual("retained_attempt_authority_unverified", status["status"])
+        self.assertEqual(3, projection.call_count)
+        self.assertTrue(all(call.kwargs == {"readiness_bounded": True}
+                            for call in projection.call_args_list))
+        self.assertEqual(2, len(inventories))
+        self.assertEqual(sorted(units) * 2, shows)
+        self.assertEqual(32, tasks.TASK_RECONCILE_READY_LOCAL_TERMINAL_LIMIT)
+
+    def test_retained_attempt_epoch_budget_admits_256_and_rejects_257(self) -> None:
+        units = {f"grabowski-task-{'1' * 24}-a{attempt}.service": ["loaded", "failed", "failed"]
+                 for attempt in range(1, 257)}
+        with patch.object(tasks.operator, "_run", side_effect=lambda argv, **kw:
+                          self._retained_epoch_result(argv[3], failed=True)) as run:
+            digest = tasks._task_retained_unit_epochs({"units": units}, deadline=time.monotonic() + 60)
+        self.assertEqual(tasks._sha256_json(dict.fromkeys(units, "1" * 32)), digest)
+        self.assertEqual(256, run.call_count)
+        units[f"grabowski-task-{'1' * 24}-a257.service"] = ["loaded", "failed", "failed"]
+        with patch.object(tasks.operator, "_run", side_effect=AssertionError("cap must precede shows")):
+            with self.assertRaisesRegex(RuntimeError, "budget exceeded"):
+                tasks._task_retained_unit_epochs({"units": units}, deadline=time.monotonic() + 60)
+        self._local_terminal_readiness_store(8225)
+        inventory = "".join(f"{unit} {' '.join(states)} retained\n" for unit, states in units.items())
+        self.assertEqual("archived_task_unit_observation_unavailable",
+                         self._retained_history_snapshot(inventory)["status"])
+
+    def test_retained_attempt_probe_deadlines_bound_inventory_and_each_show(self) -> None:
+        unit = f"grabowski-task-{'1' * 24}-a1.service"
+        inventory = {"units": {unit: ["loaded", "inactive", "dead"]}}
+        for operation, result in (
+            (lambda: tasks._task_reconcile_ready_user_unit_inventory(deadline=12.75), _launcher()),
+            (lambda: tasks._task_retained_unit_epochs(inventory, deadline=12.75), self._retained_epoch_result(unit)),
+        ):
+            with self.subTest(operation=operation), patch.object(tasks.time, "monotonic", return_value=10):
+                with patch.object(tasks.operator, "_run", return_value=result) as run:
+                    operation()
+                self.assertGreater(run.call_args.kwargs["timeout_seconds"], 0)
+                self.assertLessEqual(run.call_args.kwargs["timeout_seconds"], 2.75)
+                with patch.object(tasks.operator, "_run", return_value=result) as run:
+                    with patch.object(tasks.time, "monotonic", side_effect=[10, 13]):
+                        with self.assertRaisesRegex(RuntimeError, "deadline"):
+                            operation()
+                with patch.object(tasks.operator, "_run", side_effect=AssertionError("expired probe")):
+                    with patch.object(tasks.time, "monotonic", return_value=13):
+                        with self.assertRaisesRegex(RuntimeError, "deadline"):
+                            operation()
+
+    def test_retained_history_double_inventory_shares_60_second_deadline(self) -> None:
+        self._local_terminal_readiness_store(8225)
+        now = [0.0]
+        inventories = []
+        def slow_inventory(argv, **kwargs):
+            self.assertLessEqual(kwargs["timeout_seconds"], 60 - now[0])
+            inventories.append(argv)
+            now[0] += 31
+            return _launcher()
+        with patch.object(tasks.time, "monotonic", side_effect=lambda: now[0]):
+            status = self._retained_history_snapshot(probe=slow_inventory)
+        self.assertEqual("archived_task_unit_observation_unavailable", status["status"])
+        self.assertEqual(2, len(inventories))
+
+    def test_retained_history_readiness_checks_all_attempts_and_inventory_drift(self) -> None:
+        self._local_terminal_readiness_store(8225)
+        first = "grabowski-task-000000000000000000000001-a1.service loaded inactive dead done\n"
+        second = "grabowski-task-000000000000000000000001-a2.service loaded inactive dead done\n"
+        self.assertEqual("retained_attempt_authority_unverified", self._retained_history_snapshot(first + second)["status"])
+        self.assertEqual("archived_task_unit_live_unverified", self._retained_history_snapshot(
+            first.replace("inactive dead", "active running") + second)["status"])
+        inventories = iter([first, first + second])
+        def changing_inventory(argv, **_kwargs):
+            return (self._retained_epoch_result(argv[3]) if argv[2] == "show"
+                    else {**_launcher(), "stdout": next(inventories)})
+        with (
+            patch.object(tasks, "_resolve_task_dispatch_host",
+                         return_value=("local", {"transport": "local"}, False)),
+            patch.object(tasks.operator, "_run", side_effect=changing_inventory),
+        ):
+            with tasks._task_readonly_snapshot() as reader:
+                self.assertEqual("retained_inventory_changed", tasks._task_reconcile_ready_evidence_snapshot(reader)["status"])
+
+    def test_retained_history_readiness_rejects_same_unit_epoch_change(self) -> None:
+        self._local_terminal_readiness_store(8225)
+        unit = "grabowski-task-000000000000000000000001-a1.service"
+        inventory = {**_launcher(), "stdout": unit + " loaded inactive dead done\n"}
+        for observation, expected in (
+            (self._retained_epoch_result(unit, "2" * 32), "retained_inventory_changed"),
+            (self._retained_epoch_result(unit, ""), "archived_task_unit_observation_unavailable"),
+            (self._retained_epoch_result(unit.replace("a1", "a2")), "archived_task_unit_observation_unavailable"),
+            ({**self._retained_epoch_result(unit), "stdout_truncated": True}, "archived_task_unit_observation_unavailable"),
+            *[({**self._retained_epoch_result(unit), **change}, "archived_task_unit_observation_unavailable")
+              for change in ({"returncode": 1}, {"returncode": True}, {"returncode": None},
+                             {"timed_out": True}, {"stderr_truncated": True}, {"outcome_unknown": True},
+                             {"stdout": f"Id={unit}\n"}, {"stdout": "x" * 4097},
+                             {"stdout": self._retained_epoch_result(unit)["stdout"] + "Id=duplicate\n"})],
+        ):
+            with self.subTest(expected=expected), patch.object(
+                tasks, "_resolve_task_dispatch_host",
+                return_value=("local", {"transport": "local"}, False),
+            ), patch.object(tasks.operator, "_run", side_effect=[
+                inventory, self._retained_epoch_result(unit), inventory, observation,
+            ]):
+                with tasks._task_readonly_snapshot() as reader:
+                    self.assertEqual(expected, tasks._task_reconcile_ready_evidence_snapshot(reader)["status"])
+
+    def test_retained_history_readiness_rejects_malformed_stale_and_unaudited_witness(self) -> None:
+        self._local_terminal_readiness_store(8225)
+        key = tasks.TASK_RECONCILE_READY_EVIDENCE_METADATA_KEY
+        with tasks._task_readonly_snapshot() as reader:
+            original = json.loads(reader.execute("SELECT value FROM metadata WHERE key=?", (key,)).fetchone()[0])
+        for changes in ({"audit_record_sha256": ""}, {"scope": "retired-by-stop-show"},
+                        {"reconciled_at_unix": tasks._now() - 301},
+                        {"task_revision": "0" * 64}, {"evidence_sha256": "0" * 64}):
+            with self.subTest(changes=changes):
+                material = {**original, **changes}
+                if "evidence_sha256" not in changes:
+                    material["evidence_sha256"] = tasks._sha256_json({key: value for key, value in material.items() if key != "evidence_sha256"})
+                with tasks._database_connection() as writer:
+                    writer.execute("UPDATE metadata SET value=? WHERE key=?", (json.dumps(material), key))
+                self.assertNotEqual("verified", self._retained_history_snapshot()["status"])
+        with tasks._database_connection() as writer:
+            writer.execute("DELETE FROM metadata WHERE key=?", (key,))
+            prepared = tasks._prepare_task_reconcile_retained_evidence(writer)
+        with patch.object(tasks.base, "_append_audit_with_digest", side_effect=OSError("audit unavailable")):
+            with self.assertRaises(OSError):
+                tasks._publish_task_reconcile_ready_evidence(prepared)
+        self.assertEqual("missing", self._retained_history_snapshot()["status"])
+
+    def test_retained_marker_one_cannot_certify_hidden_active_ssh_attempt(self) -> None:
+        # Old tasks recorded marker=1 at persistence, but a Fleet race could
+        # dispatch attempt 1 over SSH. A still-active remote user unit is
+        # invisible to local systemctl --user, even if Fleet now says local.
+        self._local_terminal_readiness_store(8225)
+        task_id = "000000000000000000000001"
+        # A later local launcher field does not authenticate the historical
+        # first attempt; the pre-fix Fleet race may have launched that same
+        # identity on SSH while its stored marker was already 1.
+        with tasks._database_connection() as writer:
+            writer.execute(
+                "UPDATE tasks SET launcher_json=? WHERE task_id=?",
+                (json.dumps({
+                    "task_output_managed_from_attempt": 1,
+                    "task_launch_transport": "local",
+                }), task_id),
+            )
+            prepared = tasks._prepare_task_reconcile_retained_evidence(writer)
+        tasks._publish_task_reconcile_ready_evidence(prepared)
+        remote_unit = tasks._task_unit(task_id, 1)
+        remote_running_units = {remote_unit: "active"}
+        seen = []
+        def local_inventory(argv, **_kwargs):
+            seen.append(argv)
+            self.assertEqual(["systemctl", "--user"], argv[:2])
+            return _launcher()
+        with patch.object(
+            tasks.fleet, "run_fleet_host",
+            side_effect=AssertionError("READ_ONLY must never query remote units"),
+        ):
+            status = self._retained_history_snapshot(probe=local_inventory)
+        self.assertEqual("active", remote_running_units[remote_unit])
+        self.assertEqual("retained_attempt_authority_unverified", status["status"])
+        self.assertTrue(all(argv[:2] == ["systemctl", "--user"] for argv in seen))
+
+    def test_retained_history_readiness_rejects_unbound_earlier_attempt_transport(self) -> None:
+        self._local_terminal_readiness_store(8225)
+        for raw in ("{}", '{"task_output_managed_from_attempt":2}',
+                    '{"task_output_managed_from_attempt":true}',
+                    '{"task_output_managed_from_attempt":"1"}', "malformed"):
+            with self.subTest(launcher=raw):
+                with tasks._database_connection() as writer:
+                    writer.execute("UPDATE tasks SET launcher_json=? WHERE task_id='000000000000000000000001'", (raw,))
+                    prepared = tasks._prepare_task_reconcile_retained_evidence(writer)
+                tasks._publish_task_reconcile_ready_evidence(prepared)
+                with (
+                    patch.object(tasks, "_resolve_task_dispatch_host",
+                                 return_value=("local", {"transport": "local"}, False)),
+                    patch.object(tasks.operator, "_run", side_effect=AssertionError("unknown origin must not probe")),
+                ):
+                    with tasks._task_readonly_snapshot() as reader:
+                        self.assertEqual("retained_attempt_authority_unverified", tasks._task_reconcile_ready_evidence_snapshot(reader)["status"])
+
+    def test_retained_history_readiness_requires_exact_index_and_authorized_install(self) -> None:
+        self._local_terminal_readiness_store(8225)
+        with tasks._database_connection() as writer:
+            writer.execute("DROP INDEX " + tasks.TASK_RECONCILE_READY_RETAINED_INDEX)
+            with patch.object(tasks.operator, "_require_operator_mutation", side_effect=PermissionError("not authorized")):
+                with self.assertRaises(PermissionError):
+                    tasks._prepare_task_reconcile_retained_evidence(writer)
+            self.assertFalse(tasks._task_retained_index_present(writer))
+        self.assertEqual("unavailable", self._retained_history_snapshot()["status"])
+        with tasks._database_connection() as writer:
+            writer.execute("CREATE INDEX " + tasks.TASK_RECONCILE_READY_RETAINED_INDEX + " ON tasks(state)")
+        self.assertEqual("unavailable", self._retained_history_snapshot()["status"])
+
+    def test_retained_history_readiness_refuses_wal_without_creating_or_changing_sidecars(self) -> None:
+        self._local_terminal_readiness_store(8225)
+        for suffix in ("-wal", "-shm"):
+            sidecar = Path(str(self.database) + suffix)
+            sidecar.write_bytes(b"fixture-sidecar")
+            with self.subTest(suffix=suffix), self.assertRaises(tasks.TaskSchemaInventoryChanged):
+                self._retained_history_snapshot()
+            self.assertEqual(b"fixture-sidecar", sidecar.read_bytes())
+            sidecar.unlink()
+
+    def test_retained_history_readiness_rechecks_resource_and_transport_after_inventory(self) -> None:
+        self._local_terminal_readiness_store(8225)
+        def resource_change(*_args, **_kwargs):
+            with closing(tasks.resources._database()) as writer, writer:
+                writer.execute("UPDATE metadata SET value=? WHERE key=?",
+                               ("e" * 64, tasks.resources.RESOURCE_RECONCILE_REVISION_METADATA_KEY))
+            return _launcher()
+        with (
+            patch.object(tasks, "_resolve_task_dispatch_host",
+                         return_value=("local", {"transport": "local"}, False)),
+            patch.object(tasks.operator, "_run", side_effect=resource_change),
+        ):
+            with tasks._task_readonly_snapshot() as reader:
+                self.assertEqual("stale", tasks._task_reconcile_ready_evidence_snapshot(reader)["status"])
+        with tasks._database_connection() as writer:
+            prepared = tasks._prepare_task_reconcile_retained_evidence(writer)
+        tasks._publish_task_reconcile_ready_evidence(prepared)
+        with (
+            patch.object(tasks, "_resolve_task_dispatch_host", side_effect=[
+                ("local", {"transport": "local"}, False),
+                ("remote", {"transport": "ssh"}, False),
+            ]),
+            patch.object(tasks.operator, "_run", return_value=_launcher()),
+        ):
+            with tasks._task_readonly_snapshot() as reader:
+                self.assertEqual("stale", tasks._task_reconcile_ready_evidence_snapshot(reader)["status"])
+
+    def test_retained_history_readiness_incomplete_and_revision_drift_fail_closed(self) -> None:
+        self._local_terminal_readiness_store(8225)
+        for change in ({"returncode": 1}, {"returncode": True}, {"returncode": None},
+                       {"stdout_truncated": True}, {"timed_out": True},
+                       {"outcome_unknown": True}, {"stderr_truncated": True},
+                       {"stdout": "malformed"}):
+            with self.subTest(change=change), patch.object(
+                tasks, "_resolve_task_dispatch_host",
+                return_value=("local", {"transport": "local"}, False),
+            ), patch.object(tasks.operator, "_run", return_value={**_launcher(), **change}):
+                with tasks._task_readonly_snapshot() as reader:
+                    self.assertEqual("archived_task_unit_observation_unavailable", tasks._task_reconcile_ready_evidence_snapshot(reader)["status"])
+
+        def start_during_inventory(*_args, **_kwargs):
+            with tasks._database_connection() as writer:
+                writer.execute("UPDATE tasks SET state='launching' WHERE task_id='000000000000000000000001'")
+            return _launcher()
+
+        with (
+            patch.object(tasks, "_resolve_task_dispatch_host",
+                         return_value=("local", {"transport": "local"}, False)),
+            patch.object(tasks.operator, "_run", side_effect=start_during_inventory),
+        ):
+            with self.assertRaises(tasks.TaskSchemaInventoryChanged):
+                with tasks._task_readonly_snapshot() as reader:
+                    self.assertEqual("stale", tasks._task_reconcile_ready_evidence_snapshot(reader)["status"])
+
+    def _assert_retained_archive_authority_blocked(self, fields, expected):
+        self._local_terminal_readiness_store(8225)
+        task_id = "000000000000000000000001"
+        with tasks._database_connection() as writer:
+            writer.execute("UPDATE tasks SET " + ",".join(f"{key}=?" for key in fields)
+                           + " WHERE task_id=?", (*fields.values(), task_id))
+            writer.execute("UPDATE tasks SET lease_owner_id=? WHERE task_id=?",
+                           (tasks._lease_owner(task_id), task_id))
+        tasks._recover_task_terminalization(task_id)
+        self._archive_and_project_tasks([task_id])
+        with tasks._database_connection() as writer:
+            prepared = tasks._prepare_task_reconcile_retained_evidence(writer)
+        tasks._publish_task_reconcile_ready_evidence(prepared)
+        with (
+            patch.object(tasks, "_task_current_projection", wraps=tasks._task_current_projection) as projection,
+            patch.object(tasks, "_subtract_projected_task_counts", side_effect=AssertionError("no archive exclusion")),
+            patch.object(tasks, "_resolve_task_dispatch_host", side_effect=lambda host: (host, {"transport": "ssh" if host == "remote" else "local"}, False)),
+            patch.object(tasks.operator, "_run", side_effect=AssertionError("no systemd or SSH")),
+            patch.object(tasks, "_dispatch", side_effect=AssertionError("no dispatch")),
+        ):
+            with tasks._task_readonly_snapshot() as reader:
+                self.assertEqual(expected, tasks._task_reconcile_ready_evidence_snapshot(reader)["status"])
+        projection.assert_called_once_with(readiness_bounded=True)
+
+    def test_retained_history_readiness_never_certifies_remote_or_root_archives(self) -> None:
+        self._assert_retained_archive_authority_blocked(
+            {"execution_backend": "systemd-root-broker", "systemd_scope": "system"},
+            "privileged_live_unverified",
+        )
+
+    def test_retained_history_readiness_never_certifies_ssh_archive(self) -> None:
+        self._assert_retained_archive_authority_blocked(
+            {"host": "remote"}, "local_terminal_transport_unverified",
+        )
+
+    def test_retained_history_readiness_never_excludes_unbound_archive_origin(self) -> None:
+        self._assert_retained_archive_authority_blocked(
+            {"launcher_json": '{"task_output_managed_from_attempt":2}'},
+            "retained_attempt_authority_unverified",
+        )
+
+    def test_v4_empty_retained_cohort_cannot_certify_orphan_root_or_ssh_units(self) -> None:
+        # An intact v4 archive/audit witness and zero-row TaskStore still do
+        # not account for out-of-band root/SSH units left by prior stores.
+        with closing(tasks.resources._database()):
+            pass
+        with patch.dict(os.environ, {
+            "GRABOWSKI_TASK_ARCHIVE_ROOT": str(self.task_archive_root),
+            "GRABOWSKI_TASK_PROJECTION_ROOT": str(self.task_projection_root),
+        }), patch.object(tasks.operator, "_require_operator_mutation"):
+            with tasks._database_connection() as writer:
+                self.assertIsNone(writer.execute("SELECT 1 FROM tasks LIMIT 1").fetchone())
+                prepared = tasks._prepare_task_reconcile_retained_evidence(writer)
+            tasks._publish_task_reconcile_ready_evidence(prepared)
+            with tasks._task_readonly_snapshot() as reader:
+                proof = json.loads(reader.execute(
+                    "SELECT value FROM metadata WHERE key=?",
+                    (tasks.TASK_RECONCILE_READY_EVIDENCE_METADATA_KEY,),
+                ).fetchone()[0])
+            self.assertEqual(4, proof["schema_version"])
+            with (
+                patch.object(tasks.fleet, "run_fleet_host",
+                             side_effect=AssertionError("no SSH observation")) as ssh,
+                patch.object(tasks.privileged, "root_task_systemd_request",
+                             side_effect=AssertionError("no root observation")) as root,
+            ):
+                result = self._retained_history_snapshot()
+        self.assertEqual("retained_attempt_authority_unverified", result["status"])
+        ssh.assert_not_called()
+        root.assert_not_called()
+
+    def test_v3_empty_taskstore_cannot_certify_orphan_root_or_ssh_units(self) -> None:
+        # A previously deleted or replaced TaskStore may have zero rows while
+        # remote user-systemd and root-systemd task units remain restartable.
+        # Local-only user-systemd probes cannot rule out either external host.
+        with tasks._database_connection() as connection:
+            self.assertIsNone(connection.execute("SELECT 1 FROM tasks LIMIT 1").fetchone())
+        with closing(tasks.resources._database()):
+            pass
+        cycle = {
+            "mode": "refresh", "task_id": "", "scanned": 0,
+            "refreshed": [], "released": [], "resumed": [], "blocked": [],
+            "batch": {
+                "cycle_completed": True, "cursor_before": None,
+                "active_refresh": {"cycle_completed": True, "cursor_before": None},
+                "terminalization_recovery": {
+                    "cycle_completed": True, "cursor_before": None, "failed": [],
+                },
+            },
+        }
+        with (
+            patch.object(tasks.operator, "_require_operator_mutation"),
+            patch.object(tasks, "_reconcile_tasks_refresh_locked", return_value=cycle),
+            patch.object(tasks.base, "_append_audit"),
+        ):
+            tasks._task_reconcile_refresh_after_guard("")
+        with tasks._task_readonly_snapshot() as reader:
+            proof = json.loads(reader.execute(
+                "SELECT value FROM metadata WHERE key=?",
+                (tasks.TASK_RECONCILE_READY_EVIDENCE_METADATA_KEY,),
+            ).fetchone()[0])
+        self.assertEqual(3, proof["schema_version"])
+        orphan_units = {
+            "remote:ssh": "grabowski-task-" + "a" * 24 + "-a1.service",
+            "root:system": "grabowski-task-" + "b" * 24 + "-a1.service",
+        }
+        with (
+            patch.object(tasks.fleet, "run_fleet_host",
+                         side_effect=AssertionError("READ_ONLY cannot establish SSH authority")) as ssh,
+            patch.object(tasks.privileged, "root_task_systemd_request",
+                         side_effect=AssertionError("READ_ONLY cannot establish root authority")) as root,
+            patch.object(tasks, "_dispatch",
+                         side_effect=AssertionError("READ_ONLY cannot dispatch")) as dispatch,
+        ):
+            with tasks._task_readonly_snapshot() as reader:
+                result = tasks._task_reconcile_ready_evidence_snapshot(reader)
+        self.assertEqual(2, len(orphan_units))
+        self.assertEqual("retained_attempt_authority_unverified", result["status"])
+        ssh.assert_not_called()
+        root.assert_not_called()
+        dispatch.assert_not_called()
+
+    def test_v3_legacy_local_task_cannot_certify_possible_remote_first_attempt(self) -> None:
+        # v3 also trusts a current local Fleet mapping and local systemd
+        # inventory; a pre-fix task whose first launch crossed to SSH can
+        # remain live remotely and be invisible to those observations.
+        status, local_probes = self._local_terminal_readiness_status(1)
+        with tasks._task_readonly_snapshot() as reader:
+            proof = json.loads(reader.execute(
+                "SELECT value FROM metadata WHERE key=?",
+                (tasks.TASK_RECONCILE_READY_EVIDENCE_METADATA_KEY,),
+            ).fetchone()[0])
+        self.assertEqual(3, proof["schema_version"])
+        self.assertEqual(1, local_probes.call_count)
+        self.assertEqual("retained_attempt_authority_unverified", status["status"])
+
     def test_reconcile_ready_local_terminal_budget_admits_exactly_32(self) -> None:
         limit = tasks.TASK_RECONCILE_READY_LOCAL_TERMINAL_LIMIT
         self.assertEqual(32, limit)
         status, probe = self._local_terminal_readiness_status(limit)
-        self.assertEqual("verified", status["status"])
+        self.assertEqual("retained_attempt_authority_unverified", status["status"])
         self.assertEqual(limit, probe.call_count)
 
     def test_reconcile_ready_local_terminal_budget_has_own_state_at_33(self) -> None:
@@ -6964,6 +8052,7 @@ class TaskTests(unittest.TestCase):
         # Within the scan budget, archiving exactly the excess always fits.
         self.assertLessEqual(status["archive_excess"], status["archive_headroom"])
 
+    @patch.object(tasks, "_task_reconcile_ready_archived_user_unit_live", new=lambda: False)
     def test_remote_terminal_cohort_has_bounded_count_and_zero_local_probes(self) -> None:
         self._local_terminal_readiness_store(33)
         with (
@@ -6993,6 +8082,7 @@ class TaskTests(unittest.TestCase):
         probe.assert_not_called()
         dispatch.assert_not_called()
 
+    @patch.object(tasks, "_task_reconcile_ready_archived_user_unit_live", new=lambda: False)
     def test_remote_terminal_cohort_reports_exhausted_history_budget(self) -> None:
         self._local_terminal_readiness_store(2)
         with (
@@ -7014,6 +8104,451 @@ class TaskTests(unittest.TestCase):
             status,
         )
         probe.assert_not_called()
+
+    def test_archived_terminal_reactivation_cannot_reuse_fresh_sqlite_proof(self) -> None:
+        with patch.dict(os.environ, {
+            "GRABOWSKI_TASK_ARCHIVE_ROOT": str(self.task_archive_root),
+            "GRABOWSKI_TASK_PROJECTION_ROOT": str(self.task_projection_root),
+        }):
+            # True end-to-end regression: closeout archives the retained row and
+            # a fresh authorized reconciliation republishes a valid SQLite proof;
+            # systemd can then restart the now-unobserved unit without a DB write.
+            started = self._start()["task"]
+            task_id = str(started["task_id"])
+            self._archive_and_project_tasks([task_id])
+            complete = {
+                "mode": "refresh", "task_id": "", "scanned": 0,
+                "refreshed": [], "released": [], "resumed": [], "blocked": [],
+                "batch": {
+                    "cycle_completed": True, "cursor_before": None,
+                    "active_refresh": {"cycle_completed": True, "cursor_before": None},
+                    "terminalization_recovery": {
+                        "cycle_completed": True, "cursor_before": None, "failed": [],
+                    },
+                },
+            }
+            with (
+                patch.object(tasks.operator, "_require_operator_mutation"),
+                patch.object(tasks, "_reconcile_tasks_refresh_locked", return_value=complete),
+                patch.object(tasks.base, "_append_audit"),
+            ):
+                tasks._task_reconcile_refresh_after_guard("")
+            unit = f"grabowski-task-{task_id}-a1.service"
+            with (
+                patch.object(
+                    tasks, "_resolve_task_dispatch_host",
+                    return_value=("local", {"transport": "local"}, False),
+                ),
+                patch.object(
+                    tasks.operator, "_run",
+                    return_value={
+                        "returncode": 0,
+                        "stdout": f"{unit} loaded active running restarted task\\n",
+                        "stderr": "", "timed_out": False, "stdout_truncated": False, "stderr_truncated": False,
+                    },
+                ) as inventory,
+                patch.object(tasks, "_observe", side_effect=AssertionError(
+                    "archived task must not enter the ordinary local 32-unit probe"
+                )),
+            ):
+                with tasks._task_readonly_snapshot() as reader:
+                    status = tasks._task_reconcile_ready_evidence_snapshot(reader)
+            self.assertEqual("archived_task_unit_live_unverified", status["status"], status)
+            inventory.assert_called_once()
+
+    def test_archived_restart_during_current_terminal_probe_is_not_verified(self) -> None:
+        self._local_terminal_readiness_store(1)
+        with tasks._task_readonly_snapshot() as reader:
+            record = dict(reader.execute("SELECT * FROM tasks LIMIT 1").fetchone())
+        before = self.database.read_bytes()
+        observation = {
+            "state": "completed",
+            "properties": {
+                "LoadState": "loaded", "ActiveState": "inactive",
+                "SubState": "dead", "Result": "success",
+                "ExecMainStatus": "0",
+            },
+            "probe": {"returncode": 0, "timed_out": False,
+                        "stdout_truncated": False, "stderr_truncated": False},
+            "observer": {
+                "kind": "bound-local-user-systemd-show-v1",
+                "transport": "local",
+            },
+            "observed_at_unix": tasks._now(),
+        }
+        live = False
+        inventory_samples: list[bool] = []
+
+        def inventory() -> bool:
+            inventory_samples.append(live)
+            return live
+
+        def observe(current: dict, *, bound_local_user: bool) -> dict:
+            nonlocal live
+            self.assertTrue(bound_local_user)
+            self.assertEqual(record["task_id"], current["task_id"])
+            live = True  # external systemd restart, no TaskStore write
+            return observation
+
+        with (
+            patch.object(
+                tasks, "_task_reconcile_ready_local_terminal_rows",
+                return_value=(
+                    [record], 0,
+                    tasks.TASK_RECONCILE_READY_PRIVILEGED_HISTORY_LIMIT - 1, 0,
+                ),
+            ),
+            patch.object(tasks, "_task_reconcile_ready_archived_user_unit_live",
+                         side_effect=inventory) as scan,
+            patch.object(tasks, "_observe", side_effect=observe) as probe,
+        ):
+            with tasks._task_readonly_snapshot() as reader:
+                status = tasks._task_reconcile_ready_evidence_snapshot(reader)
+        self.assertEqual("archived_task_unit_live_unverified", status["status"], status)
+        self.assertEqual([False, True], inventory_samples)
+        self.assertEqual(2, scan.call_count)
+        probe.assert_called_once()
+        self.assertEqual(before, self.database.read_bytes())
+
+    def test_archived_post_terminal_inventory_failure_fails_closed(self) -> None:
+        self._local_terminal_readiness_store(1)
+        before = self.database.read_bytes()
+        with (
+            patch.object(
+                tasks, "_task_reconcile_ready_local_terminal_rows",
+                return_value=(
+                    [], 0,
+                    tasks.TASK_RECONCILE_READY_PRIVILEGED_HISTORY_LIMIT - 1, 0,
+                ),
+            ),
+            patch.object(
+                tasks, "_task_reconcile_ready_archived_user_unit_live",
+                side_effect=[False, RuntimeError("late inventory unavailable")],
+            ) as scan,
+        ):
+            with tasks._task_readonly_snapshot() as reader:
+                status = tasks._task_reconcile_ready_evidence_snapshot(reader)
+        self.assertEqual("archived_task_unit_observation_unavailable", status["status"])
+        self.assertEqual(2, scan.call_count)
+        self.assertEqual(before, self.database.read_bytes())
+
+    def test_archived_inventory_race_rechecks_both_sqlite_revisions(self) -> None:
+        self._local_terminal_readiness_store(1)
+        original_task = tasks._task_reconcile_revision_contract
+        original_resource = tasks.resources._resource_reconcile_revision_contract
+        before = self.database.read_bytes()
+        for store in ("task", "resource"):
+            phase = {"calls": 0, "changed": False}
+
+            def observe_inventory() -> bool:
+                phase["calls"] += 1
+                phase["changed"] = phase["calls"] == 2
+                return False
+
+            def revision_after_check(value):
+                revision = value["revision"]
+                return {**value, "revision": "a" * 64 if revision != "a" * 64 else "b" * 64}
+
+            def task_revision(conn, **kwargs):
+                value = original_task(conn, **kwargs)
+                return revision_after_check(value) if store == "task" and phase["changed"] else value
+
+            def resource_revision(conn, **kwargs):
+                value = original_resource(conn, **kwargs)
+                return revision_after_check(value) if store == "resource" and phase["changed"] else value
+
+            with (
+                self.subTest(store=store),
+                patch.object(
+                    tasks, "_task_reconcile_ready_local_terminal_rows",
+                    return_value=([], 0, tasks.TASK_RECONCILE_READY_PRIVILEGED_HISTORY_LIMIT - 1, 0),
+                ),
+                patch.object(
+                    tasks, "_task_reconcile_ready_archived_user_unit_live",
+                    side_effect=observe_inventory,
+                ),
+                patch.object(
+                    tasks, "_task_reconcile_revision_contract",
+                    side_effect=task_revision,
+                ),
+                patch.object(
+                    tasks.resources, "_resource_reconcile_revision_contract",
+                    side_effect=resource_revision,
+                ),
+            ):
+                with tasks._task_readonly_snapshot() as reader:
+                    result = tasks._task_reconcile_ready_evidence_snapshot(reader)
+            self.assertEqual("stale", result["status"], result)
+            self.assertEqual(2, phase["calls"])
+        self.assertEqual(before, self.database.read_bytes())
+
+    def test_archived_inventory_checks_live_units_even_without_archive_bindings(self) -> None:
+        # A left-over task unit may survive a reset/drained archive index.
+        # No SQLite revision or archive binding proves external quiescence.
+        self._local_terminal_readiness_store(1)
+        before = self.database.read_bytes()
+        with (
+            patch.object(
+                tasks, "_task_reconcile_ready_local_terminal_rows",
+                return_value=([], 0, tasks.TASK_RECONCILE_READY_PRIVILEGED_HISTORY_LIMIT, 0),
+            ),
+            patch.object(
+                tasks, "_task_reconcile_ready_archived_user_unit_live",
+                return_value=True,
+            ) as inventory,
+        ):
+            with tasks._task_readonly_snapshot() as reader:
+                result = tasks._task_reconcile_ready_evidence_snapshot(reader)
+        self.assertEqual("archived_task_unit_live_unverified", result["status"])
+        inventory.assert_called_once()
+        self.assertEqual(before, self.database.read_bytes())
+
+    def test_readiness_rechecks_revision_after_very_last_unit_inventory(self) -> None:
+        # A new launching row may commit after the prior revision reread but
+        # before its transient systemd unit appears in the third inventory.
+        self._local_terminal_readiness_store(1)
+        original_task = tasks._task_reconcile_revision_contract
+        original_resource = tasks.resources._resource_reconcile_revision_contract
+        for store in ("task", "resource"):
+            phase = {"probes": 0}
+
+            def inventory() -> bool:
+                phase["probes"] += 1
+                return False
+
+            def change_after_last_inventory(contract):
+                if phase["probes"] < 3:
+                    return contract
+                revision = str(contract["revision"])
+                return {
+                    **contract,
+                    "revision": ("a" * 64 if revision != "a" * 64 else "b" * 64),
+                }
+
+            def task_revision(conn, **kwargs):
+                value = original_task(conn, **kwargs)
+                return change_after_last_inventory(value) if store == "task" else value
+
+            def resource_revision(conn, **kwargs):
+                value = original_resource(conn, **kwargs)
+                return change_after_last_inventory(value) if store == "resource" else value
+
+            with (
+                self.subTest(store=store),
+                patch.object(
+                    tasks, "_task_reconcile_ready_local_terminal_rows",
+                    return_value=([], 0, tasks.TASK_RECONCILE_READY_PRIVILEGED_HISTORY_LIMIT - 1, 0),
+                ),
+                patch.object(
+                    tasks, "_task_reconcile_ready_archived_user_unit_live",
+                    side_effect=inventory,
+                ),
+                patch.object(tasks, "_task_reconcile_revision_contract",
+                             side_effect=task_revision),
+                patch.object(tasks.resources, "_resource_reconcile_revision_contract",
+                             side_effect=resource_revision),
+                tasks._task_readonly_snapshot() as reader,
+            ):
+                result = tasks._task_reconcile_ready_evidence_snapshot(reader)
+            self.assertEqual("stale", result["status"], (store, result))
+            self.assertEqual(3, phase["probes"])
+
+    def test_archived_unit_restarted_during_final_database_rereads_is_not_ready(self) -> None:
+        # The third bounded systemd snapshot detects an external restart
+        # after the preceding SQLite task/resource revision reads.
+        self._local_terminal_readiness_store(1)
+        before = self.database.read_bytes()
+        seen = []
+
+        def inventory() -> bool:
+            seen.append(len(seen) + 1)
+            return len(seen) == 3
+
+        with (
+            patch.object(
+                tasks, "_task_reconcile_ready_local_terminal_rows",
+                return_value=(
+                    [], 0, tasks.TASK_RECONCILE_READY_PRIVILEGED_HISTORY_LIMIT - 1, 0,
+                ),
+            ),
+            patch.object(
+                tasks, "_task_reconcile_ready_archived_user_unit_live",
+                side_effect=inventory,
+            ) as scans,
+        ):
+            with tasks._task_readonly_snapshot() as reader:
+                result = tasks._task_reconcile_ready_evidence_snapshot(reader)
+        self.assertEqual("archived_task_unit_live_unverified", result["status"])
+        self.assertEqual([1, 2, 3], seen)
+        self.assertEqual(3, scans.call_count)
+        self.assertEqual(before, self.database.read_bytes())
+
+    def test_archived_unit_restarted_without_db_write_never_reports_ready(self) -> None:
+        # A closeout projection excludes the retained row. Systemd still owns
+        # the loaded unit, which a separate supported service operation can
+        # start without updating the TaskStore.
+        self._local_terminal_readiness_store(1)
+        unit = f"grabowski-task-{'a' * 24}-a1.service"
+        with (
+            patch.object(
+                tasks, "_task_reconcile_ready_local_terminal_rows",
+                return_value=(
+                    [], 0,
+                    tasks.TASK_RECONCILE_READY_PRIVILEGED_HISTORY_LIMIT - 1,
+                    0,
+                ),
+            ),
+            patch.object(
+                tasks.operator, "_run",
+                return_value={
+                    "returncode": 0,
+                    "stdout": f"{unit} loaded active running restarted archived unit\\n",
+                    "stderr": "", "timed_out": False, "stdout_truncated": False, "stderr_truncated": False,
+                },
+            ) as probe,
+            patch.object(tasks, "_observe",
+                         side_effect=AssertionError("archived unit is not a current row")),
+        ):
+            with tasks._task_readonly_snapshot() as reader:
+                status = tasks._task_reconcile_ready_evidence_snapshot(reader)
+        self.assertEqual("archived_task_unit_live_unverified", status["status"])
+        probe.assert_called_once()
+
+    def test_archived_unit_inventory_absent_or_malformed_fails_closed(self) -> None:
+        self._local_terminal_readiness_store(1)
+        with (
+            patch.object(
+                tasks, "_task_reconcile_ready_local_terminal_rows",
+                return_value=([], 0, tasks.TASK_RECONCILE_READY_PRIVILEGED_HISTORY_LIMIT - 1, 0),
+            ),
+            patch.object(
+                tasks.operator, "_run",
+                return_value={"returncode": 0, "stdout": "garbage", "timed_out": False, "stdout_truncated": False, "stderr_truncated": False},
+            ),
+        ):
+            with tasks._task_readonly_snapshot() as reader:
+                status = tasks._task_reconcile_ready_evidence_snapshot(reader)
+        self.assertEqual("archived_task_unit_observation_unavailable", status["status"])
+
+    def test_archived_remote_or_privileged_unit_fails_closed_without_side_effect(self) -> None:
+        self._local_terminal_readiness_store(1)
+        with (
+            patch.object(
+                tasks, "_task_reconcile_ready_local_terminal_rows",
+                return_value=([], 0, tasks.TASK_RECONCILE_READY_PRIVILEGED_HISTORY_LIMIT - 1, 1),
+            ),
+            patch.object(
+                tasks.operator, "_run",
+                side_effect=AssertionError("no local inventory can certify remote or root unit"),
+            ) as probe,
+        ):
+            with tasks._task_readonly_snapshot() as reader:
+                status = tasks._task_reconcile_ready_evidence_snapshot(reader)
+        self.assertEqual("archived_terminal_transport_unverified", status["status"])
+        probe.assert_not_called()
+
+    def test_archived_user_unit_inventory_classifies_real_systemd_states(self) -> None:
+        unit = "grabowski-task-" + "c" * 24 + "-a1.service"
+        for load, active, sub, live in (
+            ("loaded", "active", "running", True),
+            ("loaded", "inactive", "dead", False),
+            ("loaded", "failed", "failed", False),
+            ("bad-setting", "failed", "failed", False),
+        ):
+            with self.subTest(load=load, active=active, sub=sub):
+                with patch.object(
+                    tasks.operator, "_run",
+                    return_value={
+                        "returncode": 0,
+                        "stdout": f"{unit} {load} {active} {sub} historical task\\n",
+                        "stderr": "", "timed_out": False,
+                        "stdout_truncated": False, "stderr_truncated": False,
+                    },
+                ) as run:
+                    self.assertEqual(
+                        live, tasks._task_reconcile_ready_archived_user_unit_live()
+                    )
+                self.assertEqual("systemctl", run.call_args.args[0][0])
+                self.assertIn("--all", run.call_args.args[0])
+                # systemctl may ellipsize long unit names at narrow COLUMNS
+                # unless --full is explicitly requested; the parser requires
+                # every unit name to remain complete for fail-closed liveness.
+                self.assertIn("--full", run.call_args.args[0])
+                self.assertEqual(30, run.call_args.kwargs["timeout_seconds"])
+
+    def test_archived_unit_inventory_rejects_truncation_and_unknown_units(self) -> None:
+        for stdout, truncated in (
+            ("", True),
+            ("not-grabowski-task.service loaded inactive dead other\\n", False),
+            ("grabowski-task-" + "d" * 24 + "-a1.service loaded unknown running\\n", False),
+        ):
+            with self.subTest(stdout=stdout, truncated=truncated):
+                with patch.object(tasks.operator, "_run", return_value={
+                    "returncode": 0, "stdout": stdout,
+                    "stdout_truncated": truncated, "stderr_truncated": False, "timed_out": False,
+                }):
+                    with self.assertRaises(RuntimeError):
+                        tasks._task_reconcile_ready_archived_user_unit_live()
+
+    def test_archive_inventory_covers_declared_history_budget_without_unbounded_lines(self) -> None:
+        cohort = (
+            tasks.TASK_RECONCILE_READY_PRIVILEGED_HISTORY_LIMIT
+            + tasks.TASK_RECONCILE_READY_LOCAL_TERMINAL_LIMIT
+        )
+        stdout = "".join(
+            f"grabowski-task-{index:024x}-a1.service loaded inactive dead archived unit\\n"
+            for index in range(cohort)
+        )
+        stdout = stdout.replace("\\n", "\n")
+        self.assertGreater(len(stdout.encode("utf-8")), 256 * 1024)
+        success = {
+            "returncode": 0, "stdout": stdout, "stderr": "",
+            "timed_out": False, "stdout_truncated": False,
+            "stderr_truncated": False,
+        }
+        with patch.object(tasks.operator, "_run", return_value=success) as run:
+            self.assertFalse(tasks._task_reconcile_ready_archived_user_unit_live())
+        self.assertGreaterEqual(
+            run.call_args.kwargs["max_output_bytes"], len(stdout.encode("utf-8"))
+        )
+        oversized_line = (
+            f"grabowski-task-{'f'*24}-a1.service loaded inactive dead "
+            + "x" * 1200 + "\n"
+        )
+        with patch.object(tasks.operator, "_run", return_value={
+            **success, "stdout": oversized_line,
+        }):
+            with self.assertRaises(RuntimeError):
+                tasks._task_reconcile_ready_archived_user_unit_live()
+
+    def test_archived_inactive_loaded_units_do_not_prove_retained_authority(self) -> None:
+        self._local_terminal_readiness_store(1)
+        unit = f"grabowski-task-{'b' * 24}-a1.service"
+        with (
+            patch.object(
+                tasks, "_task_reconcile_ready_local_terminal_rows",
+                return_value=([], 0, tasks.TASK_RECONCILE_READY_PRIVILEGED_HISTORY_LIMIT - 1, 0),
+            ),
+            patch.object(
+                tasks.operator, "_run",
+                return_value={
+                    "returncode": 0,
+                    "stdout": f"{unit} loaded inactive dead archived unit\\n",
+                    "stderr": "", "timed_out": False, "stdout_truncated": False, "stderr_truncated": False,
+                },
+            ) as probe,
+        ):
+            with tasks._task_readonly_snapshot() as reader:
+                status = tasks._task_reconcile_ready_evidence_snapshot(reader)
+        # Three quiescent local user-systemd inventories do not establish
+        # historical launch provenance or root/SSH restart exclusion.
+        self.assertEqual("retained_attempt_authority_unverified", status["status"])
+        self.assertNotEqual("verified", status["status"])
+        # The same bounded inventory is observed before terminal probes,
+        # after those probes, and after the final SQLite revision rereads.
+        self.assertEqual(3, probe.call_count)
+        self.assertEqual(probe.call_args_list[0], probe.call_args_list[1])
+        self.assertEqual(probe.call_args_list[1], probe.call_args_list[2])
 
     def test_reconcile_ready_publication_applies_task_scope_before_rootbroker(self) -> None:
         record = {
@@ -7129,7 +8664,8 @@ class TaskTests(unittest.TestCase):
                 "SubState": "dead", "Result": "success",
                 "ExecMainStatus": "0",
             },
-            "probe": {"returncode": 0, "timed_out": False},
+            "probe": {"returncode": 0, "timed_out": False,
+                        "stdout_truncated": False, "stderr_truncated": False},
             "observer": {
                 "kind": "bound-local-user-systemd-show-v1", "transport": "local",
             },
@@ -7148,7 +8684,7 @@ class TaskTests(unittest.TestCase):
         ):
             with tasks._task_readonly_snapshot() as reader:
                 self.assertEqual(
-                    "verified", tasks._task_reconcile_ready_evidence_snapshot(reader)["status"]
+                    "retained_attempt_authority_unverified", tasks._task_reconcile_ready_evidence_snapshot(reader)["status"]
                 )
             with patch.object(
                 tasks, "_observe",
@@ -7168,6 +8704,33 @@ class TaskTests(unittest.TestCase):
         probe.assert_called_once()
         write.assert_not_called()
 
+    def test_local_terminal_requires_complete_probe_flags(self) -> None:
+        task = {**self._start()["task"], "state": "completed"}
+        observation = {
+            "state": "completed",
+            "properties": {
+                "LoadState": "loaded", "ActiveState": "inactive",
+                "SubState": "dead", "Result": "success",
+            },
+            "probe": {
+                "returncode": 0, "timed_out": False,
+                "stdout_truncated": False, "stderr_truncated": False,
+            },
+            "observer": {
+                "kind": "bound-local-user-systemd-show-v1",
+                "transport": "local",
+            },
+            "observed_at_unix": tasks._now(),
+        }
+        self.assertTrue(tasks._task_reconcile_ready_local_terminal_observed(task, observation))
+        for field in ("timed_out", "stdout_truncated", "stderr_truncated"):
+            with self.subTest(missing_field=field):
+                partial = dict(observation["probe"])
+                del partial[field]
+                self.assertFalse(tasks._task_reconcile_ready_local_terminal_observed(
+                    task, {**observation, "probe": partial},
+                ))
+
     def test_rootbroker_cancelled_terminal_needs_coherent_positive_unit(self) -> None:
         record = {
             **self._start()["task"],
@@ -7184,11 +8747,41 @@ class TaskTests(unittest.TestCase):
                 "ExecMainCode": "1", "ExecMainStatus": "0",
                 "Id": unit, "Names": unit, "InvocationID": "a" * 32,
             },
-            "probe": {"returncode": 0, "outcome_unknown": False},
+            "probe": {
+                "returncode": 0, "outcome_unknown": False,
+                "timed_out": False, "stdout_truncated": False,
+                "stderr_truncated": False, "root_truth_observable": True,
+            },
             "observer": {"kind": "root-systemd-broker-show-v1"},
             "observed_at_unix": tasks._now(),
         }
         self.assertTrue(tasks._task_reconcile_ready_rootbroker_terminal_observed(record, observed))
+        # Success-looking systemctl properties from an incomplete broker
+        # response must not certify privileged process quiescence.
+        for invalid_field in ("timed_out", "stdout_truncated", "stderr_truncated"):
+            with self.subTest(invalid_probe=invalid_field):
+                self.assertFalse(tasks._task_reconcile_ready_rootbroker_terminal_observed(
+                    record, {**observed, "probe": {
+                        **observed["probe"], invalid_field: True,
+                    }},
+                ))
+        self.assertFalse(tasks._task_reconcile_ready_rootbroker_terminal_observed(
+            record, {**observed, "probe": {
+                **observed["probe"], "root_truth_observable": False,
+            }},
+        ))
+        # Missing, not just explicitly failed, broker status fields are
+        # insufficient authority for a positive readonly readiness proof.
+        for missing_field in (
+            "timed_out", "stdout_truncated", "stderr_truncated",
+            "root_truth_observable",
+        ):
+            with self.subTest(missing_probe=missing_field):
+                incomplete_probe = dict(observed["probe"])
+                del incomplete_probe[missing_field]
+                self.assertFalse(tasks._task_reconcile_ready_rootbroker_terminal_observed(
+                    record, {**observed, "probe": incomplete_probe},
+                ))
         self.assertFalse(tasks._task_reconcile_ready_rootbroker_terminal_observed(
             record, {**observed, "properties": {
                 **observed["properties"], "ActiveState": "active",
@@ -7234,7 +8827,8 @@ class TaskTests(unittest.TestCase):
         live = {
             "state": "running",
             "properties": {"LoadState": "loaded", "ActiveState": "active"},
-            "probe": {"returncode": 0, "timed_out": False},
+            "probe": {"returncode": 0, "timed_out": False,
+                        "stdout_truncated": False, "stderr_truncated": False},
             "observer": {
                 "kind": "bound-local-user-systemd-show-v1",
                 "transport": "local",
@@ -7351,7 +8945,11 @@ class TaskTests(unittest.TestCase):
             with self.subTest(label=label):
                 observation = {
                     "state": "completed", "properties": props,
-                    "probe": {"returncode": 0, "outcome_unknown": False},
+                    "probe": {
+                        "returncode": 0, "outcome_unknown": False,
+                        "timed_out": False, "stdout_truncated": False,
+                        "stderr_truncated": False, "root_truth_observable": True,
+                    },
                     "observer": {"kind": "root-systemd-broker-show-v1"},
                     "observed_at_unix": tasks._now(),
                 }
@@ -7395,7 +8993,11 @@ class TaskTests(unittest.TestCase):
                 "LoadState": "loaded", "ActiveState": "inactive", "SubState": "dead",
                 "Result": "success", "ExecMainStatus": "0",
             },
-            "probe": {"returncode": 0, "outcome_unknown": False},
+            "probe": {
+                "returncode": 0, "outcome_unknown": False,
+                "timed_out": False, "stdout_truncated": False,
+                "stderr_truncated": False, "root_truth_observable": True,
+            },
             "observer": {"kind": "root-systemd-broker-show-v1"},
             "observed_at_unix": tasks._now(),
         }
@@ -7538,9 +9140,9 @@ class TaskTests(unittest.TestCase):
                 tasks._task_reconcile_ready_evidence_snapshot(connection)["status"],
             )
 
-        # Positive control: the completed cycle only becomes VERIFIED after
-        # one fresh, bound local user-systemd quiescence observation. Merely
-        # changing the SQLite row cannot certify an externally restarted unit.
+        # A complete cycle still observes local user-systemd quiescence, but
+        # without first-attempt host provenance that observation must not
+        # certify legacy task history as globally ready.
         with closing(sqlite3.connect(self.database)) as connection, connection:
             connection.execute(
                 "UPDATE tasks SET state='completed' WHERE task_id=?",
@@ -7558,7 +9160,8 @@ class TaskTests(unittest.TestCase):
                 "LoadState": "loaded", "ActiveState": "inactive",
                 "SubState": "dead", "Result": "success",
             },
-            "probe": {"returncode": 0, "timed_out": False},
+            "probe": {"returncode": 0, "timed_out": False,
+                        "stdout_truncated": False, "stderr_truncated": False},
             "observer": {
                 "kind": "bound-local-user-systemd-show-v1",
                 "transport": "local",
@@ -7574,7 +9177,7 @@ class TaskTests(unittest.TestCase):
         ):
             with tasks._task_readonly_snapshot() as connection:
                 self.assertEqual(
-                    "verified",
+                    "retained_attempt_authority_unverified",
                     tasks._task_reconcile_ready_evidence_snapshot(connection)["status"],
                 )
         probe.assert_called_once()
@@ -11004,6 +12607,410 @@ class TaskTests(unittest.TestCase):
                 self.assertEqual("unpersisted_readonly_probe", public["observation_mode"])
                 self.assertEqual(before, self.database.read_bytes())
 
+    def test_task_peek_active_launching_to_running_is_not_uncertain(self) -> None:
+        task = self._start()["task"]
+        with tasks._database_connection() as connection:
+            connection.execute(
+                "UPDATE tasks SET state='launching' WHERE task_id=?", (task["task_id"],),
+            )
+        before = self.database.read_bytes()
+        with (
+            patch.object(
+                tasks, "_resolve_task_dispatch_host",
+                return_value=("local", {"transport": "local"}, False),
+            ),
+            patch.object(
+                tasks, "_observe",
+                return_value={
+                    "state": "running",
+                    "properties": {
+                        "LoadState": "loaded", "ActiveState": "active",
+                        "SubState": "running",
+                    },
+                    "probe": {
+                        "returncode": 0, "timed_out": False,
+                        "stdout_truncated": False, "stderr_truncated": False,
+                    },
+                    "observer": {
+                        "kind": "bound-local-user-systemd-show-v1",
+                        "transport": "local",
+                    },
+                    "observed_at_unix": tasks._now(),
+                },
+            ),
+            patch.object(tasks, "_set_state",
+                         side_effect=AssertionError("peek must not write")),
+        ):
+            peek = tasks.grabowski_task_peek(task["task_id"])
+        self.assertEqual("running", peek["state"])
+        self.assertEqual("launching", peek["persisted_state"])
+        self.assertFalse(peek["reconcile_required"])
+        self.assertEqual(before, self.database.read_bytes())
+
+    def test_task_peek_launching_running_requires_complete_local_probe(self) -> None:
+        task = self._start()["task"]
+        with tasks._database_connection() as connection:
+            connection.execute(
+                "UPDATE tasks SET state='launching' WHERE task_id=?", (task["task_id"],),
+            )
+        before = self.database.read_bytes()
+        good = {
+            "state": "running",
+            "properties": {
+                "LoadState": "loaded", "ActiveState": "active",
+                "SubState": "running",
+            },
+            "probe": {
+                "returncode": 0, "timed_out": False,
+                "stdout_truncated": False, "stderr_truncated": False,
+            },
+            "observer": {
+                "kind": "bound-local-user-systemd-show-v1", "transport": "local",
+            },
+            "observed_at_unix": tasks._now(),
+        }
+        failures = (
+            ("returncode", {**good, "probe": {**good["probe"], "returncode": 1}}),
+            ("timed_out", {**good, "probe": {**good["probe"], "timed_out": True}}),
+            ("stdout_truncated", {**good, "probe": {**good["probe"], "stdout_truncated": True}}),
+            ("stderr_truncated", {**good, "probe": {**good["probe"], "stderr_truncated": True}}),
+            ("unknown", {**good, "probe": {**good["probe"], "outcome_unknown": True}}),
+            ("missing_probe", {**good, "probe": {}}),
+            ("wrong_observer", {**good, "observer": {"kind": "fleet-dispatch-v1"}}),
+            ("stale", {**good, "observed_at_unix": tasks._now() - 120}),
+            ("missing_load", {**good, "properties": {"ActiveState": "active"}}),
+        )
+        for label, observation in failures:
+            with (
+                self.subTest(unsafe=label),
+                patch.object(tasks, "_resolve_task_dispatch_host",
+                             return_value=("local", {"transport": "local"}, False)),
+                patch.object(tasks, "_observe", return_value=observation),
+                patch.object(tasks, "_set_state",
+                             side_effect=AssertionError("READ_ONLY peek cannot persist")),
+            ):
+                peek = tasks.grabowski_task_peek(task["task_id"])
+            self.assertTrue(peek["reconcile_required"], label)
+            self.assertEqual("observation_error", peek["state"], label)
+            self.assertEqual("launching", peek["persisted_state"], label)
+        self.assertEqual(before, self.database.read_bytes())
+
+    def test_task_peek_terminal_gc_unit_uses_complete_absence_not_synthetic_result(self) -> None:
+        # When transient systemd forgets a terminal failed/timed-out unit,
+        # the last persisted receipt retains the actual historical outcome.
+        task = self._start()["task"]
+        for terminal in ("completed", "failed", "signalled", "timed_out", "cancelled"):
+            with tasks._database_connection() as connection:
+                connection.execute(
+                    "UPDATE tasks SET state=? WHERE task_id=?",
+                    (terminal, task["task_id"]),
+                )
+            before = self.database.read_bytes()
+            complete = {
+                "state": "completed",
+                "properties": {
+                    "LoadState": "not-found", "ActiveState": "inactive",
+                    "SubState": "dead", "Result": "success",
+                },
+                "probe": {
+                    "returncode": 0, "timed_out": False,
+                    "stdout_truncated": False, "stderr_truncated": False,
+                },
+                "observer": {
+                    "kind": "bound-local-user-systemd-show-v1",
+                    "transport": "local",
+                },
+                "observed_at_unix": tasks._now(),
+            }
+            with (
+                self.subTest(terminal=terminal),
+                patch.object(
+                    tasks, "_resolve_task_dispatch_host",
+                    return_value=("local", {"transport": "local"}, False),
+                ),
+                patch.object(tasks, "_observe", return_value=complete),
+                patch.object(tasks, "_set_state",
+                             side_effect=AssertionError("READ_ONLY may not write")),
+            ):
+                result = tasks.grabowski_task_peek(task["task_id"])
+            self.assertEqual(terminal, result["state"], terminal)
+            self.assertFalse(result["reconcile_required"], terminal)
+            self.assertEqual(before, self.database.read_bytes())
+            for bad_field in ("returncode", "timed_out", "stdout_truncated",
+                              "stderr_truncated", "observer"):
+                broken = dict(complete)
+                if bad_field == "observer":
+                    broken["observer"] = {"kind": "fleet-dispatch-v1"}
+                else:
+                    probe = dict(complete["probe"])
+                    probe[bad_field] = (1 if bad_field == "returncode" else True)
+                    broken["probe"] = probe
+                with (
+                    self.subTest(terminal=terminal, incomplete=bad_field),
+                    patch.object(
+                        tasks, "_resolve_task_dispatch_host",
+                        return_value=("local", {"transport": "local"}, False),
+                    ),
+                    patch.object(tasks, "_observe", return_value=broken),
+                ):
+                    invalid = tasks.grabowski_task_peek(task["task_id"])
+                self.assertEqual("observation_error", invalid["state"])
+                self.assertTrue(invalid["reconcile_required"])
+                self.assertEqual(before, self.database.read_bytes())
+
+    def test_task_peek_loaded_success_cannot_certify_failed_terminal(self) -> None:
+        # A GC'd not-found unit and a still-loaded successful unit are not
+        # interchangeable. The former permits the stored historical outcome;
+        # the latter contradicts persisted failure and needs reconciliation.
+        task = self._start()["task"]
+        with tasks._database_connection() as writer:
+            writer.execute(
+                "UPDATE tasks SET state='failed' WHERE task_id=?",
+                (task["task_id"],),
+            )
+        before = self.database.read_bytes()
+        complete = {
+            "state": "completed",
+            "properties": {
+                "LoadState": "loaded", "ActiveState": "inactive",
+                "SubState": "dead", "Result": "success",
+            },
+            "probe": {
+                "returncode": 0, "timed_out": False,
+                "stdout_truncated": False, "stderr_truncated": False,
+            },
+            "observer": {
+                "kind": "bound-local-user-systemd-show-v1",
+                "transport": "local",
+            },
+            "observed_at_unix": tasks._now(),
+        }
+        with (
+            patch.object(tasks, "_resolve_task_dispatch_host",
+                         return_value=("local", {"transport": "local"}, False)),
+            patch.object(tasks, "_observe", return_value=complete),
+            patch.object(tasks, "_set_state",
+                         side_effect=AssertionError("READ_ONLY must not write")),
+        ):
+            peek = tasks.grabowski_task_peek(task["task_id"])
+        self.assertEqual("failed", peek["persisted_state"])
+        self.assertEqual("observation_error", peek["state"])
+        self.assertTrue(peek["reconcile_required"])
+        self.assertEqual(before, self.database.read_bytes())
+
+    def test_task_peek_terminal_outcome_conflict_is_not_masked(self) -> None:
+        task = self._start()["task"]
+        with tasks._database_connection() as connection:
+            connection.execute(
+                "UPDATE tasks SET state='completed' WHERE task_id=?", (task["task_id"],),
+            )
+        before = self.database.read_bytes()
+        with (
+            patch.object(
+                tasks, "_resolve_task_dispatch_host",
+                return_value=("local", {"transport": "local"}, False),
+            ),
+            patch.object(
+                tasks, "_observe",
+                return_value={
+                    "state": "failed",
+                    "properties": {"LoadState": "loaded", "ActiveState": "failed"},
+                    "observed_at_unix": tasks._now(),
+                },
+            ),
+            patch.object(tasks, "_set_state",
+                         side_effect=AssertionError("peek must not write")),
+        ):
+            peek = tasks.grabowski_task_peek(task["task_id"])
+        self.assertEqual("observation_error", peek["state"])
+        self.assertTrue(peek["reconcile_required"])
+        self.assertEqual("completed", peek["persisted_state"])
+        self.assertEqual(before, self.database.read_bytes())
+
+    def test_task_peek_cancelled_allows_local_systemd_terminal_outcome(self) -> None:
+        # Cancellation is a stored policy state, not a systemd result.
+        # Quiescent terminal outcomes are compatible; live/unknown ones are not.
+        task = self._start()["task"]
+        with tasks._database_connection() as connection:
+            connection.execute(
+                "UPDATE tasks SET state='cancelled' WHERE task_id=?",
+                (task["task_id"],),
+            )
+        before = self.database.read_bytes()
+        for observed_state, systemd_result in (
+            ("completed", "success"),
+            ("failed", "exit-code"),
+            ("failed", "oom-kill"),
+            ("failed", "start-limit-hit"),
+            ("signalled", "signal"),
+            ("timed_out", "timeout"),
+        ):
+            with (
+                self.subTest(terminal=observed_state, result=systemd_result),
+                patch.object(
+                    tasks, "_resolve_task_dispatch_host",
+                    return_value=("local", {"transport": "local"}, False),
+                ),
+                patch.object(tasks, "_observe", return_value={
+                    "state": observed_state,
+                    "properties": {
+                        "LoadState": "loaded", "ActiveState": "inactive",
+                        "SubState": "dead", "Result": systemd_result,
+                    },
+                    "observed_at_unix": tasks._now(),
+                    "probe": {"returncode": 0, "timed_out": False,
+                        "stdout_truncated": False, "stderr_truncated": False},
+                    "observer": {
+                        "kind": "bound-local-user-systemd-show-v1",
+                        "transport": "local",
+                    },
+                }),
+                patch.object(tasks, "_set_state",
+                             side_effect=AssertionError("peek must not write")),
+            ):
+                peek = tasks.grabowski_task_peek(task["task_id"])
+            self.assertEqual("cancelled", peek["state"])
+            self.assertEqual("cancelled", peek["persisted_state"])
+            self.assertFalse(peek["reconcile_required"])
+        for observed_state, expected_state in (
+            ("running", "running"),
+            ("outcome_unknown", "observation_error"),
+            ("observation_error", "observation_error"),
+        ):
+            with (
+                self.subTest(unsafe=observed_state),
+                patch.object(
+                    tasks, "_resolve_task_dispatch_host",
+                    return_value=("local", {"transport": "local"}, False),
+                ),
+                patch.object(tasks, "_observe", return_value={
+                    "state": observed_state,
+                    "properties": {"LoadState": "not-found"},
+                    "observed_at_unix": tasks._now(),
+                }),
+                patch.object(tasks, "_set_state",
+                             side_effect=AssertionError("peek must not write")),
+            ):
+                peek = tasks.grabowski_task_peek(task["task_id"])
+            self.assertEqual(expected_state, peek["state"])
+            self.assertTrue(peek["reconcile_required"])
+        self.assertEqual(before, self.database.read_bytes())
+
+    def test_cancelled_peek_does_not_certify_deactivating_unit(self) -> None:
+        task = self._start()["task"]
+        with tasks._database_connection() as conn:
+            conn.execute(
+                "UPDATE tasks SET state='cancelled' WHERE task_id=?",
+                (task["task_id"],),
+            )
+        before = self.database.read_bytes()
+        for observed, unit_result in (
+            ("completed", "success"), ("signalled", "signal"),
+            ("timed_out", "timeout"), ("failed", "exit-code"),
+        ):
+            with (
+                self.subTest(observed=observed),
+                patch.object(
+                    tasks, "_resolve_task_dispatch_host",
+                    return_value=("local", {"transport": "local"}, False),
+                ),
+                patch.object(tasks, "_observe", return_value={
+                    "state": observed,
+                    "properties": {
+                        "LoadState": "loaded", "ActiveState": "deactivating",
+                        "SubState": "stop-sigterm", "Result": unit_result,
+                    },
+                    "probe": {"returncode": 0, "timed_out": False,
+                        "stdout_truncated": False, "stderr_truncated": False},
+                    "observer": {
+                        "kind": "bound-local-user-systemd-show-v1",
+                        "transport": "local",
+                    },
+                    "observed_at_unix": tasks._now(),
+                }),
+                patch.object(
+                    tasks, "_set_state",
+                    side_effect=AssertionError("READ_ONLY must not write"),
+                ),
+            ):
+                result = tasks.grabowski_task_peek(task["task_id"])
+            self.assertEqual("observation_error", result["state"])
+            self.assertTrue(result["reconcile_required"])
+            self.assertEqual("cancelled", result["persisted_state"])
+        self.assertEqual(before, self.database.read_bytes())
+
+    def test_cancelled_peek_truncated_systemd_probe_fails_closed(self) -> None:
+        task = self._start()["task"]
+        with tasks._database_connection() as connection:
+            connection.execute(
+                "UPDATE tasks SET state='cancelled' WHERE task_id=?",
+                (task["task_id"],),
+            )
+        before = self.database.read_bytes()
+        for bad_field in ("stdout_truncated", "stderr_truncated"):
+            with (
+                self.subTest(bad_field=bad_field),
+                patch.object(
+                    tasks, "_resolve_task_dispatch_host",
+                    return_value=("local", {"transport": "local"}, False),
+                ),
+                patch.object(tasks, "_observe", return_value={
+                    "state": "failed",
+                    "properties": {
+                        "LoadState": "loaded", "ActiveState": "failed",
+                        "SubState": "failed", "Result": "oom-kill",
+                    },
+                    "probe": {
+                        "returncode": 0, "timed_out": False,
+                        "stdout_truncated": bad_field == "stdout_truncated",
+                        "stderr_truncated": bad_field == "stderr_truncated",
+                    },
+                    "observer": {
+                        "kind": "bound-local-user-systemd-show-v1",
+                        "transport": "local",
+                    },
+                    "observed_at_unix": tasks._now(),
+                }),
+                patch.object(
+                    tasks, "_set_state",
+                    side_effect=AssertionError("READ_ONLY may not write"),
+                ),
+            ):
+                peek = tasks.grabowski_task_peek(task["task_id"])
+            self.assertEqual("observation_error", peek["state"])
+            self.assertTrue(peek["reconcile_required"])
+            self.assertEqual("cancelled", peek["persisted_state"])
+        self.assertEqual(before, self.database.read_bytes())
+
+    def test_task_peek_terminal_unknown_observation_fails_closed(self) -> None:
+        task = self._start()["task"]
+        with tasks._database_connection() as connection:
+            connection.execute(
+                "UPDATE tasks SET state='completed' WHERE task_id=?",
+                (task["task_id"],),
+            )
+        before = self.database.read_bytes()
+        for observed in ("outcome_unknown", "interrupted", "observation_error"):
+            with self.subTest(observed=observed):
+                with (
+                    patch.object(
+                        tasks, "_resolve_task_dispatch_host",
+                        return_value=("local", {"transport": "local"}, False),
+                    ),
+                    patch.object(tasks, "_observe", return_value={
+                        "state": observed,
+                        "properties": {"LoadState": "not-found"},
+                        "observed_at_unix": tasks._now(),
+                    }),
+                    patch.object(tasks, "_set_state",
+                                 side_effect=AssertionError("peek may not write")),
+                ):
+                    result = tasks.grabowski_task_peek(task["task_id"])
+                self.assertEqual("observation_error", result["state"])
+                self.assertTrue(result["reconcile_required"])
+                self.assertEqual("completed", result["persisted_state"])
+        self.assertEqual(before, self.database.read_bytes())
+
     def test_local_task_peek_transport_flip_cannot_dispatch_ssh(self) -> None:
         created = self._start()["task"]
         before = self.database.read_bytes()
@@ -11134,7 +13141,8 @@ class TaskTests(unittest.TestCase):
                 return_value={
                     "state": "running",
                     "properties": {"LoadState": "loaded", "ActiveState": "active"},
-                    "probe": {"returncode": 0, "timed_out": False},
+                    "probe": {"returncode": 0, "timed_out": False,
+                        "stdout_truncated": False, "stderr_truncated": False},
                     "observer": {"kind": "bound-local-user-systemd-show-v1", "transport": "local"},
                 },
             ) as probe,
@@ -16929,6 +18937,209 @@ class TaskTests(unittest.TestCase):
             [tasks.resources.inspect_resource(key) for key in fixture["resource_keys"]],
         )
 
+
+
+class ManagedLocalLaunchTests(unittest.TestCase):
+    """Exercise the real launch dispatch with inert execution and isolated stores."""
+
+    def setUp(self) -> None:
+        TaskTests.setUp(self)
+        # Other task-store tests mock the common dispatch seam. These tests
+        # explicitly exercise the physical managed-local dispatcher instead.
+        adapter = getattr(self, "managed_local_dispatch_patch", None)
+        if adapter is not None:
+            adapter.stop()
+        self.no_fleet = patch.object(
+            tasks.fleet, "load_fleet", side_effect=AssertionError("live Fleet forbidden")
+        )
+        self.no_fleet.start()
+        self.addCleanup(self.no_fleet.stop)
+
+    tearDown = TaskTests.tearDown
+
+    @contextmanager
+    def _inert(self, routes: list, *, run_error: Exception | None = None):
+        remaining = iter(routes[1:] or routes)
+        remote_dispatches = []
+        launch_resolutions = []
+        launching = False
+        original_launch = tasks._launch
+
+        def resolve(host):
+            target = next(remaining, routes[-1]) if launching else routes[0]
+            if launching:
+                launch_resolutions.append(target)
+            if isinstance(target, Exception):
+                raise target
+            return target
+
+        def launch(record):
+            nonlocal launching
+            # Admission/cwd/workspace checks retain the initial route. Flip
+            # only at the real launch boundary, after start persisted its row
+            # or resume revalidated authority and selected the next attempt.
+            launching = True
+            return original_launch(record)
+
+        def remote(host, argv, **kwargs):
+            # Model run_fleet_host's additional authority resolution, without
+            # ever running SSH, systemd, a user command or a privileged broker.
+            target = tasks.fleet.fleet_host(host)
+            if target["transport"] == "ssh":
+                remote_dispatches.append(list(argv))
+            return {"result": _launcher()}
+
+        def run(argv, **kwargs):
+            if argv[0] == "systemd-run" and run_error is not None:
+                raise run_error
+            return _launcher()
+
+        with (
+            patch.object(tasks.fleet, "fleet_host", side_effect=resolve) as authority,
+            patch.object(tasks, "_launch", side_effect=launch),
+            patch.object(tasks.fleet, "run_fleet_host", side_effect=remote) as fleet_run,
+            patch.object(tasks.fleet, "run_fleet_task_capture_stage", return_value={"result": _launcher()}) as remote_stage,
+            patch.object(tasks, "_stage_task_output_capture_script", wraps=tasks._stage_task_output_capture_script) as stage,
+            patch.object(tasks.operator, "_run", side_effect=run) as local_run,
+            patch.object(tasks.operator, "_managed_runtime_environment", return_value={"XDG_RUNTIME_DIR": "/run/user/1000"}),
+            patch.object(tasks.privileged, "root_task_systemd_request", side_effect=AssertionError("root execution forbidden")),
+            patch.object(tasks.base, "_append_audit") as audit,
+            patch.object(tasks, "_require_recovery_gate", return_value={"checked_at_unix": 123}),
+        ):
+            yield types.SimpleNamespace(
+                authority=authority, fleet_run=fleet_run, remote_stage=remote_stage,
+                stage=stage, local_run=local_run, remote_dispatches=remote_dispatches,
+                audit=audit, launch_resolutions=launch_resolutions,
+            )
+
+    def _start(self, *, host: str = "local") -> dict:
+        return tasks.grabowski_task_start(
+            host, ["/bin/echo", "route-bound"], cwd=str(self.root),
+            runtime_seconds=60, resume_policy="verify-then-retry",
+            resource_keys=["component:managed-local-launch-test"],
+        )
+
+    def _assert_rejected(self, result: dict, probes) -> None:
+        task = result["task"]
+        launcher = task["launcher"]
+        self.assertEqual(task["state"], "failed")
+        self.assertTrue(launcher["launch_not_dispatched"])
+        self.assertFalse(launcher["outcome_unknown"])
+        self.assertIn("local", launcher["stderr"])
+        self.assertEqual(probes.remote_dispatches, [])
+        probes.fleet_run.assert_not_called()
+        probes.remote_stage.assert_not_called()
+        self.assertFalse(any(c.args[0][0] == "systemd-run" for c in probes.local_run.call_args_list))
+        row = tasks._row_raw(str(task["task_id"]))
+        self.assertEqual(row["state"], "failed")
+        self.assertEqual(json.loads(row["launcher_json"]), launcher)
+        self.assertIsNone(tasks.resources.inspect_resource("component:managed-local-launch-test"))
+        outcome = tasks.TASK_OUTCOMES_DIR / f"{task['task_id']}.json"
+        self.assertEqual(json.loads(outcome.read_text())["state"], "failed")
+        self.assertEqual(result["audit"]["launcher_returncode"], 1)
+        self.assertFalse(result["audit"]["launcher_outcome_unknown"])
+        self.assertIsNone(result["audit"]["task_launch_transport"])
+        self.assertIn(result["audit"], [c.args[0] for c in probes.audit.call_args_list])
+
+    def test_persisted_local_marker_rejects_ssh_before_staging(self) -> None:
+        with self._inert([LOCAL_HOST, REMOTE_HOST]) as probes:
+            result = self._start()
+            self._assert_rejected(result, probes)
+        probes.stage.assert_not_called()
+        self.assertEqual(result["task"]["launcher"][tasks.TASK_OUTPUT_LAUNCHER_BINDING_KEY], 1)
+
+    def test_local_staging_then_ssh_at_dispatch_is_undispatched(self) -> None:
+        with self._inert([LOCAL_HOST, LOCAL_HOST, REMOTE_HOST]) as probes:
+            result = self._start()
+            self._assert_rejected(result, probes)
+        probes.stage.assert_called_once_with("local", transport="local")
+
+    def test_local_dispatch_never_calls_fleet_runner_that_could_resolve_ssh(self) -> None:
+        with self._inert([LOCAL_HOST, LOCAL_HOST, LOCAL_HOST, REMOTE_HOST]) as probes:
+            result = self._start()
+        probes.fleet_run.assert_not_called()
+        probes.remote_stage.assert_not_called()
+        self.assertEqual(probes.launch_resolutions, [LOCAL_HOST, LOCAL_HOST])
+        self.assertEqual(result["task"]["state"], "running")
+        self.assertEqual(result["task"]["launcher"]["task_launch_transport"], "local")
+        self.assertEqual(result["audit"]["task_launch_transport"], "local")
+        runs = [c for c in probes.local_run.call_args_list if c.args[0][0] == "systemd-run"]
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(runs[0].args[0].count("--user"), 1)
+        self.assertIn("--setenv=XDG_RUNTIME_DIR=/run/user/1000", runs[0].args[0])
+
+    def test_stable_local_executes_exactly_one_user_unit(self) -> None:
+        with self._inert([LOCAL_HOST]) as probes:
+            result = self._start()
+        self.assertEqual(result["task"]["state"], "running")
+        runs = [c.args[0] for c in probes.local_run.call_args_list if c.args[0][0] == "systemd-run"]
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(runs[0][1], "--user")
+        probes.fleet_run.assert_not_called()
+
+    def test_marked_resume_rejects_route_change_after_revalidation(self) -> None:
+        with self._inert([LOCAL_HOST]):
+            started = self._start()
+        task_id = str(started["task"]["task_id"])
+        observation = {
+            "state": "failed", "properties": {"Result": "exit-code"},
+            "probe": _launcher(1), "observer": {"kind": "test"},
+            "observed_at_unix": int(time.time()),
+        }
+        with self._inert([LOCAL_HOST, REMOTE_HOST]) as probes, patch.object(
+            tasks, "_observe", return_value=observation
+        ):
+            resumed = tasks.grabowski_task_resume(task_id)
+            self._assert_rejected(resumed, probes)
+        self.assertEqual(resumed["task"]["attempt"], 2)
+        probes.stage.assert_not_called()
+
+    def test_legacy_unmarked_remote_keeps_remote_route_without_local_privileges(self) -> None:
+        with self._inert([REMOTE_HOST]) as probes:
+            result = self._start(host="remote")
+        self.assertEqual(result["task"]["state"], "running")
+        self.assertNotIn(tasks.TASK_OUTPUT_LAUNCHER_BINDING_KEY, result["task"]["launcher"])
+        self.assertEqual(len(probes.remote_dispatches), 1)
+        probes.remote_stage.assert_called_once()
+        argv = probes.remote_dispatches[0]
+        self.assertFalse(any(item.startswith("--setenv=XDG_RUNTIME_DIR=") for item in argv))
+        self.assertFalse(any(c.args[0][0] == "systemd-run" for c in probes.local_run.call_args_list))
+        self.assertNotIn("task_launch_transport", result["task"]["launcher"])
+
+    def test_rootbroker_never_receives_managed_local_dispatch(self) -> None:
+        with self._inert([LOCAL_HOST]) as probes, patch.object(
+            tasks.privileged, "root_task_systemd_request", return_value=_launcher()
+        ) as broker:
+            result = tasks.grabowski_task_start(
+                "local", ["/usr/local/bin/sleep-heimserver"], cwd=str(self.root), runtime_seconds=300
+            )
+            # Even a legacy/corrupt marker must not give the system backend
+            # user-systemd output or environment privileges.
+            row = tasks._row_raw(str(result["task"]["task_id"]))
+            marked = {**row, "launcher_json": json.dumps({tasks.TASK_OUTPUT_LAUNCHER_BINDING_KEY: 1})}
+            second = tasks._launch(marked)
+        self.assertEqual(result["task"]["execution_backend"], "systemd-root-broker")
+        self.assertNotIn(tasks.TASK_OUTPUT_LAUNCHER_BINDING_KEY, result["task"]["launcher"])
+        self.assertNotIn("task_launch_transport", second)
+        self.assertEqual(broker.call_count, 2)
+        probes.stage.assert_not_called()
+        probes.fleet_run.assert_not_called()
+        self.assertFalse(any(c.args[0][0] == "systemd-run" for c in probes.local_run.call_args_list))
+
+    def test_launch_authority_error_after_persistence_is_terminal(self) -> None:
+        with self._inert([LOCAL_HOST, ValueError("local authority unavailable")]) as probes:
+            result = self._start()
+            self._assert_rejected(result, probes)
+        probes.stage.assert_not_called()
+
+    def test_started_local_runner_error_is_unknown_and_retains_resources(self) -> None:
+        with self._inert([LOCAL_HOST], run_error=OSError("runner outcome unavailable")) as probes:
+            result = self._start()
+        self.assertEqual(result["task"]["state"], "outcome_unknown")
+        self.assertTrue(result["task"]["launcher"]["outcome_unknown"])
+        self.assertFalse(result["task"]["launcher"].get("launch_not_dispatched", False))
+        self.assertIsNotNone(tasks.resources.inspect_resource("component:managed-local-launch-test"))
+        probes.fleet_run.assert_not_called()
 
 
 class RuntimeContractTests(unittest.TestCase):

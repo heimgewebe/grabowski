@@ -6567,12 +6567,12 @@ def _operator_system_overview(
     elif reconciliation_evidence.get("status") == "privileged_live_unverified":
         # READ_ONLY cannot certify a live rootbroker unit from a persisted
         # terminal observation. Repeating reconciliation alone cannot make
-        # the cached proof current. Verified terminal tasks require an
-        # authorized archival closeout before this cohort can be quiescent.
+        # the cached proof current. Archival never excludes restartable units.
         next_action = (
             "inspect current privileged tasks with authorized live observation; "
-            "archive independently verified terminal tasks through the "
-            "authorized task-closeout-archive workflow"
+            "require an authorized task-and-attempt-bound restart-exclusion "
+            "contract before certifying retirement; archival, stop/show and "
+            "reconciliation alone cannot establish that guarantee"
         )
     elif (
         reconciliation_evidence.get("status") == "local_terminal_budget_exceeded"
@@ -6600,23 +6600,50 @@ def _operator_system_overview(
             "archive projection before relying on readiness"
         )
     elif reconciliation_evidence.get("status") == "local_terminal_budget_exceeded":
-        # READ_ONLY observes at most a bounded local terminal cohort; another
-        # reconciliation leaves it unchanged. Archiving exactly the excess fits
-        # the archive history budget; archiving more can exceed it.
+        # An observed excess is a budget, not an archive or retirement
+        # authorization. Historic SSH/root attempts can still restart without
+        # changing the current TaskStore, even if they currently map local.
         excess = reconciliation_evidence.get("archive_excess")
         count = (
             f"exactly {excess} " if type(excess) is int and excess > 0 else "only the excess "
         )
         next_action = (
             "verify current local terminal tasks with authorized live observation; "
-            f"archive {count}independently verified terminal tasks through the "
-            "authorized task-closeout-archive workflow, no more, so the local "
-            "terminal readiness budget fits within the archive history budget"
+            f"the local terminal excess is {count}tasks, no more; "
+            "do not archive unproven attempts to recover readiness until "
+            "independently enforced task-and-attempt-bound restart-exclusion "
+            "is evidenced (#1556); a current terminal observation alone is "
+            "not archive admission or operator_ready"
+        )
+    elif reconciliation_evidence.get("status") == "archived_task_unit_live_unverified":
+        next_action = (
+            "inspect unexpectedly active user-systemd task units through "
+            "authorized live observation; stop only after applicable task "
+            "and service scope gates, then verify complete fresh inventory "
+            "and store revisions before trusting readiness"
+        )
+    elif reconciliation_evidence.get("status") in {
+        "archived_terminal_transport_unverified",
+        "archived_task_unit_observation_unavailable",
+    }:
+        next_action = (
+            "restore bounded authorized live observation of archived privileged "
+            "or remote terminal units and inspect unavailable local systemd "
+            "inventory before trusting readiness; repeated reconciliation "
+            "or archival alone cannot establish quiescence; privileged or remote "
+            "retirement requires a task-and-attempt-bound restart-exclusion contract"
+        )
+    elif reconciliation_evidence.get("status") == "retained_inventory_changed":
+        next_action = "inspect changing task attempt units before trusting a fresh bounded inventory"
+    elif reconciliation_evidence.get("status") == "retained_attempt_authority_unverified":
+        next_action = (
+            "recover original host, transport and scope authority for every retained "
+            "attempt through an authorized evidence workflow; missing history stays "
+            "blocked and must not be backfilled from the current fleet mapping"
         )
     elif reconciliation_evidence.get("status") == "local_terminal_transport_unverified":
         # A remote unit cannot be certified by the local read-only observer.
-        # Only recommend archive when a complete bounded cohort fits within
-        # the remaining archive history; otherwise fail closed.
+        # Budget headroom never proves external retirement or restart exclusion.
         remote_count = reconciliation_evidence.get("non_local_terminal_count")
         headroom = reconciliation_evidence.get("archive_headroom")
         if (
@@ -6625,9 +6652,9 @@ def _operator_system_overview(
         ):
             next_action = (
                 "inspect current remote-host terminal tasks with authorized live "
-                f"observation; archive exactly {remote_count} independently verified "
-                "terminal tasks through the authorized task-closeout-archive workflow, "
-                "no more, within the remaining archive-history budget"
+                f"observation; {remote_count} non-local tasks fit the archive-history "
+                "budget, but do not archive them for readiness without an "
+                "authenticated external retirement and restart-exclusion proof"
             )
         elif type(remote_count) is int and remote_count > 0 and type(headroom) is int:
             next_action = (
@@ -6641,9 +6668,14 @@ def _operator_system_overview(
             next_action = (
                 "inspect current remote-host terminal tasks with authorized live "
                 "observation; no verified non-local cohort size and archive headroom "
-                "are available, so do not archive until a bounded budget check "
-                "proves complete closeout is possible"
+                "are available, so do not archive; a budget check alone cannot "
+                "authorize closeout"
             )
+        next_action += (
+            "; archival and reconciliation alone cannot establish readiness; "
+            "remote retirement requires an authorized task-and-attempt-bound "
+            "restart-exclusion contract (#1556), which stop/show does not provide"
+        )
     elif reconciliation_evidence.get("status") != "verified":
         next_action = "reconcile live task outcomes through an authorized mutation-capable path"
     elif obligations.get("integrity_error_count"):
