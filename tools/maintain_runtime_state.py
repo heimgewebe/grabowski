@@ -3535,7 +3535,7 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
                 "recovered_archived_failed_units", []
             ),
             "deferred_failed_units": plan.get("deferred_failed_units", []),
-            "completed": not failed_resets and not reset_failures,
+            "completed": not bool(plan.get("blocked") or failed_resets or reset_failures),
             "retry": {
                 "required": bool(failed_resets or reset_failures),
                 "strategy": "rebuild_live_plan_and_chain_partial_receipt",

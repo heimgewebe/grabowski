@@ -2566,7 +2566,8 @@ class RuntimeRetentionTests(unittest.TestCase):
                 result = RETENTION.apply_plan(
                     plan, expected_plan_sha256=plan["plan_sha256"]
                 )
-            self.assertTrue(result["completed"])
+            self.assertFalse(result["completed"])
+            self.assertEqual(result["status"], "degraded")
             self.assertTrue((job / "metadata.json").is_file())
             self.assertFalse((archive / name).exists())
             self.assertFalse(index.exists())
@@ -2618,7 +2619,8 @@ class RuntimeRetentionTests(unittest.TestCase):
                 result = RETENTION.apply_plan(
                     plan, expected_plan_sha256=plan["plan_sha256"]
                 )
-            self.assertTrue(result["completed"])
+            self.assertFalse(result["completed"])
+            self.assertEqual(result["status"], "degraded")
             bootstrap.assert_not_called()
             self.assertTrue((old / "metadata.json").is_file())
             self.assertTrue((live / "metadata.json").is_file())
@@ -2897,7 +2899,8 @@ class RuntimeRetentionTests(unittest.TestCase):
                     result = RETENTION.apply_plan(
                         plan, expected_plan_sha256=plan["plan_sha256"]
                     )
-            self.assertTrue(result["completed"])
+            self.assertFalse(result["completed"])
+            self.assertEqual(result["status"], "degraded")
             self.assertTrue((source_bad / "metadata.json").is_file())
             self.assertFalse((archive / bad_name).exists())
             self.assertTrue((archive / good_name / "archive-manifest.json").is_file())
@@ -3490,7 +3493,8 @@ class RuntimeRetentionTests(unittest.TestCase):
                 result = RETENTION.apply_plan(
                     plan, expected_plan_sha256=plan["plan_sha256"]
                 )
-            self.assertTrue(result["completed"])
+            self.assertFalse(result["completed"])
+            self.assertEqual(result["status"], "degraded")
             self.assertFalse(result["retry"]["required"])
             self.assertEqual(result["archived_jobs"], [])
             self.assertTrue((source / "metadata.json").is_file())
@@ -4033,7 +4037,7 @@ class RuntimeRetentionTests(unittest.TestCase):
                 receipt = RETENTION.apply_plan(
                     plan, expected_plan_sha256=plan["plan_sha256"]
                 )
-            self.assertTrue(receipt["completed"])
+            self.assertFalse(receipt["completed"])
             self.assertTrue(receipt["mutated"])
             self.assertEqual(receipt["status"], "degraded")
             reset.assert_called_once_with(
@@ -5786,6 +5790,28 @@ class RuntimeRetentionTests(unittest.TestCase):
             result["worktree_hygiene"]["receipts"][0]["status"],
             "blocked",
         )
+
+    def test_periodic_hygiene_rejects_unknown_status_without_false_pass(self) -> None:
+        # The second R3 P2 must fail closed on every status outside passed/blocked.
+        plan = {"plan_sha256": "a" * 64, "archive_jobs": [],
+                "reset_failed_units": [], "blocked": []}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repo, allowed = root / "repo", root / "worktrees"
+            repo.mkdir()
+            allowed.mkdir()
+            for status in ("partial", "refused", "error", "applied", None):
+                with self.subTest(status=status), patch.object(
+                    RETENTION, "build_plan", return_value=plan
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "invalid status"):
+                        RETENTION.apply_periodic_plan(
+                            worktree_hygiene_repositories=[str(repo)],
+                            worktree_hygiene_allowed_roots=[str(allowed)],
+                            worktree_hygiene_runner=Mock(
+                                return_value={"status": status, "output": {"actions": 0}}
+                            ),
+                        )
 
     def test_periodic_worktree_hygiene_skips_missing_optional_roots(self) -> None:
         plan = {
