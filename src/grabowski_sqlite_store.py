@@ -8,6 +8,8 @@ import json
 import os
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 import sqlite3
 import stat
@@ -24,6 +26,13 @@ COPY_CHUNK_BYTES = 1024 * 1024
 STRICT_PRIVATE_WAL_MAX_BYTES = 2 * 1024 * 1024 * 1024
 STRICT_PRIVATE_WAL_FREE_RESERVE = 64 * 1024 * 1024
 STRICT_PRIVATE_WAL_MAX_WAL_BYTES = 32 * 1024 * 1024
+# Full physical tails are repeatedly verified; cap that IO independently.
+STRICT_PRIVATE_WAL_MAX_PHYSICAL_WAL_BYTES = 128 * 1024 * 1024
+STRICT_PRIVATE_WAL_MAX_SHM_BYTES = 16 * 1024 * 1024
+STRICT_PRIVATE_WAL_LOCK_TIMEOUT_SECONDS = 10
+STRICT_PRIVATE_WAL_MEMORY_RESERVE_BYTES = 2 * 1024 * 1024 * 1024
+_STRICT_PRIVATE_WAL_PROCESS_LOCK = threading.RLock()
+_STRICT_PRIVATE_WAL_DEPTH = threading.local()
 
 
 def status_identity(status: os.stat_result) -> FileIdentity:
@@ -174,8 +183,13 @@ def _strict_wal_file_fingerprint(
     error_type: type[ChangedError],
     message: str,
     optional: bool = False,
+    max_bytes: int | None = None,
 ) -> tuple[FileIdentity, str] | None:
-    """Pin a named, owner-private regular file and hash actual bytes through its fd."""
+    """Pin a named owner-private regular file and hash only its initial fd size.
+
+    Unbounded WAL/SHM growth during hashing must not exhaust memory or IO;
+    inode, size and timestamp drift still invalidates the source witness.
+    """
     flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
     try:
         descriptor = os.open(path, flags)
@@ -206,10 +220,16 @@ def _strict_wal_file_fingerprint(
                 )
             )
             or before.st_nlink != 1
+            or (max_bytes is not None and before.st_size > max_bytes)
         ):
             raise _changed(error_type, message)
         digest = hashlib.sha256()
-        while chunk := os.read(descriptor, COPY_CHUNK_BYTES):
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, COPY_CHUNK_BYTES))
+            if not chunk:
+                raise _changed(error_type, message)
+            remaining -= len(chunk)
             digest.update(chunk)
         try:
             named = os.lstat(path)
@@ -408,6 +428,11 @@ def _strict_wal_worker_main(arguments: list[str]) -> int:
             _strict_wal_file_fingerprint(
                 source, error_type=RuntimeError,
                 message=INVENTORY_CHANGED_MESSAGE, optional=(source == shm),
+                max_bytes=(
+                    STRICT_PRIVATE_WAL_MAX_BYTES if source == database
+                    else STRICT_PRIVATE_WAL_MAX_PHYSICAL_WAL_BYTES if source == wal
+                    else STRICT_PRIVATE_WAL_MAX_SHM_BYTES
+                ),
             )
             for source in source_paths
         ]
@@ -476,6 +501,11 @@ def _strict_wal_worker_main(arguments: list[str]) -> int:
                 _strict_wal_file_fingerprint(
                     source, error_type=RuntimeError,
                     message=INVENTORY_CHANGED_MESSAGE, optional=(source == shm),
+                    max_bytes=(
+                        STRICT_PRIVATE_WAL_MAX_BYTES if source == database
+                        else STRICT_PRIVATE_WAL_MAX_PHYSICAL_WAL_BYTES if source == wal
+                        else STRICT_PRIVATE_WAL_MAX_SHM_BYTES
+                    ),
                 )
                 for source in source_paths
             ]
@@ -612,6 +642,102 @@ def _strict_wal_source_worker(
         raise _changed(error_type, message, cause=exc)
 
 
+
+def _strict_wal_available_memory(
+    *, error_type: type[ChangedError], message: str,
+) -> int:
+    """Fail closed when the kernel cannot establish current memory headroom."""
+    try:
+        with Path("/proc/meminfo").open(encoding="ascii") as source:
+            entries = [
+                line.split()
+                for line in source
+                if line.startswith("MemAvailable:")
+            ]
+        if (
+            len(entries) != 1 or len(entries[0]) != 3
+            or entries[0][1].isdigit() is False or entries[0][2] != "kB"
+        ):
+            raise ValueError("unverifiable MemAvailable")
+        return int(entries[0][1]) * 1024
+    except (OSError, ValueError) as exc:
+        raise _changed(error_type, message, cause=exc)
+
+
+def _strict_wal_owner_lock_acquire(
+    *, error_type: type[ChangedError], message: str,
+) -> int:
+    """Serialize scratch copies without locking a world-readable tmpfs directory.
+
+    The pre-existing per-user private config directory is a lockable inode;
+    no persistent file, source database, WAL or SHM is created or mutated.
+    Thread-local recursion uses the same outer flock while a process RLock
+    serializes other threads. Cross-process readers wait a bounded interval.
+    """
+    if not _STRICT_PRIVATE_WAL_PROCESS_LOCK.acquire(
+        timeout=STRICT_PRIVATE_WAL_LOCK_TIMEOUT_SECONDS
+    ):
+        raise _changed(error_type, message)
+    depth = getattr(_STRICT_PRIVATE_WAL_DEPTH, "value", 0)
+    if depth:
+        _STRICT_PRIVATE_WAL_DEPTH.value = depth + 1
+        return -1
+    descriptor = -1
+    try:
+        private_dir = Path.home() / ".config" / "grabowski"
+        before = os.lstat(private_dir)
+        if (
+            not stat.S_ISDIR(before.st_mode)
+            or before.st_uid != os.geteuid()
+            or stat.S_IMODE(before.st_mode) & 0o077
+            or private_dir.resolve(strict=True) != private_dir
+        ):
+            raise _changed(error_type, message)
+        descriptor = os.open(
+            private_dir, os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+        now = os.fstat(descriptor)
+        if (
+            (now.st_dev, now.st_ino) != (before.st_dev, before.st_ino)
+            or now.st_uid != before.st_uid
+            or stat.S_IMODE(now.st_mode) != stat.S_IMODE(before.st_mode)
+        ):
+            raise _changed(error_type, message)
+        deadline = time.monotonic() + STRICT_PRIVATE_WAL_LOCK_TIMEOUT_SECONDS
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise _changed(error_type, message)
+                time.sleep(0.05)
+        _STRICT_PRIVATE_WAL_DEPTH.value = 1
+        return descriptor
+    except (OSError, ValueError) as exc:
+        raise _changed(error_type, message, cause=exc)
+    finally:
+        if getattr(_STRICT_PRIVATE_WAL_DEPTH, "value", 0) == 0:
+            if descriptor >= 0:
+                os.close(descriptor)
+            _STRICT_PRIVATE_WAL_PROCESS_LOCK.release()
+
+
+def _strict_wal_owner_lock_release(descriptor: int) -> None:
+    depth = getattr(_STRICT_PRIVATE_WAL_DEPTH, "value", 0)
+    if depth < 1:
+        raise RuntimeError("strict WAL reader lock ownership lost")
+    _STRICT_PRIVATE_WAL_DEPTH.value = depth - 1
+    try:
+        if depth == 1:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
+    finally:
+        _STRICT_PRIVATE_WAL_PROCESS_LOCK.release()
+
+
 @contextmanager
 def _strict_private_wal_snapshot(
     path: Path,
@@ -644,7 +770,7 @@ def _strict_private_wal_snapshot(
     if (
         not stat.S_ISREG(database_status.st_mode)
         or not stat.S_ISREG(wal_status.st_mode)
-        or wal_status.st_size > STRICT_PRIVATE_WAL_MAX_BYTES
+        or wal_status.st_size > STRICT_PRIVATE_WAL_MAX_PHYSICAL_WAL_BYTES
         or wal_status.st_size <= 32
         or database_status.st_size + min(wal_status.st_size, 32 + 24 + 512) > budget
     ):
@@ -652,18 +778,20 @@ def _strict_private_wal_snapshot(
         # impossible budgets before scratch, even when its old tail is huge.
         raise _changed(error_type, message)
     root = _strict_wal_memory_root(error_type=error_type, message=message)
-    directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    lock_descriptor = _strict_wal_owner_lock_acquire(
+        error_type=error_type, message=message,
+    )
     try:
-        try:
-            fcntl.flock(directory_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as exc:
-            raise _changed(error_type, message, cause=exc)
         stats = os.statvfs(root)
         # Only committed bytes can enter the private snapshot, never stale tail.
         total = database_status.st_size + min(
             wal_status.st_size, STRICT_PRIVATE_WAL_MAX_WAL_BYTES,
         )
-        if stats.f_bavail * stats.f_frsize < total + STRICT_PRIVATE_WAL_FREE_RESERVE:
+        if (
+            stats.f_bavail * stats.f_frsize < total + STRICT_PRIVATE_WAL_FREE_RESERVE
+            or _strict_wal_available_memory(error_type=error_type, message=message)
+            < (2 * total + STRICT_PRIVATE_WAL_MEMORY_RESERVE_BYTES)
+        ):
             raise _changed(error_type, message)
 
         with tempfile.TemporaryDirectory(dir=root, prefix="grabowski-strict-wal-") as directory:
@@ -735,7 +863,7 @@ def _strict_private_wal_snapshot(
                         connection.close()
                 verify_source()
     finally:
-        os.close(directory_fd)
+        _strict_wal_owner_lock_release(lock_descriptor)
 
 
 

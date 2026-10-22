@@ -1177,6 +1177,12 @@ class CheckoutBindingLiveIntegrationTests(unittest.TestCase):
                 keeper.execute("PRAGMA wal_autocheckpoint=0")
                 keeper.execute("PRAGMA user_version=1")
                 keeper.commit()
+                # Persist a genuine uncheckpointed lifecycle row. Reading
+                # only the old base DB cannot satisfy this positive case.
+                insert_binding(
+                    path, checkout_key="wal-only-binding",
+                    checkout_path="/home/alex/repos/.worktrees/wal-only-binding",
+                )
                 self.assertGreater(Path(str(path) + "-wal").stat().st_size, 0)
                 before = {item.name: item.read_bytes() for item in Path(tmp).iterdir()}
                 with (
@@ -1189,7 +1195,13 @@ class CheckoutBindingLiveIntegrationTests(unittest.TestCase):
                     ),
                 ):
                     payload = current_work_surface._reconciliation_payload([REPO])
-                self.assertIsInstance(payload, dict)
+                self.assertEqual("grabowski_checkout_binding_reconciliation", payload["kind"])
+                self.assertTrue(payload["read_only"])
+                self.assertEqual(1, payload["count"])
+                self.assertEqual(
+                    "wal-only-binding", payload["bindings"][0]["checkout_key"],
+                    "READ_ONLY did not expose the WAL-only lifecycle row",
+                )
                 self.assertEqual(
                     before,
                     {item.name: item.read_bytes() for item in Path(tmp).iterdir()},

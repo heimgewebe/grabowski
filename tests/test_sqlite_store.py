@@ -453,29 +453,58 @@ class SQLiteStoreTests(unittest.TestCase):
     def test_strict_ram_root_rejects_non_tmpfs_overmount(self) -> None:
         # An older tmpfs entry cannot bless a newer disk-backed /dev/shm mount.
         actual_open = sqlite_store.Path.open
+        actual_lstat = sqlite_store.os.lstat
+        actual_resolve = sqlite_store.Path.resolve
         mounts = (
             "32 20 0:44 / /dev/shm rw - tmpfs tmpfs rw\n"
             "33 20 8:1 / /dev/shm rw - ext4 /dev/sda rw\n"
         )
+        mount_reads = [0]
+
+        def fake_lstat(path, *args, **kwargs):
+            if str(path) == "/dev/shm":
+                return SimpleNamespace(st_mode=stat.S_IFDIR | 0o1777, st_uid=0)
+            return actual_lstat(path, *args, **kwargs)
+
+        def fake_resolve(path, *args, **kwargs):
+            if str(path) == "/dev/shm":
+                return Path("/dev/shm")
+            return actual_resolve(path, *args, **kwargs)
 
         def fake_open(path, *args, **kwargs):
             if str(path) == "/proc/self/mountinfo":
+                mount_reads[0] += 1
                 return StringIO(mounts)
             return actual_open(path, *args, **kwargs)
 
         with (
             patch.object(sqlite_store.Path, "open", fake_open),
+            patch.object(sqlite_store.os, "lstat", fake_lstat),
+            patch.object(sqlite_store.Path, "resolve", fake_resolve),
             self.assertRaises(InventoryChanged),
         ):
             sqlite_store._strict_wal_memory_root(
                 error_type=InventoryChanged,
                 message="untrusted mount",
             )
+        self.assertEqual(1, mount_reads[0], "test must reach mount validation")
 
     def test_strict_ram_root_rejects_zram_disk_writeback(self) -> None:
         actual_open = sqlite_store.Path.open
         actual_stat = sqlite_store.os.stat
+        actual_lstat = sqlite_store.os.lstat
+        actual_resolve = sqlite_store.Path.resolve
         mounts = "32 20 0:44 / /dev/shm rw - tmpfs tmpfs rw\n"
+
+        def fake_lstat(path, *args, **kwargs):
+            if str(path) == "/dev/shm":
+                return SimpleNamespace(st_mode=stat.S_IFDIR | 0o1777, st_uid=0)
+            return actual_lstat(path, *args, **kwargs)
+
+        def fake_resolve(path, *args, **kwargs):
+            if str(path) == "/dev/shm":
+                return Path("/dev/shm")
+            return actual_resolve(path, *args, **kwargs)
         swaps = "Filename Type Size Used Priority\n/dev/zram0 partition 16384 0 100\n"
 
         def fake_open(path, *args, **kwargs):
@@ -493,6 +522,8 @@ class SQLiteStoreTests(unittest.TestCase):
         with (
             patch.object(sqlite_store.Path, "open", fake_open),
             patch.object(sqlite_store.os, "stat", fake_stat),
+            patch.object(sqlite_store.os, "lstat", fake_lstat),
+            patch.object(sqlite_store.Path, "resolve", fake_resolve),
             patch.object(
                 sqlite_store.Path, "read_text", return_value="/dev/sda\n",
             ) as backing,
@@ -865,6 +896,10 @@ class SQLiteStoreTests(unittest.TestCase):
                         "TemporaryDirectory",
                         side_effect=AssertionError("oversize must reject before scratch creation"),
                     ) as scratch,
+                    patch.object(
+                        sqlite_store, "_strict_wal_memory_root",
+                        side_effect=AssertionError("budget must reject before mount check"),
+                    ) as mount,
                     self.assertRaises(InventoryChanged),
                 ):
                     with sqlite_store.inventory_readonly_sqlite(
@@ -878,6 +913,7 @@ class SQLiteStoreTests(unittest.TestCase):
                         pass
                 hashing.assert_not_called()
                 scratch.assert_not_called()
+                mount.assert_not_called()
             finally:
                 writer.close()
 
@@ -999,6 +1035,134 @@ class SQLiteStoreTests(unittest.TestCase):
                     )
             finally:
                 writer.close()
+
+    def test_strict_wal_nested_owner_lock(self) -> None:
+        first = sqlite_store._strict_wal_owner_lock_acquire(
+            error_type=InventoryChanged, message="test lock",
+        )
+        try:
+            second = sqlite_store._strict_wal_owner_lock_acquire(
+                error_type=InventoryChanged, message="nested test lock",
+            )
+            self.assertEqual(-1, second)
+            sqlite_store._strict_wal_owner_lock_release(second)
+        finally:
+            sqlite_store._strict_wal_owner_lock_release(first)
+
+    def test_strict_private_wal_rejects_large_physical_tail_before_hash(self) -> None:
+        with TemporaryDirectory() as directory:
+            db = Path(directory) / "large-tail.sqlite3"
+            db.write_bytes(b"placeholder")
+            with Path(str(db) + "-wal").open("wb") as wal:
+                wal.truncate(
+                    sqlite_store.STRICT_PRIVATE_WAL_MAX_PHYSICAL_WAL_BYTES + 1
+                )
+            with patch.object(
+                sqlite_store, "_strict_wal_memory_root",
+                side_effect=AssertionError("tail must be rejected before mount check"),
+            ):
+                with self.assertRaises(InventoryChanged):
+                    with sqlite_store._strict_private_wal_snapshot(
+                        db, error_type=InventoryChanged,
+                        message="oversize source WAL", max_copy_bytes=None,
+                    ):
+                        self.fail("oversize WAL must not be replayed")
+
+    def test_strict_private_wal_memory_headroom_blocks_before_copy(self) -> None:
+        with TemporaryDirectory() as directory:
+            db = Path(directory) / "low-memory.sqlite3"
+            writer = sqlite3.connect(db)
+            try:
+                writer.execute("PRAGMA journal_mode=WAL")
+                writer.execute("CREATE TABLE committed (value INTEGER)")
+                writer.execute("INSERT INTO committed VALUES (17)")
+                writer.commit()
+                with (
+                    patch.object(
+                        sqlite_store, "_strict_wal_memory_root",
+                        return_value=Path(directory),
+                    ),
+                    patch.object(
+                        sqlite_store, "_strict_wal_available_memory",
+                        return_value=0,
+                    ) as headroom,
+                    patch.object(
+                        sqlite_store.tempfile, "TemporaryDirectory",
+                        side_effect=AssertionError("no copy when memory unavailable"),
+                    ) as scratch,
+                ):
+                    with self.assertRaises(InventoryChanged):
+                        with sqlite_store.inventory_readonly_sqlite(
+                            db, temporary_prefix="memory-preflight-",
+                            error_type=InventoryChanged, allow_wal_copy=False,
+                            allow_private_wal_snapshot=True,
+                        ):
+                            self.fail("memory limit must deny")
+                headroom.assert_called_once()
+                scratch.assert_not_called()
+            finally:
+                writer.close()
+
+    def test_strict_wal_fingerprint_caps_fd_size_before_read(self) -> None:
+        with TemporaryDirectory() as directory:
+            source = Path(directory) / "large-wal"
+            source.write_bytes(b"x" * 11)
+            with patch.object(
+                sqlite_store.os, "read",
+                side_effect=AssertionError("oversize must reject before read"),
+            ) as reading:
+                with self.assertRaises(InventoryChanged):
+                    sqlite_store._strict_wal_file_fingerprint(
+                        source, error_type=InventoryChanged,
+                        message="over-budget source", max_bytes=10,
+                    )
+            reading.assert_not_called()
+
+    def test_strict_wal_fingerprint_rejects_concurrent_growth_without_following_tail(self) -> None:
+        with TemporaryDirectory() as directory:
+            source = Path(directory) / "growing-wal"
+            source.write_bytes(b"stable initial bytes")
+            original_read = sqlite_store.os.read
+            reads = [0]
+
+            def grow_after_first_read(descriptor, count):
+                data = original_read(descriptor, count)
+                reads[0] += 1
+                if reads[0] == 1:
+                    with source.open("ab") as changed:
+                        changed.write(b"changed after initial stat" * 20)
+                return data
+
+            with patch.object(sqlite_store.os, "read", grow_after_first_read):
+                with self.assertRaises(InventoryChanged):
+                    sqlite_store._strict_wal_file_fingerprint(
+                        source, error_type=InventoryChanged,
+                        message="source changed", max_bytes=4096,
+                    )
+            self.assertEqual(1, reads[0], "source growth must not extend hashing")
+
+    def test_strict_wal_worker_caps_sparse_sidecar_before_hash(self) -> None:
+        with TemporaryDirectory() as directory:
+            db = Path(directory) / "worker.sqlite3"
+            db.write_bytes(b"source")
+            wal = Path(str(db) + "-wal")
+            with wal.open("wb") as stream:
+                stream.truncate(
+                    sqlite_store.STRICT_PRIVATE_WAL_MAX_PHYSICAL_WAL_BYTES + 1
+                )
+            shm = Path(str(db) + "-shm")
+            shm.write_bytes(b"shm")
+            with patch.object(
+                sqlite_store, "_strict_validate_copied_wal",
+                side_effect=AssertionError("worker must reject before replay"),
+            ) as validation:
+                self.assertEqual(
+                    1, sqlite_store._strict_wal_worker_main([
+                        "--strict-wal-source-worker", "fingerprint",
+                        str(db), str(wal), str(shm),
+                    ]),
+                )
+            validation.assert_not_called()
 
 if __name__ == "__main__":
     unittest.main()

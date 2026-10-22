@@ -4140,6 +4140,38 @@ class ResourceTests(unittest.TestCase):
         self.assertEqual(before_stat.st_mtime_ns, self.database.stat().st_mtime_ns)
         self.assertEqual(before_files, sorted(p.name for p in self.database.parent.iterdir()))
 
+    def test_resource_readonly_snapshot_accepts_quiescent_wal0_unchanged(self) -> None:
+        key = "component:strict-checkpointed-resource-snapshot"
+        owner = "operator:strict-checkpointed-resource-snapshot"
+        resources.acquire_resources(owner, [key], purpose="before WAL0")
+        keeper = sqlite3.connect(self.database)
+        try:
+            self.assertEqual(
+                "wal", keeper.execute("PRAGMA journal_mode=WAL").fetchone()[0],
+            )
+            keeper.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+            wal = Path(str(self.database) + "-wal")
+            shm = Path(str(self.database) + "-shm")
+            self.assertTrue(shm.is_file())
+            self.assertEqual(0, wal.stat().st_size)
+            before = {
+                file.name: (file.read_bytes(), file.stat().st_mtime_ns)
+                for file in (self.database, wal, shm)
+            }
+            with patch.object(
+                resources.operator, "_require_operator_mutation",
+                side_effect=AssertionError("strict READ_ONLY must not mutate"),
+            ) as gate:
+                observed = resources.list_resources(owner_id=owner, read_only=True)
+            gate.assert_not_called()
+            self.assertEqual(key, observed[0]["resource_key"])
+            self.assertEqual(before, {
+                file.name: (file.read_bytes(), file.stat().st_mtime_ns)
+                for file in (self.database, wal, shm)
+            })
+        finally:
+            keeper.close()
+
     def test_resource_readonly_snapshot_replays_active_wal_without_original_sidecar_changes(self) -> None:
         key = "component:strict-private-resource-snapshot"
         owner = "operator:strict-private-resource-snapshot"

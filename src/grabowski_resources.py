@@ -389,6 +389,7 @@ class ResourceLeaseExpired(RuntimeError):
 def _resource_inventory_readonly_sqlite(
     path: Path, *, allow_wal_copy: bool = True,
     allow_private_wal_snapshot: bool = False,
+    allow_checkpointed_empty_wal: bool = False,
 ) -> Iterator[sqlite3.Connection]:
     with sqlite_store.inventory_readonly_sqlite(
         path,
@@ -396,6 +397,7 @@ def _resource_inventory_readonly_sqlite(
         error_type=ResourceSchemaInventoryChanged,
         allow_wal_copy=allow_wal_copy,
         allow_private_wal_snapshot=allow_private_wal_snapshot,
+        allow_checkpointed_empty_wal=allow_checkpointed_empty_wal,
     ) as connection:
         yield connection
 
@@ -8167,6 +8169,7 @@ def _resource_readonly_snapshot() -> Iterator[sqlite3.Connection]:
         raise RuntimeError("Resource store cannot be observed without explicit initialization")
     with _resource_inventory_readonly_sqlite(
         RESOURCE_DB, allow_wal_copy=False, allow_private_wal_snapshot=True,
+        allow_checkpointed_empty_wal=True,
     ) as connection:
         if _resource_schema_version(connection) != RESOURCE_CURRENT_SCHEMA_VERSION:
             raise RuntimeError("Resource store requires an explicit schema migration")
