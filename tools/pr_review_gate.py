@@ -1033,9 +1033,39 @@ def _paths(pr: dict[str, Any]) -> list[str]:
     return paths
 
 
+def _security_review_paths(pr: dict[str, Any]) -> tuple[list[str], bool]:
+    """Include both sides of renames in risk classification, not file counts.
+
+    GitHub's changedFiles counts a rename once; its previousPath still
+    identifies authority that a renamed destination may have removed.
+    """
+    paths = _paths(pr)
+    missing_rename_source = False
+    raw_files = pr.get("files")
+    if not isinstance(raw_files, list):
+        return paths, missing_rename_source
+    for item in raw_files:
+        if not isinstance(item, dict):
+            continue
+        status = item.get("status")
+        if not isinstance(status, str) or status.strip().lower() != "renamed":
+            continue
+        previous = item.get("previousPath")
+        if previous is None:
+            previous = item.get("previous_filename")
+        if not isinstance(previous, str) or _normalized_review_path(previous) != previous:
+            missing_rename_source = True
+            continue
+        paths.append(previous)
+    return paths, missing_rename_source
+
+
 def _current_pr_paths_failures(pr: dict[str, Any]) -> tuple[list[str], list[str]]:
     paths = _paths(pr)
     failures: list[str] = []
+    _, missing_rename_source = _security_review_paths(pr)
+    if missing_rename_source:
+        failures.append("renamed source path is missing or invalid")
     if not paths:
         failures.append("current PR file list is missing or empty")
     changed_files = pr.get("changedFiles")
@@ -1145,20 +1175,32 @@ def _recovery_authority_reasons(
     return reasons
 
 
+def _normalized_review_policy_path(path: str) -> str:
+    """Remove only literal './' segments; retain GitHub dot-directory identity.
+
+    str.lstrip("./") silently converts '.github/workflows' into
+    'github/workflows', bypassing the explicitly high-critical path list.
+    """
+    normalized = path.lower()
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized
+
+
 def _is_risk_path(path: str) -> bool:
-    normalized = path.lower().lstrip("./")
+    normalized = _normalized_review_policy_path(path)
     return any(normalized == prefix or normalized.startswith(prefix.rstrip("/") + "/") for prefix in RISK_PATH_PREFIXES) or any(marker in normalized for marker in RISK_PATH_MARKERS)
 
 
 def _is_policy_critical_path(path: str) -> bool:
-    normalized = path.lower().lstrip("./")
+    normalized = _normalized_review_policy_path(path)
     if normalized in POLICY_CRITICAL_PATHS:
         return True
     return any(normalized.startswith(prefix) for prefix in POLICY_CRITICAL_PREFIXES)
 
 
 def _is_documentation_path(path: str) -> bool:
-    normalized = path.lower().lstrip("./")
+    normalized = _normalized_review_policy_path(path)
     path_obj = Path(normalized)
     name = path_obj.name
     suffix = path_obj.suffix
@@ -1172,7 +1214,7 @@ def _is_documentation_path(path: str) -> bool:
 
 
 def _trivial_exempt_deny_reason(path: str, changed_lines: int) -> str | None:
-    normalized = path.lower().lstrip("./")
+    normalized = _normalized_review_policy_path(path)
     name = Path(normalized).name
     suffix = Path(normalized).suffix
     if changed_lines <= 0:
@@ -1284,7 +1326,7 @@ def _nixos_supply_chain_rename_reasons(
 
 
 def _high_critical_path_reason(path: str) -> str | None:
-    normalized = path.lower().lstrip("./")
+    normalized = _normalized_review_policy_path(path)
     if _is_policy_critical_path(normalized):
         return f"high-critical policy path touched: {path}"
     if any(normalized == prefix.rstrip("/") or normalized.startswith(prefix) for prefix in HIGH_CRITICAL_PATH_PREFIXES):
@@ -1318,18 +1360,20 @@ def classify_complexity(
 ) -> dict[str, Any]:
     changed_files = int(pr.get("changedFiles") or 0)
     changed_lines = int(pr.get("additions") or 0) + int(pr.get("deletions") or 0)
-    paths = _paths(pr)
+    paths, missing_rename_source = _security_review_paths(pr)
     normalized_repo = _canonical_repo_slug(repo_name)
     recovery_reasons = _recovery_authority_reasons(pr, normalized_repo)
     nix_supply_reasons = _nixos_supply_chain_rename_reasons(pr, normalized_repo)
     docs_only = (
-        bool(paths) and not recovery_reasons and not nix_supply_reasons
+        bool(paths) and not missing_rename_source and not recovery_reasons and not nix_supply_reasons
         and all(_is_documentation_path(path) for path in paths)
     )
     very_small_uncomplicated = _is_very_small_uncomplicated_change(paths, changed_files, changed_lines)
     important_repo = normalized_repo in IMPORTANT_REPOS
 
     high_critical_reasons: list[str] = [*recovery_reasons, *nix_supply_reasons]
+    if missing_rename_source:
+        high_critical_reasons.append("renamed source path is missing or invalid")
     if not docs_only:
         if changed_files > 15:
             high_critical_reasons.append("many files")
