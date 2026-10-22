@@ -1044,10 +1044,36 @@ class SQLiteStoreTests(unittest.TestCase):
             second = sqlite_store._strict_wal_owner_lock_acquire(
                 error_type=InventoryChanged, message="nested test lock",
             )
-            self.assertEqual(-1, second)
+            self.assertEqual(first, second)
             sqlite_store._strict_wal_owner_lock_release(second)
         finally:
             sqlite_store._strict_wal_owner_lock_release(first)
+
+    def test_strict_wal_owner_lock_releases_non_lifo_without_fd_leak(self) -> None:
+        first = sqlite_store._strict_wal_owner_lock_acquire(
+            error_type=InventoryChanged, message="outer lock",
+        )
+        second = sqlite_store._strict_wal_owner_lock_acquire(
+            error_type=InventoryChanged, message="inner lock",
+        )
+        self.assertEqual(first, second)
+        # The outer context may finish first. The remaining caller must
+        # still hold the original flock and its valid descriptor.
+        sqlite_store._strict_wal_owner_lock_release(first)
+        os.fstat(second)
+        third = sqlite_store._strict_wal_owner_lock_acquire(
+            error_type=InventoryChanged, message="third nested lock",
+        )
+        self.assertEqual(second, third)
+        sqlite_store._strict_wal_owner_lock_release(third)
+        os.fstat(second)
+        sqlite_store._strict_wal_owner_lock_release(second)
+        with self.assertRaises(OSError):
+            os.fstat(second)
+        again = sqlite_store._strict_wal_owner_lock_acquire(
+            error_type=InventoryChanged, message="fresh lock",
+        )
+        sqlite_store._strict_wal_owner_lock_release(again)
 
     def test_strict_private_wal_rejects_large_physical_tail_before_hash(self) -> None:
         with TemporaryDirectory() as directory:
@@ -1098,6 +1124,96 @@ class SQLiteStoreTests(unittest.TestCase):
                             allow_private_wal_snapshot=True,
                         ):
                             self.fail("memory limit must deny")
+                headroom.assert_called_once()
+                scratch.assert_not_called()
+            finally:
+                writer.close()
+
+    def test_strict_wal_cgroup_v2_headroom_is_minimum_of_ancestor_limits(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / "cgroup"
+            service = root / "system.slice" / "grabowski.service"
+            service.mkdir(parents=True)
+            (root / "cgroup.controllers").write_text("memory cpu\n")
+            (service / "memory.max").write_text("20000\n")
+            (service / "memory.current").write_text("14000\n")
+            parent = service.parent
+            (parent / "memory.max").write_text("8000\n")
+            (parent / "memory.current").write_text("5000\n")
+            process_cgroup = Path(directory) / "self-cgroup"
+            process_cgroup.write_text("0::/system.slice/grabowski.service\n")
+            self.assertEqual(3000, sqlite_store._strict_wal_cgroup_memory_headroom(
+                error_type=InventoryChanged, message="cgroup budget",
+                cgroup_file=process_cgroup, mount_root=root,
+            ))
+            (parent / "memory.max").write_text("max\n")
+            self.assertEqual(6000, sqlite_store._strict_wal_cgroup_memory_headroom(
+                error_type=InventoryChanged, message="cgroup budget",
+                cgroup_file=process_cgroup, mount_root=root,
+            ))
+            (service / "memory.max").write_text("max\n")
+            self.assertIsNone(sqlite_store._strict_wal_cgroup_memory_headroom(
+                error_type=InventoryChanged, message="cgroup budget",
+                cgroup_file=process_cgroup, mount_root=root,
+            ))
+
+    def test_strict_wal_cgroup_v2_invalid_or_incomplete_limits_fail_closed(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / "cgroup"
+            service = root / "scope"
+            service.mkdir(parents=True)
+            (root / "cgroup.controllers").write_text("memory\n")
+            process_cgroup = Path(directory) / "self-cgroup"
+            process_cgroup.write_text("0::/scope\n")
+            (service / "memory.max").write_text("4096\n")
+            with self.assertRaises(InventoryChanged):
+                sqlite_store._strict_wal_cgroup_memory_headroom(
+                    error_type=InventoryChanged, message="missing current",
+                    cgroup_file=process_cgroup, mount_root=root,
+                )
+            (service / "memory.current").write_text("5000\n")
+            self.assertEqual(0, sqlite_store._strict_wal_cgroup_memory_headroom(
+                error_type=InventoryChanged, message="over limit",
+                cgroup_file=process_cgroup, mount_root=root,
+            ))
+            for invalid in ("not-a-limit", "-1", "9" * 80):
+                (service / "memory.max").write_text(invalid + "\n")
+                with self.subTest(invalid=invalid):
+                    with self.assertRaises(InventoryChanged):
+                        sqlite_store._strict_wal_cgroup_memory_headroom(
+                            error_type=InventoryChanged, message="invalid limit",
+                            cgroup_file=process_cgroup, mount_root=root,
+                        )
+            process_cgroup.write_text("0::/../scope\n")
+            with self.assertRaises(InventoryChanged):
+                sqlite_store._strict_wal_cgroup_memory_headroom(
+                    error_type=InventoryChanged, message="escape",
+                    cgroup_file=process_cgroup, mount_root=root,
+                )
+
+    def test_strict_private_wal_cgroup_budget_rejects_before_copy(self) -> None:
+        with TemporaryDirectory() as directory:
+            db = Path(directory) / "limited.sqlite3"
+            writer = sqlite3.connect(db)
+            try:
+                writer.execute("PRAGMA journal_mode=WAL")
+                writer.execute("CREATE TABLE committed (value INTEGER)")
+                writer.execute("INSERT INTO committed VALUES (17)")
+                writer.commit()
+                with (
+                    patch.object(sqlite_store, "_strict_wal_memory_root", return_value=Path(directory)),
+                    patch.object(sqlite_store, "_strict_wal_cgroup_memory_headroom",
+                                 return_value=0) as headroom,
+                    patch.object(sqlite_store.tempfile, "TemporaryDirectory",
+                                 side_effect=AssertionError("no copy over cgroup budget")) as scratch,
+                ):
+                    with self.assertRaises(InventoryChanged):
+                        with sqlite_store.inventory_readonly_sqlite(
+                            db, temporary_prefix="cgroup-budget-",
+                            error_type=InventoryChanged, allow_wal_copy=False,
+                            allow_private_wal_snapshot=True,
+                        ):
+                            self.fail("cgroup memory limit must deny")
                 headroom.assert_called_once()
                 scratch.assert_not_called()
             finally:

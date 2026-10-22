@@ -8169,7 +8169,6 @@ def _resource_readonly_snapshot() -> Iterator[sqlite3.Connection]:
         raise RuntimeError("Resource store cannot be observed without explicit initialization")
     with _resource_inventory_readonly_sqlite(
         RESOURCE_DB, allow_wal_copy=False, allow_private_wal_snapshot=True,
-        allow_checkpointed_empty_wal=True,
     ) as connection:
         if _resource_schema_version(connection) != RESOURCE_CURRENT_SCHEMA_VERSION:
             raise RuntimeError("Resource store requires an explicit schema migration")

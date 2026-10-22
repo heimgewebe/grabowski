@@ -4140,36 +4140,77 @@ class ResourceTests(unittest.TestCase):
         self.assertEqual(before_stat.st_mtime_ns, self.database.stat().st_mtime_ns)
         self.assertEqual(before_files, sorted(p.name for p in self.database.parent.iterdir()))
 
-    def test_resource_readonly_snapshot_accepts_quiescent_wal0_unchanged(self) -> None:
+    def test_resource_readonly_snapshot_refuses_wal0_without_dropping_live_lock(self) -> None:
+        # WAL0 + SHM may still be owned by a live connection. Opening and
+        # closing even a read-only original fd in this process can release the
+        # keeper's POSIX locks, so deny instead of trying immutable=1.
         key = "component:strict-checkpointed-resource-snapshot"
         owner = "operator:strict-checkpointed-resource-snapshot"
         resources.acquire_resources(owner, [key], purpose="before WAL0")
-        keeper = sqlite3.connect(self.database)
+        keeper = sqlite3.connect(self.database, timeout=0, isolation_level=None)
         try:
             self.assertEqual(
                 "wal", keeper.execute("PRAGMA journal_mode=WAL").fetchone()[0],
             )
             keeper.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+            keeper.execute("BEGIN IMMEDIATE")
             wal = Path(str(self.database) + "-wal")
             shm = Path(str(self.database) + "-shm")
             self.assertTrue(shm.is_file())
             self.assertEqual(0, wal.stat().st_size)
-            before = {
-                file.name: (file.read_bytes(), file.stat().st_mtime_ns)
-                for file in (self.database, wal, shm)
-            }
+            def fingerprint_sidecars() -> dict[str, list[str | int]]:
+                # A child must read the original DB/WAL/SHM. Opening and
+                # closing those fds in the keeper's process releases its
+                # POSIX advisory locks and invalidates the regression.
+                import subprocess
+                code = (
+                    "import hashlib,json,sys\n"
+                    "from pathlib import Path\n"
+                    "print(json.dumps({p.name: [hashlib.sha256(p.read_bytes()).hexdigest(), "
+                    "p.stat().st_mtime_ns] for p in map(Path, sys.argv[1:])}))\n"
+                )
+                result = subprocess.run(
+                    [sys.executable, "-I", "-c", code,
+                     str(self.database), str(wal), str(shm)],
+                    capture_output=True, text=True, check=True, timeout=5,
+                )
+                return json.loads(result.stdout)
+
+            def probe_lock() -> str:
+                import subprocess
+                code = (
+                    "import sqlite3,sys\n"
+                    "db=sqlite3.connect(sys.argv[1],timeout=0,isolation_level=None)\n"
+                    "try:\n"
+                    " db.execute('BEGIN IMMEDIATE')\n"
+                    "except sqlite3.OperationalError:\n"
+                    " print('BLOCKED')\n"
+                    "else:\n"
+                    " print('ACQUIRED')\n"
+                    "finally:\n"
+                    " db.close()\n"
+                )
+                return subprocess.run(
+                    [sys.executable, "-I", "-c", code, str(self.database)],
+                    capture_output=True, text=True, check=True, timeout=5,
+                ).stdout.strip()
+
+            self.assertEqual("BLOCKED", probe_lock())
+            # SQLite lock probes may legitimately modify SHM; compare original
+            # bytes immediately around the READ_ONLY call, not across the probe.
+            before = fingerprint_sidecars()
             with patch.object(
                 resources.operator, "_require_operator_mutation",
                 side_effect=AssertionError("strict READ_ONLY must not mutate"),
             ) as gate:
-                observed = resources.list_resources(owner_id=owner, read_only=True)
+                with self.assertRaisesRegex(RuntimeError, "WAL sidecars exist"):
+                    resources.list_resources(owner_id=owner, read_only=True)
             gate.assert_not_called()
-            self.assertEqual(key, observed[0]["resource_key"])
-            self.assertEqual(before, {
-                file.name: (file.read_bytes(), file.stat().st_mtime_ns)
-                for file in (self.database, wal, shm)
-            })
+            self.assertEqual(before, fingerprint_sidecars())
+            self.assertEqual("BLOCKED", probe_lock(),
+                             "strict readonly must not drop the owning writer lock")
         finally:
+            keeper.rollback()
             keeper.close()
 
     def test_resource_readonly_snapshot_replays_active_wal_without_original_sidecar_changes(self) -> None:

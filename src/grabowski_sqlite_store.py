@@ -643,6 +643,59 @@ def _strict_wal_source_worker(
 
 
 
+def _strict_wal_cgroup_memory_headroom(
+    *, error_type: type[ChangedError], message: str,
+    cgroup_file: Path = Path("/proc/self/cgroup"),
+    mount_root: Path = Path("/sys/fs/cgroup"),
+) -> int | None:
+    """Read the tightest inherited cgroup-v2 memory budget, without effects.
+
+    A parent systemd slice may constrain memory even when the leaf's
+    memory.max is 'max'. Malformed advertised controls deny the snapshot.
+    """
+    try:
+        if not (mount_root / "cgroup.controllers").is_file():
+            return None  # No unified cgroup-v2 memory controls here.
+        locations = [
+            line[3:] for line in cgroup_file.read_text(
+                encoding="ascii",
+            ).splitlines() if line.startswith("0::")
+        ]
+        if len(locations) != 1 or not locations[0].startswith("/"):
+            raise ValueError("unverifiable unified cgroup")
+        if any(item in {".", ".."} for item in locations[0].split("/")):
+            raise ValueError("unsafe cgroup path")
+        root = mount_root.resolve(strict=True)
+        leaf = (root / locations[0].lstrip("/")).resolve(strict=True)
+        if leaf != root and not leaf.is_relative_to(root):
+            raise ValueError("cgroup outside memory hierarchy")
+        available: int | None = None
+        scope = leaf
+        while True:
+            max_file, current_file = scope / "memory.max", scope / "memory.current"
+            max_present, current_present = max_file.is_file(), current_file.is_file()
+            if max_present != current_present:
+                raise ValueError("incomplete cgroup memory controls")
+            if max_present:
+                maximum = max_file.read_text(encoding="ascii").strip()
+                usage = current_file.read_text(encoding="ascii").strip()
+                if (not usage.isdigit() or len(usage) > 20
+                        or (maximum != "max" and
+                            (not maximum.isdigit() or len(maximum) > 20))):
+                    raise ValueError("invalid cgroup memory controls")
+                if maximum != "max":
+                    headroom = max(0, int(maximum) - int(usage))
+                    available = (
+                        headroom if available is None
+                        else min(available, headroom)
+                    )
+            if scope == root:
+                return available
+            scope = scope.parent
+    except (OSError, ValueError) as exc:
+        raise _changed(error_type, message, cause=exc)
+
+
 def _strict_wal_available_memory(
     *, error_type: type[ChangedError], message: str,
 ) -> int:
@@ -659,7 +712,14 @@ def _strict_wal_available_memory(
             or entries[0][1].isdigit() is False or entries[0][2] != "kB"
         ):
             raise ValueError("unverifiable MemAvailable")
-        return int(entries[0][1]) * 1024
+        host_available = int(entries[0][1]) * 1024
+        cgroup_available = _strict_wal_cgroup_memory_headroom(
+            error_type=error_type, message=message,
+        )
+        return (
+            host_available if cgroup_available is None
+            else min(host_available, cgroup_available)
+        )
     except (OSError, ValueError) as exc:
         raise _changed(error_type, message, cause=exc)
 
@@ -680,8 +740,14 @@ def _strict_wal_owner_lock_acquire(
         raise _changed(error_type, message)
     depth = getattr(_STRICT_PRIVATE_WAL_DEPTH, "value", 0)
     if depth:
+        # All nested callers share one fd. A sentinel (-1) would make a
+        # non-LIFO release unlock an invalid fd and leak the outer flock.
+        held_descriptor = getattr(_STRICT_PRIVATE_WAL_DEPTH, "descriptor", None)
+        if type(held_descriptor) is not int or held_descriptor < 0:
+            _STRICT_PRIVATE_WAL_PROCESS_LOCK.release()
+            raise RuntimeError("strict WAL reader lock descriptor lost")
         _STRICT_PRIVATE_WAL_DEPTH.value = depth + 1
-        return -1
+        return held_descriptor
     descriptor = -1
     try:
         private_dir = Path.home() / ".config" / "grabowski"
@@ -712,6 +778,7 @@ def _strict_wal_owner_lock_acquire(
                 if time.monotonic() >= deadline:
                     raise _changed(error_type, message)
                 time.sleep(0.05)
+        _STRICT_PRIVATE_WAL_DEPTH.descriptor = descriptor
         _STRICT_PRIVATE_WAL_DEPTH.value = 1
         return descriptor
     except (OSError, ValueError) as exc:
@@ -725,11 +792,13 @@ def _strict_wal_owner_lock_acquire(
 
 def _strict_wal_owner_lock_release(descriptor: int) -> None:
     depth = getattr(_STRICT_PRIVATE_WAL_DEPTH, "value", 0)
-    if depth < 1:
+    held_descriptor = getattr(_STRICT_PRIVATE_WAL_DEPTH, "descriptor", None)
+    if depth < 1 or type(descriptor) is not int or descriptor != held_descriptor:
         raise RuntimeError("strict WAL reader lock ownership lost")
     _STRICT_PRIVATE_WAL_DEPTH.value = depth - 1
     try:
         if depth == 1:
+            del _STRICT_PRIVATE_WAL_DEPTH.descriptor
             try:
                 fcntl.flock(descriptor, fcntl.LOCK_UN)
             finally:
