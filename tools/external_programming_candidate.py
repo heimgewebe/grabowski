@@ -38,6 +38,8 @@ DEFAULT_FORBIDDEN_COMPONENTS = frozenset({
     ".git", ".hg", ".svn", ".venv", "venv", "node_modules", "__pycache__",
     ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox", ".nox", "build", "dist", "target",
 })
+# Mirror the controller's exact source admission in the isolated reviewer runner.
+EXACT_BUILD_DIAGNOSTICS_SOURCE = "apps/web/src/routes/build/+page.svelte"
 SENSITIVE_EXACT_COMPONENTS = frozenset({
     "secret", "secrets", "credential", "credentials", "private_key", "cookies",
     "login data", "web data", "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa",
@@ -163,7 +165,14 @@ def cleanup_stale_scratch(directory: Path, *, now_unix: int | None = None) -> di
 
 
 def path_has_default_forbidden_component(path: str) -> bool:
+    if path == EXACT_BUILD_DIAGNOSTICS_SOURCE:
+        return False
     return any(part.casefold() in DEFAULT_FORBIDDEN_COMPONENTS for part in PurePosixPath(path).parts)
+
+
+def explicit_build_source_scope(path: str, allowed: list[str]) -> bool:
+    # Do not infer permission for this exceptional file from its parent directory.
+    return path != EXACT_BUILD_DIAGNOSTICS_SOURCE or path in allowed
 
 
 def path_is_sensitive(path: str) -> bool:
@@ -710,6 +719,8 @@ def validate_packet(packet: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(item, dict) or set(item) != {"path", "sha256", "text"}:
             raise CandidateError(f"context item {index} is invalid")
         path = normalize_relative(item["path"], label=f"context[{index}].path")
+        if not explicit_build_source_scope(path, allowed):
+            raise CandidateError("explicit build source allowed path is required")
         if not path_in_scope(path, allowed) or path_in_scope(path, forbidden):
             raise CandidateError(f"context path is outside scope: {path}")
         if path_has_default_forbidden_component(path) or path_is_sensitive(path):
@@ -722,6 +733,10 @@ def validate_packet(packet: dict[str, Any]) -> dict[str, Any]:
         total_context += len(raw)
         if len(raw) > 120_000 or total_context > 500_000 or digest != sha256_bytes(raw):
             raise CandidateError("context content is too large or hash-mismatched")
+    if EXACT_BUILD_DIAGNOSTICS_SOURCE in allowed and not any(
+        item["path"] == EXACT_BUILD_DIAGNOSTICS_SOURCE for item in context
+    ):
+        raise CandidateError("special build source admission requires exact committed context")
     summary = packet["primary_summary"]
     if not isinstance(summary, str) or "\x00" in summary or len(summary.encode("utf-8")) > 32_000:
         raise CandidateError("primary_summary is invalid")
@@ -978,6 +993,8 @@ def validate_candidate(
     if len(set(normalized_changed)) != len(normalized_changed):
         raise CandidateError("candidate changed_paths contains duplicates")
     for path in normalized_changed:
+        if not explicit_build_source_scope(path, packet["allowed_paths"]):
+            raise CandidateError("explicit build source allowed path is required")
         if not path_in_scope(path, packet["allowed_paths"]) or path_in_scope(path, packet["forbidden_paths"]):
             raise CandidateError(f"candidate changed path is outside scope: {path}")
         if path_has_default_forbidden_component(path) or path_is_sensitive(path):
@@ -1001,6 +1018,8 @@ def validate_candidate(
     if not set(parsed_paths).issubset(set(normalized_changed)):
         raise CandidateError("patch paths are not declared in changed_paths")
     for path in parsed_paths:
+        if not explicit_build_source_scope(path, packet["allowed_paths"]):
+            raise CandidateError("explicit build source allowed path is required")
         if not path_in_scope(path, packet["allowed_paths"]) or path_in_scope(path, packet["forbidden_paths"]):
             raise CandidateError(f"patch path is outside scope: {path}")
         if path_has_default_forbidden_component(path) or path_is_sensitive(path):
