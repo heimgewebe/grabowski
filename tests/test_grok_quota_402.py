@@ -14,6 +14,7 @@ import test_decision_reviews as fixtures
 
 GROK_COMMAND = ["grok", "--model", "grok-4.6", "Review the frozen revision"]
 COMMANDS = ["compact", "always-approve", "context", "session-info", "feedback", "goal"]
+COMMANDS_WITH_MEMORY = [*COMMANDS[:2], "memory", *COMMANDS[2:]]
 QUOTA_MESSAGE = "API error (status 402 Payment Required): Grok Build usage balance exhausted"
 INNER = '{\n  "message": "' + QUOTA_MESSAGE + '",\n  "http_status": 402\n}'
 RECEIVER_ERROR = "Internal error: " + INNER
@@ -122,6 +123,103 @@ class GrokQuota402Tests(unittest.TestCase):
             self.assertEqual(after["slots"][0]["infrastructure_error_count"], 1)
             self.assertEqual(after["slots"][0]["independent_pass_count"], 1)
             self.assertTrue(failed.is_dir())
+
+    def test_authentic_seven_command_pre_result_402_needs_later_xai_pass(self):
+        """The observed 1593 CLI advertises memory in addition to six commands."""
+        variant = [
+            {"type": "available_commands", "tools": [], "commands": COMMANDS_WITH_MEMORY},
+            {"type": "available_commands", "tools": [], "commands": COMMANDS_WITH_MEMORY},
+            {"type": "error", "message": RECEIVER_ERROR},
+        ]
+        with tempfile.TemporaryDirectory() as temp:
+            jobs = Path(temp) / "jobs"
+            jobs.mkdir(mode=0o700)
+            failed = make_grok_job(jobs, "a00000000402", created=1787000100, failed=True)
+            amend_private_receipt(failed, events=variant)
+            before = reconcile(jobs)
+            self.assertEqual(before["status"], "blocked")
+            self.assertEqual(before["attempts"][0]["classification"], "infrastructure_error")
+            metadata, binding, origin = fixtures.reviews._validated_origin_binding(failed)
+            evidence = fixtures.reviews._validated_review_role_evidence(metadata, binding, origin)
+            self.assertTrue(evidence["pre_result_quota_failure_verified"])
+            self.assertEqual(before["slots"][0]["independent_pass_count"], 0)
+            self.assertIn("decision_review_slot_without_pass:independent-grok", before["errors"])
+            # Only a later authenticated reviewer from the same xAI slot can settle.
+            make_grok_job(jobs, "b00000000402", created=1787000200)
+            after = reconcile(jobs)
+            self.assertEqual(after["status"], "settled", after["errors"])
+            self.assertEqual(after["slots"][0]["infrastructure_error_count"], 1)
+            self.assertEqual(after["slots"][0]["independent_pass_count"], 1)
+
+    def test_seven_command_quota_rejects_unreviewed_command_drift(self):
+        """Do not turn a narrow transport allowlist into a generic subset match."""
+        original = [
+            {"type": "available_commands", "tools": [], "commands": COMMANDS_WITH_MEMORY},
+            {"type": "available_commands", "tools": [], "commands": COMMANDS_WITH_MEMORY},
+            {"type": "error", "message": RECEIVER_ERROR},
+        ]
+        invalid = {
+            "new_command": [*COMMANDS_WITH_MEMORY, "diagnostics"],
+            "duplicate_memory": [*COMMANDS_WITH_MEMORY[:3], "memory", *COMMANDS_WITH_MEMORY[3:]],
+            "reordered": ["memory", *COMMANDS],
+            "missing_goal": COMMANDS_WITH_MEMORY[:-1],
+            "unexpected_mixed_preflight": COMMANDS,
+        }
+        for name, commands in invalid.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temp:
+                events = [dict(item) for item in original]
+                events[0]["commands"] = commands
+                jobs = Path(temp) / "jobs"
+                jobs.mkdir(mode=0o700)
+                failed = make_grok_job(jobs, "a00000000402", created=1787000100, failed=True)
+                amend_private_receipt(failed, events=events)
+                make_grok_job(jobs, "b00000000402", created=1787000200)
+                outcome = reconcile(jobs)
+                self.assertEqual(outcome["status"], "blocked", name)
+                self.assertIn(
+                    "decision_review_result_invalid:grabowski-job-a00000000402:InvalidReviewDocument",
+                    outcome["errors"], name,
+                )
+
+    def test_seven_command_stream_rejects_extra_or_truncated_events(self):
+        """The three-line guard also bounds the parsed event list itself.
+
+        A claimed three-event role receipt cannot turn additional real
+        model/tool/result events into a pre-result 402, nor may a truncated
+        stream raise IndexError during reconciliation.
+        """
+        original = [
+            {"type": "available_commands", "tools": [], "commands": COMMANDS_WITH_MEMORY},
+            {"type": "available_commands", "tools": [], "commands": COMMANDS_WITH_MEMORY},
+            {"type": "error", "message": RECEIVER_ERROR},
+        ]
+        invalid = {
+            "trailing_reject": original + [
+                {"type": "result", "verdict": "REJECT_THIS_REVISION"}
+            ],
+            "trailing_tool": original + [{"type": "tool_call", "name": "terminal"}],
+            "duplicate_error": original + [original[-1]],
+            "trailing_thought": original + [{"type": "thought", "data": "analysis"}],
+            "two_events": original[:2],
+            "one_event": original[:1],
+        }
+        for name, events in invalid.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temp:
+                jobs = Path(temp) / "jobs"
+                jobs.mkdir(mode=0o700)
+                failed = make_grok_job(jobs, "a00000000402", created=1787000100, failed=True)
+                # Deliberately maintain the claimed provider event count=3
+                # even when the authenticated stream bytes contain 1/2/4 events.
+                amend_private_receipt(failed, events=events)
+                make_grok_job(jobs, "b00000000402", created=1787000200)
+                result = reconcile(jobs)
+                self.assertEqual(result["status"], "blocked", name)
+                self.assertEqual(result["attempts"][0]["classification"], "invalid_result", name)
+                self.assertIn(
+                    "decision_review_result_invalid:grabowski-job-a00000000402:InvalidReviewDocument",
+                    result["errors"], name,
+                )
+                self.assertTrue(failed.is_dir())
 
     def test_old_pass_or_different_provider_cannot_satisfy_latest_grok_quota(self):
         with tempfile.TemporaryDirectory() as temp:
