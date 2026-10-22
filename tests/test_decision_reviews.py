@@ -162,6 +162,7 @@ def make_job(
     metadata_argv_override: list[str] | None = None,
     created_at_unix: int = 1_787_000_000,
     started_at_unix_ns: int | None = None,
+    role_command_override: list[str] | None = None,
 ) -> Path:
     unit = f"grabowski-job-{suffix}"
     directory = jobs / unit
@@ -180,6 +181,8 @@ def make_job(
         "plan",
         "Review the frozen revision",
     ]
+    if role_command_override is not None:
+        role_command = role_command_override
     role_receipt_path = (
         directory / reviews.REVIEW_ROLE_ATTEMPT_RECEIPT_NAME
         if attempt_bound else

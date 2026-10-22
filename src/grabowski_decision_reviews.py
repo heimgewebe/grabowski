@@ -1211,6 +1211,149 @@ def _proven_claude_quota_failure_before_review(
     )
 
 
+def _proven_grok_quota_failure_before_review(
+    receipt: dict[str, Any], provenance: dict[str, Any]
+) -> bool:
+    """Recognize only the authenticated, three-event, pre-result xAI 402.
+
+    Recognition is *not* a review decision. It keeps the failed job in history
+    and requires a later real independent PASS from the same provider slot.
+    Any model text, tool use, unknown event, truncation or ambiguous error
+    remains invalid_result, permanently fail-closed.
+    """
+    route = provenance.get("review_route")
+    if (
+        provenance.get("schema_version") != 2
+        or not isinstance(route, dict)
+        or route.get("provider_family") != "xai"
+        or route.get("route_id") != "grok-4.6-review-high"
+        or receipt.get("verdict") != "INVALID"
+        or receipt.get("findings") != []
+        or receipt.get("failure_classification") != "invalid_review_output"
+        or type(receipt.get("returncode")) is not int
+        or receipt["returncode"] != 126
+        or receipt.get("error") != "Grok review stream used unsupported event type: error"
+        or type(receipt.get("review_document_bytes")) is not int
+        or receipt["review_document_bytes"] != 0
+        or receipt.get("review_document_sha256") is not None
+        or receipt.get("review_document_normalizations") != []
+        or receipt.get("review_findings_normalized") is not False
+        or receipt.get("review_input_source") != "committed_diff"
+        or type(receipt.get("review_input_bytes")) is not int
+        or not 0 < receipt["review_input_bytes"] <= 1024 * 1024
+        or not isinstance(receipt.get("review_input_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", receipt["review_input_sha256"]) is None
+    ):
+        return False
+    probe = receipt.get("post_failure_toolchain_probe")
+    if (
+        not isinstance(probe, dict)
+        or probe.get("passed") is not True
+        or probe.get("failure_classification") != "passed"
+        or probe.get("missing_executable") is not False
+        or probe.get("missing_python_module") is not False
+    ):
+        return False
+    provider_fields = {
+        "review_provider_available_commands_events",
+        "review_provider_available_tools",
+        "review_provider_completed_commands",
+        "review_provider_completed_tool_calls",
+        "review_provider_completed_tools",
+        "review_provider_stream_bytes",
+        "review_provider_stream_contract",
+        "review_provider_stream_events",
+        "review_provider_stream_sha256",
+    }
+    if (
+        {key for key in receipt if key.startswith("review_provider_")} != provider_fields
+        or receipt.get("review_provider_stream_contract")
+        != "grok-streaming-json-bound-diff-review-v2"
+        or type(receipt.get("review_provider_stream_events")) is not int
+        or receipt["review_provider_stream_events"] != 3
+        # The original parser returns on the unsupported "error" event
+        # before committing its in-progress available-command count.
+        or type(receipt.get("review_provider_available_commands_events")) is not int
+        or receipt["review_provider_available_commands_events"] != 0
+        or receipt.get("review_provider_available_tools") != []
+        or receipt.get("review_provider_completed_commands") != []
+        or type(receipt.get("review_provider_completed_tool_calls")) is not int
+        or receipt["review_provider_completed_tool_calls"] != 0
+        or receipt.get("review_provider_completed_tools") != []
+    ):
+        return False
+    stdout = receipt.get("stdout_tail")
+    stderr = receipt.get("stderr_tail")
+    if not isinstance(stdout, str) or not isinstance(stderr, str):
+        return False
+    raw_stdout = stdout.encode("utf-8")
+    raw_stderr = stderr.encode("utf-8")
+    if (
+        not raw_stdout or len(raw_stdout) > 4096
+        or type(receipt.get("stdout_bytes")) is not int
+        or receipt["stdout_bytes"] != len(raw_stdout)
+        or receipt.get("stdout_sha256") != hashlib.sha256(raw_stdout).hexdigest()
+        or type(receipt.get("review_provider_stream_bytes")) is not int
+        or receipt["review_provider_stream_bytes"] != len(raw_stdout)
+        or receipt.get("review_provider_stream_sha256") != receipt["stdout_sha256"]
+        or type(receipt.get("stderr_bytes")) is not int
+        or receipt["stderr_bytes"] != len(raw_stderr)
+        or receipt.get("stderr_sha256") != hashlib.sha256(raw_stderr).hexdigest()
+    ):
+        return False
+
+    error_message = (
+        "API error (status 402 Payment Required): "
+        "Grok Build usage balance exhausted"
+    )
+    wrapped = (
+        'Internal error: {\n  "message": "' + error_message
+        + '",\n  "http_status": 402\n}'
+    )
+    if stderr != "Error: " + wrapped + "\n":
+        return False
+    # No silent duplicate JSON member, Unicode alias, partial/truncated stream,
+    # embedded prose, usage, tool event or end_turn can masquerade as zero work.
+    lines = stdout.splitlines(keepends=True)
+    if len(lines) != 3 or any(not line.endswith("\n") for line in lines):
+        return False
+
+    def reject_duplicate_members(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("duplicate Grok quota stream key")
+            value[key] = item
+        return value
+
+    try:
+        events = [
+            json.loads(line[:-1], object_pairs_hook=reject_duplicate_members)
+            for line in lines
+        ]
+    except (ValueError, UnicodeError):
+        return False
+    six_commands = [
+        "compact", "always-approve", "context",
+        "session-info", "feedback", "goal",
+    ]
+    # These are the only two complete provider preflight sequences proven
+    # in immutable, origin-bound failed review receipts. Do not accept subsets,
+    # mixed lists, reordered commands or any additional result/tool events.
+    known_commands = (
+        six_commands,
+        [*six_commands[:2], "memory", *six_commands[2:]],
+    )
+    return any(
+        events == [
+            {"type": "available_commands", "tools": [], "commands": commands},
+            {"type": "available_commands", "tools": [], "commands": commands},
+            {"type": "error", "message": wrapped},
+        ]
+        for commands in known_commands
+    )
+
+
 def _validated_review_role_evidence(
     metadata: dict[str, Any], binding: dict[str, Any], provenance: dict[str, Any] | None
 ) -> dict[str, Any] | None:
@@ -1272,7 +1415,10 @@ def _validated_review_role_evidence(
         "result": result,
         "pre_result_quota_failure_verified": (
             result is None
-            and _proven_claude_quota_failure_before_review(receipt, provenance)
+            and (
+                _proven_claude_quota_failure_before_review(receipt, provenance)
+                or _proven_grok_quota_failure_before_review(receipt, provenance)
+            )
         ),
     }
 
