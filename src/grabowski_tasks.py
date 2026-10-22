@@ -1123,6 +1123,7 @@ def _terminal_stdout_receipt_fields(seal: dict[str, Any]) -> dict[str, Any]:
         "stdout_capture_status": proof["status"],
         "captured_stdout_sha256": proof.get("sha256"),
         "captured_stdout_bytes": proof.get("bytes"),
+        # Informational marker layout, not independently attested wrapper output.
         "captured_stdout_truncated": proof.get("truncated"),
         "captured_stdout_authority": proof["authority"],
     }
@@ -1151,6 +1152,15 @@ def _read_existing_outcome_receipt(
         isinstance(existing_terminalization, dict)
         and existing_terminalization.get("transition_sha256") == transition_sha256
     ):
+        # Historical v2 transitions without a seal must not inherit
+        # caller-injected stdout metadata that attention will later reject.
+        if expected_stdout_seal is None and any(
+            key.startswith(("captured_stdout_", "stdout_capture_"))
+            for key in existing
+        ):
+            raise RuntimeError(
+                "stored task stdout seal conflicts with terminal transition"
+            )
         if expected_stdout_seal is not None:
             expected_fields = _terminal_stdout_receipt_fields(expected_stdout_seal)
             for key, value in expected_fields.items():
@@ -6399,6 +6409,7 @@ def _validate_terminal_stdout_seal(seal: Any) -> dict[str, Any]:
                 "remote-transport",
                 "host-unresolved",
                 "output-root-missing",
+                "output-root-unsafe",
                 "output-directory-missing",
                 "stdout-missing",
                 "output-directory-unsafe",
@@ -6449,9 +6460,19 @@ def _terminal_stdout_seal(record: dict[str, Any]) -> dict[str, Any]:
     root = paths["directory"].parent
     if not root.exists():
         return unproven("output-root-missing")
-    root_fd, root_before = _open_local_task_output_root(root)
-    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
-    file_flags = os.O_RDONLY | os.O_CLOEXEC
+    try:
+        root_fd, root_before = _open_local_task_output_root(root)
+    except RuntimeError as exc:
+        # Known permission denial only degrades output evidence. Other
+        # root or identity/I/O errors remain fail-closed.
+        cause = exc.__cause__
+        if isinstance(cause, OSError) and cause.errno in {errno.EACCES, errno.EPERM}:
+            return unproven("output-root-unsafe")
+        raise
+    # Non-regular same-UID capture entries (notably FIFOs) must never stall
+    # task terminality while waiting for a writer before fstat can reject them.
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NONBLOCK
+    file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
     if hasattr(os, "O_NOFOLLOW"):
         directory_flags |= os.O_NOFOLLOW
         file_flags |= os.O_NOFOLLOW
@@ -6461,7 +6482,7 @@ def _terminal_stdout_seal(record: dict[str, Any]) -> dict[str, Any]:
         except FileNotFoundError:
             return unproven("output-directory-missing")
         except OSError as exc:
-            if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            if exc.errno in {errno.ELOOP, errno.ENOTDIR, errno.EACCES, errno.EPERM}:
                 return unproven("output-directory-unsafe")
             raise RuntimeError("task stdout directory could not be opened safely") from exc
         try:
@@ -6487,7 +6508,7 @@ def _terminal_stdout_seal(record: dict[str, Any]) -> dict[str, Any]:
             except FileNotFoundError:
                 return unproven("stdout-missing")
             except OSError as exc:
-                if exc.errno == errno.ELOOP:
+                if exc.errno in {errno.ELOOP, errno.EACCES, errno.EPERM, errno.ENXIO}:
                     return unproven("stdout-unsafe")
                 raise RuntimeError("task stdout could not be opened safely") from exc
             try:
@@ -6514,7 +6535,7 @@ def _terminal_stdout_seal(record: dict[str, Any]) -> dict[str, Any]:
                 except FileNotFoundError:
                     return unproven("stderr-missing")
                 except OSError as exc:
-                    if exc.errno == errno.ELOOP:
+                    if exc.errno in {errno.ELOOP, errno.EACCES, errno.EPERM, errno.ENXIO}:
                         return unproven("stderr-unsafe")
                     raise RuntimeError("task stderr could not be opened safely") from exc
                 try:
@@ -6539,8 +6560,9 @@ def _terminal_stdout_seal(record: dict[str, Any]) -> dict[str, Any]:
                 digest = hashlib.sha256()
                 remaining = int(before.st_size)
                 truncated = False
-                # Only the wrapper may place its marker at this exact offset;
-                # free-form text printed by the child is never a seal flag.
+                # A matching marker layout at the wrapper's reserved offset
+                # remains operator-UID observation only. Deliberately crafted
+                # child output can forge the same marker bytes.
                 marker_reserve = 256
                 marker_offset = (
                     TASK_OUTPUT_MAX_BYTES - TASK_OUTPUT_TAIL_BYTES - marker_reserve

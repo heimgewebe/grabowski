@@ -1917,6 +1917,76 @@ class TaskTests(unittest.TestCase):
         self.assertEqual("running", tasks._row_raw(identifier)["state"])
         self.assertIsNone(tasks.resources.task_terminalization_record(identifier))
 
+    def test_terminal_stdout_fifo_is_unproven_without_blocking_open(self) -> None:
+        # A child may replace either capture stream with a FIFO.  Never
+        # perform a blocking O_RDONLY open before checking the inode kind.
+        for stream in ("stdout", "stderr"):
+            with self.subTest(stream=stream):
+                identifier, stdout = self._managed_terminal_stdout_fixture(b"source")
+                target = stdout if stream == "stdout" else stdout.with_name("stderr.log")
+                target.unlink()
+                os.mkfifo(target, 0o600)
+                original_open = os.open
+
+                def guarded_open(path, flags, *args, **kwargs):
+                    if path == target.name and not flags & os.O_NONBLOCK:
+                        raise AssertionError("capture FIFO open would block")
+                    return original_open(path, flags, *args, **kwargs)
+
+                with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+                    tasks.os, "open", side_effect=guarded_open
+                ):
+                    stored = tasks._set_state(identifier, "failed")
+                self.assertEqual("failed", stored["state"])
+                self.assertEqual(
+                    "projected", tasks.resources.task_terminalization_record(identifier)["phase"]
+                )
+                receipt = json.loads(
+                    (tasks.TASK_OUTCOMES_DIR / f"{identifier}.json").read_text()
+                )
+                self.assertEqual("unproven", receipt["stdout_capture_status"])
+                self.assertEqual(f"{stream}-unsafe", receipt["stdout_capture_reason"])
+                self.assertIsNone(receipt["captured_stdout_sha256"])
+
+    def test_terminal_stdout_denied_capture_mode_is_unproven_not_terminal_block(self) -> None:
+        # Deterministic EACCES even on privileged CI runners, with the real
+        # files/directories also chmod(000), avoiding a root-only false green.
+        for stream in ("directory", "stdout", "stderr"):
+            with self.subTest(stream=stream):
+                identifier, stdout = self._managed_terminal_stdout_fixture(b"source")
+                target = (
+                    stdout.parent if stream == "directory"
+                    else stdout if stream == "stdout"
+                    else stdout.with_name("stderr.log")
+                )
+                expected = (
+                    "output-directory-unsafe" if stream == "directory" else f"{stream}-unsafe"
+                )
+                original_open = os.open
+                os.chmod(target, 0o000)
+
+                def denied_open(path, flags, *args, **kwargs):
+                    if path == target.name:
+                        raise PermissionError(13, "Permission denied", str(path))
+                    return original_open(path, flags, *args, **kwargs)
+
+                try:
+                    with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+                        tasks.os, "open", side_effect=denied_open
+                    ):
+                        stored = tasks._set_state(identifier, "cancelled")
+                finally:
+                    os.chmod(target, 0o700 if stream == "directory" else 0o600)
+                self.assertEqual("cancelled", stored["state"])
+                transition = tasks.resources.task_terminalization_record(identifier)
+                self.assertEqual("projected", transition["phase"])
+                receipt = json.loads(
+                    (tasks.TASK_OUTCOMES_DIR / f"{identifier}.json").read_text()
+                )
+                self.assertEqual("unproven", receipt["stdout_capture_status"])
+                self.assertEqual(expected, receipt["stdout_capture_reason"])
+                self.assertIsNone(receipt["captured_stdout_sha256"])
+
     def test_terminal_stdout_seal_validator_rejects_forged_status_and_type(self) -> None:
         valid = {
             "status": "sealed",
@@ -1938,6 +2008,75 @@ class TaskTests(unittest.TestCase):
                 forged = {**valid, **update}
                 with self.assertRaises(RuntimeError):
                     tasks._validate_terminal_stdout_seal(forged)
+
+    def test_terminal_stdout_unreadable_output_root_is_unproven(self) -> None:
+        # The child shares the operator UID and may remove access to the
+        # shared output root. Only a known permission denial degrades proof;
+        # unknown root/identity/I/O failures must still fail closed.
+        identifier, stdout = self._managed_terminal_stdout_fixture(b"source")
+        root = stdout.parent.parent
+        original_open = os.open
+        os.chmod(root, 0o000)
+
+        def denied_root_open(path, flags, *args, **kwargs):
+            if str(path) == str(root):
+                raise PermissionError(13, "Permission denied", str(root))
+            return original_open(path, flags, *args, **kwargs)
+
+        try:
+            with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+                tasks.os, "open", side_effect=denied_root_open
+            ):
+                stored = tasks._set_state(identifier, "failed")
+        finally:
+            os.chmod(root, 0o700)
+        self.assertEqual("failed", stored["state"])
+        receipt = json.loads(
+            (tasks.TASK_OUTCOMES_DIR / f"{identifier}.json").read_text()
+        )
+        self.assertEqual("unproven", receipt["stdout_capture_status"])
+        self.assertEqual("output-root-unsafe", receipt["stdout_capture_reason"])
+        self.assertEqual(
+            "projected", tasks.resources.task_terminalization_record(identifier)["phase"]
+        )
+
+    def test_historical_v2_transition_without_seal_rejects_injected_capture_fields(self) -> None:
+        transition_sha = "a" * 64
+        clean = {
+            "schema_version": 2,
+            "terminalization": {"transition_sha256": transition_sha},
+        }
+        path = self.root / "legacy-terminal-receipt.json"
+
+        def write_payload(payload):
+            material = dict(payload)
+            material["receipt_sha256"] = tasks._sha256_json(material)
+            path.write_text(json.dumps(material), encoding="utf-8")
+            return material["receipt_sha256"]
+
+        clean_digest = write_payload(clean)
+        self.assertEqual(
+            clean_digest,
+            tasks._read_existing_outcome_receipt(
+                path, transition_sha256=transition_sha, allow_legacy=False,
+                expected_stdout_seal=None,
+            ),
+        )
+        for key, value in (
+            ("captured_stdout_sha256", "0" * 64),
+            ("captured_stdout_truncated", True),
+            ("stdout_capture_status", "sealed"),
+            ("stdout_capture_reason", "forged"),
+        ):
+            with self.subTest(key=key):
+                write_payload({**clean, key: value})
+                with self.assertRaisesRegex(
+                    RuntimeError, "stored task stdout seal conflicts with terminal transition"
+                ):
+                    tasks._read_existing_outcome_receipt(
+                        path, transition_sha256=transition_sha, allow_legacy=False,
+                        expected_stdout_seal=None,
+                    )
 
     def test_terminal_stdout_existing_receipt_reseal_cannot_rollback_transition_binding(self) -> None:
         identifier, _ = self._managed_terminal_stdout_fixture(b"trusted-original")
