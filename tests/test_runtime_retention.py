@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+import io
 import hashlib
 import importlib.util
 import json
@@ -1821,7 +1822,8 @@ class RuntimeRetentionTests(unittest.TestCase):
             RETENTION, "_apply_periodic_worktree_hygiene", return_value={"completed": True}
         ):
             result = RETENTION.apply_periodic_plan()
-        self.assertTrue(result["completed"])
+        self.assertFalse(result["completed"])
+        self.assertEqual(result["status"], "degraded")
         self.assertFalse(result["mutated"])
         self.assertEqual(result["preserved_blocked_units"], blocked)
 
@@ -2564,7 +2566,8 @@ class RuntimeRetentionTests(unittest.TestCase):
                 result = RETENTION.apply_plan(
                     plan, expected_plan_sha256=plan["plan_sha256"]
                 )
-            self.assertTrue(result["completed"])
+            self.assertFalse(result["completed"])
+            self.assertEqual(result["status"], "degraded")
             self.assertTrue((job / "metadata.json").is_file())
             self.assertFalse((archive / name).exists())
             self.assertFalse(index.exists())
@@ -2616,7 +2619,8 @@ class RuntimeRetentionTests(unittest.TestCase):
                 result = RETENTION.apply_plan(
                     plan, expected_plan_sha256=plan["plan_sha256"]
                 )
-            self.assertTrue(result["completed"])
+            self.assertFalse(result["completed"])
+            self.assertEqual(result["status"], "degraded")
             bootstrap.assert_not_called()
             self.assertTrue((old / "metadata.json").is_file())
             self.assertTrue((live / "metadata.json").is_file())
@@ -2895,7 +2899,8 @@ class RuntimeRetentionTests(unittest.TestCase):
                     result = RETENTION.apply_plan(
                         plan, expected_plan_sha256=plan["plan_sha256"]
                     )
-            self.assertTrue(result["completed"])
+            self.assertFalse(result["completed"])
+            self.assertEqual(result["status"], "degraded")
             self.assertTrue((source_bad / "metadata.json").is_file())
             self.assertFalse((archive / bad_name).exists())
             self.assertTrue((archive / good_name / "archive-manifest.json").is_file())
@@ -3488,7 +3493,8 @@ class RuntimeRetentionTests(unittest.TestCase):
                 result = RETENTION.apply_plan(
                     plan, expected_plan_sha256=plan["plan_sha256"]
                 )
-            self.assertTrue(result["completed"])
+            self.assertFalse(result["completed"])
+            self.assertEqual(result["status"], "degraded")
             self.assertFalse(result["retry"]["required"])
             self.assertEqual(result["archived_jobs"], [])
             self.assertTrue((source / "metadata.json").is_file())
@@ -4031,7 +4037,9 @@ class RuntimeRetentionTests(unittest.TestCase):
                 receipt = RETENTION.apply_plan(
                     plan, expected_plan_sha256=plan["plan_sha256"]
                 )
-            self.assertTrue(receipt["completed"])
+            self.assertFalse(receipt["completed"])
+            self.assertTrue(receipt["mutated"])
+            self.assertEqual(receipt["status"], "degraded")
             reset.assert_called_once_with(
                 ["systemctl", "--user", "reset-failed", task_unit]
             )
@@ -5610,8 +5618,82 @@ class RuntimeRetentionTests(unittest.TestCase):
             second = RETENTION.apply_periodic_plan()
         self.assertEqual(first, second)
         self.assertTrue(first["completed"])
+        self.assertEqual(first["status"], "passed")
         self.assertFalse(first["mutated"])
         apply.assert_not_called()
+
+    def test_periodic_failed_runtime_degraded_is_not_hidden_by_healthy_hygiene(self) -> None:
+        plan = {
+            "plan_sha256": "8" * 64,
+            "reset_failed_units": ["grabowski-task-" + "8" * 24 + "-a1.service"],
+            "archive_jobs": [],
+            "blocked": [],
+        }
+        # The underlying reset receipt can be completed but degraded.
+        applied = {"completed": True, "mutated": True, "status": "degraded",
+                   "plan_sha256": plan["plan_sha256"], "preserved_blocked_units": []}
+        hygiene = {"completed": True, "mutated": True, "status": "passed"}
+        with patch.object(
+            RETENTION, "build_plan", side_effect=[plan, plan]
+        ), patch.object(
+            RETENTION, "apply_plan", return_value=applied
+        ), patch.object(
+            RETENTION, "_apply_periodic_worktree_hygiene", return_value=hygiene
+        ):
+            result = RETENTION.apply_periodic_plan(
+                worktree_hygiene_repositories=["/test-only"]
+            )
+        self.assertEqual(result["runtime_retention"], applied)
+        self.assertEqual(result["worktree_hygiene"], hygiene)
+        self.assertFalse(result["completed"])
+        self.assertEqual(result["status"], "degraded")
+        self.assertTrue(result["mutated"])
+
+    def test_periodic_blocked_job_noop_remains_visible_with_healthy_hygiene(self) -> None:
+        blocked = [{"unit": "grabowski-job-aaaaaaaaaaaa.service",
+                    "reason": "protected job archive has no privileged authority"}]
+        plan = {"plan_sha256": "7" * 64, "archive_jobs": [],
+                "reset_failed_units": [], "blocked": blocked}
+        hygiene = {"completed": True, "mutated": False, "status": "passed"}
+        with patch.object(
+            RETENTION, "build_plan", side_effect=[plan, plan]
+        ), patch.object(
+            RETENTION, "_apply_periodic_worktree_hygiene", return_value=hygiene
+        ):
+            result = RETENTION.apply_periodic_plan(
+                worktree_hygiene_repositories=["/test-only"]
+            )
+        self.assertFalse(result["completed"])
+        self.assertEqual(result["status"], "degraded")
+        self.assertEqual(result["preserved_blocked_units"], blocked)
+        self.assertEqual(result["runtime_retention"]["status"], "degraded")
+
+    def test_periodic_and_explicit_cli_report_degraded_via_exit_code_2(self) -> None:
+        plan = {"plan_sha256": "6" * 64, "reset_failed_units": [],
+                "archive_jobs": [], "blocked": []}
+        for mode in ("periodic", "explicit"):
+            with self.subTest(mode=mode):
+                receipt = {"schema_version": 1, "completed": True,
+                           "mutated": True, "status": "degraded",
+                           "preserved_blocked_units": [{"unit": "job", "reason": "blocked"}]}
+                argv = ["maintain_runtime_state", "--periodic-apply"] if mode == "periodic" else [
+                    "maintain_runtime_state", "--apply", "--expected-plan-sha256",
+                    plan["plan_sha256"],
+                ]
+                with patch.object(
+                    RETENTION.sys, "argv", argv
+                ), patch.object(
+                    RETENTION, "apply_periodic_plan", return_value=receipt
+                ), patch.object(
+                    RETENTION, "build_plan", return_value=plan
+                ), patch.object(
+                    RETENTION, "apply_plan", return_value=receipt
+                ), patch.object(
+                    RETENTION.sys, "stdout", new_callable=io.StringIO
+                ) as output:
+                    code = RETENTION.main()
+                self.assertEqual(code, 2)
+                self.assertEqual(json.loads(output.getvalue()), receipt)
 
     def test_periodic_apply_reuses_hash_bound_apply_contract(self) -> None:
         plan = {
@@ -5701,12 +5783,35 @@ class RuntimeRetentionTests(unittest.TestCase):
                     worktree_hygiene_allowed_roots=[str(allowed)],
                     worktree_hygiene_runner=runner,
                 )
-        self.assertTrue(result["completed"])
+        self.assertFalse(result["completed"])
+        self.assertEqual(result["status"], "degraded")
         self.assertFalse(result["mutated"])
         self.assertEqual(
             result["worktree_hygiene"]["receipts"][0]["status"],
             "blocked",
         )
+
+    def test_periodic_hygiene_rejects_unknown_status_without_false_pass(self) -> None:
+        # The second R3 P2 must fail closed on every status outside passed/blocked.
+        plan = {"plan_sha256": "a" * 64, "archive_jobs": [],
+                "reset_failed_units": [], "blocked": []}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repo, allowed = root / "repo", root / "worktrees"
+            repo.mkdir()
+            allowed.mkdir()
+            for status in ("partial", "refused", "error", "applied", None):
+                with self.subTest(status=status), patch.object(
+                    RETENTION, "build_plan", return_value=plan
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "invalid status"):
+                        RETENTION.apply_periodic_plan(
+                            worktree_hygiene_repositories=[str(repo)],
+                            worktree_hygiene_allowed_roots=[str(allowed)],
+                            worktree_hygiene_runner=Mock(
+                                return_value={"status": status, "output": {"actions": 0}}
+                            ),
+                        )
 
     def test_periodic_worktree_hygiene_skips_missing_optional_roots(self) -> None:
         plan = {
