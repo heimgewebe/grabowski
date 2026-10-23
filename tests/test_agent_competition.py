@@ -172,6 +172,43 @@ class AgentCompetitionTests(unittest.TestCase):
             ),
         )
 
+    def test_candidate_receipt_rejects_smuggled_mode_headers(self) -> None:
+        for injected_header in (
+            "new file mode 120000 100644",
+            "new file mode 160000 100644",
+            "old mode 100644 trailing-junk",
+            "index 1234567..abcdef0 120000 x",
+            "index 1234567..abcdef0 160000 100644",
+        ):
+            patch = (
+                "diff --git a/src/linked.py b/src/linked.py\n"
+                f"{injected_header}\n"
+                "--- a/src/linked.py\n"
+                "+++ b/src/linked.py\n"
+                "@@ -1 +1 @@\n"
+                "-old\n"
+                "+new\n"
+            )
+            with self.subTest(injected_header=injected_header):
+                with self.assertRaisesRegex(
+                    competition.AgentCompetitionError, "non-regular Git file mode"
+                ):
+                    competition._receipt_patch_paths(patch)
+
+    def test_candidate_receipt_denies_patch_to_committed_symlink(self) -> None:
+        link = self.repo / "src" / "linked.py"
+        link.symlink_to("../sample.py")
+        subprocess.run(["git", "add", "--", "src/linked.py"], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-qm", "committed symlink"], cwd=self.repo, check=True)
+        head = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=self.repo, text=True
+        ).strip()
+        with self.assertRaisesRegex(
+            competition.AgentCompetitionError, "non-regular tracked Git file"
+        ):
+            competition._validate_patch_base_modes(self.repo, head, ["src/linked.py"])
+        competition._validate_patch_base_modes(self.repo, head, ["src/sample.py", "src/new.py"])
+
     def test_runner_resolution_finds_manifest_bound_release_asset(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             release = Path(temporary) / "release"

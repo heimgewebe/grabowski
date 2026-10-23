@@ -625,17 +625,44 @@ def path_in_scope(path: str, roots: list[str]) -> bool:
     return any(item == PurePosixPath(root) or PurePosixPath(root) in item.parents for root in roots)
 
 
+def validate_patch_base_modes(repo: Path, head: str, paths: list[str]) -> None:
+    """Reject any patch that modifies a committed symlink, gitlink, or nonregular file."""
+    for relative in paths:
+        listing = run_git(repo, ["ls-tree", "-z", head, "--", relative])
+        if listing.returncode != 0:
+            raise CandidateError("candidate patch base Git mode is unavailable")
+        entries = [entry for entry in listing.stdout.split(b"\x00") if entry]
+        if not entries:
+            continue  # A newly added file must declare a regular Git mode in the patch.
+        if len(entries) != 1 or b"\t" not in entries[0]:
+            raise CandidateError("candidate patch base Git metadata is invalid")
+        metadata, raw_path = entries[0].split(b"\t", 1)
+        fields = metadata.split()
+        if (
+            len(fields) != 3
+            or fields[0] not in {b"100644", b"100755"}
+            or fields[1] != b"blob"
+            or raw_path != relative.encode("utf-8")
+        ):
+            raise CandidateError("candidate patch targets non-regular tracked Git file")
+
+
 def patch_paths(patch: str) -> list[str]:
     paths: list[str] = []
     for line in patch.splitlines():
         # Git permits symlink/submodule patches in a temporary index. A
         # syntactically applicable diff is not proof of a regular-file patch.
-        if line.startswith(("new file mode ", "deleted file mode ", "old mode ", "new mode ")):
-            if line.split()[-1] not in {"100644", "100755"}:
+        if line.startswith(("new file mode", "deleted file mode", "old mode", "new mode")):
+            if re.fullmatch(
+                r"(?:new file mode|deleted file mode|old mode|new mode) (?:100644|100755)",
+                line,
+            ) is None:
                 raise CandidateError("candidate patch contains non-regular Git file mode")
-        elif line.startswith("index "):
-            parts = line.split()
-            if len(parts) == 3 and parts[2] not in {"100644", "100755"}:
+        elif line.startswith("index"):
+            if re.fullmatch(
+                r"index [0-9a-fA-F]{4,64}\.\.[0-9a-fA-F]{4,64}(?: (?:100644|100755))?",
+                line,
+            ) is None:
                 raise CandidateError("candidate patch contains non-regular Git file mode")
         if line.startswith("diff --git "):
             parts = line.split(" ")
@@ -1017,6 +1044,8 @@ def validate_candidate(
     patch_rejection: dict[str, Any] | None = None
     try:
         parsed_paths = patch_paths(patch)
+        if parsed_paths:
+            validate_patch_base_modes(repo, packet["expected_head"], parsed_paths)
     except CandidateError as exc:
         patch_rejection = {
             "rejected": True,

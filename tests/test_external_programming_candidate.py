@@ -136,6 +136,67 @@ class ExternalProgrammingCandidateTests(unittest.TestCase):
         )
         self.assertEqual(["src/tool.py"], candidate_tool.patch_paths(regular))
 
+    def test_patch_paths_rejects_smuggled_git_modes(self) -> None:
+        for injected_header in (
+            "new file mode 120000 100644",
+            "new file mode 160000 100644",
+            "old mode 100644 junk",
+            "index 1234567..abcdef0 120000 x",
+            "index 1234567..abcdef0 160000 100644",
+        ):
+            patch = (
+                "diff --git a/src/linked.py b/src/linked.py\n"
+                f"{injected_header}\n"
+                "--- a/src/linked.py\n"
+                "+++ b/src/linked.py\n"
+                "@@ -1 +1 @@\n"
+                "-old\n"
+                "+new\n"
+            )
+            with self.subTest(injected_header=injected_header):
+                with self.assertRaisesRegex(
+                    candidate_tool.CandidateError, "non-regular Git file mode"
+                ):
+                    candidate_tool.patch_paths(patch)
+
+    def test_candidate_drops_patch_retargeting_committed_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+            (repo / "src").mkdir()
+            (repo / "source.txt").write_text("regular content\n", encoding="utf-8")
+            (repo / "src" / "linked.py").symlink_to("../source.txt")
+            subprocess.run(["git", "add", "."], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-qm", "base with symlink"], cwd=repo, check=True)
+            head = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=repo, text=True
+            ).strip()
+            value = self._candidate()
+            value["changed_paths"] = ["src/linked.py"]
+            value["patch"] = (
+                "diff --git a/src/linked.py b/src/linked.py\n"
+                "--- a/src/linked.py\n"
+                "+++ b/src/linked.py\n"
+                "@@ -1 +1 @@\n"
+                "-../source.txt\n"
+                "+../../secrets.txt\n"
+            )
+            packet = {
+                "allowed_paths": ["src"],
+                "forbidden_paths": [],
+                "expected_head": head,
+            }
+            result = candidate_tool.validate_candidate(value, packet, repo, scratch_dir=root)
+            self.assertEqual(result["patch"], "")
+            self.assertFalse(result["patch_check"]["syntax_accepted"])
+            self.assertTrue(result["patch_rejection"]["rejected"])
+            self.assertIn("non-regular tracked Git file", result["patch_rejection"]["reason"])
+            candidate_tool.validate_patch_base_modes(repo, head, ["source.txt", "src/new.py"])
+
     def test_committed_git_symlink_is_not_exportable_by_runner(self) -> None:
         # Git calls symlinks "blob" objects too; mode 120000 must not be treated
         # as regular source, even if the packet presents the matching blob hash.

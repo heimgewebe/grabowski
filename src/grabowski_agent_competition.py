@@ -1314,17 +1314,44 @@ def _validated_manifest(identifier: str) -> dict[str, Any]:
     return manifest
 
 
+def _validate_patch_base_modes(repo: Path, head: str, paths: list[str]) -> None:
+    """Reject patches that modify committed symlinks, gitlinks, or nonregular entries."""
+    for relative in paths:
+        listing = _git(repo, ["ls-tree", "-z", head, "--", relative])
+        if listing.returncode != 0:
+            raise AgentCompetitionError("candidate patch base Git mode is unavailable")
+        entries = [record for record in listing.stdout.split(b"\x00") if record]
+        if not entries:
+            continue  # A new file is allowed if its patch header declares a regular mode.
+        if len(entries) != 1 or b"\t" not in entries[0]:
+            raise AgentCompetitionError("candidate patch base Git metadata is invalid")
+        metadata, raw_path = entries[0].split(b"\t", 1)
+        fields = metadata.split()
+        if (
+            len(fields) != 3
+            or fields[0] not in {b"100644", b"100755"}
+            or fields[1] != b"blob"
+            or raw_path != relative.encode("utf-8")
+        ):
+            raise AgentCompetitionError("candidate patch targets non-regular tracked Git file")
+
+
 def _receipt_patch_paths(patch: str) -> list[str]:
     paths: list[str] = []
     for line in patch.splitlines():
         # Git permits symlink/submodule patches in a temporary index. A
         # syntactically applicable diff is not proof of a regular-file patch.
-        if line.startswith(("new file mode ", "deleted file mode ", "old mode ", "new mode ")):
-            if line.split()[-1] not in {"100644", "100755"}:
+        if line.startswith(("new file mode", "deleted file mode", "old mode", "new mode")):
+            if re.fullmatch(
+                r"(?:new file mode|deleted file mode|old mode|new mode) (?:100644|100755)",
+                line,
+            ) is None:
                 raise AgentCompetitionError("candidate patch contains non-regular Git file mode")
-        elif line.startswith("index "):
-            parts = line.split()
-            if len(parts) == 3 and parts[2] not in {"100644", "100755"}:
+        elif line.startswith("index"):
+            if re.fullmatch(
+                r"index [0-9a-fA-F]{4,64}\.\.[0-9a-fA-F]{4,64}(?: (?:100644|100755))?",
+                line,
+            ) is None:
                 raise AgentCompetitionError("candidate patch contains non-regular Git file mode")
         if not line.startswith("diff --git "):
             continue
@@ -1421,6 +1448,8 @@ def _validate_receipt_candidate(candidate: Any, packet: dict[str, Any]) -> dict[
     if not isinstance(patch_hash, str) or patch_hash != _sha256_bytes(patch.encode("utf-8")):
         raise AgentCompetitionError("candidate receipt patch hash is invalid")
     parsed_patch_paths = _receipt_patch_paths(patch)
+    if parsed_patch_paths:
+        _validate_patch_base_modes(Path(packet["repository"]), packet["expected_head"], parsed_patch_paths)
     recorded_patch_paths = candidate["patch_paths"]
     if not isinstance(recorded_patch_paths, list):
         raise AgentCompetitionError("candidate receipt patch_paths is invalid")
