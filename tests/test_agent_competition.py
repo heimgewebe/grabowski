@@ -53,6 +53,43 @@ else:
 
 
 class AgentCompetitionTests(unittest.TestCase):
+    def test_candidate_receipt_rejects_nonregular_git_patch_modes(self) -> None:
+        for mode in ("120000", "160000"):
+            patch = (
+                "diff --git a/src/sample.py b/src/sample.py\n"
+                f"new file mode {mode}\n"
+                "index 0000000..abcdef0\n"
+                "--- /dev/null\n"
+                "+++ b/src/sample.py\n"
+                "@@ -0,0 +1 @@\n"
+                "+relative-target\n"
+            )
+            with self.subTest(mode=mode), self.assertRaisesRegex(
+                competition.AgentCompetitionError, "non-regular Git file mode"
+            ):
+                competition._receipt_patch_paths(patch)
+        patch = (
+            "diff --git a/src/sample.py b/src/sample.py\n"
+            "index 1234567..abcdef0 120000\n"
+            "--- a/src/sample.py\n"
+            "+++ b/src/sample.py\n"
+            "@@ -1 +1 @@\n"
+            "-old\n"
+            "+new\n"
+        )
+        with self.assertRaisesRegex(
+            competition.AgentCompetitionError, "non-regular Git file mode"
+        ):
+            competition._receipt_patch_paths(patch)
+        self.assertEqual(
+            ["src/sample.py"],
+            competition._receipt_patch_paths(
+                "diff --git a/src/sample.py b/src/sample.py\n"
+                "old mode 100644\n"
+                "new mode 100755\n"
+            ),
+        )
+
     def test_runner_resolution_finds_manifest_bound_release_asset(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             release = Path(temporary) / "release"

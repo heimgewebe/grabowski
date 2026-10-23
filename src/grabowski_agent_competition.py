@@ -1300,6 +1300,15 @@ def _validated_manifest(identifier: str) -> dict[str, Any]:
 def _receipt_patch_paths(patch: str) -> list[str]:
     paths: list[str] = []
     for line in patch.splitlines():
+        # Git permits symlink/submodule patches in a temporary index. A
+        # syntactically applicable diff is not proof of a regular-file patch.
+        if line.startswith(("new file mode ", "deleted file mode ", "old mode ", "new mode ")):
+            if line.split()[-1] not in {"100644", "100755"}:
+                raise AgentCompetitionError("candidate patch contains non-regular Git file mode")
+        elif line.startswith("index "):
+            parts = line.split()
+            if len(parts) == 3 and parts[2] not in {"100644", "100755"}:
+                raise AgentCompetitionError("candidate patch contains non-regular Git file mode")
         if not line.startswith("diff --git "):
             continue
         parts = line.split(" ")

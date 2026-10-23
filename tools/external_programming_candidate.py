@@ -619,6 +619,15 @@ def path_in_scope(path: str, roots: list[str]) -> bool:
 def patch_paths(patch: str) -> list[str]:
     paths: list[str] = []
     for line in patch.splitlines():
+        # Git permits symlink/submodule patches in a temporary index. A
+        # syntactically applicable diff is not proof of a regular-file patch.
+        if line.startswith(("new file mode ", "deleted file mode ", "old mode ", "new mode ")):
+            if line.split()[-1] not in {"100644", "100755"}:
+                raise CandidateError("candidate patch contains non-regular Git file mode")
+        elif line.startswith("index "):
+            parts = line.split()
+            if len(parts) == 3 and parts[2] not in {"100644", "100755"}:
+                raise CandidateError("candidate patch contains non-regular Git file mode")
         if line.startswith("diff --git "):
             parts = line.split(" ")
             if len(parts) != 4 or not parts[2].startswith("a/") or not parts[3].startswith("b/"):

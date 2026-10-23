@@ -26,6 +26,46 @@ candidate_tool = _load_tool()
 
 
 class ExternalProgrammingCandidateTests(unittest.TestCase):
+    def test_patch_paths_reject_nonregular_git_modes(self) -> None:
+        for mode in ("120000", "160000"):
+            patch = (
+                "diff --git a/src/linked.py b/src/linked.py\n"
+                f"new file mode {mode}\n"
+                "index 0000000..abcdef0\n"
+                "--- /dev/null\n"
+                "+++ b/src/linked.py\n"
+                "@@ -0,0 +1 @@\n"
+                "+relative-target\n"
+            )
+            with self.subTest(mode=mode), self.assertRaisesRegex(
+                candidate_tool.CandidateError, "non-regular Git file mode"
+            ):
+                candidate_tool.patch_paths(patch)
+        for mode in ("120000", "160000"):
+            patch = (
+                "diff --git a/src/file.py b/src/file.py\n"
+                f"index 1234567..abcdef0 {mode}\n"
+                "--- a/src/file.py\n"
+                "+++ b/src/file.py\n"
+                "@@ -1 +1 @@\n"
+                "-old\n"
+                "+new\n"
+            )
+            with self.subTest(index_mode=mode), self.assertRaisesRegex(
+                candidate_tool.CandidateError, "non-regular Git file mode"
+            ):
+                candidate_tool.patch_paths(patch)
+        regular = (
+            "diff --git a/src/tool.py b/src/tool.py\n"
+            "new file mode 100755\n"
+            "index 0000000..abcdef0\n"
+            "--- /dev/null\n"
+            "+++ b/src/tool.py\n"
+            "@@ -0,0 +1 @@\n"
+            "+print('regular')\n"
+        )
+        self.assertEqual(["src/tool.py"], candidate_tool.patch_paths(regular))
+
     def test_committed_git_symlink_is_not_exportable_by_runner(self) -> None:
         # Git calls symlinks "blob" objects too; mode 120000 must not be treated
         # as regular source, even if the packet presents the matching blob hash.
