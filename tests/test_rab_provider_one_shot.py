@@ -900,6 +900,81 @@ class AtomicRootStateMachineTests(unittest.TestCase):
         with self.assertRaises(OSError):
             os.fstat(fd)
 
+    def test_foreign_peer_cannot_trigger_root_procfs_reads_before_pid1_match(
+        self,
+    ) -> None:
+        unit = self.policy["service_unit"]
+        trusted = {
+            "MainPID": str(self.peer[0]),
+            "ActiveState": "active",
+            "ControlGroup": "/system.slice/" + unit,
+            "InvocationID": self.policy["invocation_id"],
+            "DynamicUser": "yes",
+            "UID": str(self.peer[1]),
+            "Type": "exec",
+            "NotifyAccess": "none",
+            "PIDFile": "",
+        }
+        for name, changed in (
+            ("wrong-mainpid", {"MainPID": "9999"}),
+            ("wrong-uid", {"UID": "2000"}),
+            ("wrong-invocation", {"InvocationID": "0" * 32}),
+            ("wrong-cgroup", {"ControlGroup": "/system.slice/untrusted.service"}),
+            ("notify-enabled", {"NotifyAccess": "all"}),
+            ("pidfile-enabled", {"PIDFile": "/run/untrusted.pid"}),
+        ):
+            with self.subTest(name=name):
+                connection, other = socket.socketpair(
+                    socket.AF_UNIX, socket.SOCK_SEQPACKET
+                )
+                policy_fd = os.open(self.tmp.name, os.O_RDONLY | os.O_DIRECTORY)
+                state_fd = os.open(self.tmp.name, os.O_RDONLY | os.O_DIRECTORY)
+                pinned_fd = os.open("/dev/null", os.O_RDONLY | os.O_CLOEXEC)
+                try:
+                    with (
+                        mock.patch.object(once.os, "geteuid", return_value=0),
+                        mock.patch.object(
+                            once, "_secure_directory", side_effect=[policy_fd, state_fd]
+                        ),
+                        mock.patch.object(
+                            once, "_read_root_file", return_value=self.policy
+                        ),
+                        mock.patch.object(
+                            once,
+                            "_receive_authenticated_request",
+                            return_value=(_request(self.policy, 0), self.peer),
+                        ),
+                        mock.patch.object(
+                            once, "_open_peer_pidfd", return_value=pinned_fd
+                        ),
+                        mock.patch.object(
+                            once,
+                            "_service_observation",
+                            return_value={**trusted, **changed},
+                        ),
+                        mock.patch.object(
+                            once,
+                            "_read_proc_bounded",
+                            side_effect=AssertionError(
+                                "untrusted procfs read before PID1 confirmation"
+                            ),
+                        ) as proc_reader,
+                        self.assertRaisesRegex(
+                            once.ProviderGrantDenied, "exact trusted Systemd MainPID"
+                        ),
+                    ):
+                        once.authorize_once(
+                            connection,
+                            policy_path=once._TRUSTED_POLICY_ROOT
+                            / ("epoch-" + self.policy["epoch_sha256"] + ".json"),
+                            state_dir=once._TRUSTED_STATE_ROOT,
+                        )
+                    proc_reader.assert_not_called()
+                    self.assertEqual(list(Path(self.tmp.name).glob("spent-*")), [])
+                finally:
+                    connection.close()
+                    other.close()
+
     def test_root_entrypoint_rejects_arbitrary_policy_paths(self) -> None:
         a, b = socket.socketpair()
         try:

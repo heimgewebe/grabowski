@@ -447,16 +447,18 @@ def _service_observation(unit: str) -> dict[str, str]:
     return values
 
 
-def _attest_service(
+def _attest_service_identity(
     policy: Mapping[str, Any],
     peer_pid: int,
     peer_uid: int,
     observed: Mapping[str, str],
-    cgroup: bytes,
-    cmdline: bytes,
-) -> None:
-    unit = str(policy["service_unit"])
-    expected_group = "/system.slice/" + unit
+) -> str:
+    """Reject an untrusted PID1 sender before reading its potentially blocking argv.
+
+    This check alone never authorizes a grant: the peer's kernel cgroup,
+    cmdline digest, pinned pidfd and final liveness must still pass afterward.
+    """
+    expected_group = "/system.slice/" + str(policy["service_unit"])
     if (
         observed.get("ActiveState") != "active"
         or observed.get("Type") not in {"simple", "exec"}
@@ -467,9 +469,24 @@ def _attest_service(
         or observed.get("InvocationID") != policy["invocation_id"]
         or observed.get("DynamicUser") != "yes"
         or observed.get("UID") != str(peer_uid)
-        or cgroup != ("0::" + expected_group + "\n").encode()
-        or _sha(cmdline) != policy["main_cmdline_sha256"]
         or peer_uid <= 0
+    ):
+        raise ProviderGrantDenied("peer is not the exact trusted Systemd MainPID")
+    return expected_group
+
+
+def _attest_service(
+    policy: Mapping[str, Any],
+    peer_pid: int,
+    peer_uid: int,
+    observed: Mapping[str, str],
+    cgroup: bytes,
+    cmdline: bytes,
+) -> None:
+    expected_group = _attest_service_identity(policy, peer_pid, peer_uid, observed)
+    if (
+        cgroup != ("0::" + expected_group + "\n").encode()
+        or _sha(cmdline) != policy["main_cmdline_sha256"]
     ):
         raise ProviderGrantDenied("peer is not the exact trusted Systemd MainPID")
 
@@ -793,6 +810,7 @@ def authorize_once(
             pidfd = _open_peer_pidfd(connection, pid)
             try:
                 observed = _service_observation(policy["service_unit"])
+                _attest_service_identity(policy, pid, uid, observed)
                 cgroup = _read_proc_bounded(pid, "cgroup", 4096)
                 cmdline = _read_proc_bounded(pid, "cmdline", 16384)
                 if len(cgroup) > 4096 or len(cmdline) > 16384:
