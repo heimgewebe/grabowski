@@ -12,6 +12,9 @@ import json
 import os
 from pathlib import Path
 import socket
+import struct
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -181,6 +184,90 @@ class TrustedKernelPeerTests(unittest.TestCase):
             s2.close()
 
 
+class KernelMessageSenderTests(unittest.TestCase):
+    """Real kernel packets: SO_PEERCRED alone must never establish sender PID."""
+
+    def setUp(self) -> None:
+        self.receiver, self.sender = socket.socketpair(
+            socket.AF_UNIX, socket.SOCK_SEQPACKET
+        )
+        self.addCleanup(self.receiver.close)
+        self.addCleanup(self.sender.close)
+        # Install PASSCRED before a child sends so the kernel always emits
+        # per-message evidence, even when the packet is queued before recvmsg.
+        self.receiver.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+
+    def test_matching_original_peer_and_packet_sender(self) -> None:
+        p = _policy()
+        req = _request(p, 0)
+        self.sender.sendall(json.dumps(req).encode())
+        received, identity = once._receive_authenticated_request(self.receiver)
+        self.assertEqual(req, received)
+        self.assertEqual(identity, (os.getpid(), os.getuid(), os.getgid()))
+
+    def test_inherited_fd_child_sender_is_denied(self) -> None:
+        """A child really sends, but SO_PEERCRED still reports its parent."""
+        original_peer = once._peer_credentials(self.receiver)
+        sent = json.dumps(_request(_policy(), 0))
+        child = subprocess.run(
+            [
+                sys.executable,
+                "-B",
+                "-c",
+                "import socket,sys; s=socket.socket(fileno=int(sys.argv[1]));"
+                "s.sendall(sys.argv[2].encode()); s.close()",
+                str(self.sender.fileno()),
+                sent,
+            ],
+            check=True,
+            capture_output=True,
+            timeout=5,
+            pass_fds=(self.sender.fileno(),),
+        )
+        self.assertEqual(child.returncode, 0)
+        self.assertEqual(original_peer[0], os.getpid())
+        with self.assertRaisesRegex(
+            once.ProviderGrantDenied,
+            "inherited/forwarded socket sender",
+        ):
+            once._receive_authenticated_request(self.receiver)
+
+    def test_stream_without_packet_boundaries_is_denied(self) -> None:
+        a, b = socket.socketpair()
+        try:
+            with self.assertRaisesRegex(once.ProviderGrantDenied, "SOCK_SEQPACKET"):
+                once._receive_authenticated_request(a)
+        finally:
+            a.close()
+            b.close()
+
+    def test_invalid_json_and_non_object_rejected(self) -> None:
+        for data in (b"not-json", b"[]"):
+            with self.subTest(data=data):
+                self.sender.sendall(data)
+                with self.assertRaisesRegex(
+                    once.ProviderGrantDenied, "not JSON|not an object"
+                ):
+                    once._receive_authenticated_request(self.receiver)
+
+    def test_oversized_single_packet_denied(self) -> None:
+        self.sender.sendall(b"x" * (once._MAX_BYTES + 1))
+        with self.assertRaisesRegex(once.ProviderGrantDenied, "oversized"):
+            once._receive_authenticated_request(self.receiver)
+
+    def test_rights_attachment_denied_without_consuming_request(self) -> None:
+        fd = os.open("/dev/null", os.O_RDONLY | os.O_CLOEXEC)
+        try:
+            self.sender.sendmsg(
+                [json.dumps(_request(_policy(), 0)).encode()],
+                [(socket.SOL_SOCKET, socket.SCM_RIGHTS, struct.pack("i", fd))],
+            )
+        finally:
+            os.close(fd)
+        with self.assertRaises(once.ProviderGrantDenied):
+            once._receive_authenticated_request(self.receiver)
+
+
 class AtomicRootStateMachineTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory(prefix="rab-provider-free-")
@@ -327,7 +414,6 @@ class AtomicRootStateMachineTests(unittest.TestCase):
                     a,
                     policy_path=Path(self.tmp.name) / "policy.json",
                     state_dir=Path(self.tmp.name),
-                    request=_request(self.policy, 0),
                 )
         finally:
             a.close()
@@ -345,7 +431,6 @@ class AtomicRootStateMachineTests(unittest.TestCase):
                     a,
                     policy_path=Path(self.tmp.name) / "policy.json",
                     state_dir=Path(self.tmp.name),
-                    request=_request(self.policy, 0),
                 )
         finally:
             a.close()

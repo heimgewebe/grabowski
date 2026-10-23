@@ -204,6 +204,77 @@ def _peer_credentials(connection: socket.socket) -> tuple[int, int, int]:
     return pid, uid, gid
 
 
+def _receive_authenticated_request(
+    connection: socket.socket,
+) -> tuple[dict[str, Any], tuple[int, int, int]]:
+    """Receive one bounded UNIX record from the actual kernel sender.
+
+    SO_PEERCRED alone is captured at connect/socketpair time: a process
+    inheriting/passing the descriptor can send from a different PID.
+    SO_PASSCRED supplies SCM_CREDENTIALS for the received packet. Require it
+    to equal the connection's original peer. No caller-supplied request object
+    may bypass this read. This is a SOCK_SEQPACKET protocol, not a stream.
+    """
+    if (
+        not isinstance(connection, socket.socket)
+        or connection.family != socket.AF_UNIX
+        or connection.type != socket.SOCK_SEQPACKET
+        or not hasattr(socket, "SO_PASSCRED")
+        or not hasattr(socket, "SCM_CREDENTIALS")
+    ):
+        raise ProviderGrantDenied("one-shot requires UNIX SOCK_SEQPACKET credentials")
+    peer = _peer_credentials(connection)
+    credential_size = struct.calcsize("3i")
+    if not hasattr(socket, "MSG_CMSG_CLOEXEC"):
+        raise ProviderGrantDenied("close-on-exec ancillary receive is unavailable")
+    previous_timeout = connection.gettimeout()
+    try:
+        connection.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+        connection.settimeout(5.0)
+        raw, ancillary, flags, _source = connection.recvmsg(
+            _MAX_BYTES + 1,
+            socket.CMSG_SPACE(credential_size),
+            socket.MSG_CMSG_CLOEXEC,
+        )
+    except (OSError, ValueError) as exc:
+        raise ProviderGrantDenied("authenticated provider packet unavailable") from exc
+    finally:
+        connection.settimeout(previous_timeout)
+    # recvmsg may install rights even when ancillary is truncated. Never retain
+    # an untrusted passed file descriptor in the privileged broker.
+    for level, kind, data in ancillary:
+        if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+            word = struct.calcsize("i")
+            for (fd,) in struct.iter_unpack("i", data[: len(data) // word * word]):
+                os.close(fd)
+    if (
+        not raw
+        or len(raw) > _MAX_BYTES
+        or flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC)
+        or len(ancillary) != 1
+    ):
+        raise ProviderGrantDenied("provider packet missing, oversized or truncated")
+    level, kind, data = ancillary[0]
+    if (
+        level != socket.SOL_SOCKET
+        or kind != socket.SCM_CREDENTIALS
+        or len(data) != credential_size
+    ):
+        raise ProviderGrantDenied("kernel per-message credentials missing or invalid")
+    sender = struct.unpack("3i", data)
+    if sender != peer:
+        raise ProviderGrantDenied(
+            "inherited/forwarded socket sender is not original peer"
+        )
+    try:
+        request = json.loads(raw)
+    except (UnicodeError, ValueError) as exc:
+        raise ProviderGrantDenied("authenticated provider packet is not JSON") from exc
+    if not isinstance(request, dict):
+        raise ProviderGrantDenied("authenticated provider packet is not an object")
+    return request, sender
+
+
 def _service_observation(unit: str) -> dict[str, str]:
     try:
         completed = subprocess.run(
@@ -405,7 +476,6 @@ def authorize_once(
     *,
     policy_path: Path,
     state_dir: Path,
-    request: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Root broker seam: kernel-authenticated exact service, then irreversible CAS.
 
@@ -429,7 +499,7 @@ def authorize_once(
         policy = _validate_policy(_read_root_file(parent_fd, policy_path.name))
         if policy_path.name != "epoch-" + policy["epoch_sha256"] + ".json":
             raise ProviderGrantDenied("root policy filename does not match epoch")
-        peer = _peer_credentials(connection)
+        request, peer = _receive_authenticated_request(connection)
         pid, uid, _gid = peer
         if not hasattr(os, "pidfd_open"):
             raise ProviderGrantDenied("pidfd kernel support is required")
