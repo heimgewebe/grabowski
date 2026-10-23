@@ -147,6 +147,7 @@ class TrustedKernelPeerTests(unittest.TestCase):
             "UID": "1999",
             "Type": "exec",
             "NotifyAccess": "none",
+            "PIDFile": "",
         }
         cmdline = b"python3\0-I\0-B\0"
         p["main_cmdline_sha256"] = once._sha(cmdline)
@@ -162,6 +163,7 @@ class TrustedKernelPeerTests(unittest.TestCase):
             "UID",
             "Type",
             "NotifyAccess",
+            "PIDFile",
         ):
             different = dict(observed)
             different[change] = "wrong"
@@ -198,6 +200,7 @@ class TrustedKernelPeerTests(unittest.TestCase):
             "UID": "1999",
             "Type": "exec",
             "NotifyAccess": "none",
+            "PIDFile": "",
         }
         cgroup = ("0::" + group + "\n").encode()
         for key, value in (
@@ -207,6 +210,8 @@ class TrustedKernelPeerTests(unittest.TestCase):
             ("NotifyAccess", "all"),
             ("NotifyAccess", "exec"),
             ("NotifyAccess", "main"),
+            ("PIDFile", "/run/fake-main.pid"),
+            ("PIDFile", "/run/user/1000/writable.pid"),
             ("Type", ""),
             ("NotifyAccess", ""),
         ):
@@ -217,7 +222,7 @@ class TrustedKernelPeerTests(unittest.TestCase):
                     once.ProviderGrantDenied, "trusted Systemd MainPID"
                 ):
                     once._attest_service(policy, peer, 1999, changed, cgroup, cmdline)
-        for key in ("Type", "NotifyAccess"):
+        for key in ("Type", "NotifyAccess", "PIDFile"):
             changed = dict(trusted)
             del changed[key]
             with self.subTest(missing=key):
@@ -234,6 +239,7 @@ class TrustedKernelPeerTests(unittest.TestCase):
             "UID": "1999",
             "Type": "exec",
             "NotifyAccess": "none",
+            "PIDFile": "",
         }
         output = "".join(f"{key}={value}\n" for key, value in metadata.items())
         with mock.patch.object(
@@ -245,6 +251,17 @@ class TrustedKernelPeerTests(unittest.TestCase):
             argv = proc.call_args.args[0]
             self.assertIn("Type", argv[-2])
             self.assertIn("NotifyAccess", argv[-2])
+            self.assertIn("PIDFile", argv[-2])
+        missing_pidfile_line = output.replace("PIDFile=\n", "")
+        with (
+            mock.patch.object(
+                once.subprocess,
+                "run",
+                return_value=mock.Mock(stdout=missing_pidfile_line),
+            ),
+            self.assertRaisesRegex(once.ProviderGrantDenied, "metadata incomplete"),
+        ):
+            once._service_observation("grabowski-rab-rabpilot.service")
 
     def test_procfs_file_reader_bounds_bytes_before_allocating_all(self) -> None:
         current_pid = os.getpid()

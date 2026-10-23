@@ -413,7 +413,7 @@ def _service_observation(unit: str) -> dict[str, str]:
                 "show",
                 "--system",
                 unit,
-                "--property=MainPID,ActiveState,ControlGroup,InvocationID,DynamicUser,UID,Type,NotifyAccess",
+                "--property=MainPID,ActiveState,ControlGroup,InvocationID,DynamicUser,UID,Type,NotifyAccess,PIDFile",
                 "--no-pager",
             ],
             check=True,
@@ -441,6 +441,7 @@ def _service_observation(unit: str) -> dict[str, str]:
         "UID",
         "Type",
         "NotifyAccess",
+        "PIDFile",
     }:
         raise ProviderGrantDenied("PID1 service metadata incomplete")
     return values
@@ -460,6 +461,7 @@ def _attest_service(
         observed.get("ActiveState") != "active"
         or observed.get("Type") not in {"simple", "exec"}
         or observed.get("NotifyAccess") != "none"
+        or observed.get("PIDFile") != ""
         or observed.get("MainPID") != str(peer_pid)
         or observed.get("ControlGroup") != expected_group
         or observed.get("InvocationID") != policy["invocation_id"]
