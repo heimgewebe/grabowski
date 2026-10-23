@@ -27,6 +27,8 @@ _SHA = re.compile(r"[0-9a-f]{64}\Z")
 _UNIT = re.compile(r"grabowski-rab-[a-z][a-z0-9-]{0,16}\.service\Z")
 _ARMS = frozenset({"baseline", "treatment"})
 _MAX_BYTES = 16 * 1024
+# Linux UAPI /usr/include/asm-generic/socket.h; absent support must fail closed.
+_SO_PEERPIDFD = 77
 _TRUSTED_POLICY_ROOT = Path("/etc/grabowski/rab-provider-one-shot")
 _TRUSTED_STATE_ROOT = Path("/var/lib/grabowski/rab-provider-one-shot")
 
@@ -97,7 +99,7 @@ def _read_root_file(directory_fd: int, filename: str) -> dict[str, Any]:
             raise ProviderGrantDenied("trusted policy/receipt changed while reading")
         try:
             value = json.loads(raw)
-        except (ValueError, UnicodeDecodeError) as exc:
+        except (ValueError, UnicodeDecodeError, RecursionError) as exc:
             raise ProviderGrantDenied("invalid trusted JSON") from exc
         if not isinstance(value, dict):
             raise ProviderGrantDenied("trusted document must be an object")
@@ -268,11 +270,65 @@ def _receive_authenticated_request(
         )
     try:
         request = json.loads(raw)
-    except (UnicodeError, ValueError) as exc:
+    except (UnicodeError, ValueError, RecursionError) as exc:
         raise ProviderGrantDenied("authenticated provider packet is not JSON") from exc
     if not isinstance(request, dict):
         raise ProviderGrantDenied("authenticated provider packet is not an object")
     return request, sender
+
+
+def _open_peer_pidfd(connection: socket.socket, expected_pid: int) -> int:
+    """Pin the connected peer's original struct pid, not merely its PID number.
+
+    SO_PEERCRED and SCM_CREDENTIALS expose PID numbers that can be reused.
+    Linux SO_PEERPIDFD pins the socket peer's kernel identity. On hosts with
+    modern per-PID pidfs inodes, that identity must equal pidfd_open(MainPID).
+    Fail closed on unsupported kernels and old shared anon-inode pidfds.
+    Caller owns the returned descriptor and MUST close it.
+    """
+    if not hasattr(os, "pidfd_open") or expected_pid <= 1:
+        raise ProviderGrantDenied("stable kernel PID identity unavailable")
+    peer_fd = -1
+    current_fd = -1
+    anchor_fd = -1
+    try:
+        raw = connection.getsockopt(
+            socket.SOL_SOCKET, _SO_PEERPIDFD, struct.calcsize("i")
+        )
+        if len(raw) != struct.calcsize("i"):
+            raise ProviderGrantDenied("SO_PEERPIDFD was not returned by the kernel")
+        peer_fd = struct.unpack("i", raw)[0]
+        if peer_fd < 0:
+            raise ProviderGrantDenied("invalid kernel SO_PEERPIDFD")
+        os.set_inheritable(peer_fd, False)
+        current_fd = os.pidfd_open(expected_pid, 0)
+        # PID 1 is distinct from any admitted request PID. If its descriptor
+        # has the same inode as the target, this is an old shared anonymous
+        # inode rather than a collision-resistant pidfs process identity.
+        anchor_fd = os.pidfd_open(1, 0)
+
+        def identity(fd: int) -> tuple[int, int]:
+            info = os.fstat(fd)
+            return info.st_dev, info.st_ino
+
+        if identity(peer_fd) != identity(current_fd) or identity(peer_fd) == identity(
+            anchor_fd
+        ):
+            raise ProviderGrantDenied("peer PIDFD does not match the live MainPID")
+        poll = select.poll()
+        poll.register(peer_fd, select.POLLIN | select.POLLERR | select.POLLHUP)
+        if poll.poll(0):
+            raise ProviderGrantDenied("connected peer has exited")
+        accepted_fd, peer_fd = peer_fd, -1
+        return accepted_fd
+    except (OSError, ValueError) as exc:
+        raise ProviderGrantDenied(
+            "kernel SO_PEERPIDFD attestation unavailable"
+        ) from exc
+    finally:
+        for fd in (peer_fd, current_fd, anchor_fd):
+            if fd >= 0:
+                os.close(fd)
 
 
 def _service_observation(unit: str) -> dict[str, str]:
@@ -283,7 +339,7 @@ def _service_observation(unit: str) -> dict[str, str]:
                 "show",
                 "--system",
                 unit,
-                "--property=MainPID,ActiveState,ControlGroup,InvocationID,DynamicUser",
+                "--property=MainPID,ActiveState,ControlGroup,InvocationID,DynamicUser,UID",
                 "--no-pager",
             ],
             check=True,
@@ -308,6 +364,7 @@ def _service_observation(unit: str) -> dict[str, str]:
         "ControlGroup",
         "InvocationID",
         "DynamicUser",
+        "UID",
     }:
         raise ProviderGrantDenied("PID1 service metadata incomplete")
     return values
@@ -329,6 +386,7 @@ def _attest_service(
         or observed.get("ControlGroup") != expected_group
         or observed.get("InvocationID") != policy["invocation_id"]
         or observed.get("DynamicUser") != "yes"
+        or observed.get("UID") != str(peer_uid)
         or cgroup != ("0::" + expected_group + "\n").encode()
         or _sha(cmdline) != policy["main_cmdline_sha256"]
         or peer_uid <= 0
@@ -361,6 +419,61 @@ def _position(policy: Mapping[str, Any], request: Any) -> dict[str, Any]:
     }:
         raise ProviderGrantDenied("one-shot request digest or arm mismatch")
     return policy["positions"][index]
+
+
+def _first_outcome_digest(
+    policy: Mapping[str, Any],
+    first: Mapping[str, Any],
+    first_token: str,
+    receipt: Any,
+) -> str:
+    """Canonical SHA of an independently written root-owned first-turn receipt.
+
+    The future trusted root issuer must verify the actual provider output,
+    usage and model before writing this receipt; no unprivileged caller may do
+    so. Merely finding a spent intent marker NEVER releases the second arm.
+    """
+    if not isinstance(receipt, dict) or set(receipt) != {
+        "kind",
+        "schema_version",
+        "epoch_sha256",
+        "pair_id",
+        "first_token_sha256",
+        "arm",
+        "slot_id",
+        "request_sha256",
+        "service_unit",
+        "invocation_id",
+        "provider",
+        "model",
+        "outcome",
+        "codex_exec_process_count",
+        "provider_output_sha256",
+        "usage_receipt_sha256",
+    }:
+        raise ProviderGrantDenied("first provider outcome receipt shape invalid")
+    checks = (
+        receipt["kind"] == "rab.root_first_arm_outcome_receipt",
+        type(receipt["schema_version"]) is int and receipt["schema_version"] == 1,
+        receipt["epoch_sha256"] == policy["epoch_sha256"],
+        receipt["pair_id"] == policy["pair_id"],
+        receipt["first_token_sha256"] == first_token,
+        receipt["arm"] == first["arm"],
+        receipt["slot_id"] == first["slot_id"],
+        receipt["request_sha256"] == first["request_sha256"],
+        receipt["service_unit"] == policy["service_unit"],
+        receipt["invocation_id"] == policy["invocation_id"],
+        receipt["provider"] == policy["provider"],
+        receipt["model"] == policy["model"],
+        receipt["outcome"] == "provider_completed",
+        type(receipt["codex_exec_process_count"]) is int
+        and receipt["codex_exec_process_count"] == 1,
+        _hex(receipt["provider_output_sha256"]),
+        _hex(receipt["usage_receipt_sha256"]),
+    )
+    if not all(checks):
+        raise ProviderGrantDenied("first provider outcome receipt identity invalid")
+    return _digest(receipt)
 
 
 def _consume_position(
@@ -419,6 +532,19 @@ def _consume_position(
             )
         ):
             raise ProviderGrantDenied("first position root intent marker changed")
+        try:
+            first_receipt = _read_root_file(
+                state_fd, "receipt-" + first_token + ".json"
+            )
+        except OSError as exc:
+            raise ProviderGrantDenied(
+                "first position lacks trusted root outcome receipt"
+            ) from exc
+        expected_receipt_digest = _first_outcome_digest(
+            policy, first, first_token, first_receipt
+        )
+        if release["first_receipt_sha256"] != expected_receipt_digest:
+            raise ProviderGrantDenied("second release does not bind first outcome")
     token = _digest(
         {
             "epoch": policy["epoch_sha256"],
@@ -477,11 +603,11 @@ def authorize_once(
     policy_path: Path,
     state_dir: Path,
 ) -> dict[str, Any]:
-    """Root broker seam: kernel-authenticated exact service, then irreversible CAS.
+    """Root-only socket broker seam; no authority to start or install Codex.
 
-    Never call from Codex, an untrusted Python launcher, or a test fixture. A
-    trusted root process must receive the request over a real connected socket.
-    This primitive cannot install policies, issue release grants or launch Codex.
+    The broker must install immutable code and policy, then receive one kernel
+    sender-attested packet for the exact active systemd MainPID before CAS.
+    This standalone primitive does NOT issue first-arm success receipts.
     """
     if os.geteuid() != 0:
         raise ProviderGrantDenied("only an independent root-owned broker may consume")
@@ -493,31 +619,45 @@ def authorize_once(
         or re.fullmatch(r"epoch-[0-9a-f]{64}\.json", policy_path.name) is None
     ):
         raise ProviderGrantDenied("one-shot root policy or state path is not canonical")
-    parent_fd = _secure_directory(policy_path.parent)
-    state_fd = _secure_directory(state_dir)
     try:
-        policy = _validate_policy(_read_root_file(parent_fd, policy_path.name))
-        if policy_path.name != "epoch-" + policy["epoch_sha256"] + ".json":
-            raise ProviderGrantDenied("root policy filename does not match epoch")
-        request, peer = _receive_authenticated_request(connection)
-        pid, uid, _gid = peer
-        if not hasattr(os, "pidfd_open"):
-            raise ProviderGrantDenied("pidfd kernel support is required")
-        pidfd = os.pidfd_open(pid, 0)
+        parent_fd = _secure_directory(policy_path.parent)
+    except OSError as exc:
+        raise ProviderGrantDenied("root provider policy parent unavailable") from exc
+    try:
         try:
-            observed = _service_observation(policy["service_unit"])
-            cgroup = Path("/proc").joinpath(str(pid), "cgroup").read_bytes()
-            cmdline = Path("/proc").joinpath(str(pid), "cmdline").read_bytes()
-            if len(cgroup) > 4096 or len(cmdline) > 16384:
-                raise ProviderGrantDenied("kernel process projection exceeds bound")
-            _attest_service(policy, pid, uid, observed, cgroup, cmdline)
-            watcher = select.poll()
-            watcher.register(pidfd, select.POLLIN | select.POLLHUP | select.POLLERR)
-            if watcher.poll(0):
-                raise ProviderGrantDenied("trusted MainPID exited before consumption")
-            return _consume_position(state_fd, policy, request, peer)
+            state_fd = _secure_directory(state_dir)
+        except OSError as exc:
+            raise ProviderGrantDenied(
+                "root provider state directory unavailable"
+            ) from exc
+        try:
+            policy = _validate_policy(_read_root_file(parent_fd, policy_path.name))
+            if policy_path.name != "epoch-" + policy["epoch_sha256"] + ".json":
+                raise ProviderGrantDenied("root policy filename does not match epoch")
+            request, peer = _receive_authenticated_request(connection)
+            pid, uid, _gid = peer
+            pidfd = _open_peer_pidfd(connection, pid)
+            try:
+                observed = _service_observation(policy["service_unit"])
+                cgroup = Path("/proc").joinpath(str(pid), "cgroup").read_bytes()
+                cmdline = Path("/proc").joinpath(str(pid), "cmdline").read_bytes()
+                if len(cgroup) > 4096 or len(cmdline) > 16384:
+                    raise ProviderGrantDenied("kernel process projection exceeds bound")
+                _attest_service(policy, pid, uid, observed, cgroup, cmdline)
+                watcher = select.poll()
+                watcher.register(pidfd, select.POLLIN | select.POLLHUP | select.POLLERR)
+                if watcher.poll(0):
+                    raise ProviderGrantDenied(
+                        "trusted MainPID exited before consumption"
+                    )
+                return _consume_position(state_fd, policy, request, peer)
+            finally:
+                os.close(pidfd)
         finally:
-            os.close(pidfd)
+            os.close(state_fd)
+    except OSError as exc:
+        raise ProviderGrantDenied(
+            "root one-shot filesystem or process unavailable"
+        ) from exc
     finally:
         os.close(parent_fd)
-        os.close(state_fd)

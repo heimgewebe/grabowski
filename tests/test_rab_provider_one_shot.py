@@ -138,6 +138,7 @@ class TrustedKernelPeerTests(unittest.TestCase):
             "ControlGroup": g,
             "InvocationID": p["invocation_id"],
             "DynamicUser": "yes",
+            "UID": "1999",
         }
         cmdline = b"python3\0-I\0-B\0"
         p["main_cmdline_sha256"] = once._sha(cmdline)
@@ -150,6 +151,7 @@ class TrustedKernelPeerTests(unittest.TestCase):
             "ControlGroup",
             "InvocationID",
             "DynamicUser",
+            "UID",
         ):
             different = dict(observed)
             different[change] = "wrong"
@@ -250,6 +252,12 @@ class KernelMessageSenderTests(unittest.TestCase):
                 ):
                     once._receive_authenticated_request(self.receiver)
 
+    def test_deeply_nested_json_is_typed_denial_not_recursion_crash(self) -> None:
+        payload = b"[" * 1400 + b"0" + b"]" * 1400
+        self.sender.sendall(payload)
+        with self.assertRaisesRegex(once.ProviderGrantDenied, "not JSON"):
+            once._receive_authenticated_request(self.receiver)
+
     def test_oversized_single_packet_denied(self) -> None:
         self.sender.sendall(b"x" * (once._MAX_BYTES + 1))
         with self.assertRaisesRegex(once.ProviderGrantDenied, "oversized"):
@@ -266,6 +274,88 @@ class KernelMessageSenderTests(unittest.TestCase):
             os.close(fd)
         with self.assertRaises(once.ProviderGrantDenied):
             once._receive_authenticated_request(self.receiver)
+
+
+class StablePeerPidfdTests(unittest.TestCase):
+    def test_live_peer_pidfd_matches_exact_kernel_process(self) -> None:
+        a, b = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        try:
+            try:
+                pinned = once._open_peer_pidfd(a, os.getpid())
+            except once.ProviderGrantDenied as exc:
+                self.skipTest(f"host lacks stable kernel PIDFD identity: {exc}")
+            else:
+                os.close(pinned)
+            with self.assertRaises(once.ProviderGrantDenied):
+                once._open_peer_pidfd(a, 1)
+        finally:
+            a.close()
+            b.close()
+
+    def test_legacy_shared_anon_inode_must_fail_closed(self) -> None:
+        from types import SimpleNamespace
+
+        a, b = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        try:
+            fake = SimpleNamespace(st_dev=1, st_ino=1)
+            with (
+                mock.patch.object(once.os, "fstat", return_value=fake),
+                self.assertRaisesRegex(
+                    once.ProviderGrantDenied, "does not match the live MainPID"
+                ),
+            ):
+                once._open_peer_pidfd(a, os.getpid())
+        finally:
+            a.close()
+            b.close()
+
+    def test_other_live_pid_does_not_match_original_socket_peer(self) -> None:
+        a, b = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        other = subprocess.Popen(
+            [sys.executable, "-B", "-c", "import time;time.sleep(3)"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            with self.assertRaises(once.ProviderGrantDenied):
+                once._open_peer_pidfd(a, other.pid)
+        finally:
+            other.terminate()
+            other.wait(timeout=5)
+            a.close()
+            b.close()
+
+    def test_reaped_peer_cannot_be_reidentified_by_reused_number(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="rab-pidfd-listen-") as root:
+            sockpath = str(Path(root) / "c.sock")
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+            try:
+                listener.bind(sockpath)
+                listener.listen(1)
+                child = subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-B",
+                        "-c",
+                        "import socket,sys; s=socket.socket(socket.AF_UNIX,"
+                        "socket.SOCK_SEQPACKET);s.connect(sys.argv[1]);"
+                        "s.sendall(b'queued');s.close()",
+                        sockpath,
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                )
+                _, stderr = child.communicate(timeout=5)
+                self.assertEqual(child.returncode, 0, stderr)
+                accepted, _ = listener.accept()
+                try:
+                    self.assertEqual(once._peer_credentials(accepted)[0], child.pid)
+                    with self.assertRaises(once.ProviderGrantDenied):
+                        once._open_peer_pidfd(accepted, child.pid)
+                finally:
+                    accepted.close()
+            finally:
+                listener.close()
 
 
 class AtomicRootStateMachineTests(unittest.TestCase):
@@ -291,14 +381,39 @@ class AtomicRootStateMachineTests(unittest.TestCase):
             }
         )
 
-    def _release(self, *, valid: bool = True) -> dict:
+    def _first_receipt(self) -> dict:
+        first = self.policy["positions"][0]
+        return {
+            "kind": "rab.root_first_arm_outcome_receipt",
+            "schema_version": 1,
+            "epoch_sha256": self.policy["epoch_sha256"],
+            "pair_id": self.policy["pair_id"],
+            "first_token_sha256": self._first_spent_sha(),
+            "arm": first["arm"],
+            "slot_id": first["slot_id"],
+            "request_sha256": first["request_sha256"],
+            "service_unit": self.policy["service_unit"],
+            "invocation_id": self.policy["invocation_id"],
+            "provider": self.policy["provider"],
+            "model": self.policy["model"],
+            "outcome": "provider_completed",
+            "codex_exec_process_count": 1,
+            "provider_output_sha256": "5" * 64,
+            "usage_receipt_sha256": "6" * 64,
+        }
+
+    def _release(self, *, valid: bool = True, receipt: dict | None = None) -> dict:
         return {
             "kind": "rab.second_position_release",
             "schema_version": 1,
             "pair_id": self.policy["pair_id"],
             "slot_id": self.policy["positions"][1]["slot_id"],
             "first_token_sha256": self._first_spent_sha(),
-            "first_receipt_sha256": "5" * 64 if valid else "corrupt",
+            "first_receipt_sha256": (
+                once._digest(self._first_receipt() if receipt is None else receipt)
+                if valid
+                else "corrupt"
+            ),
         }
 
     def test_first_consumed_at_most_once_and_persisted(self) -> None:
@@ -321,11 +436,21 @@ class AtomicRootStateMachineTests(unittest.TestCase):
             self._consume(1)
         self.assertEqual(len(list(Path(self.tmp.name).glob("spent-*"))), 1)
 
-    def _root_file_simulator(self, release: dict):
-        # Synthetic root-only reads for a rootless regression test.
+    def _root_file_simulator(
+        self,
+        release: dict,
+        first_receipt: dict | None = None,
+        *,
+        missing_receipt: bool = False,
+    ):
+        # Synthetic root-owned read: public broker path is still not installed.
         def read(_state_fd: int, filename: str) -> dict:
             if filename.startswith("release-"):
                 return release
+            if filename.startswith("receipt-"):
+                if missing_receipt:
+                    raise FileNotFoundError("no independent first outcome")
+                return self._first_receipt() if first_receipt is None else first_receipt
             return json.loads(Path(self.tmp.name, filename).read_text())
 
         return read
@@ -362,6 +487,72 @@ class AtomicRootStateMachineTests(unittest.TestCase):
             self.assertRaisesRegex(once.ProviderGrantDenied, "marker changed"),
         ):
             self._consume(1)
+
+    def test_second_release_requires_existing_first_outcome_receipt(self) -> None:
+        self._consume(0)
+        with (
+            mock.patch.object(
+                once,
+                "_read_root_file",
+                side_effect=self._root_file_simulator(
+                    self._release(), missing_receipt=True
+                ),
+            ),
+            self.assertRaisesRegex(
+                once.ProviderGrantDenied, "lacks trusted root outcome receipt"
+            ),
+        ):
+            self._consume(1)
+        self.assertEqual(len(list(Path(self.tmp.name).glob("spent-*"))), 1)
+
+    def test_second_release_rejects_first_receipt_sha_mismatch(self) -> None:
+        self._consume(0)
+        forged = self._first_receipt()
+        forged["provider_output_sha256"] = "0" * 64
+        with (
+            mock.patch.object(
+                once,
+                "_read_root_file",
+                side_effect=self._root_file_simulator(
+                    self._release(), first_receipt=forged
+                ),
+            ),
+            self.assertRaisesRegex(
+                once.ProviderGrantDenied, "does not bind first outcome"
+            ),
+        ):
+            self._consume(1)
+
+    def test_second_release_rejects_noncompleted_outcome_even_with_sha(self) -> None:
+        self._consume(0)
+        failed = self._first_receipt()
+        failed["outcome"] = "failed"
+        with (
+            mock.patch.object(
+                once,
+                "_read_root_file",
+                side_effect=self._root_file_simulator(
+                    self._release(receipt=failed), first_receipt=failed
+                ),
+            ),
+            self.assertRaisesRegex(
+                once.ProviderGrantDenied, "outcome receipt identity invalid"
+            ),
+        ):
+            self._consume(1)
+
+    def test_first_outcome_rejects_bool_process_count(self) -> None:
+        receipt = self._first_receipt()
+        receipt["codex_exec_process_count"] = True
+        with self.assertRaisesRegex(
+            once.ProviderGrantDenied, "outcome receipt identity invalid"
+        ):
+            once._first_outcome_digest(
+                self.policy,
+                self.policy["positions"][0],
+                self._first_spent_sha(),
+                receipt,
+            )
 
     def test_corrupted_second_release_never_consumes(self) -> None:
         self._consume(0)
@@ -402,6 +593,30 @@ class AtomicRootStateMachineTests(unittest.TestCase):
         with self.assertRaisesRegex(once.ProviderGrantDenied, "mismatch"):
             once._consume_position(self.fd, self.policy, req, self.peer)
         self.assertEqual(list(Path(self.tmp.name).iterdir()), [])
+
+    def test_state_directory_error_closes_prior_root_policy_fd(self) -> None:
+        fd = os.open(self.tmp.name, os.O_RDONLY | os.O_DIRECTORY)
+        connection, other = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        self.addCleanup(connection.close)
+        self.addCleanup(other.close)
+        with connection:
+            with (
+                mock.patch.object(once.os, "geteuid", return_value=0),
+                mock.patch.object(
+                    once,
+                    "_secure_directory",
+                    side_effect=[fd, once.ProviderGrantDenied("state root denied")],
+                ),
+                self.assertRaisesRegex(once.ProviderGrantDenied, "state root denied"),
+            ):
+                once.authorize_once(
+                    connection,
+                    policy_path=once._TRUSTED_POLICY_ROOT
+                    / ("epoch-" + "a" * 64 + ".json"),
+                    state_dir=once._TRUSTED_STATE_ROOT,
+                )
+        with self.assertRaises(OSError):
+            os.fstat(fd)
 
     def test_root_entrypoint_rejects_arbitrary_policy_paths(self) -> None:
         a, b = socket.socketpair()
