@@ -784,6 +784,91 @@ class SQLiteStoreTests(unittest.TestCase):
             finally:
                 writer.close()
 
+    def test_strict_private_wal_orphan_reaper_ignores_foreign_prefix_flood(self) -> None:
+        # A shared /dev/shm allows arbitrary other-user prefix entries.
+        # Neither those names nor unmarked own directories are reaping
+        # authority or a reason to deny a valid strict READ_ONLY request.
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            decoys = []
+            for index in range(70):
+                prefix = f"grabowski-strict-wal-decoy-{index:03d}"
+                file_decoy = root / (prefix + "-file")
+                file_decoy.write_bytes(b"unrelated")
+                directory_decoy = root / (prefix + "-public")
+                directory_decoy.mkdir()
+                directory_decoy.chmod(0o755)
+                unmarked = root / (prefix + "-unmarked")
+                unmarked.mkdir(mode=0o700)
+                decoys.extend((file_decoy, directory_decoy, unmarked))
+            orphan = root / "grabowski-strict-wal-valid-orphan"
+            orphan.mkdir(mode=0o700)
+            sqlite_store._strict_wal_mark_private_snapshot(orphan, "old.sqlite3")
+            old_bytes = orphan / "old.sqlite3"
+            old_bytes.write_bytes(b"orphaned private bytes")
+            old_bytes.chmod(0o600)
+
+            database = root / "prefix-flood.sqlite3"
+            writer = sqlite3.connect(database)
+            try:
+                writer.execute("PRAGMA journal_mode=WAL")
+                writer.execute("CREATE TABLE witness(value INTEGER)")
+                writer.execute("INSERT INTO witness VALUES (59)")
+                writer.commit()
+                with (
+                    patch.object(sqlite_store, "_strict_wal_memory_root", return_value=root),
+                    sqlite_store.inventory_readonly_sqlite(
+                        database, temporary_prefix="prefix-flood-",
+                        error_type=InventoryChanged, allow_wal_copy=False,
+                        allow_private_wal_snapshot=True,
+                    ) as reader,
+                ):
+                    self.assertEqual(
+                        59, reader.execute("SELECT value FROM witness").fetchone()[0],
+                    )
+                self.assertFalse(orphan.exists(), "verified orphan was starved by decoys")
+                self.assertTrue(all(item.exists() for item in decoys))
+                self.assertEqual(b"unrelated", decoys[0].read_bytes())
+            finally:
+                writer.close()
+
+    def test_strict_private_wal_orphan_reaper_defers_over_cap_without_denial(self) -> None:
+        # Cleanup is bounded, but more than 64 previously marker-attested
+        # SIGKILL orphans must never permanently deny public READ_ONLY.
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            orphan_names = []
+            for index in range(sqlite_store._STRICT_PRIVATE_WAL_MAX_ORPHAN_ENTRIES + 1):
+                candidate = root / f"grabowski-strict-wal-owned-{index:03d}"
+                candidate.mkdir(mode=0o700)
+                sqlite_store._strict_wal_mark_private_snapshot(candidate, "old.sqlite3")
+                contents = candidate / "old.sqlite3"
+                contents.write_bytes(b"disposable")
+                contents.chmod(0o600)
+                orphan_names.append(candidate)
+            database = root / "orphan-budget.sqlite3"
+            writer = sqlite3.connect(database)
+            try:
+                writer.execute("PRAGMA journal_mode=WAL")
+                writer.execute("CREATE TABLE witness(value INTEGER)")
+                writer.execute("INSERT INTO witness VALUES (71)")
+                writer.commit()
+                for _ in range(2):
+                    with (
+                        patch.object(sqlite_store, "_strict_wal_memory_root", return_value=root),
+                        sqlite_store.inventory_readonly_sqlite(
+                            database, temporary_prefix="orphan-budget-",
+                            error_type=InventoryChanged, allow_wal_copy=False,
+                            allow_private_wal_snapshot=True,
+                        ) as reader,
+                    ):
+                        self.assertEqual(
+                            71, reader.execute("SELECT value FROM witness").fetchone()[0],
+                        )
+                self.assertFalse(any(item.exists() for item in orphan_names))
+            finally:
+                writer.close()
+
     def test_strict_private_wal_orphan_reaper_does_not_follow_malicious_entries(self) -> None:
         # Even with a valid marker an unexpected symlink means the entire
         # directory is left intact; marker/prefix alone are not cleanup authority.

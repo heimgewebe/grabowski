@@ -37,6 +37,7 @@ _STRICT_PRIVATE_WAL_SNAPSHOT_PREFIX = "grabowski-strict-wal-"
 _STRICT_PRIVATE_WAL_SNAPSHOT_MARKER = ".grabowski-owned-wal-snapshot-v1"
 _STRICT_PRIVATE_WAL_SNAPSHOT_KIND = "grabowski.strict-private-wal-snapshot.v1"
 _STRICT_PRIVATE_WAL_MAX_ORPHAN_ENTRIES = 64
+_STRICT_PRIVATE_WAL_MAX_SCANNED_PREFIX_ENTRIES = 4096
 
 
 def status_identity(status: os.stat_result) -> FileIdentity:
@@ -937,7 +938,8 @@ def _strict_wal_reap_private_snapshot_orphans(
             pinned_root.st_dev, pinned_root.st_ino
         ):
             raise _changed(error_type, message)
-        candidates = 0
+        reaped = 0
+        inspected = 0
         with os.scandir(root_fd) as entries:
             for entry in entries:
                 directory_name = entry.name
@@ -946,9 +948,13 @@ def _strict_wal_reap_private_snapshot_orphans(
                     or len(directory_name) > 255
                 ):
                     continue
-                candidates += 1
-                if candidates > _STRICT_PRIVATE_WAL_MAX_ORPHAN_ENTRIES:
-                    raise _changed(error_type, message)
+                # This namespace is shared by other users. Foreign entries
+                # cannot consume the authenticated-orphan deletion budget,
+                # and exceeding the independent scan bound merely defers
+                # optional cleanup instead of denying public READ_ONLY.
+                inspected += 1
+                if inspected > _STRICT_PRIVATE_WAL_MAX_SCANNED_PREFIX_ENTRIES:
+                    break
                 observed = os.stat(
                     directory_name, dir_fd=root_fd, follow_symlinks=False,
                 )
@@ -1041,6 +1047,12 @@ def _strict_wal_reap_private_snapshot_orphans(
                         for info in file_stats
                     ) or sum(info.st_size for info in file_stats) > budget + 512:
                         continue
+                    # Only fully authenticated, safely unlinkable copies
+                    # consume the bounded orphan-deletion budget. More
+                    # cleanup may be performed by the next strict reader;
+                    # it is not a condition of a valid READ_ONLY response.
+                    if reaped >= _STRICT_PRIVATE_WAL_MAX_ORPHAN_ENTRIES:
+                        break
                     # Reconfirm the candidate's root binding immediately
                     # before the irreversible, bounded single-level unlink.
                     still = os.stat(
@@ -1053,6 +1065,7 @@ def _strict_wal_reap_private_snapshot_orphans(
                             os.unlink(filename, dir_fd=child_fd)
                     os.unlink(_STRICT_PRIVATE_WAL_SNAPSHOT_MARKER, dir_fd=child_fd)
                     os.rmdir(directory_name, dir_fd=root_fd)
+                    reaped += 1
                 finally:
                     os.close(child_fd)
     except OSError as exc:
