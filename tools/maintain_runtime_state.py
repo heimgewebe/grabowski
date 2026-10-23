@@ -513,6 +513,10 @@ def _failed_units(*, job_authority: bool = True) -> list[str]:
         fields = line.split()
         if fields:
             unit = fields[0]
+            # A failed periodic producer is never an independently resettable
+            # job, task or worker, even with future protected job authority.
+            if unit == "grabowski-runtime-retention.service":
+                continue
             # Never accept a job returned despite the restricted pattern.
             if not job_authority and JOB_UNIT.fullmatch(unit):
                 continue
