@@ -26,6 +26,76 @@ candidate_tool = _load_tool()
 
 
 class ExternalProgrammingCandidateTests(unittest.TestCase):
+    def test_broad_ancestor_does_not_admit_special_build_source(self) -> None:
+        source = "apps/web/src/routes/build/+page.svelte"
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            root.chmod(0o700)
+            repo = root / "repo"
+            repo.mkdir(mode=0o700)
+            packet_file = self._packet(root, repo)
+            packet = json.loads(packet_file.read_text(encoding="utf-8"))
+            value = "<h1>Build diagnostics</h1>\n"
+            packet["allowed_paths"] = ["apps/web/src/routes"]
+            packet["context"] = [{
+                "path": source,
+                "sha256": hashlib.sha256(value.encode()).hexdigest(),
+                "text": value,
+            }]
+            packet["packet_sha256"] = candidate_tool.sha256_json({
+                k: v for k, v in packet.items() if k != "packet_sha256"
+            })
+            with self.assertRaisesRegex(candidate_tool.CandidateError, "explicit build source"):
+                candidate_tool.validate_packet(packet)
+
+        candidate = self._candidate()
+        candidate["changed_paths"] = [source]
+        broad_packet = {
+            "allowed_paths": ["apps/web/src/routes"],
+            "forbidden_paths": [],
+            "expected_head": "a" * 40,
+        }
+        with self.assertRaisesRegex(candidate_tool.CandidateError, "explicit build source"):
+            candidate_tool.validate_candidate(candidate, broad_packet, Path("/tmp"))
+
+    def test_runner_uses_identical_single_route_export_policy(self) -> None:
+        source = "apps/web/src/routes/build/+page.svelte"
+        self.assertFalse(candidate_tool.path_has_default_forbidden_component(source))
+        for rejected in (
+            "build/apps/web/src/routes/build/+page.svelte",
+            "apps/web/build/+page.svelte",
+            "apps/web/src/routes/build/+layout.svelte",
+            "apps/web/src/routes/build/node_modules/dependency.js",
+            "apps/web/src/routes/build/+page.svelte/assets.js",
+            "apps/web/src/routes/build/dist/output.js",
+        ):
+            with self.subTest(path=rejected):
+                self.assertTrue(candidate_tool.path_has_default_forbidden_component(rejected))
+
+    def test_runner_validates_packet_for_exact_svelte_source_not_build_tree(self) -> None:
+        source = "apps/web/src/routes/build/+page.svelte"
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            root.chmod(0o700)
+            repo = root / "repo"
+            repo.mkdir(mode=0o700)
+            packet_file = self._packet(root, repo)
+            packet = json.loads(packet_file.read_text(encoding="utf-8"))
+            value = "<h1>Build diagnostics</h1>\n"
+            packet["allowed_paths"] = [source]
+            packet["context"] = [{
+                "path": source,
+                "sha256": hashlib.sha256(value.encode()).hexdigest(),
+                "text": value,
+            }]
+            packet["packet_sha256"] = candidate_tool.sha256_json({k: v for k, v in packet.items() if k != "packet_sha256"})
+            validated = candidate_tool.validate_packet(packet)
+            self.assertEqual(validated["context"][0]["path"], source)
+            packet["allowed_paths"] = ["apps/web/build/assets/index.js"]
+            packet["packet_sha256"] = candidate_tool.sha256_json({k: v for k, v in packet.items() if k != "packet_sha256"})
+            with self.assertRaisesRegex(candidate_tool.CandidateError, "non-exportable"):
+                candidate_tool.validate_packet(packet)
+
     def test_patch_paths_reject_nonregular_git_modes(self) -> None:
         for mode in ("120000", "160000"):
             patch = (

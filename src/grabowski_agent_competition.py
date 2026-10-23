@@ -75,6 +75,8 @@ DEFAULT_FORBIDDEN_COMPONENTS = frozenset({
     ".git", ".hg", ".svn", ".venv", "venv", "node_modules", "__pycache__",
     ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox", ".nox", "build", "dist", "target",
 })
+# Single explicitly admitted versioned source route; generated build trees stay forbidden.
+EXACT_BUILD_DIAGNOSTICS_SOURCE = "apps/web/src/routes/build/+page.svelte"
 SENSITIVE_EXACT_COMPONENTS = frozenset({
     "secret", "secrets", "credential", "credentials", "private_key", "cookies",
     "login data", "web data", "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa",
@@ -730,6 +732,8 @@ def _commit_blob(repo: Path, head: str, relative: str) -> bytes:
     fields = metadata.split()
     if len(fields) != 3 or fields[1] != b"blob" or re.fullmatch(rb"[0-9a-f]{40,64}", fields[2]) is None:
         raise AgentCompetitionError(f"context path metadata is invalid at expected_head: {relative}")
+    if fields[0] not in {b"100644", b"100755"}:
+        raise AgentCompetitionError(f"context path is not a regular tracked file at expected_head: {relative}")
     try:
         observed_path = raw_path.decode("utf-8")
     except UnicodeDecodeError as exc:
@@ -756,7 +760,14 @@ def _path_in_scope(path: str, roots: list[str]) -> bool:
 
 
 def _path_has_default_forbidden_component(path: str) -> bool:
+    if path == EXACT_BUILD_DIAGNOSTICS_SOURCE:
+        return False
     return any(part.casefold() in DEFAULT_FORBIDDEN_COMPONENTS for part in PurePosixPath(path).parts)
+
+
+def _explicit_build_source_scope(path: str, allowed: list[str]) -> bool:
+    # A broad ancestor scope must not silently admit this exceptional build path.
+    return path != EXACT_BUILD_DIAGNOSTICS_SOURCE or path in allowed
 
 
 def _path_is_sensitive(path: str) -> bool:
@@ -808,6 +819,8 @@ def _context(
         if relative in seen:
             raise AgentCompetitionError("context_paths contains duplicates")
         seen.add(relative)
+        if not _explicit_build_source_scope(relative, allowed):
+            raise AgentCompetitionError("explicit build source allowed path is required")
         if not _path_in_scope(relative, allowed) or _path_in_scope(relative, forbidden):
             raise AgentCompetitionError(f"context path is outside declared scope: {relative}")
         if _path_has_default_forbidden_component(relative):
@@ -1047,6 +1060,8 @@ def _validated_packet(identifier: str) -> dict[str, Any]:
         if path in seen:
             raise AgentCompetitionError("candidate packet context paths contain duplicates")
         seen.add(path)
+        if not _explicit_build_source_scope(path, allowed):
+            raise AgentCompetitionError("explicit build source allowed path is required")
         if not _path_in_scope(path, allowed) or _path_in_scope(path, forbidden):
             raise AgentCompetitionError(f"candidate packet context path is outside scope: {path}")
         if _path_has_default_forbidden_component(path) or _path_is_sensitive(path):
@@ -1067,6 +1082,8 @@ def _validated_packet(identifier: str) -> dict[str, Any]:
             or digest != _sha256_bytes(raw)
         ):
             raise AgentCompetitionError("candidate packet context content is too large or hash-mismatched")
+    if EXACT_BUILD_DIAGNOSTICS_SOURCE in allowed and EXACT_BUILD_DIAGNOSTICS_SOURCE not in seen:
+        raise AgentCompetitionError("special build source admission requires exact committed context")
     summary = packet["primary_summary"]
     nonce = packet["packet_nonce"]
     if (
@@ -1391,6 +1408,8 @@ def _validate_receipt_candidate(candidate: Any, packet: dict[str, Any]) -> dict[
     if not isinstance(allowed, list) or not isinstance(forbidden, list):
         raise AgentCompetitionError("candidate packet path scope is invalid")
     for path in changed_paths:
+        if not _explicit_build_source_scope(path, allowed):
+            raise AgentCompetitionError("explicit build source allowed path is required")
         if not _path_in_scope(path, allowed) or _path_in_scope(path, forbidden):
             raise AgentCompetitionError(f"candidate receipt changed path is outside scope: {path}")
         if _path_has_default_forbidden_component(path) or _path_is_sensitive(path):
@@ -1414,6 +1433,8 @@ def _validate_receipt_candidate(candidate: Any, packet: dict[str, Any]) -> dict[
     if not set(parsed_patch_paths).issubset(set(changed_paths)):
         raise AgentCompetitionError("candidate receipt patch paths are not declared in changed_paths")
     for path in parsed_patch_paths:
+        if not _explicit_build_source_scope(path, allowed):
+            raise AgentCompetitionError("explicit build source allowed path is required")
         if _path_has_default_forbidden_component(path) or _path_is_sensitive(path):
             raise AgentCompetitionError(f"candidate receipt patch path is non-exportable: {path}")
     patch_check = candidate["patch_check"]
@@ -2375,6 +2396,8 @@ def grabowski_agent_competition_start(
     sensitive_allowed = [path for path in allowed if _path_is_sensitive(path)]
     if sensitive_allowed:
         raise AgentCompetitionError(f"sensitive-looking allowed paths are not exportable: {sensitive_allowed}")
+    if EXACT_BUILD_DIAGNOSTICS_SOURCE in allowed and EXACT_BUILD_DIAGNOSTICS_SOURCE not in context_paths:
+        raise AgentCompetitionError("special build source admission requires exact committed context")
     contexts = _context(repo, head, context_paths, allowed, forbidden)
     execution_binary = (
         route_contract["argv_prefix"][0]

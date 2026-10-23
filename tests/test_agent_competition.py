@@ -53,6 +53,88 @@ else:
 
 
 class AgentCompetitionTests(unittest.TestCase):
+    def test_build_source_requires_explicit_file_scope_not_ancestor(self) -> None:
+        source = "apps/web/src/routes/build/+page.svelte"
+        file = self.repo / source
+        file.parent.mkdir(parents=True)
+        file.write_text("<h1>Build diagnostics</h1>\n", encoding="utf-8")
+        subprocess.run(["git", "add", "--", source], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-qm", "add special source"], cwd=self.repo, check=True)
+        head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.repo, text=True).strip()
+        with (
+            mock.patch.object(
+                competition.tasks, "grabowski_task_start",
+                return_value=self._task_start("unexpected-build-export"),
+            ) as start,
+            self.assertRaisesRegex(competition.AgentCompetitionError, "explicit build source"),
+        ):
+            self._authorized_start(
+                request_id="implicit-build-source",
+                provider="claude",
+                mode="competitor",
+                repository=str(self.repo),
+                expected_head=head,
+                task="Attempt export via broad ancestor scope",
+                allowed_paths=["apps/web/src/routes"],
+                context_paths=[source],
+                forbidden_paths=[],
+                timeout_seconds=120,
+            )
+        start.assert_not_called()
+
+    def test_review_export_admits_only_exact_build_diagnostics_source_route(self) -> None:
+        source = "apps/web/src/routes/build/+page.svelte"
+        self.assertFalse(competition._path_has_default_forbidden_component(source))
+        for rejected in (
+            "apps/web/build/+page.svelte",
+            "apps/web/src/routes/build/+layout.svelte",
+            "apps/web/src/routes/build/+page.svelte/bundle.js",
+            "apps/web/src/routes/build/static/bundle.js",
+            "build/apps/web/src/routes/build/+page.svelte",
+            "apps/web/src/routes/build/dist/+page.svelte",
+            "apps/web/src/routes/build/node_modules/evil.js",
+            "apps/web/src/routes/build/+page.svelte.map",
+            "src/routes/build/+page.svelte",
+        ):
+            with self.subTest(path=rejected):
+                self.assertTrue(competition._path_has_default_forbidden_component(rejected))
+
+    def test_review_export_accepts_exact_committed_svelte_source(self) -> None:
+        source = "apps/web/src/routes/build/+page.svelte"
+        file = self.repo / source
+        file.parent.mkdir(parents=True)
+        file.write_text("<h1>Build diagnostics</h1>\n", encoding="utf-8")
+        subprocess.run(["git", "add", "--", source], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-qm", "add build diagnostics source"], cwd=self.repo, check=True)
+        head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.repo, text=True).strip()
+        with mock.patch.object(competition.tasks, "grabowski_task_start", return_value=self._task_start("route-review")):
+            result = self._authorized_start(
+                request_id="exact-route-review",
+                provider="claude",
+                mode="competitor",
+                repository=str(self.repo),
+                expected_head=head,
+                task="Review only the exact versioned Svelte source",
+                allowed_paths=[source],
+                context_paths=[source],
+                forbidden_paths=[],
+                timeout_seconds=120,
+            )
+        packet = competition._validated_packet(result["competition_id"])
+        self.assertEqual(packet["context"][0]["path"], source)
+        self.assertEqual(packet["context"][0]["text"], "<h1>Build diagnostics</h1>\n")
+
+    def test_export_of_committed_symlink_is_denied_before_context(self) -> None:
+        source = "apps/web/src/routes/build/+page.svelte"
+        link = self.repo / source
+        link.parent.mkdir(parents=True)
+        link.symlink_to("../../../../../src/sample.py")
+        subprocess.run(["git", "add", "--", source], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-qm", "symlink route"], cwd=self.repo, check=True)
+        head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.repo, text=True).strip()
+        with self.assertRaisesRegex(competition.AgentCompetitionError, "regular tracked file"):
+            competition._commit_blob(self.repo, head, source)
+
     def test_candidate_receipt_rejects_nonregular_git_patch_modes(self) -> None:
         for mode in ("120000", "160000"):
             patch = (
