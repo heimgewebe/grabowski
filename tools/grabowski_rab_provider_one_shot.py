@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -118,11 +119,18 @@ def _bounded_json_object(raw: bytes) -> dict[str, Any]:
     def reject_nonfinite(_: str) -> Any:
         raise ProviderGrantDenied("provider JSON has non-finite numbers")
 
+    def finite_float(raw: str) -> float:
+        value = float(raw)
+        if not math.isfinite(value):
+            raise ProviderGrantDenied("provider JSON has non-finite numbers")
+        return value
+
     try:
         value = json.loads(
             decoded,
             object_pairs_hook=unique_pairs,
             parse_constant=reject_nonfinite,
+            parse_float=finite_float,
         )
     except (ValueError, RecursionError) as exc:
         raise ProviderGrantDenied("provider JSON cannot be decoded") from exc

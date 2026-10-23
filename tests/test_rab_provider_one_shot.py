@@ -227,6 +227,9 @@ class BoundedJsonTests(unittest.TestCase):
             b'{"value":NaN}',
             b'{"value":Infinity}',
             b'{"value":-Infinity}',
+            b'{"value":1e999}',
+            b'{"value":-1e999}',
+            b'{"nested":{"value":1e999}}',
         ):
             with self.subTest(raw=raw):
                 with self.assertRaises(once.ProviderGrantDenied):
