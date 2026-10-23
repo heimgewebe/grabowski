@@ -105,6 +105,39 @@ class RepoGroundReservedJobOriginTests(unittest.TestCase):
 
 
 class DecisionReviewLogicalClockTests(unittest.TestCase):
+    def test_historical_over_10k_job_dirs_keep_causal_frontier(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            a, b = self.roots(temp)
+            with a, b:
+                previous, previous_hash = build("ffffffffffff", 2_000_000_000_500_000_000)
+                jobs = job_origin.DECISION_REVIEW_JOBS_ROOT
+                jobs.mkdir(parents=True, exist_ok=True, mode=0o700)
+                folder = jobs / "grabowski-job-ffffffffffff"
+                folder.mkdir(mode=0o700)
+                metadata = folder / "metadata.json"
+                metadata.write_text(
+                    json.dumps({"origin": previous, "origin_sha256": previous_hash}),
+                    encoding="utf-8",
+                )
+                os.chmod(metadata, 0o600)
+                next(job_origin.DECISION_REVIEW_ORDER_ROOT.glob("*.json")).unlink()
+                for number in range(10_010):
+                    (jobs / f"grabowski-job-{number:012x}").mkdir(mode=0o700)
+                current, _ = build("eeeeeeeeeeee", 1_900_000_000_100_000_000)
+        self.assertEqual(current["scope"]["started_at_unix_ns"],
+                         previous["scope"]["started_at_unix_ns"] + 1)
+
+    def test_hard_typed_scan_budget_stays_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            a, b = self.roots(temp)
+            with a, b, mock.patch.object(job_origin, "DECISION_REVIEW_ORDER_MAX_JOB_DIRECTORIES", 2):
+                jobs = job_origin.DECISION_REVIEW_JOBS_ROOT
+                jobs.mkdir(parents=True, mode=0o700)
+                for number in range(3):
+                    (jobs / f"grabowski-job-{number:012x}").mkdir(mode=0o700)
+                with self.assertRaisesRegex(ValueError, "directory limit"):
+                    build("ffffffffffff", 1_900_000_000_100_000_000)
+
     def roots(self, temporary: str):
         root = Path(temporary)
         return (

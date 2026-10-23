@@ -385,6 +385,22 @@ def stamp_claude_quota_429(directory: Path, *, envelope_updates: dict | None = N
 
 
 class DecisionReviewReconciliationTests(unittest.TestCase):
+    def test_large_registry_cannot_hide_late_reject(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            jobs = Path(temp) / "jobs"
+            jobs.mkdir(mode=0o700)
+            for number in range(10_010):
+                (jobs / f"grabowski-job-{number:012x}").mkdir(mode=0o700)
+            make_job(jobs, suffix="fffffffffff0", slot="A", terminal_status="succeeded",
+                     review_result=result("A", "PASS_THIS_REVISION", 0))
+            make_job(jobs, suffix="fffffffffff1", slot="A", terminal_status="succeeded",
+                     review_result=result("A", "REJECT_THIS_REVISION", 1))
+            checked = self.reconcile(jobs)
+        self.assertEqual(checked["status"], "blocked")
+        self.assertEqual(checked["attempt_count"], 2)
+        self.assertEqual(checked["slots"][0]["material_reject_count"], 1)
+        self.assertFalse(any("inventory_truncated" in x for x in checked["errors"]))
+
     def test_v2_claude_429_blocks_until_exact_later_same_slot_pass(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             jobs = Path(temporary) / "jobs"

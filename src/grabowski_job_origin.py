@@ -47,7 +47,8 @@ DECISION_REVIEW_ORDER_ROOT = (
 )
 DECISION_REVIEW_JOBS_ROOT = Path.home() / ".local" / "state" / "grabowski" / "jobs"
 DECISION_REVIEW_ORDER_MAX_BYTES = 4096
-DECISION_REVIEW_ORDER_MAX_JOB_DIRECTORIES = 10_000
+# Streaming typed job history remains hard-bounded; protected retention still required.
+DECISION_REVIEW_ORDER_MAX_JOB_DIRECTORIES = 100_000
 DECISION_REVIEW_ORDER_MAX_METADATA_BYTES = 256 * 1024
 DECISION_REVIEW_ORDER_MAX_NS = (1 << 63) - 1
 _DECISION_REVIEW_REPO_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
@@ -178,70 +179,77 @@ def _existing_decision_review_max_ns(
         return -1
     if stat.S_ISLNK(root_metadata.st_mode) or not stat.S_ISDIR(root_metadata.st_mode):
         raise PermissionError("decision review jobs root is unsafe")
-    directories = list(root.iterdir())
-    if len(directories) > DECISION_REVIEW_ORDER_MAX_JOB_DIRECTORIES:
-        raise ValueError("decision review job bootstrap exceeds directory limit")
     maximum = -1
-    for directory in directories:
-        try:
-            directory_metadata = directory.lstat()
-        except OSError:
-            continue
-        if stat.S_ISLNK(directory_metadata.st_mode) or not stat.S_ISDIR(
-            directory_metadata.st_mode
-        ):
-            continue
-        metadata_path = directory / "metadata.json"
-        try:
-            metadata_stat = metadata_path.lstat()
-        except FileNotFoundError:
-            continue
-        if (
-            not stat.S_ISREG(metadata_stat.st_mode)
-            or metadata_stat.st_nlink != 1
-            or stat.S_IMODE(metadata_stat.st_mode) & 0o077
-            or metadata_stat.st_size > DECISION_REVIEW_ORDER_MAX_METADATA_BYTES
-        ):
-            continue
-        try:
-            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-            continue
-        if not isinstance(metadata, dict):
-            continue
-        origin = metadata.get("origin")
-        origin_sha256 = metadata.get("origin_sha256")
-        if not isinstance(origin, dict) or not isinstance(origin_sha256, str):
-            continue
-        calculated = hashlib.sha256(canonical_json_bytes(origin)).hexdigest()
-        if not hmac.compare_digest(origin_sha256, calculated):
-            continue
-        scope = origin.get("scope")
-        created = origin.get("created_at_unix")
-        if not isinstance(scope, dict):
-            continue
-        try:
-            candidate_key = _decision_review_order_key(scope)
-        except ValueError:
-            continue
-        if candidate_key != key_sha256:
-            continue
-        if "started_at_unix_ns" not in scope:
-            maximum = max(maximum, _legacy_decision_review_upper_bound_ns(created))
-            continue
-        candidate = scope.get("started_at_unix_ns")
-        if (
-            isinstance(created, bool)
-            or not isinstance(created, int)
-            or created < 0
-            or isinstance(candidate, bool)
-            or not isinstance(candidate, int)
-            or candidate < 0
-            or candidate > DECISION_REVIEW_ORDER_MAX_NS
-            or candidate // 1_000_000_000 != created
-        ):
-            raise ValueError("existing decision review ordering evidence is invalid")
-        maximum = max(maximum, candidate)
+    # Scan every typed job; stream names to avoid O(job count) allocation.
+    # Never treat a truncated registry prefix as a complete causal frontier.
+    scanned = 0
+    with os.scandir(root) as entries:
+        for entry in entries:
+            if UNIT_RE.fullmatch(entry.name) is None:
+                continue
+            scanned += 1
+            if scanned > DECISION_REVIEW_ORDER_MAX_JOB_DIRECTORIES:
+                raise ValueError("decision review job bootstrap exceeds directory limit")
+            directory = root / entry.name
+            try:
+                directory_metadata = directory.lstat()
+            except OSError:
+                continue
+            if stat.S_ISLNK(directory_metadata.st_mode) or not stat.S_ISDIR(
+                directory_metadata.st_mode
+            ):
+                continue
+            metadata_path = directory / "metadata.json"
+            try:
+                metadata_stat = metadata_path.lstat()
+            except FileNotFoundError:
+                continue
+            if (
+                not stat.S_ISREG(metadata_stat.st_mode)
+                or metadata_stat.st_nlink != 1
+                or stat.S_IMODE(metadata_stat.st_mode) & 0o077
+                or metadata_stat.st_size > DECISION_REVIEW_ORDER_MAX_METADATA_BYTES
+            ):
+                continue
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if not isinstance(metadata, dict):
+                continue
+            origin = metadata.get("origin")
+            origin_sha256 = metadata.get("origin_sha256")
+            if not isinstance(origin, dict) or not isinstance(origin_sha256, str):
+                continue
+            calculated = hashlib.sha256(canonical_json_bytes(origin)).hexdigest()
+            if not hmac.compare_digest(origin_sha256, calculated):
+                continue
+            scope = origin.get("scope")
+            created = origin.get("created_at_unix")
+            if not isinstance(scope, dict):
+                continue
+            try:
+                candidate_key = _decision_review_order_key(scope)
+            except ValueError:
+                continue
+            if candidate_key != key_sha256:
+                continue
+            if "started_at_unix_ns" not in scope:
+                maximum = max(maximum, _legacy_decision_review_upper_bound_ns(created))
+                continue
+            candidate = scope.get("started_at_unix_ns")
+            if (
+                isinstance(created, bool)
+                or not isinstance(created, int)
+                or created < 0
+                or isinstance(candidate, bool)
+                or not isinstance(candidate, int)
+                or candidate < 0
+                or candidate > DECISION_REVIEW_ORDER_MAX_NS
+                or candidate // 1_000_000_000 != created
+            ):
+                raise ValueError("existing decision review ordering evidence is invalid")
+            maximum = max(maximum, candidate)
     return maximum
 
 
