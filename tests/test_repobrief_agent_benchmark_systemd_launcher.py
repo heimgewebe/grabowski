@@ -68,6 +68,20 @@ class RootSystemdLauncherTests(unittest.TestCase):
         self.assertNotIn("--allow-live-provider", cmd)
         self.assertFalse(any("codex" in x.lower() for x in cmd))
 
+    def test_live_pair_never_inherits_operator_stdio(self) -> None:
+        live = launcher.unit_argv(
+            "no-root-tty", ["/usr/bin/true"], probe=False, pair=True
+        )
+        options = live[: live.index("--")]
+        properties = self.props(live)
+        self.assertNotIn("--pipe", options)
+        self.assertNotIn("--pty", options)
+        self.assertEqual(properties["StandardInput"], "null")
+        self.assertEqual(properties["StandardOutput"], "journal")
+        self.assertEqual(properties["StandardError"], "journal")
+        probe = launcher.probe_argv("stdio-probe")
+        self.assertIn("--pipe", probe[: probe.index("--")])
+
     def test_mainpid_contract_pinned_for_probe_and_pair_plans(self) -> None:
         # The independent root grant checks these exact PID1 properties;
         # neither a future probe nor a paired unit may rely on defaults.
