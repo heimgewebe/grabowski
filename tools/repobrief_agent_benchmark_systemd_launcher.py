@@ -76,6 +76,10 @@ def unit_argv(
 
     properties = [
         "Type=exec",
+        # The root-side one-shot sender verifier refuses mutable PID1
+        # MainPID settings.  These cannot be inherited as unproven defaults.
+        "NotifyAccess=none",
+        "PIDFile=",
         "DynamicUser=yes",
         f"User={name}",
         f"Group={name}",

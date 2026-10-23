@@ -64,6 +64,25 @@ class RootSystemdLauncherTests(unittest.TestCase):
         self.assertNotIn("--allow-live-provider", cmd)
         self.assertFalse(any("codex" in x.lower() for x in cmd))
 
+    def test_mainpid_contract_pinned_for_probe_and_pair_plans(self) -> None:
+        # The independent root grant checks these exact PID1 properties;
+        # neither a future probe nor a paired unit may rely on defaults.
+        plans = (
+            launcher.probe_argv("identityprobe"),
+            launcher.unit_argv(
+                "identitypair", ["/usr/bin/true"], probe=False, pair=True
+            ),
+        )
+        for argv in plans:
+            with self.subTest(argv=argv[4]):
+                properties = self.props(argv)
+                self.assertEqual(properties["Type"], "exec")
+                self.assertEqual(properties["NotifyAccess"], "none")
+                self.assertEqual(properties["PIDFile"], "")
+                self.assertEqual(argv.count("--property=NotifyAccess=none"), 1)
+                self.assertEqual(argv.count("--property=PIDFile="), 1)
+                self.assertEqual(argv.count("--"), 1)
+
     def test_probe_private_mounts_are_runtime_owned_and_closed(self) -> None:
         p = self.props(launcher.probe_argv("proof"))
         self.assertEqual(p["DynamicUser"], "yes")
