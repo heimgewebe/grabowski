@@ -437,6 +437,53 @@ def _insert_baseline_generation(
     return existing
 
 
+class _RetainedEvidencePreflightNeeded(Exception):
+    """Release the SQLite writer transaction before observing Git/remote state."""
+
+    def __init__(
+        self, inputs: dict[str, Any], current_identity: dict[str, Any],
+        prior_identity: dict[str, Any], evidence_sha256: str,
+    ) -> None:
+        self.inputs = inputs
+        self.current_identity = current_identity
+        self.prior_identity = prior_identity
+        self.evidence_sha256 = evidence_sha256
+
+
+def _observe_retained_checkout(
+    inputs: dict[str, Any],
+    current_identity: dict[str, Any],
+    prior: dict[str, Any],
+) -> bool:
+    """Bounded Git/remote proof outside all checkout-identity write transactions."""
+    try:
+        repo, common_dir, record = _checkouts()._worktree_for_path(
+            Path(inputs["repo"]), Path(inputs["target_path"])
+        )
+        status = _checkouts()._require_clean_linked(record)
+        remote = _checkouts()._remote_secured_observation(
+            record, verify_github_pull_ref=True
+        )
+        if not (
+            str(repo.resolve()) == str(Path(inputs["repo"]).resolve())
+            and str(common_dir) == inputs["repo_common_dir"]
+            and record.get("head") == prior.get("expected_head")
+            and record.get("branch") == prior.get("expected_branch")
+            and status.get("dirty") is False
+            and remote.get("remote_secured") is True
+        ):
+            return False
+        ancestry = _checkouts()._git_read(
+            Path(inputs["repo"]),
+            ["merge-base", "--is-ancestor",
+             current_identity["expected_head"], prior["expected_head"]],
+            check=False,
+        )
+        return ancestry.returncode == 0
+    except (OSError, RuntimeError, ValueError, KeyError):
+        return False
+
+
 def _reconcile_archived_evidence_generation(
     connection: sqlite3.Connection,
     *,
@@ -444,6 +491,7 @@ def _reconcile_archived_evidence_generation(
     evidence: dict[str, Any],
     current: dict[str, Any],
     now: int,
+    retained_verified: bool = False,
 ) -> dict[str, Any]:
     """Reconcile exact terminal protected evidence without changing owner authority.
 
@@ -510,36 +558,8 @@ def _reconcile_archived_evidence_generation(
         and SHA40_RE.fullmatch(str(current_identity.get("expected_head", ""))) is not None
         and SHA40_RE.fullmatch(str(prior.get("expected_head", ""))) is not None
     )
-    if retained_valid:
-        # A completed-retained record cannot confer authority if the actual
-        # linked checkout is dirty, drifted, or not secured by a remote ref.
-        # Observe Git under the identity transaction before reconciling.
-        try:
-            repo, common_dir, record = _checkouts()._worktree_for_path(
-                Path(inputs["repo"]), Path(inputs["target_path"])
-            )
-            status = _checkouts()._require_clean_linked(record)
-            remote = _checkouts()._remote_secured_observation(
-                record, verify_github_pull_ref=True
-            )
-            retained_valid = bool(
-                str(repo.resolve()) == str(Path(inputs["repo"]).resolve())
-                and str(common_dir) == inputs["repo_common_dir"]
-                and record.get("head") == prior.get("expected_head")
-                and record.get("branch") == prior.get("expected_branch")
-                and status.get("dirty") is False
-                and remote.get("remote_secured") is True
-            )
-            if retained_valid:
-                ancestry = _checkouts()._git_read(
-                    Path(inputs["repo"]),
-                    ["merge-base", "--is-ancestor",
-                     current_identity["expected_head"], prior["expected_head"]],
-                    check=False,
-                )
-                retained_valid = ancestry.returncode == 0
-        except (OSError, RuntimeError, ValueError, KeyError):
-            retained_valid = False
+    # Git/remote proof must have completed outside the writer transaction.
+    retained_valid = retained_valid and retained_verified
     if not (archived_valid or retained_valid):
         raise CheckoutIdentityConflict(
             "identity ledger and protected checkout evidence disagree"
@@ -822,7 +842,11 @@ def _insert_reservation(
     return row
 
 
-def prepare(inputs: dict[str, Any]) -> dict[str, Any]:
+def _prepare(
+    inputs: dict[str, Any],
+    *,
+    retained_probe: tuple[str, bool] | None = None,
+) -> dict[str, Any]:
     identity = _requested_identity(inputs)
     supersession = inputs.get("identity_supersession")
     if supersession is not None:
@@ -855,6 +879,11 @@ def prepare(inputs: dict[str, Any]) -> dict[str, Any]:
 
         evidence = _load_evidence(connection, checkout_key, now)
         current = _current_generation(connection, checkout_key)
+        evidence_sha256 = _sha256_json({"evidence": evidence, "current": current})
+        if retained_probe is not None and evidence_sha256 != retained_probe[0]:
+            raise CheckoutIdentityConflict(
+                "completed-retained evidence changed during external observation"
+            )
         supersession_binding_generation = current
         if current is not None and current["state"] in {"reserved", "blocking"}:
             raise CheckoutIdentityConflict(
@@ -863,12 +892,24 @@ def prepare(inputs: dict[str, Any]) -> dict[str, Any]:
         if current is not None:
             current_identity = json.loads(current["identity_json"])
             if evidence["protected"] and current_identity != evidence["prior_identity"]:
+                lifecycle = evidence["lifecycle"]
+                retained_case = bool(
+                    isinstance(lifecycle, dict)
+                    and lifecycle.get("phase") == "completed_retained"
+                    and evidence["archive"] is None
+                )
+                if retained_case and retained_probe is None:
+                    raise _RetainedEvidencePreflightNeeded(
+                        prepared_inputs, current_identity,
+                        evidence["prior_identity"], evidence_sha256,
+                    )
                 current = _reconcile_archived_evidence_generation(
                     connection,
                     inputs=prepared_inputs,
                     evidence=evidence,
                     current=current,
                     now=now,
+                    retained_verified=bool(retained_case and retained_probe and retained_probe[1]),
                 )
 
         exact_replay = _identity_matches(evidence["prior_identity"], identity)
@@ -1072,6 +1113,20 @@ def prepare(inputs: dict[str, Any]) -> dict[str, Any]:
         connection.commit()
         return _reservation_public(row)
 
+
+
+def prepare(inputs: dict[str, Any]) -> dict[str, Any]:
+    try:
+        return _prepare(inputs)
+    except _RetainedEvidencePreflightNeeded as pending:
+        # The failed first transaction has been rolled back and closed. Do not
+        # hold a global checkout writer lock during potentially slow Git/HTTP.
+        verified = _observe_retained_checkout(
+            pending.inputs, pending.current_identity, pending.prior_identity
+        )
+        # The second write transaction checks the full protected DB evidence
+        # against the exact preflight snapshot before any identity transition.
+        return _prepare(inputs, retained_probe=(pending.evidence_sha256, verified))
 
 
 def finalize(reservation: dict[str, Any]) -> dict[str, Any]:

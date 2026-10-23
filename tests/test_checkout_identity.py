@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 import json
+import sqlite3
 from pathlib import Path
 import sys
 import tempfile
@@ -471,6 +472,106 @@ class CheckoutIdentityTests(unittest.TestCase):
                 (retention_head or head, branch, self.now, prior["checkout_key"]),
             )
         return {**prior, "head": head, "branch": branch}
+
+    def test_completed_retained_git_proof_does_not_hold_sqlite_writer_lock(self) -> None:
+        prior = self._seed_prior(phase="active", active_retention=True)
+        original = identity.prepare(
+            self._inputs(
+                owner=str(prior["owner_id"]), purpose=str(prior["purpose"]),
+                source_kind=str(prior["source_kind"]),
+                source_id=str(prior["source_id"]),
+                artifact_class=str(prior["artifact_class"]),
+                head=str(prior["head"]), branch=str(prior["branch"]),
+                idempotency_key="preflight-initial",
+            )
+        )
+        retained = self._complete_retained_prior(prior)
+        followup = self._inputs(idempotency_key="preflight-followup")
+        followup["identity_supersession"] = self._supersession(
+            retained, followup, expected_generation_id=original["generation_id"]
+        )
+
+        def remote_probe(_record: dict[str, object], **_kwargs: object) -> dict[str, object]:
+            # An independent writer must not be blocked by Git/remote read I/O.
+            with sqlite3.connect(self.checkout_db, timeout=0.05) as writer:
+                writer.execute("BEGIN IMMEDIATE")
+                writer.execute("SELECT 1")
+                writer.rollback()
+            return {"remote_secured": True}
+
+        with ExitStack() as probes:
+            probes.enter_context(patch.object(
+                checkouts, "_worktree_for_path",
+                return_value=(self.repo, self.common_dir, {
+                    "path": str(self.checkout), "repo_path": str(self.repo),
+                    "head": NEW_HEAD, "branch": str(prior["branch"]),
+                }),
+            ))
+            probes.enter_context(patch.object(
+                checkouts, "_require_clean_linked", return_value={"dirty": False}
+            ))
+            remote = probes.enter_context(patch.object(
+                checkouts, "_remote_secured_observation", side_effect=remote_probe
+            ))
+            probes.enter_context(patch.object(
+                checkouts, "_git_read",
+                return_value=types.SimpleNamespace(returncode=0),
+            ))
+            result = identity.prepare(followup)
+        self.assertEqual("supersession", result["action"])
+        remote.assert_called_once()
+
+    def test_completed_retained_preflight_rejects_database_evidence_drift(self) -> None:
+        prior = self._seed_prior(phase="active", active_retention=True)
+        identity.prepare(
+            self._inputs(
+                owner=str(prior["owner_id"]), purpose=str(prior["purpose"]),
+                source_kind=str(prior["source_kind"]),
+                source_id=str(prior["source_id"]),
+                artifact_class=str(prior["artifact_class"]),
+                head=str(prior["head"]), branch=str(prior["branch"]),
+                idempotency_key="drift-initial",
+            )
+        )
+        retained = self._complete_retained_prior(prior)
+        followup = self._inputs(idempotency_key="drift-followup")
+        followup["identity_supersession"] = self._supersession(retained, followup)
+
+        def remote_probe(_record: dict[str, object], **_kwargs: object) -> dict[str, object]:
+            with checkouts._database() as connection:
+                connection.execute(
+                    "UPDATE retention SET updated_at_unix=updated_at_unix+1 "
+                    "WHERE checkout_key=?", (prior["checkout_key"],)
+                )
+            return {"remote_secured": True}
+
+        with ExitStack() as probes:
+            probes.enter_context(patch.object(
+                checkouts, "_worktree_for_path",
+                return_value=(self.repo, self.common_dir, {
+                    "path": str(self.checkout), "repo_path": str(self.repo),
+                    "head": NEW_HEAD, "branch": str(prior["branch"]),
+                }),
+            ))
+            probes.enter_context(patch.object(
+                checkouts, "_require_clean_linked", return_value={"dirty": False}
+            ))
+            probes.enter_context(patch.object(
+                checkouts, "_remote_secured_observation", side_effect=remote_probe
+            ))
+            probes.enter_context(patch.object(
+                checkouts, "_git_read",
+                return_value=types.SimpleNamespace(returncode=0),
+            ))
+            with self.assertRaisesRegex(
+                identity.CheckoutIdentityConflict, "changed during"
+            ):
+                identity.prepare(followup)
+        active = self._fetchone(
+            "SELECT state FROM checkout_identity_generations WHERE checkout_key=? "
+            "AND state='active'", (prior["checkout_key"],)
+        )
+        self.assertIsNotNone(active)
 
     def test_completed_retained_head_reconciliation_preserves_lineage_and_handoff(self) -> None:
         prior = self._seed_prior(phase="active", active_retention=True)
