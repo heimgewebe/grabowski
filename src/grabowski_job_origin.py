@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+import errno
 import fcntl
 import hashlib
 import hmac
@@ -48,7 +49,10 @@ DECISION_REVIEW_ORDER_ROOT = (
 DECISION_REVIEW_JOBS_ROOT = Path.home() / ".local" / "state" / "grabowski" / "jobs"
 DECISION_REVIEW_ORDER_MAX_BYTES = 4096
 # Streaming typed job history remains hard-bounded; protected retention still required.
-DECISION_REVIEW_ORDER_MAX_JOB_DIRECTORIES = 100_000
+DECISION_REVIEW_ORDER_MAX_JOB_DIRECTORIES = 16_384  # All entries, bounded
+DECISION_REVIEW_ORDER_MAX_REVIEW_JOBS = 10_000  # Authenticated reviews
+_DECISION_REVIEW_UNIT_RE = re.compile(r"grabowski-job-[0-9a-f]{12}\Z")
+_RGPM_UNIT_RE = re.compile(r"grabowski-job-rgpm-[0-9a-f]{16}-[0-9]{2}\Z")
 DECISION_REVIEW_ORDER_MAX_METADATA_BYTES = 256 * 1024
 DECISION_REVIEW_ORDER_MAX_TOTAL_METADATA_BYTES = 128 * 1024 * 1024
 DECISION_REVIEW_ORDER_MAX_NS = (1 << 63) - 1
@@ -189,7 +193,7 @@ def _existing_decision_review_max_ns(
         ):
             raise PermissionError("decision review jobs root is unsafe")
         maximum = -1
-        scanned = typed_scanned = metadata_bytes = 0
+        scanned = review_scanned = metadata_bytes = 0
         # All top-level entries consume budget, not only well-shaped job names.
         # A noncanonical directory with job metadata is an unknown frontier,
         # never permission to ignore an older material review decision.
@@ -198,17 +202,29 @@ def _existing_decision_review_max_ns(
                 scanned += 1
                 if scanned > DECISION_REVIEW_ORDER_MAX_JOB_DIRECTORIES:
                     raise ValueError("decision review job bootstrap exceeds directory limit")
-                canonical = UNIT_RE.fullmatch(entry.name) is not None
-                if canonical:
-                    typed_scanned += 1
-                    if typed_scanned > DECISION_REVIEW_ORDER_MAX_JOB_DIRECTORIES:
-                        raise ValueError("decision review job bootstrap exceeds typed directory limit")
+                canonical = _DECISION_REVIEW_UNIT_RE.fullmatch(entry.name) is not None
                 try:
                     job_fd = os.open(entry.name, directory_flags, dir_fd=root_fd)
                 except OSError as exc:
-                    if canonical:
-                        raise ValueError("decision review job directory changed or is unsafe") from exc
-                    continue  # Unrelated files, including receipt JSONs.
+                    # ENOTDIR alone cannot prove a harmless foreign file:
+                    # O_DIRECTORY|O_NOFOLLOW also rejects a directory symlink.
+                    # Only a still-existing, non-job, regular file is inert.
+                    if not canonical and exc.errno == errno.ENOTDIR:
+                        try:
+                            untyped = os.stat(
+                                entry.name, dir_fd=root_fd, follow_symlinks=False
+                            )
+                        except OSError:
+                            pass
+                        else:
+                            if (
+                                stat.S_ISREG(untyped.st_mode)
+                                and not entry.name.startswith("grabowski-job-")
+                            ):
+                                continue
+                    raise ValueError(
+                        "decision review job directory changed or is unsafe"
+                    ) from exc
                 try:
                     job_stat = os.fstat(job_fd)
                     if (
@@ -222,8 +238,6 @@ def _existing_decision_review_max_ns(
                     except FileNotFoundError:
                         continue  # Historical jobs may predate metadata.json.
                     try:
-                        if not canonical:
-                            raise ValueError("noncanonical job metadata cannot establish review ordering")
                         before = os.fstat(metadata_fd)
                         if (
                             not stat.S_ISREG(before.st_mode)
@@ -259,7 +273,9 @@ def _existing_decision_review_max_ns(
                 origin = metadata.get("origin")
                 origin_sha256 = metadata.get("origin_sha256")
                 if origin is None and origin_sha256 is None:
-                    continue  # Valid older job metadata with no origin.
+                    if not canonical:
+                        raise ValueError("noncanonical job metadata cannot establish review ordering")
+                    continue  # Valid older canonical job metadata with no origin.
                 if not isinstance(origin, dict) or not isinstance(origin_sha256, str):
                     raise ValueError("decision review job origin is incomplete")
                 calculated = hashlib.sha256(canonical_json_bytes(origin)).hexdigest()
@@ -271,6 +287,35 @@ def _existing_decision_review_max_ns(
                 created = origin.get("created_at_unix")
                 if not isinstance(scope, dict):
                     raise ValueError("decision review job origin scope is invalid")
+                # Runtime metadata may retain the original wall-clock ns
+                # while a legacy signed origin omits its logical-clock field.
+                # Only that duplicate field may differ; the sealed origin
+                # remains the authority for review order and every other key.
+                if "scope" in metadata and metadata["scope"] != scope:
+                    mirrored = metadata["scope"]
+                    if (
+                        not isinstance(mirrored, dict)
+                        or {
+                            key: value for key, value in mirrored.items()
+                            if key != "started_at_unix_ns"
+                        } != {
+                            key: value for key, value in scope.items()
+                            if key != "started_at_unix_ns"
+                        }
+                    ):
+                        raise ValueError("decision review metadata scope does not match origin")
+                if not canonical:
+                    # Foreign RepoGround metadata cannot establish an R3 causal frontier.
+                    if (
+                        _RGPM_UNIT_RE.fullmatch(entry.name) is None
+                        or scope.get("decision_bound_review") is not None
+                    ):
+                        raise ValueError("noncanonical job metadata cannot establish review ordering")
+                    continue
+                if scope.get("decision_bound_review") is not None:
+                    review_scanned += 1
+                    if review_scanned > DECISION_REVIEW_ORDER_MAX_REVIEW_JOBS:
+                        raise ValueError("decision review origin exceeds review attempt limit")
                 candidate_key = _decision_review_order_key(scope)
                 if candidate_key != key_sha256:
                     continue
@@ -481,6 +526,11 @@ def _build_origin(
         raise ValueError("origin argv hash is invalid")
     if not isinstance(scope, dict):
         raise ValueError("origin scope is invalid")
+    if (
+        scope.get("decision_bound_review") is not None
+        and _DECISION_REVIEW_UNIT_RE.fullmatch(unit) is None
+    ):
+        raise ValueError("decision-bound review requires canonical 12-hex job unit")
     if (
         isinstance(created_at_unix, bool)
         or not isinstance(created_at_unix, int)

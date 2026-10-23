@@ -64,6 +64,23 @@ def build(suffix: str, observed_ns: int | None) -> tuple[dict, str]:
 
 
 class RepoGroundReservedJobOriginTests(unittest.TestCase):
+    def test_reserved_unit_must_not_allocate_decision_review_clock(self) -> None:
+        unit = "grabowski-job-rgpm-" + "a" * 16 + "-01"
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            with self.assertRaisesRegex(ValueError, "canonical 12-hex"):
+                job_origin.build_origin(
+                    unit=unit, owner=f"uid:{os.getuid()}",
+                    argv_sha256="e" * 64,
+                    scope=scope(1_900_000_000_100_000_000),
+                    notify_on_done={"requested": False, "channels": []},
+                    created_at_unix=1_900_000_000,
+                    started_at="2030-03-17T17:46:40Z",
+                    invoker_tool="grabowski_job_start",
+                    jobs_root=root / "jobs", order_root=root / "order",
+                )
+            self.assertFalse((root / "order").exists())
+
     def test_reserved_unit_origin_round_trip_remains_exact(self) -> None:
         unit = "grabowski-job-rgpm-" + "a" * 16 + "-01"
         origin, digest = job_origin.build_origin(
@@ -147,7 +164,9 @@ class DecisionReviewLogicalClockTests(unittest.TestCase):
                 jobs.mkdir(parents=True, mode=0o700)
                 other = jobs / "foreign-claimed-review"
                 other.mkdir(mode=0o700)
-                (other / "metadata.json").write_text("{}", encoding="utf-8")
+                metadata = other / "metadata.json"
+                metadata.write_text("{}", encoding="utf-8")
+                metadata.chmod(0o600)
                 with self.assertRaisesRegex(ValueError, "noncanonical job metadata"):
                     build("aaaaaaaaaaaa", 1_900_000_000_100_000_000)
 
@@ -207,6 +226,35 @@ class DecisionReviewLogicalClockTests(unittest.TestCase):
                 (job / "metadata.json").write_text('{"scope":null}', encoding="utf-8")
                 with self.assertRaisesRegex(ValueError, "aggregate budget"):
                     build("aaaaaaaaaaaa", 1_900_000_000_100_000_000)
+
+    def test_noncanonical_symlink_cannot_hide_review_origin(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            a, b = self.roots(temp)
+            with a, b:
+                jobs = job_origin.DECISION_REVIEW_JOBS_ROOT
+                jobs.mkdir(parents=True, mode=0o700)
+                other = Path(temp) / "other"
+                other.mkdir(mode=0o700)
+                (jobs / "foreign-claimed-review").symlink_to(other)
+                with self.assertRaisesRegex(ValueError, "directory changed or is unsafe"):
+                    build("aaaaaaaaaaaa", 1_900_000_000_100_000_000)
+
+    def test_noncanonical_unreadable_directory_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            a, b = self.roots(temp)
+            with a, b:
+                jobs = job_origin.DECISION_REVIEW_JOBS_ROOT
+                jobs.mkdir(parents=True, mode=0o700)
+                other = jobs / "foreign-unreadable"
+                other.mkdir(mode=0o700)
+                other.chmod(0)
+                try:
+                    with self.assertRaisesRegex(
+                        ValueError, "directory changed or is unsafe"
+                    ):
+                        build("aaaaaaaaaaaa", 1_900_000_000_100_000_000)
+                finally:
+                    other.chmod(0o700)
 
     def roots(self, temporary: str):
         root = Path(temporary)
