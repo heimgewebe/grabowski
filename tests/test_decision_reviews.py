@@ -401,6 +401,33 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
         self.assertEqual(checked["slots"][0]["material_reject_count"], 1)
         self.assertFalse(any("inventory_truncated" in x for x in checked["errors"]))
 
+    def test_inventory_hard_limit_never_reports_partial_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            jobs = Path(temp) / "jobs"
+            jobs.mkdir(mode=0o700)
+            make_job(jobs, suffix="000000000001", slot="A", terminal_status="succeeded",
+                     review_result=result("A", "PASS_THIS_REVISION", 0))
+            make_job(jobs, suffix="fffffffffff1", slot="A", terminal_status="succeeded",
+                     review_result=result("A", "REJECT_THIS_REVISION", 1))
+            (jobs / "grabowski-job-000000000002").mkdir(mode=0o700)
+            with mock.patch.object(reviews, "MAX_JOB_DIRECTORIES", 2):
+                checked = self.reconcile(jobs)
+        self.assertEqual(checked["status"], "blocked")
+        self.assertIn("decision_review_job_inventory_truncated", checked["errors"])
+        self.assertEqual(checked["attempt_count"], 0)
+
+    def test_inventory_aggregate_metadata_budget_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            jobs = Path(temp) / "jobs"
+            jobs.mkdir(mode=0o700)
+            make_job(jobs, suffix="fffffffffff2", slot="A", terminal_status="succeeded",
+                     review_result=result("A", "PASS_THIS_REVISION", 0))
+            with mock.patch.object(reviews, "MAX_TOTAL_METADATA_BYTES", 4):
+                checked = self.reconcile(jobs)
+        self.assertEqual(checked["status"], "blocked")
+        self.assertIn("decision_review_metadata_aggregate_budget_exceeded", checked["errors"])
+        self.assertEqual(checked["attempt_count"], 0)
+
     def test_v2_claude_429_blocks_until_exact_later_same_slot_pass(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             jobs = Path(temporary) / "jobs"

@@ -1,4 +1,5 @@
 from pathlib import Path
+import errno
 import json
 import os
 import tempfile
@@ -138,6 +139,75 @@ class DecisionReviewLogicalClockTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "directory limit"):
                     build("ffffffffffff", 1_900_000_000_100_000_000)
 
+    def test_noncanonical_metadata_never_disappears_from_frontier(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            a, b = self.roots(temp)
+            with a, b:
+                jobs = job_origin.DECISION_REVIEW_JOBS_ROOT
+                jobs.mkdir(parents=True, mode=0o700)
+                other = jobs / "foreign-claimed-review"
+                other.mkdir(mode=0o700)
+                (other / "metadata.json").write_text("{}", encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "noncanonical job metadata"):
+                    build("aaaaaaaaaaaa", 1_900_000_000_100_000_000)
+
+    def test_nonmatching_names_still_consume_global_scan_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            a, b = self.roots(temp)
+            with a, b, mock.patch.object(
+                job_origin, "DECISION_REVIEW_ORDER_MAX_JOB_DIRECTORIES", 2
+            ):
+                jobs = job_origin.DECISION_REVIEW_JOBS_ROOT
+                jobs.mkdir(parents=True, mode=0o700)
+                for number in range(3):
+                    (jobs / f"unrelated-{number}.json").write_text("{}", encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "directory limit"):
+                    build("aaaaaaaaaaaa", 1_900_000_000_100_000_000)
+
+    def test_canonical_job_symlink_cannot_redirect_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            a, b = self.roots(temp)
+            with a, b:
+                jobs = job_origin.DECISION_REVIEW_JOBS_ROOT
+                jobs.mkdir(parents=True, mode=0o700)
+                outside = Path(temp) / "outside"
+                outside.mkdir(mode=0o700)
+                (jobs / "grabowski-job-ffffffffffff").symlink_to(outside)
+                with self.assertRaisesRegex(ValueError, "directory changed or is unsafe"):
+                    build("aaaaaaaaaaaa", 1_900_000_000_100_000_000)
+
+    def test_metadata_symlink_not_followed_even_inside_owned_job(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            a, b = self.roots(temp)
+            with a, b:
+                jobs = job_origin.DECISION_REVIEW_JOBS_ROOT
+                jobs.mkdir(parents=True, mode=0o700)
+                job = jobs / "grabowski-job-ffffffffffff"
+                job.mkdir(mode=0o700)
+                target = Path(temp) / "secret.txt"
+                target.write_text("secret", encoding="utf-8")
+                (job / "metadata.json").symlink_to(target)
+                with self.assertRaises(OSError) as failure:
+                    build("aaaaaaaaaaaa", 1_900_000_000_100_000_000)
+                self.assertEqual(failure.exception.errno, errno.ELOOP)
+
+    def test_aggregate_metadata_budget_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            a, b = self.roots(temp)
+            with a, b, mock.patch.object(
+                job_origin, "DECISION_REVIEW_ORDER_MAX_TOTAL_METADATA_BYTES", 3
+            ):
+                jobs = job_origin.DECISION_REVIEW_JOBS_ROOT
+                jobs.mkdir(parents=True, mode=0o700)
+                job = jobs / "grabowski-job-ffffffffffff"
+                job.mkdir(mode=0o700)
+                metadata = job / "metadata.json"
+                metadata.write_text("{}", encoding="utf-8")
+                os.chmod(metadata, 0o600)
+                (job / "metadata.json").write_text('{"scope":null}', encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "aggregate budget"):
+                    build("aaaaaaaaaaaa", 1_900_000_000_100_000_000)
+
     def roots(self, temporary: str):
         root = Path(temporary)
         return (
@@ -197,7 +267,8 @@ class DecisionReviewLogicalClockTests(unittest.TestCase):
                     job_origin.DECISION_REVIEW_JOBS_ROOT
                     / "grabowski-job-000000000004"
                 )
-                job_directory.mkdir(parents=True, mode=0o700)
+                job_directory.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+                job_directory.mkdir(mode=0o700)
                 metadata_path = job_directory / "metadata.json"
                 metadata_path.write_text(
                     json.dumps(

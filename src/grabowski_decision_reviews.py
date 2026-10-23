@@ -28,6 +28,7 @@ RESULT_PREFIX = "GRABOWSKI_DECISION_REVIEW_V1="
 # Full registry scan retains late material REJECTs; this is not an archive solution.
 MAX_JOB_DIRECTORIES = 100_000
 MAX_METADATA_BYTES = 256 * 1024
+MAX_TOTAL_METADATA_BYTES = 128 * 1024 * 1024
 MAX_FINALIZATION_BYTES = 256 * 1024
 MAX_STDOUT_TAIL_BYTES = 256 * 1024
 MAX_ROLE_RECEIPT_BYTES = 4 * 1024 * 1024
@@ -1530,23 +1531,47 @@ def reconcile(
         directories: list[Path] = []
     else:
         directories = []
+        scanned = 0
         with os.scandir(root) as entries:
             for entry in entries:
+                scanned += 1
+                if scanned > MAX_JOB_DIRECTORIES:
+                    errors.append("decision_review_job_inventory_truncated")
+                    directories = []
+                    break
                 if _UNIT_RE.fullmatch(entry.name) is None:
                     continue
                 try:
                     if not entry.is_dir(follow_symlinks=False):
-                        continue
+                        errors.append("decision_review_job_inventory_unverifiable")
+                        directories = []
+                        break
                 except OSError:
-                    continue
+                    errors.append("decision_review_job_inventory_unverifiable")
+                    directories = []
+                    break
                 directories.append(Path(entry.path))
-        directories.sort(key=lambda item: item.name)
-        if len(directories) > MAX_JOB_DIRECTORIES:
-            errors.append("decision_review_job_inventory_truncated")
-            directories = directories[:MAX_JOB_DIRECTORIES]
+        if not errors:
+            directories.sort(key=lambda item: item.name)
+            if len(directories) > MAX_JOB_DIRECTORIES:
+                errors.append("decision_review_job_inventory_truncated")
+                directories = []
 
+    aggregate_metadata_bytes = 0
     for directory in directories:
         raw_targets_pr_head = False
+        try:
+            metadata_stat = (directory / "metadata.json").lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            errors.append(f"decision_review_metadata_stat_invalid:{directory.name}:{type(exc).__name__}")
+            continue
+        aggregate_metadata_bytes += metadata_stat.st_size
+        if aggregate_metadata_bytes > MAX_TOTAL_METADATA_BYTES:
+            errors.append("decision_review_metadata_aggregate_budget_exceeded")
+            attempts = []
+            break
         try:
             raw_metadata = _read_private_json(directory / "metadata.json", MAX_METADATA_BYTES)
             raw_scope = raw_metadata.get("scope")
