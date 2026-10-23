@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 import json
 from pathlib import Path
 import sys
@@ -443,6 +444,180 @@ class CheckoutIdentityTests(unittest.TestCase):
                 ).fetchall()
             ]
         self.assertEqual({"active", "superseded"}, {row["state"] for row in generations})
+
+
+    def _complete_retained_prior(
+        self, prior: dict[str, object], *, head: str = NEW_HEAD,
+        branch: str | None = None, terminal: bool = True,
+        retention_head: str | None = None,
+    ) -> dict[str, object]:
+        branch = str(prior["branch"]) if branch is None else branch
+        with checkouts._database() as connection:
+            connection.execute(
+                """
+                UPDATE lifecycle_bindings SET phase='completed_retained',
+                    expected_head=?, expected_branch=?,
+                    terminal_at_unix=?, archived_at_unix=NULL, updated_at_unix=?
+                WHERE checkout_key=?
+                """,
+                (head, branch, self.now if terminal else None,
+                 self.now, prior["checkout_key"]),
+            )
+            connection.execute(
+                """
+                UPDATE retention SET expected_head=?, expected_branch=?,
+                    updated_at_unix=? WHERE checkout_key=?
+                """,
+                (retention_head or head, branch, self.now, prior["checkout_key"]),
+            )
+        return {**prior, "head": head, "branch": branch}
+
+    def test_completed_retained_head_reconciliation_preserves_lineage_and_handoff(self) -> None:
+        prior = self._seed_prior(phase="active", active_retention=True)
+        original = identity.prepare(
+            self._inputs(
+                owner=str(prior["owner_id"]), purpose=str(prior["purpose"]),
+                source_kind=str(prior["source_kind"]),
+                source_id=str(prior["source_id"]),
+                artifact_class=str(prior["artifact_class"]),
+                head=str(prior["head"]), branch=str(prior["branch"]),
+                idempotency_key="retained-original",
+            )
+        )
+        retained = self._complete_retained_prior(prior)
+        followup = self._inputs(idempotency_key="retained-successor")
+        with ExitStack() as probes:
+            probes.enter_context(patch.object(
+                checkouts, "_worktree_for_path",
+                return_value=(self.repo, self.common_dir, {
+                    "path": str(self.checkout), "repo_path": str(self.repo),
+                    "head": NEW_HEAD, "branch": str(prior["branch"]),
+                }),
+            ))
+            probes.enter_context(patch.object(
+                checkouts, "_require_clean_linked", return_value={"dirty": False},
+            ))
+            probes.enter_context(patch.object(
+                checkouts, "_remote_secured_observation",
+                return_value={"remote_secured": True},
+            ))
+            ancestry = probes.enter_context(patch.object(
+                checkouts, "_git_read",
+                return_value=types.SimpleNamespace(returncode=0),
+            ))
+            # Historical commit reconciliation must not grant another writer.
+            with self.assertRaisesRegex(
+                identity.CheckoutIdentityConflict,
+                "explicit owner-bound supersession is required",
+            ):
+                identity.prepare(followup)
+            self.assertEqual(
+                1, self._fetchone(
+                    "SELECT count(*) AS total FROM checkout_identity_generations WHERE checkout_key=?",
+                    (prior["checkout_key"],),
+                )["total"],
+            )
+            followup["identity_supersession"] = self._supersession(
+                retained, followup, expected_generation_id=original["generation_id"],
+            )
+            result = identity.prepare(followup)
+            self.assertEqual("supersession", result["action"])
+            self.assertEqual("reserved", result["state"])
+            self.assertEqual("active", identity.finalize(result)["state"])
+        self.assertGreaterEqual(ancestry.call_count, 2)
+        ancestry.assert_any_call(
+            self.repo, ["merge-base", "--is-ancestor", OLD_HEAD, NEW_HEAD],
+            check=False,
+        )
+        old_generation = self._fetchone(
+            "SELECT * FROM checkout_identity_generations WHERE generation_id=?",
+            (original["generation_id"],),
+        )
+        baseline = self._fetchone(
+            "SELECT * FROM checkout_identity_generations WHERE generation_id=?",
+            (result["prior_generation_id"],),
+        )
+        self.assertEqual("superseded", old_generation["state"])
+        self.assertEqual(
+            baseline["generation_id"], old_generation["superseded_by_generation_id"]
+        )
+        self.assertEqual("superseded", baseline["state"])
+        self.assertEqual(NEW_HEAD, json.loads(baseline["identity_json"])["expected_head"])
+        self.assertIsNone(
+            self._fetchone(
+                "SELECT * FROM archives WHERE checkout_key=?",
+                (prior["checkout_key"],),
+            )
+        )
+
+    def test_completed_retained_reconciliation_fails_closed_on_invalid_evidence(self) -> None:
+        for case in ("no_terminal", "branch_changed", "retention_mismatch",
+                     "ancestry_failed", "owner_changed", "dirty_checkout",
+                     "remote_unsecured", "head_mismatch"):
+            with self.subTest(case=case):
+                prior = self._seed_prior(
+                    path=self.worktrees / case, phase="active", active_retention=True
+                )
+                seeded = identity.prepare(
+                    self._inputs(
+                        path=self.worktrees / case,
+                        owner=str(prior["owner_id"]), purpose=str(prior["purpose"]),
+                        source_kind=str(prior["source_kind"]),
+                        source_id=str(prior["source_id"]),
+                        artifact_class=str(prior["artifact_class"]),
+                        head=str(prior["head"]), branch=str(prior["branch"]),
+                        idempotency_key=f"original-{case}",
+                    )
+                )
+                retained = self._complete_retained_prior(
+                    prior,
+                    terminal=case != "no_terminal",
+                    branch="other-branch" if case == "branch_changed" else None,
+                    retention_head=OTHER_HEAD if case == "retention_mismatch" else None,
+                )
+                if case == "owner_changed":
+                    with checkouts._database() as connection:
+                        connection.execute(
+                            "UPDATE lifecycle_bindings SET owner_id='tampered' WHERE checkout_key=?",
+                            (prior["checkout_key"],),
+                        )
+                followup = self._inputs(
+                    path=self.worktrees / case,
+                    idempotency_key=f"successor-{case}",
+                )
+                followup["identity_supersession"] = self._supersession(retained, followup)
+                with ExitStack() as probes:
+                    probes.enter_context(patch.object(
+                        checkouts, "_worktree_for_path",
+                        return_value=(self.repo, self.common_dir, {
+                            "path": str(self.worktrees / case),
+                            "repo_path": str(self.repo),
+                            "head": OTHER_HEAD if case == "head_mismatch" else NEW_HEAD,
+                            "branch": retained["branch"],
+                        }),
+                    ))
+                    probes.enter_context(patch.object(
+                        checkouts, "_require_clean_linked",
+                        return_value={"dirty": case == "dirty_checkout"},
+                    ))
+                    probes.enter_context(patch.object(
+                        checkouts, "_remote_secured_observation",
+                        return_value={"remote_secured": case != "remote_unsecured"},
+                    ))
+                    probes.enter_context(patch.object(
+                        checkouts, "_git_read",
+                        return_value=types.SimpleNamespace(
+                            returncode=1 if case == "ancestry_failed" else 0,
+                        ),
+                    ))
+                    with self.assertRaises(identity.CheckoutIdentityConflict):
+                        identity.prepare(followup)
+                original_generation = self._fetchone(
+                    "SELECT * FROM checkout_identity_generations WHERE generation_id=?",
+                    (seeded["generation_id"],),
+                )
+                self.assertEqual("active", original_generation["state"])
+                self.assertIsNone(original_generation["superseded_by_generation_id"])
 
     def test_archived_identity_evolution_reconciles_generation_lineage_before_handoff(self) -> None:
         prior = self._seed_prior(

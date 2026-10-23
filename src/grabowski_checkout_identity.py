@@ -445,13 +445,12 @@ def _reconcile_archived_evidence_generation(
     current: dict[str, Any],
     now: int,
 ) -> dict[str, Any]:
-    """Converge an immutable active generation to exact archived evidence.
+    """Reconcile exact terminal protected evidence without changing owner authority.
 
-    Archive and safe identity-rebind paths may advance a checkout's head or
-    branch after its original identity generation was finalized.  The ledger
-    must preserve that historical generation while making the protected
-    lifecycle/archive identity current before any later reactivation or
-    owner-bound supersession is evaluated.
+    An archived checkout has an immutable archive. A clean, retained PR
+    checkout may instead have advanced its head at terminal closeout. Neither
+    transition admits a successor owner: an explicit, exact supersession is
+    still required after this historical generation baseline is established.
     """
     prior = evidence["prior_identity"]
     current_identity = json.loads(current["identity_json"])
@@ -465,30 +464,83 @@ def _reconcile_archived_evidence_generation(
         "source_id",
         "artifact_class",
     )
-    valid = bool(
+    common_valid = bool(
         current.get("state") == "active"
         and evidence.get("protected") is True
         and isinstance(lifecycle, dict)
-        and lifecycle.get("phase") == "archived"
-        and type(lifecycle.get("terminal_at_unix")) is int
-        and type(lifecycle.get("archived_at_unix")) is int
         and isinstance(retention, dict)
-        and isinstance(archive, dict)
-        and archive.get("cleaned_at_unix") is None
         and _identity_complete(current_identity)
         and _identity_complete(prior)
         and all(current_identity.get(field) == prior.get(field) for field in immutable_fields)
-        and archive.get("owner_id") == prior.get("owner_id")
-        and archive.get("head") == prior.get("expected_head")
-        and archive.get("branch") == prior.get("expected_branch")
         and retention.get("owner_id") == prior.get("owner_id")
         and retention.get("expected_head") == prior.get("expected_head")
         and retention.get("expected_branch") == prior.get("expected_branch")
+    )
+    archived_valid = bool(
+        common_valid
+        and lifecycle.get("phase") == "archived"
+        and type(lifecycle.get("terminal_at_unix")) is int
+        and type(lifecycle.get("archived_at_unix")) is int
+        and isinstance(archive, dict)
+        and archive.get("cleaned_at_unix") is None
+        and archive.get("owner_id") == prior.get("owner_id")
+        and archive.get("head") == prior.get("expected_head")
+        and archive.get("branch") == prior.get("expected_branch")
         and type(archive.get("created_at_unix")) is int
         and type(current.get("created_at_unix")) is int
         and archive["created_at_unix"] >= current["created_at_unix"]
     )
-    if not valid:
+    retained_valid = bool(
+        common_valid
+        and lifecycle.get("phase") == "completed_retained"
+        and archive is None
+        and type(lifecycle.get("terminal_at_unix")) is int
+        and lifecycle["terminal_at_unix"] <= now
+        and lifecycle.get("archived_at_unix") is None
+        and type(current.get("created_at_unix")) is int
+        and current["created_at_unix"] <= lifecycle["terminal_at_unix"]
+        and type(lifecycle.get("updated_at_unix")) is int
+        and lifecycle["updated_at_unix"] >= lifecycle["terminal_at_unix"]
+        and type(retention.get("updated_at_unix")) is int
+        and retention["updated_at_unix"] >= lifecycle["terminal_at_unix"]
+        and retention.get("retention_until_unix") == lifecycle.get("retention_until_unix")
+        and lifecycle["retention_until_unix"] > now
+        and current_identity.get("expected_branch") == prior.get("expected_branch")
+        and current_identity.get("expected_head") != prior.get("expected_head")
+        and SHA40_RE.fullmatch(str(current_identity.get("expected_head", ""))) is not None
+        and SHA40_RE.fullmatch(str(prior.get("expected_head", ""))) is not None
+    )
+    if retained_valid:
+        # A completed-retained record cannot confer authority if the actual
+        # linked checkout is dirty, drifted, or not secured by a remote ref.
+        # Observe Git under the identity transaction before reconciling.
+        try:
+            repo, common_dir, record = _checkouts()._worktree_for_path(
+                Path(inputs["repo"]), Path(inputs["target_path"])
+            )
+            status = _checkouts()._require_clean_linked(record)
+            remote = _checkouts()._remote_secured_observation(
+                record, verify_github_pull_ref=True
+            )
+            retained_valid = bool(
+                str(repo.resolve()) == str(Path(inputs["repo"]).resolve())
+                and str(common_dir) == inputs["repo_common_dir"]
+                and record.get("head") == prior.get("expected_head")
+                and record.get("branch") == prior.get("expected_branch")
+                and status.get("dirty") is False
+                and remote.get("remote_secured") is True
+            )
+            if retained_valid:
+                ancestry = _checkouts()._git_read(
+                    Path(inputs["repo"]),
+                    ["merge-base", "--is-ancestor",
+                     current_identity["expected_head"], prior["expected_head"]],
+                    check=False,
+                )
+                retained_valid = ancestry.returncode == 0
+        except (OSError, RuntimeError, ValueError, KeyError):
+            retained_valid = False
+    if not (archived_valid or retained_valid):
         raise CheckoutIdentityConflict(
             "identity ledger and protected checkout evidence disagree"
         )
@@ -496,9 +548,9 @@ def _reconcile_archived_evidence_generation(
     generation_id = _generation_id(
         inputs["checkout_key"],
         {
-            "kind": "archived-evidence-baseline",
+            "kind": "archived-evidence-baseline" if archived_valid else "retained-evidence-baseline",
             "identity": prior,
-            "archive_id": archive["archive_id"],
+            "archive_id": archive["archive_id"] if archived_valid else None,
             "predecessor_generation_id": current["generation_id"],
         },
     )
