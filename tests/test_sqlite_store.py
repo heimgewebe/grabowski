@@ -784,6 +784,47 @@ class SQLiteStoreTests(unittest.TestCase):
             finally:
                 writer.close()
 
+    def test_strict_private_wal_reaper_tolerates_foreign_prefix_disappearing_before_stat(self) -> None:
+        # The shared tmpfs is not owned by the inventory reader. A foreign
+        # prefix entry may disappear after scandir and before stat. That
+        # optional cleanup race cannot deny a valid committed WAL read.
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            decoy = root / "grabowski-strict-wal-foreign-vanishing"
+            decoy.write_bytes(b"not a snapshot")
+            database = root / "stat-race.sqlite3"
+            writer = sqlite3.connect(database)
+            try:
+                writer.execute("PRAGMA journal_mode=WAL")
+                writer.execute("CREATE TABLE witness(value INTEGER)")
+                writer.execute("INSERT INTO witness VALUES (83)")
+                writer.commit()
+                original_stat = sqlite_store.os.stat
+                witnessed = []
+
+                def disappeared(name, *args, **kwargs):
+                    if name == decoy.name and kwargs.get("dir_fd") is not None:
+                        witnessed.append(name)
+                        raise FileNotFoundError(2, "foreign prefix entry disappeared", name)
+                    return original_stat(name, *args, **kwargs)
+
+                with (
+                    patch.object(sqlite_store, "_strict_wal_memory_root", return_value=root),
+                    patch.object(sqlite_store.os, "stat", side_effect=disappeared),
+                    sqlite_store.inventory_readonly_sqlite(
+                        database, temporary_prefix="untrusted-stat-",
+                        error_type=InventoryChanged, allow_wal_copy=False,
+                        allow_private_wal_snapshot=True,
+                    ) as reader,
+                ):
+                    self.assertEqual(
+                        83, reader.execute("SELECT value FROM witness").fetchone()[0],
+                    )
+                self.assertEqual([decoy.name], witnessed)
+                self.assertEqual(b"not a snapshot", decoy.read_bytes())
+            finally:
+                writer.close()
+
     def test_strict_private_wal_orphan_reaper_ignores_foreign_prefix_flood(self) -> None:
         # A shared /dev/shm allows arbitrary other-user prefix entries.
         # Neither those names nor unmarked own directories are reaping
@@ -1548,44 +1589,103 @@ class SQLiteStoreTests(unittest.TestCase):
             finally:
                 writer.close()
 
-    def test_strict_wal_nested_owner_lock(self) -> None:
-        first = sqlite_store._strict_wal_owner_lock_acquire(
-            error_type=InventoryChanged, message="test lock",
-        )
-        try:
-            second = sqlite_store._strict_wal_owner_lock_acquire(
-                error_type=InventoryChanged, message="nested test lock",
+    def test_strict_wal_owner_flock_is_same_for_different_home_environments(self) -> None:
+        # The uid account-root remains stable for two independent processes
+        # with different HOME values. Both use the same synthetic passwd home,
+        # never the developer's production config directory.
+        with TemporaryDirectory() as directory:
+            account = Path(directory) / "account"
+            owner_lock = account / ".config" / "grabowski"
+            owner_lock.mkdir(parents=True, mode=0o700)
+            owner_lock.chmod(0o700)
+            roots = [Path(directory) / name for name in ("home-a", "home-b")]
+            for root in roots:
+                lock_dir = root / ".config" / "grabowski"
+                lock_dir.mkdir(parents=True, mode=0o700)
+                lock_dir.chmod(0o700)
+            probe = (
+                "import sys\n"
+                "from types import SimpleNamespace\n"
+                "from unittest.mock import patch\n"
+                "sys.path.insert(0,sys.argv[1])\n"
+                "import grabowski_sqlite_store as store\n"
+                "store.STRICT_PRIVATE_WAL_LOCK_TIMEOUT_SECONDS=0.5\n"
+                "with patch.object(store.pwd, 'getpwuid', "
+                "return_value=SimpleNamespace(pw_dir=sys.argv[2])):\n"
+                " try:\n"
+                "  fd=store._strict_wal_owner_lock_acquire("
+                "error_type=RuntimeError,message='blocked')\n"
+                " except RuntimeError:\n"
+                "  print('BLOCKED')\n"
+                " else:\n"
+                "  store._strict_wal_owner_lock_release(fd)\n"
+                "  print('ACQUIRED')\n"
             )
-            self.assertEqual(first, second)
-            sqlite_store._strict_wal_owner_lock_release(second)
-        finally:
-            sqlite_store._strict_wal_owner_lock_release(first)
+            with (
+                patch.object(
+                    sqlite_store.pwd, "getpwuid",
+                    return_value=SimpleNamespace(pw_dir=str(account)),
+                ),
+                patch.dict(os.environ, {"HOME": str(roots[0])}),
+            ):
+                held = sqlite_store._strict_wal_owner_lock_acquire(
+                    error_type=InventoryChanged, message="outer lock",
+                )
+                try:
+                    result = subprocess.run(
+                        [
+                            sys.executable, "-I", "-B", "-c", probe,
+                            str(Path(sqlite_store.__file__).resolve().parent),
+                            str(account),
+                        ],
+                        env={**os.environ, "HOME": str(roots[1])},
+                        capture_output=True, text=True, check=True, timeout=8,
+                    )
+                    self.assertEqual("BLOCKED", result.stdout.strip())
+                finally:
+                    sqlite_store._strict_wal_owner_lock_release(held)
+
+    def test_strict_wal_nested_owner_lock(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = sqlite_store._strict_wal_owner_lock_acquire(
+                error_type=InventoryChanged, message="test lock",
+                private_scratch_root=root,
+            )
+            try:
+                second = sqlite_store._strict_wal_owner_lock_acquire(
+                    error_type=InventoryChanged, message="nested test lock",
+                    private_scratch_root=root,
+                )
+                self.assertEqual(first, second)
+                sqlite_store._strict_wal_owner_lock_release(second)
+            finally:
+                sqlite_store._strict_wal_owner_lock_release(first)
 
     def test_strict_wal_owner_lock_releases_non_lifo_without_fd_leak(self) -> None:
-        first = sqlite_store._strict_wal_owner_lock_acquire(
-            error_type=InventoryChanged, message="outer lock",
-        )
-        second = sqlite_store._strict_wal_owner_lock_acquire(
-            error_type=InventoryChanged, message="inner lock",
-        )
-        self.assertEqual(first, second)
-        # The outer context may finish first. The remaining caller must
-        # still hold the original flock and its valid descriptor.
-        sqlite_store._strict_wal_owner_lock_release(first)
-        os.fstat(second)
-        third = sqlite_store._strict_wal_owner_lock_acquire(
-            error_type=InventoryChanged, message="third nested lock",
-        )
-        self.assertEqual(second, third)
-        sqlite_store._strict_wal_owner_lock_release(third)
-        os.fstat(second)
-        sqlite_store._strict_wal_owner_lock_release(second)
-        with self.assertRaises(OSError):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            def acquire(message: str) -> int:
+                return sqlite_store._strict_wal_owner_lock_acquire(
+                    error_type=InventoryChanged, message=message,
+                    private_scratch_root=root,
+                )
+            first = acquire("outer lock")
+            second = acquire("inner lock")
+            self.assertEqual(first, second)
+            # The outer context may finish first; the remaining caller must
+            # still hold the original flock and its valid descriptor.
+            sqlite_store._strict_wal_owner_lock_release(first)
             os.fstat(second)
-        again = sqlite_store._strict_wal_owner_lock_acquire(
-            error_type=InventoryChanged, message="fresh lock",
-        )
-        sqlite_store._strict_wal_owner_lock_release(again)
+            third = acquire("third nested lock")
+            self.assertEqual(second, third)
+            sqlite_store._strict_wal_owner_lock_release(third)
+            os.fstat(second)
+            sqlite_store._strict_wal_owner_lock_release(second)
+            with self.assertRaises(OSError):
+                os.fstat(second)
+            again = acquire("fresh lock")
+            sqlite_store._strict_wal_owner_lock_release(again)
 
     def test_strict_private_wal_rejects_large_physical_tail_before_hash(self) -> None:
         with TemporaryDirectory() as directory:

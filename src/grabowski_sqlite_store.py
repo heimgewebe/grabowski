@@ -6,6 +6,7 @@ import fcntl
 import hashlib
 import json
 import os
+import pwd
 import subprocess
 import sys
 import threading
@@ -802,14 +803,34 @@ def _strict_wal_available_memory(
 
 def _strict_wal_owner_lock_acquire(
     *, error_type: type[ChangedError], message: str,
+    private_scratch_root: Path | None = None,
 ) -> int:
     """Serialize scratch copies without locking a world-readable tmpfs directory.
 
-    The pre-existing per-user private config directory is a lockable inode;
-    no persistent file, source database, WAL or SHM is created or mutated.
+    Production locks the existing uid-bound account-private config inode,
+    never HOME. A separately verified private scratch root can be supplied
+    by a hermetic test fixture, whose distinct snapshots cannot overlap with
+    production /dev/shm. No persistent lock file or source write is created.
     Thread-local recursion uses the same outer flock while a process RLock
     serializes other threads. Cross-process readers wait a bounded interval.
     """
+    if private_scratch_root is not None and (
+        not isinstance(private_scratch_root, Path)
+        or not private_scratch_root.is_absolute()
+    ):
+        raise _changed(error_type, message)
+    try:
+        account_home = Path(pwd.getpwuid(os.geteuid()).pw_dir)
+        if not account_home.is_absolute():
+            raise _changed(error_type, message)
+        private_dir = (
+            private_scratch_root
+            if private_scratch_root is not None
+            and private_scratch_root != Path("/dev/shm")
+            else account_home / ".config" / "grabowski"
+        )
+    except (KeyError, OSError, ValueError) as exc:
+        raise _changed(error_type, message, cause=exc)
     if not _STRICT_PRIVATE_WAL_PROCESS_LOCK.acquire(
         timeout=STRICT_PRIVATE_WAL_LOCK_TIMEOUT_SECONDS
     ):
@@ -819,14 +840,17 @@ def _strict_wal_owner_lock_acquire(
         # All nested callers share one fd. A sentinel (-1) would make a
         # non-LIFO release unlock an invalid fd and leak the outer flock.
         held_descriptor = getattr(_STRICT_PRIVATE_WAL_DEPTH, "descriptor", None)
-        if type(held_descriptor) is not int or held_descriptor < 0:
+        if (
+            type(held_descriptor) is not int
+            or held_descriptor < 0
+            or getattr(_STRICT_PRIVATE_WAL_DEPTH, "lock_dir", None) != private_dir
+        ):
             _STRICT_PRIVATE_WAL_PROCESS_LOCK.release()
-            raise RuntimeError("strict WAL reader lock descriptor lost")
+            raise _changed(error_type, message)
         _STRICT_PRIVATE_WAL_DEPTH.value = depth + 1
         return held_descriptor
     descriptor = -1
     try:
-        private_dir = Path.home() / ".config" / "grabowski"
         before = os.lstat(private_dir)
         if (
             not stat.S_ISDIR(before.st_mode)
@@ -855,9 +879,10 @@ def _strict_wal_owner_lock_acquire(
                     raise _changed(error_type, message)
                 time.sleep(0.05)
         _STRICT_PRIVATE_WAL_DEPTH.descriptor = descriptor
+        _STRICT_PRIVATE_WAL_DEPTH.lock_dir = private_dir
         _STRICT_PRIVATE_WAL_DEPTH.value = 1
         return descriptor
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, KeyError) as exc:
         raise _changed(error_type, message, cause=exc)
     finally:
         if getattr(_STRICT_PRIVATE_WAL_DEPTH, "value", 0) == 0:
@@ -875,6 +900,7 @@ def _strict_wal_owner_lock_release(descriptor: int) -> None:
     try:
         if depth == 1:
             del _STRICT_PRIVATE_WAL_DEPTH.descriptor
+            del _STRICT_PRIVATE_WAL_DEPTH.lock_dir
             try:
                 fcntl.flock(descriptor, fcntl.LOCK_UN)
             finally:
@@ -955,9 +981,15 @@ def _strict_wal_reap_private_snapshot_orphans(
                 inspected += 1
                 if inspected > _STRICT_PRIVATE_WAL_MAX_SCANNED_PREFIX_ENTRIES:
                     break
-                observed = os.stat(
-                    directory_name, dir_fd=root_fd, follow_symlinks=False,
-                )
+                try:
+                    observed = os.stat(
+                        directory_name, dir_fd=root_fd, follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    # scandir enumerates shared /dev/shm. A foreign prefix
+                    # entry that vanishes before its first identity proof has
+                    # no cleanup authority and must not deny READ_ONLY.
+                    continue
                 if (
                     not stat.S_ISDIR(observed.st_mode)
                     or observed.st_dev != pinned_root.st_dev
@@ -1116,7 +1148,7 @@ def _strict_private_wal_snapshot(
         raise _changed(error_type, message)
     root = _strict_wal_memory_root(error_type=error_type, message=message)
     lock_descriptor = _strict_wal_owner_lock_acquire(
-        error_type=error_type, message=message,
+        error_type=error_type, message=message, private_scratch_root=root,
     )
     try:
         if getattr(_STRICT_PRIVATE_WAL_DEPTH, "value", 0) == 1:
