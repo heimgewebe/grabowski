@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -21,6 +24,49 @@ REPO = "/home/alex/repos/grabowski"
 COMMON = "/home/alex/repos/grabowski/.git"
 CHECKOUT = "/home/alex/repos/.worktrees/example"
 HEAD = "a" * 40
+
+
+def _original_sqlite_hashes_in_child(paths) -> dict[str, str]:
+    """Fingerprint original SQLite/WAL/SHM only outside the keeper process.
+
+    Closing even a readonly raw -shm descriptor in the SQLite-owning process
+    can release its POSIX locks and make an unsafe reader test pass.
+    """
+    command = (
+        "import hashlib,json,sys\n"
+        "from pathlib import Path\n"
+        "print(json.dumps({name:hashlib.sha256(Path(name).read_bytes()).hexdigest() "
+        "for name in sys.argv[1:]}))\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", command, *(str(path) for path in paths)],
+        capture_output=True, text=True, check=True, timeout=10,
+    )
+    return json.loads(result.stdout)
+
+
+def _foreign_sqlite_writer_is_blocked(database: Path) -> bool:
+    """Cross-process lock probe; never opens a raw fd in the SQLite keeper."""
+    command = (
+        "import sqlite3,sys\n"
+        "db=sqlite3.connect(sys.argv[1],timeout=0,isolation_level=None)\n"
+        "try:\n"
+        " db.execute('BEGIN IMMEDIATE')\n"
+        "except sqlite3.OperationalError as exc:\n"
+        " code=getattr(exc,'sqlite_errorcode',None)\n"
+        " if (code is not None and code & 255 not in (sqlite3.SQLITE_BUSY,sqlite3.SQLITE_LOCKED)) or (code is None and str(exc) not in ('database is locked','database table is locked')):\n"
+        "  raise\n"
+        " print('BLOCKED')\n"
+        "else:\n"
+        " print('ACQUIRED')\n"
+        "finally:\n"
+        " db.close()\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", command, str(database)],
+        capture_output=True, text=True, check=True, timeout=10,
+    )
+    return result.stdout.strip() == "BLOCKED"
 
 
 def binding(**overrides):
@@ -1009,21 +1055,23 @@ class CheckoutBindingLiveIntegrationTests(unittest.TestCase):
                 self.assertEqual(keeper.execute("PRAGMA journal_mode=WAL").fetchone()[0], "wal")
                 keeper.execute("INSERT INTO metadata(key,value) VALUES('wal-present','yes')")
                 keeper.commit()
-                import hashlib
                 import grabowski_checkout_binding_reconciler as reconciler
 
                 files = [database, Path(str(database) + "-wal"), Path(str(database) + "-shm")]
-                before = [hashlib.sha256(f.read_bytes()).digest() for f in files]
+                before = _original_sqlite_hashes_in_child(files)
                 with reconciler.sqlite_store.inventory_native_wal_readonly_sqlite(
                     database, error_type=CheckoutBindingDatabaseError,
                 ) as connection:
                     self.assertEqual(connection.execute("PRAGMA query_only").fetchone()[0], 1)
                     with self.assertRaises(sqlite3.OperationalError):
                         connection.execute("INSERT INTO metadata(key,value) VALUES('denied','yes')")
-                after = [hashlib.sha256(f.read_bytes()).digest() for f in files]
+                after = _original_sqlite_hashes_in_child(files)
                 # SQLite's WAL reader protocol may update -shm read marks.
                 # SQL content and the durable main/WAL bytes must not change.
-                self.assertEqual(before[:2], after[:2])
+                self.assertEqual(
+                    [before[str(file)] for file in files[:2]],
+                    [after[str(file)] for file in files[:2]],
+                )
                 self.assertIsNone(
                     keeper.execute(
                         "SELECT value FROM metadata WHERE key='denied'",
@@ -1123,9 +1171,13 @@ class CheckoutBindingLiveIntegrationTests(unittest.TestCase):
                     ),
                 )
                 keeper.commit()
+                # A positive READ_ONLY probe must not release the keeper's
+                # writer lock by closing any original database-sidecar FD.
+                keeper.execute("BEGIN IMMEDIATE")
+                self.assertTrue(_foreign_sqlite_writer_is_blocked(path))
                 wal_path = Path(str(path) + "-wal")
                 self.assertGreater(wal_path.stat().st_size, 0)
-                before = {item.name: item.read_bytes() for item in Path(tmp).iterdir()}
+                before = _original_sqlite_hashes_in_child(Path(tmp).iterdir())
                 # A unit fixture can use a private temporary copy root; only
                 # production exercises the separately verified tmpfs boundary.
                 with mock.patch.object(
@@ -1135,8 +1187,9 @@ class CheckoutBindingLiveIntegrationTests(unittest.TestCase):
                 self.assertIn("key-wal", [row["checkout_key"] for row in snapshot["bindings"]])
                 self.assertEqual(
                     before,
-                    {item.name: item.read_bytes() for item in Path(tmp).iterdir()},
+                    _original_sqlite_hashes_in_child(Path(tmp).iterdir()),
                 )
+                self.assertTrue(_foreign_sqlite_writer_is_blocked(path))
             finally:
                 keeper.close()
 
@@ -1184,7 +1237,9 @@ class CheckoutBindingLiveIntegrationTests(unittest.TestCase):
                     checkout_path="/home/alex/repos/.worktrees/wal-only-binding",
                 )
                 self.assertGreater(Path(str(path) + "-wal").stat().st_size, 0)
-                before = {item.name: item.read_bytes() for item in Path(tmp).iterdir()}
+                keeper.execute("BEGIN IMMEDIATE")
+                self.assertTrue(_foreign_sqlite_writer_is_blocked(path))
+                before = _original_sqlite_hashes_in_child(Path(tmp).iterdir())
                 with (
                     mock.patch(
                         "grabowski_checkout_binding_reconciler._database_path",
@@ -1204,7 +1259,7 @@ class CheckoutBindingLiveIntegrationTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     before,
-                    {item.name: item.read_bytes() for item in Path(tmp).iterdir()},
+                    _original_sqlite_hashes_in_child(Path(tmp).iterdir()),
                 )
             finally:
                 keeper.close()

@@ -60,6 +60,49 @@ def run(cwd: Path, *argv: str) -> str:
     return subprocess.check_output(list(argv), cwd=cwd, text=True).strip()
 
 
+def _original_sqlite_hashes_in_child(paths) -> dict[str, str]:
+    """Never close raw SQLite/-wal/-shm FDs in the SQLite-owning test process.
+
+    Closing even a read-only sidecar descriptor can drop process-wide POSIX
+    locks and falsely validate a reader that releases the writer's lock.
+    """
+    command = (
+        "import hashlib,json,sys\n"
+        "from pathlib import Path\n"
+        "print(json.dumps({name:hashlib.sha256(Path(name).read_bytes()).hexdigest() "
+        "for name in sys.argv[1:]}))\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", command, *(str(path) for path in paths)],
+        capture_output=True, text=True, check=True, timeout=10,
+    )
+    return json.loads(result.stdout)
+
+
+def _foreign_sqlite_writer_is_blocked(database: Path) -> bool:
+    """Use a distinct process to test the keeper's reserved WAL writer lock."""
+    command = (
+        "import sqlite3,sys\n"
+        "db=sqlite3.connect(sys.argv[1],timeout=0,isolation_level=None)\n"
+        "try:\n"
+        " db.execute('BEGIN IMMEDIATE')\n"
+        "except sqlite3.OperationalError as exc:\n"
+        " code=getattr(exc,'sqlite_errorcode',None)\n"
+        " if (code is not None and code & 255 not in (sqlite3.SQLITE_BUSY,sqlite3.SQLITE_LOCKED)) or (code is None and str(exc) not in ('database is locked','database table is locked')):\n"
+        "  raise\n"
+        " print('BLOCKED')\n"
+        "else:\n"
+        " print('ACQUIRED')\n"
+        "finally:\n"
+        " db.close()\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", command, str(database)],
+        capture_output=True, text=True, check=True, timeout=10,
+    )
+    return result.stdout.strip() == "BLOCKED"
+
+
 def binding_evidence(kind: str, identifier: str) -> dict:
     return {
         "source": "test",
@@ -1624,7 +1667,9 @@ class AgentWorkspaceTests(unittest.TestCase):
             shm = Path(str(database) + "-shm")
             self.assertTrue(wal.is_file())
             self.assertTrue(shm.is_file())
-            before = {path: path.read_bytes() for path in (database, wal, shm)}
+            keeper.execute("BEGIN IMMEDIATE")
+            self.assertTrue(_foreign_sqlite_writer_is_blocked(database))
+            before = _original_sqlite_hashes_in_child((database, wal, shm))
             with mock.patch.object(
                 workspace.operator,
                 "_require_operator_mutation",
@@ -1635,8 +1680,9 @@ class AgentWorkspaceTests(unittest.TestCase):
             self.assertIn("Strict read-only snapshot unavailable", observed["error"])
             gate.assert_not_called()
             self.assertEqual(
-                before, {path: path.read_bytes() for path in (database, wal, shm)}
+                before, _original_sqlite_hashes_in_child((database, wal, shm)),
             )
+            self.assertTrue(_foreign_sqlite_writer_is_blocked(database))
         finally:
             keeper.close()
 
@@ -1970,11 +2016,8 @@ class AgentWorkspaceTests(unittest.TestCase):
                 for database in databases for suffix in ("-wal", "-shm")
             ]
             self.assertTrue(all(path.is_file() for path in sidecars))
-            before = {
-                str(path): path.read_bytes()
-                for database in databases
-                for path in (database, Path(str(database) + "-wal"), Path(str(database) + "-shm"))
-            }
+            # No original byte fingerprint in the SQLite keeper process:
+            # authorized WAL-aware checks below may retain live POSIX locks.
             with (
                 mock.patch.object(workspace, "_writer_attempts", return_value=[{"actor": "initial_writer"}]),
                 mock.patch.object(workspace, "_writer_task_binding_reasons", return_value=[]),
@@ -2014,15 +2057,17 @@ class AgentWorkspaceTests(unittest.TestCase):
                     resource_wal.stat().st_size, 32,
                     "This test must observe uncheckpointed ResourceStore WAL frames",
                 )
-                before = {
-                    str(path): path.read_bytes()
+                keepers[0].execute("BEGIN IMMEDIATE")
+                self.assertTrue(_foreign_sqlite_writer_is_blocked(databases[0]))
+                before = _original_sqlite_hashes_in_child(
+                    path
                     for database in databases
                     for path in (
                         database,
                         Path(str(database) + "-wal"),
                         Path(str(database) + "-shm"),
                     )
-                }
+                )
                 with (
                     mock.patch.object(
                         workspace.operator,
@@ -2045,8 +2090,12 @@ class AgentWorkspaceTests(unittest.TestCase):
                 self.assertIn("checkout_lifecycle_unobservable", strict["reasons"])
                 self.assertNotIn("workspace_lease_unobservable", strict["reasons"])
                 self.assertNotIn("workspace_lease_missing", strict["reasons"])
-                for filename, payload in before.items():
-                    self.assertEqual(Path(filename).read_bytes(), payload)
+                self.assertEqual(
+                    before, _original_sqlite_hashes_in_child(
+                        Path(filename) for filename in before
+                    ),
+                )
+                self.assertTrue(_foreign_sqlite_writer_is_blocked(databases[0]))
         finally:
             for connection in keepers:
                 connection.close()

@@ -33,6 +33,10 @@ STRICT_PRIVATE_WAL_LOCK_TIMEOUT_SECONDS = 10
 STRICT_PRIVATE_WAL_MEMORY_RESERVE_BYTES = 2 * 1024 * 1024 * 1024
 _STRICT_PRIVATE_WAL_PROCESS_LOCK = threading.RLock()
 _STRICT_PRIVATE_WAL_DEPTH = threading.local()
+_STRICT_PRIVATE_WAL_SNAPSHOT_PREFIX = "grabowski-strict-wal-"
+_STRICT_PRIVATE_WAL_SNAPSHOT_MARKER = ".grabowski-owned-wal-snapshot-v1"
+_STRICT_PRIVATE_WAL_SNAPSHOT_KIND = "grabowski.strict-private-wal-snapshot.v1"
+_STRICT_PRIVATE_WAL_MAX_ORPHAN_ENTRIES = 64
 
 
 def status_identity(status: os.stat_result) -> FileIdentity:
@@ -109,7 +113,15 @@ def copy_regular_file(
         ):
             raise _changed(error_type, message)
         with os.fdopen(os.dup(descriptor), "rb") as source_handle:
-            with target.open("xb") as target_handle:
+            # The private 0600 mode must be established at creation, not
+            # only after a successful copy: SIGKILL can interrupt the stream.
+            target_fd = os.open(
+                target,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                | os.O_NOFOLLOW | os.O_CLOEXEC,
+                0o600,
+            )
+            with os.fdopen(target_fd, "wb") as target_handle:
                 copied = 0
                 while True:
                     request = (
@@ -394,6 +406,42 @@ def _strict_validate_copied_wal(
                     raise _changed(error_type, message)
                 last_pages = int.from_bytes(frame[4:8], "big")
                 committed |= last_pages != 0
+            if wal_index_header is not None:
+                # The index may have a *valid* checksum but describe an
+                # earlier commit in the same WAL epoch. Never accept a
+                # private replay that hides subsequent committed frames.
+                # A restart creates different salts; rolled-back spill
+                # frames keep commit size zero. Only the former is denied.
+                if (
+                    size > STRICT_PRIVATE_WAL_MAX_PHYSICAL_WAL_BYTES
+                    or (size - 32) % frame_size
+                ):
+                    raise _changed(error_type, message)
+                tail_first, tail_second = first, second
+                for _ in range((size - 32) // frame_size - count):
+                    frame = source.read(24)
+                    page = source.read(page_size)
+                    if len(frame) != 24 or len(page) != page_size:
+                        raise _changed(error_type, message)
+                    if (
+                        frame[8:16] != header[16:24]
+                        or int.from_bytes(frame[:4], "big") < 1
+                    ):
+                        break  # Retained physical tail from an older epoch.
+                    next_first, next_second = roll(
+                        frame[:8], tail_first, tail_second, byte_order=order,
+                    )
+                    next_first, next_second = roll(
+                        page, next_first, next_second, byte_order=order,
+                    )
+                    if frame[16:24] != (
+                        next_first.to_bytes(4, "big")
+                        + next_second.to_bytes(4, "big")
+                    ):
+                        break  # Stale or partial physical tail is not replayed.
+                    if int.from_bytes(frame[4:8], "big") != 0:
+                        raise _changed(error_type, message)
+                    tail_first, tail_second = next_first, next_second
             if (
                 not committed
                 or (
@@ -569,10 +617,22 @@ def _strict_wal_source_worker(
         assert scratch is not None and budget is not None
         command.extend((str(scratch), str(budget)))
     try:
+        # The owner flock must outlive the parent if SIGKILL happens while
+        # this subprocess still copies bytes into the marked snapshot.
+        # Passing its existing file description keeps orphan reaping excluded
+        # until the last copy worker exits, without introducing another lock.
+        lock_descriptor = getattr(_STRICT_PRIVATE_WAL_DEPTH, "descriptor", None)
+        lock_depth = getattr(_STRICT_PRIVATE_WAL_DEPTH, "value", 0)
+        inherited_fds = (
+            (lock_descriptor,)
+            if lock_depth > 0 and type(lock_descriptor) is int
+            and lock_descriptor >= 0
+            else ()
+        )
         result = subprocess.run(
             command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL, check=False, close_fds=True,
-            timeout=120,
+            pass_fds=inherited_fds, timeout=120,
         )
         if result.returncode != 0 or not 0 < len(result.stdout) <= 4096:
             raise ValueError("strict WAL worker did not produce a valid result")
@@ -654,13 +714,28 @@ def _strict_wal_cgroup_memory_headroom(
     memory.max is 'max'. Malformed advertised controls deny the snapshot.
     """
     try:
-        if not (mount_root / "cgroup.controllers").is_file():
-            return None  # No unified cgroup-v2 memory controls here.
+        # v1 memory may govern this process even with a mounted cgroup2 tree.
+        # Read all memberships once; an unverified memory authority denies.
+        entries = cgroup_file.read_text(encoding="ascii").splitlines()
+        if not entries:
+            raise ValueError("cgroup controller membership unavailable")
+        memberships = []
+        for entry in entries:
+            parts = entry.split(":", 2)
+            if (len(parts) != 3 or not parts[0].isdigit()
+                    or not parts[2].startswith("/")):
+                raise ValueError("malformed cgroup membership")
+            if "memory" in parts[1].split(","):
+                raise ValueError("unverifiable v1/hybrid memory controller")
+            memberships.append(parts)
         locations = [
-            line[3:] for line in cgroup_file.read_text(
-                encoding="ascii",
-            ).splitlines() if line.startswith("0::")
+            path for hierarchy, controllers, path in memberships
+            if hierarchy == "0" and controllers == ""
         ]
+        if not (mount_root / "cgroup.controllers").is_file():
+            if locations:
+                raise ValueError("unverifiable unified cgroup mount")
+            return None
         if len(locations) != 1 or not locations[0].startswith("/"):
             raise ValueError("unverifiable unified cgroup")
         if any(item in {".", ".."} for item in locations[0].split("/")):
@@ -807,6 +882,186 @@ def _strict_wal_owner_lock_release(descriptor: int) -> None:
         _STRICT_PRIVATE_WAL_PROCESS_LOCK.release()
 
 
+def _strict_wal_mark_private_snapshot(directory: Path, database_name: str) -> None:
+    """Mark only safely reappable names before any plaintext can be copied."""
+    # The later orphan reaper deliberately accepts at most 240 UTF-8 bytes
+    # (including room for SQLite sidecar suffixes). A longer live database
+    # name must be denied here, not left as an unrecoverable SIGKILL copy.
+    if (
+        not isinstance(database_name, str)
+        or not database_name
+        or database_name in {".", ".."}
+        or "/" in database_name
+        or len(database_name.encode("utf-8")) > 240
+    ):
+        raise ValueError("strict WAL snapshot filename is not safely recoverable")
+    payload = json.dumps(
+        {"kind": _STRICT_PRIVATE_WAL_SNAPSHOT_KIND, "database_name": database_name},
+        sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    descriptor = os.open(
+        directory / _STRICT_PRIVATE_WAL_SNAPSHOT_MARKER,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+        0o600,
+    )
+    try:
+        if os.write(descriptor, payload) != len(payload):
+            raise OSError("incomplete private WAL snapshot marker")
+    finally:
+        os.close(descriptor)
+
+
+def _strict_wal_reap_private_snapshot_orphans(
+    root: Path, *, error_type: type[ChangedError], message: str,
+) -> None:
+    """Reap only a marker-attested inactive copy, never an arbitrary glob.
+
+    The existing per-user flock excludes other readers throughout their copy
+    and query lifetimes. Reentrant nested readers share the flock and must not
+    reap a still-live outer copy, so reaping is only allowed at depth one.
+    Every candidate is checked through no-follow, directory-relative FDs;
+    unsupported or unmarked directories are left untouched.
+    """
+    if getattr(_STRICT_PRIVATE_WAL_DEPTH, "value", 0) != 1:
+        raise RuntimeError("orphan cleanup requires outermost strict WAL owner lock")
+    root_fd = -1
+    try:
+        root_status = os.lstat(root)
+        if not stat.S_ISDIR(root_status.st_mode):
+            raise _changed(error_type, message)
+        root_fd = os.open(
+            root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
+        pinned_root = os.fstat(root_fd)
+        if (root_status.st_dev, root_status.st_ino) != (
+            pinned_root.st_dev, pinned_root.st_ino
+        ):
+            raise _changed(error_type, message)
+        candidates = 0
+        with os.scandir(root_fd) as entries:
+            for entry in entries:
+                directory_name = entry.name
+                if (
+                    not directory_name.startswith(_STRICT_PRIVATE_WAL_SNAPSHOT_PREFIX)
+                    or len(directory_name) > 255
+                ):
+                    continue
+                candidates += 1
+                if candidates > _STRICT_PRIVATE_WAL_MAX_ORPHAN_ENTRIES:
+                    raise _changed(error_type, message)
+                observed = os.stat(
+                    directory_name, dir_fd=root_fd, follow_symlinks=False,
+                )
+                if (
+                    not stat.S_ISDIR(observed.st_mode)
+                    or observed.st_dev != pinned_root.st_dev
+                    or observed.st_uid != os.geteuid()
+                    or stat.S_IMODE(observed.st_mode) != 0o700
+                ):
+                    continue
+                child_fd = os.open(
+                    directory_name,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=root_fd,
+                )
+                try:
+                    child = os.fstat(child_fd)
+                    if (child.st_dev, child.st_ino) != (
+                        observed.st_dev, observed.st_ino
+                    ):
+                        raise _changed(error_type, message)
+                    try:
+                        marker_fd = os.open(
+                            _STRICT_PRIVATE_WAL_SNAPSHOT_MARKER,
+                            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                            dir_fd=child_fd,
+                        )
+                    except FileNotFoundError:
+                        continue  # Older/unrelated copies have no deletion authority.
+                    try:
+                        marker = os.fstat(marker_fd)
+                        if (
+                            not stat.S_ISREG(marker.st_mode)
+                            or marker.st_uid != os.geteuid()
+                            or marker.st_nlink != 1
+                            or stat.S_IMODE(marker.st_mode) != 0o600
+                            or marker.st_size > 512
+                        ):
+                            continue
+                        try:
+                            record = json.loads(os.read(marker_fd, 513))
+                        except (ValueError, UnicodeError, TypeError):
+                            continue
+                        after_marker = os.fstat(marker_fd)
+                        # Reading a marker can update atime (relatime); atime
+                        # is not provenance and must not block safe recovery.
+                        if status_identity(after_marker) != status_identity(marker):
+                            raise _changed(error_type, message)
+                    finally:
+                        os.close(marker_fd)
+                    if not isinstance(record, dict) or record.get("kind") != (
+                        _STRICT_PRIVATE_WAL_SNAPSHOT_KIND
+                    ):
+                        continue
+                    database_name = record.get("database_name")
+                    if (
+                        not isinstance(database_name, str)
+                        or not database_name
+                        or len(database_name.encode("utf-8")) > 240
+                        or database_name in {".", ".."}
+                        or "/" in database_name
+                    ):
+                        continue
+                    allowed = {
+                        _STRICT_PRIVATE_WAL_SNAPSHOT_MARKER, database_name,
+                        database_name + "-wal", database_name + "-shm",
+                        database_name + "-journal",
+                    }
+                    filenames = os.listdir(child_fd)
+                    if not 1 <= len(filenames) <= len(allowed) or any(
+                        filename not in allowed for filename in filenames
+                    ):
+                        continue
+                    budget = (
+                        STRICT_PRIVATE_WAL_MAX_BYTES
+                        + STRICT_PRIVATE_WAL_MAX_WAL_BYTES
+                        + STRICT_PRIVATE_WAL_MAX_SHM_BYTES
+                    )
+                    file_stats = [
+                        os.stat(filename, dir_fd=child_fd, follow_symlinks=False)
+                        for filename in filenames
+                    ]
+                    if any(
+                        not stat.S_ISREG(info.st_mode)
+                        or info.st_uid != os.geteuid()
+                        or info.st_dev != pinned_root.st_dev
+                        or info.st_nlink != 1
+                        or stat.S_IMODE(info.st_mode) & 0o077
+                        or info.st_size > budget
+                        for info in file_stats
+                    ) or sum(info.st_size for info in file_stats) > budget + 512:
+                        continue
+                    # Reconfirm the candidate's root binding immediately
+                    # before the irreversible, bounded single-level unlink.
+                    still = os.stat(
+                        directory_name, dir_fd=root_fd, follow_symlinks=False,
+                    )
+                    if (still.st_dev, still.st_ino) != (child.st_dev, child.st_ino):
+                        raise _changed(error_type, message)
+                    for filename in filenames:
+                        if filename != _STRICT_PRIVATE_WAL_SNAPSHOT_MARKER:
+                            os.unlink(filename, dir_fd=child_fd)
+                    os.unlink(_STRICT_PRIVATE_WAL_SNAPSHOT_MARKER, dir_fd=child_fd)
+                    os.rmdir(directory_name, dir_fd=root_fd)
+                finally:
+                    os.close(child_fd)
+    except OSError as exc:
+        raise _changed(error_type, message, cause=exc)
+    finally:
+        if root_fd >= 0:
+            os.close(root_fd)
+
+
 @contextmanager
 def _strict_private_wal_snapshot(
     path: Path,
@@ -851,6 +1106,10 @@ def _strict_private_wal_snapshot(
         error_type=error_type, message=message,
     )
     try:
+        if getattr(_STRICT_PRIVATE_WAL_DEPTH, "value", 0) == 1:
+            _strict_wal_reap_private_snapshot_orphans(
+                root, error_type=error_type, message=message,
+            )
         stats = os.statvfs(root)
         # Only committed bytes can enter the private snapshot, never stale tail.
         total = database_status.st_size + min(
@@ -863,7 +1122,14 @@ def _strict_private_wal_snapshot(
         ):
             raise _changed(error_type, message)
 
-        with tempfile.TemporaryDirectory(dir=root, prefix="grabowski-strict-wal-") as directory:
+        with tempfile.TemporaryDirectory(
+            dir=root, prefix=_STRICT_PRIVATE_WAL_SNAPSHOT_PREFIX,
+        ) as directory:
+            # SIGKILL before this marker cannot leave copied plaintext.
+            try:
+                _strict_wal_mark_private_snapshot(Path(directory), path.name)
+            except (OSError, ValueError) as exc:
+                raise _changed(error_type, message, cause=exc)
             snapshot = Path(directory) / path.name
             snap_wal = Path(str(snapshot) + "-wal")
             before, wal_index_header, copied_wal = _strict_wal_source_worker(
@@ -909,28 +1175,46 @@ def _strict_private_wal_snapshot(
 
             verify_source()
             connection: sqlite3.Connection | None = None
+            caller_completed = False
             try:
-                connection = sqlite3.connect(
-                    snapshot.as_uri() + "?mode=ro", uri=True, timeout=1,
-                )
-                connection.row_factory = sqlite3.Row
-                connection.execute("PRAGMA query_only=ON")
-                connection.execute("PRAGMA trusted_schema=OFF")
-                if connection.execute("PRAGMA journal_mode").fetchone()[0] != "wal":
-                    raise _changed(error_type, message)
-                connection.execute("BEGIN")
-                connection.execute("SELECT name FROM sqlite_master LIMIT 1").fetchall()
-                verify_source()
+                # Only snapshot-setup SQLite failures are retryable inventory
+                # errors. Once yielded, the caller owns its query diagnostics.
+                try:
+                    connection = sqlite3.connect(
+                        snapshot.as_uri() + "?mode=ro", uri=True, timeout=1,
+                    )
+                    connection.row_factory = sqlite3.Row
+                    connection.execute("PRAGMA query_only=ON")
+                    connection.execute("PRAGMA trusted_schema=OFF")
+                    if connection.execute("PRAGMA journal_mode").fetchone()[0] != "wal":
+                        raise _changed(error_type, message)
+                    connection.execute("BEGIN")
+                    connection.execute("SELECT name FROM sqlite_master LIMIT 1").fetchall()
+                    verify_source()
+                except sqlite3.Error as exc:
+                    raise _changed(error_type, message, cause=exc)
                 yield connection
-            except sqlite3.Error as exc:
-                raise _changed(error_type, message, cause=exc)
+                caller_completed = True
             finally:
+                # Source verification must happen AFTER private SQLite cleanup:
+                # a writer can commit during rollback/close, and the caller's
+                # successful return must never conceal that concurrent drift.
+                # If a caller raises, preserve that original diagnostic rather
+                # than masking it with a cleanup or post-error inventory check.
                 if connection is not None:
                     try:
                         connection.rollback()
+                    except Exception:
+                        if caller_completed:
+                            raise
                     finally:
-                        connection.close()
-                verify_source()
+                        try:
+                            connection.close()
+                        except Exception:
+                            if caller_completed:
+                                raise
+                if caller_completed:
+                    verify_source()
     finally:
         _strict_wal_owner_lock_release(lock_descriptor)
 
