@@ -337,8 +337,14 @@ class CheckoutIdentityTests(unittest.TestCase):
         self,
         prior: dict[str, object],
         inputs: dict[str, object],
+        cross_owner: bool = False,
         **overrides: object,
     ) -> dict[str, object]:
+        # All happy-path lineage tests operate under the *same* actual
+        # checkout owner. Cross-owner claims are tested separately and must
+        # not gain authority merely by naming the old owner in a packet.
+        if not cross_owner:
+            inputs["lease_owner_id"] = prior["owner_id"]
         value: dict[str, object] = {
             "schema_version": 1,
             "expected_checkout_key": prior["checkout_key"],
@@ -390,7 +396,7 @@ class CheckoutIdentityTests(unittest.TestCase):
         self.assertEqual(first["intent_key"], second["intent_key"])
         self.assertEqual("active", identity.finalize(first)["state"])
 
-    def test_authorized_supersession_is_atomic_and_preserves_archive_evidence(self) -> None:
+    def test_same_owner_supersession_is_atomic_and_preserves_archive_evidence(self) -> None:
         prior = self._seed_prior(
             phase="archived", active_retention=False, archive=True
         )
@@ -912,6 +918,35 @@ class CheckoutIdentityTests(unittest.TestCase):
         assert current is not None
         self.assertEqual(seeded["generation_id"], current["generation_id"])
         self.assertEqual("active", current["state"])
+
+    def test_forged_cross_owner_handoff_hash_never_authorizes_retained_path(self) -> None:
+        prior = self._seed_prior(phase="archived", active_retention=False, archive=True)
+        for index, bogus_digest in enumerate((RECEIPT_SHA256, "0" * 64)):
+            with self.subTest(index=index):
+                inputs = self._inputs(
+                    owner="owner-new", idempotency_key=f"forged-handoff-{index}"
+                )
+                inputs["identity_supersession"] = self._supersession(
+                    prior, inputs, cross_owner=True,
+                    handoff_receipt_sha256=bogus_digest,
+                )
+                with self.assertRaisesRegex(
+                    identity.CheckoutIdentityConflict,
+                    "cross-owner supersession requires verified",
+                ):
+                    identity.prepare(inputs)
+                original = self._fetchone(
+                    "SELECT owner_id FROM lifecycle_bindings WHERE checkout_key=?",
+                    (prior["checkout_key"],),
+                )
+                self.assertIsNotNone(original)
+                self.assertEqual(prior["owner_id"], original["owner_id"])
+                self.assertIsNone(
+                    self._fetchone(
+                        "SELECT * FROM checkout_identity_generations WHERE checkout_key=?",
+                        (prior["checkout_key"],),
+                    )
+                )
 
     def test_supersession_rejects_wrong_prior_bindings(self) -> None:
         prior = self._seed_prior(

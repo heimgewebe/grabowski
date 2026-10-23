@@ -645,6 +645,15 @@ def _validate_supersession(
         observed_generation = prior_generation.get("generation_id") if prior_generation else None
         if expected_generation != observed_generation:
             raise CheckoutIdentityConflict("supersession generation does not match current evidence")
+    # A matching old owner name and a 64-digit caller-supplied receipt hash do
+    # not authenticate the old owner's consent. Until a validated, owner-bound
+    # handoff receipt is available, preserve the old checkout and require a
+    # separate worktree for a new owner.
+    if supersession["new_owner_id"] != supersession["expected_owner_id"]:
+        raise CheckoutIdentityConflict(
+            "cross-owner supersession requires verified prior-owner handoff; "
+            "caller-supplied owner identity and receipt hash are not authorization"
+        )
 
 
 def _active_slot_available(
