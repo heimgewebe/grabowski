@@ -1,0 +1,356 @@
+"""Provider-free regression tests for root-only RAB one-shot primitive.
+
+These exercise the CAS state machine, NOT root-owned installation, socket
+broker integration, or permission to execute a model.
+"""
+
+from __future__ import annotations
+
+from concurrent.futures import ThreadPoolExecutor
+import importlib.util
+import json
+import os
+from pathlib import Path
+import socket
+import tempfile
+import unittest
+from unittest import mock
+
+
+_MODULE = (
+    Path(__file__).resolve().parents[1] / "tools" / "grabowski_rab_provider_one_shot.py"
+)
+_spec = importlib.util.spec_from_file_location("rab_once", _MODULE)
+assert _spec is not None and _spec.loader is not None
+once = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(once)
+
+
+def _policy() -> dict:
+    return {
+        "schema_version": 1,
+        "epoch_sha256": "a" * 64,
+        "pair_id": "rab-sixcase:finalizer:r1",
+        "service_unit": "grabowski-rab-rabpilot.service",
+        "invocation_id": "b" * 32,
+        "main_cmdline_sha256": "c" * 64,
+        "source_manifest_sha256": "d" * 64,
+        "runtime_code_sha256": "e" * 64,
+        "codex_binary_sha256": "f" * 64,
+        "mode": "chatgpt_subscription",
+        "provider": "openai-codex-cli",
+        "model": "gpt-6-astra",
+        "reasoning": "medium",
+        "max_exec": 2,
+        "positions": [
+            {
+                "arm": "treatment",
+                "index": 0,
+                "request_sha256": "1" * 64,
+                "slot_id": "2" * 64,
+            },
+            {
+                "arm": "baseline",
+                "index": 1,
+                "request_sha256": "3" * 64,
+                "slot_id": "4" * 64,
+            },
+        ],
+    }
+
+
+def _request(policy: dict, index: int) -> dict:
+    return {
+        "epoch_sha256": policy["epoch_sha256"],
+        "pair_id": policy["pair_id"],
+        **policy["positions"][index],
+    }
+
+
+class FrozenGrantPolicyTests(unittest.TestCase):
+    def test_exact_epoch_and_pair_contract(self) -> None:
+        p = _policy()
+        self.assertIs(once._validate_policy(p), p)
+        self.assertEqual(once._position(p, _request(p, 0))["arm"], "treatment")
+        self.assertEqual(once._position(p, _request(p, 1))["arm"], "baseline")
+
+    def test_reject_adversarial_fields(self) -> None:
+        import copy
+
+        modifications = (
+            lambda p: p.update(model="gpt-6.1-sol"),
+            lambda p: p.update(provider="openai-api-payg"),
+            lambda p: p.update(mode="api"),
+            lambda p: p.update(reasoning="high"),
+            lambda p: p.update(max_exec=True),
+            lambda p: p.update(max_exec=3),
+            lambda p: p.update(service_unit="grabowski-operator.service"),
+            lambda p: p.update(invocation_id="0" * 64),
+            lambda p: p.update(codex_binary_sha256="invalid"),
+            lambda p: p.update(schema_version=True),
+            lambda p: p.update(extra_auth=True),
+            lambda p: p["positions"].pop(),
+            lambda p: p["positions"][1].update(arm="treatment"),
+            lambda p: p["positions"][1].update(arm=[]),
+            lambda p: p["positions"][1].update(index=0),
+            lambda p: p["positions"][0].update(slot_id="4" * 64),
+            lambda p: p["positions"][1].update(request_sha256="not-sha"),
+            lambda p: p["positions"][1].update(request_sha256="1" * 64),
+        )
+        for mutate in modifications:
+            p = copy.deepcopy(_policy())
+            mutate(p)
+            with self.subTest(p=p), self.assertRaises(once.ProviderGrantDenied):
+                once._validate_policy(p)
+
+    def test_request_cannot_change_identity_or_position(self) -> None:
+        p = _policy()
+        for key, value in (
+            ("epoch_sha256", "0" * 64),
+            ("pair_id", "different"),
+            ("arm", "baseline"),
+            ("index", 1),
+            ("index", True),
+            ("request_sha256", "0" * 64),
+            ("slot_id", "0" * 64),
+        ):
+            request = _request(p, 0)
+            request[key] = value
+            with self.subTest(key=key), self.assertRaises(once.ProviderGrantDenied):
+                once._position(p, request)
+        request = _request(p, 0)
+        request["extra"] = "allow"
+        with self.assertRaises(once.ProviderGrantDenied):
+            once._position(p, request)
+
+
+class TrustedKernelPeerTests(unittest.TestCase):
+    def test_wrong_pid_invocation_cgroup_or_runtime_rejected(self) -> None:
+        p = _policy()
+        peer = 12114
+        g = "/system.slice/" + p["service_unit"]
+        observed = {
+            "MainPID": str(peer),
+            "ActiveState": "active",
+            "ControlGroup": g,
+            "InvocationID": p["invocation_id"],
+            "DynamicUser": "yes",
+        }
+        cmdline = b"python3\0-I\0-B\0"
+        p["main_cmdline_sha256"] = once._sha(cmdline)
+        once._attest_service(
+            p, peer, 1999, observed, ("0::" + g + "\n").encode(), cmdline
+        )
+        for change in (
+            "MainPID",
+            "ActiveState",
+            "ControlGroup",
+            "InvocationID",
+            "DynamicUser",
+        ):
+            different = dict(observed)
+            different[change] = "wrong"
+            with (
+                self.subTest(change=change),
+                self.assertRaises(once.ProviderGrantDenied),
+            ):
+                once._attest_service(
+                    p, peer, 1999, different, ("0::" + g + "\n").encode(), cmdline
+                )
+        with self.assertRaises(once.ProviderGrantDenied):
+            once._attest_service(p, peer, 1999, observed, b"0::/user.slice\n", cmdline)
+        with self.assertRaises(once.ProviderGrantDenied):
+            once._attest_service(
+                p, peer, 1999, observed, ("0::" + g + "\n").encode(), b"other"
+            )
+        with self.assertRaises(once.ProviderGrantDenied):
+            once._attest_service(
+                p, peer, 0, observed, ("0::" + g + "\n").encode(), cmdline
+            )
+
+    def test_peer_credentials_come_from_kernel_not_payload(self) -> None:
+        if os.getuid() == 0:
+            self.skipTest("only rootless test of kernel peer UID")
+        s1, s2 = socket.socketpair()
+        try:
+            self.assertEqual(once._peer_credentials(s1)[:2], (os.getpid(), os.getuid()))
+            with self.assertRaises(once.ProviderGrantDenied):
+                once._peer_credentials("user-supplied-PID")
+        finally:
+            s1.close()
+            s2.close()
+
+
+class AtomicRootStateMachineTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory(prefix="rab-provider-free-")
+        self.addCleanup(self.tmp.cleanup)
+        self.fd = os.open(self.tmp.name, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        self.addCleanup(os.close, self.fd)
+        self.policy = _policy()
+        self.peer = (2255, 1999, 1999)
+
+    def _consume(self, index: int) -> dict:
+        return once._consume_position(
+            self.fd, self.policy, _request(self.policy, index), self.peer
+        )
+
+    def _first_spent_sha(self) -> str:
+        return once._digest(
+            {
+                "epoch": self.policy["epoch_sha256"],
+                "pair": self.policy["pair_id"],
+                "position": self.policy["positions"][0],
+            }
+        )
+
+    def _release(self, *, valid: bool = True) -> dict:
+        return {
+            "kind": "rab.second_position_release",
+            "schema_version": 1,
+            "pair_id": self.policy["pair_id"],
+            "slot_id": self.policy["positions"][1]["slot_id"],
+            "first_token_sha256": self._first_spent_sha(),
+            "first_receipt_sha256": "5" * 64 if valid else "corrupt",
+        }
+
+    def test_first_consumed_at_most_once_and_persisted(self) -> None:
+        result = self._consume(0)
+        self.assertEqual(result["status"], "consumed")
+        self.assertEqual(result["arm"], "treatment")
+        record = Path(self.tmp.name, "spent-" + result["token_sha256"] + ".json")
+        self.assertTrue(record.is_file())
+        self.assertEqual(record.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(json.loads(record.read_text())["request_sha256"], "1" * 64)
+        with self.assertRaisesRegex(once.ProviderGrantDenied, "already consumed"):
+            self._consume(0)
+        self.assertEqual(len(list(Path(self.tmp.name).glob("spent-*"))), 1)
+
+    def test_second_without_root_release_is_denied(self) -> None:
+        self._consume(0)
+        with self.assertRaisesRegex(
+            once.ProviderGrantDenied, "independent root release"
+        ):
+            self._consume(1)
+        self.assertEqual(len(list(Path(self.tmp.name).glob("spent-*"))), 1)
+
+    def _root_file_simulator(self, release: dict):
+        # Synthetic root-only reads for a rootless regression test.
+        def read(_state_fd: int, filename: str) -> dict:
+            if filename.startswith("release-"):
+                return release
+            return json.loads(Path(self.tmp.name, filename).read_text())
+
+        return read
+
+    def test_second_release_cannot_grant_first_or_duplicate(self) -> None:
+        with mock.patch.object(
+            once,
+            "_read_root_file",
+            side_effect=self._root_file_simulator(self._release()),
+        ):
+            with self.assertRaisesRegex(
+                once.ProviderGrantDenied, "not previously consumed"
+            ):
+                self._consume(1)
+            self._consume(0)
+            second = self._consume(1)
+            self.assertEqual(second["arm"], "baseline")
+            with self.assertRaisesRegex(once.ProviderGrantDenied, "already consumed"):
+                self._consume(1)
+        self.assertEqual(len(list(Path(self.tmp.name).glob("spent-*"))), 2)
+
+    def test_corrupt_first_marker_blocks_second_even_with_root_release(self) -> None:
+        first = self._consume(0)
+        spent = Path(self.tmp.name, "spent-" + first["token_sha256"] + ".json")
+        data = json.loads(spent.read_text())
+        data["request_sha256"] = "0" * 64
+        spent.write_text(json.dumps(data))
+        with (
+            mock.patch.object(
+                once,
+                "_read_root_file",
+                side_effect=self._root_file_simulator(self._release()),
+            ),
+            self.assertRaisesRegex(once.ProviderGrantDenied, "marker changed"),
+        ):
+            self._consume(1)
+
+    def test_corrupted_second_release_never_consumes(self) -> None:
+        self._consume(0)
+        with mock.patch.object(
+            once, "_read_root_file", return_value=self._release(valid=False)
+        ):
+            with self.assertRaisesRegex(once.ProviderGrantDenied, "not bound"):
+                self._consume(1)
+        self.assertEqual(len(list(Path(self.tmp.name).glob("spent-*"))), 1)
+
+    def test_empty_partial_or_symlink_marker_is_terminal_no_retry(self) -> None:
+        token = self._first_spent_sha()
+        filename = Path(self.tmp.name, "spent-" + token + ".json")
+        filename.write_bytes(b"")
+        with self.assertRaisesRegex(once.ProviderGrantDenied, "already consumed"):
+            self._consume(0)
+        filename.unlink()
+        filename.symlink_to(Path(self.tmp.name, "not-authority"))
+        with self.assertRaisesRegex(once.ProviderGrantDenied, "already consumed"):
+            self._consume(0)
+
+    def test_parallel_provider_intents_have_single_winner(self) -> None:
+        def run() -> str:
+            try:
+                self._consume(0)
+            except once.ProviderGrantDenied:
+                return "rejected"
+            return "consumed"
+
+        with ThreadPoolExecutor(max_workers=12) as pool:
+            outcomes = list(pool.map(lambda _: run(), range(12)))
+        self.assertEqual(outcomes.count("consumed"), 1)
+        self.assertEqual(outcomes.count("rejected"), 11)
+
+    def test_changed_request_does_not_create_any_marker(self) -> None:
+        req = _request(self.policy, 0)
+        req["request_sha256"] = "9" * 64
+        with self.assertRaisesRegex(once.ProviderGrantDenied, "mismatch"):
+            once._consume_position(self.fd, self.policy, req, self.peer)
+        self.assertEqual(list(Path(self.tmp.name).iterdir()), [])
+
+    def test_root_entrypoint_rejects_arbitrary_policy_paths(self) -> None:
+        a, b = socket.socketpair()
+        try:
+            with (
+                mock.patch.object(once.os, "geteuid", return_value=0),
+                self.assertRaisesRegex(once.ProviderGrantDenied, "not canonical"),
+            ):
+                once.authorize_once(
+                    a,
+                    policy_path=Path(self.tmp.name) / "policy.json",
+                    state_dir=Path(self.tmp.name),
+                    request=_request(self.policy, 0),
+                )
+        finally:
+            a.close()
+            b.close()
+
+    def test_public_root_seam_fail_closed_for_unprivileged_caller(self) -> None:
+        if os.geteuid() == 0:
+            self.skipTest("requires rootless environment")
+        a, b = socket.socketpair()
+        try:
+            with self.assertRaisesRegex(
+                once.ProviderGrantDenied, "independent root-owned broker"
+            ):
+                once.authorize_once(
+                    a,
+                    policy_path=Path(self.tmp.name) / "policy.json",
+                    state_dir=Path(self.tmp.name),
+                    request=_request(self.policy, 0),
+                )
+        finally:
+            a.close()
+            b.close()
+
+
+if __name__ == "__main__":
+    unittest.main()
