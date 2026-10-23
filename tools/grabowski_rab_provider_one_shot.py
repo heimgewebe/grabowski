@@ -413,7 +413,7 @@ def _service_observation(unit: str) -> dict[str, str]:
                 "show",
                 "--system",
                 unit,
-                "--property=MainPID,ActiveState,ControlGroup,InvocationID,DynamicUser,UID",
+                "--property=MainPID,ActiveState,ControlGroup,InvocationID,DynamicUser,UID,Type,NotifyAccess",
                 "--no-pager",
             ],
             check=True,
@@ -439,6 +439,8 @@ def _service_observation(unit: str) -> dict[str, str]:
         "InvocationID",
         "DynamicUser",
         "UID",
+        "Type",
+        "NotifyAccess",
     }:
         raise ProviderGrantDenied("PID1 service metadata incomplete")
     return values
@@ -456,6 +458,8 @@ def _attest_service(
     expected_group = "/system.slice/" + unit
     if (
         observed.get("ActiveState") != "active"
+        or observed.get("Type") not in {"simple", "exec"}
+        or observed.get("NotifyAccess") != "none"
         or observed.get("MainPID") != str(peer_pid)
         or observed.get("ControlGroup") != expected_group
         or observed.get("InvocationID") != policy["invocation_id"]
@@ -632,6 +636,9 @@ def _consume_position(
                 isinstance(peer_pid, int) and peer_pid <= 1,
                 isinstance(peer_uid, int) and peer_uid <= 0,
                 isinstance(peer_gid, int) and peer_gid < 0,
+                peer_pid != peer[0],
+                peer_uid != peer[1],
+                peer_gid != peer[2],
                 first_record.get("service_unit") != policy["service_unit"],
                 first_record.get("invocation_id") != policy["invocation_id"],
                 first_record.get("token_sha256") != first_token,
@@ -709,6 +716,39 @@ def _consume_position(
     return {"status": "consumed", "token_sha256": token, "arm": pos["arm"]}
 
 
+def _read_proc_bounded(pid: int, kind: str, limit: int) -> bytes:
+    """Read only the fixed kernel fields with a size bound before allocating."""
+    if (
+        type(pid) is not int
+        or pid <= 1
+        or kind not in {"cgroup", "cmdline"}
+        or type(limit) is not int
+        or not 0 < limit <= 16384
+    ):
+        raise ProviderGrantDenied("kernel process projection selector invalid")
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+    try:
+        fd = os.open(f"/proc/{pid}/{kind}", flags)
+    except OSError as exc:
+        raise ProviderGrantDenied("kernel process projection unavailable") from exc
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ProviderGrantDenied("kernel process projection is not a file")
+        data = bytearray()
+        while len(data) <= limit:
+            chunk = os.read(fd, limit + 1 - len(data))
+            if not chunk:
+                break
+            data.extend(chunk)
+    except OSError as exc:
+        raise ProviderGrantDenied("kernel process projection cannot be read") from exc
+    finally:
+        os.close(fd)
+    if len(data) > limit:
+        raise ProviderGrantDenied("kernel process projection exceeds bound")
+    return bytes(data)
+
+
 def authorize_once(
     connection: socket.socket,
     *,
@@ -751,8 +791,8 @@ def authorize_once(
             pidfd = _open_peer_pidfd(connection, pid)
             try:
                 observed = _service_observation(policy["service_unit"])
-                cgroup = Path("/proc").joinpath(str(pid), "cgroup").read_bytes()
-                cmdline = Path("/proc").joinpath(str(pid), "cmdline").read_bytes()
+                cgroup = _read_proc_bounded(pid, "cgroup", 4096)
+                cmdline = _read_proc_bounded(pid, "cmdline", 16384)
                 if len(cgroup) > 4096 or len(cmdline) > 16384:
                     raise ProviderGrantDenied("kernel process projection exceeds bound")
                 _attest_service(policy, pid, uid, observed, cgroup, cmdline)

@@ -145,6 +145,8 @@ class TrustedKernelPeerTests(unittest.TestCase):
             "InvocationID": p["invocation_id"],
             "DynamicUser": "yes",
             "UID": "1999",
+            "Type": "exec",
+            "NotifyAccess": "none",
         }
         cmdline = b"python3\0-I\0-B\0"
         p["main_cmdline_sha256"] = once._sha(cmdline)
@@ -158,6 +160,8 @@ class TrustedKernelPeerTests(unittest.TestCase):
             "InvocationID",
             "DynamicUser",
             "UID",
+            "Type",
+            "NotifyAccess",
         ):
             different = dict(observed)
             different[change] = "wrong"
@@ -178,6 +182,93 @@ class TrustedKernelPeerTests(unittest.TestCase):
             once._attest_service(
                 p, peer, 0, observed, ("0::" + g + "\n").encode(), cmdline
             )
+
+    def test_systemd_mainpid_cannot_be_reassigned_by_notify_or_pidfile(self) -> None:
+        policy = _policy()
+        peer = 12114
+        group = "/system.slice/" + policy["service_unit"]
+        cmdline = b"python3\0-I\0-B\0"
+        policy["main_cmdline_sha256"] = once._sha(cmdline)
+        trusted = {
+            "MainPID": str(peer),
+            "ActiveState": "active",
+            "ControlGroup": group,
+            "InvocationID": policy["invocation_id"],
+            "DynamicUser": "yes",
+            "UID": "1999",
+            "Type": "exec",
+            "NotifyAccess": "none",
+        }
+        cgroup = ("0::" + group + "\n").encode()
+        for key, value in (
+            ("Type", "forking"),
+            ("Type", "notify"),
+            ("Type", "oneshot"),
+            ("NotifyAccess", "all"),
+            ("NotifyAccess", "exec"),
+            ("NotifyAccess", "main"),
+            ("Type", ""),
+            ("NotifyAccess", ""),
+        ):
+            changed = dict(trusted)
+            changed[key] = value
+            with self.subTest(key=key, value=value):
+                with self.assertRaisesRegex(
+                    once.ProviderGrantDenied, "trusted Systemd MainPID"
+                ):
+                    once._attest_service(policy, peer, 1999, changed, cgroup, cmdline)
+        for key in ("Type", "NotifyAccess"):
+            changed = dict(trusted)
+            del changed[key]
+            with self.subTest(missing=key):
+                with self.assertRaises(once.ProviderGrantDenied):
+                    once._attest_service(policy, peer, 1999, changed, cgroup, cmdline)
+
+    def test_pid1_service_observation_includes_immutable_notify_contract(self) -> None:
+        metadata = {
+            "MainPID": "12114",
+            "ActiveState": "active",
+            "ControlGroup": "/system.slice/grabowski-rab-rabpilot.service",
+            "InvocationID": "b" * 32,
+            "DynamicUser": "yes",
+            "UID": "1999",
+            "Type": "exec",
+            "NotifyAccess": "none",
+        }
+        output = "".join(f"{key}={value}\n" for key, value in metadata.items())
+        with mock.patch.object(
+            once.subprocess, "run", return_value=mock.Mock(stdout=output)
+        ) as proc:
+            self.assertEqual(
+                once._service_observation("grabowski-rab-rabpilot.service"), metadata
+            )
+            argv = proc.call_args.args[0]
+            self.assertIn("Type", argv[-2])
+            self.assertIn("NotifyAccess", argv[-2])
+
+    def test_procfs_file_reader_bounds_bytes_before_allocating_all(self) -> None:
+        current_pid = os.getpid()
+        with self.assertRaisesRegex(once.ProviderGrantDenied, "exceeds bound"):
+            once._read_proc_bounded(current_pid, "cmdline", 1)
+        original = Path("/proc/self/cmdline").read_bytes()
+        self.assertEqual(
+            once._read_proc_bounded(current_pid, "cmdline", 16384), original
+        )
+        with self.assertRaises(once.ProviderGrantDenied):
+            once._read_proc_bounded(current_pid, "environ", 1)
+
+    def test_procfs_short_read_never_becomes_a_trusted_prefix(self) -> None:
+        current_pid = os.getpid()
+        with mock.patch.object(
+            once.os, "read", side_effect=[b"allow", b"ed", b""]
+        ) as read:
+            self.assertEqual(
+                once._read_proc_bounded(current_pid, "cmdline", 16384), b"allowed"
+            )
+            self.assertEqual(read.call_count, 3)
+        with mock.patch.object(once.os, "read", side_effect=[b"a", b"b", b"c"]):
+            with self.assertRaisesRegex(once.ProviderGrantDenied, "exceeds bound"):
+                once._read_proc_bounded(current_pid, "cmdline", 1)
 
     def test_peer_credentials_come_from_kernel_not_payload(self) -> None:
         if os.getuid() == 0:
@@ -556,6 +647,27 @@ class AtomicRootStateMachineTests(unittest.TestCase):
             with self.assertRaisesRegex(once.ProviderGrantDenied, "already consumed"):
                 self._consume(1)
         self.assertEqual(len(list(Path(self.tmp.name).glob("spent-*"))), 2)
+
+    def test_second_position_must_be_consumed_by_first_kernel_peer(self) -> None:
+        self._consume(0)
+        with mock.patch.object(
+            once,
+            "_read_root_file",
+            side_effect=self._root_file_simulator(self._release()),
+        ):
+            for other in (
+                (2256, 1999, 1999),
+                (2255, 2000, 1999),
+                (2255, 1999, 2000),
+            ):
+                with self.subTest(other=other):
+                    with self.assertRaisesRegex(
+                        once.ProviderGrantDenied, "marker changed"
+                    ):
+                        once._consume_position(
+                            self.fd, self.policy, _request(self.policy, 1), other
+                        )
+        self.assertEqual(len(list(Path(self.tmp.name).glob("spent-*"))), 1)
 
     def test_first_spent_marker_bad_peer_types_fail_typed(self) -> None:
         first = self._consume(0)
