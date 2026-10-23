@@ -421,7 +421,9 @@ class KernelMessageSenderTests(unittest.TestCase):
     def test_deeply_nested_json_is_typed_denial_not_recursion_crash(self) -> None:
         payload = b"[" * 1400 + b"0" + b"]" * 1400
         self.sender.sendall(payload)
-        with self.assertRaisesRegex(once.ProviderGrantDenied, "not JSON"):
+        # Python versions may reject nesting during JSON decode or after decoding
+        # the resulting top-level array. Both are typed, fail-closed denials.
+        with self.assertRaisesRegex(once.ProviderGrantDenied, "not JSON|not an object"):
             once._receive_authenticated_request(self.receiver)
 
     def test_oversized_single_packet_denied(self) -> None:
