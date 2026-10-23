@@ -195,6 +195,53 @@ class AgentCompetitionTests(unittest.TestCase):
                 ):
                     competition._receipt_patch_paths(patch)
 
+    def test_receipt_patch_paths_rejects_git_file_marker_spoof_and_copy_metadata(self) -> None:
+        regular = (
+            "diff --git a/src/allowed.py b/src/allowed.py\n"
+            "index 1234567..abcdef0 100644\n"
+            "--- a/src/allowed.py\n"
+            "+++ b/src/allowed.py\n"
+            "@@ -1 +1 @@\n-old\n+new\n"
+        )
+        self.assertEqual(["src/allowed.py"], competition._receipt_patch_paths(regular))
+        new_regular = (
+            "diff --git a/src/new.py b/src/new.py\n"
+            "new file mode 100644\n"
+            "index 0000000..abcdef0\n"
+            "--- /dev/null\n"
+            "+++ b/src/new.py\n"
+            "@@ -0,0 +1 @@\n+new\n"
+        )
+        self.assertEqual(["src/new.py"], competition._receipt_patch_paths(new_regular))
+        base = "diff --git a/src/allowed.py b/src/allowed.py\n"
+        cases = (
+            base + "--- a/src/sensitive.py\n+++ b/src/sensitive.py\n@@ -1 +1 @@\n-old\n+new\n",
+            base + "--- a/src/allowed.py\n+++ b/src/sensitive.py\n@@ -1 +1 @@\n-old\n+new\n",
+            base + "--- a/src/allowed.py\n+++ b/elsewhere\n@@ -1 +1 @@\n-old\n+new\n",
+            base + "similarity index 100%\ncopy from src/symlink\ncopy to src/allowed.py\n",
+            base + "similarity index 100%\nrename from src/symlink\nrename to src/allowed.py\n",
+            base + "--- a/src/allowed.py\n+++ b/src/allowed.py\n+++ b/src/sensitive.py\n",
+        )
+        for patch in cases:
+            with self.subTest(patch=patch[:100]), self.assertRaises(competition.AgentCompetitionError):
+                competition._receipt_patch_paths(patch)
+
+    def test_git_base_modes_are_literal_and_reject_symlink_ancestors(self) -> None:
+        colon = self.repo / ":linked"
+        colon.symlink_to("src/sample.py")
+        ancestor = self.repo / "src" / "linkdir"
+        ancestor.symlink_to("../src")
+        subprocess.run(["git", "add", "--", ":(literal):linked", "src/linkdir"], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-qm", "literal symlink fixtures"], cwd=self.repo, check=True)
+        head = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=self.repo, text=True
+        ).strip()
+        for relative in (":linked", "src/linkdir/new.py"):
+            with self.subTest(relative=relative), self.assertRaisesRegex(
+                competition.AgentCompetitionError, "non-regular tracked Git file"
+            ):
+                competition._validate_patch_base_modes(self.repo, head, [relative])
+
     def test_candidate_receipt_denies_patch_to_committed_symlink(self) -> None:
         link = self.repo / "src" / "linked.py"
         link.symlink_to("../sample.py")

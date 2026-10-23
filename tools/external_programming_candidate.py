@@ -626,59 +626,103 @@ def path_in_scope(path: str, roots: list[str]) -> bool:
 
 
 def validate_patch_base_modes(repo: Path, head: str, paths: list[str]) -> None:
-    """Reject any patch that modifies a committed symlink, gitlink, or nonregular file."""
+    """Fail closed on symlink/gitlink leaf or ancestor, using literal Git pathspecs."""
     for relative in paths:
-        listing = run_git(repo, ["ls-tree", "-z", head, "--", relative])
-        if listing.returncode != 0:
-            raise CandidateError("candidate patch base Git mode is unavailable")
-        entries = [entry for entry in listing.stdout.split(b"\x00") if entry]
-        if not entries:
-            continue  # A newly added file must declare a regular Git mode in the patch.
-        if len(entries) != 1 or b"\t" not in entries[0]:
-            raise CandidateError("candidate patch base Git metadata is invalid")
-        metadata, raw_path = entries[0].split(b"\t", 1)
-        fields = metadata.split()
-        if (
-            len(fields) != 3
-            or fields[0] not in {b"100644", b"100755"}
-            or fields[1] != b"blob"
-            or raw_path != relative.encode("utf-8")
-        ):
-            raise CandidateError("candidate patch targets non-regular tracked Git file")
-
+        parts = PurePosixPath(relative).parts
+        for depth in range(1, len(parts) + 1):
+            exact_path = "/".join(parts[:depth])
+            listing = run_git(repo, ["ls-tree", "-z", head, "--", ":(literal)" + exact_path])
+            if listing.returncode != 0:
+                raise CandidateError("candidate patch base Git mode is unavailable")
+            records = [item for item in listing.stdout.split(b"\x00") if item]
+            if not records:
+                break  # The first missing ancestor proves all deeper entries are new.
+            if len(records) != 1 or b"\t" not in records[0]:
+                raise CandidateError("candidate patch base Git metadata is invalid")
+            metadata, actual_path = records[0].split(b"\t", 1)
+            fields = metadata.split()
+            if len(fields) != 3 or actual_path != exact_path.encode("utf-8"):
+                raise CandidateError("candidate patch base Git metadata is invalid")
+            expected_mode, expected_type = (
+                (b"040000", b"tree")
+                if depth < len(parts) else (None, b"blob")
+            )
+            if (
+                fields[1] != expected_type
+                or (
+                    fields[0] != expected_mode
+                    if expected_mode is not None
+                    else fields[0] not in {b"100644", b"100755"}
+                )
+            ):
+                raise CandidateError("candidate patch targets non-regular tracked Git file")
 
 def patch_paths(patch: str) -> list[str]:
+    """Bind all Git patch file markers to the one normalized diff path."""
     paths: list[str] = []
+    current_path: str | None = None
+    old_seen = False
+    new_seen = False
+    old_null = False
+    new_null = False
+    in_hunk = False
+
     for line in patch.splitlines():
-        # Git permits symlink/submodule patches in a temporary index. A
-        # syntactically applicable diff is not proof of a regular-file patch.
+        if line.startswith("diff --git "):
+            if old_seen != new_seen or (old_null and new_null):
+                raise CandidateError("candidate patch file headers are incomplete")
+            parts = line.split(" ")
+            if len(parts) != 4 or not parts[2].startswith("a/") or not parts[3].startswith("b/"):
+                raise CandidateError("candidate patch has an unsupported diff header")
+            left = normalize_relative(parts[2][2:], label="patch path")
+            right = normalize_relative(parts[3][2:], label="patch path")
+            if left != right:
+                raise CandidateError("candidate patch may not contain renames or copies")
+            current_path = left
+            paths.append(left)
+            old_seen = new_seen = old_null = new_null = in_hunk = False
+            continue
+        if current_path is None:
+            if line:
+                raise CandidateError("candidate patch has content outside a diff header")
+            continue
+        if line.startswith(("rename from", "rename to", "copy from", "copy to",
+                            "similarity index", "dissimilarity index")):
+            raise CandidateError("candidate patch contains unsupported copy/rename metadata")
+        if line.startswith("--- "):
+            if old_seen or in_hunk or line not in ("--- a/" + current_path, "--- /dev/null"):
+                raise CandidateError("candidate patch file marker differs from diff --git path")
+            old_seen, old_null = True, line == "--- /dev/null"
+            continue
+        if line.startswith("+++ "):
+            if new_seen or in_hunk or line not in ("+++ b/" + current_path, "+++ /dev/null"):
+                raise CandidateError("candidate patch file marker differs from diff --git path")
+            new_seen, new_null = True, line == "+++ /dev/null"
+            continue
+        if line.startswith("@@ "):
+            if not (old_seen and new_seen) or (old_null and new_null):
+                raise CandidateError("candidate patch lacks matching file markers")
+            in_hunk = True
+            continue
         if line.startswith(("new file mode", "deleted file mode", "old mode", "new mode")):
-            if re.fullmatch(
+            if in_hunk or re.fullmatch(
                 r"(?:new file mode|deleted file mode|old mode|new mode) (?:100644|100755)",
                 line,
             ) is None:
                 raise CandidateError("candidate patch contains non-regular Git file mode")
         elif line.startswith("index"):
-            if re.fullmatch(
+            if in_hunk or re.fullmatch(
                 r"index [0-9a-fA-F]{4,64}\.\.[0-9a-fA-F]{4,64}(?: (?:100644|100755))?",
                 line,
             ) is None:
                 raise CandidateError("candidate patch contains non-regular Git file mode")
-        if line.startswith("diff --git "):
-            parts = line.split(" ")
-            if len(parts) != 4 or not parts[2].startswith("a/") or not parts[3].startswith("b/"):
-                raise CandidateError("patch contains an unsupported diff header")
-            left = normalize_relative(parts[2][2:], label="patch path")
-            right = normalize_relative(parts[3][2:], label="patch path")
-            if left != right:
-                raise CandidateError("renames and copies are not supported in candidate patches")
-            paths.append(left)
+    if old_seen != new_seen or (old_null and new_null):
+        raise CandidateError("candidate patch file headers are incomplete")
     if patch and not paths:
-        raise CandidateError("non-empty patch contains no diff headers")
+        raise CandidateError("candidate patch non-empty text contains no diff headers")
     if "GIT binary patch" in patch or "Binary files " in patch:
-        raise CandidateError("binary candidate patches are not supported")
+        raise CandidateError("candidate patch may not contain binary data")
     return sorted(set(paths))
-
 
 def validate_packet(packet: dict[str, Any]) -> dict[str, Any]:
     common = {

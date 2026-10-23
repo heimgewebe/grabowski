@@ -159,6 +159,92 @@ class ExternalProgrammingCandidateTests(unittest.TestCase):
                 ):
                     candidate_tool.patch_paths(patch)
 
+    def test_patch_paths_rejects_git_file_marker_spoof_and_copy_metadata(self) -> None:
+        regular = (
+            "diff --git a/src/allowed.py b/src/allowed.py\n"
+            "index 1234567..abcdef0 100644\n"
+            "--- a/src/allowed.py\n"
+            "+++ b/src/allowed.py\n"
+            "@@ -1 +1 @@\n-old\n+new\n"
+        )
+        self.assertEqual(["src/allowed.py"], candidate_tool.patch_paths(regular))
+        new_regular = (
+            "diff --git a/src/new.py b/src/new.py\n"
+            "new file mode 100644\n"
+            "index 0000000..abcdef0\n"
+            "--- /dev/null\n"
+            "+++ b/src/new.py\n"
+            "@@ -0,0 +1 @@\n+new\n"
+        )
+        self.assertEqual(["src/new.py"], candidate_tool.patch_paths(new_regular))
+        base = "diff --git a/src/allowed.py b/src/allowed.py\n"
+        cases = (
+            base + "--- a/src/sensitive.py\n+++ b/src/sensitive.py\n@@ -1 +1 @@\n-old\n+new\n",
+            base + "--- a/src/allowed.py\n+++ b/src/sensitive.py\n@@ -1 +1 @@\n-old\n+new\n",
+            base + "--- a/src/allowed.py\n+++ b/elsewhere\n@@ -1 +1 @@\n-old\n+new\n",
+            base + "similarity index 100%\ncopy from src/symlink\ncopy to src/allowed.py\n",
+            base + "similarity index 100%\nrename from src/symlink\nrename to src/allowed.py\n",
+            base + "--- a/src/allowed.py\n+++ b/src/allowed.py\n+++ b/src/sensitive.py\n",
+        )
+        for patch in cases:
+            with self.subTest(patch=patch[:100]), self.assertRaises(candidate_tool.CandidateError):
+                candidate_tool.patch_paths(patch)
+
+    def test_git_base_modes_are_literal_and_reject_symlink_ancestors(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=repo, check=True)
+            (repo / "src").mkdir()
+            (repo / ":linked").symlink_to("regular")
+            (repo / "src" / "linkdir").symlink_to("../regular")
+            (repo / "regular").write_text("regular\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-qm", "symlink fixtures"], cwd=repo, check=True)
+            head = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=repo, text=True
+            ).strip()
+            for relative in (":linked", "src/linkdir/new.py"):
+                with self.subTest(relative=relative), self.assertRaisesRegex(
+                    candidate_tool.CandidateError, "non-regular tracked Git file"
+                ):
+                    candidate_tool.validate_patch_base_modes(repo, head, [relative])
+
+    def test_git_apply_can_target_undeclared_file_markers(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=repo, check=True)
+            (repo / "src").mkdir()
+            for name in ("allowed.py", "sensitive.py"):
+                (repo / "src" / name).write_text("old\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-qm", "base"], cwd=repo, check=True)
+            patch = (
+                "diff --git a/src/allowed.py b/src/allowed.py\n"
+                "--- a/src/sensitive.py\n"
+                "+++ b/src/sensitive.py\n"
+                "@@ -1 +1 @@\n-old\n+new\n"
+            )
+            checked = subprocess.run(
+                ["git", "apply", "--cached", "--check", "-"],
+                cwd=repo, input=patch.encode("utf-8"), capture_output=True,
+            )
+            self.assertEqual(0, checked.returncode, checked.stderr)
+            applied = subprocess.run(
+                ["git", "apply", "--cached", "-"],
+                cwd=repo, input=patch.encode("utf-8"), capture_output=True,
+            )
+            self.assertEqual(0, applied.returncode, applied.stderr)
+            changed = subprocess.check_output(
+                ["git", "diff", "--cached", "--name-only"], cwd=repo, text=True,
+            ).strip()
+            self.assertEqual("src/sensitive.py", changed)
+            with self.assertRaises(candidate_tool.CandidateError):
+                candidate_tool.patch_paths(patch)
+
     def test_candidate_drops_patch_retargeting_committed_symlink(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
