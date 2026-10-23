@@ -48,6 +48,8 @@ DECISION_REVIEW_ORDER_ROOT = (
 DECISION_REVIEW_JOBS_ROOT = Path.home() / ".local" / "state" / "grabowski" / "jobs"
 DECISION_REVIEW_ORDER_MAX_BYTES = 4096
 DECISION_REVIEW_ORDER_MAX_JOB_DIRECTORIES = 10_000
+# Same name pattern as grabowski_decision_reviews._UNIT_RE.
+_DECISION_REVIEW_UNIT_RE = re.compile(r"grabowski-job-[0-9a-f]{12}\Z")
 DECISION_REVIEW_ORDER_MAX_METADATA_BYTES = 256 * 1024
 DECISION_REVIEW_ORDER_MAX_NS = (1 << 63) - 1
 _DECISION_REVIEW_REPO_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
@@ -178,9 +180,19 @@ def _existing_decision_review_max_ns(
         return -1
     if stat.S_ISLNK(root_metadata.st_mode) or not stat.S_ISDIR(root_metadata.st_mode):
         raise PermissionError("decision review jobs root is unsafe")
-    directories = list(root.iterdir())
-    if len(directories) > DECISION_REVIEW_ORDER_MAX_JOB_DIRECTORIES:
-        raise ValueError("decision review job bootstrap exceeds directory limit")
+    # Only exact 12-hex job units are admissible DecisionReview attempts.
+    # RepoGround reserved jobs and unrelated legacy entries must not exhaust
+    # the causal-clock bootstrap budget; the DecisionReview reconciler uses
+    # the same unit-name boundary. Count even unsafe typed names before lstat,
+    # so symlinks/files cannot evade the hard inventory cap.
+    directories: list[Path] = []
+    with os.scandir(root) as entries:
+        for entry in entries:
+            if _DECISION_REVIEW_UNIT_RE.fullmatch(entry.name) is None:
+                continue
+            directories.append(root / entry.name)
+            if len(directories) > DECISION_REVIEW_ORDER_MAX_JOB_DIRECTORIES:
+                raise ValueError("decision review job bootstrap exceeds directory limit")
     maximum = -1
     for directory in directories:
         try:

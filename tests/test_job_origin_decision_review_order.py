@@ -186,6 +186,83 @@ class DecisionReviewLogicalClockTests(unittest.TestCase):
             first["scope"]["started_at_unix_ns"] + 1,
         )
 
+    def test_unrelated_job_directories_cannot_exhaust_review_bootstrap(self) -> None:
+        # A valid canonical review job must keep its causal precedence. Legacy
+        # and RepoGround reserved job directories are not independently
+        # admissible DecisionReview units, even if they contain metadata that
+        # resembles a matching (or a copied) review origin.
+        with tempfile.TemporaryDirectory() as temporary:
+            order_patch, jobs_patch = self.roots(temporary)
+            with order_patch, jobs_patch:
+                first_ns = 2_000_000_000_500_000_000
+                first, first_digest = build("000000000010", first_ns)
+                later, later_digest = build(
+                    "000000000011", first_ns + 20_000_000_000
+                )
+                jobs_root = job_origin.DECISION_REVIEW_JOBS_ROOT
+                canonical = jobs_root / "grabowski-job-000000000010"
+                canonical.mkdir(parents=True, mode=0o700)
+                (canonical / "metadata.json").write_text(
+                    json.dumps({"origin": first, "origin_sha256": first_digest}),
+                    encoding="utf-8",
+                )
+                os.chmod(canonical / "metadata.json", 0o600)
+                for name in (
+                    "grabowski-job-rgpm-" + "a" * 16 + "-01",
+                    "unrelated-legacy-job-directory",
+                ):
+                    unrelated = jobs_root / name
+                    unrelated.mkdir(mode=0o700)
+                    # Deliberately copied signed metadata must not silently
+                    # become a valid new DecisionReview job identity.
+                    metadata = unrelated / "metadata.json"
+                    metadata.write_text(
+                        json.dumps(
+                            {"origin": later, "origin_sha256": later_digest}
+                        ),
+                        encoding="utf-8",
+                    )
+                    os.chmod(metadata, 0o600)
+                state_path = next(
+                    job_origin.DECISION_REVIEW_ORDER_ROOT.glob("*.json")
+                )
+                state_path.unlink()
+                with mock.patch.object(
+                    job_origin, "DECISION_REVIEW_ORDER_MAX_JOB_DIRECTORIES", 1
+                ):
+                    successor, _ = build(
+                        "000000000012", 1_900_000_000_100_000_000
+                    )
+        self.assertEqual(
+            successor["scope"]["started_at_unix_ns"],
+            first["scope"]["started_at_unix_ns"] + 1,
+        )
+        self.assertLess(
+            successor["scope"]["started_at_unix_ns"],
+            later["scope"]["started_at_unix_ns"],
+        )
+
+    def test_real_canonical_job_limit_still_blocks_before_any_origin_read(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            order_patch, jobs_patch = self.roots(temporary)
+            with order_patch, jobs_patch:
+                jobs_root = job_origin.DECISION_REVIEW_JOBS_ROOT
+                jobs_root.mkdir(parents=True, mode=0o700)
+                (jobs_root / "grabowski-job-0000000000a1").mkdir(mode=0o700)
+                # A canonical-looking unsafe/non-directory entry must also
+                # consume the bounded inventory, never bypass the hard limit.
+                (jobs_root / "grabowski-job-0000000000a2").write_text(
+                    "not a safe job directory", encoding="utf-8"
+                )
+                key = job_origin._decision_review_order_key(scope(None))
+                with mock.patch.object(
+                    job_origin, "DECISION_REVIEW_ORDER_MAX_JOB_DIRECTORIES", 1
+                ):
+                    with self.assertRaisesRegex(
+                        ValueError, "decision review job bootstrap exceeds directory limit"
+                    ):
+                        job_origin._existing_decision_review_max_ns(key)
+
     def test_interrupted_replace_preserves_last_valid_state(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             order_patch, jobs_patch = self.roots(temporary)
