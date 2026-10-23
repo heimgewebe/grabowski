@@ -226,6 +226,19 @@ class AgentCompetitionTests(unittest.TestCase):
             with self.subTest(patch=patch[:100]), self.assertRaises(competition.AgentCompetitionError):
                 competition._receipt_patch_paths(patch)
 
+    def test_candidate_receipt_rejects_legacy_rename_and_line_separators(self) -> None:
+        base = "diff --git a/src/allowed.py b/src/allowed.py\n"
+        cases = (
+            base + "rename old src/symlink\nrename new src/allowed.py\n",
+            base + "--- a/src/allowed.py\n+++ b/src/allowed.py\v/secrets/key\n@@ -1 +1 @@\n-old\n+new\n",
+            base + "--- a/src/allowed.py\n+++ b/src/allowed.py\u2028/secrets/key\n@@ -1 +1 @@\n-old\n+new\n",
+        )
+        for patch in cases:
+            with self.subTest(patch=repr(patch[:90])), self.assertRaises(
+                competition.AgentCompetitionError
+            ):
+                competition._receipt_patch_paths(patch)
+
     def test_git_base_modes_are_literal_and_reject_symlink_ancestors(self) -> None:
         colon = self.repo / ":linked"
         colon.symlink_to("src/sample.py")

@@ -190,6 +190,53 @@ class ExternalProgrammingCandidateTests(unittest.TestCase):
             with self.subTest(patch=patch[:100]), self.assertRaises(candidate_tool.CandidateError):
                 candidate_tool.patch_paths(patch)
 
+    def test_patch_paths_rejects_legacy_rename_and_line_separators(self) -> None:
+        base = "diff --git a/src/allowed.py b/src/allowed.py\n"
+        cases = (
+            base + "rename old src/symlink\nrename new src/allowed.py\n",
+            base + "--- a/src/allowed.py\n+++ b/src/allowed.py\v/secrets/key\n@@ -1 +1 @@\n-old\n+new\n",
+            base + "--- a/src/allowed.py\n+++ b/src/allowed.py\u2028/secrets/key\n@@ -1 +1 @@\n-old\n+new\n",
+        )
+        for patch in cases:
+            with self.subTest(patch=repr(patch[:90])), self.assertRaises(
+                candidate_tool.CandidateError
+            ):
+                candidate_tool.patch_paths(patch)
+
+    def test_git_apply_legacy_rename_moves_symlink_but_runner_denies(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+            subprocess.run(
+                ["git", "config", "user.email", "test@example.invalid"],
+                cwd=repo, check=True,
+            )
+            (repo / "src").mkdir()
+            (repo / "src" / "symlink").symlink_to("../outside")
+            subprocess.run(["git", "add", "."], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-qm", "symlink source"], cwd=repo, check=True)
+            patch = (
+                "diff --git a/src/allowed b/src/allowed\n"
+                "rename old src/symlink\n"
+                "rename new src/allowed\n"
+            )
+            for option in (["--check", "-"], ["-"]):
+                applied = subprocess.run(
+                    ["git", "apply", "--cached", *option], cwd=repo,
+                    input=patch.encode(), capture_output=True,
+                )
+                self.assertEqual(0, applied.returncode, applied.stderr)
+            staged = subprocess.check_output(
+                ["git", "ls-files", "--stage", "--", "src/allowed"],
+                cwd=repo, text=True,
+            )
+            self.assertTrue(staged.startswith("120000 "), staged)
+            with self.assertRaisesRegex(
+                candidate_tool.CandidateError, "unsupported Git header"
+            ):
+                candidate_tool.patch_paths(patch)
+
     def test_git_base_modes_are_literal_and_reject_symlink_ancestors(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repo = Path(temporary)

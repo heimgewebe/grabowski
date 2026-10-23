@@ -667,7 +667,16 @@ def patch_paths(patch: str) -> list[str]:
     new_null = False
     in_hunk = False
 
-    for line in patch.splitlines():
+    # Python splitlines() accepts separators that Git's patch parser does not.
+    # Only LF is a patch line delimiter; fail closed on noncanonical controls.
+    if any(
+        (ord(char) < 32 and char not in "\n\t")
+        or 0x7F <= ord(char) <= 0x9F
+        or char in {"\u2028", "\u2029"}
+        for char in patch
+    ):
+        raise CandidateError("candidate patch contains unsafe control characters")
+    for line in patch.removesuffix("\n").split("\n"):
         if line.startswith("diff --git "):
             if old_seen != new_seen or (old_null and new_null):
                 raise CandidateError("candidate patch file headers are incomplete")
@@ -716,6 +725,13 @@ def patch_paths(patch: str) -> list[str]:
                 line,
             ) is None:
                 raise CandidateError("candidate patch contains non-regular Git file mode")
+        elif in_hunk:
+            if not line.startswith((" ", "+", "-", "\\")):
+                raise CandidateError("candidate patch contains unsupported hunk line")
+        else:
+            # Git recognizes legacy rename metadata such as rename old/new.
+            # Unknown header syntax must not change undeclared file paths.
+            raise CandidateError("candidate patch contains unsupported Git header")
     if old_seen != new_seen or (old_null and new_null):
         raise CandidateError("candidate patch file headers are incomplete")
     if patch and not paths:
