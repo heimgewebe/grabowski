@@ -106,8 +106,24 @@ def _bounded_json_object(raw: bytes) -> dict[str, Any]:
                 raise ProviderGrantDenied("provider JSON nesting is unbalanced")
     if nesting or in_string:
         raise ProviderGrantDenied("provider JSON nesting is incomplete")
+
+    def unique_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ProviderGrantDenied("provider JSON has duplicate keys")
+            result[key] = value
+        return result
+
+    def reject_nonfinite(_: str) -> Any:
+        raise ProviderGrantDenied("provider JSON has non-finite numbers")
+
     try:
-        value = json.loads(decoded)
+        value = json.loads(
+            decoded,
+            object_pairs_hook=unique_pairs,
+            parse_constant=reject_nonfinite,
+        )
     except (ValueError, RecursionError) as exc:
         raise ProviderGrantDenied("provider JSON cannot be decoded") from exc
     if not isinstance(value, dict):
@@ -120,13 +136,14 @@ def _read_root_file(directory_fd: int, filename: str) -> dict[str, Any]:
         raise ProviderGrantDenied("unsafe trusted filename")
     fd = os.open(
         filename,
-        os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
         dir_fd=directory_fd,
     )
     try:
         before = os.fstat(fd)
         if (
             not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
             or before.st_uid != 0
             or before.st_mode & 0o022
             or not 0 < before.st_size <= _MAX_BYTES
@@ -187,10 +204,16 @@ def _validate_policy(policy: Any) -> dict[str, Any]:
         or re.fullmatch(r"[0-9a-f]{32}", policy["invocation_id"]) is None
     ):
         raise ProviderGrantDenied("trusted one-shot invocation identity invalid")
-    if (
-        not isinstance(policy["pair_id"], str)
-        or not 0 < len(policy["pair_id"].encode("utf-8")) <= 256
-        or any(ord(char) < 32 for char in policy["pair_id"])
+    try:
+        pair_utf8 = (
+            policy["pair_id"].encode("utf-8")
+            if isinstance(policy["pair_id"], str)
+            else b""
+        )
+    except UnicodeError as exc:
+        raise ProviderGrantDenied("trusted one-shot pair identity invalid") from exc
+    if not 0 < len(pair_utf8) <= 256 or any(
+        ord(char) < 32 for char in policy["pair_id"]
     ):
         raise ProviderGrantDenied("trusted one-shot pair identity invalid")
     if (
@@ -391,7 +414,7 @@ def _service_observation(unit: str) -> dict[str, str]:
             timeout=10,
             env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
         )
-    except (OSError, subprocess.SubprocessError) as exc:
+    except (OSError, UnicodeError, subprocess.SubprocessError) as exc:
         raise ProviderGrantDenied("PID1 service identity unavailable") from exc
     if len(completed.stdout) > 4096:
         raise ProviderGrantDenied("PID1 response exceeds bound")
@@ -568,6 +591,11 @@ def _consume_position(
             first_record = _read_root_file(state_fd, "spent-" + first_token + ".json")
         except OSError as exc:
             raise ProviderGrantDenied("first position not previously consumed") from exc
+        if not isinstance(first_record, dict):
+            raise ProviderGrantDenied("first position root intent marker changed")
+        peer_pid = first_record.get("peer_pid")
+        peer_uid = first_record.get("peer_uid")
+        peer_gid = first_record.get("peer_gid")
         if any(
             (
                 first_record.get("kind") != "rab.root_provider_intent_consumed",
@@ -590,12 +618,12 @@ def _consume_position(
                     "peer_uid",
                     "peer_gid",
                 },
-                type(first_record.get("peer_pid")) is not int,
-                type(first_record.get("peer_uid")) is not int,
-                type(first_record.get("peer_gid")) is not int,
-                first_record.get("peer_pid", 0) <= 1,
-                first_record.get("peer_uid", 0) <= 0,
-                first_record.get("peer_gid", -1) < 0,
+                type(peer_pid) is not int,
+                type(peer_uid) is not int,
+                type(peer_gid) is not int,
+                isinstance(peer_pid, int) and peer_pid <= 1,
+                isinstance(peer_uid, int) and peer_uid <= 0,
+                isinstance(peer_gid, int) and peer_gid < 0,
                 first_record.get("service_unit") != policy["service_unit"],
                 first_record.get("invocation_id") != policy["invocation_id"],
                 first_record.get("token_sha256") != first_token,

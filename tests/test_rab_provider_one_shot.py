@@ -71,6 +71,12 @@ def _request(policy: dict, index: int) -> dict:
 
 
 class FrozenGrantPolicyTests(unittest.TestCase):
+    def test_lone_surrogate_pair_is_typed_denial(self) -> None:
+        p = _policy()
+        p["pair_id"] = "\ud800"
+        with self.assertRaisesRegex(once.ProviderGrantDenied, "pair identity invalid"):
+            once._validate_policy(p)
+
     def test_exact_epoch_and_pair_contract(self) -> None:
         p = _policy()
         self.assertIs(once._validate_policy(p), p)
@@ -212,6 +218,18 @@ class BoundedJsonTests(unittest.TestCase):
         ):
             with self.subTest(raw=raw[:12]):
                 with self.assertRaisesRegex(once.ProviderGrantDenied, "UTF-8"):
+                    once._bounded_json_object(raw)
+
+    def test_duplicate_keys_and_nonfinite_json_are_denied(self) -> None:
+        for raw in (
+            b'{"outcome":"failed","outcome":"provider_completed"}',
+            b'{"nested":{"a":1,"a":2}}',
+            b'{"value":NaN}',
+            b'{"value":Infinity}',
+            b'{"value":-Infinity}',
+        ):
+            with self.subTest(raw=raw):
+                with self.assertRaises(once.ProviderGrantDenied):
                     once._bounded_json_object(raw)
 
     def test_root_json_parser_rejects_scalar_or_truncated_object(self) -> None:
@@ -486,6 +504,12 @@ class AtomicRootStateMachineTests(unittest.TestCase):
             self._consume(0)
         self.assertEqual(len(list(Path(self.tmp.name).glob("spent-*"))), 1)
 
+    def test_fifo_input_is_immediately_denied_without_writer(self) -> None:
+        target = Path(self.tmp.name, "fifo.json")
+        os.mkfifo(target, mode=0o600)
+        with self.assertRaises(once.ProviderGrantDenied):
+            once._read_root_file(self.fd, target.name)
+
     def test_second_without_root_release_is_denied(self) -> None:
         self._consume(0)
         with self.assertRaisesRegex(
@@ -529,6 +553,31 @@ class AtomicRootStateMachineTests(unittest.TestCase):
             with self.assertRaisesRegex(once.ProviderGrantDenied, "already consumed"):
                 self._consume(1)
         self.assertEqual(len(list(Path(self.tmp.name).glob("spent-*"))), 2)
+
+    def test_first_spent_marker_bad_peer_types_fail_typed(self) -> None:
+        first = self._consume(0)
+        spent = Path(self.tmp.name, "spent-" + first["token_sha256"] + ".json")
+        original = json.loads(spent.read_text())
+        for field, value in (
+            ("peer_pid", "2255"),
+            ("peer_uid", None),
+            ("peer_gid", []),
+            ("peer_pid", True),
+        ):
+            mutated = dict(original)
+            mutated[field] = value
+            spent.write_text(json.dumps(mutated))
+            with (
+                self.subTest(field=field, value=value),
+                mock.patch.object(
+                    once,
+                    "_read_root_file",
+                    side_effect=self._root_file_simulator(self._release()),
+                ),
+                self.assertRaisesRegex(once.ProviderGrantDenied, "marker changed"),
+            ):
+                self._consume(1)
+        spent.write_text(json.dumps(original))
 
     def test_second_release_strict_schema_does_not_accept_boolean(self) -> None:
         self._consume(0)
