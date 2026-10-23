@@ -186,6 +186,43 @@ class TrustedKernelPeerTests(unittest.TestCase):
             s2.close()
 
 
+class BoundedJsonTests(unittest.TestCase):
+    def test_deeply_nested_near_full_packet_is_rejected_before_parser(self) -> None:
+        levels = once._MAX_BYTES // 2 - 2
+        payload = b"[" * levels + b"0" + b"]" * levels
+        self.assertLessEqual(len(payload), once._MAX_BYTES)
+        with self.assertRaisesRegex(once.ProviderGrantDenied, "nesting budget"):
+            once._bounded_json_object(payload)
+
+    def test_quoted_brackets_and_escaped_quotes_do_not_increase_depth(self) -> None:
+        request = {
+            "pair_id": '[[]]{\\\\\\" nested not brackets',
+            "nested": {"value": ["ok", "brackets } ] { ["]},
+        }
+        self.assertEqual(
+            once._bounded_json_object(json.dumps(request).encode()),
+            request,
+        )
+
+    def test_utf16_utf32_bom_and_malformed_utf8_are_denied(self) -> None:
+        for raw in (
+            json.dumps({"a": 1}).encode("utf-16"),
+            json.dumps({"a": 1}).encode("utf-32"),
+            b'{"k":"\xff"}',
+        ):
+            with self.subTest(raw=raw[:12]):
+                with self.assertRaisesRegex(once.ProviderGrantDenied, "UTF-8"):
+                    once._bounded_json_object(raw)
+
+    def test_root_json_parser_rejects_scalar_or_truncated_object(self) -> None:
+        for raw in (b"true", b"{}", b'{"open": [1,2}', b'"scalar"'):
+            if raw == b"{}":
+                self.assertEqual(once._bounded_json_object(raw), {})
+            else:
+                with self.assertRaises(once.ProviderGrantDenied):
+                    once._bounded_json_object(raw)
+
+
 class KernelMessageSenderTests(unittest.TestCase):
     """Real kernel packets: SO_PEERCRED alone must never establish sender PID."""
 
@@ -325,6 +362,26 @@ class StablePeerPidfdTests(unittest.TestCase):
             a.close()
             b.close()
 
+    def test_unverified_architecture_denied_before_kernel_option(self) -> None:
+        from types import SimpleNamespace
+
+        a, b = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        try:
+            with (
+                mock.patch.object(
+                    once.os,
+                    "uname",
+                    return_value=SimpleNamespace(sysname="Linux", machine="sparc64"),
+                ),
+                self.assertRaisesRegex(
+                    once.ProviderGrantDenied, "stable kernel PID identity unavailable"
+                ),
+            ):
+                once._open_peer_pidfd(a, os.getpid())
+        finally:
+            a.close()
+            b.close()
+
     def test_reaped_peer_cannot_be_reidentified_by_reused_number(self) -> None:
         with tempfile.TemporaryDirectory(prefix="rab-pidfd-listen-") as root:
             sockpath = str(Path(root) / "c.sock")
@@ -387,6 +444,7 @@ class AtomicRootStateMachineTests(unittest.TestCase):
             "kind": "rab.root_first_arm_outcome_receipt",
             "schema_version": 1,
             "epoch_sha256": self.policy["epoch_sha256"],
+            "policy_sha256": once._digest(self.policy),
             "pair_id": self.policy["pair_id"],
             "first_token_sha256": self._first_spent_sha(),
             "arm": first["arm"],
@@ -471,6 +529,49 @@ class AtomicRootStateMachineTests(unittest.TestCase):
             with self.assertRaisesRegex(once.ProviderGrantDenied, "already consumed"):
                 self._consume(1)
         self.assertEqual(len(list(Path(self.tmp.name).glob("spent-*"))), 2)
+
+    def test_second_release_strict_schema_does_not_accept_boolean(self) -> None:
+        self._consume(0)
+        release = self._release()
+        release["schema_version"] = True
+        with (
+            mock.patch.object(
+                once,
+                "_read_root_file",
+                side_effect=self._root_file_simulator(release),
+            ),
+            self.assertRaisesRegex(once.ProviderGrantDenied, "release is not bound"),
+        ):
+            self._consume(1)
+
+    def test_root_first_outcome_cannot_cross_policy_code_digest(self) -> None:
+        receipt = self._first_receipt()
+        changed_policy = {**self.policy, "runtime_code_sha256": "0" * 64}
+        with self.assertRaisesRegex(
+            once.ProviderGrantDenied, "outcome receipt identity invalid"
+        ):
+            once._first_outcome_digest(
+                changed_policy,
+                changed_policy["positions"][0],
+                self._first_spent_sha(),
+                receipt,
+            )
+
+    def test_strict_spent_marker_rejects_boolean_schema(self) -> None:
+        first = self._consume(0)
+        spent = Path(self.tmp.name, "spent-" + first["token_sha256"] + ".json")
+        changed = json.loads(spent.read_text())
+        changed["schema_version"] = True
+        spent.write_text(json.dumps(changed))
+        with (
+            mock.patch.object(
+                once,
+                "_read_root_file",
+                side_effect=self._root_file_simulator(self._release()),
+            ),
+            self.assertRaisesRegex(once.ProviderGrantDenied, "marker changed"),
+        ):
+            self._consume(1)
 
     def test_corrupt_first_marker_blocks_second_even_with_root_release(self) -> None:
         first = self._consume(0)

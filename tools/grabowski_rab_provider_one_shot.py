@@ -27,6 +27,7 @@ _SHA = re.compile(r"[0-9a-f]{64}\Z")
 _UNIT = re.compile(r"grabowski-rab-[a-z][a-z0-9-]{0,16}\.service\Z")
 _ARMS = frozenset({"baseline", "treatment"})
 _MAX_BYTES = 16 * 1024
+_MAX_JSON_NESTING = 32
 # Linux UAPI /usr/include/asm-generic/socket.h; absent support must fail closed.
 _SO_PEERPIDFD = 77
 _TRUSTED_POLICY_ROOT = Path("/etc/grabowski/rab-provider-one-shot")
@@ -69,6 +70,51 @@ def _secure_directory(path: Path) -> int:
         raise
 
 
+def _bounded_json_object(raw: bytes) -> dict[str, Any]:
+    """Parse only bounded UTF-8 JSON with shallow nesting, no recursive scan.
+
+    The byte limit alone does not protect a small-stack rootbroker thread from
+    deeply nested JSON. Track braces and brackets outside strings, including
+    escaped quotes. The standard JSON decoder still owns syntax validation.
+    """
+    if not isinstance(raw, bytes) or not 0 < len(raw) <= _MAX_BYTES:
+        raise ProviderGrantDenied("provider JSON exceeds byte budget")
+    try:
+        decoded = raw.decode("utf-8", errors="strict")
+    except UnicodeError as exc:
+        raise ProviderGrantDenied("provider JSON must be UTF-8") from exc
+    nesting = 0
+    in_string = False
+    escaped = False
+    for char in decoded:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+        elif char == '"':
+            in_string = True
+        elif char in "[{":
+            nesting += 1
+            if nesting > _MAX_JSON_NESTING:
+                raise ProviderGrantDenied("provider JSON nesting budget exceeded")
+        elif char in "]}":
+            nesting -= 1
+            if nesting < 0:
+                raise ProviderGrantDenied("provider JSON nesting is unbalanced")
+    if nesting or in_string:
+        raise ProviderGrantDenied("provider JSON nesting is incomplete")
+    try:
+        value = json.loads(decoded)
+    except (ValueError, RecursionError) as exc:
+        raise ProviderGrantDenied("provider JSON cannot be decoded") from exc
+    if not isinstance(value, dict):
+        raise ProviderGrantDenied("provider JSON must be an object")
+    return value
+
+
 def _read_root_file(directory_fd: int, filename: str) -> dict[str, Any]:
     if filename in {"", ".", ".."} or "/" in filename:
         raise ProviderGrantDenied("unsafe trusted filename")
@@ -97,13 +143,7 @@ def _read_root_file(directory_fd: int, filename: str) -> dict[str, Any]:
             before.st_mtime_ns,
         ) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
             raise ProviderGrantDenied("trusted policy/receipt changed while reading")
-        try:
-            value = json.loads(raw)
-        except (ValueError, UnicodeDecodeError, RecursionError) as exc:
-            raise ProviderGrantDenied("invalid trusted JSON") from exc
-        if not isinstance(value, dict):
-            raise ProviderGrantDenied("trusted document must be an object")
-        return value
+        return _bounded_json_object(raw)
     finally:
         os.close(fd)
 
@@ -269,11 +309,9 @@ def _receive_authenticated_request(
             "inherited/forwarded socket sender is not original peer"
         )
     try:
-        request = json.loads(raw)
-    except (UnicodeError, ValueError, RecursionError) as exc:
+        request = _bounded_json_object(raw)
+    except ProviderGrantDenied as exc:
         raise ProviderGrantDenied("authenticated provider packet is not JSON") from exc
-    if not isinstance(request, dict):
-        raise ProviderGrantDenied("authenticated provider packet is not an object")
     return request, sender
 
 
@@ -286,7 +324,12 @@ def _open_peer_pidfd(connection: socket.socket, expected_pid: int) -> int:
     Fail closed on unsupported kernels and old shared anon-inode pidfds.
     Caller owns the returned descriptor and MUST close it.
     """
-    if not hasattr(os, "pidfd_open") or expected_pid <= 1:
+    if (
+        not hasattr(os, "pidfd_open")
+        or expected_pid <= 1
+        or os.uname().sysname != "Linux"
+        or os.uname().machine != "x86_64"
+    ):
         raise ProviderGrantDenied("stable kernel PID identity unavailable")
     peer_fd = -1
     current_fd = -1
@@ -437,6 +480,7 @@ def _first_outcome_digest(
         "kind",
         "schema_version",
         "epoch_sha256",
+        "policy_sha256",
         "pair_id",
         "first_token_sha256",
         "arm",
@@ -456,6 +500,7 @@ def _first_outcome_digest(
         receipt["kind"] == "rab.root_first_arm_outcome_receipt",
         type(receipt["schema_version"]) is int and receipt["schema_version"] == 1,
         receipt["epoch_sha256"] == policy["epoch_sha256"],
+        receipt["policy_sha256"] == _digest(policy),
         receipt["pair_id"] == policy["pair_id"],
         receipt["first_token_sha256"] == first_token,
         receipt["arm"] == first["arm"],
@@ -505,14 +550,19 @@ def _consume_position(
             raise ProviderGrantDenied(
                 "second position lacks independent root release"
             ) from exc
-        if release != {
-            "kind": "rab.second_position_release",
-            "schema_version": 1,
-            "pair_id": policy["pair_id"],
-            "slot_id": pos["slot_id"],
-            "first_token_sha256": first_token,
-            "first_receipt_sha256": release.get("first_receipt_sha256"),
-        } or not _hex(release.get("first_receipt_sha256")):
+        if (
+            release
+            != {
+                "kind": "rab.second_position_release",
+                "schema_version": 1,
+                "pair_id": policy["pair_id"],
+                "slot_id": pos["slot_id"],
+                "first_token_sha256": first_token,
+                "first_receipt_sha256": release.get("first_receipt_sha256"),
+            }
+            or not _hex(release.get("first_receipt_sha256"))
+            or type(release.get("schema_version")) is not int
+        ):
             raise ProviderGrantDenied("second position root release is not bound")
         try:
             first_record = _read_root_file(state_fd, "spent-" + first_token + ".json")
@@ -521,7 +571,33 @@ def _consume_position(
         if any(
             (
                 first_record.get("kind") != "rab.root_provider_intent_consumed",
+                type(first_record.get("schema_version")) is not int,
                 first_record.get("schema_version") != 1,
+                set(first_record)
+                != {
+                    "kind",
+                    "schema_version",
+                    "token_sha256",
+                    "policy_sha256",
+                    "epoch_sha256",
+                    "pair_id",
+                    "arm",
+                    "request_sha256",
+                    "slot_id",
+                    "service_unit",
+                    "invocation_id",
+                    "peer_pid",
+                    "peer_uid",
+                    "peer_gid",
+                },
+                type(first_record.get("peer_pid")) is not int,
+                type(first_record.get("peer_uid")) is not int,
+                type(first_record.get("peer_gid")) is not int,
+                first_record.get("peer_pid", 0) <= 1,
+                first_record.get("peer_uid", 0) <= 0,
+                first_record.get("peer_gid", -1) < 0,
+                first_record.get("service_unit") != policy["service_unit"],
+                first_record.get("invocation_id") != policy["invocation_id"],
                 first_record.get("token_sha256") != first_token,
                 first_record.get("policy_sha256") != _digest(policy),
                 first_record.get("epoch_sha256") != policy["epoch_sha256"],
