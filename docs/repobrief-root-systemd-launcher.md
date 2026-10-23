@@ -81,18 +81,27 @@ The per-condition wall_seconds budget measures only the bounded provider
 execution, not subsequent Git readback, evidence cleanup or terminalization.
 The latter still count toward the independent systemd service maximum.
 
-The --max-cost-usd flag is a ceiling for **both** conditions together, not an
-independent allowance for each arm. Checking costs *after* a condition is
-not a verified pre-spend reservation for the next one: an initial $0.99
-condition followed by a $0.02 condition cannot be dispatched under a
-$1.00 limit without a trustworthy prior reservation/authorization.
-Codex subscription token counts, synthetic CLI dollar values, mock ledgers
-and optional configuration flags do not enforce that USD ceiling.
-There is currently no installed external one-shot verifier with actual
-independent cost reservation and observed USD costs. The pair planner
-is therefore **non-authorizing**, and the real provider path remains
-fail-closed before provider intent. Full systemd and cost qualification
-must precede any paid provider request.
+The old --max-cost-usd field remains an explicitly **non-authorizing legacy
+compatibility field** for Codex ChatGPT-subscription pairs. The preflight now
+validates an independent, request-hash/model/order-bound *non-monetary* envelope:
+exactly two bounded Codex exec processes (one per condition), up to 300
+provider wall-clock seconds, 64,000 input and 6,000 output tokens, 80 tool
+calls, 1 MiB tool input and 8 MiB tool output per condition. The bound source
+is the 24-request frozen variants plan (SHA-256
+\`2795584ac0c100cdceb6ed2c7eb42b883de2099b2a3d33ac51dbe9987655f10c\`).
+Token/tool limits are checked against provider receipts after execution, not
+reserved beforehand. The external Root-Systemd service has its separate
+six-hour absolute lifetime limit. Neither those bounds nor a user-supplied
+dollar flag is a hard USD spending ceiling; individual subscription USD
+expenses remain unknown and must not be reported as 0 USD.
+
+**This envelope is not an independent one-shot authorization.** Both the
+paired preflight and direct Codex runner still deny real provider starts until
+an independently issued, precisely bound and consumed one-time provider grant
+is implemented and verified. No internal ledger, CLI flag, credential or
+Root-Systemd admission alone supplies that grant. The live plan remains
+non-authorizing; root-owned frozen code and MCP sources, complete mounts and
+the real production validator are also required before any model process.
 
 For a future live plan, the launcher instead uses StateDirectory
 on persistent host storage, with four mode-0700 dynamic UID leaves.

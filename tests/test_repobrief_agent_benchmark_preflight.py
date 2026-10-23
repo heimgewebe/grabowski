@@ -3418,6 +3418,156 @@ class FrozenG2PreflightProofTests(unittest.TestCase):
         codex_runner._require_g2_preflight_evidence({}, clean_binding)
 
 
+class CodexSubscriptionPairEnvelopeTests(unittest.TestCase):
+    """The non-USD resource envelope never grants a provider call."""
+
+    @staticmethod
+    def _inputs() -> tuple[dict, dict, dict[str, str]]:
+        runner_contract = {
+            "execution_contract": codex_runner.EXECUTION_CONTRACT,
+            "provider": codex_runner.PROVIDER,
+            "model": codex_runner.MODEL,
+            "sampling": codex_runner.SAMPLING,
+        }
+        budgets = {
+            "wall_seconds": 300,
+            "input_tokens": 64000,
+            "output_tokens": 6000,
+            "max_tool_calls": 64,
+            "max_tool_input_bytes": 400000,
+            "max_tool_output_bytes": 400000,
+        }
+        baseline = {
+            "condition": "baseline",
+            "order": 2,
+            "pair_id": "pair-a",
+            "runner": runner_contract,
+            "budgets": dict(budgets),
+        }
+        treatment = {
+            "condition": "treatment",
+            "order": 1,
+            "pair_id": "pair-a",
+            "runner": runner_contract,
+            "budgets": dict(budgets),
+        }
+        return (
+            baseline,
+            treatment,
+            {
+                "baseline": codex_preflight.core._sha256_json(baseline),
+                "treatment": codex_preflight.core._sha256_json(treatment),
+            },
+        )
+
+    def test_subscription_envelope_is_bounded_and_never_asserts_usd(self) -> None:
+        b, t, hashes = self._inputs()
+        policy = codex_preflight._require_bounded_codex_subscription_pair(
+            pair_id="pair-a",
+            ordered_requests=(b, t),
+            request_sha256=hashes,
+            max_cost_usd=support.Decimal("1.00"),
+        )
+        self.assertEqual(policy["mode"], "chatgpt_subscription")
+        self.assertEqual(policy["model"], codex_runner.MODEL)
+        self.assertEqual(policy["max_codex_exec_processes"], 2)
+        self.assertEqual(policy["max_provider_wall_seconds_total"], 600)
+        self.assertFalse(policy["usd_ceiling_enforced"])
+        self.assertIsNone(policy["observed_cost_usd"])
+        self.assertTrue(policy["independent_external_one_shot_required"])
+        with self.assertRaisesRegex(
+            codex_preflight.core.PreflightError, "external one-shot"
+        ):
+            codex_preflight._require_external_provider_one_shot(
+                pair_id="pair-a",
+                request_sha256=hashes,
+                max_cost_usd=support.Decimal("1.00"),
+                subscription_envelope=policy,
+            )
+
+    def test_broken_pair_identity_model_order_or_budgets_rejected(self) -> None:
+        import copy
+
+        for alteration in (
+            "hash",
+            "wrong_model",
+            "wrong_provider",
+            "wrong_pair",
+            "duplicate_order",
+            "wall_zero",
+            "wall_excess",
+            "input_excess",
+            "output_excess",
+            "tool_calls_excess",
+            "tool_input_excess",
+            "tool_output_excess",
+            "bool_budget",
+            "missing_budget",
+            "duplicate_arm",
+        ):
+            b, t, hashes = self._inputs()
+            b, t, hashes = copy.deepcopy((b, t, hashes))
+            if alteration == "hash":
+                hashes["baseline"] = "0" * 64
+            elif alteration == "wrong_model":
+                b["runner"]["model"] = "another-model"
+            elif alteration == "wrong_provider":
+                b["runner"]["provider"] = "openai-api-payg"
+            elif alteration == "wrong_pair":
+                b["pair_id"] = "different"
+            elif alteration == "duplicate_order":
+                b["order"] = t["order"]
+            elif alteration == "wall_zero":
+                b["budgets"]["wall_seconds"] = 0
+            elif alteration == "wall_excess":
+                b["budgets"]["wall_seconds"] = 301
+            elif alteration == "input_excess":
+                b["budgets"]["input_tokens"] = 64001
+            elif alteration == "output_excess":
+                b["budgets"]["output_tokens"] = 6001
+            elif alteration == "tool_calls_excess":
+                b["budgets"]["max_tool_calls"] = 81
+            elif alteration == "tool_input_excess":
+                b["budgets"]["max_tool_input_bytes"] = 1048577
+            elif alteration == "tool_output_excess":
+                b["budgets"]["max_tool_output_bytes"] = 8388609
+            elif alteration == "bool_budget":
+                b["budgets"]["input_tokens"] = True
+            elif alteration == "missing_budget":
+                b["budgets"].pop("max_tool_calls")
+            elif alteration == "duplicate_arm":
+                t["condition"] = "baseline"
+            # Rebind the hashes for altered requests: the *contract* must
+            # reject the shape even when an attacker controls its own digest.
+            if alteration != "hash":
+                hashes = {
+                    "baseline": codex_preflight.core._sha256_json(b),
+                    "treatment": codex_preflight.core._sha256_json(t),
+                }
+            with self.subTest(alteration=alteration):
+                with self.assertRaises(codex_preflight.core.PreflightError):
+                    codex_preflight._require_bounded_codex_subscription_pair(
+                        pair_id="pair-a",
+                        ordered_requests=(b, t),
+                        request_sha256=hashes,
+                        max_cost_usd=support.Decimal("1.00"),
+                    )
+
+    def test_missing_external_envelope_cannot_grant_provider(self) -> None:
+        _, _, hashes = self._inputs()
+        for untrusted in (None, {}, {"mode": "chatgpt_subscription"}):
+            with self.subTest(value=untrusted):
+                with self.assertRaisesRegex(
+                    codex_preflight.core.PreflightError, "external one-shot"
+                ):
+                    codex_preflight._require_external_provider_one_shot(
+                        pair_id="pair-a",
+                        request_sha256=hashes,
+                        max_cost_usd=support.Decimal("1.00"),
+                        subscription_envelope=untrusted,
+                    )
+
+
 class CodexSameUnitPairContractTests(unittest.TestCase):
     """Simulated pair-control-flow tests; never live USD or spend authorization evidence."""
 
@@ -3506,7 +3656,9 @@ class CodexSameUnitPairContractTests(unittest.TestCase):
             mock.patch.object(
                 codex_preflight, "_ENTRYPOINT_BOOTSTRAP_IDENTITY", {"name": "test"}
             ),
-            mock.patch.object(codex_preflight, "_require_enforceable_codex_pair_cost"),
+            mock.patch.object(
+                codex_preflight, "_require_bounded_codex_subscription_pair"
+            ),
             mock.patch.object(
                 codex_preflight.core, "load_pair", return_value=self._requests()
             ) as load,
@@ -3521,9 +3673,9 @@ class CodexSameUnitPairContractTests(unittest.TestCase):
             authorize.assert_not_called()
             execute.assert_not_called()
 
-    def test_unenforceable_real_codex_cost_never_authorizes_or_dispatches(self) -> None:
-        # Use the real pre-spend denial: no mocked USD, no internal ledger,
-        # no external verifier invocation and no provider process.
+    def test_unbound_subscription_envelope_never_authorizes_or_dispatches(self) -> None:
+        # Unbound synthetic requests cannot satisfy an Abo envelope.
+        # No internal ledger, external verifier, or provider process.
         with (
             mock.patch.object(
                 codex_preflight, "_ENTRYPOINT_BOOTSTRAP_IDENTITY", {"name": "test"}
@@ -3538,7 +3690,8 @@ class CodexSameUnitPairContractTests(unittest.TestCase):
             mock.patch.object(codex_preflight.codex_runner, "execute") as execute,
         ):
             with self.assertRaisesRegex(
-                codex_preflight.core.PreflightError, "pair cost ceiling unenforceable"
+                codex_preflight.core.PreflightError,
+                "Codex subscription pair request identities",
             ):
                 codex_preflight.execute_authorized_pair(**self._kwargs())
             load.assert_called_once()
@@ -3552,7 +3705,9 @@ class CodexSameUnitPairContractTests(unittest.TestCase):
             mock.patch.object(
                 codex_preflight, "_ENTRYPOINT_BOOTSTRAP_IDENTITY", {"name": "test"}
             ),
-            mock.patch.object(codex_preflight, "_require_enforceable_codex_pair_cost"),
+            mock.patch.object(
+                codex_preflight, "_require_bounded_codex_subscription_pair"
+            ),
             mock.patch.object(codex_preflight, "_require_external_provider_one_shot"),
             mock.patch.object(
                 codex_preflight.core, "load_pair", return_value=(baseline, treatment)
@@ -3591,7 +3746,9 @@ class CodexSameUnitPairContractTests(unittest.TestCase):
             mock.patch.object(
                 codex_preflight, "_ENTRYPOINT_BOOTSTRAP_IDENTITY", {"name": "test"}
             ),
-            mock.patch.object(codex_preflight, "_require_enforceable_codex_pair_cost"),
+            mock.patch.object(
+                codex_preflight, "_require_bounded_codex_subscription_pair"
+            ),
             mock.patch.object(codex_preflight, "_require_external_provider_one_shot"),
             mock.patch.object(
                 codex_preflight.core, "load_pair", return_value=(baseline, treatment)
@@ -3682,7 +3839,9 @@ class CodexSameUnitPairContractTests(unittest.TestCase):
             mock.patch.object(
                 codex_preflight, "_ENTRYPOINT_BOOTSTRAP_IDENTITY", {"name": "test"}
             ),
-            mock.patch.object(codex_preflight, "_require_enforceable_codex_pair_cost"),
+            mock.patch.object(
+                codex_preflight, "_require_bounded_codex_subscription_pair"
+            ),
             mock.patch.object(codex_preflight, "_require_external_provider_one_shot"),
             mock.patch.object(
                 codex_preflight.core, "load_pair", return_value=(baseline, treatment)
@@ -3727,7 +3886,9 @@ class CodexSameUnitPairContractTests(unittest.TestCase):
             mock.patch.object(
                 codex_preflight, "_ENTRYPOINT_BOOTSTRAP_IDENTITY", {"name": "test"}
             ),
-            mock.patch.object(codex_preflight, "_require_enforceable_codex_pair_cost"),
+            mock.patch.object(
+                codex_preflight, "_require_bounded_codex_subscription_pair"
+            ),
             mock.patch.object(codex_preflight, "_require_external_provider_one_shot"),
             mock.patch.object(
                 codex_preflight.core, "load_pair", return_value=(baseline, treatment)
@@ -4039,7 +4200,9 @@ class CodexSameUnitPairContractTests(unittest.TestCase):
             mock.patch.object(
                 codex_preflight, "_ENTRYPOINT_BOOTSTRAP_IDENTITY", {"name": "test"}
             ),
-            mock.patch.object(codex_preflight, "_require_enforceable_codex_pair_cost"),
+            mock.patch.object(
+                codex_preflight, "_require_bounded_codex_subscription_pair"
+            ),
             mock.patch.object(codex_preflight, "_require_external_provider_one_shot"),
             mock.patch.object(
                 codex_preflight.core, "load_pair", return_value=(baseline, treatment)
@@ -4091,7 +4254,9 @@ class CodexSameUnitPairContractTests(unittest.TestCase):
             mock.patch.object(
                 codex_preflight, "_ENTRYPOINT_BOOTSTRAP_IDENTITY", {"name": "test"}
             ),
-            mock.patch.object(codex_preflight, "_require_enforceable_codex_pair_cost"),
+            mock.patch.object(
+                codex_preflight, "_require_bounded_codex_subscription_pair"
+            ),
             mock.patch.object(codex_preflight, "_require_external_provider_one_shot"),
             mock.patch.object(
                 codex_preflight.core, "load_pair", return_value=(baseline, treatment)
@@ -4149,7 +4314,9 @@ class CodexSameUnitPairContractTests(unittest.TestCase):
             mock.patch.object(
                 codex_preflight, "_ENTRYPOINT_BOOTSTRAP_IDENTITY", {"name": "test"}
             ),
-            mock.patch.object(codex_preflight, "_require_enforceable_codex_pair_cost"),
+            mock.patch.object(
+                codex_preflight, "_require_bounded_codex_subscription_pair"
+            ),
             mock.patch.object(codex_preflight, "_require_external_provider_one_shot"),
             mock.patch.object(
                 codex_preflight.core, "load_pair", return_value=(baseline, treatment)

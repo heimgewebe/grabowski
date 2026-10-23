@@ -351,32 +351,126 @@ def authorize_pair(
     )
 
 
-def _require_enforceable_codex_pair_cost(
-    *, pair_id: str, request_sha256: dict[str, str], max_cost_usd: Decimal
-) -> None:
-    """Block paid Codex pairs before internal grants or irreversible intent.
+def _require_bounded_codex_subscription_pair(
+    *,
+    pair_id: str,
+    ordered_requests: tuple[dict[str, Any], dict[str, Any]],
+    request_sha256: dict[str, str],
+    max_cost_usd: Decimal,
+) -> dict[str, Any]:
+    """Bind a two-process ChatGPT-subscription envelope, NOT a USD reservation.
 
-    Subscription turn.completed reports tokens, not verified USD. Mocked dollar
-    values and a CLI price flag cannot satisfy a pair-level spending ceiling.
-    Future providers must implement observed USD *and* a pre-spend reservation
-    for each condition before this denial may be removed.
+    The frozen request loader performs the full schema/provenance checks first.
+    This additional check binds both model processes and their bounded wall
+    clocks to the exact pair before any external one-shot authority is queried.
+    Provider token/tool counters are still post-hoc observations, not a
+    pre-spend monetary guarantee. The legacy USD CLI field cannot grant spend.
     """
     if (
         not isinstance(pair_id, str)
         or not pair_id
+        or not isinstance(request_sha256, dict)
         or set(request_sha256) != {"baseline", "treatment"}
         or not isinstance(max_cost_usd, Decimal)
         or not max_cost_usd.is_finite()
         or not Decimal("0") < max_cost_usd <= Decimal("1.00")
     ):
-        raise core.PreflightError("paired provider cost contract is invalid")
-    raise core.PreflightError(
-        "pair cost ceiling unenforceable: Codex subscription stream reports no verified USD"
-    )
+        raise core.PreflightError(
+            "Codex subscription pair identity or legacy field invalid"
+        )
+    if len(ordered_requests) != 2:
+        raise core.PreflightError("Codex subscription requires exactly two requests")
+    expected_runner = {
+        "execution_contract": codex_runner.EXECUTION_CONTRACT,
+        "provider": codex_runner.PROVIDER,
+        "model": codex_runner.MODEL,
+        "sampling": codex_runner.SAMPLING,
+    }
+    # Exact upper budgets across all 24 frozen requests (variants plan
+    # SHA-256 2795584a...); not a provider billing reservation.
+    maximum = {
+        "wall_seconds": 300,
+        "input_tokens": 64000,
+        "output_tokens": 6000,
+        "max_tool_calls": 80,
+        "max_tool_input_bytes": 1048576,
+        "max_tool_output_bytes": 8388608,
+    }
+    observed: dict[str, dict[str, int]] = {}
+    for request in ordered_requests:
+        if not isinstance(request, dict):
+            raise core.PreflightError("Codex subscription pair request is invalid")
+        condition = request.get("condition")
+        if (
+            condition not in {"baseline", "treatment"}
+            or condition in observed
+            or request.get("pair_id") != pair_id
+            or request.get("runner") != expected_runner
+            or core._sha256_json(request) != request_sha256[condition]
+        ):
+            raise core.PreflightError(
+                "Codex subscription pair request identities are invalid"
+            )
+        budgets = request.get("budgets")
+        if not isinstance(budgets, dict) or set(budgets) != {
+            "wall_seconds",
+            "input_tokens",
+            "output_tokens",
+            "max_tool_calls",
+            "max_tool_input_bytes",
+            "max_tool_output_bytes",
+        }:
+            raise core.PreflightError("Codex subscription pair budgets are invalid")
+        wall = budgets.get("wall_seconds")
+        if type(wall) is not int or not 1 <= wall <= maximum["wall_seconds"]:
+            raise core.PreflightError("Codex subscription wall clock is invalid")
+        for name in (
+            "input_tokens",
+            "output_tokens",
+            "max_tool_calls",
+            "max_tool_input_bytes",
+            "max_tool_output_bytes",
+        ):
+            value = budgets[name]
+            if type(value) is not int or not 1 <= value <= maximum[name]:
+                raise core.PreflightError(
+                    "Codex subscription resource budget is invalid"
+                )
+        order = request.get("order")
+        if type(order) is not int or order not in (1, 2):
+            raise core.PreflightError("Codex subscription pair order is invalid")
+        observed[condition] = {"wall_seconds": wall, "order": order}
+    if set(observed) != {"baseline", "treatment"} or {
+        row["order"] for row in observed.values()
+    } != {1, 2}:
+        raise core.PreflightError("Codex subscription pair order or conditions invalid")
+    return {
+        "schema_version": 1,
+        "kind": "grabowski.codex_subscription_pair_envelope",
+        "mode": "chatgpt_subscription",
+        "provider": codex_runner.PROVIDER,
+        "model": codex_runner.MODEL,
+        "sampling": codex_runner.SAMPLING,
+        "pair_id": pair_id,
+        "request_sha256": dict(request_sha256),
+        "conditions": observed,
+        "max_codex_exec_processes": 2,
+        "max_provider_wall_seconds_total": sum(
+            row["wall_seconds"] for row in observed.values()
+        ),
+        "observed_cost_usd": None,
+        "usd_ceiling_enforced": False,
+        "legacy_cli_max_cost_usd_non_authorizing": format(max_cost_usd, "f"),
+        "independent_external_one_shot_required": True,
+    }
 
 
 def _require_external_provider_one_shot(
-    *, pair_id: str, request_sha256: dict[str, str], max_cost_usd: Decimal
+    *,
+    pair_id: str,
+    request_sha256: dict[str, str],
+    max_cost_usd: Decimal,
+    subscription_envelope: dict[str, Any] | None = None,
 ) -> None:
     """Keep paired live dispatch closed until a trusted external verifier exists.
 
@@ -384,6 +478,16 @@ def _require_external_provider_one_shot(
     admission cannot confer separate single-use spending authorization.
     No canonical verifier is currently wired to this entrypoint.
     """
+    if (
+        not isinstance(subscription_envelope, dict)
+        or subscription_envelope.get("mode") != "chatgpt_subscription"
+        or subscription_envelope.get("pair_id") != pair_id
+        or subscription_envelope.get("request_sha256") != request_sha256
+        or subscription_envelope.get("independent_external_one_shot_required")
+        is not True
+        or subscription_envelope.get("usd_ceiling_enforced") is not False
+    ):
+        raise core.PreflightError("external one-shot subscription envelope is invalid")
     raise core.PreflightError(
         "external one-shot provider authorization verifier is unavailable"
     )
@@ -591,11 +695,17 @@ def execute_authorized_pair(
         "baseline": core._sha256_json(baseline),
         "treatment": core._sha256_json(treatment),
     }
-    _require_enforceable_codex_pair_cost(
-        pair_id=pair_id, request_sha256=requests, max_cost_usd=max_cost_usd
+    subscription_envelope = _require_bounded_codex_subscription_pair(
+        pair_id=pair_id,
+        ordered_requests=(baseline, treatment),
+        request_sha256=requests,
+        max_cost_usd=max_cost_usd,
     )
     _require_external_provider_one_shot(
-        pair_id=pair_id, request_sha256=requests, max_cost_usd=max_cost_usd
+        pair_id=pair_id,
+        request_sha256=requests,
+        max_cost_usd=max_cost_usd,
+        subscription_envelope=subscription_envelope,
     )
 
     authorization: dict[str, Any] | None = None
