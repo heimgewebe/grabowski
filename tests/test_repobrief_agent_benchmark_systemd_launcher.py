@@ -19,9 +19,13 @@ import repobrief_agent_benchmark_systemd_launcher as launcher
 class RootSystemdLauncherTests(unittest.TestCase):
     @staticmethod
     def props(argv: list[str]) -> dict[str, str]:
+        # The child program's argv begins after '--'; it can contain literal
+        # --property=... strings without changing PID 1 service properties.
+        if argv.count("--") != 1:
+            raise AssertionError("systemd-run needs one option separator")
         values = [
             value.removeprefix("--property=")
-            for value in argv
+            for value in argv[: argv.index("--")]
             if value.startswith("--property=")
         ]
         results = {}
@@ -82,6 +86,25 @@ class RootSystemdLauncherTests(unittest.TestCase):
                 self.assertEqual(argv.count("--property=NotifyAccess=none"), 1)
                 self.assertEqual(argv.count("--property=PIDFile="), 1)
                 self.assertEqual(argv.count("--"), 1)
+
+    def test_untrusted_program_flags_never_override_unit_properties(self) -> None:
+        for untrusted_argument in (
+            "--property=Type=notify",
+            "--property=NotifyAccess=all",
+            "--property=PIDFile=/run/attacker.pid",
+        ):
+            with self.subTest(argument=untrusted_argument):
+                command = launcher.unit_argv(
+                    "attested",
+                    ["/usr/bin/true", untrusted_argument],
+                    probe=False,
+                    pair=True,
+                )
+                properties = self.props(command)
+                self.assertEqual(properties["Type"], "exec")
+                self.assertEqual(properties["NotifyAccess"], "none")
+                self.assertEqual(properties["PIDFile"], "")
+                self.assertEqual(command[command.index("--") + 2], untrusted_argument)
 
     def test_probe_private_mounts_are_runtime_owned_and_closed(self) -> None:
         p = self.props(launcher.probe_argv("proof"))
