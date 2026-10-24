@@ -921,7 +921,7 @@
       ],
       "plans": {
         "anthropic": "Claude Pro",
-        "google": "Google AI subscription (exact tier owner-asserted, harness access verified)",
+        "google": "Google AI subscription (exact tier owner-asserted; historical Antigravity access observed 2026-07-29, not current entitlement)",
         "openai": "ChatGPT Pro (owner-asserted, Codex ChatGPT login verified)",
         "xai": "SuperGrok"
       },
@@ -997,7 +997,7 @@
       ],
       "overage_action": "block_and_surface",
       "plan": "Google AI subscription",
-      "plan_evidence": "owner-asserted-2026-07-29; antigravity-gemini-3.1-pro-smoke-2026-07-29"
+      "plan_evidence": "historical-owner-plan-assertion-2026-07-29; historical-antigravity-gemini-3.1-pro-smoke-2026-07-29; unauthenticated-agy-1.4.4-model-inventory-2026-10-21; current-harness-access-unverified"
     },
     "antigravity-claude": {
       "cost_mode": "subscription_included",

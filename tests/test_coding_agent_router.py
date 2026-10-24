@@ -1976,6 +1976,49 @@ class CodingAgentRouterTests(unittest.TestCase):
             delegated["scoped_writer"]["provider_family"],
             delegated["reviewers"][0]["provider_family"],
         )
+        self.assertNotEqual(
+            delegated["scoped_writer"]["independence_group"],
+            delegated["reviewers"][0]["independence_group"],
+        )
+
+    def test_delivery_scoped_writer_retains_enabled_independent_review(self) -> None:
+        # Positive delivery admission must survive retirement of Gemini Pro.
+        for harness, state in self.state["catalog"]["harnesses"].items():
+            state["available"] = harness in {"claude", "codex"}
+        self.state["pools"]["claude-pro"] = {"remaining_ratio": 0.9}
+        self.state["pools"]["openai-agentic"] = {"remaining_ratio": 0.9}
+        self._write_state()
+
+        delivery = self._route(
+            "architecture",
+            changed_files=24,
+            duration_minutes=180,
+            novelty="high",
+            risk_flags=["high-risk"],
+            need_review=True,
+            verification_policy="independent_review",
+            effect_profile="delivery",
+        )
+
+        self.assertEqual("delivery", delivery["effect_profile"])
+        self.assertEqual("scoped_writer", delivery["executor"])
+        self.assertEqual("claude-opus-5.5-writer-high", delivery["writer_route"])
+        writer = delivery["scoped_writer"]
+        self.assertIsNotNone(writer)
+        reviewer = delivery["reviewers"][0]
+        self.assertEqual("codex-astra-review-high", reviewer["route"])
+        self.assertTrue(reviewer["execution_eligible_if_separately_authorized"])
+        self.assertNotEqual(writer["provider_family"], reviewer["provider_family"])
+        self.assertNotEqual(writer["independence_group"], reviewer["independence_group"])
+        self.assertEqual(0, delivery["review_gap"])
+
+    def test_google_entitlement_text_remains_historical_not_verified(self) -> None:
+        google = self.catalog["policy"]["subscription_routing_policy"]["plans"]["google"]
+        self.assertIn("historical Antigravity access", google)
+        self.assertIn("not current entitlement", google)
+        plan_evidence = self.catalog["quota_pools"]["antigravity-account"]["plan_evidence"]
+        self.assertIn("historical-antigravity-gemini-3.1-pro-smoke-2026-07-29", plan_evidence)
+        self.assertIn("current-harness-access-unverified", plan_evidence)
 
     def test_selected_scoped_writer_fails_closed_without_independent_review_route(
         self,
