@@ -312,5 +312,26 @@ class RootArmReleaseTests(unittest.TestCase):
         systemd_start.assert_not_called()
 
 
+class RootbrokerActionCatalogTests(unittest.TestCase):
+    def test_dedicated_broker_entry_has_no_arbitrary_command_and_is_inert(self) -> None:
+        catalogue = json.loads(
+            (_SOURCE.parents[1] / "config" / "privileged-actions.example.json")
+            .read_text(encoding="utf-8")
+        )["actions"]
+        action = catalogue["operator_rab_benchmark_arm_start"]
+        self.assertIs(action["enabled"], False)
+        self.assertEqual(action["mode"], "template")
+        self.assertEqual(action["target_pattern"], "[0-9a-f]{64}:[01]")
+        self.assertEqual(
+            action["argv"],
+            ["/usr/local/libexec/grabowski-rab-root-arm-controller", "{target}"],
+        )
+        self.assertEqual(action["timeout_seconds"], 600)
+        self.assertEqual(action["allowed_peer_uid"], 1000)
+        self.assertEqual(action["allowed_peer_unit"], "grabowski-operator.service")
+        self.assertIn("kill_switch_path", action)
+        self.assertNotIn("allowed_argv_prefixes", action)
+
+
 if __name__ == "__main__":
     unittest.main()

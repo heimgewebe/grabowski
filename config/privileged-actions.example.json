@@ -163,6 +163,20 @@
       "allowed_peer_unit": "grabowski-operator.service",
       "allowed_peer_uid": 1000
     },
+    "operator_rab_benchmark_arm_start": {
+      "enabled": false,
+      "mode": "template",
+      "target_pattern": "[0-9a-f]{64}:[01]",
+      "argv": [
+        "/usr/local/libexec/grabowski-rab-root-arm-controller",
+        "{target}"
+      ],
+      "timeout_seconds": 600,
+      "kill_switch_path": "/var/lib/grabowski/operator-blockade/operator-kill-switch",
+      "legacy_kill_switch_path": "/home/alex/.local/state/grabowski/operator-kill-switch",
+      "allowed_peer_unit": "grabowski-operator.service",
+      "allowed_peer_uid": 1000
+    },
     "operator_root_task_systemd_unit": {
       "enabled": true,
       "mode": "root-task-systemd",
