@@ -426,8 +426,15 @@ def _read_private_bytes(
     path: Path, max_bytes: int, *, require_private_parent: bool = True,
     parent_fd: int | None = None,
     aggregate_metadata_bytes: list[int] | None = None,
+    allow_legacy_readable: bool = False,
 ) -> bytes:
-    """Read a size-bounded, owner-private regular file through a stable fd."""
+    """Read bounded stable owner-owned bytes; ordinary legacy logs may be 0644.
+
+    The only relaxed caller searches for blocking evidence under a verified
+    owner-private directory. It cannot use such bytes to grant a review PASS.
+    """
+    if allow_legacy_readable and not require_private_parent:
+        raise ValueError("legacy readable stdout requires an owner-private parent")
     flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
     owns_parent = parent_fd is None
     if parent_fd is None:
@@ -448,7 +455,13 @@ def _read_private_bytes(
                 not stat.S_ISREG(before.st_mode)
                 or before.st_nlink != 1
                 or before.st_uid != os.getuid()
-                or stat.S_IMODE(before.st_mode) & 0o077
+                or (
+                    stat.S_IMODE(before.st_mode) & 0o077
+                    and not (
+                        allow_legacy_readable
+                        and stat.S_IMODE(before.st_mode) == 0o644
+                    )
+                )
             ):
                 raise ValueError(f"{path.name} is not one owner-private regular file")
             if before.st_size > max_bytes:
@@ -512,7 +525,7 @@ def _read_stdout_tail(
 
 def _unbound_review_result_visible(
     directory: Path, *, parent_fd: int, aggregate_bytes: list[int],
-    expected: dict[str, Any],
+    expected: dict[str, Any], allow_legacy_readable_stdout: bool = False,
 ) -> bool:
     """Find review evidence in a job whose valid origin now denies review status.
 
@@ -525,6 +538,7 @@ def _unbound_review_result_visible(
         receipt = _read_private_json(
             directory / REVIEW_ROLE_ATTEMPT_RECEIPT_NAME,
             MAX_ROLE_RECEIPT_BYTES, parent_fd=parent_fd,
+            aggregate_metadata_bytes=aggregate_bytes,
         )
     except FileNotFoundError:
         pass
@@ -549,6 +563,7 @@ def _unbound_review_result_visible(
     stdout = _read_private_bytes(
         directory / "stdout.log", MAX_UNBOUND_STDOUT_BYTES,
         parent_fd=parent_fd, aggregate_metadata_bytes=aggregate_bytes,
+        allow_legacy_readable=allow_legacy_readable_stdout,
     )
     for line in stdout.decode("utf-8", errors="replace").splitlines():
         if not line.startswith(RESULT_PREFIX):
@@ -1512,6 +1527,7 @@ def _proven_grok_quota_failure_before_review(
 def _validated_review_role_evidence(
     metadata: dict[str, Any], binding: dict[str, Any], provenance: dict[str, Any] | None,
     *, directory: Path | None = None, parent_fd: int | None = None,
+    aggregate_bytes: list[int] | None = None,
 ) -> dict[str, Any] | None:
     if provenance is None:
         return None
@@ -1531,6 +1547,7 @@ def _validated_review_role_evidence(
         receipt_path, MAX_ROLE_RECEIPT_BYTES,
         require_private_parent=provenance["schema_version"] == 2,
         parent_fd=pinned_receipt_fd,
+        aggregate_metadata_bytes=aggregate_bytes,
     )
     expected_receipt_sha256 = _agent_role_receipt_sha256(receipt)
     if receipt.get("receipt_sha256") != expected_receipt_sha256:
@@ -1631,8 +1648,36 @@ def _attempt_started_after(candidate: dict[str, Any], prior: dict[str, Any]) -> 
 
 
 
+def _review_child_file_snapshot(
+    directory_fd: int,
+) -> tuple[tuple[str, tuple[int, ...] | None], ...]:
+    """Bounded no-follow snapshots of files whose in-place writes can hide R3.
+
+    A directory's mtime/ctime does not advance when an existing child file is
+    rewritten. Keep the first file-level stat preimages and verify them both
+    after examining a job and at the end of the complete registry scan.
+    This is drift detection, not authentication against prior same-UID edits.
+    """
+    snapshots: list[tuple[str, tuple[int, ...] | None]] = []
+    for name in (
+        "metadata.json", "stdout.log", "stderr.log", "finalization.json",
+        REVIEW_ROLE_ATTEMPT_RECEIPT_NAME, "review-role-receipt.json",
+    ):
+        try:
+            value = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            snapshots.append((name, None))
+            continue
+        snapshots.append((name, (
+            value.st_dev, value.st_ino, value.st_mode, value.st_uid,
+            value.st_nlink, value.st_size, value.st_mtime_ns, value.st_ctime_ns,
+        )))
+    return tuple(snapshots)
+
+
 def _iter_pinned_review_job_directories(
-    root: Path, errors: list[str], metadata_budget: list[int],
+    root: Path, errors: list[str], metadata_budget: list[int], *,
+    expected: dict[str, Any], unbound_stdout_budget: list[int],
 ) -> Iterator[tuple[Path, int]]:
     dir_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
     try:
@@ -1652,7 +1697,7 @@ def _iter_pinned_review_job_directories(
         names: list[tuple[str, int, int]] = []
         # Child writes do not advance the jobs root mtime. Revalidate each
         # processed child's pinned directory identity after the whole scan.
-        inspected_children: list[tuple[str, tuple[int, ...]]] = []
+        inspected_children: list[tuple[str, tuple[int, ...], tuple[Any, ...]]] = []
         seen = 0
         with os.scandir(root_fd) as entries:
             for entry in entries:
@@ -1690,6 +1735,7 @@ def _iter_pinned_review_job_directories(
                 except OSError:
                     errors.append("decision_review_noncanonical_job_unverifiable")
                     return
+                foreign_files_before = None
                 try:
                     foreign_stat = os.fstat(foreign_fd)
                     if (
@@ -1699,20 +1745,44 @@ def _iter_pinned_review_job_directories(
                     ):
                         errors.append("decision_review_noncanonical_job_unverifiable")
                         return
-                    # Noncanonical directories must be pinned too: metadata
-                    # published after inspection cannot escape the final scan.
+                    # Pin both the directory and the already existing files.
+                    # In-place writes do not change the directory timestamps.
+                    foreign_files_before = _review_child_file_snapshot(foreign_fd)
                     inspected_children.append((entry.name, (
                         foreign_stat.st_dev, foreign_stat.st_ino,
                         foreign_stat.st_mode, foreign_stat.st_uid,
                         foreign_stat.st_nlink, foreign_stat.st_mtime_ns,
                         foreign_stat.st_ctime_ns,
-                    )))
+                    ), foreign_files_before))
                     # RepoGround rgpm jobs are a separate, signed job namespace.
                     # Inspect their metadata, but NEVER admit them as DecisionReviews.
                     if _RGPM_UNIT_RE.fullmatch(entry.name) is None:
                         try:
                             os.stat("metadata.json", dir_fd=foreign_fd, follow_symlinks=False)
                         except FileNotFoundError:
+                            # A renamed old R3 job may retain an exact-bound
+                            # REJECT stdout even when its metadata is missing.
+                            # Unknown noncanonical bundles are still harmless
+                            # only when no such secondary evidence survives.
+                            try:
+                                if _unbound_review_result_visible(
+                                    root / entry.name, parent_fd=foreign_fd,
+                                    aggregate_bytes=unbound_stdout_budget,
+                                    expected=expected,
+                                    allow_legacy_readable_stdout=True,
+                                ):
+                                    errors.append(
+                                        f"decision_review_unbound_result:{entry.name}"
+                                    )
+                                    return
+                            except FileNotFoundError:
+                                pass  # A genuine bundle may have no stdout.
+                            except (OSError, ValueError) as exc:
+                                errors.append(
+                                    f"decision_review_unbound_evidence_invalid:"
+                                    f"{entry.name}:{type(exc).__name__}"
+                                )
+                                return
                             continue
                         except OSError:
                             errors.append("decision_review_noncanonical_job_unverifiable")
@@ -1726,32 +1796,65 @@ def _iter_pinned_review_job_directories(
                             aggregate_metadata_bytes=metadata_budget,
                         )
                     except FileNotFoundError:
-                        continue  # Historical rgpm jobs may lack metadata.
+                        foreign_metadata = None  # Historical rgpm jobs may lack metadata.
                     except (OSError, ValueError):
                         errors.append("decision_review_noncanonical_job_unverifiable")
                         return
+                    if foreign_metadata is not None:
+                        try:
+                            foreign_origin = job_origin.validate_origin(
+                                foreign_metadata.get("origin"),
+                                foreign_metadata.get("origin_sha256"),
+                                expected_unit=entry.name,
+                            )
+                            if any(
+                                foreign_metadata.get(key) != foreign_origin.get(key)
+                                for key in ("unit", "job_id", "owner", "argv_sha256", "scope")
+                            ):
+                                raise ValueError("foreign job metadata origin mismatch")
+                            foreign_scope = foreign_origin.get("scope")
+                            if (
+                                not isinstance(foreign_scope, dict)
+                                or foreign_scope.get("decision_bound_review") is not None
+                            ):
+                                raise ValueError("foreign job may contain a review decision")
+                        except ValueError:
+                            errors.append("decision_review_noncanonical_job_unverifiable")
+                            return
+                    # A hash-valid rgpm/ordinary Origin cannot prove a formerly
+                    # bound review never existed. The canonical job might have
+                    # been renamed and rebound while retaining a material REJECT.
+                    # Reuse the same bounded FD-pinned secondary-evidence check;
+                    # never grant foreign jobs a PASS or advance their clock.
                     try:
-                        foreign_origin = job_origin.validate_origin(
-                            foreign_metadata.get("origin"),
-                            foreign_metadata.get("origin_sha256"),
-                            expected_unit=entry.name,
+                        if _unbound_review_result_visible(
+                            root / entry.name, parent_fd=foreign_fd,
+                            aggregate_bytes=unbound_stdout_budget, expected=expected,
+                            allow_legacy_readable_stdout=True,
+                        ):
+                            errors.append(f"decision_review_unbound_result:{entry.name}")
+                            return
+                    except FileNotFoundError:
+                        # Legitimate historic rgpm jobs may lack stdout. A
+                        # matching role receipt would already have blocked above.
+                        pass
+                    except (OSError, ValueError) as exc:
+                        errors.append(
+                            f"decision_review_unbound_evidence_invalid:"
+                            f"{entry.name}:{type(exc).__name__}"
                         )
-                        if any(
-                            foreign_metadata.get(key) != foreign_origin.get(key)
-                            for key in ("unit", "job_id", "owner", "argv_sha256", "scope")
-                        ):
-                            raise ValueError("foreign job metadata origin mismatch")
-                        foreign_scope = foreign_origin.get("scope")
-                        if (
-                            not isinstance(foreign_scope, dict)
-                            or foreign_scope.get("decision_bound_review") is not None
-                        ):
-                            raise ValueError("foreign job may contain a review decision")
-                    except ValueError:
-                        errors.append("decision_review_noncanonical_job_unverifiable")
                         return
                     continue
+                except OSError:
+                    errors.append("decision_review_noncanonical_job_unverifiable")
+                    return
                 finally:
+                    if foreign_files_before is not None:
+                        try:
+                            if _review_child_file_snapshot(foreign_fd) != foreign_files_before:
+                                errors.append("decision_review_job_file_changed")
+                        except OSError:
+                            errors.append("decision_review_job_file_changed")
                     os.close(foreign_fd)
         if errors:
             return
@@ -1762,6 +1865,7 @@ def _iter_pinned_review_job_directories(
                 errors.append("decision_review_job_inventory_unverifiable")
                 return
             job_stat = None
+            job_files_before = None
             try:
                 job_stat = os.fstat(job_fd)
                 if (
@@ -1772,6 +1876,7 @@ def _iter_pinned_review_job_directories(
                 ):
                     errors.append("decision_review_job_inventory_unverifiable")
                     return
+                job_files_before = _review_child_file_snapshot(job_fd)
                 yield root / unit, job_fd
             finally:
                 try:
@@ -1782,22 +1887,30 @@ def _iter_pinned_review_job_directories(
                             or job_after.st_ctime_ns != job_stat.st_ctime_ns
                         ):
                             errors.append("decision_review_job_directory_changed")
-                        else:
-                            inspected_children.append((unit, (
-                                job_after.st_dev, job_after.st_ino,
-                                job_after.st_mode, job_after.st_uid,
-                                job_after.st_nlink, job_after.st_mtime_ns,
-                                job_after.st_ctime_ns,
-                            )))
+                        elif job_files_before is not None:
+                            if _review_child_file_snapshot(job_fd) != job_files_before:
+                                errors.append("decision_review_job_file_changed")
+                            else:
+                                inspected_children.append((unit, (
+                                    job_after.st_dev, job_after.st_ino,
+                                    job_after.st_mode, job_after.st_uid,
+                                    job_after.st_nlink, job_after.st_mtime_ns,
+                                    job_after.st_ctime_ns,
+                                ), job_files_before))
                 except OSError:
                     errors.append("decision_review_job_directory_changed")
                 finally:
                     os.close(job_fd)
         # An earlier stub may publish metadata or a material REJECT while
         # a later child is being evaluated. A final root-only stat misses it.
-        for unit, snapshot in inspected_children:
+        for unit, snapshot, files_before in inspected_children:
             try:
-                child_after = os.stat(unit, dir_fd=root_fd, follow_symlinks=False)
+                child_fd = os.open(unit, dir_flags, dir_fd=root_fd)
+                try:
+                    child_after = os.fstat(child_fd)
+                    files_after = _review_child_file_snapshot(child_fd)
+                finally:
+                    os.close(child_fd)
             except OSError:
                 errors.append("decision_review_job_directory_changed")
                 return
@@ -1811,6 +1924,9 @@ def _iter_pinned_review_job_directories(
                 ) != snapshot
             ):
                 errors.append("decision_review_job_directory_changed")
+                return
+            if files_after != files_before:
+                errors.append("decision_review_job_file_changed")
                 return
         try:
             after = os.stat(root, follow_symlinks=False)
@@ -1893,7 +2009,10 @@ def reconcile(
     metadata_budget = [0]
     unbound_stdout_budget = [0]
     skipped_prelaunch_stubs: list[str] = []
-    iterator = _iter_pinned_review_job_directories(root, errors, metadata_budget)
+    iterator = _iter_pinned_review_job_directories(
+        root, errors, metadata_budget, expected=expected,
+        unbound_stdout_budget=unbound_stdout_budget,
+    )
     review_attempt_count = 0
     with closing(iterator):
         for directory, directory_fd in iterator:
@@ -2032,7 +2151,10 @@ def reconcile(
                 attempts.append(attempt)
                 continue
             try:
-                role_evidence = _validated_review_role_evidence(metadata, binding, provenance, directory=directory, parent_fd=directory_fd)
+                role_evidence = _validated_review_role_evidence(
+                    metadata, binding, provenance, directory=directory,
+                    parent_fd=directory_fd, aggregate_bytes=metadata_budget,
+                )
             except FileNotFoundError as exc:
                 # A drifted diff binding is repairable only when a valid provenance-
                 # bound role receipt proves that no semantic review result exists.

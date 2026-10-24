@@ -174,6 +174,20 @@ def _legacy_decision_review_upper_bound_ns(created_at_unix: int) -> int:
     return upper_bound
 
 
+def _review_order_metadata_snapshot(
+    job_fd: int,
+) -> tuple[int, ...] | None:
+    """Pin the metadata child's identity, including in-place write timestamps."""
+    try:
+        value = os.stat("metadata.json", dir_fd=job_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    return (
+        value.st_dev, value.st_ino, value.st_mode, value.st_uid,
+        value.st_nlink, value.st_size, value.st_mtime_ns, value.st_ctime_ns,
+    )
+
+
 def _existing_decision_review_max_ns(
     key_sha256: str, *, jobs_root: Path | None = None
 ) -> int:
@@ -194,7 +208,7 @@ def _existing_decision_review_max_ns(
             raise PermissionError("decision review jobs root is unsafe")
         maximum = -1
         scanned = review_scanned = metadata_bytes = 0
-        child_snapshots: list[tuple[str, int, int, int, int]] = []
+        child_snapshots: list[tuple[str, int, int, int, int, tuple[int, ...] | None]] = []
         # All top-level entries consume budget, not only well-shaped job names.
         # A noncanonical directory with job metadata is an unknown frontier,
         # never permission to ignore an older material review decision.
@@ -239,6 +253,7 @@ def _existing_decision_review_max_ns(
                     child_snapshots.append((
                         entry.name, job_stat.st_dev, job_stat.st_ino,
                         job_stat.st_mtime_ns, job_stat.st_ctime_ns,
+                        _review_order_metadata_snapshot(job_fd),
                     ))
                     try:
                         metadata_fd = os.open("metadata.json", file_flags, dir_fd=job_fd)
@@ -347,9 +362,14 @@ def _existing_decision_review_max_ns(
         # This is a single identity-validation pass, not a retry or a second
         # interpretation of history. Normal PR/head starts also hold the
         # existing decision_review_lock across allocation and publication.
-        for name, device, inode, modified_ns, changed_ns in child_snapshots:
+        for name, device, inode, modified_ns, changed_ns, metadata_before in child_snapshots:
             try:
-                check = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+                child_fd = os.open(name, directory_flags, dir_fd=root_fd)
+                try:
+                    check = os.fstat(child_fd)
+                    metadata_after = _review_order_metadata_snapshot(child_fd)
+                finally:
+                    os.close(child_fd)
             except OSError as exc:
                 raise ValueError(
                     "decision review job directory changed during scan"
@@ -360,6 +380,8 @@ def _existing_decision_review_max_ns(
                 != (device, inode, modified_ns, changed_ns)
             ):
                 raise ValueError("decision review job directory changed during scan")
+            if metadata_after != metadata_before:
+                raise ValueError("decision review job metadata changed during scan")
         after_root = root.lstat()
         if (
             after_root.st_dev, after_root.st_ino,

@@ -435,6 +435,68 @@ class DecisionReviewLogicalClockTests(unittest.TestCase):
                         )
                 self.assertEqual(triggered, [True])
 
+    def test_inplace_metadata_rewrite_after_visit_invalidates_bootstrap(self) -> None:
+        # A byte rewrite of an existing metadata inode updates file ctime,
+        # but leaves the containing job directory timestamps unchanged.
+        with tempfile.TemporaryDirectory() as temporary:
+            order_patch, jobs_patch = self.roots(temporary)
+            with order_patch, jobs_patch:
+                initial, digest = build("000000000004", 2_000_000_000_500_000_000)
+                jobs = job_origin.DECISION_REVIEW_JOBS_ROOT
+                jobs.mkdir(parents=True, mode=0o700, exist_ok=True)
+                first = jobs / "grabowski-job-000000000004"
+                second = jobs / "grabowski-job-000000000005"
+                for directory in (first, second):
+                    directory.mkdir(mode=0o700)
+                metadata = first / "metadata.json"
+                metadata.write_text(
+                    json.dumps({"origin": initial, "origin_sha256": digest}),
+                    encoding="utf-8",
+                )
+                metadata.chmod(0o600)
+                ordinary = second / "metadata.json"
+                ordinary.write_text("{}", encoding="utf-8")
+                ordinary.chmod(0o600)
+                key = job_origin._decision_review_order_key(initial["scope"])
+                original_open = job_origin.os.open
+                visited = []
+                rewritten = []
+
+                def inject(path, flags, *args, **kwargs):
+                    if path in (first.name, second.name) and kwargs.get("dir_fd") is not None:
+                        if not visited:
+                            visited.append(path)
+                        elif path != visited[0] and not rewritten:
+                            prior = jobs / visited[0]
+                            old_dir = prior.stat()
+                            old_inode = (prior / "metadata.json").stat().st_ino
+                            changed = json.loads(json.dumps(initial))
+                            changed["unit"] = prior.name
+                            changed["job_id"] = prior.name.removeprefix("grabowski-job-")
+                            changed["scope"]["started_at_unix_ns"] += 1000
+                            changed_digest = hashlib.sha256(
+                                job_origin.canonical_json_bytes(changed)
+                            ).hexdigest()
+                            # Retain the same pathname and inode.
+                            (prior / "metadata.json").write_text(
+                                json.dumps({
+                                    "origin": changed,
+                                    "origin_sha256": changed_digest,
+                                }), encoding="utf-8",
+                            )
+                            self.assertEqual((prior / "metadata.json").stat().st_ino, old_inode)
+                            self.assertEqual(
+                                (prior.stat().st_mtime_ns, prior.stat().st_ctime_ns),
+                                (old_dir.st_mtime_ns, old_dir.st_ctime_ns),
+                            )
+                            rewritten.append(True)
+                    return original_open(path, flags, *args, **kwargs)
+
+                with mock.patch.object(job_origin.os, "open", side_effect=inject):
+                    with self.assertRaisesRegex(ValueError, "metadata changed during scan"):
+                        job_origin._existing_decision_review_max_ns(key, jobs_root=jobs)
+                self.assertEqual(rewritten, [True])
+
     def test_corrupt_order_state_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             order_patch, jobs_patch = self.roots(temporary)
