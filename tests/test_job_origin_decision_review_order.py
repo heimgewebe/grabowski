@@ -392,27 +392,38 @@ class DecisionReviewLogicalClockTests(unittest.TestCase):
                 ordinary = second / "metadata.json"
                 ordinary.write_text("{}", encoding="utf-8")
                 ordinary.chmod(0o600)
-                changed = json.loads(json.dumps(initial))
-                changed["scope"]["started_at_unix_ns"] += 1000
-                changed_digest = hashlib.sha256(
-                    job_origin.canonical_json_bytes(changed)
-                ).hexdigest()
-                replacement = first / "metadata.next"
                 key = job_origin._decision_review_order_key(initial["scope"])
                 original_open = job_origin.os.open
+                visited = []
                 triggered = []
 
                 def inject(path, flags, *args, **kwargs):
-                    if path == second.name and not triggered:
-                        replacement.write_text(
-                            json.dumps({
-                                "origin": changed,
-                                "origin_sha256": changed_digest,
-                            }), encoding="utf-8",
-                        )
-                        replacement.chmod(0o600)
-                        os.replace(replacement, metadata)
-                        triggered.append(True)
+                    if (
+                        path in (first.name, second.name)
+                        and kwargs.get("dir_fd") is not None
+                    ):
+                        if not visited:
+                            visited.append(path)
+                        elif path != visited[0] and not triggered:
+                            # Mutate the child already visited, regardless of
+                            # filesystem-dependent scandir iteration order.
+                            prior = jobs / visited[0]
+                            changed = json.loads(json.dumps(initial))
+                            changed["unit"] = prior.name
+                            changed["scope"]["started_at_unix_ns"] += 1000
+                            changed_digest = hashlib.sha256(
+                                job_origin.canonical_json_bytes(changed)
+                            ).hexdigest()
+                            replacement = prior / "metadata.next"
+                            replacement.write_text(
+                                json.dumps({
+                                    "origin": changed,
+                                    "origin_sha256": changed_digest,
+                                }), encoding="utf-8",
+                            )
+                            replacement.chmod(0o600)
+                            os.replace(replacement, prior / "metadata.json")
+                            triggered.append(True)
                     return original_open(path, flags, *args, **kwargs)
 
                 with mock.patch.object(job_origin.os, "open", side_effect=inject):
