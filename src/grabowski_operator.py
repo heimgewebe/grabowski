@@ -48,6 +48,7 @@ import grabowski_merge_authority as merge_authority
 import grabowski_deployment_observer as deployment_observer
 import grabowski_private_io as private_io
 import grabowski_effect_interceptor
+import grabowski_agent_sandbox as git_sandbox
 import grabowski_grips
 import grabowski_git_preimage
 import grabowski_transport_assertion
@@ -5409,6 +5410,7 @@ def _run(
     timeout_seconds: int,
     max_output_bytes: int,
     environment: dict[str, str] | None = None,
+    pass_fds: tuple[int, ...] = (),
 ) -> dict[str, Any]:
     started = time.monotonic()
     process = subprocess.Popen(
@@ -5419,6 +5421,7 @@ def _run(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         start_new_session=True,
+        pass_fds=pass_fds,
     )
     (
         stdout_raw,
@@ -7439,10 +7442,18 @@ def _validate_push_remote_target(repo: Path, remote: str) -> None:
 
 
 def _reject_git_alias_configuration(configurations: list[tuple[str, str]]) -> None:
-    if any(key.startswith("alias.") for key, _value in configurations):
-        raise PermissionError(
-            "Git alias injection is blocked because it can conceal a push operation."
-        )
+    # Git command-line -c has precedence over the trusted Git environment.
+    # Arbitrary values can re-enable executable hooks, fsmonitor and helpers
+    # even at our effect-time sandbox; keep only one audited inert override.
+    for key, value in configurations:
+        if key.startswith("alias."):
+            raise PermissionError(
+                "Git alias injection is blocked because it can conceal a push operation."
+            )
+        if (key, value) != ("core.pager", "cat"):
+            raise PermissionError(
+                "Caller Git -c configuration is blocked to prevent executable helpers."
+            )
 
 
 def _reject_configured_alias(repo: Path, subcommand: str) -> None:
@@ -8968,13 +8979,47 @@ def grabowski_git(
             "branch_attempt is accepted only for local branch/index mutation subcommands"
         )
 
-    result = _run(
-        command,
-        cwd=path,
-        timeout_seconds=execution_timeout_seconds,
-        max_output_bytes=MAX_OUTPUT_BYTES,
-        environment=environment,
-    )
+    if subcommand != "push":
+        # Every non-transport Git invocation needs effect-time helper isolation.
+        # Keep the special push SSH/credential environment and its own transport
+        # gate intact. Never alter branch_attempt ownership or postimage/audit.
+        # A guard failure before _run is provably pre-effect: close only that
+        # exact acquired attempt; if _run started but failed its outcome is
+        # unknown and the lease must stay available for reconciliation.
+        effect_started = False
+        try:
+            with git_sandbox.safe_git_filter_effect(path, command) as (
+                effect_command, effect_env, effect_fds
+            ):
+                effect_started = True
+                result = _run(
+                    effect_command,
+                    cwd=path,
+                    timeout_seconds=execution_timeout_seconds,
+                    max_output_bytes=MAX_OUTPUT_BYTES,
+                    environment=effect_env,
+                    pass_fds=effect_fds,
+                )
+        except Exception:
+            if not effect_started and branch_context is not None:
+                try:
+                    resources.complete_branch_mutation_attempt(
+                        branch_context["lease"]
+                    )
+                except Exception as cleanup_exc:
+                    raise RuntimeError(
+                        "Git filter admission denied before effect; branch attempt "
+                        "lease cleanup failed, reconcile before any retry"
+                    ) from cleanup_exc
+            raise
+    else:
+        result = _run(
+            command,
+            cwd=path,
+            timeout_seconds=execution_timeout_seconds,
+            max_output_bytes=MAX_OUTPUT_BYTES,
+            environment=environment,
+        )
     if branch_context is None:
         return result
 

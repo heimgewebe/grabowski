@@ -32,7 +32,7 @@ import grabowski_lifecycle_collectors as lifecycle_collectors
 import grabowski_lifecycle_effect_plan as lifecycle_effect_plan
 import grabowski_physical_checkout as physical_checkout
 import grabowski_work_acquire as work_acquire
-from grabowski_agent_sandbox import safe_git_environment
+from grabowski_agent_sandbox import safe_git_filter_effect, safe_git_repository_environment
 try:
     import grabowski_operator_core as operator
 except ModuleNotFoundError:
@@ -1430,18 +1430,45 @@ def _contains(parent: str, child: str) -> bool:
     return child == parent or child.startswith(parent + "/")
 
 
+def _workspace_host_git_argv(argv: list[str]) -> list[str]:
+    # Host Git add loads repository-selected clean filters at effect time, after
+    # any separate config preflight. Never allow this helper-executing porcelain
+    # command: Candidate adoption stages only its immutable patch with git apply.
+    if argv and argv[0] == "git":
+        index = 1
+        while index < len(argv):
+            part = argv[index]
+            if part in ("-c", "-C", "--git-dir", "--work-tree", "--namespace", "--config-env"):
+                index += 2
+            elif part.startswith("-"):
+                index += 1
+            else:
+                break
+        if index < len(argv) and argv[index] == "add":
+            raise RuntimeError("host Git add is forbidden; use immutable cached patch staging")
+    # Repository diff config may change after preflight but before Git spawn.
+    # Disable external diff/textconv at the Git effect itself, not just in a
+    # separate earlier config readback.
+    if argv[:2] == ["git", "diff"]:
+        return ["git", "diff", "--no-ext-diff", "--no-textconv", *argv[2:]]
+    return argv
+
+
 def _run(cwd: Path, argv: list[str], *, timeout: int = 120) -> dict[str, Any]:
-    completed = subprocess.run(
-        argv,
-        cwd=cwd,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        timeout=timeout,
-        check=False,
-        env=safe_git_environment(),
-    )
+    # Git loads attributes at the actual effect, after config preflight.
+    with safe_git_filter_effect(cwd, _workspace_host_git_argv(argv)) as (command, env, fds):
+        completed = subprocess.run(
+            command,
+            cwd=cwd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout,
+            check=False,
+            env=env,
+            pass_fds=fds,
+        )
     return {
         "returncode": completed.returncode,
         "stdout": completed.stdout,
@@ -1460,17 +1487,19 @@ def _checked(runner: CommandRunner, cwd: Path, argv: list[str], *, label: str) -
 
 
 def _run_bytes(cwd: Path, argv: list[str], *, timeout: int = 120) -> dict[str, Any]:
-    completed = subprocess.run(
-        argv,
-        cwd=cwd,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=False,
-        timeout=timeout,
-        check=False,
-        env=safe_git_environment(),
-    )
+    with safe_git_filter_effect(cwd, _workspace_host_git_argv(argv)) as (command, env, fds):
+        completed = subprocess.run(
+            command,
+            cwd=cwd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=False,
+            timeout=timeout,
+            check=False,
+            env=env,
+            pass_fds=fds,
+        )
     return {
         "returncode": completed.returncode,
         "stdout": completed.stdout,
@@ -3452,6 +3481,8 @@ def _initialize_isolated_git_repository(root: Path, source_objects: Path) -> Non
     (git_dir / "objects" / "pack").mkdir(mode=0o700)
     (git_dir / "refs" / "heads").mkdir(parents=True, mode=0o700)
     (git_dir / "refs" / "tags").mkdir(parents=True, mode=0o700)
+    # Materializing the isolated checkout requires an inert-attribute mountpoint.
+    (git_dir / "info").mkdir(mode=0o700)
     (git_dir / "HEAD").write_text(
         "ref: refs/heads/grabowski-integration-probe\n", encoding="utf-8"
     )
@@ -3654,7 +3685,8 @@ def _git_snapshot(manifest: dict[str, Any], runner: CommandRunner) -> dict[str, 
     status_lines = [os.fsdecode(item) for item in bytes(status_result["stdout"]).split(b"\x00") if item]
     committed_diff = _checked_bytes(
         worktree,
-        ["git", "diff", "--binary", "--no-ext-diff", "--no-textconv", f"{base_head}...{head}"],
+        ["git", "diff", "--binary", "--no-ext-diff", "--no-textconv",
+         f"{base_head}...{head}", "--"],
         label="committed diff",
     )
     working_diff = _checked_bytes(
@@ -4685,7 +4717,7 @@ def _candidate_patch_tree_sha(
         index_path = root / "index"
         patch_copy = root / "candidate.patch"
         patch_copy.write_bytes(patch_bytes)
-        environment = safe_git_environment()
+        environment = safe_git_repository_environment(worktree)
         environment["GIT_INDEX_FILE"] = str(index_path)
 
         def run_index(argv: list[str], *, label: str) -> str:
@@ -4741,12 +4773,49 @@ def _stage_candidate_for_adoption(
         ["git", "reset", "--mixed", "--quiet", base_head],
         label="candidate adoption index reset",
     )
-    _checked(
-        _run,
-        worktree,
-        ["git", "--literal-pathspecs", "add", "--all", "--", *[str(path) for path in changed_paths]],
-        label="candidate adoption stage",
-    )
+    # Do not invoke Git clean filters on mutable worktree contents. Stage
+    # exactly the already-verified immutable Candidate patch directly into the
+    # index. Git apply --cached neither consults clean filters nor runs hooks.
+    writer_result = collection.get("writer_result")
+    if (
+        not isinstance(writer_result, dict)
+        or not _verify_patch_artifact(
+            writer_result, expected_path=_writer_patch_path(manifest)
+        )
+    ):
+        raise AgentWorkspaceError("immutable Candidate patch artifact changed")
+    try:
+        patch_bytes = Path(str(writer_result["path"])).read_bytes()
+    except OSError as exc:
+        raise AgentWorkspaceError("immutable Candidate patch became unreadable") from exc
+    if (
+        len(patch_bytes) > MAX_PATCH_BYTES
+        or hashlib.sha256(patch_bytes).hexdigest() != candidate.get("patch_sha256")
+    ):
+        raise AgentWorkspaceError("immutable Candidate patch changed before staging")
+    # Feed the verified bytes directly to Git, not a filename which can be
+    # switched after digest verification and before the Git process opens it.
+    # Git apply --cached operates on the index without clean/smudge filters.
+    try:
+        applied = subprocess.run(
+            ["/usr/bin/git", "-C", str(worktree), "apply", "--cached",
+             "--binary", "--whitespace=nowarn", "-"],
+            input=patch_bytes,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=120,
+            env=safe_git_repository_environment(worktree),
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise AgentWorkspaceError("candidate adoption cached patch stage unavailable") from exc
+    if applied.returncode != 0 or applied.stdout or applied.stderr:
+        detail = (applied.stderr or applied.stdout or b"git apply failed").decode(
+            "utf-8", errors="replace"
+        ).strip()
+        raise AgentWorkspaceError(
+            f"candidate adoption cached patch stage failed: {detail[:2000]}"
+        )
     staged = _checked_bytes(
         worktree,
         ["git", "diff", "--cached", "--name-only", "-z", "--no-renames"],
@@ -4770,6 +4839,13 @@ def _stage_candidate_for_adoption(
         label="candidate adoption untracked paths",
     )
     if bytes(unstaged["stdout"]) or bytes(untracked["stdout"]):
+        # The worktree no longer matches its frozen patch. Revert the staged
+        # index back to the bound base; never leave a partial adoption staged.
+        restore = _run(worktree, ["git", "reset", "--mixed", "--quiet", base_head])
+        if not isinstance(restore, dict) or restore.get("returncode") != 0:
+            raise AgentWorkspaceError(
+                "Candidate staging drifted and the pre-effect index could not be restored"
+            )
         raise AgentWorkspaceError("Candidate could not be fully staged for adoption")
     tree = str(
         _checked(_run, worktree, ["git", "write-tree"], label="candidate adoption tree").get(

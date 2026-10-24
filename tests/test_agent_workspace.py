@@ -249,6 +249,9 @@ class GitFixture:
         self.writer = root / "writer"
         self.repo.mkdir()
         subprocess.run(["git", "init", "-b", "main"], cwd=self.repo, check=True, stdout=subprocess.PIPE)
+        # A normal managed checkout is admitted with an inert Git attribute mountpoint.
+        # This source fixture must model it; the read-only Git guard never creates it.
+        (self.repo / ".git" / "info").mkdir(mode=0o700, exist_ok=True)
         subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=self.repo, check=True)
         subprocess.run(["git", "config", "user.name", "Test"], cwd=self.repo, check=True)
         (self.repo / "src").mkdir()
@@ -1110,6 +1113,37 @@ class AgentWorkspaceTests(unittest.TestCase):
         )
 
 
+    def test_lane_candidate_staging_uses_verified_patch_bytes_after_path_swap(self) -> None:
+        _lane, manifest, collection, candidate, _closed = self.closed_lane_candidate_fixture()
+        writer_result = collection["writer_result"]
+        patch_path = Path(writer_result["path"])
+        original = patch_path.read_bytes()
+        expected_git_tree = workspace._candidate_patch_tree_sha(manifest, collection, candidate)
+        real_run = subprocess.run
+        observed = []
+
+        def swap_before_git_effect(argv: list[str], *args: object, **kwargs: object):
+            if argv[:1] == ["/usr/bin/git"] and "apply" in argv:
+                observed.append(bytes(kwargs["input"]))
+                patch_path.write_bytes(b"malicious replacement after digest verification\\n")
+            return real_run(argv, *args, **kwargs)
+
+        with mock.patch.object(workspace.subprocess, "run", side_effect=swap_before_git_effect):
+            tree = workspace._stage_candidate_for_adoption(manifest, collection, candidate)
+
+        self.assertEqual(observed, [original], "verified bytes must reach Git through stdin")
+        self.assertNotEqual(patch_path.read_bytes(), original)
+        self.assertEqual(tree, expected_git_tree)
+        self.assertEqual(
+            run(self.git.writer, "git", "write-tree"),
+            expected_git_tree,
+        )
+        self.assertEqual(
+            run(self.git.writer, "git", "rev-parse", "HEAD"),
+            candidate["base_head"],
+            "staging must not mutate HEAD",
+        )
+
     def test_lane_candidate_adoption_rejects_staged_content_drift_after_freeze(self) -> None:
         _lane, manifest, collection, candidate, _closed = self.closed_lane_candidate_fixture()
         before_head = run(self.git.writer, "git", "rev-parse", "HEAD")
@@ -1135,9 +1169,11 @@ class AgentWorkspaceTests(unittest.TestCase):
                 "_adoption_candidate_snapshot",
                 side_effect=mutate_after_snapshot,
             ),
+            # Immutable cached-patch staging leaves the post-snapshot tamper
+            # unstaged, so adoption rejects it before creating any commit.
             self.assertRaisesRegex(
                 workspace.AgentWorkspaceError,
-                "staged Candidate tree differs from immutable Candidate patch",
+                "Candidate could not be fully staged for adoption",
             ),
         ):
             workspace.grabowski_agent_workspace_adopt(
@@ -6314,7 +6350,7 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertEqual(pairs["core.hooksPath"], "/dev/null")
         self.assertEqual(pairs["core.fsmonitor"], "false")
         self.assertEqual(environment["GIT_CONFIG_GLOBAL"], "/dev/null")
-        self.assertEqual(environment["GIT_ALLOW_PROTOCOL"], "ssh:https:file")
+        self.assertEqual(environment["GIT_ALLOW_PROTOCOL"], "ssh:file")
         self.assertEqual(environment["GIT_TERMINAL_PROMPT"], "0")
         self.assertNotIn("OTEL_EXPORTER_OTLP_HEADERS", environment)
         self.assertNotIn("OTEL_EXPORTER_OTLP_TRACES_HEADERS", environment)

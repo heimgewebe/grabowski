@@ -1780,7 +1780,16 @@ class WorkAcquireTests(unittest.TestCase):
             raise AssertionError(args)
 
         completed = __import__("subprocess").CompletedProcess([], 0, b"", b"")
+
+        @contextmanager
+        def synthetic_git_effect(_cwd: Path, command: list[str]):
+            # This test uses a synthetic checkout/runner to assess the shared
+            # monotonic deadline, not Git's physical checkout trust boundary.
+            yield command, {"PATH": "/usr/bin"}, ()
+
         with (
+            patch.object(work_acquire.sandbox, "safe_git_filter_effect",
+                         side_effect=synthetic_git_effect),
             patch.object(
                 work_acquire.checkouts,
                 "_worktree_for_path",

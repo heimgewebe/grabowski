@@ -11,7 +11,7 @@ import stat
 import sys
 from typing import Any
 
-from grabowski_agent_sandbox import minimal_sandbox_argv, prepare_external_agent_command, runtime_sandbox_argv, safe_git_environment, run_bounded_capture
+from grabowski_agent_sandbox import minimal_sandbox_argv, prepare_external_agent_command, runtime_sandbox_argv, safe_git_filter_effect, safe_git_repository_environment, run_bounded_capture
 
 SHA40 = __import__("re").compile(r"^[0-9a-f]{40}$")
 SHA256 = __import__("re").compile(r"^[0-9a-f]{64}$")
@@ -30,33 +30,41 @@ def _digest(value: Any) -> str:
 
 
 def _git(repo: Path, *args: str) -> str:
-    completed = subprocess.run(
-        ["git", "-C", str(repo), *args],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="surrogateescape",
-        timeout=30,
-        check=False,
-        env=safe_git_environment(),
-    )
+    command = ["git", "-C", str(repo), *args]
+    with safe_git_filter_effect(repo, command) as (protected, environment, descriptors):
+        completed = subprocess.run(
+            protected,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="surrogateescape",
+            timeout=30,
+            check=False,
+            env=environment,
+            pass_fds=descriptors,
+        )
     if completed.returncode != 0:
         raise RuntimeError((completed.stderr or completed.stdout or "git failed").strip())
     return completed.stdout.strip()
 
 
 def _git_bytes(repo: Path, *args: str) -> bytes:
-    completed = subprocess.run(
-        ["git", "-C", str(repo), *args],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=30,
-        check=False,
-        env=safe_git_environment(),
-    )
+    # Dirty diffs invoke repository-selected clean filters at Git effect time,
+    # even with --no-ext-diff. Bind inert filter attributes in that process.
+    command = ["git", "-C", str(repo), *args]
+    with safe_git_filter_effect(repo, command) as (protected, environment, descriptors):
+        completed = subprocess.run(
+            protected,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+            check=False,
+            env=environment,
+            pass_fds=descriptors,
+        )
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout or b"git failed").decode(
             "utf-8", errors="replace"
@@ -131,7 +139,8 @@ def _untracked_file_fingerprint(
 
 def _dirty_preimage_sha256(repo: Path, base_head: str, head: str, branch: str) -> str:
     committed = _git_bytes(
-        repo, "diff", "--binary", "--no-ext-diff", "--no-textconv", f"{base_head}...{head}"
+        repo, "diff", "--binary", "--no-ext-diff", "--no-textconv",
+        f"{base_head}...{head}", "--",
     )
     working = _git_bytes(
         repo, "diff", "--binary", "--no-ext-diff", "--no-textconv", "HEAD"
