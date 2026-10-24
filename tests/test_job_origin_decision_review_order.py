@@ -1,5 +1,6 @@
 from pathlib import Path
 import errno
+import hashlib
 import json
 import os
 import tempfile
@@ -368,6 +369,60 @@ class DecisionReviewLogicalClockTests(unittest.TestCase):
             third["scope"]["started_at_unix_ns"],
             first["scope"]["started_at_unix_ns"] + 1,
         )
+
+    def test_child_metadata_published_after_visit_invalidates_bootstrap(self) -> None:
+        # Updating an already visited child leaves the JOBS ROOT timestamp
+        # unchanged. An order-state rebuild must not accept that stale scan.
+        with tempfile.TemporaryDirectory() as temporary:
+            order_patch, jobs_patch = self.roots(temporary)
+            with order_patch, jobs_patch:
+                initial, digest = build("000000000004", 2_000_000_000_500_000_000)
+                jobs = job_origin.DECISION_REVIEW_JOBS_ROOT
+                jobs.mkdir(parents=True, mode=0o700)
+                first = jobs / "grabowski-job-000000000004"
+                second = jobs / "grabowski-job-000000000005"
+                first.mkdir(mode=0o700)
+                second.mkdir(mode=0o700)
+                metadata = first / "metadata.json"
+                metadata.write_text(
+                    json.dumps({"origin": initial, "origin_sha256": digest}),
+                    encoding="utf-8",
+                )
+                metadata.chmod(0o600)
+                ordinary = second / "metadata.json"
+                ordinary.write_text("{}", encoding="utf-8")
+                ordinary.chmod(0o600)
+                changed = json.loads(json.dumps(initial))
+                changed["scope"]["started_at_unix_ns"] += 1000
+                changed_digest = hashlib.sha256(
+                    job_origin.canonical_json_bytes(changed)
+                ).hexdigest()
+                replacement = first / "metadata.next"
+                key = job_origin._decision_review_order_key(initial["scope"])
+                original_open = job_origin.os.open
+                triggered = []
+
+                def inject(path, flags, *args, **kwargs):
+                    if path == second.name and not triggered:
+                        replacement.write_text(
+                            json.dumps({
+                                "origin": changed,
+                                "origin_sha256": changed_digest,
+                            }), encoding="utf-8",
+                        )
+                        replacement.chmod(0o600)
+                        os.replace(replacement, metadata)
+                        triggered.append(True)
+                    return original_open(path, flags, *args, **kwargs)
+
+                with mock.patch.object(job_origin.os, "open", side_effect=inject):
+                    with self.assertRaisesRegex(
+                        ValueError, "changed during scan"
+                    ):
+                        job_origin._existing_decision_review_max_ns(
+                            key, jobs_root=jobs,
+                        )
+                self.assertEqual(triggered, [True])
 
     def test_corrupt_order_state_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

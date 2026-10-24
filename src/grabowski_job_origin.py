@@ -194,6 +194,7 @@ def _existing_decision_review_max_ns(
             raise PermissionError("decision review jobs root is unsafe")
         maximum = -1
         scanned = review_scanned = metadata_bytes = 0
+        child_snapshots: list[tuple[str, int, int, int, int]] = []
         # All top-level entries consume budget, not only well-shaped job names.
         # A noncanonical directory with job metadata is an unknown frontier,
         # never permission to ignore an older material review decision.
@@ -233,6 +234,12 @@ def _existing_decision_review_max_ns(
                         or stat.S_IMODE(job_stat.st_mode) & 0o077
                     ):
                         raise PermissionError("decision review job directory is unsafe")
+                    # A later metadata.json publication changes this job
+                    # directory even if the parent jobs root is unchanged.
+                    child_snapshots.append((
+                        entry.name, job_stat.st_dev, job_stat.st_ino,
+                        job_stat.st_mtime_ns, job_stat.st_ctime_ns,
+                    ))
                     try:
                         metadata_fd = os.open("metadata.json", file_flags, dir_fd=job_fd)
                     except FileNotFoundError:
@@ -335,9 +342,32 @@ def _existing_decision_review_max_ns(
                 ):
                     raise ValueError("existing decision review ordering evidence is invalid")
                 maximum = max(maximum, candidate)
-        # Catch root replacement during the scan, never accept partial history.
+        # Children may publish an origin after they were visited without
+        # touching jobs-root mtime. Detect that before trusting the frontier.
+        # This is a single identity-validation pass, not a retry or a second
+        # interpretation of history. Normal PR/head starts also hold the
+        # existing decision_review_lock across allocation and publication.
+        for name, device, inode, modified_ns, changed_ns in child_snapshots:
+            try:
+                check = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+            except OSError as exc:
+                raise ValueError(
+                    "decision review job directory changed during scan"
+                ) from exc
+            if (
+                not stat.S_ISDIR(check.st_mode)
+                or (check.st_dev, check.st_ino, check.st_mtime_ns, check.st_ctime_ns)
+                != (device, inode, modified_ns, changed_ns)
+            ):
+                raise ValueError("decision review job directory changed during scan")
         after_root = root.lstat()
-        if (after_root.st_dev, after_root.st_ino) != (root_stat.st_dev, root_stat.st_ino):
+        if (
+            after_root.st_dev, after_root.st_ino,
+            after_root.st_mtime_ns, after_root.st_ctime_ns,
+        ) != (
+            root_stat.st_dev, root_stat.st_ino,
+            root_stat.st_mtime_ns, root_stat.st_ctime_ns,
+        ):
             raise ValueError("decision review jobs root changed during scan")
         return maximum
     finally:

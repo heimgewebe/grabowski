@@ -32,6 +32,10 @@ MAX_METADATA_BYTES = 256 * 1024
 MAX_TOTAL_METADATA_BYTES = 128 * 1024 * 1024
 MAX_FINALIZATION_BYTES = 256 * 1024
 MAX_STDOUT_TAIL_BYTES = 256 * 1024
+# Non-review origins must not conceal review results retained in their job logs.
+# This is a separate, bounded verification budget, not a limit increase for
+# admitted review evidence.
+MAX_UNBOUND_STDOUT_BYTES = 8 * 1024 * 1024
 MAX_ROLE_RECEIPT_BYTES = 4 * 1024 * 1024
 MAX_REVIEW_ROLE_MODULE_BYTES = 1024 * 1024
 REVIEW_ROLE_MODULE = "grabowski_agent_role"
@@ -504,6 +508,112 @@ def _read_stdout_tail(
 ) -> tuple[str, str]:
     payload = _read_private_bytes(path, MAX_STDOUT_TAIL_BYTES, parent_fd=parent_fd)
     return payload.decode("utf-8", errors="replace"), hashlib.sha256(payload).hexdigest()
+
+
+def _unbound_review_result_visible(
+    directory: Path, *, parent_fd: int, aggregate_bytes: list[int],
+    expected: dict[str, Any],
+) -> bool:
+    """Find review evidence in a job whose valid origin now denies review status.
+
+    Only evidence for this exact PR/head blocks. Unrelated ordinary jobs may
+    print literal marker text or retain other revisions' role receipts.
+    This detects surviving evidence, not coordinated same-UID tampering of
+    metadata plus every secondary artifact.
+    """
+    try:
+        receipt = _read_private_json(
+            directory / REVIEW_ROLE_ATTEMPT_RECEIPT_NAME,
+            MAX_ROLE_RECEIPT_BYTES, parent_fd=parent_fd,
+        )
+    except FileNotFoundError:
+        pass
+    else:
+        head = receipt.get("expected_head")
+        if not isinstance(head, str) or _SHA40_RE.fullmatch(head) is None:
+            raise ValueError("unbound role receipt head is invalid")
+        if head == expected["head_sha"]:
+            return True
+    stdout = _read_private_bytes(
+        directory / "stdout.log", MAX_UNBOUND_STDOUT_BYTES,
+        parent_fd=parent_fd, aggregate_metadata_bytes=aggregate_bytes,
+    )
+    for line in stdout.decode("utf-8", errors="replace").splitlines():
+        if not line.startswith(RESULT_PREFIX):
+            continue
+        try:
+            marker = json.loads(line[len(RESULT_PREFIX):])
+        except json.JSONDecodeError as exc:
+            raise ValueError("unbound review marker is malformed") from exc
+        if not isinstance(marker, dict):
+            raise ValueError("unbound review marker is not an object")
+        if _raw_binding_targets_pr_head(marker, expected):
+            return True
+    return False
+
+
+def _exact_empty_prelaunch_stub(directory_fd: int) -> bool:
+    """Narrow legacy footprint from failed pre-origin job preparation.
+
+    This is a pinned filesystem classification, NOT proof that an adversary
+    never started work and subsequently erased all same-UID evidence.
+    """
+    parent_before = os.fstat(directory_fd)
+    if (
+        not stat.S_ISDIR(parent_before.st_mode)
+        or parent_before.st_uid != os.geteuid()
+        or stat.S_IMODE(parent_before.st_mode) & 0o077
+    ):
+        return False
+    observed: dict[str, os.stat_result] = {}
+    with os.scandir(directory_fd) as entries:
+        for entry in entries:
+            if len(observed) >= 2 or entry.name not in {"stdout.log", "stderr.log"}:
+                return False
+            observed[entry.name] = entry.stat(follow_symlinks=False)
+    if set(observed) != {"stdout.log", "stderr.log"}:
+        return False
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK | os.O_NOFOLLOW
+    descriptors: list[int] = []
+    try:
+        for name in ("stdout.log", "stderr.log"):
+            fd = os.open(name, flags, dir_fd=directory_fd)
+            descriptors.append(fd)
+            before = os.fstat(fd)
+            snapshot = observed[name]
+            identity = lambda s: (
+                s.st_dev, s.st_ino, s.st_mode, s.st_uid, s.st_nlink,
+                s.st_size, s.st_mtime_ns, s.st_ctime_ns,
+            )
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_uid != os.geteuid()
+                or stat.S_IMODE(before.st_mode) != 0o600
+                or before.st_nlink != 1
+                or before.st_size != 0
+                or identity(before) != identity(snapshot)
+                or os.read(fd, 1) != b""
+                or identity(os.fstat(fd)) != identity(before)
+                or identity(os.stat(name, dir_fd=directory_fd, follow_symlinks=False))
+                != identity(before)
+            ):
+                return False
+        with os.scandir(directory_fd) as entries:
+            after_names = sorted(entry.name for entry in entries)
+        after = os.fstat(directory_fd)
+        return (
+            after_names == ["stderr.log", "stdout.log"]
+            and (
+                parent_before.st_dev, parent_before.st_ino,
+                parent_before.st_mtime_ns, parent_before.st_ctime_ns,
+            ) == (
+                after.st_dev, after.st_ino,
+                after.st_mtime_ns, after.st_ctime_ns,
+            )
+        )
+    finally:
+        for fd in descriptors:
+            os.close(fd)
 
 
 def _raw_binding_targets_pr_head(value: Any, expected: dict[str, Any]) -> bool:
@@ -1722,6 +1832,8 @@ def reconcile(
             "accepted_diff_sha256s": accepted_diff_sha256s_projection,
             "accepted_diff_sha256s_sha256": sha256_json(accepted_diff_sha256s_projection),
             "attempt_count": 0,
+            "skipped_prelaunch_stub_count": 0,
+            "skipped_prelaunch_stub_units_sha256": sha256_json([]),
             "slot_count": 0,
             "slots": [],
             "errors": [],
@@ -1732,16 +1844,24 @@ def reconcile(
             ],
         }
     metadata_budget = [0]
+    unbound_stdout_budget = [0]
+    skipped_prelaunch_stubs: list[str] = []
     iterator = _iter_pinned_review_job_directories(root, errors, metadata_budget)
     review_attempt_count = 0
     with closing(iterator):
         for directory, directory_fd in iterator:
             raw_targets_pr_head = False
             try:
-                raw_metadata = _read_private_json(
-                    directory / "metadata.json", MAX_METADATA_BYTES,
-                    parent_fd=directory_fd, aggregate_metadata_bytes=metadata_budget,
-                )
+                try:
+                    raw_metadata = _read_private_json(
+                        directory / "metadata.json", MAX_METADATA_BYTES,
+                        parent_fd=directory_fd, aggregate_metadata_bytes=metadata_budget,
+                    )
+                except FileNotFoundError:
+                    if _exact_empty_prelaunch_stub(directory_fd):
+                        skipped_prelaunch_stubs.append(directory.name)
+                        continue
+                    raise
                 raw_scope = raw_metadata.get("scope")
                 raw_review_binding = (
                     raw_scope.get("decision_bound_review")
@@ -1783,6 +1903,21 @@ def reconcile(
                 )
                 continue
             if binding is None or not _binding_matches_pr_head(binding, expected):
+                # A review origin rewritten as an ordinary job OR as a valid
+                # review for a foreign revision must not conceal surviving
+                # evidence from this PR/head.
+                try:
+                    if _unbound_review_result_visible(
+                        directory, parent_fd=directory_fd,
+                        aggregate_bytes=unbound_stdout_budget,
+                        expected=expected,
+                    ):
+                        errors.append(f"decision_review_unbound_result:{directory.name}")
+                except (OSError, ValueError) as exc:
+                    errors.append(
+                        f"decision_review_unbound_evidence_invalid:"
+                        f"{directory.name}:{type(exc).__name__}"
+                    )
                 continue
 
             attempt: dict[str, Any] = {
@@ -2065,6 +2200,8 @@ def reconcile(
         "accepted_diff_sha256s": accepted_diff_sha256s_projection,
         "accepted_diff_sha256s_sha256": sha256_json(accepted_diff_sha256s_projection),
         "attempt_count": len(attempts_projection),
+        "skipped_prelaunch_stub_count": len(skipped_prelaunch_stubs),
+        "skipped_prelaunch_stub_units_sha256": sha256_json(sorted(skipped_prelaunch_stubs)),
         "slot_count": len(slots),
         "slots": slots,
         "deferred_diff_identity_count": sum(
