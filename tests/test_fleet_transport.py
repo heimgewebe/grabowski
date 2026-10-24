@@ -92,6 +92,59 @@ class FleetTransportGateTests(unittest.TestCase):
         self.assertTrue(contract["server_owned_limits"])
         self.assertFalse(contract["client_selected_timeout_supported"])
 
+    def test_explicit_posix_ssh_task_home_is_validated_and_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            module, _fake = _load_fleet_module(Path(tmp))
+            config = json.loads(module.FLEET_CONFIG.read_text(encoding="utf-8"))
+            config["hosts"]["remote"] = {
+                "transport": "ssh", "target": "alex@heim-pc",
+                "enabled": True, "roles": ["worker"],
+                "command_allowlist": ["systemctl"],
+                "task_home": "/home/alex",
+            }
+            module.FLEET_CONFIG.write_text(json.dumps(config), encoding="utf-8")
+            host = module.fleet_host("remote")
+            self.assertEqual(module.task_home("remote"), "/home/alex")
+            digest = "a" * 64
+            path = "/home/alex/.local/state/grabowski/task-capture/capture-" + digest + ".py"
+            output = "/home/alex/.grabowski-task-output-" + "a" * 24 + "-a1"
+            self.assertIsNotNone(module._capture_script_pattern(host).fullmatch(path))
+            self.assertIsNotNone(module._task_output_directory_pattern(host).fullmatch(output))
+            self.assertIsNone(module._capture_script_pattern(host).fullmatch(
+                path.replace("/home/alex/", "/home/kleiner-maulwurf/")
+            ))
+            self.assertIsNone(module._task_output_directory_pattern(host).fullmatch(
+                output.replace("/home/alex/", "/tmp/")
+            ))
+
+    def test_task_home_denies_cross_user_traversal_and_nonssh_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            module, _fake = _load_fleet_module(Path(tmp))
+            original = json.loads(module.FLEET_CONFIG.read_text(encoding="utf-8"))
+            host = {
+                "transport": "ssh", "target": "alex@heim-pc",
+                "enabled": True, "roles": ["worker"],
+                "command_allowlist": ["systemctl"],
+                "task_home": "/home/alex",
+            }
+            for bad in (None, "", "/", "/tmp/alex", "/home/../root",
+                        "/home/.secret", "/home/bob", "/home/alex/../bob"):
+                with self.subTest(bad=bad):
+                    candidate = json.loads(json.dumps(original))
+                    candidate["hosts"]["remote"] = {**host, "task_home": bad}
+                    module.FLEET_CONFIG.write_text(json.dumps(candidate), encoding="utf-8")
+                    with self.assertRaises(ValueError):
+                        module.load_fleet()
+            for transport, mode in (("local", "posix"), ("ssh", "windows-powershell")):
+                with self.subTest(transport=transport, mode=mode):
+                    candidate = json.loads(json.dumps(original))
+                    candidate["hosts"]["remote"] = {
+                        **host, "transport": transport, "remote_command_mode": mode
+                    }
+                    module.FLEET_CONFIG.write_text(json.dumps(candidate), encoding="utf-8")
+                    with self.assertRaises(ValueError):
+                        module.load_fleet()
+
     def test_fleet_list_is_registry_read_without_terminal_capability(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             module, fake = _load_fleet_module(Path(tmp))
