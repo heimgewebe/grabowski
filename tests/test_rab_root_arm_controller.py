@@ -111,6 +111,15 @@ class RootArmPolicyTests(unittest.TestCase):
         self.assertEqual(after[0], str(controller._INSTALLED_RUNNER))
         self.assertFalse(any("sh -c" in item for item in argv))
 
+    def test_root_unit_retains_pid1_identity_until_root_observes_and_stops_it(self) -> None:
+        # Host-probed systemd 249: after --wait the transient unit is
+        # LoadState=not-found with empty InvocationID. --no-block plus
+        # RemainAfterExit preserves active/exited and its original InvocationID.
+        argv = controller._unit_argv(_pair(), 0)
+        self.assertIn("--no-block", argv)
+        self.assertNotIn("--wait", argv)
+        self.assertIn("--property=RemainAfterExit=yes", argv)
+
     def test_outer_unit_has_separate_bounded_pre_and_postflight_budget(self) -> None:
         p = _pair()
         self.assertEqual(p["max_wall_seconds"], 300)
@@ -129,6 +138,70 @@ class RootArmPolicyTests(unittest.TestCase):
         ):
             controller.execute_one("a" * 64 + ":0")
         bootstrap.assert_not_called()
+
+
+class RootArmHostLifecycleTests(unittest.TestCase):
+    def test_root_stops_completed_unit_before_durable_receipt(self) -> None:
+        policy = _pair()
+        name = controller._unit(policy, 0)
+        fields = {
+            "Id": name,
+            "LoadState": "loaded",
+            "ActiveState": "active",
+            "SubState": "exited",
+            "Result": "success",
+            "MainPID": "0",
+            "ControlGroup": "/system.slice/" + name,
+            "InvocationID": "b" * 32,
+            "Type": "exec",
+            "RemainAfterExit": "yes",
+            "KillMode": "control-group",
+            "DynamicUser": "yes",
+            "NoNewPrivileges": "yes",
+            "StandardInput": "null",
+            "StandardOutput": "null",
+            "StandardError": "null",
+        }
+        events = []
+
+        def systemctl(argv, **_kwargs):
+            if argv[1] == "show":
+                events.append("show")
+                stdout = ("\n".join(f"{key}={val}" for key, val in fields.items()) + "\n").encode("ascii")
+                return SimpleNamespace(returncode=0, stdout=stdout)
+            if argv[1] == "stop":
+                self.assertEqual(argv[2], name)
+                events.append("stop")
+                return SimpleNamespace(returncode=0, stdout=b"")
+            self.fail("unexpected PID1 action")
+
+        with (
+            mock.patch.object(controller.subprocess, "run", side_effect=systemctl),
+            mock.patch.object(controller, "_write_once", side_effect=lambda *a: events.append("receipt")),
+        ):
+            controller._root_outcome(policy, 0, 7, "f" * 64)
+        self.assertEqual(events, ["show", "stop", "receipt"])
+
+    def test_invalid_completed_unit_stopped_without_receipt(self) -> None:
+        policy = _pair()
+        name = controller._unit(policy, 0)
+        events = []
+        body = (
+            "Id=" + name + "\n"
+            "LoadState=loaded\nActiveState=failed\nSubState=failed\n"
+            "Result=exit-code\nMainPID=0\n"
+        ).encode("ascii")
+        def systemctl(argv, **_kwargs):
+            events.append(argv[1])
+            return SimpleNamespace(returncode=0, stdout=body if argv[1] == "show" else b"")
+        with (
+            mock.patch.object(controller.subprocess, "run", side_effect=systemctl),
+            mock.patch.object(controller, "_write_once") as receipt,
+            self.assertRaises(controller.ArmDenied),
+        ):
+            controller._root_outcome(policy, 0, 7, "f" * 64)
+        receipt.assert_not_called()
+        self.assertIn("stop", events)
 
 
 class RootArmJsonTests(unittest.TestCase):

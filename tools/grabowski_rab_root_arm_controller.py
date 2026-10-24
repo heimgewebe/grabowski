@@ -22,6 +22,7 @@ from pathlib import Path
 import re
 import stat
 import subprocess
+import time
 from typing import Any
 
 _INSTALLED_SELF = Path("/usr/local/libexec/grabowski-rab-root-arm-controller")
@@ -308,6 +309,7 @@ def _unit_argv(policy: dict[str, Any], index: int) -> list[str]:
     properties = [
         "Type=exec",
         "NotifyAccess=none",
+        "RemainAfterExit=yes",
         "PIDFile=",
         "DynamicUser=yes",
         "PrivateTmp=yes",
@@ -345,7 +347,7 @@ def _unit_argv(policy: dict[str, Any], index: int) -> list[str]:
     return [
         _SYSTEMD_RUN,
         "--system",
-        "--wait",
+        "--no-block",
         "--unit=" + unit,
         *(f"--property={p}" for p in properties),
         "--",
@@ -588,71 +590,99 @@ def _qualified_credential(policy: dict[str, Any]) -> None:
 
 
 def _root_outcome(policy: dict[str, Any], index: int, fd: int, token: str) -> None:
-    """Root issues receipt only after PID1 completed and its cgroup disappeared."""
+    """Root observes PID 1 through exit, stops unit, then durably records only lifecycle."""
     name = _unit(policy, index)
+    group = Path("/sys/fs/cgroup/system.slice") / name
     wanted = (
-        "Id",
-        "LoadState",
-        "ActiveState",
-        "SubState",
-        "Result",
-        "MainPID",
-        "ControlGroup",
-        "InvocationID",
-        "Type",
-        "KillMode",
-        "DynamicUser",
-        "NoNewPrivileges",
-        "StandardInput",
-        "StandardOutput",
+        "Id", "LoadState", "ActiveState", "SubState", "Result", "MainPID",
+        "ControlGroup", "InvocationID", "Type", "RemainAfterExit", "KillMode",
+        "DynamicUser", "NoNewPrivileges", "StandardInput", "StandardOutput",
         "StandardError",
     )
-    show = subprocess.run(
-        [_SYSTEMCTL, "show", name, *(f"--property={k}" for k in wanted)],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        check=False,
-        timeout=15,
-    )
-    if show.returncode != 0 or len(show.stdout) > 8192:
-        raise ArmDenied("root PID1 readback is unavailable")
-    values: dict[str, str] = {}
-    try:
-        for line in show.stdout.decode("ascii", "strict").splitlines():
-            key, sep, val = line.partition("=")
-            if not sep or key in values or key not in wanted:
-                raise ArmDenied("root PID1 fields are ambiguous")
-            values[key] = val
-    except UnicodeError as exc:
-        raise ArmDenied("root PID1 fields must be ASCII") from exc
-    if (
-        set(values) != set(wanted)
-        or values["Id"] != name
-        or values["LoadState"] != "loaded"
-        or values["ActiveState"] != "inactive"
-        or values["SubState"] != "dead"
-        or values["Result"] != "success"
-        or values["MainPID"] != "0"
-        or values["Type"] != "exec"
-        or values["KillMode"] != "control-group"
-        or values["DynamicUser"] != "yes"
-        or values["NoNewPrivileges"] != "yes"
-        or values["StandardInput"] != "null"
-        or values["StandardOutput"] != "null"
-        or values["StandardError"] != "null"
-        or not re.fullmatch("[0-9a-f]{32}", values["InvocationID"])
-        or values["ControlGroup"] not in {"", "/system.slice/" + name}
-    ):
-        raise ArmDenied("root PID1 process lifecycle is unqualified")
-    group = Path("/sys/fs/cgroup/system.slice") / name
-    if group.exists():
+    deadline = time.monotonic() + policy["max_wall_seconds"] + 135
+    observed: dict[str, str] | None = None
+
+    def no_descendants() -> bool:
+        if not group.exists():
+            return True
         try:
             live = (group / "cgroup.procs").read_bytes()
             threads = (group / "cgroup.threads").read_bytes()
         except OSError as exc:
             raise ArmDenied("root cgroup descendant count is unreadable") from exc
-        if live.strip() or threads.strip():
-            raise ArmDenied("root cgroup still has descendant processes")
+        return not live.strip() and not threads.strip()
+
+    try:
+        while True:
+            if time.monotonic() > deadline:
+                raise ArmDenied("root PID1 arm execution exceeded bounded wait")
+            show = subprocess.run(
+                [_SYSTEMCTL, "show", name, *(f"--property={k}" for k in wanted)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=15,
+            )
+            if show.returncode != 0 or len(show.stdout) > 8192:
+                raise ArmDenied("root PID1 readback is unavailable")
+            values: dict[str, str] = {}
+            try:
+                for line in show.stdout.decode("ascii", "strict").splitlines():
+                    key, sep, val = line.partition("=")
+                    if not sep or key in values or key not in wanted:
+                        raise ArmDenied("root PID1 fields are ambiguous")
+                    values[key] = val
+            except UnicodeError as exc:
+                raise ArmDenied("root PID1 fields must be ASCII") from exc
+            if (
+                set(values) != set(wanted)
+                or values["Id"] != name
+                or values["LoadState"] != "loaded"
+                or values["Type"] != "exec"
+                or values["RemainAfterExit"] != "yes"
+                or values["KillMode"] != "control-group"
+                or values["DynamicUser"] != "yes"
+                or values["NoNewPrivileges"] != "yes"
+                or values["StandardInput"] != "null"
+                or values["StandardOutput"] != "null"
+                or values["StandardError"] != "null"
+                or values["ControlGroup"] != "/system.slice/" + name
+            ):
+                raise ArmDenied("root PID1 security or unit identity is unqualified")
+            if values["ActiveState"] == "active" and values["SubState"] == "exited":
+                if (
+                    values["Result"] != "success"
+                    or values["MainPID"] != "0"
+                    or re.fullmatch("[0-9a-f]{32}", values["InvocationID"]) is None
+                ):
+                    raise ArmDenied("root PID1 completed service has invalid result")
+                if not no_descendants():
+                    raise ArmDenied("root cgroup still has descendant processes")
+                observed = values
+                break
+            if values["ActiveState"] not in {"active", "activating"} or values["SubState"] not in {
+                "running", "start", "start-pre", "condition", "auto-restart"
+            }:
+                raise ArmDenied("root PID1 service exited unsuccessfully or unobservably")
+            time.sleep(0.25)
+    finally:
+        # RemainAfterExit retains the transient unit for reliable PID1 readback.
+        # Always stop it, including failed, timed-out or ambiguous attempts.
+        try:
+            stopped = subprocess.run(
+                [_SYSTEMCTL, "stop", name],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=15,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise ArmDenied("root PID1 unit cleanup could not be confirmed") from exc
+        if stopped.returncode != 0:
+            raise ArmDenied("root PID1 unit cleanup failed")
+    if observed is None or not no_descendants():
+        raise ArmDenied("root PID1 lifecycle completion cannot be attested")
     _write_once(
         fd,
         "completed-" + token + ".json",
@@ -662,12 +692,12 @@ def _root_outcome(policy: dict[str, Any], index: int, fd: int, token: str) -> No
             "policy_sha256": _sha(_canonical(policy)),
             "token_sha256": token,
             "unit": name,
-            "invocation_id": values["InvocationID"],
-            "result": values["Result"],
+            "invocation_id": observed["InvocationID"],
+            "result": observed["Result"],
             "main_pid": 0,
             "cgroup_empty": True,
-            # Root can attest process lifetime, but cannot call Codex claims
-            # cryptographically verified provider usage or dollar costs.
+            # Root can attest process lifetime, not cryptographically verify
+            # a real provider call or infer an actual dollar charge.
             "provider_outcome_status": "unverified",
         },
     )
