@@ -534,20 +534,27 @@ def _unbound_review_result_visible(
             raise ValueError("unbound role receipt head is invalid")
         if head == expected["head_sha"]:
             return True
-    stdout = _read_private_bytes(
-        directory / "stdout.log", MAX_UNBOUND_STDOUT_BYTES,
-        parent_fd=parent_fd, aggregate_metadata_bytes=aggregate_bytes,
-    )
+    try:
+        stdout = _read_private_bytes(
+            directory / "stdout.log", MAX_UNBOUND_STDOUT_BYTES,
+            parent_fd=parent_fd, aggregate_metadata_bytes=aggregate_bytes,
+        )
+    except ValueError as exc:
+        # Only a pinned, owner-private regular file can reach this exact
+        # size rejection. It exceeds even the permitted reviewer stdout size,
+        # so unrelated ordinary output cannot deny every PR's R3 settlement.
+        if str(exc) == "stdout.log is too large":
+            return False
+        raise
     for line in stdout.decode("utf-8", errors="replace").splitlines():
         if not line.startswith(RESULT_PREFIX):
             continue
         try:
             marker = json.loads(line[len(RESULT_PREFIX):])
-        except json.JSONDecodeError as exc:
-            raise ValueError("unbound review marker is malformed") from exc
-        if not isinstance(marker, dict):
-            raise ValueError("unbound review marker is not an object")
-        if _raw_binding_targets_pr_head(marker, expected):
+        except json.JSONDecodeError:
+            # A quoted marker name is not an authenticated review decision.
+            continue
+        if isinstance(marker, dict) and _raw_binding_targets_pr_head(marker, expected):
             return True
     return False
 

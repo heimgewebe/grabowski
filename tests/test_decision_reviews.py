@@ -2619,6 +2619,7 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
             # emitting a complete line-bound decision for this revision.
             write_private(
                 ordinary / "stdout.log",
+                reviews.RESULT_PREFIX + "not-valid-json\\n" +
                 "ordinary job output GRABOWSKI_DECISION_REVIEW_V1=example\\n",
             )
             write_private(
@@ -2657,13 +2658,18 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
             metadata["origin"]["scope"] = scope
             metadata["origin_sha256"] = reviews.sha256_json(metadata["origin"])
             write_private(metadata_path, json.dumps(metadata))
+            # A surviving, exactly bound V2 role receipt stays blocking even
+            # when stdout itself exceeds the ordinary-job inspection cap.
+            with (rejected / "stdout.log").open("wb") as stream:
+                stream.truncate(reviews.MAX_UNBOUND_STDOUT_BYTES + 1)
+            os.chmod(rejected / "stdout.log", 0o600)
             checked = self.reconcile(jobs)
         self.assertEqual(checked["status"], "blocked")
         self.assertIn(
             f"decision_review_unbound_result:{rejected.name}", checked["errors"]
         )
 
-    def test_unbound_oversized_stdout_blocks_without_unbounded_read(self) -> None:
+    def test_unbound_oversized_ordinary_stdout_does_not_block_review(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             jobs = Path(temp) / "jobs"
             jobs.mkdir(mode=0o700)
@@ -2692,11 +2698,9 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
                 stream.truncate(reviews.MAX_UNBOUND_STDOUT_BYTES + 1)
             os.chmod(ordinary / "stdout.log", 0o600)
             checked = self.reconcile(jobs)
-        self.assertEqual(checked["status"], "blocked")
-        self.assertIn(
-            f"decision_review_unbound_evidence_invalid:{ordinary.name}:ValueError",
-            checked["errors"],
-        )
+        self.assertEqual(checked["status"], "settled")
+        self.assertEqual(checked["errors"], [])
+        self.assertEqual(checked["attempt_count"], 1)
 
     def test_malformed_targeted_registration_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
