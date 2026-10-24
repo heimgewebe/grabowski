@@ -5618,7 +5618,7 @@ def _record_preflight_dispatch_intent(
             raise RunnerError("preflight dispatch pair is terminal after failure")
         if state["pending_condition"] is not None:
             raise RunnerError("prior dispatch intent has no terminal outcome")
-        process_sha256 = _live_dispatch_process_binding(pair_id)
+        process_sha256 = _dispatch_origin_process_binding(request)
         if intents and state["origin_process_sha256"] != process_sha256:
             raise RunnerError(
                 "preflight dispatch pair cannot resume after process restart"
@@ -10502,6 +10502,36 @@ def _verified_root_systemd_one_shot(request: Mapping[str, Any]) -> bool:
     if unit.group(1) != "grabowski-rab-" + token[:16] + ".service":
         raise RunnerError("root-controlled provider unit differs from granted slot")
     return True
+
+
+def _dispatch_origin_process_binding(request: Mapping[str, Any]) -> str:
+    """Preserve original process-nonce rule except for root-issued separate arms.
+
+    Root's two different PID1 units cannot share an in-process random nonce.
+    After the *actual* root-systemd kernel/request check, bind their paired
+    dispatch ledger to the exact root policy bytes. The root controller's
+    durable one-shot markers and first-arm issuer receipt remain mandatory;
+    this does not authorize any direct provider process or retry.
+    """
+    pair_id = request.get("pair_id") if isinstance(request, Mapping) else None
+    if not isinstance(pair_id, str) or not pair_id:
+        raise RunnerError("dispatch process has no valid pair identity")
+    if not _verified_root_systemd_one_shot(request):
+        return _live_dispatch_process_binding(pair_id)
+    directory = os.environ.get("CREDENTIALS_DIRECTORY")
+    if not isinstance(directory, str) or _ROOT_ARM_UNIT.fullmatch(directory) is None:
+        raise RunnerError("root dispatch policy credential path is invalid")
+    raw = _read_bound_regular_file(
+        Path(directory) / "pair.json",
+        label="root-systemd pair ledger origin",
+        max_bytes=65536,
+    )
+    policy = base._load_object_bytes(raw, label="root-systemd pair ledger origin")
+    if policy.get("pair_id") != pair_id or policy.get("plan_sha256") != _ROOT_ARM_PLAN_SHA256:
+        raise RunnerError("root dispatch policy differs from verified pair")
+    return hashlib.sha256(
+        b"grabowski.rab.root-systemd-dispatch-origin.v1\x00" + raw
+    ).hexdigest()
 
 
 def _require_external_provider_one_shot(

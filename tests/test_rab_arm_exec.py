@@ -378,6 +378,41 @@ class RootSubscriptionOneShotContractTests(unittest.TestCase):
                 runner._require_in_process_pair_condition(request)
 
 
+    def test_separate_root_units_share_only_exact_policy_bound_ledger_origin(self) -> None:
+        from tests.test_repobrief_agent_benchmark_codex_runner import runner
+
+        policy, baseline = pair("baseline")
+        _, treatment = pair("treatment")
+        policy["positions"][1]["request_sha256"] = arm._request_sha(treatment)
+        root_bytes = json.dumps(policy).encode("utf-8")
+        with (
+            mock.patch.dict(os.environ, {
+                "CREDENTIALS_DIRECTORY": "/run/credentials/grabowski-rab-1111111111111111.service"
+            }),
+            mock.patch.object(runner, "_verified_root_systemd_one_shot", return_value=True),
+            mock.patch.object(runner, "_read_bound_regular_file", return_value=root_bytes) as loader,
+        ):
+            first = runner._dispatch_origin_process_binding(baseline)
+            second = runner._dispatch_origin_process_binding(treatment)
+            self.assertEqual(first, second)
+            self.assertRegex(first, r"^[0-9a-f]{64}$")
+            loader.assert_called()
+            changed = dict(policy)
+            changed["epoch_sha256"] = "e" * 64
+            loader.return_value = json.dumps(changed).encode("utf-8")
+            self.assertNotEqual(first, runner._dispatch_origin_process_binding(treatment))
+        with mock.patch.object(runner, "_verified_root_systemd_one_shot", return_value=False):
+            self.assertEqual(
+                runner._dispatch_origin_process_binding(baseline),
+                runner._live_dispatch_process_binding(baseline["pair_id"]),
+            )
+        with mock.patch.object(
+            runner, "_verified_root_systemd_one_shot",
+            side_effect=runner.RunnerError("kernel unit is not authorized"),
+        ):
+            with self.assertRaisesRegex(runner.RunnerError, "kernel unit"):
+                runner._dispatch_origin_process_binding(baseline)
+
     def test_provider_model_child_cannot_fake_initial_pid_namespace(self) -> None:
         from tests.test_repobrief_agent_benchmark_codex_runner import runner
         policy, request = pair()
