@@ -2631,6 +2631,66 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
         self.assertEqual(checked["attempt_count"], 1)
         self.assertEqual(checked["errors"], [])
 
+    def test_foreign_v2_receipt_matching_only_head_cannot_block_or_hide_reject(self) -> None:
+        # An ordinary job's unauthenticated role receipt can name the same
+        # HEAD but a different BASE and DIFF. It cannot deny an independent
+        # review of this revision, unless residual exact-bound evidence exists.
+        with tempfile.TemporaryDirectory() as temporary:
+            jobs = Path(temporary) / "jobs"
+            jobs.mkdir(mode=0o700)
+            make_job(
+                jobs, suffix="aaaaaaaaa241", slot="A",
+                terminal_status="succeeded",
+                review_result=result("A", "PASS_THIS_REVISION", 0),
+            )
+            ordinary = jobs / "grabowski-job-bbbbbbbbb242"
+            ordinary.mkdir(mode=0o700)
+            scope = {
+                "cwd": "/tmp", "argv_sha256": "e" * 64,
+                "runtime_seconds": 60,
+            }
+            origin, digest = job_origin.build_origin(
+                unit=ordinary.name, owner=f"uid:{os.getuid()}",
+                argv_sha256="e" * 64, scope=scope,
+                notify_on_done={"requested": False, "channels": []},
+                created_at_unix=1_787_000_000,
+                started_at="2026-08-18T12:00:00Z",
+                invoker_tool="grabowski_job_start",
+            )
+            write_private(ordinary / "metadata.json", json.dumps({
+                "unit": ordinary.name, "job_id": origin["job_id"],
+                "owner": origin["owner"], "argv_sha256": origin["argv_sha256"],
+                "scope": scope, "origin": origin, "origin_sha256": digest,
+            }))
+            stdout = ordinary / "stdout.log"
+            write_private(stdout, "")
+            write_private(
+                ordinary / reviews.REVIEW_ROLE_ATTEMPT_RECEIPT_NAME,
+                json.dumps({
+                    "expected_head": HEAD,
+                    "expected_base_head": "d" * 40,
+                    "expected_diff_sha256": "e" * 64,
+                }),
+            )
+            unrelated = self.reconcile(jobs)
+            self.assertEqual(unrelated["status"], "settled")
+            self.assertEqual(unrelated["errors"], [])
+            self.assertEqual(unrelated["attempt_count"], 1)
+
+            # If metadata was rebound but the genuine review stdout remains,
+            # a material REJECT for this exact revision must still block.
+            write_private(
+                stdout,
+                reviews.RESULT_PREFIX +
+                json.dumps(result("A", "REJECT_THIS_REVISION", 1)) + "\n",
+            )
+            retained_reject = self.reconcile(jobs)
+        self.assertEqual(retained_reject["status"], "blocked")
+        self.assertIn(
+            f"decision_review_unbound_result:{ordinary.name}",
+            retained_reject["errors"],
+        )
+
     def test_replaced_v2_origin_with_role_receipt_still_blocks(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             jobs = Path(temp) / "jobs"

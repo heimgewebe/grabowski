@@ -533,7 +533,15 @@ def _unbound_review_result_visible(
         if not isinstance(head, str) or _SHA40_RE.fullmatch(head) is None:
             raise ValueError("unbound role receipt head is invalid")
         if head == expected["head_sha"]:
-            return True
+            base_head = receipt.get("expected_base_head")
+            if not isinstance(base_head, str) or _SHA40_RE.fullmatch(base_head) is None:
+                raise ValueError("unbound role receipt base head is invalid")
+            # A matching HEAD from another PR base is not proof of a review
+            # of this revision. The role's expected_diff_sha256 is a workspace
+            # diff and cannot be equated to the canonical PR diff identity.
+            # Still scan any surviving stdout for an exact-bound REJECT.
+            if base_head == expected["base_sha"]:
+                return True
     # An oversized unbound stdout can retain a material REJECT even after
     # its origin metadata has been rebound to an ordinary job. Without an
     # independent, authenticated origin record, it cannot be classified as
