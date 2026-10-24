@@ -63,8 +63,10 @@ def build(suffix: str, *, created: int, observed_ns: int | None) -> tuple[dict, 
 
 
 def persist(jobs_root: Path, suffix: str, origin: dict, digest: str) -> None:
+    # Production review roots are owner-private; model that invariant in tests.
+    jobs_root.mkdir(parents=True, mode=0o700, exist_ok=True)
     directory = jobs_root / f"grabowski-job-{suffix}"
-    directory.mkdir(parents=True, mode=0o700)
+    directory.mkdir(mode=0o700)
     metadata_path = directory / "metadata.json"
     metadata_path.write_text(
         json.dumps({"origin": origin, "origin_sha256": digest}, sort_keys=True),

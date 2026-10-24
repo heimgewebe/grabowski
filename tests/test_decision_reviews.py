@@ -385,6 +385,311 @@ def stamp_claude_quota_429(directory: Path, *, envelope_updates: dict | None = N
 
 
 class DecisionReviewReconciliationTests(unittest.TestCase):
+    def test_rgpm_signed_v2_review_pass_cannot_grant_captain_authority(self) -> None:
+        # Construct a valid foreign-namespace reviewer under the old, widened
+        # unit matcher.  The actual reconciler must never accept that PASS.
+        with tempfile.TemporaryDirectory() as temp:
+            jobs = Path(temp) / "jobs"
+            jobs.mkdir(mode=0o700)
+            with (
+                mock.patch.object(reviews, "_UNIT_RE", job_origin.UNIT_RE),
+                mock.patch.object(
+                    job_origin, "_DECISION_REVIEW_UNIT_RE", job_origin.UNIT_RE
+                ),
+            ):
+                make_job(
+                    jobs, suffix="rgpm-0123456789abcdef-01", slot="A",
+                    terminal_status="succeeded",
+                    review_result=result("A", "PASS_THIS_REVISION", 0),
+                    review_role=True, attempt_bound=True, attempt_epoch=2,
+                )
+            checked = self.reconcile(jobs)
+        self.assertEqual(checked["status"], "blocked")
+        self.assertEqual(checked["attempt_count"], 0)
+        self.assertIn(
+            "decision_review_noncanonical_job_unverifiable", checked["errors"]
+        )
+
+    def test_genuine_rgpm_job_without_review_evidence_does_not_block(self) -> None:
+        # RepoGround has its own signed job namespace, not R3 authority.
+        with tempfile.TemporaryDirectory() as temp:
+            jobs = Path(temp) / "jobs"
+            jobs.mkdir(mode=0o700)
+            unit = "grabowski-job-rgpm-0123456789abcdef-01"
+            directory = jobs / unit
+            directory.mkdir(mode=0o700)
+            scope = {
+                "cwd": "/tmp", "argv_sha256": "e" * 64,
+                "runtime_seconds": 60,
+            }
+            origin, digest = job_origin.build_origin(
+                unit=unit, owner=f"uid:{os.getuid()}",
+                argv_sha256="e" * 64, scope=scope,
+                notify_on_done={"requested": False, "channels": []},
+                created_at_unix=1_787_000_000,
+                started_at="2026-08-18T12:00:00Z",
+                invoker_tool="grabowski_job_start",
+            )
+            metadata = {
+                "unit": unit, "job_id": origin["job_id"],
+                "owner": origin["owner"],
+                "argv_sha256": origin["argv_sha256"],
+                "scope": origin["scope"],
+                "origin": origin, "origin_sha256": digest,
+            }
+            write_private(directory / "metadata.json", json.dumps(metadata))
+            checked = self.reconcile(jobs)
+        self.assertEqual(checked["status"], "not_applicable")
+        self.assertEqual(checked["attempt_count"], 0)
+        self.assertEqual(checked["errors"], [])
+
+    def test_review_attempt_hard_cap_never_yields_partial_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            jobs = Path(temp) / "jobs"
+            jobs.mkdir(mode=0o700)
+            make_job(
+                jobs, suffix="aaaaaaaaa901", slot="A",
+                terminal_status="succeeded",
+                review_result=result("A", "PASS_THIS_REVISION", 0),
+            )
+            make_job(
+                jobs, suffix="bbbbbbbbb902", slot="A",
+                terminal_status="succeeded",
+                review_result=result("A", "REJECT_THIS_REVISION", 1),
+            )
+            with mock.patch.object(reviews, "MAX_BOUND_REVIEW_JOBS", 1):
+                checked = self.reconcile(jobs)
+        self.assertEqual(checked["status"], "blocked")
+        self.assertIn("decision_review_attempt_inventory_truncated", checked["errors"])
+        self.assertEqual(checked["attempt_count"], 0)
+
+    def test_noncanonical_renamed_reject_blocks_inventory(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            jobs = Path(temp) / "jobs"
+            jobs.mkdir(mode=0o700)
+            reject = make_job(
+                jobs, suffix="aaaaaaaaa111", slot="A",
+                terminal_status="succeeded",
+                review_result=result("A", "REJECT_THIS_REVISION", 1),
+            )
+            reject.rename(jobs / "foreign-renamed-review")
+            checked = self.reconcile(jobs)
+        self.assertEqual(checked["status"], "blocked")
+        self.assertIn("decision_review_noncanonical_job_directory", checked["errors"])
+        self.assertEqual(checked["attempt_count"], 0)
+
+    def test_noncanonical_bundle_without_job_metadata_is_not_a_review(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            jobs = Path(temp) / "jobs"
+            jobs.mkdir(mode=0o700)
+            other = jobs / "report-bundle"
+            other.mkdir(mode=0o700)
+            write_private(other / "evaluation.json", "{}")
+            make_job(
+                jobs, suffix="aaaaaaaaa112", slot="A",
+                terminal_status="succeeded",
+                review_result=result("A", "PASS_THIS_REVISION", 0),
+            )
+            checked = self.reconcile(jobs)
+        self.assertEqual(checked["status"], "settled")
+        self.assertEqual(checked["attempt_count"], 1)
+
+    def test_noncanonical_symlink_never_hides_a_review(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            jobs = Path(temp) / "jobs"
+            jobs.mkdir(mode=0o700)
+            normal = make_job(
+                jobs, suffix="aaaaaaaaa113", slot="A",
+                terminal_status="succeeded",
+                review_result=result("A", "PASS_THIS_REVISION", 0),
+            )
+            (jobs / "foreign-review-alias").symlink_to(
+                normal, target_is_directory=True
+            )
+            checked = self.reconcile(jobs)
+        self.assertEqual(checked["status"], "blocked")
+        self.assertIn("decision_review_noncanonical_job_unverifiable", checked["errors"])
+
+    def test_job_metadata_symlink_never_hides_reject(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            jobs = Path(temp) / "jobs"
+            jobs.mkdir(mode=0o700)
+            passing = make_job(
+                jobs, suffix="aaaaaaaaa114", slot="A",
+                terminal_status="succeeded",
+                review_result=result("A", "PASS_THIS_REVISION", 0),
+            )
+            rejected = make_job(
+                jobs, suffix="bbbbbbbbb115", slot="A",
+                terminal_status="succeeded",
+                review_result=result("A", "REJECT_THIS_REVISION", 1),
+            )
+            metadata = rejected / "metadata.json"
+            metadata.unlink()
+            metadata.symlink_to(passing / "metadata.json")
+            checked = self.reconcile(jobs)
+        self.assertEqual(checked["status"], "blocked")
+        self.assertTrue(
+            any("decision_review_origin_invalid" in e for e in checked["errors"])
+        )
+
+    def test_signed_pass_swapped_after_inventory_cannot_hide_reject(self) -> None:
+        # Both files have authentic per-unit origin SHA and finalization.  The
+        # only difference is the observed directory inode at inventory time.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            jobs = root / "jobs"
+            jobs.mkdir(mode=0o700)
+            standby = root / "standby"
+            standby.mkdir(mode=0o700)
+            rejected = make_job(
+                jobs, suffix="aaaaaaaaa119", slot="A",
+                terminal_status="succeeded",
+                review_result=result("A", "REJECT_THIS_REVISION", 1),
+            )
+            replacement = make_job(
+                standby, suffix="aaaaaaaaa119", slot="A",
+                terminal_status="succeeded",
+                review_result=result("A", "PASS_THIS_REVISION", 0),
+            )
+            real_open = os.open
+            switched = [False]
+
+            def swap_before_open(path, flags, *args, **kwargs):
+                if (
+                    not switched[0]
+                    and path == rejected.name
+                    and kwargs.get("dir_fd") is not None
+                    and flags & os.O_DIRECTORY
+                ):
+                    rejected.rename(root / "moved-original-reject")
+                    replacement.rename(rejected)
+                    switched[0] = True
+                return real_open(path, flags, *args, **kwargs)
+
+            with mock.patch.object(reviews.os, "open", side_effect=swap_before_open):
+                checked = self.reconcile(jobs)
+        self.assertTrue(switched[0])
+        self.assertEqual(checked["status"], "blocked")
+        self.assertIn(
+            "decision_review_job_inventory_unverifiable", checked["errors"]
+        )
+        self.assertEqual(checked["attempt_count"], 0)
+
+    def test_swapped_job_path_cannot_replace_pinned_reject(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            jobs = Path(temp) / "jobs"
+            jobs.mkdir(mode=0o700)
+            rejected = make_job(
+                jobs, suffix="aaaaaaaaa116", slot="A",
+                terminal_status="succeeded",
+                review_result=result("A", "REJECT_THIS_REVISION", 1),
+            )
+            passing = make_job(
+                jobs, suffix="bbbbbbbbb117", slot="A",
+                terminal_status="succeeded",
+                review_result=result("A", "PASS_THIS_REVISION", 0),
+            )
+            original_read = reviews._read_private_json
+            switched = [False]
+
+            def swap_then_read(path: Path, max_bytes: int, **kwargs):
+                if (
+                    not switched[0] and path == rejected / "metadata.json"
+                    and kwargs.get("parent_fd") is not None
+                ):
+                    rejected.rename(jobs / "moved-original-review")
+                    rejected.symlink_to(passing, target_is_directory=True)
+                    switched[0] = True
+                return original_read(path, max_bytes, **kwargs)
+
+            with mock.patch.object(
+                reviews, "_read_private_json", side_effect=swap_then_read
+            ):
+                checked = self.reconcile(jobs)
+        self.assertTrue(switched[0])
+        self.assertEqual(checked["status"], "blocked")
+        self.assertEqual(checked["attempt_count"], 2)
+        self.assertEqual(checked["slots"][0]["material_reject_count"], 1)
+
+    def test_reserved_repoground_origin_without_review_does_not_block(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            jobs = Path(temp) / "jobs"
+            jobs.mkdir(mode=0o700)
+            unit = "grabowski-job-rgpm-1234567890abcdef-00"
+            reserved = jobs / unit
+            reserved.mkdir(mode=0o700)
+            origin, digest = job_origin.build_origin(
+                unit=unit,
+                owner=f"uid:{os.getuid()}",
+                argv_sha256="e" * 64,
+                scope={
+                    "cwd": "/tmp/review", "argv_sha256": "e" * 64,
+                    "runtime_seconds": 60,
+                },
+                notify_on_done={"requested": False, "channels": []},
+                created_at_unix=1_787_000_000,
+                started_at="2026-08-18T12:00:00Z",
+                invoker_tool="grabowski_job_start",
+            )
+            write_private(
+                reserved / "metadata.json",
+                json.dumps({**{key: origin[key] for key in (
+                    "unit", "job_id", "owner", "argv_sha256", "scope"
+                )}, "origin": origin, "origin_sha256": digest}),
+            )
+            make_job(
+                jobs, suffix="aaaaaaaaa118", slot="A",
+                terminal_status="succeeded",
+                review_result=result("A", "PASS_THIS_REVISION", 0),
+            )
+            checked = self.reconcile(jobs)
+        self.assertEqual(checked["status"], "settled")
+        self.assertEqual(checked["attempt_count"], 1)
+
+    def test_large_registry_cannot_hide_late_reject(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            jobs = Path(temp) / "jobs"
+            jobs.mkdir(mode=0o700)
+            for number in range(10_010):
+                (jobs / f"grabowski-job-{number:012x}").mkdir(mode=0o700)
+            make_job(jobs, suffix="fffffffffff0", slot="A", terminal_status="succeeded",
+                     review_result=result("A", "PASS_THIS_REVISION", 0))
+            make_job(jobs, suffix="fffffffffff1", slot="A", terminal_status="succeeded",
+                     review_result=result("A", "REJECT_THIS_REVISION", 1))
+            checked = self.reconcile(jobs)
+        self.assertEqual(checked["status"], "blocked")
+        self.assertEqual(checked["attempt_count"], 2)
+        self.assertEqual(checked["slots"][0]["material_reject_count"], 1)
+        self.assertFalse(any("inventory_truncated" in x for x in checked["errors"]))
+
+    def test_inventory_hard_limit_never_reports_partial_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            jobs = Path(temp) / "jobs"
+            jobs.mkdir(mode=0o700)
+            make_job(jobs, suffix="000000000001", slot="A", terminal_status="succeeded",
+                     review_result=result("A", "PASS_THIS_REVISION", 0))
+            make_job(jobs, suffix="fffffffffff1", slot="A", terminal_status="succeeded",
+                     review_result=result("A", "REJECT_THIS_REVISION", 1))
+            (jobs / "grabowski-job-000000000002").mkdir(mode=0o700)
+            with mock.patch.object(reviews, "MAX_JOB_DIRECTORIES", 2):
+                checked = self.reconcile(jobs)
+        self.assertEqual(checked["status"], "blocked")
+        self.assertIn("decision_review_job_inventory_truncated", checked["errors"])
+        self.assertEqual(checked["attempt_count"], 0)
+
+    def test_inventory_aggregate_metadata_budget_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            jobs = Path(temp) / "jobs"
+            jobs.mkdir(mode=0o700)
+            make_job(jobs, suffix="fffffffffff2", slot="A", terminal_status="succeeded",
+                     review_result=result("A", "PASS_THIS_REVISION", 0))
+            with mock.patch.object(reviews, "MAX_TOTAL_METADATA_BYTES", 4):
+                checked = self.reconcile(jobs)
+        self.assertEqual(checked["status"], "blocked")
+        self.assertIn("decision_review_metadata_aggregate_budget_exceeded", checked["errors"])
+        self.assertEqual(checked["attempt_count"], 0)
+
     def test_v2_claude_429_blocks_until_exact_later_same_slot_pass(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             jobs = Path(temporary) / "jobs"
@@ -1448,7 +1753,7 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             jobs = root / "jobs"
-            jobs.mkdir()
+            jobs.mkdir(mode=0o700)
             fixture = python_rotation_fixture(
                 root,
                 historical_module_bytes=Path(agent_role.__file__).read_bytes(),
@@ -1491,7 +1796,7 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             jobs = root / "jobs"
-            jobs.mkdir()
+            jobs.mkdir(mode=0o700)
             fixture = python_rotation_fixture(root)
 
             with patch_rotation(fixture, fixture["stable_python"], bind_launcher=True):
@@ -2083,6 +2388,518 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
         slot = next(item for item in reconciled["slots"] if item["slot"] == "a")
         self.assertEqual(slot["infrastructure_error_count"], 1)
         self.assertEqual(slot["pass_count"], 1)
+
+    def test_exact_empty_prelaunch_footprints_do_not_block_valid_review(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            jobs = Path(temp) / "jobs"
+            jobs.mkdir(mode=0o700)
+            make_job(
+                jobs, suffix="aaaaaaaaa501", slot="A",
+                terminal_status="succeeded",
+                review_result=result("A", "PASS_THIS_REVISION", 0),
+            )
+            names = []
+            for i in range(8):
+                directory = jobs / f"grabowski-job-{0xabc000000000+i:012x}"
+                directory.mkdir(mode=0o700)
+                write_private(directory / "stdout.log", "")
+                write_private(directory / "stderr.log", "")
+                names.append(directory.name)
+            checked = self.reconcile(jobs)
+        self.assertEqual(checked["status"], "settled")
+        self.assertEqual(checked["errors"], [])
+        self.assertEqual(checked["attempt_count"], 1)
+        self.assertEqual(checked["skipped_prelaunch_stub_count"], 8)
+        self.assertEqual(
+            checked["skipped_prelaunch_stub_units_sha256"],
+            reviews.sha256_json(sorted(names)),
+        )
+
+    def test_late_foreign_directory_metadata_blocks_settlement(self) -> None:
+        # A foreign child may gain suspicious review metadata after it was
+        # inspected, without advancing the jobs root's timestamps.
+        with tempfile.TemporaryDirectory() as temp:
+            jobs = Path(temp) / "jobs"
+            jobs.mkdir(mode=0o700)
+            foreign = jobs / "foreign-review-holder"
+            foreign.mkdir(mode=0o700)
+            passed = make_job(
+                jobs, suffix="aaaaaaaaa501", slot="A",
+                terminal_status="succeeded",
+                review_result=result("A", "PASS_THIS_REVISION", 0),
+            )
+            original = reviews._validated_origin_binding
+            published = False
+
+            def publish_after_foreign_scan(directory, *args, **kwargs):
+                nonlocal published
+                if directory == passed and not published:
+                    write_private(
+                        foreign / "metadata.json",
+                        json.dumps({"scope": {"decision_bound_review": binding("A")}}),
+                    )
+                    published = True
+                return original(directory, *args, **kwargs)
+
+            with mock.patch.object(
+                reviews, "_validated_origin_binding",
+                side_effect=publish_after_foreign_scan,
+            ):
+                first = self.reconcile(jobs)
+            self.assertTrue(published)
+            self.assertEqual(first["status"], "blocked")
+            self.assertIn("decision_review_job_directory_changed", first["errors"])
+            second = self.reconcile(jobs)
+            self.assertEqual(second["status"], "blocked")
+            self.assertIn(
+                "decision_review_noncanonical_job_directory", second["errors"],
+            )
+
+    def test_late_publication_inside_skipped_stub_blocks_settlement(self) -> None:
+        # A child already classified as an exact prelaunch stub can publish
+        # a material REJECT while the scanner processes a later PASS. Root
+        # directory timestamps remain unchanged by those child writes.
+        with tempfile.TemporaryDirectory() as temp:
+            jobs = Path(temp) / "jobs"
+            jobs.mkdir(mode=0o700)
+            rejected = make_job(
+                jobs, suffix="000000000001", slot="A",
+                terminal_status="succeeded",
+                review_result=result("A", "REJECT_THIS_REVISION", 1),
+            )
+            parked = Path(temp) / "parked"
+            parked.mkdir(mode=0o700)
+            for item in list(rejected.iterdir()):
+                os.replace(item, parked / item.name)
+            write_private(rejected / "stdout.log", "")
+            write_private(rejected / "stderr.log", "")
+            passed = make_job(
+                jobs, suffix="aaaaaaaaa501", slot="A",
+                terminal_status="succeeded",
+                review_result=result("A", "PASS_THIS_REVISION", 0),
+            )
+            original = reviews._validated_origin_binding
+            published = False
+
+            def publish_after_stub(directory, *args, **kwargs):
+                nonlocal published
+                if directory == passed and not published:
+                    for item in list(parked.iterdir()):
+                        if item.name in {"stdout.log", "stderr.log"}:
+                            write_private(rejected / item.name, item.read_text())
+                            item.unlink()
+                        else:
+                            os.replace(item, rejected / item.name)
+                    published = True
+                return original(directory, *args, **kwargs)
+
+            with mock.patch.object(
+                reviews, "_validated_origin_binding",
+                side_effect=publish_after_stub,
+            ):
+                first = self.reconcile(jobs)
+            self.assertTrue(published)
+            self.assertEqual(first["status"], "blocked")
+            self.assertIn("decision_review_job_directory_changed", first["errors"])
+            second = self.reconcile(jobs)
+            self.assertEqual(second["status"], "blocked")
+            self.assertTrue(any(
+                "decision_review" in error for error in second["errors"]
+            ))
+
+    def test_only_exact_empty_prelaunch_footprints_are_exempt(self) -> None:
+        variants = (
+            "stdout_nonempty", "stderr_nonempty", "finalization",
+            "role_receipt", "extra_file", "stdout_symlink", "stdout_fifo",
+            "stdout_hardlink", "wrong_file_mode", "wrong_directory_mode",
+            "missing_stdout", "missing_stderr",
+        )
+        for variant in variants:
+            with self.subTest(variant=variant):
+                with tempfile.TemporaryDirectory() as temp:
+                    jobs = Path(temp) / "jobs"
+                    jobs.mkdir(mode=0o700)
+                    make_job(
+                        jobs, suffix="aaaaaaaaa501", slot="A",
+                        terminal_status="succeeded",
+                        review_result=result("A", "PASS_THIS_REVISION", 0),
+                    )
+                    directory = jobs / "grabowski-job-bbbbbbbbb502"
+                    directory.mkdir(mode=0o700)
+                    write_private(directory / "stdout.log", "")
+                    write_private(directory / "stderr.log", "")
+                    stdout = directory / "stdout.log"
+                    stderr = directory / "stderr.log"
+                    if variant == "stdout_nonempty":
+                        write_private(stdout, "REJECT_THIS_REVISION")
+                    elif variant == "stderr_nonempty":
+                        write_private(stderr, "worker launched")
+                    elif variant == "finalization":
+                        write_private(directory / "finalization.json", "{}")
+                    elif variant == "role_receipt":
+                        write_private(directory / reviews.REVIEW_ROLE_ATTEMPT_RECEIPT_NAME, "{}")
+                    elif variant == "extra_file":
+                        write_private(directory / "other.txt", "")
+                    elif variant == "stdout_symlink":
+                        stdout.unlink()
+                        stdout.symlink_to(stderr)
+                    elif variant == "stdout_fifo":
+                        stdout.unlink()
+                        os.mkfifo(stdout, 0o600)
+                    elif variant == "stdout_hardlink":
+                        os.link(stdout, Path(temp) / "other-hardlink")
+                    elif variant == "wrong_file_mode":
+                        stdout.chmod(0o644)
+                    elif variant == "wrong_directory_mode":
+                        directory.chmod(0o755)
+                    elif variant == "missing_stdout":
+                        stdout.unlink()
+                    elif variant == "missing_stderr":
+                        stderr.unlink()
+                    checked = self.reconcile(jobs)
+                self.assertEqual(checked["status"], "blocked")
+                if variant == "wrong_directory_mode":
+                    self.assertIn(
+                        "decision_review_job_inventory_unverifiable", checked["errors"],
+                    )
+                else:
+                    self.assertIn(
+                        "decision_review_origin_invalid:grabowski-job-bbbbbbbbb502:",
+                        " ".join(checked["errors"]),
+                    )
+
+    def test_unrecognizable_reject_origin_cannot_leave_a_prior_pass_settled(self) -> None:
+        # Damage may erase every raw PR/head hint from the REJECT's metadata.
+        # A separate valid PASS must never establish a settled verdict.
+        for damaged in (None, "{}", "not-valid-json", '{"scope":{"decision_bound_review":null}}'):
+            with self.subTest(damaged=damaged):
+                with tempfile.TemporaryDirectory() as temp:
+                    jobs = Path(temp) / "jobs"
+                    jobs.mkdir(mode=0o700)
+                    make_job(
+                        jobs, suffix="aaaaaaaaa311", slot="A",
+                        terminal_status="succeeded",
+                        review_result=result("A", "PASS_THIS_REVISION", 0),
+                    )
+                    rejected = make_job(
+                        jobs, suffix="bbbbbbbbb312", slot="A",
+                        terminal_status="succeeded",
+                        review_result=result("A", "REJECT_THIS_REVISION", 1),
+                    )
+                    before = self.reconcile(jobs)
+                    self.assertEqual(before["status"], "blocked")
+                    self.assertEqual(before["attempt_count"], 2)
+                    if damaged is None:
+                        (rejected / "metadata.json").unlink()
+                    else:
+                        write_private(rejected / "metadata.json", damaged)
+                    checked = self.reconcile(jobs)
+                self.assertEqual(checked["status"], "blocked")
+                error_type = "FileNotFoundError" if damaged is None else "ValueError"
+                self.assertIn(
+                    f"decision_review_origin_invalid:grabowski-job-bbbbbbbbb312:{error_type}",
+                    checked["errors"],
+                )
+                self.assertEqual(checked["attempt_count"], 1)
+
+    def test_signed_nonreview_replacement_cannot_erase_material_reject(self) -> None:
+        # A self-consistent ordinary origin can replace a review origin while
+        # leaving an authentic REJECT marker in the unchanged job stdout.
+        with tempfile.TemporaryDirectory() as temp:
+            jobs = Path(temp) / "jobs"
+            jobs.mkdir(mode=0o700)
+            make_job(
+                jobs, suffix="aaaaaaaaa211", slot="A",
+                terminal_status="succeeded",
+                review_result=result("A", "PASS_THIS_REVISION", 0),
+            )
+            rejected = make_job(
+                jobs, suffix="bbbbbbbbb212", slot="A",
+                terminal_status="succeeded",
+                review_result=result("A", "REJECT_THIS_REVISION", 1),
+            )
+            before = self.reconcile(jobs)
+            self.assertEqual(before["status"], "blocked")
+            metadata_path = rejected / "metadata.json"
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            scope = dict(metadata["scope"])
+            scope.pop("decision_bound_review", None)
+            scope.pop("decision_review_provenance", None)
+            scope.pop("decision_review_attempt_epoch", None)
+            metadata["scope"] = scope
+            metadata["origin"]["scope"] = scope
+            metadata["origin_sha256"] = reviews.sha256_json(metadata["origin"])
+            write_private(metadata_path, json.dumps(metadata))
+            checked = self.reconcile(jobs)
+        self.assertEqual(checked["status"], "blocked")
+        self.assertTrue(
+            any("decision_review_unbound_result:" in e for e in checked["errors"])
+        )
+
+    def test_valid_foreign_review_rebinding_cannot_hide_local_reject(self) -> None:
+        # A valid metadata+origin digest for another revision must not erase
+        # the original decision still present in the same job's stdout.
+        for drift in ({"pr": PR + 1}, {"head_sha": "d" * 40}):
+            with self.subTest(drift=drift):
+                with tempfile.TemporaryDirectory() as temp:
+                    jobs = Path(temp) / "jobs"
+                    jobs.mkdir(mode=0o700)
+                    make_job(
+                        jobs, suffix="aaaaaaaaa219", slot="A",
+                        terminal_status="succeeded",
+                        review_result=result("A", "PASS_THIS_REVISION", 0),
+                    )
+                    rejected = make_job(
+                        jobs, suffix="bbbbbbbbb220", slot="A",
+                        terminal_status="succeeded",
+                        review_result=result("A", "REJECT_THIS_REVISION", 1),
+                    )
+                    if "head_sha" in drift:
+                        # The normal result parser accepts normalized case.
+                        upper = result("A", "REJECT_THIS_REVISION", 1)
+                        upper["repo"] = upper["repo"].upper()
+                        upper["head_sha"] = upper["head_sha"].upper()
+                        write_private(
+                            rejected / "stdout.log",
+                            reviews.RESULT_PREFIX + json.dumps(upper) + "\n",
+                        )
+                    before = self.reconcile(jobs)
+                    self.assertEqual(before["status"], "blocked")
+                    metadata_path = rejected / "metadata.json"
+                    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                    scope = dict(metadata["scope"])
+                    bound = dict(scope["decision_bound_review"])
+                    bound.update(drift)
+                    scope["decision_bound_review"] = bound
+                    metadata["scope"] = scope
+                    metadata["origin"]["scope"] = scope
+                    metadata["origin_sha256"] = reviews.sha256_json(metadata["origin"])
+                    write_private(metadata_path, json.dumps(metadata))
+                    checked = self.reconcile(jobs)
+                self.assertEqual(checked["status"], "blocked")
+                self.assertIn(
+                    f"decision_review_unbound_result:{rejected.name}",
+                    checked["errors"],
+                )
+
+    def test_legitimate_unbound_job_with_stdout_does_not_block_review(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            jobs = Path(temp) / "jobs"
+            jobs.mkdir(mode=0o700)
+            make_job(
+                jobs, suffix="aaaaaaaaa213", slot="A",
+                terminal_status="succeeded",
+                review_result=result("A", "PASS_THIS_REVISION", 0),
+            )
+            ordinary = jobs / "grabowski-job-bbbbbbbbb214"
+            ordinary.mkdir(mode=0o700)
+            scope = {"cwd": "/tmp", "argv_sha256": "e" * 64, "runtime_seconds": 60}
+            origin, digest = job_origin.build_origin(
+                unit=ordinary.name, owner=f"uid:{os.getuid()}",
+                argv_sha256="e" * 64, scope=scope,
+                notify_on_done={"requested": False, "channels": []},
+                created_at_unix=1_787_000_000,
+                started_at="2026-08-18T12:00:00Z",
+                invoker_tool="grabowski_job_start",
+            )
+            write_private(ordinary / "metadata.json", json.dumps({
+                "unit": ordinary.name, "job_id": origin["job_id"],
+                "owner": origin["owner"], "argv_sha256": origin["argv_sha256"],
+                "scope": scope, "origin": origin, "origin_sha256": digest,
+            }))
+            # Unbound tasks can legitimately echo the marker *name* without
+            # emitting a complete line-bound decision for this revision.
+            write_private(
+                ordinary / "stdout.log",
+                reviews.RESULT_PREFIX + "not-valid-json\\n" +
+                "ordinary job output GRABOWSKI_DECISION_REVIEW_V1=example\\n",
+            )
+            write_private(
+                ordinary / reviews.REVIEW_ROLE_ATTEMPT_RECEIPT_NAME,
+                json.dumps({"expected_head": "d" * 40}),
+            )
+            checked = self.reconcile(jobs)
+        self.assertEqual(checked["status"], "settled")
+        self.assertEqual(checked["attempt_count"], 1)
+        self.assertEqual(checked["errors"], [])
+
+    def test_foreign_v2_receipt_matching_only_head_cannot_block_or_hide_reject(self) -> None:
+        # An ordinary job's unauthenticated role receipt can name the same
+        # HEAD but a different BASE and DIFF. It cannot deny an independent
+        # review of this revision, unless residual exact-bound evidence exists.
+        with tempfile.TemporaryDirectory() as temporary:
+            jobs = Path(temporary) / "jobs"
+            jobs.mkdir(mode=0o700)
+            make_job(
+                jobs, suffix="aaaaaaaaa241", slot="A",
+                terminal_status="succeeded",
+                review_result=result("A", "PASS_THIS_REVISION", 0),
+            )
+            ordinary = jobs / "grabowski-job-bbbbbbbbb242"
+            ordinary.mkdir(mode=0o700)
+            scope = {
+                "cwd": "/tmp", "argv_sha256": "e" * 64,
+                "runtime_seconds": 60,
+            }
+            origin, digest = job_origin.build_origin(
+                unit=ordinary.name, owner=f"uid:{os.getuid()}",
+                argv_sha256="e" * 64, scope=scope,
+                notify_on_done={"requested": False, "channels": []},
+                created_at_unix=1_787_000_000,
+                started_at="2026-08-18T12:00:00Z",
+                invoker_tool="grabowski_job_start",
+            )
+            write_private(ordinary / "metadata.json", json.dumps({
+                "unit": ordinary.name, "job_id": origin["job_id"],
+                "owner": origin["owner"], "argv_sha256": origin["argv_sha256"],
+                "scope": scope, "origin": origin, "origin_sha256": digest,
+            }))
+            stdout = ordinary / "stdout.log"
+            write_private(stdout, "")
+            write_private(
+                ordinary / reviews.REVIEW_ROLE_ATTEMPT_RECEIPT_NAME,
+                json.dumps({
+                    "expected_head": HEAD,
+                    "expected_base_head": "d" * 40,
+                    "expected_diff_sha256": "e" * 64,
+                }),
+            )
+            unrelated = self.reconcile(jobs)
+            self.assertEqual(unrelated["status"], "settled")
+            self.assertEqual(unrelated["errors"], [])
+            self.assertEqual(unrelated["attempt_count"], 1)
+
+            # If metadata was rebound but the genuine review stdout remains,
+            # a material REJECT for this exact revision must still block.
+            write_private(
+                stdout,
+                reviews.RESULT_PREFIX +
+                json.dumps(result("A", "REJECT_THIS_REVISION", 1)) + "\n",
+            )
+            retained_reject = self.reconcile(jobs)
+        self.assertEqual(retained_reject["status"], "blocked")
+        self.assertIn(
+            f"decision_review_unbound_result:{ordinary.name}",
+            retained_reject["errors"],
+        )
+
+    def test_replaced_v2_origin_with_role_receipt_still_blocks(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            jobs = Path(temp) / "jobs"
+            jobs.mkdir(mode=0o700)
+            make_job(
+                jobs, suffix="aaaaaaaaa215", slot="A",
+                terminal_status="succeeded",
+                review_result=result("A", "PASS_THIS_REVISION", 0),
+            )
+            rejected = make_job(
+                jobs, suffix="bbbbbbbbb216", slot="A",
+                terminal_status="succeeded", review_result=None,
+                review_role=True, attempt_bound=True, attempt_epoch=2,
+            )
+            self.assertTrue((rejected / reviews.REVIEW_ROLE_ATTEMPT_RECEIPT_NAME).is_file())
+            metadata_path = rejected / "metadata.json"
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            scope = dict(metadata["scope"])
+            for key in (
+                "decision_bound_review", "decision_review_provenance",
+                "decision_review_attempt_epoch",
+            ):
+                scope.pop(key, None)
+            metadata["scope"] = scope
+            metadata["origin"]["scope"] = scope
+            metadata["origin_sha256"] = reviews.sha256_json(metadata["origin"])
+            write_private(metadata_path, json.dumps(metadata))
+            # A surviving, exactly bound V2 role receipt stays blocking even
+            # when stdout itself exceeds the ordinary-job inspection cap.
+            with (rejected / "stdout.log").open("wb") as stream:
+                stream.truncate(reviews.MAX_UNBOUND_STDOUT_BYTES + 1)
+            os.chmod(rejected / "stdout.log", 0o600)
+            checked = self.reconcile(jobs)
+        self.assertEqual(checked["status"], "blocked")
+        self.assertIn(
+            f"decision_review_unbound_result:{rejected.name}", checked["errors"]
+        )
+
+    def test_preserved_material_reject_padded_after_origin_rewrite_stays_blocked(self) -> None:
+        # A legitimate bound REJECT must not disappear solely because its
+        # surviving stdout grows beyond the unrelated-job inspection limit.
+        # Only synthetic private fixtures are modified, never real job data.
+        with tempfile.TemporaryDirectory() as temp:
+            jobs = Path(temp) / "jobs"
+            jobs.mkdir(mode=0o700)
+            make_job(
+                jobs, suffix="aaaaaaaaa251", slot="A",
+                terminal_status="succeeded",
+                review_result=result("A", "PASS_THIS_REVISION", 0),
+            )
+            rejected = make_job(
+                jobs, suffix="bbbbbbbbb252", slot="A",
+                terminal_status="succeeded",
+                review_result=result("A", "REJECT_THIS_REVISION", 1),
+            )
+            self.assertEqual(self.reconcile(jobs)["status"], "blocked")
+            metadata_path = rejected / "metadata.json"
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            scope = dict(metadata["scope"])
+            for key in (
+                "decision_bound_review", "decision_review_provenance",
+                "decision_review_attempt_epoch",
+            ):
+                scope.pop(key, None)
+            metadata["scope"] = scope
+            metadata["origin"]["scope"] = scope
+            metadata["origin_sha256"] = reviews.sha256_json(metadata["origin"])
+            write_private(metadata_path, json.dumps(metadata))
+            stdout = rejected / "stdout.log"
+            original = stdout.read_bytes()
+            with stdout.open("ab") as stream:
+                stream.truncate(reviews.MAX_UNBOUND_STDOUT_BYTES + 1)
+            with stdout.open("rb") as stream:
+                self.assertEqual(stream.read(len(original)), original)
+            checked = self.reconcile(jobs)
+        self.assertEqual(checked["status"], "blocked")
+        self.assertTrue(any(
+            error.startswith("decision_review_unbound_")
+            for error in checked["errors"]
+        ))
+
+    def test_unbound_oversized_stdout_without_origin_proof_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            jobs = Path(temp) / "jobs"
+            jobs.mkdir(mode=0o700)
+            make_job(
+                jobs, suffix="aaaaaaaaa217", slot="A",
+                terminal_status="succeeded",
+                review_result=result("A", "PASS_THIS_REVISION", 0),
+            )
+            ordinary = jobs / "grabowski-job-bbbbbbbbb218"
+            ordinary.mkdir(mode=0o700)
+            scope = {"cwd": "/tmp", "argv_sha256": "e" * 64, "runtime_seconds": 60}
+            origin, digest = job_origin.build_origin(
+                unit=ordinary.name, owner=f"uid:{os.getuid()}",
+                argv_sha256="e" * 64, scope=scope,
+                notify_on_done={"requested": False, "channels": []},
+                created_at_unix=1_787_000_000,
+                started_at="2026-08-18T12:00:00Z",
+                invoker_tool="grabowski_job_start",
+            )
+            write_private(ordinary / "metadata.json", json.dumps({
+                "unit": ordinary.name, "job_id": origin["job_id"],
+                "owner": origin["owner"], "argv_sha256": origin["argv_sha256"],
+                "scope": scope, "origin": origin, "origin_sha256": digest,
+            }))
+            with (ordinary / "stdout.log").open("wb") as stream:
+                stream.truncate(reviews.MAX_UNBOUND_STDOUT_BYTES + 1)
+            os.chmod(ordinary / "stdout.log", 0o600)
+            checked = self.reconcile(jobs)
+        # Without a separately authenticated origin, this could be a former
+        # reviewer whose retained material REJECT now lies beyond the limit.
+        self.assertEqual(checked["status"], "blocked")
+        self.assertIn(
+            f"decision_review_unbound_evidence_invalid:{ordinary.name}:ValueError",
+            checked["errors"],
+        )
 
     def test_malformed_targeted_registration_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
