@@ -2388,6 +2388,58 @@ class GrokReviewRoleTests(unittest.TestCase):
                         object_format="sha256",
                     )
 
+    @staticmethod
+    def _native_sha256_git_commits(directory: str) -> tuple[Path, str, str]:
+        """Create a disposable SHA-256 Git fixture without inherited Git scope."""
+        import subprocess
+
+        repo = Path(directory) / "native-sha256"
+        # Even git -C can follow inherited Git directories, indexes, object
+        # stores and config. Keep every subprocess wholly inside this root.
+        env = {
+            key: value for key, value in os.environ.items()
+            if not key.startswith("GIT_")
+        }
+        env.update({
+            "HOME": directory,
+            "XDG_CONFIG_HOME": directory,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_NO_REPLACE_OBJECTS": "1",
+            "GIT_GRAFT_FILE": os.devnull,
+            "GIT_TERMINAL_PROMPT": "0",
+        })
+        git_options = (
+            "-c", "commit.gpgsign=false",
+            "-c", "core.hooksPath=/dev/null",
+            "-c", "core.fsmonitor=false",
+        )
+        subprocess.run(
+            ["git", *git_options, "init", "--quiet", "--object-format=sha256", str(repo)],
+            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env=env, timeout=30,
+        )
+
+        def git(*args: str) -> str:
+            return subprocess.run(
+                ["git", *git_options,
+                 "-c", "user.name=Review Test", "-c", "user.email=review@example.org",
+                 "-C", str(repo), *args],
+                check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                env=env, timeout=30,
+            ).stdout.decode().strip()
+
+        file = repo / "src" / "change.txt"
+        file.parent.mkdir()
+        file.write_text("before\n", encoding="utf-8")
+        git("add", "src/change.txt")
+        git("commit", "-m", "before")
+        base = git("rev-parse", "HEAD")
+        file.write_text("after\n", encoding="utf-8")
+        git("add", "src/change.txt")
+        git("commit", "-m", "after")
+        return repo, base, git("rev-parse", "HEAD")
+
     def test_sha256_native_committed_diff_rejects_mixed_widths(self) -> None:
         import subprocess
         with tempfile.TemporaryDirectory() as directory:
@@ -2422,6 +2474,69 @@ class GrokReviewRoleTests(unittest.TestCase):
                 with self.subTest(bad_len=len(bad), upper=bad[:1].isupper()):
                     with self.assertRaisesRegex(RuntimeError, "exact base and head"):
                         role.committed_diff(repo, base, bad)
+
+    def test_sha256_native_fixture_ignores_poisoned_git_environment(self) -> None:
+        # Exercise the fixture's subprocesses under deliberately hostile Git
+        # environment. Independently test role.committed_diff after restoring
+        # the real process environment; that is a distinct production contract.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            poisoned = {
+                "GIT_DIR": str(root / "foreign.git"),
+                "GIT_WORK_TREE": str(root / "foreign-worktree"),
+                "GIT_INDEX_FILE": str(root / "foreign.index"),
+                "GIT_OBJECT_DIRECTORY": str(root / "foreign-objects"),
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(root / "foreign-alternates"),
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "core.hooksPath",
+                "GIT_CONFIG_VALUE_0": str(root / "foreign-hooks"),
+                "GIT_CONFIG_GLOBAL": str(root / "foreign-global-config"),
+                "GIT_CONFIG_NOSYSTEM": "0",
+                "GIT_TRACE": str(root / "foreign-trace"),
+            }
+            # A poisoned hooksPath only has an observable effect if an
+            # executable hook exists; additionally capture the actual env.
+            import shlex
+            import subprocess
+
+            hook_dir = root / "foreign-hooks"
+            hook_dir.mkdir(mode=0o700)
+            hook_witness = root / "foreign-hook-fired"
+            hook = hook_dir / "pre-commit"
+            hook.write_text(
+                "#!/bin/sh\nprintf 'injected' > "
+                + shlex.quote(str(hook_witness)) + "\n",
+                encoding="utf-8",
+            )
+            hook.chmod(0o700)
+            subprocess_envs: list[dict[str, str]] = []
+            real_run = subprocess.run
+
+            def record_git_run(*args: Any, **kwargs: Any) -> Any:
+                subprocess_envs.append(dict(kwargs["env"]))
+                return real_run(*args, **kwargs)
+
+            with (
+                mock.patch.dict(os.environ, poisoned),
+                mock.patch.object(subprocess, "run", side_effect=record_git_run),
+            ):
+                repo, base, head = self._native_sha256_git_commits(directory)
+            self.assertTrue(subprocess_envs)
+            for env in subprocess_envs:
+                self.assertEqual("1", env.get("GIT_CONFIG_NOSYSTEM"))
+                self.assertEqual(os.devnull, env.get("GIT_CONFIG_GLOBAL"))
+                for key in poisoned:
+                    if key not in {"GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_GLOBAL"}:
+                        self.assertNotIn(key, env)
+            self.assertFalse(hook_witness.exists())
+            self.assertEqual((64, 64), (len(base), len(head)))
+            self.assertIn(b"+after", role.committed_diff(repo, base, head))
+            for name in (
+                "foreign.git", "foreign-worktree", "foreign.index",
+                "foreign-objects", "foreign-trace",
+            ):
+                with self.subTest(path=name):
+                    self.assertFalse((root / name).exists())
 
     def test_sha256_review_main_passes_valid_bound_input_without_provider(self) -> None:
         from types import SimpleNamespace
