@@ -76,6 +76,10 @@ def unit_argv(
 
     properties = [
         "Type=exec",
+        # The root-side one-shot sender verifier refuses mutable PID1
+        # MainPID settings.  These cannot be inherited as unproven defaults.
+        "NotifyAccess=none",
+        "PIDFile=",
         "DynamicUser=yes",
         f"User={name}",
         f"Group={name}",
@@ -121,6 +125,11 @@ def unit_argv(
             [
                 f"StateDirectory={' '.join([f'{name}/epoch/{x}' for x in _OUTPUTS] + [f'{name}/repos'])}",
                 "StateDirectoryMode=0700",
+                # A model-driven child must never inherit a privileged caller's
+                # terminal or stdio. Probe-only --pipe remains for diagnostics.
+                "StandardInput=null",
+                "StandardOutput=journal",
+                "StandardError=journal",
             ]
         )
 
@@ -128,8 +137,7 @@ def unit_argv(
         "/usr/bin/systemd-run",
         "--system",
         "--wait",
-        "--pipe",
-        *(["--collect"] if probe else []),
+        *(["--pipe", "--collect"] if probe else []),
         f"--unit={name}",
         *(f"--property={p}" for p in properties),
         "--",
