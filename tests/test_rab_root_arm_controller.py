@@ -67,6 +67,33 @@ class RootArmPolicyTests(unittest.TestCase):
         self.assertTrue(first.endswith(".service") and second.endswith(".service"))
         self.assertNotEqual(controller._token(p, 0), controller._token(p, 1))
 
+    def test_pair_scoped_private_state_survives_distinct_root_units(self) -> None:
+        p = controller._pair_policy(_pair())
+        first, second = controller._unit_argv(p, 0), controller._unit_argv(p, 1)
+        self.assertNotEqual(first[first.index("--") + 1:], second[second.index("--") + 1:])
+        for prop in (
+            "--property=DynamicUser=yes",
+            "--property=ProtectHome=tmpfs",
+            "--property=StateDirectoryMode=0700",
+        ):
+            self.assertIn(prop, first)
+            self.assertIn(prop, second)
+        first_state = [item for item in first if item.startswith("--property=StateDirectory=")]
+        second_state = [item for item in second if item.startswith("--property=StateDirectory=")]
+        self.assertEqual(len(first_state), 1)
+        self.assertEqual(first_state, second_state)
+        self.assertRegex(first_state[0], r"^--property=StateDirectory=grabowski-rab-pair-[0-9a-f]{16}$")
+        home = first_state[0].removeprefix("--property=StateDirectory=")
+        for argv in (first, second):
+            self.assertIn("--property=Environment=HOME=/var/lib/" + home, argv)
+            self.assertNotIn("--property=ProtectHome=read-only", argv)
+        changed = _pair()
+        changed["pair_id"] = "separate-frozen-pair"
+        self.assertNotEqual(
+            first_state,
+            [item for item in controller._unit_argv(changed, 0) if item.startswith("--property=StateDirectory=")],
+        )
+
     def test_subscription_contract_fails_closed(self) -> None:
         for key, value in (
             ("provider", "openai-api-payg"),

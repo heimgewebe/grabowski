@@ -178,6 +178,21 @@ def _unit(policy: dict[str, Any], index: int) -> str:
     return "grabowski-rab-" + _token(policy, index)[:16] + ".service"
 
 
+def _pair_state_directory(policy: dict[str, Any]) -> str:
+    """One private systemd StateDirectory for both PID1 units of one pair.
+
+    Each arm has its own unit, invocation and spent marker. Their existing
+    preflight ledger and provider evidence must nonetheless survive arm 1.
+    The independent two-unit DynamicUser host probe verified this state
+    mechanism; it does not authorize any provider start.
+    """
+    identity = {
+        "epoch_sha256": policy["epoch_sha256"],
+        "pair_id": policy["pair_id"],
+    }
+    return "grabowski-rab-pair-" + _sha(_canonical(identity))[:16]
+
+
 def _write_once(fd: int, filename: str, value: dict[str, Any]) -> None:
     if "/" in filename or filename in {"", ".", ".."}:
         raise ArmDenied("root receipt filename is unsafe")
@@ -314,7 +329,8 @@ def _unit_argv(policy: dict[str, Any], index: int) -> list[str]:
     _pair_policy(policy)
     pos = policy["positions"][index]
     unit = _unit(policy, index)
-    home = "/var/lib/" + unit.removesuffix(".service")
+    pair_state = _pair_state_directory(policy)
+    home = "/var/lib/" + pair_state
     credential = _CREDENTIAL_ROOT / ("epoch-" + policy["epoch_sha256"] + ".auth")
     pair_file = _POLICY_ROOT / ("epoch-" + policy["epoch_sha256"] + ".json")
     request_file = _REQUEST_ROOT / ("slot-" + pos["slot_id"] + ".json")
@@ -352,7 +368,7 @@ def _unit_argv(policy: dict[str, Any], index: int) -> list[str]:
         f"RuntimeMaxSec={policy['max_wall_seconds'] + 120}",
         "MemoryMax=512M",
         "TasksMax=128",
-        f"StateDirectory={unit.removesuffix('.service')}",
+        f"StateDirectory={pair_state}",
         "StateDirectoryMode=0700",
         f"Environment=HOME={home}",
         # PID1 loads only root-installed fixed inputs. The dynamic-user child
