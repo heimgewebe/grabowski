@@ -68,6 +68,35 @@ TASK_OUTPUT_CAPTURE_SCRIPT = re.compile(
 )
 TASK_OUTPUT_CAPTURE_PAYLOAD = re.compile(r"[A-Za-z0-9+/]+={0,2}\Z")
 TASK_OUTPUT_CAPTURE_MAX_PAYLOAD_BYTES = 256 * 1024
+TASK_HOME_USERNAME = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]{0,63}\Z")
+
+
+def _task_home(host: dict[str, Any]) -> str:
+    return str(host.get("task_home", HOME))
+
+
+def task_home(name: str) -> str:
+    return _task_home(fleet_host(name))
+
+
+def _capture_script_pattern(host: dict[str, Any]) -> re.Pattern[str]:
+    home = _task_home(host)
+    if home == str(HOME):
+        return TASK_OUTPUT_CAPTURE_SCRIPT
+    return re.compile(
+        re.escape(home)
+        + r"/\.local/state/grabowski/task-capture/capture-([0-9a-f]{64})\.py\Z"
+    )
+
+
+def _task_output_directory_pattern(host: dict[str, Any]) -> re.Pattern[str]:
+    home = _task_home(host)
+    if home == str(HOME):
+        return TASK_OUTPUT_DIRECTORY
+    return re.compile(
+        re.escape(home)
+        + r"/\.grabowski-task-output-([0-9a-f]{24})-a([1-9][0-9]*)\Z"
+    )
 
 
 class FleetCommandDenied(PermissionError):
@@ -111,7 +140,7 @@ def validate_fleet(raw: dict[str, Any]) -> dict[str, Any]:
             raise ValueError(f"Fleet host {name} must be an object")
         _keys(candidate,
               {"transport", "target", "enabled", "roles", "command_allowlist"},
-              {"connect_timeout_seconds", "remote_command_mode"}, f"Fleet host {name}")
+              {"connect_timeout_seconds", "remote_command_mode", "task_home"}, f"Fleet host {name}")
         transport = candidate["transport"]
         target = candidate["target"]
         roles = candidate["roles"]
@@ -138,6 +167,18 @@ def validate_fleet(raw: dict[str, Any]) -> dict[str, Any]:
             raise ValueError(f"Fleet host {name} has invalid remote command mode")
         if transport != "ssh" and remote_command_mode != "posix":
             raise ValueError(f"Fleet host {name} remote command mode requires SSH transport")
+        task_home_value = candidate.get("task_home")
+        if "task_home" in candidate:
+            if transport != "ssh" or remote_command_mode != "posix":
+                raise ValueError(f"Fleet host {name} task_home requires POSIX SSH")
+            if (
+                not isinstance(task_home_value, str)
+                or not task_home_value.startswith("/home/")
+                or TASK_HOME_USERNAME.fullmatch(task_home_value[6:]) is None
+                or task_home_value[6:] in {".", ".."}
+                or ("@" in target and target.split("@", 1)[0] != task_home_value[6:])
+            ):
+                raise ValueError(f"Fleet host {name} task_home is invalid or mismatched")
         hosts[name] = {
             **candidate,
             "connect_timeout_seconds": timeout,
@@ -268,7 +309,7 @@ def run_fleet_task_output_read(
     code_sha256 = hashlib.sha256(command[2].encode("utf-8")).hexdigest()
     if code_sha256 != TASK_OUTPUT_READ_CODE_SHA256:
         raise PermissionError("Task-output reader code identity mismatch")
-    directory_match = TASK_OUTPUT_DIRECTORY.fullmatch(command[3])
+    directory_match = _task_output_directory_pattern(host).fullmatch(command[3])
     if directory_match is None:
         raise ValueError("Invalid task-output directory")
     if command[4] not in TASK_OUTPUT_STREAM:
@@ -363,7 +404,7 @@ def run_fleet_task_capture_stage(
     code_sha256 = hashlib.sha256(command[2].encode("utf-8")).hexdigest()
     if code_sha256 != TASK_OUTPUT_CAPTURE_STAGE_CODE_SHA256:
         raise PermissionError("Capture stager code identity mismatch")
-    script_match = TASK_OUTPUT_CAPTURE_SCRIPT.fullmatch(command[3])
+    script_match = _capture_script_pattern(host).fullmatch(command[3])
     if script_match is None:
         raise ValueError("Invalid capture script destination")
     payload = command[4]
@@ -458,7 +499,7 @@ def run_fleet_task_output_cleanup(
     mode = command[3]
     if mode not in {"inspect", "delete"}:
         raise ValueError("Invalid task-output cleanup mode")
-    directory_match = TASK_OUTPUT_DIRECTORY.fullmatch(command[4])
+    directory_match = _task_output_directory_pattern(host).fullmatch(command[4])
     if directory_match is None:
         raise ValueError("Invalid task-output cleanup directory")
     if re.fullmatch(r"[0-9a-f]{64}", command[5]) is None:

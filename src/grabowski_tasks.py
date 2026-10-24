@@ -122,6 +122,7 @@ TASK_OUTPUT_LEGACY_ROOT = Path(operator.HOME)
 TASK_OUTPUT_CONTRACT_VERSION = 2
 TASK_OUTPUT_LEGACY_CONTRACT_VERSION = 1
 TASK_OUTPUT_LAUNCHER_BINDING_KEY = "task_output_managed_from_attempt"
+TASK_OUTPUT_REMOTE_HOME_BINDING_KEY = "task_output_remote_home"
 TASK_OUTPUT_DIRECTORY_PREFIX = ".grabowski-task-output"
 TASK_OUTPUT_MAX_BYTES = 8 * 1024 * 1024
 TASK_OUTPUT_TAIL_BYTES = 64 * 1024
@@ -3169,7 +3170,7 @@ def _reconcile_runtime_refresh_prelaunch_binding_journals(
     return {**material, "recovery_sha256": _sha256_json(material)}
 
 def _validate_cwd(host: str, raw: str | None) -> str:
-    candidate = str(operator.HOME) if raw is None else raw
+    candidate = fleet.task_home(host) if raw is None else raw
     if not isinstance(candidate, str) or not candidate.startswith("/"):
         raise ValueError("Task cwd must be an absolute path")
     if len(candidate.encode("utf-8")) > 4096 or "\x00" in candidate:
@@ -5903,6 +5904,29 @@ def _task_output_managed_from_attempt(record: dict[str, Any]) -> int | None:
     return value
 
 
+def _task_output_remote_home(record: dict[str, Any]) -> str | None:
+    raw = record.get("launcher_json")
+    if not isinstance(raw, str):
+        return None
+    try:
+        launcher = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("task remote home binding is invalid JSON") from exc
+    if not isinstance(launcher, dict):
+        raise RuntimeError("task remote home binding is invalid")
+    home = launcher.get(TASK_OUTPUT_REMOTE_HOME_BINDING_KEY)
+    if home is None:
+        return None
+    target = fleet.fleet_host(str(record["host"]))
+    if (
+        not isinstance(home, str)
+        or target["transport"] != "ssh"
+        or target.get("task_home") != home
+    ):
+        raise RuntimeError("task remote home binding differs from fleet authority")
+    return home
+
+
 def _task_output_root(record: dict[str, Any]) -> Path:
     attempt = record.get("attempt")
     if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1:
@@ -5911,7 +5935,7 @@ def _task_output_root(record: dict[str, Any]) -> Path:
     root = (
         Path(TASK_OUTPUT_ROOT)
         if managed_from is not None and attempt >= managed_from
-        else Path(TASK_OUTPUT_LEGACY_ROOT)
+        else Path(_task_output_remote_home(record) or TASK_OUTPUT_LEGACY_ROOT)
     )
     if not root.is_absolute():
         raise RuntimeError("task output root must be absolute")
@@ -6015,10 +6039,16 @@ def _bind_task_output_managed_from_attempt(
     return _row_raw(identifier)
 
 
-def _task_output_capture_script_path() -> Path:
-    """Return the wrapper path without touching the filesystem."""
+def _task_output_capture_script_path(record: dict[str, Any] | None = None) -> Path:
+    """Return the local or bound remote wrapper path without filesystem effects."""
     digest = hashlib.sha256(TASK_OUTPUT_CAPTURE_CODE.encode("utf-8")).hexdigest()
-    return TASK_OUTPUT_CAPTURE_SCRIPT_ROOT / f"capture-{digest}.py"
+    home = _task_output_remote_home(record) if record is not None else None
+    root = (
+        Path(home) / ".local/state/grabowski/task-capture"
+        if home is not None
+        else TASK_OUTPUT_CAPTURE_SCRIPT_ROOT
+    )
+    return root / f"capture-{digest}.py"
 
 
 def _task_output_capture_script() -> Path:
@@ -6082,7 +6112,9 @@ def _task_output_capture_script() -> Path:
     return path
 
 
-def _stage_task_output_capture_script(host: str, *, transport: str) -> dict[str, Any]:
+def _stage_task_output_capture_script(
+    host: str, *, transport: str, record: dict[str, Any] | None = None
+) -> dict[str, Any]:
     """Make sure the wrapper exists on the host that will run the task.
 
     A local target is written directly. Any other transport executes the task
@@ -6095,7 +6127,7 @@ def _stage_task_output_capture_script(host: str, *, transport: str) -> dict[str,
     one, so a host whose command allowlist omits an interpreter can still
     launch tasks.
     """
-    path = _task_output_capture_script_path()
+    path = _task_output_capture_script_path(record)
     if transport == "local":
         _task_output_capture_script()
         return {"host": host, "transport": transport, "path": str(path), "status": "local"}
@@ -6113,7 +6145,9 @@ def _stage_task_output_capture_script(host: str, *, transport: str) -> dict[str,
         max_output_bytes=operator.DEFAULT_OUTPUT_BYTES,
     )
     result = staged["result"]
-    if result.get("returncode") != 0:
+    if result.get("returncode") != 0 or str(result.get("stdout", "")).strip() not in {
+        "written", "present"
+    }:
         raise RuntimeError(
             "task output capture script could not be staged on the task host"
         )
@@ -6130,7 +6164,7 @@ def _task_output_capture_argv(record: dict[str, Any]) -> list[str]:
     paths = _task_output_paths(record)
     return [
         TASK_OUTPUT_CAPTURE_PYTHON,
-        str(_task_output_capture_script_path()),
+        str(_task_output_capture_script_path(record)),
         str(paths["directory"]),
         str(TASK_OUTPUT_MAX_BYTES),
         str(TASK_OUTPUT_TAIL_BYTES),
@@ -6773,8 +6807,13 @@ def _launch(record: dict[str, Any]) -> dict[str, Any]:
             }
     target = fleet.fleet_host(record["host"])
     try:
+        if (
+            target["transport"] == "ssh"
+            and target.get("task_home") != _task_output_remote_home(record)
+        ):
+            raise RuntimeError("task remote home binding is missing or stale")
         _stage_task_output_capture_script(
-            record["host"], transport=target["transport"]
+            record["host"], transport=target["transport"], record=record
         )
     except (OSError, PermissionError, RuntimeError, ValueError) as exc:
         # The row is already committed as launching and its leases are held.
@@ -9588,6 +9627,11 @@ def grabowski_task_start(
         if target["transport"] == "local" and execution_backend == "systemd-user"
         else None
     )
+    task_output_remote_home = (
+        target.get("task_home")
+        if target["transport"] == "ssh" and execution_backend == "systemd-user"
+        else None
+    )
     executor_lease_binding_plan: dict[str, Any] | None = None
     executor_lease_binding_journal: dict[str, Any] | None = None
     executor_lease_binding: dict[str, Any] | None = None
@@ -9617,6 +9661,11 @@ def grabowski_task_start(
                 **(
                     {TASK_OUTPUT_LAUNCHER_BINDING_KEY: task_output_managed_from_attempt}
                     if task_output_managed_from_attempt is not None
+                    else {}
+                ),
+                **(
+                    {TASK_OUTPUT_REMOTE_HOME_BINDING_KEY: task_output_remote_home}
+                    if task_output_remote_home is not None
                     else {}
                 ),
                 "task_effect_classification": dict(
@@ -9912,6 +9961,11 @@ def grabowski_task_start(
         raise
     launcher = {
         **_launch(record),
+        **(
+            {TASK_OUTPUT_REMOTE_HOME_BINDING_KEY: task_output_remote_home}
+            if task_output_remote_home is not None
+            else {}
+        ),
         "task_effect_classification": dict(task_effect_classification),
         **(
             {
@@ -10413,10 +10467,20 @@ def grabowski_task_resume(
             coding_agent_pre_dispatch_admission = candidate_admission
     attempt = int(record["attempt"]) + 1
     task_output_managed_from_attempt = _task_output_managed_from_attempt(record)
+    task_output_remote_home = _task_output_remote_home(record)
+    if task_output_remote_home is not None:
+        recovery_launcher_bindings[TASK_OUTPUT_REMOTE_HOME_BINDING_KEY] = (
+            task_output_remote_home
+        )
     if not _is_root_systemd_backend(record):
         _resolved_host, resume_target, _legacy_local_alias = (
             _resolve_task_dispatch_host(str(record["host"]))
         )
+        if (
+            resume_target["transport"] == "ssh"
+            and resume_target.get("task_home") != task_output_remote_home
+        ):
+            raise RuntimeError("task remote home binding is missing or stale on resume")
         if task_output_managed_from_attempt is None:
             if resume_target["transport"] == "local":
                 record = _bind_task_output_managed_from_attempt(
@@ -10514,6 +10578,11 @@ def grabowski_task_resume(
                 "reconciled" if lease_result.get("preserved") else "reacquired"
             )
     launcher = _launch(candidate)
+    if task_output_remote_home is not None:
+        launcher = {
+            **launcher,
+            TASK_OUTPUT_REMOTE_HOME_BINDING_KEY: task_output_remote_home,
+        }
     if coding_agent_pre_dispatch_admission is not None:
         launcher = {
             **launcher,

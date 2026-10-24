@@ -357,8 +357,9 @@ class TaskTests(unittest.TestCase):
         )
         separator = launch.index("--")
         capture = launch[separator + 1 :]
-        paths = tasks._task_output_paths(result["task"])
-        script = tasks._task_output_capture_script_path()
+        persisted = tasks._row_raw(str(result["task"]["task_id"]))
+        paths = tasks._task_output_paths(persisted)
+        script = tasks._task_output_capture_script_path(persisted)
         if selected["transport"] == "local":
             self.assertTrue(script.is_file(), "local launch must stage the wrapper")
             self.assertEqual(script.read_text(), tasks.TASK_OUTPUT_CAPTURE_CODE)
@@ -499,6 +500,70 @@ class TaskTests(unittest.TestCase):
             tasks.fleet,
             "run_fleet_task_capture_stage",
             return_value={"result": {"returncode": 1, "stdout": ""}},
+        ):
+            with self.assertRaisesRegex(RuntimeError, "could not be staged"):
+                tasks._stage_task_output_capture_script("heimserver", transport="ssh")
+
+    def test_ssh_task_home_is_bound_across_stage_capture_read_and_cleanup(self) -> None:
+        with patch.dict(REMOTE_HOST, {"task_home": "/home/remote"}), patch.object(
+            tasks.fleet, "fleet_host", return_value=REMOTE_HOST
+        ):
+            self.assertEqual(tasks._validate_cwd("heimserver", None), "/home/remote")
+            started = self._start(host="heimserver")
+            record = tasks._row_raw(str(started["task"]["task_id"]))
+            binding = json.loads(record["launcher_json"])
+            self.assertEqual(binding["task_output_remote_home"], "/home/remote")
+            script = tasks._task_output_capture_script_path(record)
+            self.assertEqual(
+                script.parent, Path("/home/remote/.local/state/grabowski/task-capture")
+            )
+            capture = tasks._task_output_capture_argv(record)
+            self.assertEqual(capture[1], str(script))
+            self.assertEqual(capture[2], str(tasks._task_output_paths(record)["directory"]))
+            self.assertTrue(capture[2].startswith("/home/remote/.grabowski-task-output-"))
+            cleanup = tasks._task_output_cleanup_argv(
+                record, mode="inspect", token="a" * 64
+            )
+            self.assertEqual(cleanup[4], capture[2])
+            with patch.object(
+                tasks.fleet, "run_fleet_task_capture_stage",
+                return_value={"result": {"returncode": 0, "stdout": "present"}},
+            ) as stage:
+                staged = tasks._stage_task_output_capture_script(
+                    "heimserver", transport="ssh", record=record
+                )
+            self.assertEqual(staged["path"], str(script))
+            self.assertEqual(stage.call_args.args[1][3], str(script))
+
+    def test_remote_home_drift_stops_launch_without_dispatch(self) -> None:
+        with patch.dict(REMOTE_HOST, {"task_home": "/home/remote"}), patch.object(
+            tasks.fleet, "fleet_host", return_value=REMOTE_HOST
+        ):
+            started = self._start(host="heimserver")
+            record = tasks._row_raw(str(started["task"]["task_id"]))
+            REMOTE_HOST["task_home"] = "/home/other"
+            with self.assertRaisesRegex(RuntimeError, "differs from fleet authority"):
+                tasks._task_output_paths(record)
+            with patch.object(tasks, "_dispatch") as dispatch:
+                refused = tasks._launch(record)
+            dispatch.assert_not_called()
+            self.assertTrue(refused["launch_not_dispatched"])
+            self.assertEqual(refused["returncode"], 1)
+
+    def test_legacy_ssh_task_cannot_silently_adopt_new_home(self) -> None:
+        started = self._start(host="heimserver")
+        record = tasks._row_raw(str(started["task"]["task_id"]))
+        with patch.dict(REMOTE_HOST, {"task_home": "/home/remote"}), patch.object(
+            tasks.fleet, "fleet_host", return_value=REMOTE_HOST
+        ), patch.object(tasks, "_dispatch") as dispatch:
+            result = tasks._launch(record)
+        dispatch.assert_not_called()
+        self.assertTrue(result["launch_not_dispatched"])
+
+    def test_ssh_capture_staging_requires_positive_bound_readback(self) -> None:
+        with patch.object(
+            tasks.fleet, "run_fleet_task_capture_stage",
+            return_value={"result": {"returncode": 0, "stdout": "unverified"}},
         ):
             with self.assertRaisesRegex(RuntimeError, "could not be staged"):
                 tasks._stage_task_output_capture_script("heimserver", transport="ssh")
