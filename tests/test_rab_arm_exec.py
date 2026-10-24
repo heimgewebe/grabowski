@@ -308,5 +308,95 @@ class SubscriptionSystemdCredentialTests(unittest.TestCase):
             self.assertNotIn("CODEX_ACCESS_TOKEN", forwarded)
 
 
+class RootSubscriptionOneShotContractTests(unittest.TestCase):
+    def test_default_live_runner_remains_fail_closed(self) -> None:
+        from tests.test_repobrief_agent_benchmark_codex_runner import runner
+        policy, request = pair()
+        with mock.patch.dict(os.environ, {"CREDENTIALS_DIRECTORY": ""}):
+            with self.assertRaises(runner.RunnerError):
+                runner._require_in_process_pair_condition(request)
+            with self.assertRaises(runner.RunnerError):
+                runner._require_external_provider_one_shot(
+                    request=request, authorization={"status": "authorized"}
+                )
+
+    def test_forged_credential_directory_must_not_authorize_provider(self) -> None:
+        from tests.test_repobrief_agent_benchmark_codex_runner import runner
+        _, request = pair()
+        with mock.patch.dict(os.environ, {"CREDENTIALS_DIRECTORY": "/tmp/fake"}):
+            with self.assertRaisesRegex(runner.RunnerError, "root-controlled"):
+                runner._verified_root_systemd_one_shot(request)
+
+    def test_exact_kernel_root_unit_and_frozen_request_are_both_required(self) -> None:
+        from tests.test_repobrief_agent_benchmark_codex_runner import runner
+        policy, request = pair()
+        # The successful mocked branch does not establish any host isolation.
+        token = arm._unit(policy["epoch_sha256"], policy["pair_id"], policy["positions"][0]["slot_id"])
+        cred = "/run/credentials/" + token
+        saved = {
+            "pair.json": json.dumps(policy).encode("utf-8"),
+            "request.json": json.dumps(request).encode("utf-8"),
+        }
+        status = "NoNewPrivs:\t1\nCapEff:\t0\nCapPrm:\t0\nCapAmb:\t0\n"
+        kernel = {"cgroup": ("0::/system.slice/" + token + "\n").encode()}
+        def readfixed(path, *, label, max_bytes):
+            return saved[Path(path).name]
+        auth = {
+            "status": "authorized",
+            "pair_id": request["pair_id"],
+            "request_sha256": {"baseline": runner.base._sha256_json(request)},
+        }
+        with (
+            mock.patch.dict(os.environ, {"CREDENTIALS_DIRECTORY": cred}),
+            mock.patch.object(runner.os, "getuid", return_value=1000),
+            mock.patch.object(runner.os, "geteuid", return_value=1000),
+            mock.patch.object(runner, "_assert_initial_kernel_namespaces") as initial_ns,
+            mock.patch.object(runner, "_authenticated_procfs_evidence", return_value=(status.encode(), b"mountinfo")),
+            mock.patch.object(runner, "_authenticated_procfs_cgroup", side_effect=lambda: kernel["cgroup"]),
+            mock.patch.object(runner.Path, "lstat", return_value=SimpleNamespace(st_mode=0o40700)),
+            mock.patch.object(runner, "_read_bound_regular_file", side_effect=readfixed),
+        ):
+            self.assertIs(runner._verified_root_systemd_one_shot(request), True)
+            initial_ns.assert_called()
+            runner._require_in_process_pair_condition(request)
+            runner._require_external_provider_one_shot(request=request, authorization=auth)
+            for not_root_group in (
+                "0::/user.slice/user-1000.slice/" + token + "\n",
+                "0::/system.slice/another.service\n",
+            ):
+                kernel["cgroup"] = not_root_group.encode()
+                with self.subTest(cgroup=not_root_group), self.assertRaises(runner.RunnerError):
+                    runner._require_external_provider_one_shot(request=request, authorization=auth)
+            kernel["cgroup"] = ("0::/system.slice/" + token + "\n").encode()
+            with self.assertRaisesRegex(runner.RunnerError, "ledger"):
+                runner._require_external_provider_one_shot(
+                    request=request,
+                    authorization={**auth, "request_sha256": {"baseline": "a" * 64}},
+                )
+            saved["request.json"] = json.dumps({**request, "request_id": "spoofed"}).encode()
+            with self.assertRaisesRegex(runner.RunnerError, "unqualified"):
+                runner._require_in_process_pair_condition(request)
+
+
+    def test_provider_model_child_cannot_fake_initial_pid_namespace(self) -> None:
+        from tests.test_repobrief_agent_benchmark_codex_runner import runner
+        policy, request = pair()
+        unit = arm._unit(
+            policy["epoch_sha256"], policy["pair_id"], policy["positions"][0]["slot_id"]
+        )
+        with (
+            mock.patch.dict(os.environ, {"CREDENTIALS_DIRECTORY": "/run/credentials/" + unit}),
+            mock.patch.object(runner.os, "getuid", return_value=1000),
+            mock.patch.object(runner.os, "geteuid", return_value=1000),
+            mock.patch.object(runner, "_assert_initial_kernel_namespaces", side_effect=runner.RunnerError("nested pid namespace")),
+            mock.patch.object(runner, "_authenticated_procfs_evidence") as procfs,
+            mock.patch.object(runner, "_read_bound_regular_file") as credentials,
+        ):
+            with self.assertRaisesRegex(runner.RunnerError, "nested pid namespace"):
+                runner._verified_root_systemd_one_shot(request)
+            procfs.assert_not_called()
+            credentials.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

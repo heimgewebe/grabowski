@@ -10391,6 +10391,119 @@ def _fixture_capture(
     }
 
 
+_ROOT_ARM_PLAN_SHA256 = "2795584ac0c100cdceb6ed2c7eb42b883de2099b2a3d33ac51dbe9987655f10c"
+_ROOT_ARM_UNIT = re.compile(r"/run/credentials/(grabowski-rab-[0-9a-f]{16}\.service)\Z")
+
+
+def _verified_root_systemd_one_shot(request: Mapping[str, Any]) -> bool:
+    """A root-spent, PID1-identified arm, not a CLI flag or Python pair scope.
+
+    Return False only outside the root-arm service. A forged or malformed
+    CREDENTIALS_DIRECTORY is a hard error rather than a legacy fallback.
+    The fixed root controller creates this system service after its durable
+    single-use marker; an unprivileged user unit cannot claim its cgroup.
+    """
+    directory = os.environ.get("CREDENTIALS_DIRECTORY")
+    if directory is None:
+        return False
+    unit = _ROOT_ARM_UNIT.fullmatch(directory)
+    if (
+        unit is None
+        or os.geteuid() == 0
+        or os.getuid() != os.geteuid()
+        or not isinstance(request, Mapping)
+    ):
+        raise RunnerError("root-controlled provider arm identity is unavailable")
+    # The model runs in a bwrap PID/mount namespace and may fabricate
+    # /run/credentials plus ordinary files named /proc/self/cgroup. Reuse
+    # the already-established kernel-authenticated *initial* namespaces and
+    # procfs mount FDs; plain Path.read_text must never confer this grant.
+    _assert_initial_kernel_namespaces()
+    status_raw, _mountinfo_raw = _authenticated_procfs_evidence()
+    group_raw = _authenticated_procfs_cgroup()
+    try:
+        group = group_raw.decode("ascii", "strict")
+        fields = dict(
+            line.split(":", 1)
+            for line in status_raw.decode("ascii", "strict").splitlines()
+            if ":" in line
+        )
+        cdir = Path(directory).lstat()
+    except (OSError, UnicodeError) as exc:
+        raise RunnerError("root-controlled kernel identity is unreadable") from exc
+    if (
+        group != "0::/system.slice/" + unit.group(1) + "\n"
+        or not stat.S_ISDIR(cdir.st_mode)
+        or cdir.st_mode & 0o022
+        or fields.get("NoNewPrivs", "").strip() != "1"
+        or any(
+            int(fields.get(name, "-1").strip(), 16) != 0
+            for name in ("CapEff", "CapPrm", "CapAmb")
+        )
+    ):
+        raise RunnerError("root-controlled provider arm kernel restriction failed")
+    policy = base._load_object_bytes(
+        _read_bound_regular_file(
+            Path(directory) / "pair.json",
+            label="root systemd arm policy",
+            max_bytes=65536,
+        ),
+        label="root systemd arm policy",
+    )
+    saved = base._load_object_bytes(
+        _read_bound_regular_file(
+            Path(directory) / "request.json",
+            label="root systemd arm request",
+            max_bytes=base.MAX_REQUEST_BYTES,
+        ),
+        label="root systemd arm request",
+    )
+    if (
+        policy.get("kind") != "rab.root_controlled_separate_arms"
+        or type(policy.get("schema_version")) is not int
+        or policy["schema_version"] != 2
+        or policy.get("plan_sha256") != _ROOT_ARM_PLAN_SHA256
+        or policy.get("mode") != "chatgpt_subscription"
+        or policy.get("provider") != PROVIDER
+        or policy.get("model") != MODEL
+        or policy.get("reasoning") != "medium"
+        or type(policy.get("max_exec_per_arm")) is not int
+        or policy["max_exec_per_arm"] != 1
+        or type(policy.get("max_wall_seconds")) is not int
+        or policy["max_wall_seconds"] != 300
+        or policy.get("pair_id") != request.get("pair_id")
+        or not isinstance(policy.get("positions"), list)
+        or len(policy["positions"]) != 2
+        or base._sha256_json(saved) != base._sha256_json(request)
+    ):
+        raise RunnerError("root-controlled provider policy or request is unqualified")
+    matched = [
+        position for position in policy["positions"]
+        if isinstance(position, dict)
+        and position.get("arm") == request.get("condition")
+        and position.get("request_sha256") == base._sha256_json(request)
+    ]
+    if len(matched) != 1 or type(matched[0].get("index")) is not int or matched[0]["index"] not in (0, 1):
+        raise RunnerError("root-controlled provider slot binding is invalid")
+    index = matched[0]["index"]
+    if policy["positions"][index] != matched[0]:
+        raise RunnerError("root-controlled provider position was reordered")
+    slot = matched[0].get("slot_id")
+    epoch = policy.get("epoch_sha256")
+    if (
+        not isinstance(epoch, str) or re.fullmatch("[0-9a-f]{64}", epoch) is None
+        or not isinstance(slot, str) or re.fullmatch("[0-9a-f]{64}", slot) is None
+    ):
+        raise RunnerError("root-controlled provider slot digest is invalid")
+    token = hashlib.sha256(json.dumps(
+        {"epoch_sha256": epoch, "pair_id": policy["pair_id"], "slot_id": slot},
+        ensure_ascii=True, sort_keys=True, separators=(",", ":"),
+    ).encode("ascii")).hexdigest()
+    if unit.group(1) != "grabowski-rab-" + token[:16] + ".service":
+        raise RunnerError("root-controlled provider unit differs from granted slot")
+    return True
+
+
 def _require_external_provider_one_shot(
     *, request: Mapping[str, Any], authorization: Mapping[str, Any]
 ) -> None:
@@ -10403,6 +10516,18 @@ def _require_external_provider_one_shot(
     """
     if not isinstance(request, Mapping) or not isinstance(authorization, Mapping):
         raise RunnerError("external one-shot provider authorization is invalid")
+    # A root-owned systemd arm is the separate one-shot authority. This must
+    # agree with the existing, non-authorizing preflight ledger too.
+    if _verified_root_systemd_one_shot(request):
+        hashes = authorization.get("request_sha256")
+        if (
+            authorization.get("status") != "authorized"
+            or authorization.get("pair_id") != request.get("pair_id")
+            or not isinstance(hashes, Mapping)
+            or hashes.get(request.get("condition")) != base._sha256_json(request)
+        ):
+            raise RunnerError("root-owned one-shot and preflight ledger disagree")
+        return
     raise RunnerError(
         "external one-shot provider authorization verifier is unavailable"
     )
@@ -10455,6 +10580,10 @@ def _in_process_pair_dispatch_scope(
 
 def _require_in_process_pair_condition(request: Mapping[str, Any]) -> None:
     """Fail before opening a ledger, consuming workspaces, login or dispatch."""
+    # Root authorizes each separately PID1-launched arm, not the historical
+    # two-condition single-Python-process dispatch.
+    if _verified_root_systemd_one_shot(request):
+        return
     state = getattr(_ACTIVE_IN_PROCESS_PAIR, "state", None)
     if not isinstance(state, dict) or state.get("pid") != os.getpid():
         raise RunnerError("direct live provider condition requires in-process pair")
