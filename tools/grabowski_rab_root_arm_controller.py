@@ -66,6 +66,15 @@ def _canonical(value: Any) -> bytes:
     ).encode("ascii")
 
 
+def _request_sha(value: Any) -> str:
+    # Frozen RepoBrief requests use UTF-8, not the root-policy's ASCII JSON.
+    raw = json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return _sha(raw)
+
+
 def _hex(value: Any) -> bool:
     return isinstance(value, str) and _DIGEST.fullmatch(value) is not None
 
@@ -619,7 +628,7 @@ def _qualified_arm_inputs(policy: dict[str, Any], index: int, core: Any) -> None
     except (OSError, core.ProviderGrantDenied) as exc:
         raise ArmDenied("root-owned request or runtime credential is missing") from exc
     if (
-        _sha(_canonical(request)) != position["request_sha256"]
+        _request_sha(request) != position["request_sha256"]
         or request.get("pair_id") != policy["pair_id"]
         or request.get("condition") != position["arm"]
         or not isinstance(request.get("runner"), dict)

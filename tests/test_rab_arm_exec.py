@@ -33,7 +33,7 @@ def pair(arm_name: str = "baseline") -> tuple[dict, dict]:
             "index": i,
             "arm": ("baseline", "treatment")[i],
             "slot_id": ("1" if i == 0 else "2") * 64,
-            "request_sha256": arm._sha(arm._canonical(request)) if i == selected else "a" * 64,
+            "request_sha256": arm._request_sha(request) if i == selected else "a" * 64,
         }
         for i in (0, 1)
     ]
@@ -56,6 +56,19 @@ def pair(arm_name: str = "baseline") -> tuple[dict, dict]:
 
 
 class RABSingleArmTests(unittest.TestCase):
+    def test_utf8_frozen_request_digest_matches_original_repobrief(self) -> None:
+        from tests.test_repobrief_agent_benchmark_codex_runner import runner
+        from tests.test_rab_root_arm_controller import controller
+        request = {
+            "prompt": "Finde den zugehörigen Test für die Datei.",
+            "pair_id": "unicode-test",
+            "condition": "baseline",
+        }
+        expected = runner.base._sha256_json(request)
+        self.assertEqual(controller._request_sha(request), expected)
+        self.assertEqual(arm._request_sha(request), expected)
+        self.assertNotEqual(arm._sha(arm._canonical(request)), expected)
+
     def test_both_arms_have_distinct_kernel_unit_identity(self) -> None:
         self.assertNotEqual(
             arm._unit("f" * 64, "frozen-pair", "1" * 64),
@@ -188,7 +201,7 @@ class RABSingleArmTests(unittest.TestCase):
                 kwargs["stdout"].write(json.dumps({
                     "status": "success",
                     "request_id": r["request_id"],
-                    "request_sha256": arm._sha(arm._canonical(r)),
+                    "request_sha256": arm._request_sha(r),
                 }).encode())
                 return SimpleNamespace(returncode=0)
             with (
@@ -201,7 +214,7 @@ class RABSingleArmTests(unittest.TestCase):
             disk = json.loads((base / ("unverified-" + "1" * 64 + ".json")).read_text())
             self.assertEqual(disk["provider_outcome_status"], "unverified")
             self.assertEqual(disk["arm"], "baseline")
-            self.assertEqual(disk["request_sha256"], arm._sha(arm._canonical(r)))
+            self.assertEqual(disk["request_sha256"], arm._request_sha(r))
 
 
 class RootControllerInputBindingTests(unittest.TestCase):
@@ -227,7 +240,7 @@ class RootControllerInputBindingTests(unittest.TestCase):
             "condition": p["positions"][0]["arm"],
             "runner": {"model": p["model"], "provider": p["provider"]},
         }
-        p["positions"][0]["request_sha256"] = controller._sha(controller._canonical(request))
+        p["positions"][0]["request_sha256"] = controller._request_sha(request)
         runtime = {
             "schema_version": 1,
             "kind": "rab.root_installed_single_arm_runtime",

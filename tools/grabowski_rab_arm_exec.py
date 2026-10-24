@@ -43,6 +43,14 @@ def _sha(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+def _request_sha(value: Any) -> str:
+    # Same canonical UTF-8 digest as repobrief_agent_benchmark_runner._sha256_json.
+    return _sha(json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8"))
+
+
 def _unit(epoch: str, pair_id: str, slot_id: str) -> str:
     token = _sha(_canonical({"epoch_sha256": epoch, "pair_id": pair_id, "slot_id": slot_id}))
     return "grabowski-rab-" + token[:16] + ".service"
@@ -160,7 +168,7 @@ def _verify_pair(policy: dict[str, Any], request: dict[str, Any], *,
         set(match) != {"index", "arm", "slot_id", "request_sha256"}
         or any(not isinstance(p, dict) for p in positions)
         or positions[match["index"]] != match
-        or _sha(_canonical(request)) != match["request_sha256"]
+        or _request_sha(request) != match["request_sha256"]
         or request.get("pair_id") != pair_id
         or request.get("condition") != arm
         or not isinstance(request.get("runner"), dict)
@@ -313,14 +321,14 @@ def execute(epoch: str, pair_id: str, slot_id: str, arm: str) -> None:
             not isinstance(runner_receipt, dict)
             or runner_receipt.get("status") != "success"
             or runner_receipt.get("request_id") != request.get("request_id")
-            or runner_receipt.get("request_sha256") != _sha(_canonical(request))
+            or runner_receipt.get("request_sha256") != _request_sha(request)
         ):
             raise ArmExecDenied("Codex runner success is not bound to this exact request")
         _write_result(runtime["state_root"], slot_id, {
             "schema_version": 1,
             "kind": "rab.unverified_single_arm_runner_observation",
             "unit": unit, "pair_id": pair_id, "slot_id": slot_id,
-            "arm": arm, "request_sha256": _sha(_canonical(request)),
+            "arm": arm, "request_sha256": _request_sha(request),
             "runner_receipt_sha256": _sha(_canonical(runner_receipt)),
             "runner_receipt_bytes": amount,
             # Root must independently verify immutable provider evidence
