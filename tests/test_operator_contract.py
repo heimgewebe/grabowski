@@ -3097,7 +3097,7 @@ class OperatorContractTests(unittest.TestCase):
                 "head_sha": head,
                 "base_sha": base,
                 "diff_sha256": "f" * 64,
-                "slot": "independent-gemini",
+                "slot": "independent-claude",
             }
             argv = [
                 operator.decision_reviews.REVIEW_ROLE_PYTHON,
@@ -3109,7 +3109,8 @@ class OperatorContractTests(unittest.TestCase):
                 "--expected-diff-sha256", workspace_sha,
                 "--expected-dirty", "false",
                 "--output", str(root / "unused-output.json"),
-                "--", "agy", "--model", "gemini-3.1-pro-high",
+                "--", "claude", "--model", "claude-opus-5-5",
+                "--effort", "high", "--permission-mode", "plan",
                 "Review the bound immutable committed diff",
             ]
             with patch.object(operator, "STATE_DIR", state), patch.object(
