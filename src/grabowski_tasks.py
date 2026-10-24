@@ -4827,12 +4827,13 @@ def _resolve_recent_completed_execution_reuse(
     resume_policy: ResumePolicy,
 ) -> dict[str, Any] | None:
     latest = _latest_matching_unbound_execution_record(identity)
-    if latest is not None and str(latest["state"]) == "completed":
-        _require_reused_task_target_identity(latest)
-    return _resolve_recent_completed_record_reuse(
+    reusable = _resolve_recent_completed_record_reuse(
         latest,
         resume_policy=resume_policy,
     )
+    if reusable is not None:
+        _require_reused_task_target_identity(reusable)
+    return reusable
 
 
 def _matching_attention_execution_records(

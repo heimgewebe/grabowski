@@ -15216,6 +15216,53 @@ class TaskTests(unittest.TestCase):
                 resume_policy="verify-then-retry",
             )
 
+    def test_expired_completed_execution_skips_stale_remote_identity(self) -> None:
+        record, identity = self._completed_execution_reuse_validation_fixture()
+        expired = dict(record)
+        now = tasks._now()
+        expired["terminalized_at_unix"] = (
+            now - tasks.TASK_OPERATION_REUSE_WINDOW_SECONDS - 1
+        )
+        with (
+            patch.object(tasks, "_now", return_value=now),
+            patch.object(
+                tasks,
+                "_latest_matching_unbound_execution_record",
+                return_value=expired,
+            ),
+            patch.object(
+                tasks,
+                "_require_reused_task_target_identity",
+                side_effect=AssertionError("expired task target must not be inspected"),
+            ) as target_check,
+        ):
+            self.assertIsNone(
+                tasks._resolve_recent_completed_execution_reuse(
+                    identity, resume_policy="verify-then-retry"
+                )
+            )
+            target_check.assert_not_called()
+
+    def test_reusable_completed_execution_still_checks_target_identity(self) -> None:
+        record, identity = self._completed_execution_reuse_validation_fixture()
+        with (
+            patch.object(
+                tasks,
+                "_latest_matching_unbound_execution_record",
+                return_value=record,
+            ),
+            patch.object(
+                tasks,
+                "_require_reused_task_target_identity",
+                side_effect=RuntimeError("remote task identity mismatch"),
+            ) as target_check,
+            self.assertRaisesRegex(RuntimeError, "remote task identity mismatch"),
+        ):
+            tasks._resolve_recent_completed_execution_reuse(
+                identity, resume_policy="verify-then-retry"
+            )
+        target_check.assert_called_once_with(record)
+
     def test_unbound_execution_identity_inconsistent_record_fails_closed(self) -> None:
         record, identity = self._completed_execution_reuse_validation_fixture()
         inconsistent = dict(record)
