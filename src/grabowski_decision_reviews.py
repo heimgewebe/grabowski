@@ -1650,6 +1650,9 @@ def _iter_pinned_review_job_directories(
             errors.append("decision_review_jobs_root_invalid")
             return
         names: list[tuple[str, int, int]] = []
+        # Child writes do not advance the jobs root mtime. Revalidate each
+        # processed child's pinned directory identity after the whole scan.
+        inspected_children: list[tuple[str, tuple[int, ...]]] = []
         seen = 0
         with os.scandir(root_fd) as entries:
             for entry in entries:
@@ -1696,6 +1699,14 @@ def _iter_pinned_review_job_directories(
                     ):
                         errors.append("decision_review_noncanonical_job_unverifiable")
                         return
+                    # Noncanonical directories must be pinned too: metadata
+                    # published after inspection cannot escape the final scan.
+                    inspected_children.append((entry.name, (
+                        foreign_stat.st_dev, foreign_stat.st_ino,
+                        foreign_stat.st_mode, foreign_stat.st_uid,
+                        foreign_stat.st_nlink, foreign_stat.st_mtime_ns,
+                        foreign_stat.st_ctime_ns,
+                    )))
                     # RepoGround rgpm jobs are a separate, signed job namespace.
                     # Inspect their metadata, but NEVER admit them as DecisionReviews.
                     if _RGPM_UNIT_RE.fullmatch(entry.name) is None:
@@ -1771,10 +1782,36 @@ def _iter_pinned_review_job_directories(
                             or job_after.st_ctime_ns != job_stat.st_ctime_ns
                         ):
                             errors.append("decision_review_job_directory_changed")
+                        else:
+                            inspected_children.append((unit, (
+                                job_after.st_dev, job_after.st_ino,
+                                job_after.st_mode, job_after.st_uid,
+                                job_after.st_nlink, job_after.st_mtime_ns,
+                                job_after.st_ctime_ns,
+                            )))
                 except OSError:
                     errors.append("decision_review_job_directory_changed")
                 finally:
                     os.close(job_fd)
+        # An earlier stub may publish metadata or a material REJECT while
+        # a later child is being evaluated. A final root-only stat misses it.
+        for unit, snapshot in inspected_children:
+            try:
+                child_after = os.stat(unit, dir_fd=root_fd, follow_symlinks=False)
+            except OSError:
+                errors.append("decision_review_job_directory_changed")
+                return
+            if (
+                not stat.S_ISDIR(child_after.st_mode)
+                or (
+                    child_after.st_dev, child_after.st_ino,
+                    child_after.st_mode, child_after.st_uid,
+                    child_after.st_nlink, child_after.st_mtime_ns,
+                    child_after.st_ctime_ns,
+                ) != snapshot
+            ):
+                errors.append("decision_review_job_directory_changed")
+                return
         try:
             after = os.stat(root, follow_symlinks=False)
         except OSError:

@@ -2415,6 +2415,98 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
             reviews.sha256_json(sorted(names)),
         )
 
+    def test_late_foreign_directory_metadata_blocks_settlement(self) -> None:
+        # A foreign child may gain suspicious review metadata after it was
+        # inspected, without advancing the jobs root's timestamps.
+        with tempfile.TemporaryDirectory() as temp:
+            jobs = Path(temp) / "jobs"
+            jobs.mkdir(mode=0o700)
+            foreign = jobs / "foreign-review-holder"
+            foreign.mkdir(mode=0o700)
+            passed = make_job(
+                jobs, suffix="aaaaaaaaa501", slot="A",
+                terminal_status="succeeded",
+                review_result=result("A", "PASS_THIS_REVISION", 0),
+            )
+            original = reviews._validated_origin_binding
+            published = False
+
+            def publish_after_foreign_scan(directory, *args, **kwargs):
+                nonlocal published
+                if directory == passed and not published:
+                    write_private(
+                        foreign / "metadata.json",
+                        json.dumps({"scope": {"decision_bound_review": binding("A")}}),
+                    )
+                    published = True
+                return original(directory, *args, **kwargs)
+
+            with mock.patch.object(
+                reviews, "_validated_origin_binding",
+                side_effect=publish_after_foreign_scan,
+            ):
+                first = self.reconcile(jobs)
+            self.assertTrue(published)
+            self.assertEqual(first["status"], "blocked")
+            self.assertIn("decision_review_job_directory_changed", first["errors"])
+            second = self.reconcile(jobs)
+            self.assertEqual(second["status"], "blocked")
+            self.assertIn(
+                "decision_review_noncanonical_job_directory", second["errors"],
+            )
+
+    def test_late_publication_inside_skipped_stub_blocks_settlement(self) -> None:
+        # A child already classified as an exact prelaunch stub can publish
+        # a material REJECT while the scanner processes a later PASS. Root
+        # directory timestamps remain unchanged by those child writes.
+        with tempfile.TemporaryDirectory() as temp:
+            jobs = Path(temp) / "jobs"
+            jobs.mkdir(mode=0o700)
+            rejected = make_job(
+                jobs, suffix="000000000001", slot="A",
+                terminal_status="succeeded",
+                review_result=result("A", "REJECT_THIS_REVISION", 1),
+            )
+            parked = Path(temp) / "parked"
+            parked.mkdir(mode=0o700)
+            for item in list(rejected.iterdir()):
+                os.replace(item, parked / item.name)
+            write_private(rejected / "stdout.log", "")
+            write_private(rejected / "stderr.log", "")
+            passed = make_job(
+                jobs, suffix="aaaaaaaaa501", slot="A",
+                terminal_status="succeeded",
+                review_result=result("A", "PASS_THIS_REVISION", 0),
+            )
+            original = reviews._validated_origin_binding
+            published = False
+
+            def publish_after_stub(directory, *args, **kwargs):
+                nonlocal published
+                if directory == passed and not published:
+                    for item in list(parked.iterdir()):
+                        if item.name in {"stdout.log", "stderr.log"}:
+                            write_private(rejected / item.name, item.read_text())
+                            item.unlink()
+                        else:
+                            os.replace(item, rejected / item.name)
+                    published = True
+                return original(directory, *args, **kwargs)
+
+            with mock.patch.object(
+                reviews, "_validated_origin_binding",
+                side_effect=publish_after_stub,
+            ):
+                first = self.reconcile(jobs)
+            self.assertTrue(published)
+            self.assertEqual(first["status"], "blocked")
+            self.assertIn("decision_review_job_directory_changed", first["errors"])
+            second = self.reconcile(jobs)
+            self.assertEqual(second["status"], "blocked")
+            self.assertTrue(any(
+                "decision_review" in error for error in second["errors"]
+            ))
+
     def test_only_exact_empty_prelaunch_footprints_are_exempt(self) -> None:
         variants = (
             "stdout_nonempty", "stderr_nonempty", "finalization",
