@@ -30,6 +30,8 @@ class RABRootbrokerInstalledArtifactsTests(unittest.TestCase):
             (cutover.RAB_CODEX_RUNNER_TARGET, "tools/repobrief_agent_benchmark_codex_runner.py", 0o755),
             (cutover.RAB_BASE_RUNNER_TARGET, "tools/repobrief_agent_benchmark_runner.py", 0o644),
             (cutover.RAB_BOOTSTRAP_TARGET, "tools/repobrief_agent_benchmark_source_bootstrap.py", 0o644),
+            (cutover.RAB_CODEX_PREFLIGHT_TARGET, "tools/repobrief_agent_benchmark_codex_preflight.py", 0o755),
+            (cutover.RAB_PREFLIGHT_CORE_TARGET, "tools/repobrief_agent_benchmark_preflight_core.py", 0o644),
         )
         for target, source, mode in closure:
             self.assertEqual(artifacts[target].source_relative, source)

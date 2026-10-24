@@ -83,6 +83,8 @@ RAB_ARM_EXEC_TARGET = Path("/usr/local/libexec/grabowski-rab-arm-exec")
 RAB_CODEX_RUNNER_TARGET = Path("/usr/local/libexec/grabowski-rab-codex-runner")
 RAB_BASE_RUNNER_TARGET = Path("/usr/local/libexec/repobrief_agent_benchmark_runner.py")
 RAB_BOOTSTRAP_TARGET = Path("/usr/local/libexec/repobrief_agent_benchmark_source_bootstrap.py")
+RAB_CODEX_PREFLIGHT_TARGET = Path("/usr/local/libexec/repobrief_agent_benchmark_codex_preflight.py")
+RAB_PREFLIGHT_CORE_TARGET = Path("/usr/local/libexec/repobrief_agent_benchmark_preflight_core.py")
 RAB_ARM_CORE_TARGET = Path("/usr/local/lib/grabowski/grabowski_rab_provider_one_shot.py")
 RAB_ARM_ACTION = "operator_rab_benchmark_arm_start"
 CRITICAL_USER_DATA_INVENTORY_ACTION = "critical_user_data_inventory"
@@ -297,6 +299,18 @@ ARTIFACTS = (
     Artifact(
         "tools/repobrief_agent_benchmark_source_bootstrap.py",
         RAB_BOOTSTRAP_TARGET,
+        0o644,
+        True,
+    ),
+    Artifact(
+        "tools/repobrief_agent_benchmark_codex_preflight.py",
+        RAB_CODEX_PREFLIGHT_TARGET,
+        0o755,
+        True,
+    ),
+    Artifact(
+        "tools/repobrief_agent_benchmark_preflight_core.py",
+        RAB_PREFLIGHT_CORE_TARGET,
         0o644,
         True,
     ),
