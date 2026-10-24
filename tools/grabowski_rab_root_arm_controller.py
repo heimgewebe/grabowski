@@ -351,6 +351,9 @@ def _unit_argv(policy: dict[str, Any], index: int) -> list[str]:
         "AmbientCapabilities=",
         "ProtectSystem=strict",
         "ProtectHome=tmpfs",
+        # Hide the underlying writable DynamicUser state alias; only its
+        # StateDirectory public mount may remain accessible to the arm.
+        "InaccessiblePaths=/var/lib/private",
         "ProtectControlGroups=yes",
         "ProtectKernelTunables=yes",
         "ProtectKernelModules=yes",

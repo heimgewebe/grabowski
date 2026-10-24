@@ -134,6 +134,7 @@ class RootArmPolicyTests(unittest.TestCase):
         self.assertIn("--property=StandardInput=null", before)
         self.assertIn("--property=StandardOutput=null", before)
         self.assertIn("--property=StandardError=null", before)
+        self.assertIn("--property=InaccessiblePaths=/var/lib/private", before)
         self.assertIn("--property=KillMode=control-group", before)
         self.assertEqual(after[0], str(controller._INSTALLED_RUNNER))
         self.assertFalse(any("sh -c" in item for item in argv))
