@@ -331,6 +331,10 @@ def execute(epoch: str, pair_id: str, slot_id: str, arm: str) -> None:
             "arm": arm, "request_sha256": _request_sha(request),
             "runner_receipt_sha256": _sha(_canonical(runner_receipt)),
             "runner_receipt_bytes": amount,
+            # Root's separate process can now compare the exact normalized
+            # outcome to the immutable provider JSONL, stderr policy and ledger.
+            # This is NOT self-attestation or authorization to release arm 2.
+            "runner_receipt": runner_receipt,
             # Root must independently verify immutable provider evidence
             # before issuing a second-arm release.
             "provider_outcome_status": "unverified",

@@ -215,6 +215,13 @@ class RABSingleArmTests(unittest.TestCase):
             self.assertEqual(disk["provider_outcome_status"], "unverified")
             self.assertEqual(disk["arm"], "baseline")
             self.assertEqual(disk["request_sha256"], arm._request_sha(r))
+            # Root must later revalidate actual provider artifacts against
+            # this complete captured receipt; a digest alone is insufficient.
+            self.assertEqual(disk["runner_receipt"]["request_id"], r["request_id"])
+            self.assertEqual(
+                disk["runner_receipt_sha256"],
+                arm._sha(arm._canonical(disk["runner_receipt"])),
+            )
 
 
 class RootControllerInputBindingTests(unittest.TestCase):

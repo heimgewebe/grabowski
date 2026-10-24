@@ -213,6 +213,67 @@ class RootArmHostLifecycleTests(unittest.TestCase):
             controller._root_outcome(policy, 0, 7, "f" * 64)
         self.assertEqual(events, ["show", "stop", "receipt"])
 
+    def test_real_root_issuer_requires_provider_recheck_before_release(self) -> None:
+        # Only deterministic PID1/mock provider evidence; never a real model.
+        p = _pair()
+        name = controller._unit(p, 0)
+        first = controller._token(p, 0)
+        values = {
+            "Id": name, "LoadState": "loaded", "ActiveState": "active",
+            "SubState": "exited", "Result": "success", "MainPID": "0",
+            "ControlGroup": "/system.slice/" + name,
+            "InvocationID": "a" * 32, "Type": "exec",
+            "RemainAfterExit": "yes", "KillMode": "control-group",
+            "DynamicUser": "yes", "NoNewPrivileges": "yes",
+            "StandardInput": "null", "StandardOutput": "null",
+            "StandardError": "null",
+        }
+
+        def manager(argv, **_kwargs):
+            if argv[1] == "show":
+                raw = ("\n".join(f"{key}={value}" for key, value in values.items()) + "\n").encode()
+                return SimpleNamespace(returncode=0, stdout=raw)
+            self.assertEqual(argv[1], "stop")
+            return SimpleNamespace(returncode=0, stdout=b"")
+
+        receipts: list[tuple[str, dict]] = []
+        def persist(_fd: int, name: str, value: dict) -> None:
+            receipts.append((name, value))
+        evidence = {"provider_receipt_sha256": "c" * 64, "transcript_sha256": "d" * 64, "stderr_policy_sha256": "e" * 64}
+        with (
+            mock.patch.object(controller.subprocess, "run", side_effect=manager),
+            mock.patch.object(controller, "_write_once", side_effect=persist),
+            mock.patch.object(controller, "_verify_completed_provider_capture", return_value=evidence) as checked,
+        ):
+            controller._root_outcome(p, 0, 7, first, core=object())
+            checked.assert_called_once()
+        self.assertEqual([name for name, _ in receipts], [
+            "completed-" + first + ".json",
+            "release-" + p["positions"][1]["slot_id"] + ".json",
+        ])
+        completed, release = (record for _, record in receipts)
+        self.assertEqual(completed["provider_outcome_status"], "verified_by_root_issuer")
+        self.assertEqual(completed["provider_receipt_sha256"], "c" * 64)
+        self.assertEqual(completed["transcript_sha256"], "d" * 64)
+        self.assertEqual(completed["stderr_policy_sha256"], "e" * 64)
+        self.assertEqual(release["first_receipt_sha256"], controller._sha(controller._canonical(completed)))
+
+        receipts.clear()
+        with (
+            mock.patch.object(controller.subprocess, "run", side_effect=manager),
+            mock.patch.object(controller, "_write_once", side_effect=persist),
+            mock.patch.object(
+                controller, "_verify_completed_provider_capture",
+                side_effect=controller.ArmDenied("provider response missing"),
+            ),
+            self.assertRaisesRegex(controller.ArmDenied, "unverified"),
+        ):
+            controller._root_outcome(p, 0, 7, first, core=object())
+        self.assertEqual([name for name, _ in receipts], ["completed-" + first + ".json"])
+        self.assertEqual(receipts[0][1]["provider_outcome_status"], "unverified")
+        self.assertIsNone(receipts[0][1]["transcript_sha256"])
+        self.assertIsNone(receipts[0][1]["stderr_policy_sha256"])
+
     def test_invalid_completed_unit_stopped_without_receipt(self) -> None:
         policy = _pair()
         name = controller._unit(policy, 0)
@@ -274,6 +335,101 @@ class RootArmJsonTests(unittest.TestCase):
         self.assertEqual(parsed["nested"], [{"a": True}])
 
 
+class RootProviderOutcomeProofTests(unittest.TestCase):
+    def test_reparsed_real_format_stream_is_required_before_root_issuer(self) -> None:
+        from datetime import datetime, timezone
+        import hashlib
+        from tests.test_repobrief_agent_benchmark_codex_runner import (
+            request, runner, stream,
+        )
+
+        req = request(condition="baseline")
+        policy = _pair()
+        policy["pair_id"] = req["pair_id"]
+        policy["positions"][0]["request_sha256"] = controller._request_sha(req)
+        raw = stream(req)
+        artifact = hashlib.sha256(req["request_id"].encode()).hexdigest() + ".jsonl"
+        clock = datetime(2026, 10, 24, tzinfo=timezone.utc)
+        receipt = runner.receipt(req, raw, artifact, 0, clock, clock)
+        observation = {
+            "schema_version": 1,
+            "kind": "rab.unverified_single_arm_runner_observation",
+            "unit": controller._unit(policy, 0),
+            "pair_id": policy["pair_id"],
+            "slot_id": policy["positions"][0]["slot_id"],
+            "arm": "baseline",
+            "request_sha256": controller._request_sha(req),
+            "runner_receipt_sha256": controller._sha(controller._canonical(receipt)),
+            "runner_receipt_bytes": len(
+                (json.dumps(receipt, ensure_ascii=False, sort_keys=True) + "\n").encode()
+            ),
+            "runner_receipt": receipt,
+            "provider_outcome_status": "unverified",
+        }
+        proof = controller._attest_provider_reply(
+            policy, 0, req, observation, raw, runner.receipt
+        )
+        self.assertEqual(proof["transcript_sha256"], hashlib.sha256(raw).hexdigest())
+        self.assertEqual(proof["provider_receipt_sha256"], observation["runner_receipt_sha256"])
+        for altered, transcript in (
+            ({**observation, "runner_receipt_sha256": "f" * 64}, raw),
+            ({**observation, "provider_outcome_status": "verified_by_root_issuer"}, raw),
+            (observation, raw.replace(b"turn.completed", b"turn.failed")),
+            (observation, raw + b'{"type":"turn.completed"}\n'),
+        ):
+            with self.subTest(altered=altered is not observation), self.assertRaises(controller.ArmDenied):
+                controller._attest_provider_reply(
+                    policy, 0, req, altered, transcript, runner.receipt
+                )
+
+
+class RootStderrOutcomeProofTests(unittest.TestCase):
+    def test_root_rechecks_exact_raw_stderr_diagnostics_and_policy(self) -> None:
+        import hashlib
+        from datetime import datetime, timezone
+        from tests.test_repobrief_agent_benchmark_codex_runner import runner, request, stream
+        value = request()
+        transcript = stream(value)
+        now = datetime(2026, 10, 24, tzinfo=timezone.utc)
+        capture = {
+            "stdout": transcript,
+            "stderr": b"",
+            "returncode": 0,
+            "capture_error": None,
+            "stdout_overflow": False,
+            "stderr_overflow": False,
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            result = runner.persist_provider_capture(
+                value, transcript_root=root / "transcripts",
+                evidence_root=root / "evidence",
+                capture=capture, started_at=now, ended_at=now,
+                synthetic_fixture=False,
+            )
+            diagnostics = result["diagnostics_path"].read_bytes()
+            stderr_policy = result["stderr_policy_path"].read_bytes()
+            successful = controller._attest_provider_stderr(
+                value, transcript, b"", diagnostics, stderr_policy,
+                runner.classify_stderr,
+            )
+            self.assertEqual(
+                successful["stderr_policy_sha256"], hashlib.sha256(stderr_policy).hexdigest()
+            )
+            for wrong_diag, wrong_policy, raw_stderr in (
+                (diagnostics, stderr_policy, b"unapproved failure\n"),
+                (diagnostics.replace(b'"synthetic_fixture": false', b'"synthetic_fixture": true'),
+                 stderr_policy, b""),
+                (diagnostics, stderr_policy.replace(b'"allowed": true', b'"allowed": false'), b""),
+                (diagnostics, stderr_policy.replace(b'"capture_error": null', b'"capture_error": "masked"'), b""),
+            ):
+                with self.subTest(stderr=raw_stderr), self.assertRaises(controller.ArmDenied):
+                    controller._attest_provider_stderr(
+                        value, transcript, raw_stderr,
+                        wrong_diag, wrong_policy, runner.classify_stderr,
+                    )
+
+
 class RootArmReleaseTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(prefix="rab-root-arm-offline-")
@@ -312,6 +468,15 @@ class RootArmReleaseTests(unittest.TestCase):
                 "main_pid": 0,
                 "cgroup_empty": True,
                 "provider_outcome_status": provider_outcome_status,
+                "provider_receipt_sha256": (
+                    "a" * 64 if provider_outcome_status == "verified_by_root_issuer" else None
+                ),
+                "transcript_sha256": (
+                    "b" * 64 if provider_outcome_status == "verified_by_root_issuer" else None
+                ),
+                "stderr_policy_sha256": (
+                    "c" * 64 if provider_outcome_status == "verified_by_root_issuer" else None
+                ),
             },
         )
 
@@ -359,6 +524,17 @@ class RootArmReleaseTests(unittest.TestCase):
         self._spent()
         self._lifecycle(provider_outcome_status="verified_by_root_issuer")
         with self.assertRaisesRegex(controller.ArmDenied, "release"):
+            controller._consume_position(self.p, 1, self.fd, self.core)
+
+    def test_verified_result_without_stderr_digest_is_denied(self) -> None:
+        self._spent()
+        self._lifecycle(provider_outcome_status="verified_by_root_issuer")
+        name = "completed-" + self.token + ".json"
+        receipt = json.loads((Path(self.temp.name) / name).read_text())
+        receipt["stderr_policy_sha256"] = None
+        self._write(name, receipt)
+        self._release()
+        with self.assertRaises(controller.ArmDenied):
             controller._consume_position(self.p, 1, self.fd, self.core)
 
     def test_wrong_independent_release_receipt_hash_denied(self) -> None:

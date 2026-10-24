@@ -12,6 +12,7 @@ process can start. Never substitute a direct Codex invocation.
 
 from __future__ import annotations
 
+from datetime import datetime
 import fcntl
 import hashlib
 import importlib.util
@@ -20,6 +21,7 @@ import math
 import os
 from pathlib import Path
 import re
+import runpy
 import stat
 import subprocess
 import time
@@ -193,6 +195,183 @@ def _pair_state_directory(policy: dict[str, Any]) -> str:
     return "grabowski-rab-pair-" + _sha(_canonical(identity))[:16]
 
 
+def _attest_provider_reply(
+    policy: dict[str, Any],
+    index: int,
+    request: dict[str, Any],
+    observation: dict[str, Any],
+    transcript: bytes,
+    receipt_function: Any,
+) -> dict[str, str]:
+    """Recompute the Codex success receipt from actual JSONL in the ROOT issuer.
+
+    A trusted installed parser is loaded independently of the per-arm process.
+    Neither its returned evidence hashes nor this pure helper grant a start.
+    """
+    _pair_policy(policy)
+    if type(index) is not int or index not in (0, 1):
+        raise ArmDenied("root provider result index is invalid")
+    position = policy["positions"][index]
+    request_sha = _request_sha(request)
+    request_id = request.get("request_id")
+    expected_keys = {
+        "schema_version", "kind", "unit", "pair_id", "slot_id",
+        "arm", "request_sha256", "runner_receipt_sha256",
+        "runner_receipt_bytes", "runner_receipt", "provider_outcome_status",
+    }
+    if (
+        not isinstance(request_id, str)
+        or not request_id
+        or not isinstance(observation, dict)
+        or set(observation) != expected_keys
+        or type(observation["schema_version"]) is not int
+        or observation["schema_version"] != 1
+        or observation["kind"] != "rab.unverified_single_arm_runner_observation"
+        or observation["unit"] != _unit(policy, index)
+        or observation["pair_id"] != policy["pair_id"]
+        or observation["slot_id"] != position["slot_id"]
+        or observation["arm"] != position["arm"]
+        or observation["request_sha256"] != position["request_sha256"]
+        or request_sha != position["request_sha256"]
+        or request.get("pair_id") != policy["pair_id"]
+        or request.get("condition") != position["arm"]
+        or observation["provider_outcome_status"] != "unverified"
+        or not _hex(observation["runner_receipt_sha256"])
+        or type(observation["runner_receipt_bytes"]) is not int
+        or not 0 < observation["runner_receipt_bytes"] <= 1_048_576
+        or not isinstance(observation["runner_receipt"], dict)
+        or not isinstance(transcript, bytes)
+        or not 0 < len(transcript) <= 16 * 1024 * 1024
+        or not callable(receipt_function)
+    ):
+        raise ArmDenied("root provider receipt observation is not qualified")
+    result = observation["runner_receipt"]
+    artifact = hashlib.sha256(request_id.encode("utf-8", "strict")).hexdigest() + ".jsonl"
+    descriptor = result.get("transcript")
+    if (
+        result.get("status") != "success"
+        or result.get("request_id") != request_id
+        or result.get("request_sha256") != request_sha
+        or result.get("exit_code") != 0
+        or result.get("error") is not None
+        or not isinstance(descriptor, dict)
+        or descriptor.get("artifact") != artifact
+        or descriptor.get("storage") != "artifact"
+        or descriptor.get("inline") is not None
+        or descriptor.get("sha256") != _sha(transcript)
+        or descriptor.get("bytes") != len(transcript)
+    ):
+        raise ArmDenied("root provider transcript reference does not match")
+    try:
+        captured = (
+            json.dumps(result, ensure_ascii=False, sort_keys=True, allow_nan=False)
+            + "\n"
+        ).encode("utf-8", "strict")
+        if (
+            len(captured) != observation["runner_receipt_bytes"]
+            or _sha(_canonical(result)) != observation["runner_receipt_sha256"]
+        ):
+            raise ArmDenied("root normalized result bytes or digest mismatch")
+        started = datetime.fromisoformat(result["started_at"].replace("Z", "+00:00"))
+        ended = datetime.fromisoformat(result["ended_at"].replace("Z", "+00:00"))
+        if started.tzinfo is None or ended.tzinfo is None or ended < started:
+            raise ArmDenied("root provider timestamps are not qualified")
+        recomputed = receipt_function(request, transcript, artifact, 0, started, ended)
+        if _canonical(recomputed) != _canonical(result):
+            raise ArmDenied("root replay of actual Codex JSONL disagrees with runner")
+    except (ArmDenied, OSError, UnicodeError, ValueError, TypeError, KeyError, RecursionError) as exc:
+        raise ArmDenied("root provider result cannot be independently validated") from exc
+    except Exception as exc:
+        raise ArmDenied("independent root provider normalization refused the transcript") from exc
+    return {
+        "provider_receipt_sha256": observation["runner_receipt_sha256"],
+        "transcript_sha256": _sha(transcript),
+    }
+
+
+def _attest_provider_stderr(
+    request: dict[str, Any],
+    transcript: bytes,
+    raw_stderr: bytes,
+    diagnostics_bytes: bytes,
+    policy_bytes: bytes,
+    classifier: Any,
+) -> dict[str, str]:
+    """Root checks actual stderr, stored capture and Codex policy independently.
+
+    A normalized success receipt by itself cannot prove that the provider's
+    error stream, capture limits and persistence also passed qualification.
+    This shares the pinned runner's classifier, not its success assertion.
+    """
+    request_id = request.get("request_id") if isinstance(request, dict) else None
+    if (
+        not isinstance(request_id, str)
+        or not request_id
+        or not isinstance(transcript, bytes)
+        or not 0 < len(transcript) <= 16 * 1024 * 1024
+        or not isinstance(raw_stderr, bytes)
+        or len(raw_stderr) > 256 * 1024
+        or not callable(classifier)
+    ):
+        raise ArmDenied("root stderr proof inputs are invalid")
+    try:
+        diagnostic = _bounded_policy_json(diagnostics_bytes, max_bytes=1_048_576)
+        policy = _bounded_policy_json(policy_bytes, max_bytes=1_048_576)
+        stem = hashlib.sha256(request_id.encode("utf-8", "strict")).hexdigest()
+        request_sha = _request_sha(request)
+        stdout = {
+            "artifact": stem + ".jsonl",
+            "sha256": _sha(transcript),
+            "bytes": len(transcript),
+            "overflow": False,
+        }
+        stderr = {
+            "artifact": stem + ".stderr",
+            "sha256": _sha(raw_stderr),
+            "bytes": len(raw_stderr),
+            "overflow": False,
+        }
+        interpreted = classifier(raw_stderr)
+        if not isinstance(interpreted, dict) or interpreted.get("allowed") is not True:
+            raise ArmDenied("Codex stderr classification denied")
+        expected = {"artifact": stem + ".stderr", **interpreted, "overflow": False}
+        for value, kind in (
+            (diagnostic, "repobrief.codex_provider_capture"),
+            (policy, "repobrief.codex_stderr_policy"),
+        ):
+            if (
+                value.get("kind") != kind
+                or value.get("request_id") != request_id
+                or value.get("request_sha256") != request_sha
+                or value.get("provider") != "openai-codex-cli"
+                or value.get("model") != "gpt-6-astra"
+                or value.get("synthetic_fixture") is not False
+                or type(value.get("returncode")) is not int
+                or value["returncode"] != 0
+                or value.get("capture_error") is not None
+                or value.get("started_at") != diagnostic.get("started_at")
+                or value.get("ended_at") != diagnostic.get("ended_at")
+                or value.get("stdout") != stdout
+            ):
+                raise ArmDenied("root provider capture or policy identity invalid")
+        if (
+            diagnostic.get("stderr") != stderr
+            or diagnostic.get("semantic_interpretation") != "not_performed"
+            or policy.get("capture_diagnostics_sha256") != _sha(diagnostics_bytes)
+            or policy.get("stderr") != expected
+            or policy.get("version") != diagnostic.get("version")
+            or policy.get("version") != "1.0"
+        ):
+            raise ArmDenied("root stderr policy does not match raw diagnostics")
+    except ArmDenied:
+        raise
+    except (OSError, ValueError, TypeError, KeyError, UnicodeError, RecursionError) as exc:
+        raise ArmDenied("root stderr could not be independently qualified") from exc
+    except Exception as exc:
+        raise ArmDenied("root Codex stderr classifier rejected the capture") from exc
+    return {"stderr_policy_sha256": _sha(policy_bytes)}
+
+
 def _write_once(fd: int, filename: str, value: dict[str, Any]) -> None:
     if "/" in filename or filename in {"", ".", ".."}:
         raise ArmDenied("root receipt filename is unsafe")
@@ -256,6 +435,9 @@ def _first_receipt(policy: dict[str, Any], fd: int, core: Any) -> dict[str, Any]
             "main_pid",
             "cgroup_empty",
             "provider_outcome_status",
+            "provider_receipt_sha256",
+            "transcript_sha256",
+            "stderr_policy_sha256",
         }
         or type(receipt.get("schema_version")) is not int
         or receipt["schema_version"] != _VERSION
@@ -273,6 +455,9 @@ def _first_receipt(policy: dict[str, Any], fd: int, core: Any) -> dict[str, Any]
         # response nor usable provider results. The separate outcome issuer
         # does not exist yet: unverified must NEVER enable arm 2.
         or receipt["provider_outcome_status"] != "verified_by_root_issuer"
+        or not _hex(receipt["provider_receipt_sha256"])
+        or not _hex(receipt["transcript_sha256"])
+        or not _hex(receipt["stderr_policy_sha256"])
     ):
         raise ArmDenied("first root lifecycle receipt is absent or unqualified")
     # The independently issued success proof does not itself authorize
@@ -475,9 +660,16 @@ def _verify_root_owned_file(path: Path, expected_sha256: str) -> None:
         os.close(parent)
 
 
-def _bounded_policy_json(raw: bytes) -> dict[str, Any]:
-    """Bound C/Python JSON decoder depth *before* parsing any root policy."""
-    if not isinstance(raw, bytes) or not 0 < len(raw) <= _MAX_POLICY_BYTES:
+def _bounded_policy_json(
+    raw: bytes, *, max_bytes: int = _MAX_POLICY_BYTES
+) -> dict[str, Any]:
+    """Bound C/Python JSON decoder depth before parsing policies or arm outputs."""
+    if (
+        not isinstance(raw, bytes)
+        or type(max_bytes) is not int
+        or not 0 < max_bytes <= 1_048_576
+        or not 0 < len(raw) <= max_bytes
+    ):
         raise ArmDenied("root policy JSON byte budget invalid")
     try:
         text = raw.decode("utf-8", "strict")
@@ -712,8 +904,172 @@ def _qualified_arm_inputs(policy: dict[str, Any], index: int, core: Any) -> None
         )
 
 
-def _root_outcome(policy: dict[str, Any], index: int, fd: int, token: str) -> None:
-    """Root observes PID 1 through exit, stops unit, then durably records only lifecycle."""
+def _read_dynamic_arm_artifact(
+    policy: dict[str, Any], leaf: str, filename: str, *, max_bytes: int
+) -> tuple[bytes, int]:
+    """Root reads only a fixed file from the physical DynamicUser private state.
+
+    The public StateDirectory path is overmounted only inside systemd's
+    namespace. Following it from the root issuer after unit exit would see
+    a different (possibly empty) tree; use the physical root-owned parent.
+    """
+    patterns = {
+        "state": r"unverified-[0-9a-f]{64}\.json",
+        "transcripts": r"[0-9a-f]{64}\.jsonl",
+        "evidence": r"[0-9a-f]{64}\.(?:stderr|provider\.json|stderr-policy\.json)",
+    }
+    budgets = {
+        "state": {1_048_576},
+        "transcripts": {16 * 1024 * 1024},
+        "evidence": {256 * 1024, 1_048_576},
+    }
+    if (
+        leaf not in patterns
+        or not isinstance(filename, str)
+        or re.fullmatch(patterns[leaf], filename) is None
+        or type(max_bytes) is not int
+        or max_bytes not in budgets[leaf]
+        or (max_bytes == 256 * 1024) != filename.endswith(".stderr")
+    ):
+        raise ArmDenied("root provider artifact selector is invalid")
+    pieces = ("var", "lib", "private", _pair_state_directory(policy), "epoch", leaf)
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    parent = os.open("/", flags)
+    try:
+        for part in pieces:
+            child = os.open(part, flags, dir_fd=parent)
+            os.close(parent)
+            parent = child
+            info = os.fstat(parent)
+            if not stat.S_ISDIR(info.st_mode) or info.st_mode & 0o022:
+                raise ArmDenied("root provider artifact parent is writable by outsiders")
+        handle = os.open(
+            filename, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+            dir_fd=parent,
+        )
+        try:
+            before = os.fstat(handle)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_nlink != 1
+                or before.st_mode & 0o077
+                or before.st_uid == 0
+                or before.st_size > max_bytes
+                or (before.st_size == 0 and not filename.endswith(".stderr"))
+            ):
+                raise ArmDenied("root provider artifact ownership or size invalid")
+            raw = bytearray()
+            while len(raw) < before.st_size:
+                chunk = os.read(handle, min(1024 * 1024, before.st_size - len(raw)))
+                if not chunk:
+                    raise ArmDenied("root provider artifact read ended early")
+                raw.extend(chunk)
+            after = os.fstat(handle)
+            if (
+                (before.st_dev, before.st_ino, before.st_mode,
+                 before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+                !=
+                (after.st_dev, after.st_ino, after.st_mode,
+                 after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+            ):
+                raise ArmDenied("root provider artifact changed during read")
+            return bytes(raw), before.st_uid
+        finally:
+            os.close(handle)
+    except OSError as exc:
+        raise ArmDenied("root provider artifact cannot be safely opened") from exc
+    finally:
+        os.close(parent)
+
+
+def _verify_completed_provider_capture(
+    policy: dict[str, Any], index: int, core: Any
+) -> dict[str, str]:
+    """Root replays the trusted pinned parser over a completed arm's RAW JSONL.
+
+    This is deliberately after systemd's clean no-descendants readback. It
+    never trusts a transient process-exit code or tool-supplied success string.
+    """
+    position = policy["positions"][index]
+    pair = _pair_state_directory(policy)
+    home = "/var/lib/" + pair
+    request_fd = core._secure_directory(_REQUEST_ROOT)
+    runtime_fd = core._secure_directory(_POLICY_ROOT)
+    try:
+        request = core._read_root_file(
+            request_fd, "slot-" + position["slot_id"] + ".json"
+        )
+        runtime = core._read_root_file(
+            runtime_fd, "epoch-" + policy["epoch_sha256"] + ".runtime.json"
+        )
+    finally:
+        os.close(request_fd)
+        os.close(runtime_fd)
+    paths = {
+        "state_root": home + "/epoch/state",
+        "transcript_root": home + "/epoch/transcripts",
+        "provider_evidence_root": home + "/epoch/evidence",
+    }
+    if (
+        not isinstance(runtime, dict)
+        or any(runtime.get(key) != val for key, val in paths.items())
+        or _request_sha(request) != position["request_sha256"]
+    ):
+        raise ArmDenied("root verifier state or request differs from fixed pair")
+    observation_bytes, uid = _read_dynamic_arm_artifact(
+        policy, "state", "unverified-" + position["slot_id"] + ".json",
+        max_bytes=1_048_576,
+    )
+    observation = _bounded_policy_json(observation_bytes, max_bytes=1_048_576)
+    request_id = request.get("request_id")
+    if not isinstance(request_id, str) or not request_id:
+        raise ArmDenied("root verified request identifier is missing")
+    filename = hashlib.sha256(request_id.encode("utf-8", "strict")).hexdigest() + ".jsonl"
+    stream, stream_uid = _read_dynamic_arm_artifact(
+        policy, "transcripts", filename, max_bytes=16 * 1024 * 1024
+    )
+    if uid != stream_uid:
+        raise ArmDenied("root provider output owners differ between transcript and result")
+    codex_path = Path("/usr/local/libexec/grabowski-rab-codex-runner")
+    base_path = Path("/usr/local/libexec/repobrief_agent_benchmark_runner.py")
+    _verify_root_owned_file(codex_path, runtime["codex_runner_sha256"])
+    _verify_root_owned_file(base_path, runtime["base_runner_sha256"])
+    # No provider command is run: import only the exactly pinned normalizer.
+    namespace = runpy.run_path(str(codex_path), run_name="rab_root_capture_verifier")
+    normalized = _attest_provider_reply(
+        policy, index, request, observation, stream, namespace.get("receipt")
+    )
+    stem = hashlib.sha256(request_id.encode("utf-8", "strict")).hexdigest()
+    stderr, stderr_uid = _read_dynamic_arm_artifact(
+        policy, "evidence", stem + ".stderr", max_bytes=256 * 1024
+    )
+    diagnostics, diagnostic_uid = _read_dynamic_arm_artifact(
+        policy, "evidence", stem + ".provider.json", max_bytes=1_048_576
+    )
+    policy_raw, policy_uid = _read_dynamic_arm_artifact(
+        policy, "evidence", stem + ".stderr-policy.json", max_bytes=1_048_576
+    )
+    if any(owner != uid for owner in (stderr_uid, diagnostic_uid, policy_uid)):
+        raise ArmDenied("root provider output owner differs across persisted evidence")
+    stderr_proof = _attest_provider_stderr(
+        request, stream, stderr, diagnostics, policy_raw,
+        namespace.get("classify_stderr"),
+    )
+    detail = _bounded_policy_json(diagnostics, max_bytes=1_048_576)
+    original = observation["runner_receipt"]
+    if (
+        detail.get("started_at") != original.get("started_at")
+        or detail.get("ended_at") != original.get("ended_at")
+    ):
+        raise ArmDenied("root captured provider timestamps mismatch")
+    return {**normalized, **stderr_proof}
+
+
+def _root_outcome(
+    policy: dict[str, Any], index: int, fd: int, token: str,
+    *, core: Any | None = None,
+) -> None:
+    """Root stops verified PID1, replays raw provider JSONL and issues one release."""
     name = _unit(policy, index)
     group = Path("/sys/fs/cgroup/system.slice") / name
     wanted = (
@@ -806,24 +1162,56 @@ def _root_outcome(policy: dict[str, Any], index: int, fd: int, token: str) -> No
             raise ArmDenied("root PID1 unit cleanup failed")
     if observed is None or not no_descendants():
         raise ArmDenied("root PID1 lifecycle completion cannot be attested")
-    _write_once(
-        fd,
-        "completed-" + token + ".json",
-        {
-            "schema_version": _VERSION,
-            "kind": "rab.root_arm_lifecycle_observation",
-            "policy_sha256": _sha(_canonical(policy)),
-            "token_sha256": token,
-            "unit": name,
-            "invocation_id": observed["InvocationID"],
-            "result": observed["Result"],
-            "main_pid": 0,
-            "cgroup_empty": True,
-            # Root can attest process lifetime, not cryptographically verify
-            # a real provider call or infer an actual dollar charge.
-            "provider_outcome_status": "unverified",
-        },
-    )
+    proof: dict[str, str] | None = None
+    proof_error: Exception | None = None
+    if core is not None:
+        # Never report provider success from systemd exit alone. The original
+        # root-owned controller reads DynamicUser output only after a clean
+        # stop, validates exact stream bytes and replays the pinned parser.
+        try:
+            proof = _verify_completed_provider_capture(policy, index, core)
+        except Exception as exc:
+            proof_error = exc
+    completed = {
+        "schema_version": _VERSION,
+        "kind": "rab.root_arm_lifecycle_observation",
+        "policy_sha256": _sha(_canonical(policy)),
+        "token_sha256": token,
+        "unit": name,
+        "invocation_id": observed["InvocationID"],
+        "result": observed["Result"],
+        "main_pid": 0,
+        "cgroup_empty": True,
+        "provider_outcome_status": (
+            "verified_by_root_issuer" if proof is not None else "unverified"
+        ),
+        "provider_receipt_sha256": (
+            proof["provider_receipt_sha256"] if proof is not None else None
+        ),
+        "transcript_sha256": (
+            proof["transcript_sha256"] if proof is not None else None
+        ),
+        "stderr_policy_sha256": (
+            proof["stderr_policy_sha256"] if proof is not None else None
+        ),
+    }
+    _write_once(fd, "completed-" + token + ".json", completed)
+    if core is not None and proof is None:
+        raise ArmDenied("root provider result remains unverified; slot spent") from proof_error
+    if core is not None and index == 0:
+        next_slot = policy["positions"][1]["slot_id"]
+        _write_once(
+            fd, "release-" + next_slot + ".json",
+            {
+                "schema_version": _VERSION,
+                "kind": "rab.root_arm_second_release",
+                "policy_sha256": _sha(_canonical(policy)),
+                "pair_id": policy["pair_id"],
+                "slot_id": next_slot,
+                "first_token_sha256": token,
+                "first_receipt_sha256": _sha(_canonical(completed)),
+            },
+        )
 
 
 def _require_independent_tool_isolation(_policy: dict[str, Any]) -> None:
@@ -889,7 +1277,7 @@ def execute_one(target: str) -> None:
                 raise ArmDenied("root systemd dispatch uncertain, slot spent") from exc
             if completed.returncode != 0:
                 raise ArmDenied("root systemd dispatch failed, slot spent")
-            _root_outcome(policy, index, state_fd, token)
+            _root_outcome(policy, index, state_fd, token, core=core)
         finally:
             os.close(lock_fd)
     finally:
