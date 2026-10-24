@@ -1232,6 +1232,11 @@ def _provider_pid_namespaced_codex_argv(
         "--chmod",
         "1777",
         "/tmp",
+        # Root's systemd LoadCredential directory remains available to the
+        # trusted outer runner, but never to the isolated Codex process or
+        # model-driven tools. A read-only root bind would expose these bytes.
+        "--tmpfs",
+        "/run/credentials",
     ]
     # Only the unique private per-session Codex home is writable to hostile
     # provider bytes; trusted state, ledger, receipts and reports remain RO.
