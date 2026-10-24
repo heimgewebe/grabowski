@@ -1345,6 +1345,68 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
         self.assertEqual(outcome["errors"], [])
         self.assertTrue(outcome["attempts"][0]["independence_verified"])
 
+    def test_late_inplace_or_replaced_external_v1_role_receipt_blocks_first_settlement(self) -> None:
+        # External legacy V1 reviewer receipts can live outside a job directory.
+        # Job-child file snapshots alone do not detect late mutation of these
+        # create-only independent-review results (P1 regression).
+        for mutation in ("inplace", "replace"):
+            with self.subTest(mutation=mutation):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    jobs = root / "jobs"
+                    jobs.mkdir(mode=0o700)
+                    shared = root / "shared-audit"
+                    shared.mkdir(mode=0o755)
+                    make_job(
+                        jobs, suffix="a00000000221", slot="independent-reviewer",
+                        terminal_status="succeeded", review_result=None, review_role=True,
+                        legacy_role_receipt_parent=shared,
+                    )
+                    later = make_job(
+                        jobs, suffix="b00000000222", slot="B",
+                        terminal_status="succeeded",
+                        review_result=result("B", "PASS_THIS_REVISION", 0),
+                    )
+                    receipt = shared / "review-role-receipt.json"
+                    original_inode = receipt.stat().st_ino
+                    original_validator = reviews._validated_origin_binding
+                    mutated = False
+
+                    def late_reject(directory, *args, **kwargs):
+                        nonlocal mutated
+                        if directory == later and not mutated:
+                            value = json.loads(receipt.read_text(encoding="utf-8"))
+                            value.update(
+                                verdict="NEEDS_CHANGE",
+                                findings=[{"severity": "P1", "summary": "late reject"}],
+                                failure_classification="review_verdict",
+                                returncode=1,
+                            )
+                            value["receipt_sha256"] = reviews._agent_role_receipt_sha256(value)
+                            if mutation == "inplace":
+                                write_private(receipt, json.dumps(value))
+                                self.assertEqual(receipt.stat().st_ino, original_inode)
+                            else:
+                                replacement = shared / "replacement.json"
+                                write_private(replacement, json.dumps(value))
+                                replacement.replace(receipt)
+                            mutated = True
+                        return original_validator(directory, *args, **kwargs)
+
+                    with mock.patch.object(
+                        reviews, "_validated_origin_binding", side_effect=late_reject
+                    ):
+                        first = self.reconcile(jobs)
+                    self.assertTrue(mutated)
+                    self.assertEqual(first["status"], "blocked")
+                    self.assertIn("decision_review_external_role_receipt_changed", first["errors"])
+                    second = self.reconcile(jobs)
+                    self.assertEqual(second["status"], "blocked")
+                    self.assertTrue(any(
+                        item.startswith("decision_review_material_reject:")
+                        for item in second["errors"]
+                    ))
+
     def test_v1_shared_parent_still_rejects_symlinks_hardlinks_and_fifos(self) -> None:
         for attack in ("symlink", "hardlink", "fifo"):
             with self.subTest(attack=attack):

@@ -422,11 +422,27 @@ def decision_review_lock(binding: dict[str, Any]) -> Iterator[None]:
             os.close(descriptor)
 
 
+def _review_stat_file_identity(value: os.stat_result) -> tuple[int, ...]:
+    """Compare physical identity and all writable inode metadata of evidence."""
+    return (
+        value.st_dev, value.st_ino, value.st_mode, value.st_uid,
+        value.st_nlink, value.st_size, value.st_mtime_ns, value.st_ctime_ns,
+    )
+
+
+def _review_stat_parent_identity(value: os.stat_result) -> tuple[int, ...]:
+    """Pin a V1 external receipt's parent without blocking unrelated writes."""
+    return (
+        value.st_dev, value.st_ino, value.st_mode, value.st_uid, value.st_nlink,
+    )
+
+
 def _read_private_bytes(
     path: Path, max_bytes: int, *, require_private_parent: bool = True,
     parent_fd: int | None = None,
     aggregate_metadata_bytes: list[int] | None = None,
     allow_legacy_readable: bool = False,
+    external_v1_snapshots: list[tuple[Path, tuple[int, ...], tuple[int, ...]]] | None = None,
 ) -> bytes:
     """Read bounded stable owner-owned bytes; ordinary legacy logs may be 0644.
 
@@ -443,6 +459,10 @@ def _read_private_bytes(
         parent = os.fstat(parent_fd)
         if not stat.S_ISDIR(parent.st_mode):
             raise ValueError("review evidence parent is not a directory")
+        external_parent_identity = (
+            _review_stat_parent_identity(parent)
+            if external_v1_snapshots is not None else None
+        )
         if require_private_parent and (
             parent.st_uid != os.getuid()
             or stat.S_IMODE(parent.st_mode) & 0o077
@@ -489,6 +509,23 @@ def _read_private_bytes(
                     after.st_size, after.st_mtime_ns, after.st_ctime_ns)
             ):
                 raise ValueError(f"{path.name} changed during read")
+            if external_v1_snapshots is not None:
+                # V1 receipts can live outside the job root. Preserve the FD
+                # preimage, not a later path stat: both inode rewrites and
+                # replacements must invalidate a formerly observed PASS.
+                file_identity = _review_stat_file_identity(before)
+                linked = os.stat(
+                    path.name, dir_fd=parent_fd, follow_symlinks=False
+                )
+                if (
+                    _review_stat_file_identity(linked) != file_identity
+                    or _review_stat_parent_identity(os.fstat(parent_fd))
+                    != external_parent_identity
+                ):
+                    raise ValueError(f"{path.name} changed after review evidence read")
+                external_v1_snapshots.append(
+                    (path, external_parent_identity, file_identity)
+                )
             return bytes(content)
         finally:
             os.close(descriptor)
@@ -501,11 +538,13 @@ def _read_private_json(
     path: Path, max_bytes: int, *, require_private_parent: bool = True,
     parent_fd: int | None = None,
     aggregate_metadata_bytes: list[int] | None = None,
+    external_v1_snapshots: list[tuple[Path, tuple[int, ...], tuple[int, ...]]] | None = None,
 ) -> dict[str, Any]:
     """Read one stable owner-private JSON object without following its path."""
     content = _read_private_bytes(
         path, max_bytes, require_private_parent=require_private_parent,
         parent_fd=parent_fd, aggregate_metadata_bytes=aggregate_metadata_bytes,
+        external_v1_snapshots=external_v1_snapshots,
     )
     try:
         value = json.loads(content.decode("utf-8"))
@@ -1528,6 +1567,7 @@ def _validated_review_role_evidence(
     metadata: dict[str, Any], binding: dict[str, Any], provenance: dict[str, Any] | None,
     *, directory: Path | None = None, parent_fd: int | None = None,
     aggregate_bytes: list[int] | None = None,
+    external_v1_snapshots: list[tuple[Path, tuple[int, ...], tuple[int, ...]]] | None = None,
 ) -> dict[str, Any] | None:
     if provenance is None:
         return None
@@ -1548,6 +1588,9 @@ def _validated_review_role_evidence(
         require_private_parent=provenance["schema_version"] == 2,
         parent_fd=pinned_receipt_fd,
         aggregate_metadata_bytes=aggregate_bytes,
+        external_v1_snapshots=(
+            external_v1_snapshots if provenance["schema_version"] == 1 else None
+        ),
     )
     expected_receipt_sha256 = _agent_role_receipt_sha256(receipt)
     if receipt.get("receipt_sha256") != expected_receipt_sha256:
@@ -1646,6 +1689,35 @@ def _attempt_started_after(candidate: dict[str, Any], prior: dict[str, Any]) -> 
         return False
     return candidate_ns > prior_ns
 
+
+
+def _external_v1_role_receipts_unchanged(
+    snapshots: list[tuple[Path, tuple[int, ...], tuple[int, ...]]],
+) -> bool:
+    """Recheck every earlier external V1 receipt after the full registry scan.
+
+    Unlike V2 evidence, historical V1 role receipts can reside outside the
+    scanned job directory. No receipt is reinterpreted or granted authority
+    here; this only invalidates prior observations if their path, parent or
+    physical file identity changed.
+    """
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    for path, parent_identity, file_identity in snapshots:
+        try:
+            parent_fd = os.open(path.parent, flags)
+            try:
+                if _review_stat_parent_identity(os.fstat(parent_fd)) != parent_identity:
+                    return False
+                observed = os.stat(
+                    path.name, dir_fd=parent_fd, follow_symlinks=False
+                )
+                if _review_stat_file_identity(observed) != file_identity:
+                    return False
+            finally:
+                os.close(parent_fd)
+        except OSError:
+            return False
+    return True
 
 
 def _review_child_file_snapshot(
@@ -2008,6 +2080,7 @@ def reconcile(
         }
     metadata_budget = [0]
     unbound_stdout_budget = [0]
+    external_v1_snapshots: list[tuple[Path, tuple[int, ...], tuple[int, ...]]] = []
     skipped_prelaunch_stubs: list[str] = []
     iterator = _iter_pinned_review_job_directories(
         root, errors, metadata_budget, expected=expected,
@@ -2154,6 +2227,7 @@ def reconcile(
                 role_evidence = _validated_review_role_evidence(
                     metadata, binding, provenance, directory=directory,
                     parent_fd=directory_fd, aggregate_bytes=metadata_budget,
+                    external_v1_snapshots=external_v1_snapshots,
                 )
             except FileNotFoundError as exc:
                 # A drifted diff binding is repairable only when a valid provenance-
@@ -2262,6 +2336,9 @@ def reconcile(
             else:
                 attempt["classification"] = "pass"
             attempts.append(attempt)
+
+    if not _external_v1_role_receipts_unchanged(external_v1_snapshots):
+        errors.append("decision_review_external_role_receipt_changed")
 
     slots: list[dict[str, Any]] = []
     for slot in sorted({str(item["slot"]) for item in attempts}):
