@@ -37,7 +37,10 @@ _TARGET = re.compile(r"([0-9a-f]{64}):([01])\Z")
 _MAX_POLICY_BYTES = 16384
 _MAX_ARM_SECONDS = 300
 _FROZEN_PLAN_SHA256 = "2795584ac0c100cdceb6ed2c7eb42b883de2099b2a3d33ac51dbe9987655f10c"
-_MAX_INSTALLED_BYTES = 32 * 1024 * 1024
+# The official Codex CLI 0.163.0 is 296865480 bytes on the target host.
+# Hash from a fixed fd in chunks; never load that executable into RAM.
+_MAX_INSTALLED_BYTES = 512 * 1024 * 1024
+_HASH_CHUNK_BYTES = 1024 * 1024
 _SYSTEMD_RUN = "/usr/bin/systemd-run"
 _SYSTEMCTL = "/usr/bin/systemctl"
 _VERSION = 2
@@ -356,8 +359,23 @@ def _unit_argv(policy: dict[str, Any], index: int) -> list[str]:
     ]
 
 
-def _root_owned_bytes(path: Path, expected_sha256: str) -> bytes:
-    """Pin installed bytes through root-only, non-symlink directory handles."""
+def _digest_verified_fd(descriptor: int, size: int) -> str:
+    """Hash a fixed regular-file fd in bounded chunks, failing on short reads."""
+    if type(size) is not int or not 0 < size <= _MAX_INSTALLED_BYTES:
+        raise ArmDenied("installed program size is invalid")
+    digest = hashlib.sha256()
+    remaining = size
+    while remaining:
+        part = os.read(descriptor, min(_HASH_CHUNK_BYTES, remaining))
+        if not part:
+            raise ArmDenied("installed program ended during hash verification")
+        digest.update(part)
+        remaining -= len(part)
+    return digest.hexdigest()
+
+
+def _verify_root_owned_file(path: Path, expected_sha256: str) -> None:
+    """Pin installed executable bytes through root-only, non-symlink handles."""
     if not _hex(expected_sha256) or not path.is_absolute():
         raise ArmDenied("installed code digest or path is invalid")
     flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
@@ -385,16 +403,14 @@ def _root_owned_bytes(path: Path, expected_sha256: str) -> bytes:
                 or not 0 < before.st_size <= _MAX_INSTALLED_BYTES
             ):
                 raise ArmDenied("installed program has unsafe ownership")
-            raw = os.read(descriptor, _MAX_INSTALLED_BYTES + 1)
+            actual_sha256 = _digest_verified_fd(descriptor, before.st_size)
             after = os.fstat(descriptor)
             if (
-                len(raw) != before.st_size
-                or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+                (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
                 != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
-                or _sha(raw) != expected_sha256
+                or actual_sha256 != expected_sha256
             ):
                 raise ArmDenied("installed program bytes changed or digest mismatched")
-            return raw
         finally:
             os.close(descriptor)
     except OSError as exc:
@@ -519,7 +535,7 @@ def _verified_core(policy: dict[str, Any]) -> Any:
     if Path(__file__).absolute() != _INSTALLED_SELF:
         raise ArmDenied("controller is not the installed root program")
     for key, path in files.items():
-        _root_owned_bytes(path, policy["installed_sha256"][key])
+        _verify_root_owned_file(path, policy["installed_sha256"][key])
     spec = importlib.util.spec_from_file_location(
         "rab_installed_root_core", _INSTALLED_CORE
     )

@@ -321,6 +321,38 @@ class RootArmReleaseTests(unittest.TestCase):
         systemd_start.assert_not_called()
 
 
+class InstalledCodexIdentityTests(unittest.TestCase):
+    def test_codex_cli_binary_larger_than_old_32m_is_supported_boundedly(self) -> None:
+        # Official Codex CLI 0.163.0 on heim-pc is 296865480 bytes.
+        self.assertGreaterEqual(controller._MAX_INSTALLED_BYTES, 296865480)
+        self.assertTrue(hasattr(controller, "_digest_verified_fd"))
+
+    def test_large_installed_file_digest_reads_in_bounded_chunks(self) -> None:
+        import hashlib
+        size = 33 * 1024 * 1024
+        with tempfile.TemporaryFile() as handle:
+            handle.truncate(size)
+            handle.seek(0)
+            original = os.read
+            calls = []
+
+            def bounded_read(fd: int, length: int) -> bytes:
+                if fd == handle.fileno():
+                    calls.append(length)
+                    self.assertLessEqual(length, 1024 * 1024)
+                return original(fd, length)
+
+            with mock.patch.object(controller.os, "read", side_effect=bounded_read):
+                actual = controller._digest_verified_fd(handle.fileno(), size)
+            # Distinguish a streamed kernel read from a forged fixed digest.
+            expected = hashlib.sha256()
+            block = bytes(1024 * 1024)
+            for _ in range(33):
+                expected.update(block)
+            self.assertEqual(actual, expected.hexdigest())
+            self.assertGreater(len(calls), 30)
+
+
 class RootbrokerActionCatalogTests(unittest.TestCase):
     def test_dedicated_broker_entry_has_no_arbitrary_command_and_is_inert(self) -> None:
         catalogue = json.loads(
