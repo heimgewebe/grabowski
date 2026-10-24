@@ -5,6 +5,7 @@ Tests construct exact production Codex argv. They never invoke a model.
 from __future__ import annotations
 
 from pathlib import Path
+import os
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -18,6 +19,43 @@ from tests.test_repobrief_agent_benchmark_codex_runner import (
 
 
 class CodexToolProfileSecurityTests(unittest.TestCase):
+    def test_git_root_owned_snapshot_trust_is_exact_and_non_authorizing(self) -> None:
+        unit = "/run/credentials/grabowski-rab-" + "a" * 16 + ".service"
+        with patch.dict(os.environ, {
+            "CREDENTIALS_DIRECTORY": unit,
+            "GIT_CONFIG_COUNT": "99",
+            "GIT_CONFIG_KEY_0": "core.hooksPath",
+            "GIT_CONFIG_VALUE_0": "/tmp/untrusted",
+        }, clear=True):
+            git_env = runner.base._git_environment()
+            provider_env = runner.provider_env()
+        self.assertEqual(git_env["GIT_CONFIG_COUNT"], "2")
+        self.assertEqual(
+            (git_env["GIT_CONFIG_KEY_0"], git_env["GIT_CONFIG_KEY_1"]),
+            ("safe.directory", "safe.directory"),
+        )
+        self.assertEqual(
+            git_env["GIT_CONFIG_VALUE_0"],
+            "/home/alex/.local/state/grabowski/rab-v1-effectiveness-20260922-struct-finalizer-r2/source",
+        )
+        self.assertEqual(
+            git_env["GIT_CONFIG_VALUE_1"],
+            "/home/alex/.local/state/grabowski/rab-g1-historical-20261009/lenskit",
+        )
+        self.assertNotIn("GIT_CONFIG_COUNT", provider_env)
+        for invalid_unit in (
+            "", "/run/credentials/not-a-root-rab.service",
+            "/run/credentials/grabowski-rab-" + "x" * 16 + ".service",
+        ):
+            with patch.dict(os.environ, {
+                "CREDENTIALS_DIRECTORY": invalid_unit,
+                "GIT_CONFIG_COUNT": "99",
+                "GIT_CONFIG_KEY_0": "core.hooksPath",
+            }, clear=True):
+                direct = runner.base._git_environment()
+            self.assertNotIn("GIT_CONFIG_COUNT", direct)
+            self.assertNotIn("GIT_CONFIG_KEY_0", direct)
+
     def test_both_arms_deny_auth_file_reads_and_outbound_network(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

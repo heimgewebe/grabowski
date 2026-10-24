@@ -656,6 +656,21 @@ def _git_environment() -> dict[str, str]:
             "GIT_NO_LAZY_FETCH": "1",
         }
     )
+    # The two frozen RAB sources are root-owned inside the PID1-controlled
+    # read-only input projection. A DynamicUser needs Git's owner exception.
+    # Only exact static paths enter Git's per-process config; inherited Git
+    # keys are never forwarded. This does NOT authenticate a root systemd
+    # unit or grant provider execution, which remain separate runner gates.
+    unit = os.environ.get("CREDENTIALS_DIRECTORY", "")
+    if re.fullmatch(r"/run/credentials/grabowski-rab-[0-9a-f]{16}\.service", unit):
+        sources = (
+            "/home/alex/.local/state/grabowski/rab-v1-effectiveness-20260922-struct-finalizer-r2/source",
+            "/home/alex/.local/state/grabowski/rab-g1-historical-20261009/lenskit",
+        )
+        environment["GIT_CONFIG_COUNT"] = str(len(sources))
+        for index, source in enumerate(sources):
+            environment[f"GIT_CONFIG_KEY_{index}"] = "safe.directory"
+            environment[f"GIT_CONFIG_VALUE_{index}"] = source
     return environment
 
 
