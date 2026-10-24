@@ -111,6 +111,16 @@ class RootArmPolicyTests(unittest.TestCase):
         self.assertEqual(after[0], str(controller._INSTALLED_RUNNER))
         self.assertFalse(any("sh -c" in item for item in argv))
 
+    def test_outer_unit_has_separate_bounded_pre_and_postflight_budget(self) -> None:
+        p = _pair()
+        self.assertEqual(p["max_wall_seconds"], 300)
+        argv = controller._unit_argv(p, 0)
+        # The provider still has only 300s, but the unit must also have time
+        # for login/sandbox preflight and root-visible result finalization.
+        self.assertIn("--property=RuntimeMaxSec=420", argv)
+        self.assertNotIn("--property=RuntimeMaxSec=300", argv)
+
+
     def test_unprivileged_root_action_cannot_execute(self) -> None:
         with (
             mock.patch.object(controller.os, "geteuid", return_value=1000),

@@ -332,7 +332,9 @@ def _unit_argv(policy: dict[str, Any], index: int) -> list[str]:
         "StandardInput=null",
         "StandardOutput=null",
         "StandardError=null",
-        f"RuntimeMaxSec={policy['max_wall_seconds']}",
+        # The 300-second model wall clock is enforced by the provider runner;
+        # PID 1 also needs a bounded 120s envelope for preparation and closeout.
+        f"RuntimeMaxSec={policy['max_wall_seconds'] + 120}",
         "MemoryMax=512M",
         "TasksMax=128",
         f"StateDirectory={unit.removesuffix('.service')}",
