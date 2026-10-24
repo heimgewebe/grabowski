@@ -4849,6 +4849,20 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
         self.assertTrue(any("domains={}" in item for item in baseline))
         self.assertTrue(any(":workspace_roots" in item for item in baseline))
         self.assertIn('web_search="disabled"', baseline)
+        # Codex needs auth, but model-driven tools must not read/copy it.
+        # This exact permission profile was accepted by Codex CLI 0.163
+        # and denied a real user-systemd sandbox file-read probe.
+        protected_auth = runner._toml_string(str(codex_home / "auth.json")) + '="deny"'
+        for command in (baseline, treatment):
+            profiles = [
+                item
+                for item in command
+                if item.startswith(
+                    f"permissions.{runner.PERMISSION_PROFILE}.filesystem="
+                )
+            ]
+            self.assertEqual(len(profiles), 1)
+            self.assertEqual(profiles[0].count(protected_auth), 1)
         baseline_disabled = [
             baseline[index + 1]
             for index, value in enumerate(baseline[:-1])

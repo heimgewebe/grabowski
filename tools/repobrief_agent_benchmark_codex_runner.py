@@ -8888,6 +8888,11 @@ def build_command(
         '{":minimal"="read",":workspace_roots"={"."="read"},'
         + _toml_string(str(codex_home / "tmp"))
         + '="read",'
+        # The official Codex process authenticates outside its tool sandbox.
+        # Model-controlled shell/MCP descendants must not read/copy auth.json.
+        # This exact deny-read profile was validated with Codex CLI 0.163.
+        + _toml_string(str(codex_home / "auth.json"))
+        + '="deny",'
         + _toml_string(str(Path(codex).parent))
         + '="read"}'
     )
