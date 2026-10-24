@@ -1180,7 +1180,9 @@ def _strict_private_wal_snapshot(
             before, wal_index_header, copied_wal = _strict_wal_source_worker(
                 "prepare", database=path, wal=wal, shm=shm,
                 error_type=error_type, message=message,
-                scratch=Path(directory), budget=budget,
+                # Never exceed the tmpfs/memory allocation approved before
+                # a concurrent SQLite writer can grow the source database.
+                scratch=Path(directory), budget=min(budget, total),
             )
             database_id, wal_id = before[path], before[wal]
             if (

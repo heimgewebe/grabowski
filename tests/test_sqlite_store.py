@@ -1706,6 +1706,78 @@ class SQLiteStoreTests(unittest.TestCase):
                     ):
                         self.fail("oversize WAL must not be replayed")
 
+    def test_strict_wal_worker_cannot_copy_more_than_preflight_headroom(self) -> None:
+        # Reproduce a genuine SQLite commit/checkpoint between the parent's
+        # memory proof and the isolated worker. The old worker copied the
+        # larger database before the parent noticed changed source identities.
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "growing.sqlite3"
+            writer = sqlite3.connect(database)
+            try:
+                writer.execute("PRAGMA journal_mode=WAL")
+                writer.execute("PRAGMA wal_autocheckpoint=0")
+                writer.execute("CREATE TABLE items (payload BLOB)")
+                writer.execute("INSERT INTO items VALUES (?)", (b"initial",))
+                writer.commit()
+                wal = Path(str(database) + "-wal")
+                approved_bytes = database.stat().st_size + min(
+                    wal.stat().st_size, sqlite_store.STRICT_PRIVATE_WAL_MAX_WAL_BYTES
+                )
+                observed_private_copies = []
+                original_worker = sqlite_store._strict_wal_source_worker
+
+                def grow_at_prepare(action, **kwargs):
+                    if action != "prepare":
+                        return original_worker(action, **kwargs)
+                    writer.execute(
+                        "INSERT INTO items VALUES (?)", (b"x" * (1024 * 1024),)
+                    )
+                    writer.commit()
+                    writer.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                    writer.execute("INSERT INTO items VALUES (?)", (b"new tail",))
+                    writer.commit()
+                    self.assertGreater(database.stat().st_size, approved_bytes)
+                    try:
+                        return original_worker(action, **kwargs)
+                    finally:
+                        copied = kwargs["scratch"] / database.name
+                        if copied.exists():
+                            observed_private_copies.append(copied.stat().st_size)
+
+                # Advertise only enough free memory for the ORIGINAL source
+                # size. A later real source growth must fail in the worker
+                # before even the first plaintext byte is copied.
+                with (
+                    patch.object(
+                        sqlite_store, "_strict_wal_memory_root", return_value=root,
+                    ),
+                    patch.object(
+                        sqlite_store, "_strict_wal_available_memory",
+                        return_value=(
+                            2 * approved_bytes
+                            + sqlite_store.STRICT_PRIVATE_WAL_MEMORY_RESERVE_BYTES
+                        ),
+                    ),
+                    patch.object(
+                        sqlite_store, "_strict_wal_source_worker",
+                        side_effect=grow_at_prepare,
+                    ),
+                    self.assertRaises(InventoryChanged),
+                ):
+                    with sqlite_store.inventory_readonly_sqlite(
+                        database, temporary_prefix="headroom-race-",
+                        error_type=InventoryChanged, allow_wal_copy=False,
+                        allow_private_wal_snapshot=True,
+                    ):
+                        self.fail("raced source must not yield a reader")
+                self.assertEqual(
+                    observed_private_copies, [],
+                    "worker must not copy bytes beyond preflight-approved headroom",
+                )
+            finally:
+                writer.close()
+
     def test_strict_private_wal_memory_headroom_blocks_before_copy(self) -> None:
         with TemporaryDirectory() as directory:
             db = Path(directory) / "low-memory.sqlite3"
