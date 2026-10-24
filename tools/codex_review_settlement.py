@@ -770,6 +770,7 @@ def _live_state(repo: Path, repository: str, pr_number: int) -> dict[str, Any]:
         timeout=90,
         env=pr_review_gate._env(),
     )
+    oversized_diff_bound = False
     if diff_bytes.returncode != 0:
         diagnostic = diff_bytes.stderr + b"\n" + diff_bytes.stdout
         detail = diff_bytes.stderr.decode("utf-8", errors="replace")
@@ -795,11 +796,27 @@ def _live_state(repo: Path, repository: str, pr_number: int) -> dict[str, Any]:
             or sorted(graphql_paths) != sorted(item["path"] for item in rest_files)
         ):
             raise SettlementError("GraphQL and REST PR file paths or counts drift")
+        # Local Git authenticates the complete changed-path set but not the
+        # pairing of REST rename/copy origins with their destinations. Two
+        # renames can swap previousPath while preserving the same path set.
+        # Do not promote mutable REST rename/copy provenance into a decision.
+        # Even a benign-looking REST status cannot establish the origin pair.
+        if any(item.get("status") in {"renamed", "copied"} for item in rest_files):
+            raise SettlementError(
+                "oversized PR diff rename/copy provenance is not authenticated"
+            )
+        # HTTP 406 affects the mutable raw PR diff, not necessarily the
+        # commit-pinned Compare file inventory. A->B->A can make REST claim
+        # "added"/"modified" while the exact SHA pair still contains a rename
+        # or copy from a high-critical trust path. Use only that immutable
+        # pairing as the fallback's review and local-Git binding authority.
+        # Missing/truncated Compare evidence must fail closed.
+        pinned_files = _revision_bound_rename_files(repo, repository, pull_request)
         view = {
             "headRefOid": pull_request["headRefOid"],
             "baseRefOid": pull_request["baseRefOid"],
             "pullFilesEvidenceComplete": True,
-            "files": rest_files,
+            "files": pinned_files,
         }
         try:
             local_diff = pr_review_gate._local_bound_pr_diff_bytes(repo, view)
@@ -818,11 +835,106 @@ def _live_state(repo: Path, repository: str, pr_number: int) -> dict[str, Any]:
         ):
             raise SettlementError("PR head, base or file count drifted during local diff readback")
         pull_request["diff_sha256"] = pr_review_gate.github_pr_diff_identity_sha256(local_diff)
+        # The exact local diff is bound to complete revision-pinned origin
+        # evidence, not the mutable REST statuses used for count/path comparison.
+        pull_request["files"] = {
+            "nodes": pinned_files, "pageInfo": {"hasNextPage": False}
+        }
+        oversized_diff_bound = True
     else:
         if not diff_bytes.stdout:
             raise SettlementError("current PR diff is empty")
         pull_request["diff_sha256"] = pr_review_gate.github_pr_diff_identity_sha256(diff_bytes.stdout)
+    # A destination-only GraphQL list cannot prove rename origin, even when
+    # another changed path already demands independent review. Never skip the
+    # immutable compare because of a pre-existing risk tier.
+    if not oversized_diff_bound:
+        pinned = _revision_bound_rename_files(repo, repository, pull_request)
+        pull_request["files"] = {
+            "nodes": pinned, "pageInfo": {"hasNextPage": False}
+        }
+        # "gh pr diff" has no revision parameter. In an A->B->A head cycle
+        # it can contain B's bytes while the metadata above describes A.
+        # Bind the canonical patch identity as well as rename origins to the
+        # exact SHA pair. Index abbreviation and optional hunk labels are
+        # presentation details, not new source identities.
+        base, head = _current_base(pull_request), _current_head(pull_request)
+        pinned_diff = subprocess.run(
+            [
+                "gh", "api", "-H", "Accept: application/vnd.github.diff",
+                f"repos/{repository}/compare/{base}...{head}",
+            ],
+            cwd=repo,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=90,
+            env=pr_review_gate._env(),
+        )
+        if pinned_diff.returncode != 0 or not pinned_diff.stdout:
+            raise SettlementError("cannot read revision-bound PR diff")
+        if (
+            pr_review_gate.github_pr_diff_identity_sha256(pinned_diff.stdout)
+            != pull_request["diff_sha256"]
+        ):
+            raise SettlementError(
+                "revision-bound PR diff differs from mutable PR diff: "
+                "possible PR/Compare merge-base divergence; fail closed and "
+                "use CAS-bound pr-base-converge only after fresh authority checks"
+            )
     return pull_request
+
+def _revision_bound_rename_files(
+    repo: Path, repository: str, pr: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Bind rename source paths to immutable base/head commit IDs, not PR REST state.
+
+    GitHub's PR files endpoint has no revision parameter; an A->B->A head
+    transition could otherwise substitute metadata from B into a review of A.
+    GitHub compare is addressed by the exact SHA pair and fails closed when
+    its bounded changed-file inventory cannot be authenticated.
+    """
+    base, head = _current_base(pr), _current_head(pr)
+    count = pr.get("changedFiles")
+    graphql = _list_nodes(pr.get("files"), label="files")
+    if type(count) is not int or count < 1 or count > 300 or len(graphql) != count:
+        raise SettlementError("immutable changed-file evidence is incomplete or too large")
+    paths = [item.get("path") for item in graphql]
+    if any(not isinstance(path, str) or not path for path in paths):
+        raise SettlementError("GraphQL changed-file paths are malformed")
+    payload = _run_json(
+        repo, ["gh", "api", f"repos/{repository}/compare/{base}...{head}"]
+    )
+    if not isinstance(payload, dict):
+        raise SettlementError("revision-bound compare response is invalid")
+    # The intentionally *unpaged* GitHub Compare endpoint returns at most
+    # 250 commits, but its final commit is the comparison's newest HEAD
+    # even when total_commits is larger. With page/per_page the last entry
+    # may be an intermediate commit. Do not add pagination here without
+    # separately authenticating the immutable comparison's last HEAD.
+    # https://docs.github.com/en/rest/commits/commits#compare-two-commits
+    commits = payload.get("commits")
+    if (
+        not isinstance(payload.get("base_commit"), dict)
+        or payload["base_commit"].get("sha") != base
+        or not isinstance(commits, list)
+        or not commits
+        or not isinstance(commits[-1], dict)
+        or commits[-1].get("sha") != head
+    ):
+        raise SettlementError("revision-bound compare base/head identity drifted")
+    evidence = pr_review_gate._pull_file_evidence([payload.get("files")])
+    if (
+        evidence is None
+        or len(evidence) != count
+        or pr_review_gate._complete_pr_diff_paths({
+            "pullFilesEvidenceComplete": True, "files": evidence
+        }) is None
+        or sorted(paths) != sorted(item["path"] for item in evidence)
+    ):
+        raise SettlementError("revision-bound compare rename evidence is incomplete or drifted")
+    return evidence
 
 
 def _list_nodes(container: Any, *, label: str) -> list[dict[str, Any]]:
@@ -1027,13 +1139,44 @@ def _current_diff(pr: dict[str, Any]) -> str:
 
 def _policy(pr: dict[str, Any], repository: str, *, explicitly_required: bool) -> dict[str, Any]:
     files = _list_nodes(pr.get("files"), label="files")
+    # Keep the source side of an authenticated rename risk-visible.  The
+    # base review-gate classifier may predate native previousPath support;
+    # treating the source as another risk path is conservative on both versions.
+    paths = [{"path": item.get("path")} for item in files]
+    renamed_critical_sources: list[str] = []
+    for item in files:
+        if item.get("status") == "renamed":
+            previous = item.get("previousPath")
+            if (not isinstance(previous, str)
+                    or pr_review_gate._normalized_review_path(previous) != previous):
+                raise SettlementError("rename source path is missing or invalid")
+            paths.append({"path": previous})
+            # Until the separate PR #1568 risk-path normalizer is integrated,
+            # .github is wrongly lstrip("./")-normalized to github.  Apply
+            # the existing high-critical prefix policy to the exact source
+            # path without rewriting its identity.
+            if any(previous.lower() == prefix.rstrip("/")
+                   or previous.lower().startswith(prefix)
+                   for prefix in pr_review_gate.HIGH_CRITICAL_PATH_PREFIXES):
+                renamed_critical_sources.append(previous)
     view = {
         "changedFiles": pr.get("changedFiles"),
         "additions": pr.get("additions"),
         "deletions": pr.get("deletions"),
-        "files": [{"path": item.get("path")} for item in files],
+        "files": paths,
     }
     complexity = pr_review_gate.classify_complexity(view, None, repo_name=repository)
+    if renamed_critical_sources:
+        complexity["review_tier"] = "high_critical"
+        complexity["external_review_required"] = True
+        complexity["self_review_required"] = True
+        complexity["minimum_self_review_iterations"] = max(
+            4, int(complexity.get("minimum_self_review_iterations") or 0)
+        )
+        complexity["reasons"] = list(complexity.get("reasons") or []) + [
+            f"immutable rename source requires high-critical review: {source}"
+            for source in renamed_critical_sources
+        ]
     policy_required = complexity.get("external_review_required") is True
     required = explicitly_required or policy_required
     reasons: list[str] = []
