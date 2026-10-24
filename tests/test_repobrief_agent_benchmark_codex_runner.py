@@ -4863,6 +4863,14 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
             ]
             self.assertEqual(len(profiles), 1)
             self.assertEqual(profiles[0].count(protected_auth), 1)
+            # On the real host, "limited" networking still allowed a direct
+            # outbound TCP connection from a Codex tool; enabled=false made
+            # the AF_INET socket syscall fail with EPERM, without a model turn.
+            disabled_network = (
+                f"permissions.{runner.PERMISSION_PROFILE}.network="
+                '{enabled=false,mode="limited",allow_local_binding=false,domains={}}'
+            )
+            self.assertEqual(command.count(disabled_network), 1)
         baseline_disabled = [
             baseline[index + 1]
             for index, value in enumerate(baseline[:-1])
