@@ -2389,6 +2389,40 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
         self.assertEqual(slot["infrastructure_error_count"], 1)
         self.assertEqual(slot["pass_count"], 1)
 
+    def test_unrecognizable_reject_origin_cannot_leave_a_prior_pass_settled(self) -> None:
+        # Damage may erase every raw PR/head hint from the REJECT's metadata.
+        # A separate valid PASS must never establish a settled verdict.
+        for damaged in (None, "{}", "not-valid-json", '{"scope":{"decision_bound_review":null}}'):
+            with self.subTest(damaged=damaged):
+                with tempfile.TemporaryDirectory() as temp:
+                    jobs = Path(temp) / "jobs"
+                    jobs.mkdir(mode=0o700)
+                    make_job(
+                        jobs, suffix="aaaaaaaaa311", slot="A",
+                        terminal_status="succeeded",
+                        review_result=result("A", "PASS_THIS_REVISION", 0),
+                    )
+                    rejected = make_job(
+                        jobs, suffix="bbbbbbbbb312", slot="A",
+                        terminal_status="succeeded",
+                        review_result=result("A", "REJECT_THIS_REVISION", 1),
+                    )
+                    before = self.reconcile(jobs)
+                    self.assertEqual(before["status"], "blocked")
+                    self.assertEqual(before["attempt_count"], 2)
+                    if damaged is None:
+                        (rejected / "metadata.json").unlink()
+                    else:
+                        write_private(rejected / "metadata.json", damaged)
+                    checked = self.reconcile(jobs)
+                self.assertEqual(checked["status"], "blocked")
+                error_type = "FileNotFoundError" if damaged is None else "ValueError"
+                self.assertIn(
+                    f"decision_review_origin_invalid:grabowski-job-bbbbbbbbb312:{error_type}",
+                    checked["errors"],
+                )
+                self.assertEqual(checked["attempt_count"], 1)
+
     def test_malformed_targeted_registration_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             jobs = Path(tmp)

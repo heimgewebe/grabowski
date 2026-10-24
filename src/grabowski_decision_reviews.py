@@ -1775,12 +1775,12 @@ def reconcile(
                 attempts = []
                 break
             except (FileNotFoundError, OSError, ValueError) as exc:
-                if raw_targets_pr_head or (
-                    isinstance(exc, OSError) and not isinstance(exc, FileNotFoundError)
-                ):
-                    errors.append(
-                        f"decision_review_origin_invalid:{directory.name}:{type(exc).__name__}"
-                    )
+                # Missing or corrupted canonical metadata could conceal a
+                # material REJECT, regardless of any recoverable PR/head hint.
+                # Do not infer a legacy exemption from absence of evidence.
+                errors.append(
+                    f"decision_review_origin_invalid:{directory.name}:{type(exc).__name__}"
+                )
                 continue
             if binding is None or not _binding_matches_pr_head(binding, expected):
                 continue
