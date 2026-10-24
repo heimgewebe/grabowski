@@ -634,6 +634,10 @@
       "source": "src/grabowski_agent_sandbox.py"
     },
     {
+      "module": "grabowski_codex_preflight",
+      "source": "src/grabowski_codex_preflight.py"
+    },
+    {
       "module": "grabowski_agent_writer",
       "source": "src/grabowski_agent_writer.py"
     },

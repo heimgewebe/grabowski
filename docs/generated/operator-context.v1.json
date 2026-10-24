@@ -3597,6 +3597,10 @@
         "source": "src/grabowski_agent_sandbox.py"
       },
       {
+        "module": "grabowski_codex_preflight",
+        "source": "src/grabowski_codex_preflight.py"
+      },
+      {
         "module": "grabowski_agent_writer",
         "source": "src/grabowski_agent_writer.py"
       },
@@ -3702,7 +3706,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "9e0934a57620c5e970ac0aadf964c977f9c037356faa2ed48d99264850958c93"
+      "sha256": "8414018c4b85bab3fa58581cc113720bb750a1da70c76400c046f8caf516f48c"
     },
     "runtime_source_digest_contract": "mcp-tool-surface-v1",
     "runtime_sources": {
@@ -3738,6 +3742,7 @@
       "src/grabowski_checkouts.py": "b765e63544a072a0b0ab24d1f7a06670173642f44c45356783492cbdbf52a4f8",
       "src/grabowski_chronik.py": "68785720fc9dac258b493011f99d5568ef1ca5543e21eee853e6d8e6c1616c17",
       "src/grabowski_client_snapshot.py": "777d9aa6d4bd964e7fdbb923d82586d186f9e0340e51b8e4b1140cae1e863eec",
+      "src/grabowski_codex_preflight.py": "3a90bb4ba8118f178b3ae5ed517d2a18c1eff36f985fbf2a4ac2bc3dc5f27b76",
       "src/grabowski_coding_agent_catalog_data.py": "2e9b3163bf93f58f5c2848813e51d1cf0f13c59dc071eb678a11657c4bb645a2",
       "src/grabowski_coding_agent_router.py": "a845c30a5d639531a502e719d9d934675750f413aef6d768a76de7fdb9eb159b",
       "src/grabowski_coding_agent_router_cli.py": "583e4d7e0213245b423d7255fca88834db2de678ea1ae86ed2e515946b9afb14",
