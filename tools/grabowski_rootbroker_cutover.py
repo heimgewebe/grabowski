@@ -78,6 +78,8 @@ ROOTBROKER_CUTOVER_ACTION = "operator_rootbroker_cutover"
 SECRET_PTY_ACTION = "operator_secret_pty_getpass_probe"
 BLOCKADE_LIFECYCLE_ACTION = "operator_blockade_marker_lifecycle"
 ROOT_TASK_ACTION = "operator_root_task_systemd_unit"
+RAB_ARM_CONTROLLER_TARGET = Path("/usr/local/libexec/grabowski-rab-root-arm-controller")
+RAB_ARM_CORE_TARGET = Path("/usr/local/lib/grabowski/grabowski_rab_provider_one_shot.py")
 RAB_ARM_ACTION = "operator_rab_benchmark_arm_start"
 CRITICAL_USER_DATA_INVENTORY_ACTION = "critical_user_data_inventory"
 CRITICAL_USER_DATA_INVENTORY_READ_ACTION = "critical_user_data_inventory_read"
@@ -256,6 +258,18 @@ ARTIFACTS = (
         "tools/grabowski_rootbroker_cutover.py",
         CUTOVER_HELPER_TARGET,
         0o755,
+        True,
+    ),
+    Artifact(
+        "tools/grabowski_rab_root_arm_controller.py",
+        RAB_ARM_CONTROLLER_TARGET,
+        0o755,
+        True,
+    ),
+    Artifact(
+        "tools/grabowski_rab_provider_one_shot.py",
+        RAB_ARM_CORE_TARGET,
+        0o644,
         True,
     ),
     Artifact(
