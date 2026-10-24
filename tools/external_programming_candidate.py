@@ -549,6 +549,8 @@ def _commit_blob(repo: Path, expected_head: str, relative: str) -> bytes:
     fields = metadata.split()
     if len(fields) != 3 or fields[1] != b"blob" or re.fullmatch(rb"[0-9a-f]{40,64}", fields[2]) is None:
         raise CandidateError(f"context path metadata is invalid at bound commit: {relative}")
+    if fields[0] not in {b"100644", b"100755"}:
+        raise CandidateError(f"context path is not a regular tracked file at bound commit: {relative}")
     try:
         observed_path = raw_path.decode("utf-8")
     except UnicodeDecodeError as exc:

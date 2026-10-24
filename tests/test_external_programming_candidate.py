@@ -96,6 +96,40 @@ class ExternalProgrammingCandidateTests(unittest.TestCase):
             with self.assertRaisesRegex(candidate_tool.CandidateError, "non-exportable"):
                 candidate_tool.validate_packet(packet)
 
+    def test_committed_git_symlink_is_not_exportable_by_runner(self) -> None:
+        # Git calls symlinks "blob" objects too; mode 120000 must not be treated
+        # as regular source, even if the packet presents the matching blob hash.
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.name", "Source Test"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=repo, check=True)
+            (repo / "source.txt").write_text("trusted source\n", encoding="utf-8")
+            link = repo / "src" / "sample.py"
+            link.parent.mkdir()
+            link.symlink_to("../source.txt")
+            subprocess.run(["git", "add", "--", "source.txt", "src/sample.py"], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-qm", "committed regular and symlink"], cwd=repo, check=True)
+            head = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=repo, text=True
+            ).strip()
+            self.assertEqual(
+                candidate_tool._commit_blob(repo, head, "source.txt"),
+                b"trusted source\n",
+            )
+            with self.assertRaisesRegex(candidate_tool.CandidateError, "regular tracked file"):
+                candidate_tool._commit_blob(repo, head, "src/sample.py")
+            with self.assertRaisesRegex(candidate_tool.CandidateError, "regular tracked file"):
+                candidate_tool.repo_snapshot(
+                    repo,
+                    head,
+                    [{
+                        "path": "src/sample.py",
+                        "sha256": hashlib.sha256(b"../source.txt").hexdigest(),
+                    }],
+                )
+
     def _packet(
         self,
         directory: Path,
