@@ -36,11 +36,14 @@ _POLICY_ROOT = Path("/etc/grabowski/rab-arm")
 _CREDENTIAL_ROOT = _POLICY_ROOT / "credentials"
 _REQUEST_ROOT = _POLICY_ROOT / "requests"
 _STATE_ROOT = Path("/var/lib/grabowski/rab-arm")
+_INPUT_ROOT = _STATE_ROOT / "input-projections"
+_FROZEN_INPUT_EPOCH = Path(".local/state/grabowski/rab-six-case-epoch-20261010-b3e93e2f7f")
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 _TARGET = re.compile(r"([0-9a-f]{64}):([01])\Z")
 _MAX_POLICY_BYTES = 16384
 _MAX_ARM_SECONDS = 300
 _FROZEN_PLAN_SHA256 = "2795584ac0c100cdceb6ed2c7eb42b883de2099b2a3d33ac51dbe9987655f10c"
+_INPUT_PROJECTION = _INPUT_ROOT / ("plan-" + _FROZEN_PLAN_SHA256)
 # The official Codex CLI 0.163.0 is 296865480 bytes on the target host.
 # Hash from a fixed fd in chunks; never load that executable into RAM.
 _MAX_INSTALLED_BYTES = 512 * 1024 * 1024
@@ -516,6 +519,7 @@ def _unit_argv(policy: dict[str, Any], index: int) -> list[str]:
     unit = _unit(policy, index)
     pair_state = _pair_state_directory(policy)
     home = "/var/lib/" + pair_state
+    input_projection = _INPUT_PROJECTION
     output_names = ("state", "transcripts", "evidence", "reports")
     outputs = tuple(home + "/epoch/" + name for name in output_names)
     unit_prefix = unit.removesuffix(".service")
@@ -547,10 +551,14 @@ def _unit_argv(policy: dict[str, Any], index: int) -> list[str]:
         "RuntimeDirectoryMode=0700",
         f"BindPaths=/run/{scratch_tmp}:/tmp /run/{scratch_var}:/var/tmp "
         f"/var/lib/private/{pair_state}:{home}",
+        # PID1 binds only the root-controlled curated home projection. The
+        # original /home/alex (mode 0700) is never traversed by DynamicUser.
+        f"BindReadOnlyPaths={input_projection}:/home/alex",
         f"ReadOnlyPaths=/run /run/{scratch_tmp} /run/{scratch_var} "
         f"{home} {home}/repos /proc /sys",
         "InaccessiblePaths=-/run/user -/run/docker -/mnt/backup "
-        "-/dev/hugepages /var/lib/private",
+        "-/dev/hugepages /var/lib/private "
+        f"-{_INPUT_ROOT}",
         f"ReadWritePaths={' '.join(outputs)}",
         "TemporaryFileSystem=/dev/shm:rw,nosuid,nodev,noexec,mode=1777",
         "ProtectControlGroups=yes",
@@ -658,6 +666,29 @@ def _verify_root_owned_file(path: Path, expected_sha256: str) -> None:
         raise ArmDenied("installed program unavailable") from exc
     finally:
         os.close(parent)
+
+
+def _require_input_projection(policy: dict[str, Any]) -> None:
+    """Require the original frozen plan in a root-owned readable home projection.
+
+    Pre-spend guard: PID1 may bind only immutable root-controlled bytes, never
+    the owner-private original home or a writable alias of the input tree.
+    """
+    root = _INPUT_PROJECTION
+    try:
+        info = root.lstat()
+    except OSError as exc:
+        raise ArmDenied("root input projection is not installed") from exc
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != 0
+        or info.st_mode & 0o022
+        or (info.st_mode & 0o005) != 0o005
+    ):
+        raise ArmDenied("root input projection is not immutable and readable")
+    _verify_root_owned_file(
+        root / _FROZEN_INPUT_EPOCH / "plan.json", _FROZEN_PLAN_SHA256
+    )
 
 
 def _bounded_policy_json(
@@ -1240,6 +1271,7 @@ def execute_one(target: str) -> None:
     # tool child. Block before any spent marker, unit, or model process.
     _require_independent_tool_isolation(policy)
     _qualified_arm_inputs(policy, index, core)
+    _require_input_projection(policy)
     try:
         state_fd = core._secure_directory(_STATE_ROOT)
     except (OSError, core.ProviderGrantDenied) as exc:

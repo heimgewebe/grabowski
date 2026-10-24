@@ -80,6 +80,16 @@ class RootArmPolicyTests(unittest.TestCase):
             self.assertIn("--property=DynamicUser=yes", before)
             self.assertIn("--property=ProtectSystem=strict", before)
             self.assertIn("--property=ProtectHome=read-only", before)
+            input_projection = controller._INPUT_PROJECTION
+            self.assertIn(
+                "--property=BindReadOnlyPaths=" + str(input_projection) + ":/home/alex",
+                before,
+            )
+            self.assertTrue(any(
+                item.startswith("--property=InaccessiblePaths=")
+                and "-" + str(controller._INPUT_ROOT) in item
+                for item in before
+            ))
             self.assertIn("--property=StateDirectory=" + " ".join(state), before)
             self.assertIn("--property=StateDirectoryMode=0700", before)
             self.assertIn("--property=Environment=HOME=" + home, before)
@@ -95,6 +105,15 @@ class RootArmPolicyTests(unittest.TestCase):
         changed = _pair()
         changed["pair_id"] = "separate-frozen-pair"
         self.assertNotEqual(pair, controller._pair_state_directory(changed))
+
+    def test_uninstalled_input_projection_denied_before_root_dispatch(self) -> None:
+        # Neither a real provider nor a root-owned systemd unit is started.
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(controller, "_INPUT_PROJECTION", Path(tmp) / "missing"):
+                with self.assertRaisesRegex(
+                    controller.ArmDenied, "root input projection is not installed"
+                ):
+                    controller._require_input_projection(_pair())
 
     def test_subscription_contract_fails_closed(self) -> None:
         for key, value in (
