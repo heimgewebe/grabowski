@@ -123,6 +123,7 @@ TASK_OUTPUT_CONTRACT_VERSION = 2
 TASK_OUTPUT_LEGACY_CONTRACT_VERSION = 1
 TASK_OUTPUT_LAUNCHER_BINDING_KEY = "task_output_managed_from_attempt"
 TASK_OUTPUT_REMOTE_HOME_BINDING_KEY = "task_output_remote_home"
+TASK_OUTPUT_REMOTE_TARGET_BINDING_KEY = "task_output_remote_target"
 TASK_OUTPUT_DIRECTORY_PREFIX = ".grabowski-task-output"
 TASK_OUTPUT_MAX_BYTES = 8 * 1024 * 1024
 TASK_OUTPUT_TAIL_BYTES = 64 * 1024
@@ -5916,12 +5917,15 @@ def _task_output_remote_home(record: dict[str, Any]) -> str | None:
         raise RuntimeError("task remote home binding is invalid")
     home = launcher.get(TASK_OUTPUT_REMOTE_HOME_BINDING_KEY)
     if home is None:
+        if TASK_OUTPUT_REMOTE_TARGET_BINDING_KEY in launcher:
+            raise RuntimeError("task remote target exists without home binding")
         return None
     target = fleet.fleet_host(str(record["host"]))
     if (
         not isinstance(home, str)
         or target["transport"] != "ssh"
         or target.get("task_home") != home
+        or launcher.get(TASK_OUTPUT_REMOTE_TARGET_BINDING_KEY) != target["target"]
     ):
         raise RuntimeError("task remote home binding differs from fleet authority")
     return home
@@ -9664,7 +9668,10 @@ def grabowski_task_start(
                     else {}
                 ),
                 **(
-                    {TASK_OUTPUT_REMOTE_HOME_BINDING_KEY: task_output_remote_home}
+                    {
+                        TASK_OUTPUT_REMOTE_HOME_BINDING_KEY: task_output_remote_home,
+                        TASK_OUTPUT_REMOTE_TARGET_BINDING_KEY: target["target"],
+                    }
                     if task_output_remote_home is not None
                     else {}
                 ),
@@ -9962,7 +9969,10 @@ def grabowski_task_start(
     launcher = {
         **_launch(record),
         **(
-            {TASK_OUTPUT_REMOTE_HOME_BINDING_KEY: task_output_remote_home}
+            {
+                        TASK_OUTPUT_REMOTE_HOME_BINDING_KEY: task_output_remote_home,
+                        TASK_OUTPUT_REMOTE_TARGET_BINDING_KEY: target["target"],
+                    }
             if task_output_remote_home is not None
             else {}
         ),
@@ -10472,6 +10482,9 @@ def grabowski_task_resume(
         recovery_launcher_bindings[TASK_OUTPUT_REMOTE_HOME_BINDING_KEY] = (
             task_output_remote_home
         )
+        recovery_launcher_bindings[TASK_OUTPUT_REMOTE_TARGET_BINDING_KEY] = (
+            fleet.fleet_host(str(record["host"]))["target"]
+        )
     if not _is_root_systemd_backend(record):
         _resolved_host, resume_target, _legacy_local_alias = (
             _resolve_task_dispatch_host(str(record["host"]))
@@ -10582,6 +10595,7 @@ def grabowski_task_resume(
         launcher = {
             **launcher,
             TASK_OUTPUT_REMOTE_HOME_BINDING_KEY: task_output_remote_home,
+            TASK_OUTPUT_REMOTE_TARGET_BINDING_KEY: fleet.fleet_host(str(record["host"]))["target"],
         }
     if coding_agent_pre_dispatch_admission is not None:
         launcher = {

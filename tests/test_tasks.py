@@ -513,6 +513,7 @@ class TaskTests(unittest.TestCase):
             record = tasks._row_raw(str(started["task"]["task_id"]))
             binding = json.loads(record["launcher_json"])
             self.assertEqual(binding["task_output_remote_home"], "/home/remote")
+            self.assertEqual(binding["task_output_remote_target"], "remote")
             script = tasks._task_output_capture_script_path(record)
             self.assertEqual(
                 script.parent, Path("/home/remote/.local/state/grabowski/task-capture")
@@ -549,6 +550,20 @@ class TaskTests(unittest.TestCase):
             dispatch.assert_not_called()
             self.assertTrue(refused["launch_not_dispatched"])
             self.assertEqual(refused["returncode"], 1)
+
+    def test_remote_ssh_target_drift_is_not_a_home_match(self) -> None:
+        with patch.dict(REMOTE_HOST, {"task_home": "/home/remote"}), patch.object(
+            tasks.fleet, "fleet_host", return_value=REMOTE_HOST
+        ):
+            started = self._start(host="heimserver")
+            record = tasks._row_raw(str(started["task"]["task_id"]))
+            REMOTE_HOST["target"] = "another-host"
+            with self.assertRaisesRegex(RuntimeError, "differs from fleet authority"):
+                tasks._task_output_paths(record)
+            with patch.object(tasks, "_dispatch") as dispatch:
+                result = tasks._launch(record)
+            dispatch.assert_not_called()
+            self.assertTrue(result["launch_not_dispatched"])
 
     def test_legacy_ssh_task_cannot_silently_adopt_new_home(self) -> None:
         started = self._start(host="heimserver")
