@@ -32,6 +32,7 @@ _INSTALLED_CODEX = Path("/usr/local/libexec/grabowski-rab-codex")
 _INSTALLED_MCP = Path("/usr/local/libexec/grabowski-rab-mcp")
 _POLICY_ROOT = Path("/etc/grabowski/rab-arm")
 _CREDENTIAL_ROOT = _POLICY_ROOT / "credentials"
+_REQUEST_ROOT = _POLICY_ROOT / "requests"
 _STATE_ROOT = Path("/var/lib/grabowski/rab-arm")
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 _TARGET = re.compile(r"([0-9a-f]{64}):([01])\Z")
@@ -306,6 +307,9 @@ def _unit_argv(policy: dict[str, Any], index: int) -> list[str]:
     unit = _unit(policy, index)
     home = "/var/lib/" + unit.removesuffix(".service")
     credential = _CREDENTIAL_ROOT / ("epoch-" + policy["epoch_sha256"] + ".auth")
+    pair_file = _POLICY_ROOT / ("epoch-" + policy["epoch_sha256"] + ".json")
+    request_file = _REQUEST_ROOT / ("slot-" + pos["slot_id"] + ".json")
+    runtime_file = _POLICY_ROOT / ("epoch-" + policy["epoch_sha256"] + ".runtime.json")
     properties = [
         "Type=exec",
         "NotifyAccess=none",
@@ -342,7 +346,12 @@ def _unit_argv(policy: dict[str, Any], index: int) -> list[str]:
         f"StateDirectory={unit.removesuffix('.service')}",
         "StateDirectoryMode=0700",
         f"Environment=HOME={home}",
+        # PID1 loads only root-installed fixed inputs. The dynamic-user child
+        # cannot choose another policy, request, executable or model.
         f"LoadCredential=auth.json:{credential}",
+        f"LoadCredential=pair.json:{pair_file}",
+        f"LoadCredential=request.json:{request_file}",
+        f"LoadCredential=runtime.json:{runtime_file}",
     ]
     return [
         _SYSTEMD_RUN,
@@ -589,6 +598,77 @@ def _qualified_credential(policy: dict[str, Any]) -> None:
         os.close(parent)
 
 
+def _qualified_arm_inputs(policy: dict[str, Any], index: int, core: Any) -> None:
+    """Root-owned request/runtime must exist and match BEFORE slot consumption."""
+    position = policy["positions"][index]
+    try:
+        request_fd = core._secure_directory(_REQUEST_ROOT)
+        try:
+            request = core._read_root_file(
+                request_fd, "slot-" + position["slot_id"] + ".json"
+            )
+        finally:
+            os.close(request_fd)
+        runtime_fd = core._secure_directory(_POLICY_ROOT)
+        try:
+            runtime = core._read_root_file(
+                runtime_fd, "epoch-" + policy["epoch_sha256"] + ".runtime.json"
+            )
+        finally:
+            os.close(runtime_fd)
+    except (OSError, core.ProviderGrantDenied) as exc:
+        raise ArmDenied("root-owned request or runtime credential is missing") from exc
+    if (
+        _sha(_canonical(request)) != position["request_sha256"]
+        or request.get("pair_id") != policy["pair_id"]
+        or request.get("condition") != position["arm"]
+        or not isinstance(request.get("runner"), dict)
+        or request["runner"].get("model") != policy["model"]
+        or request["runner"].get("provider") != policy["provider"]
+    ):
+        raise ArmDenied("root request source or arm identity differs from policy")
+    required = {
+        "schema_version", "kind", "codex_runner_sha256",
+        "base_runner_sha256", "codex_bootstrap_sha256", "request_root",
+        "repository_map", "state_root", "transcript_root",
+        "provider_evidence_root",
+    }
+    if (
+        not isinstance(runtime, dict)
+        or set(runtime) != required
+        or type(runtime["schema_version"]) is not int
+        or runtime["schema_version"] != 1
+        or runtime["kind"] != "rab.root_installed_single_arm_runtime"
+        or not all(_hex(runtime[name]) for name in (
+            "codex_runner_sha256", "base_runner_sha256",
+            "codex_bootstrap_sha256",
+        ))
+    ):
+        raise ArmDenied("root runtime manifest is incomplete")
+    for name in (
+        "request_root", "repository_map", "state_root",
+        "transcript_root", "provider_evidence_root",
+    ):
+        value = runtime[name]
+        if (
+            not isinstance(value, str)
+            or len(value) > 1024
+            or not value.startswith("/")
+            or "//" in value
+            or ".." in Path(value).parts
+        ):
+            raise ArmDenied("root runtime path is not a bounded absolute input")
+    for filename, sha_field in (
+        ("grabowski-rab-codex-runner", "codex_runner_sha256"),
+        ("repobrief_agent_benchmark_runner.py", "base_runner_sha256"),
+        ("repobrief_agent_benchmark_source_bootstrap.py", "codex_bootstrap_sha256"),
+    ):
+        _verify_root_owned_file(
+            Path("/usr/local/libexec") / filename,
+            runtime[sha_field],
+        )
+
+
 def _root_outcome(policy: dict[str, Any], index: int, fd: int, token: str) -> None:
     """Root observes PID 1 through exit, stops unit, then durably records only lifecycle."""
     name = _unit(policy, index)
@@ -728,6 +808,7 @@ def execute_one(target: str) -> None:
     # Root's valid policy and CAS cannot isolate the credential from a same-UID
     # tool child. Block before any spent marker, unit, or model process.
     _require_independent_tool_isolation(policy)
+    _qualified_arm_inputs(policy, index, core)
     try:
         state_fd = core._secure_directory(_STATE_ROOT)
     except (OSError, core.ProviderGrantDenied) as exc:

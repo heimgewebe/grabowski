@@ -3217,14 +3217,40 @@ def provider_env(
 
 
 def _read_chatgpt_auth_file(home: Path) -> bytes:
-    path = home / ".codex" / "auth.json"
+    # Root's RAB LoadCredential is readable only in its verified systemd unit.
+    # Provider subprocesses do not inherit this variable (provider_env) and
+    # their bubblewrap mount masks /run/credentials.
+    credential_root = os.environ.get("CREDENTIALS_DIRECTORY")
+    allowed_owners = {os.geteuid()}
+    if credential_root is not None:
+        selected = re.fullmatch(
+            r"/run/credentials/(grabowski-rab-[0-9a-f]{16}\.service)",
+            credential_root,
+        )
+        if selected is None:
+            raise RunnerError("Codex systemd credential unit identity is invalid")
+        try:
+            cgroup = Path("/proc/self/cgroup").read_text(encoding="ascii").strip()
+            directory = Path(credential_root).lstat()
+        except (OSError, UnicodeError) as exc:
+            raise RunnerError("Codex systemd credential kernel identity is unavailable") from exc
+        if (
+            cgroup != "0::/system.slice/" + selected.group(1)
+            or not stat.S_ISDIR(directory.st_mode)
+            or directory.st_mode & 0o022
+        ):
+            raise RunnerError("Codex credential does not belong to this root unit")
+        path = Path(credential_root) / "auth.json"
+        allowed_owners.add(0)
+    else:
+        path = home / ".codex" / "auth.json"
     try:
         linked = path.lstat()
     except OSError as exc:
         raise RunnerError("Codex ChatGPT auth file is unavailable") from exc
     if stat.S_ISLNK(linked.st_mode) or not stat.S_ISREG(linked.st_mode):
         raise RunnerError("Codex ChatGPT auth file must be a regular non-symlink file")
-    if linked.st_uid != os.geteuid() or linked.st_mode & 0o077:
+    if linked.st_uid not in allowed_owners or linked.st_mode & 0o077:
         raise RunnerError("Codex ChatGPT auth file permissions are unsafe")
     if linked.st_size <= 0 or linked.st_size > MAX_AUTH_BYTES:
         raise RunnerError("Codex ChatGPT auth file size is invalid")

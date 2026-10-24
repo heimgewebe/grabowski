@@ -79,6 +79,10 @@ SECRET_PTY_ACTION = "operator_secret_pty_getpass_probe"
 BLOCKADE_LIFECYCLE_ACTION = "operator_blockade_marker_lifecycle"
 ROOT_TASK_ACTION = "operator_root_task_systemd_unit"
 RAB_ARM_CONTROLLER_TARGET = Path("/usr/local/libexec/grabowski-rab-root-arm-controller")
+RAB_ARM_EXEC_TARGET = Path("/usr/local/libexec/grabowski-rab-arm-exec")
+RAB_CODEX_RUNNER_TARGET = Path("/usr/local/libexec/grabowski-rab-codex-runner")
+RAB_BASE_RUNNER_TARGET = Path("/usr/local/libexec/repobrief_agent_benchmark_runner.py")
+RAB_BOOTSTRAP_TARGET = Path("/usr/local/libexec/repobrief_agent_benchmark_source_bootstrap.py")
 RAB_ARM_CORE_TARGET = Path("/usr/local/lib/grabowski/grabowski_rab_provider_one_shot.py")
 RAB_ARM_ACTION = "operator_rab_benchmark_arm_start"
 CRITICAL_USER_DATA_INVENTORY_ACTION = "critical_user_data_inventory"
@@ -269,6 +273,30 @@ ARTIFACTS = (
     Artifact(
         "tools/grabowski_rab_provider_one_shot.py",
         RAB_ARM_CORE_TARGET,
+        0o644,
+        True,
+    ),
+    Artifact(
+        "tools/grabowski_rab_arm_exec.py",
+        RAB_ARM_EXEC_TARGET,
+        0o755,
+        True,
+    ),
+    Artifact(
+        "tools/repobrief_agent_benchmark_codex_runner.py",
+        RAB_CODEX_RUNNER_TARGET,
+        0o755,
+        True,
+    ),
+    Artifact(
+        "tools/repobrief_agent_benchmark_runner.py",
+        RAB_BASE_RUNNER_TARGET,
+        0o644,
+        True,
+    ),
+    Artifact(
+        "tools/repobrief_agent_benchmark_source_bootstrap.py",
+        RAB_BOOTSTRAP_TARGET,
         0o644,
         True,
     ),
