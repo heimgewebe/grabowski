@@ -8176,6 +8176,64 @@ def _start_job(
             command, decision_review_binding,
             cwd=working_directory, attempt_directory=_jobs_root() / unit,
         )
+        # A canonical Codex role must prove dedicated ChatGPT metadata access
+        # before any immutable decision-bound attempt is registered.
+        provenance = decision_reviews.review_role_provenance(
+            command, decision_review_binding, cwd=working_directory,
+            attempt_directory=_jobs_root() / unit,
+        )
+        if provenance is not None:
+            separator = command.index("--")
+            reviewer_argv = command[separator + 1:]
+            if (
+                provenance["review_route"].get("provider_family") == "openai"
+                or (reviewer_argv and Path(reviewer_argv[0]).name == "codex")
+            ):
+                from grabowski_codex_preflight import (
+                    CodexPreflightDenied, require_codex_review_preflight,
+                )
+                binding = decision_reviews.normalize_binding(decision_review_binding)
+                try:
+                    checked = require_codex_review_preflight(
+                        reviewer_argv, provenance["review_route"],
+                    )
+                    # Preflight may have taken seconds: rebind exact HEAD, base,
+                    # clean workspace and active canonical model route afterward.
+                    try:
+                        reread = decision_reviews.bind_job_review_role_argv(
+                            command, binding, cwd=working_directory,
+                            attempt_directory=_jobs_root() / unit,
+                        )
+                    except (OSError, RuntimeError, ValueError):
+                        raise CodexPreflightDenied("workspace_identity_drift") from None
+                    if reread != command:
+                        raise CodexPreflightDenied("workspace_identity_drift")
+                except CodexPreflightDenied as exc:
+                    _append_effect_audit({
+                        "schema_version": 1,
+                        "kind": "grabowski_codex_review_prelaunch_admission",
+                        "binding": binding,
+                        "attempt_unit": unit,
+                        "decision": "refused",
+                        "failure_classification": exc.code,
+                        "job_directory_created": False,
+                        "provider_thread_request_sent": False,
+                        "historical_review_receipts_modified": False,
+                    })
+                    raise ValueError(
+                        "independent Codex review prelaunch admission denied: " + exc.code
+                    ) from None
+                _append_effect_audit({
+                    "schema_version": 1,
+                    "kind": "grabowski_codex_review_prelaunch_admission",
+                    "binding": binding,
+                    "attempt_unit": unit,
+                    "decision": "metadata_accepted",
+                    "preflight": checked,
+                    "job_directory_created": False,
+                    "provider_thread_request_sent": False,
+                    "historical_review_receipts_modified": False,
+                })
     directory = _job_directory(unit, create=True)
     stdout_path = directory / "stdout.log"
     stderr_path = directory / "stderr.log"
