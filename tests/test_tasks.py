@@ -565,6 +565,48 @@ class TaskTests(unittest.TestCase):
             dispatch.assert_not_called()
             self.assertTrue(result["launch_not_dispatched"])
 
+    def test_remote_host_identity_drift_blocks_prior_task_reuse(self) -> None:
+        with patch.dict(REMOTE_HOST, {"task_home": "/home/remote"}), patch.object(
+            tasks.fleet, "fleet_host", return_value=REMOTE_HOST
+        ):
+            started = self._start(host="heimserver")
+            previous = tasks._row_raw(str(started["task"]["task_id"]))
+            REMOTE_HOST["target"] = "another-host"
+            kwargs = {
+                "cwd": str(self.root),
+                "runtime_seconds": 60,
+                "resume_policy": "verify-then-retry",
+                "cpu_weight": 50,
+                "io_weight": 25,
+                "memory_max_bytes": 64 * 1024 * 1024,
+            }
+            with (
+                patch.object(
+                    tasks, "_normalize_task_operation_identity",
+                    return_value={"operation_identity_sha256": "a" * 64},
+                ),
+                patch.object(
+                    tasks, "_resolve_task_operation_identity",
+                    return_value={"reuse": previous, "reuse_reason": "matched", "retry_binding": None},
+                ),
+                patch.object(tasks, "_dispatch") as dispatch,
+                patch.object(tasks.base, "_append_audit"),
+                patch.object(tasks, "_require_recovery_gate", return_value={"checked_at_unix": 123}),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "remote task.*identity"):
+                    tasks.grabowski_task_start("heimserver", ["/bin/echo", "ok"], **kwargs)
+                dispatch.assert_not_called()
+            with (
+                patch.object(tasks, "_latest_matching_active_execution_record", return_value=previous),
+                patch.object(tasks, "_resolve_recent_completed_execution_reuse", return_value=None),
+                patch.object(tasks, "_dispatch") as dispatch,
+                patch.object(tasks.base, "_append_audit"),
+                patch.object(tasks, "_require_recovery_gate", return_value={"checked_at_unix": 123}),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "remote task.*identity"):
+                    tasks.grabowski_task_start("heimserver", ["/bin/echo", "ok"], **kwargs)
+                dispatch.assert_not_called()
+
     def test_legacy_ssh_task_cannot_silently_adopt_new_home(self) -> None:
         started = self._start(host="heimserver")
         record = tasks._row_raw(str(started["task"]["task_id"]))

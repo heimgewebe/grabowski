@@ -4710,6 +4710,7 @@ def _resolve_active_execution_reuse(
     latest = _latest_matching_active_execution_record(identity)
     if latest is None:
         return None
+    _require_reused_task_target_identity(latest)
     if (
         _persisted_retry_binding_or_raise(latest) is not None
         or _persisted_interrupted_recovery_binding_or_raise(latest) is not None
@@ -4825,8 +4826,11 @@ def _resolve_recent_completed_execution_reuse(
     *,
     resume_policy: ResumePolicy,
 ) -> dict[str, Any] | None:
+    latest = _latest_matching_unbound_execution_record(identity)
+    if latest is not None and str(latest["state"]) == "completed":
+        _require_reused_task_target_identity(latest)
     return _resolve_recent_completed_record_reuse(
-        _latest_matching_unbound_execution_record(identity),
+        latest,
         resume_policy=resume_policy,
     )
 
@@ -5929,6 +5933,27 @@ def _task_output_remote_home(record: dict[str, Any]) -> str | None:
     ):
         raise RuntimeError("task remote home binding differs from fleet authority")
     return home
+
+
+def _require_reused_task_target_identity(record: dict[str, Any]) -> None:
+    """Reject deduplicated SSH work if its persisted destination differs."""
+    host = str(record["host"])
+    try:
+        target = fleet.fleet_host(host)
+    except ValueError as exc:
+        # Historic local-alias task records can be matched by internal
+        # read-only reconciliation even when the legacy alias is no longer
+        # registered. A new task must independently pass Fleet admission
+        # before this reuse path can be reached through its public surface.
+        if host == "local" and str(exc) == "Unknown fleet host: local":
+            return
+        raise RuntimeError("remote task identity unavailable before reuse") from exc
+    try:
+        previous_home = _task_output_remote_home(record)
+    except (KeyError, TypeError, ValueError, RuntimeError, PermissionError) as exc:
+        raise RuntimeError("remote task identity unavailable before reuse") from exc
+    if target["transport"] == "ssh" and target.get("task_home") != previous_home:
+        raise RuntimeError("remote task identity missing or stale before reuse")
 
 
 def _task_output_root(record: dict[str, Any]) -> Path:
@@ -9221,6 +9246,7 @@ def grabowski_task_start(
     )
     reused_record = operation_resolution["reuse"]
     if reused_record is not None:
+        _require_reused_task_target_identity(reused_record)
         reused_classification = _project_task_effect_classification(
             _record_task_effect_classification(reused_record),
             fallback=task_effect_classification,
