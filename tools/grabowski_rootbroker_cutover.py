@@ -78,6 +78,7 @@ ROOTBROKER_CUTOVER_ACTION = "operator_rootbroker_cutover"
 SECRET_PTY_ACTION = "operator_secret_pty_getpass_probe"
 BLOCKADE_LIFECYCLE_ACTION = "operator_blockade_marker_lifecycle"
 ROOT_TASK_ACTION = "operator_root_task_systemd_unit"
+RAB_ARM_ACTION = "operator_rab_benchmark_arm_start"
 CRITICAL_USER_DATA_INVENTORY_ACTION = "critical_user_data_inventory"
 CRITICAL_USER_DATA_INVENTORY_READ_ACTION = "critical_user_data_inventory_read"
 CRITICAL_USER_DATA_INVENTORY_TARGET_PATTERN = (
@@ -1626,6 +1627,37 @@ def _root_task_action_from_repository(
 
 
 
+def _rab_arm_action_from_repository(
+    repository: Path, *, expected_head: str, runner: RunCommand
+) -> dict[str, Any]:
+    """Accept only one disabled commit-bound Rootbroker benchmark action."""
+    relative_path = "config/privileged-actions.example.json"
+    blob = _repository_blob(
+        repository, commit_id=expected_head,
+        relative_path=relative_path, runner=runner,
+    )
+    example = _decode_json_object(blob, label=relative_path)
+    actions = example.get("actions")
+    action = actions.get(RAB_ARM_ACTION) if isinstance(actions, dict) else None
+    expected = {
+        "enabled": False,
+        "mode": "template",
+        "target_pattern": "[0-9a-f]{64}:[01]",
+        "argv": [
+            "/usr/local/libexec/grabowski-rab-root-arm-controller",
+            "{target}",
+        ],
+        "timeout_seconds": 600,
+        "kill_switch_path": str(CANONICAL_KILL_SWITCH),
+        "legacy_kill_switch_path": str(LEGACY_KILL_SWITCH),
+        "allowed_peer_unit": OPERATOR_UNIT,
+        "allowed_peer_uid": 1000,
+    }
+    if action != expected:
+        raise CutoverError("RAB action differs from disabled fixed template")
+    return json.loads(json.dumps(action))
+
+
 def _critical_user_data_inventory_action_from_repository(
     repository: Path,
     *,
@@ -2146,6 +2178,7 @@ def merge_privileged_config(
     power: dict[str, Any] | None = None,
     lifecycle: dict[str, Any] | None = None,
     root_task: dict[str, Any] | None = None,
+    rab_arm_start: dict[str, Any] | None = None,
     critical_user_data_inventory: dict[str, Any] | None = None,
     critical_user_data_inventory_read: dict[str, Any] | None = None,
     process_observer: dict[str, Any] | None = None,
@@ -2321,6 +2354,26 @@ def merge_privileged_config(
             )
         merged_actions[ROOT_TASK_ACTION] = json.loads(json.dumps(root_task))
 
+    rab_arm_before = actions.get(RAB_ARM_ACTION)
+    if rab_arm_start is not None:
+        if (
+            rab_arm_start.get("enabled") is not False
+            or rab_arm_start.get("mode") != "template"
+            or rab_arm_start.get("target_pattern") != "[0-9a-f]{64}:[01]"
+            or rab_arm_start.get("argv") != [
+                "/usr/local/libexec/grabowski-rab-root-arm-controller",
+                "{target}",
+            ]
+        ):
+            raise CutoverError("RAB benchmark root action is not disabled and bounded")
+        if (
+            not allow_controlled_updates
+            and rab_arm_before is not None
+            and rab_arm_before != rab_arm_start
+        ):
+            raise CutoverError("installed RAB root action differs from commit-bound contract")
+        merged_actions[RAB_ARM_ACTION] = json.loads(json.dumps(rab_arm_start))
+
     critical_inventory_before = actions.get(CRITICAL_USER_DATA_INVENTORY_ACTION)
     if critical_user_data_inventory is not None:
         if (
@@ -2361,6 +2414,8 @@ def merge_privileged_config(
         controlled.add(BLOCKADE_LIFECYCLE_ACTION)
     if root_task is not None:
         controlled.add(ROOT_TASK_ACTION)
+    if rab_arm_start is not None:
+        controlled.add(RAB_ARM_ACTION)
     if critical_user_data_inventory is not None:
         controlled.add(CRITICAL_USER_DATA_INVENTORY_ACTION)
     if critical_user_data_inventory_read is not None:
@@ -2391,6 +2446,10 @@ def merge_privileged_config(
             _sha256(_canonical_json(root_task)) if root_task is not None else None
         ),
         "root_task_preexisting": root_task_before is not None,
+        "rab_arm_sha256": (
+            _sha256(_canonical_json(rab_arm_start)) if rab_arm_start is not None else None
+        ),
+        "rab_arm_preexisting": rab_arm_before is not None,
         "critical_user_data_inventory_sha256": (
             _sha256(_canonical_json(critical_user_data_inventory))
             if critical_user_data_inventory is not None else None
@@ -3169,10 +3228,10 @@ def _apply_cutover_locked(
         automatic=automatic,
     )
     root_task = _root_task_action_from_repository(
-        repository,
-        expected_head=expected_head,
-        runner=runner,
-        automatic=automatic,
+        repository, expected_head=expected_head, runner=runner, automatic=automatic,
+    )
+    rab_arm_start = _rab_arm_action_from_repository(
+        repository, expected_head=expected_head, runner=runner,
     )
     critical_user_data_inventory = _critical_user_data_inventory_action_from_repository(
         repository, expected_head=expected_head, runner=runner
@@ -3223,6 +3282,7 @@ def _apply_cutover_locked(
         power=power,
         lifecycle=lifecycle,
         root_task=root_task,
+        rab_arm_start=rab_arm_start,
         critical_user_data_inventory=critical_user_data_inventory,
         critical_user_data_inventory_read=critical_user_data_inventory_read,
         process_observer=process_observer,
@@ -3574,9 +3634,10 @@ def build_plan(*, repository: Path, expected_head: str, runner: RunCommand = _ru
         runner=runner,
     )
     root_task = _root_task_action_from_repository(
-        repository,
-        expected_head=expected_head,
-        runner=runner,
+        repository, expected_head=expected_head, runner=runner,
+    )
+    rab_arm_start = _rab_arm_action_from_repository(
+        repository, expected_head=expected_head, runner=runner,
     )
     critical_user_data_inventory = _critical_user_data_inventory_action_from_repository(
         repository, expected_head=expected_head, runner=runner
@@ -3619,6 +3680,7 @@ def build_plan(*, repository: Path, expected_head: str, runner: RunCommand = _ru
         power=power,
         lifecycle=lifecycle,
         root_task=root_task,
+        rab_arm_start=rab_arm_start,
         critical_user_data_inventory=critical_user_data_inventory,
         critical_user_data_inventory_read=critical_user_data_inventory_read,
         process_observer=process_observer,

@@ -211,6 +211,7 @@ def _example_config_text() -> str:
                 cutover.POWER_ACTION: _power_action(),
                 cutover.BLOCKADE_LIFECYCLE_ACTION: _lifecycle(),
                 cutover.ROOT_TASK_ACTION: _root_task_action(),
+                cutover.RAB_ARM_ACTION: _bound_action(cutover.RAB_ARM_ACTION),
                 cutover.PROCESS_OBSERVER_ACTION: _bound_action(cutover.PROCESS_OBSERVER_ACTION),
                 cutover.PLATFORM_CONNECTOR_CAPTURE_ACTION: _platform_connector_capture_action(),
                 cutover.CRITICAL_USER_DATA_INVENTORY_ACTION: _critical_user_data_inventory_action(),
@@ -1392,6 +1393,56 @@ class RootbrokerCutoverTests(unittest.TestCase):
                 power=_power_action(),
                 lifecycle=_lifecycle(),
                 root_task=root_task,
+            )
+
+    def test_rab_root_action_is_commit_bound_disabled_and_narrow(self) -> None:
+        example = json.loads(_example_config_text())
+        action = example["actions"][cutover.RAB_ARM_ACTION]
+        runner = FakeRunner(
+            blobs={"config/privileged-actions.example.json": json.dumps(example)}
+        )
+        observed = cutover._rab_arm_action_from_repository(
+            ROOT, expected_head=HEAD, runner=runner
+        )
+        self.assertEqual(observed, action)
+        self.assertIs(observed["enabled"], False)
+        self.assertEqual(observed["argv"], [
+            "/usr/local/libexec/grabowski-rab-root-arm-controller", "{target}"
+        ])
+        for key, bad in (
+            ("enabled", True),
+            ("target_pattern", ".*"),
+            ("argv", ["/bin/sh", "{target}"]),
+            ("timeout_seconds", 3600),
+            ("allowed_peer_uid", 0),
+        ):
+            altered = json.loads(json.dumps(example))
+            altered["actions"][cutover.RAB_ARM_ACTION][key] = bad
+            fake = FakeRunner(
+                blobs={"config/privileged-actions.example.json": json.dumps(altered)}
+            )
+            with self.subTest(field=key), self.assertRaisesRegex(
+                cutover.CutoverError, "disabled fixed template"
+            ):
+                cutover._rab_arm_action_from_repository(
+                    ROOT, expected_head=HEAD, runner=fake
+                )
+
+    def test_config_merge_only_adds_disabled_rab_root_action(self) -> None:
+        action = _bound_action(cutover.RAB_ARM_ACTION)
+        merged, evidence = cutover.merge_privileged_config(
+            _installed_config(), publisher=_canonical_publisher(),
+            power=_power_action(), rab_arm_start=action,
+        )
+        self.assertEqual(merged["actions"][cutover.RAB_ARM_ACTION], action)
+        self.assertIsNotNone(evidence["rab_arm_sha256"])
+        self.assertFalse(evidence["rab_arm_preexisting"])
+        unsafe = dict(action)
+        unsafe["enabled"] = True
+        with self.assertRaisesRegex(cutover.CutoverError, "disabled and bounded"):
+            cutover.merge_privileged_config(
+                _installed_config(), publisher=_canonical_publisher(),
+                power=_power_action(), rab_arm_start=unsafe,
             )
 
     def test_root_task_loader_rejects_broadened_command_catalog(self) -> None:
