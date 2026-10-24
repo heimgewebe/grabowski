@@ -2669,7 +2669,50 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
             f"decision_review_unbound_result:{rejected.name}", checked["errors"]
         )
 
-    def test_unbound_oversized_ordinary_stdout_does_not_block_review(self) -> None:
+    def test_preserved_material_reject_padded_after_origin_rewrite_stays_blocked(self) -> None:
+        # A legitimate bound REJECT must not disappear solely because its
+        # surviving stdout grows beyond the unrelated-job inspection limit.
+        # Only synthetic private fixtures are modified, never real job data.
+        with tempfile.TemporaryDirectory() as temp:
+            jobs = Path(temp) / "jobs"
+            jobs.mkdir(mode=0o700)
+            make_job(
+                jobs, suffix="aaaaaaaaa251", slot="A",
+                terminal_status="succeeded",
+                review_result=result("A", "PASS_THIS_REVISION", 0),
+            )
+            rejected = make_job(
+                jobs, suffix="bbbbbbbbb252", slot="A",
+                terminal_status="succeeded",
+                review_result=result("A", "REJECT_THIS_REVISION", 1),
+            )
+            self.assertEqual(self.reconcile(jobs)["status"], "blocked")
+            metadata_path = rejected / "metadata.json"
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            scope = dict(metadata["scope"])
+            for key in (
+                "decision_bound_review", "decision_review_provenance",
+                "decision_review_attempt_epoch",
+            ):
+                scope.pop(key, None)
+            metadata["scope"] = scope
+            metadata["origin"]["scope"] = scope
+            metadata["origin_sha256"] = reviews.sha256_json(metadata["origin"])
+            write_private(metadata_path, json.dumps(metadata))
+            stdout = rejected / "stdout.log"
+            original = stdout.read_bytes()
+            with stdout.open("ab") as stream:
+                stream.truncate(reviews.MAX_UNBOUND_STDOUT_BYTES + 1)
+            with stdout.open("rb") as stream:
+                self.assertEqual(stream.read(len(original)), original)
+            checked = self.reconcile(jobs)
+        self.assertEqual(checked["status"], "blocked")
+        self.assertTrue(any(
+            error.startswith("decision_review_unbound_")
+            for error in checked["errors"]
+        ))
+
+    def test_unbound_oversized_stdout_without_origin_proof_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             jobs = Path(temp) / "jobs"
             jobs.mkdir(mode=0o700)
@@ -2698,9 +2741,13 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
                 stream.truncate(reviews.MAX_UNBOUND_STDOUT_BYTES + 1)
             os.chmod(ordinary / "stdout.log", 0o600)
             checked = self.reconcile(jobs)
-        self.assertEqual(checked["status"], "settled")
-        self.assertEqual(checked["errors"], [])
-        self.assertEqual(checked["attempt_count"], 1)
+        # Without a separately authenticated origin, this could be a former
+        # reviewer whose retained material REJECT now lies beyond the limit.
+        self.assertEqual(checked["status"], "blocked")
+        self.assertIn(
+            f"decision_review_unbound_evidence_invalid:{ordinary.name}:ValueError",
+            checked["errors"],
+        )
 
     def test_malformed_targeted_registration_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -534,18 +534,14 @@ def _unbound_review_result_visible(
             raise ValueError("unbound role receipt head is invalid")
         if head == expected["head_sha"]:
             return True
-    try:
-        stdout = _read_private_bytes(
-            directory / "stdout.log", MAX_UNBOUND_STDOUT_BYTES,
-            parent_fd=parent_fd, aggregate_metadata_bytes=aggregate_bytes,
-        )
-    except ValueError as exc:
-        # Only a pinned, owner-private regular file can reach this exact
-        # size rejection. It exceeds even the permitted reviewer stdout size,
-        # so unrelated ordinary output cannot deny every PR's R3 settlement.
-        if str(exc) == "stdout.log is too large":
-            return False
-        raise
+    # An oversized unbound stdout can retain a material REJECT even after
+    # its origin metadata has been rebound to an ordinary job. Without an
+    # independent, authenticated origin record, it cannot be classified as
+    # harmless. Keep the FD-pinned bounded read fail-closed on oversize.
+    stdout = _read_private_bytes(
+        directory / "stdout.log", MAX_UNBOUND_STDOUT_BYTES,
+        parent_fd=parent_fd, aggregate_metadata_bytes=aggregate_bytes,
+    )
     for line in stdout.decode("utf-8", errors="replace").splitlines():
         if not line.startswith(RESULT_PREFIX):
             continue
@@ -656,7 +652,6 @@ def _proven_not_started(metadata: dict[str, Any]) -> bool:
         and not isinstance(launcher.get("returncode"), bool)
         and launcher["returncode"] != 0
     )
-
 
 def _validated_origin_binding(
     directory: Path, *, raw_metadata: dict[str, Any] | None = None,
