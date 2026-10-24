@@ -418,7 +418,7 @@ def _bounded_policy_json(raw: bytes) -> dict[str, Any]:
         if quoted:
             if escaped:
                 escaped = False
-            elif ch == "\\\\":
+            elif ch == "\\":
                 escaped = True
             elif ch == '"':
                 quoted = False

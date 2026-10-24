@@ -145,6 +145,15 @@ class RootArmJsonTests(unittest.TestCase):
             with self.subTest(size=len(raw)), self.assertRaises(controller.ArmDenied):
                 controller._bounded_policy_json(raw)
 
+    def test_escaped_quote_keeps_brackets_inside_json_string(self) -> None:
+        # A valid escaped quote must not switch the bounded root JSON
+        # lexer into structural mode.
+        value = {"text": 'before " ' + "[" * 40 + " after"}
+        self.assertEqual(
+            controller._bounded_policy_json(json.dumps(value).encode("utf-8")),
+            value,
+        )
+
     def test_json_quoted_brackets_and_escapes_not_counted_as_nesting(self) -> None:
         raw = b'{"text":"[\\"unbalanced\\"]","nested":[{"a":true}]}'
         parsed = controller._bounded_policy_json(raw)
