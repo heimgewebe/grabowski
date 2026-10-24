@@ -1329,7 +1329,7 @@ def _assert_provider_pid_namespace_ready(
         "-c",
         f"permissions.{PERMISSION_PROFILE}.filesystem={filesystem}",
         "-c",
-        f'permissions.{PERMISSION_PROFILE}.network={{enabled=true,mode="limited",allow_local_binding=false,domains={{}}}}',
+        f'permissions.{PERMISSION_PROFILE}.network={{enabled=false,mode="limited",allow_local_binding=false,domains={{}}}}',
         "--permission-profile",
         PERMISSION_PROFILE,
         "--enable",
@@ -8893,6 +8893,9 @@ def build_command(
         '{":minimal"="read",":workspace_roots"={"."="read"},'
         + _toml_string(str(codex_home / "tmp"))
         + '="read",'
+        # Codex authenticates in its trusted process, never in model tools.
+        + _toml_string(str(codex_home / "auth.json"))
+        + '="deny",'
         + _toml_string(str(Path(codex).parent))
         + '="read"}'
     )
@@ -8908,7 +8911,7 @@ def build_command(
         "-c",
         f"permissions.{PERMISSION_PROFILE}.filesystem={filesystem}",
         "-c",
-        f'permissions.{PERMISSION_PROFILE}.network={{enabled=true,mode="limited",allow_local_binding=false,domains={{}}}}',
+        f'permissions.{PERMISSION_PROFILE}.network={{enabled=false,mode="limited",allow_local_binding=false,domains={{}}}}',
         "--ephemeral",
         "--ignore-user-config",
         "--ignore-rules",
