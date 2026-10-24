@@ -71,28 +71,30 @@ class RootArmPolicyTests(unittest.TestCase):
         p = controller._pair_policy(_pair())
         first, second = controller._unit_argv(p, 0), controller._unit_argv(p, 1)
         self.assertNotEqual(first[first.index("--") + 1:], second[second.index("--") + 1:])
-        for prop in (
-            "--property=DynamicUser=yes",
-            "--property=ProtectHome=tmpfs",
-            "--property=StateDirectoryMode=0700",
-        ):
-            self.assertIn(prop, first)
-            self.assertIn(prop, second)
-        first_state = [item for item in first if item.startswith("--property=StateDirectory=")]
-        second_state = [item for item in second if item.startswith("--property=StateDirectory=")]
-        self.assertEqual(len(first_state), 1)
-        self.assertEqual(first_state, second_state)
-        self.assertRegex(first_state[0], r"^--property=StateDirectory=grabowski-rab-pair-[0-9a-f]{16}$")
-        home = first_state[0].removeprefix("--property=StateDirectory=")
+        pair = controller._pair_state_directory(p)
+        home = "/var/lib/" + pair
+        outputs = tuple(home + "/epoch/" + n for n in ("state", "transcripts", "evidence", "reports"))
+        state = [pair + "/epoch/" + n for n in ("state", "transcripts", "evidence", "reports")] + [pair + "/repos"]
         for argv in (first, second):
-            self.assertIn("--property=Environment=HOME=/var/lib/" + home, argv)
-            self.assertNotIn("--property=ProtectHome=read-only", argv)
+            before = argv[:argv.index("--")]
+            self.assertIn("--property=DynamicUser=yes", before)
+            self.assertIn("--property=ProtectSystem=strict", before)
+            self.assertIn("--property=ProtectHome=read-only", before)
+            self.assertIn("--property=StateDirectory=" + " ".join(state), before)
+            self.assertIn("--property=StateDirectoryMode=0700", before)
+            self.assertIn("--property=Environment=HOME=" + home, before)
+            self.assertIn("--property=ReadWritePaths=" + " ".join(outputs), before)
+            self.assertIn("--property=TemporaryFileSystem=/dev/shm:rw,nosuid,nodev,noexec,mode=1777", before)
+            self.assertTrue(any(item.startswith("--property=BindPaths=") and
+                "/var/lib/private/" + pair + ":" + home in item for item in before))
+            self.assertTrue(any(item.startswith("--property=ReadOnlyPaths=") and
+                home + "/repos" in item for item in before))
+            self.assertTrue(any(item.startswith("--property=InaccessiblePaths=") and
+                "/var/lib/private" in item for item in before))
+            self.assertTrue(any(item.startswith("--property=RuntimeDirectory=") for item in before))
         changed = _pair()
         changed["pair_id"] = "separate-frozen-pair"
-        self.assertNotEqual(
-            first_state,
-            [item for item in controller._unit_argv(changed, 0) if item.startswith("--property=StateDirectory=")],
-        )
+        self.assertNotEqual(pair, controller._pair_state_directory(changed))
 
     def test_subscription_contract_fails_closed(self) -> None:
         for key, value in (
@@ -134,7 +136,8 @@ class RootArmPolicyTests(unittest.TestCase):
         self.assertIn("--property=StandardInput=null", before)
         self.assertIn("--property=StandardOutput=null", before)
         self.assertIn("--property=StandardError=null", before)
-        self.assertIn("--property=InaccessiblePaths=/var/lib/private", before)
+        self.assertTrue(any(item.startswith("--property=InaccessiblePaths=") and
+                            "/var/lib/private" in item for item in before))
         self.assertIn("--property=KillMode=control-group", before)
         self.assertEqual(after[0], str(controller._INSTALLED_RUNNER))
         self.assertFalse(any("sh -c" in item for item in argv))

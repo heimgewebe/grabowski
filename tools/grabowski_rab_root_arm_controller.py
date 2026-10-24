@@ -331,6 +331,10 @@ def _unit_argv(policy: dict[str, Any], index: int) -> list[str]:
     unit = _unit(policy, index)
     pair_state = _pair_state_directory(policy)
     home = "/var/lib/" + pair_state
+    output_names = ("state", "transcripts", "evidence", "reports")
+    outputs = tuple(home + "/epoch/" + name for name in output_names)
+    unit_prefix = unit.removesuffix(".service")
+    scratch_tmp, scratch_var = unit_prefix + "-tmp", unit_prefix + "-var"
     credential = _CREDENTIAL_ROOT / ("epoch-" + policy["epoch_sha256"] + ".auth")
     pair_file = _POLICY_ROOT / ("epoch-" + policy["epoch_sha256"] + ".json")
     request_file = _REQUEST_ROOT / ("slot-" + pos["slot_id"] + ".json")
@@ -350,10 +354,20 @@ def _unit_argv(policy: dict[str, Any], index: int) -> list[str]:
         "CapabilityBoundingSet=",
         "AmbientCapabilities=",
         "ProtectSystem=strict",
-        "ProtectHome=tmpfs",
-        # Hide the underlying writable DynamicUser state alias; only its
-        # StateDirectory public mount may remain accessible to the arm.
-        "InaccessiblePaths=/var/lib/private",
+        "ProtectHome=read-only",
+        # Reuse the host-qualified nine-writable-mount systemd geometry:
+        # four private epoch outputs, two independent /run scratch mounts,
+        # and isolated pseudo-device filesystems. Mask physical state aliases.
+        f"RuntimeDirectory={scratch_tmp} {scratch_var}",
+        "RuntimeDirectoryMode=0700",
+        f"BindPaths=/run/{scratch_tmp}:/tmp /run/{scratch_var}:/var/tmp "
+        f"/var/lib/private/{pair_state}:{home}",
+        f"ReadOnlyPaths=/run /run/{scratch_tmp} /run/{scratch_var} "
+        f"{home} {home}/repos /proc /sys",
+        "InaccessiblePaths=-/run/user -/run/docker -/mnt/backup "
+        "-/dev/hugepages /var/lib/private",
+        f"ReadWritePaths={' '.join(outputs)}",
+        "TemporaryFileSystem=/dev/shm:rw,nosuid,nodev,noexec,mode=1777",
         "ProtectControlGroups=yes",
         "ProtectKernelTunables=yes",
         "ProtectKernelModules=yes",
@@ -371,7 +385,8 @@ def _unit_argv(policy: dict[str, Any], index: int) -> list[str]:
         f"RuntimeMaxSec={policy['max_wall_seconds'] + 120}",
         "MemoryMax=512M",
         "TasksMax=128",
-        f"StateDirectory={pair_state}",
+        f"StateDirectory={' '.join(f'{pair_state}/epoch/{name}' for name in output_names)} "
+        f"{pair_state}/repos",
         "StateDirectoryMode=0700",
         f"Environment=HOME={home}",
         # PID1 loads only root-installed fixed inputs. The dynamic-user child
