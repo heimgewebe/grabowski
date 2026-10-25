@@ -3349,6 +3349,50 @@ class OperatorContractTests(unittest.TestCase):
                 self.assertEqual(persisted["origin_sha256"], job["origin_sha256"])
 
 
+    def test_failed_review_origin_bootstrap_leaves_no_canonical_prelaunch_stub(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state, jobs, cwd = root / "state", root / "state/jobs", root / "cwd"
+            cwd.mkdir(mode=0o700)
+            binding = {
+                "schema_version": 1,
+                "kind": operator.decision_reviews.BINDING_KIND,
+                "repo": "heimgewebe/vibe-lab",
+                "pr": 350,
+                "head_sha": "a" * 40,
+                "base_sha": "b" * 40,
+                "diff_sha256": "c" * 64,
+                "slot": "independent-reviewer",
+            }
+            with (
+                patch.object(operator, "STATE_DIR", state),
+                patch.object(operator, "JOBS_DIR", jobs),
+                patch.object(operator.uuid, "uuid4", return_value=types.SimpleNamespace(
+                    hex="abc123def456" + "f" * 20
+                )),
+                patch.object(
+                    operator.decision_reviews, "bind_job_review_role_argv",
+                    side_effect=lambda command, *_args, **_kwargs: command,
+                ),
+                patch.object(operator.decision_reviews, "review_role_provenance", return_value=None),
+                patch.object(
+                    operator.job_origin, "build_origin",
+                    side_effect=ValueError("origin bootstrap intentionally failed"),
+                ),
+                patch.object(operator, "_run", side_effect=AssertionError("must not dispatch")),
+            ):
+                with self.assertRaisesRegex(ValueError, "origin bootstrap intentionally failed"):
+                    operator._start_job(
+                        ["/usr/bin/python3", "-c", "print('review')"],
+                        cwd=str(cwd), runtime_seconds=60,
+                        decision_review_binding=binding,
+                    )
+            self.assertFalse(
+                list(jobs.glob("grabowski-job-*")),
+                "failed origin allocation must not leave any canonical prelaunch directory",
+            )
+
     def test_noncanonical_review_module_cannot_create_job_directory(self) -> None:
         operator = _load_operator_module()
         with tempfile.TemporaryDirectory() as temporary:

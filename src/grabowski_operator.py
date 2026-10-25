@@ -8278,16 +8278,11 @@ def _start_job(
                     "provider_thread_request_sent": False,
                     "historical_review_receipts_modified": False,
                 })
-    directory = _job_directory(unit, create=True)
+    # Complete origin allocation before publishing a canonical job footprint:
+    # an unsuccessful bootstrap cannot leave missing-metadata review stubs.
+    directory = _jobs_root() / unit
     stdout_path = directory / "stdout.log"
     stderr_path = directory / "stderr.log"
-    for path in (stdout_path, stderr_path):
-        descriptor = os.open(
-            path,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
-            0o600,
-        )
-        os.close(descriptor)
 
     now_unix, now_iso, started_at_unix_ns = _job_start_timestamp()
     metadata_path = directory / "metadata.json"
@@ -8431,6 +8426,18 @@ def _start_job(
             terminalization,
         ),
     }
+    # All origin and metadata preparation has completed. Reserve and verify the
+    # canonical destination only at the final pre-dispatch publication point.
+    created_directory = _job_directory(unit, create=True)
+    if created_directory != directory:
+        raise PermissionError("job directory identity drifted during preparation")
+    for path in (stdout_path, stderr_path):
+        descriptor = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+            0o600,
+        )
+        os.close(descriptor)
     metadata_path = _write_job_metadata(directory, metadata)
 
     systemd_argv = [
