@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -30,6 +32,9 @@ class ScheduledWorkerGitFilterTests(unittest.TestCase):
                 worker.os.path, "lexists",
                 side_effect=lambda path: str(path) == "/run/current-system/sw/bin/git",
             ),
+            patch.object(Path, "lstat", return_value=SimpleNamespace(
+                st_uid=0, st_mode=stat.S_IFLNK | 0o755,
+            )),
             patch.object(Path, "resolve", return_value=Path("/tmp/attacker-git")),
             self.assertRaisesRegex(RuntimeError, "NixOS Git"),
         ):
