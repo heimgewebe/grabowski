@@ -5970,7 +5970,10 @@ class OperatorContractTests(unittest.TestCase):
                 ["git", "-C", str(repo), "remote", "add", "origin", f"ssh://test.invalid{bare}"],
                 check=True,
             )
-            environment = operator._git_push_environment()
+            # This refspec test uses an isolated fake SSH transport, not a real
+            # GitHub writer identity on the GitHub Actions runner.
+            with patch.object(operator.grabowski_git_ssh, "hardened_git_ssh_command", return_value=str(fake_ssh)):
+                environment = operator._git_push_environment()
             environment["GIT_SSH_COMMAND"] = str(fake_ssh)
             with (
                 patch.object(operator, "_require_operator_mutation", return_value=None),

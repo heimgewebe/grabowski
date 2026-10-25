@@ -60,6 +60,7 @@ class NixosPublisherBinariesTests(unittest.TestCase):
         operator = _load_operator_module()
         with (
             patch.object(operator.os.path, "lexists", return_value=False),
+            patch.object(operator.Path, "resolve", return_value=Path("/nix/store/fixture/bin/git")),
             patch.object(operator.grabowski_git_ssh, "_root_managed_chain", side_effect=PermissionError("mutable symlink")),
         ):
             with self.assertRaisesRegex(PermissionError, "mutable symlink"):
@@ -78,8 +79,9 @@ class NixosPublisherBinariesTests(unittest.TestCase):
 
     def test_untrusted_path_environment_ignored(self) -> None:
         operator = _load_operator_module()
+        expected = operator._trusted_git_cli_path()
         with patch.dict(os.environ, {"PATH": "/tmp/attacker/bin", "GIT_SSH_COMMAND": "/tmp/evil"}):
-            self.assertEqual("/run/current-system/sw/bin/git", operator._trusted_git_cli_path())
+            self.assertEqual(expected, operator._trusted_git_cli_path())
 
     def test_real_nixos_github_cli_when_usr_bin_missing(self) -> None:
         operator = _load_operator_module()
