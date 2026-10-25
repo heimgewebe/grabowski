@@ -6005,11 +6005,50 @@ class OperatorContractTests(unittest.TestCase):
             environment = operator._git_push_environment()
         self.assertNotIn("GIT_SSH", environment)
         self.assertNotIn("GIT_PROXY_COMMAND", environment)
-        self.assertEqual(f"{operator._git_push_ssh_binary()} -F /dev/null -oBatchMode=yes -oProxyCommand=none -oPermitLocalCommand=no -oClearAllForwardings=yes", environment["GIT_SSH_COMMAND"])
+        binary = operator._git_push_ssh_binary()
+        identity = operator._git_push_nixos_identity_flags(binary)
+        self.assertEqual(f"{binary} -F /dev/null{identity} -oBatchMode=yes -oProxyCommand=none -oPermitLocalCommand=no -oClearAllForwardings=yes", environment["GIT_SSH_COMMAND"])
         self.assertEqual("ssh", environment["GIT_SSH_VARIANT"])
         self.assertEqual("/bin/false", environment["GIT_ASKPASS"])
         self.assertEqual("/bin/false", environment["SSH_ASKPASS"])
         self.assertEqual("ssh", environment["GIT_ALLOW_PROTOCOL"])
+
+    def test_nixos_push_explicit_identity_preserves_all_transport_restrictions(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            ssh_directory = home / ".ssh"
+            ssh_directory.mkdir(mode=0o700)
+            key = ssh_directory / "heimgewebe-github-ed25519"
+            key.write_text("mock private key; not used for network calls")
+            key.chmod(0o600)
+            with patch.object(operator, "HOME", home), patch.object(
+                operator, "_git_push_ssh_binary",
+                return_value="/run/current-system/sw/bin/ssh",
+            ):
+                env = operator._git_push_environment()
+                command = env["GIT_SSH_COMMAND"]
+                self.assertIn(" -F /dev/null ", command)
+                self.assertIn(f" -i {key} -oIdentitiesOnly=yes ", command)
+                for control in (
+                    "-oBatchMode=yes", "-oProxyCommand=none",
+                    "-oPermitLocalCommand=no", "-oClearAllForwardings=yes",
+                ):
+                    self.assertIn(control, command)
+                key.chmod(0o644)
+                with self.assertRaises(PermissionError):
+                    operator._git_push_environment()
+                key.chmod(0o600)
+                key.unlink()
+                key.symlink_to("/etc/hosts")
+                with self.assertRaises(PermissionError):
+                    operator._git_push_environment()
+                key.unlink()
+                with self.assertRaises(PermissionError):
+                    operator._git_push_environment()
+            with patch.object(operator, "_git_push_ssh_binary", return_value="/usr/bin/ssh"):
+                env = operator._git_push_environment()
+                self.assertNotIn(" -i ", env["GIT_SSH_COMMAND"])
 
     def test_git_push_uses_root_owned_nixos_ssh_if_usr_bin_missing(self) -> None:
         operator = _load_operator_module()

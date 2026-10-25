@@ -7216,6 +7216,31 @@ def _git_push_ssh_binary() -> str:
     raise FileNotFoundError("No trusted Git SSH executable is available")
 
 
+def _git_push_nixos_identity_flags(ssh_binary: str) -> str:
+    """Bind the verified local GitHub key without allowing SSH config execution."""
+    if ssh_binary != "/run/current-system/sw/bin/ssh":
+        return ""
+    directory = HOME / ".ssh"
+    identity = directory / "heimgewebe-github-ed25519"
+    try:
+        directory_info = directory.lstat()
+        identity_info = identity.lstat()
+    except OSError as exc:
+        raise PermissionError("NixOS GitHub SSH identity is unavailable") from exc
+    uid = os.geteuid()
+    if not (
+        stat.S_ISDIR(directory_info.st_mode)
+        and directory_info.st_uid == uid
+        and not (directory_info.st_mode & 0o077)
+        and stat.S_ISREG(identity_info.st_mode)
+        and identity_info.st_uid == uid
+        and not (identity_info.st_mode & 0o077)
+        and identity_info.st_nlink == 1
+    ):
+        raise PermissionError("NixOS GitHub SSH identity has unsafe ownership or mode")
+    return f" -i {shlex.quote(str(identity))} -oIdentitiesOnly=yes"
+
+
 def _git_push_environment() -> dict[str, str]:
     environment = _git_environment()
     for key in (
@@ -7227,10 +7252,12 @@ def _git_push_environment() -> dict[str, str]:
         "GIT_ALLOW_PROTOCOL",
     ):
         environment.pop(key, None)
+    ssh_binary = _git_push_ssh_binary()
+    identity_flags = _git_push_nixos_identity_flags(ssh_binary)
     environment.update(
         {
             "GIT_ALLOW_PROTOCOL": "ssh",
-            "GIT_SSH_COMMAND": f"{_git_push_ssh_binary()} -F /dev/null -oBatchMode=yes -oProxyCommand=none -oPermitLocalCommand=no -oClearAllForwardings=yes",
+            "GIT_SSH_COMMAND": f"{ssh_binary} -F /dev/null{identity_flags} -oBatchMode=yes -oProxyCommand=none -oPermitLocalCommand=no -oClearAllForwardings=yes",
             "GIT_SSH_VARIANT": "ssh",
             "GIT_ASKPASS": "/bin/false",
             "SSH_ASKPASS": "/bin/false",
