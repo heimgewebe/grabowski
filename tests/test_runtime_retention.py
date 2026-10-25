@@ -994,6 +994,105 @@ class RuntimeRetentionTests(unittest.TestCase):
             ))
             self.assertEqual(stderr.read_bytes(), original)
 
+    def test_fifo_and_sparse_oversized_logs_allow_safe_archive_apply(self) -> None:
+        # The historical #1593 FIFO and both oversize streams are preserved.
+        # Neither may consume the bounded safe-job archive/reset budget.
+        for shape in ("fifo-stderr", "oversized-stderr", "oversized-stdout"):
+            with self.subTest(shape=shape):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    jobs = root / "jobs"
+                    bad_name = "grabowski-job-000000000001"
+                    safe_name = "grabowski-job-000000000002"
+                    bad_unit, safe_unit = bad_name + ".service", safe_name + ".service"
+                    bad = self._job(jobs, bad_name, 100)
+                    self._job(jobs, safe_name, 101)
+                    log = bad / ("stdout.log" if shape == "oversized-stdout" else "stderr.log")
+                    if shape == "fifo-stderr":
+                        log.unlink()
+                        os.mkfifo(log, mode=0o600)
+                    else:
+                        with log.open("r+b") as stream:
+                            stream.truncate(RETENTION.MAX_ARCHIVE_FILE_BYTES + 1)
+                    before = log.stat(follow_symlinks=False)
+                    metadata_before = (bad / "metadata.json").read_bytes()
+                    bad_identity = bad.stat()
+                    original_open = os.open
+
+                    def forbid_fifo_open(path, flags, *args, **kwargs):
+                        # Turn even an O_NONBLOCK FIFO open into a fast test failure.
+                        if shape == "fifo-stderr" and os.fspath(path).endswith("stderr.log"):
+                            fd = kwargs.get("dir_fd")
+                            parent = os.fstat(fd) if fd is not None else None
+                            if os.fspath(path) == str(log) or (
+                                parent is not None
+                                and (parent.st_dev, parent.st_ino)
+                                == (bad_identity.st_dev, bad_identity.st_ino)
+                            ):
+                                raise AssertionError("historical FIFO must never be opened")
+                        return original_open(path, flags, *args, **kwargs)
+
+                    states = {unit: self._state(unit) for unit in (bad_unit, safe_unit)}
+                    fake_deploy = types.ModuleType("grabowski_self_deploy")
+                    fake_deploy.DEPLOY_INDEX_FILENAME = "runtime-deploy-index.json"
+                    fake_deploy._deploy_schedule_lock = lambda: nullcontext()
+                    fake_deploy._read_deploy_index = lambda _root: None
+                    fake_deploy._write_deploy_index = Mock()
+                    fake_base = types.ModuleType("grabowski_mcp")
+                    fake_base._append_audit = Mock()
+                    fake_base._require_mutations_enabled = Mock()
+                    fake_base._require_capability = Mock()
+                    reset = Mock(return_value=Mock(returncode=0, stderr=""))
+                    with (
+                        patch.object(RETENTION.os, "open", side_effect=forbid_fifo_open),
+                        patch.dict("sys.modules", {
+                            "grabowski_self_deploy": fake_deploy,
+                            "grabowski_mcp": fake_base,
+                        }),
+                        patch.object(RETENTION, "_run", reset),
+                        patch.object(RETENTION, "_systemd_unit_states", return_value=states),
+                    ):
+                        plan = RETENTION.build_plan(
+                            minimum_job_age_seconds=50, max_archive_jobs=1, now=1000,
+                            jobs_root=jobs, archive_root=root / "archive",
+                            receipt_root=root / "receipts", task_db=root / "missing.sqlite3",
+                            failed_units=[bad_unit, safe_unit], unit_states=states,
+                        )
+                        self.assertEqual(
+                            [row["unit"] for row in plan["archive_jobs"]], [safe_unit]
+                        )
+                        self.assertEqual(plan["reset_failed_units"], [safe_unit])
+                        self.assertTrue(any(
+                            row["unit"] == bad_unit for row in plan["blocked"]
+                        ))
+                        result = RETENTION.apply_plan(
+                            plan, expected_plan_sha256=plan["plan_sha256"]
+                        )
+                    self.assertEqual(result["status"], "degraded")
+                    self.assertFalse(result["completed"])
+                    self.assertTrue(result["mutated"])
+                    self.assertTrue(any(
+                        row["unit"] == bad_unit for row in result["preserved_blocked_units"]
+                    ))
+                    self.assertEqual((bad / "metadata.json").read_bytes(), metadata_before)
+                    after = log.stat(follow_symlinks=False)
+                    self.assertEqual(
+                        (after.st_dev, after.st_ino, after.st_mode, after.st_size),
+                        (before.st_dev, before.st_ino, before.st_mode, before.st_size),
+                    )
+                    if shape == "fifo-stderr":
+                        self.assertTrue(log.is_fifo())
+                    else:
+                        self.assertEqual(after.st_size, RETENTION.MAX_ARCHIVE_FILE_BYTES + 1)
+                    self.assertFalse((root / "archive" / bad_name).exists())
+                    self.assertTrue(
+                        (root / "archive" / safe_name / "archive-manifest.json").is_file()
+                    )
+                    self.assertTrue(Path(result["receipt_path"]).is_file())
+                    reset.assert_called_once_with(
+                        ["systemctl", "--user", "reset-failed", safe_unit]
+                    )
+
     def test_archive_manifest_symlink_swap_cannot_read_foreign_files(self) -> None:
         # Reproduce an exact timing race: the source directory is exchanged
         # after initial verification, just before the directory enumeration.
@@ -3977,6 +4076,28 @@ class RuntimeRetentionTests(unittest.TestCase):
             ))
             for number in range(4):
                 self.assertTrue((jobs / f"grabowski-job-{number + 1:012x}").is_dir())
+
+    def test_authorized_failed_unit_scan_excludes_own_retention_service(self) -> None:
+        # The failed retention producer is never its own reset candidate,
+        # even under hypothetical separately authorized job retention.
+        task_unit = "grabowski-task-" + "f" * 24 + "-a1.service"
+        job_unit = "grabowski-job-000000000001.service"
+        own_service = "grabowski-runtime-retention.service"
+        output = "\n".join(
+            f"{unit} loaded failed failed evidence"
+            for unit in (own_service, task_unit, job_unit)
+        ) + "\n"
+        with patch.object(
+            RETENTION, "_run",
+            return_value=Mock(returncode=0, stdout=output, stderr=""),
+        ) as runner:
+            self.assertEqual(
+                RETENTION._failed_units(job_authority=True),
+                sorted([task_unit, job_unit]),
+            )
+        runner.assert_called_once_with([
+            "systemctl", "--user", "--failed", "--no-legend", "--plain",
+        ])
 
     def test_untrusted_failed_unit_discovery_excludes_job_units_server_side(self) -> None:
         self._simulated_protected_authority.return_value = False
