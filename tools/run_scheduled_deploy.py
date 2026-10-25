@@ -608,9 +608,41 @@ def assert_not_repoground_managed_source(repo: Path) -> None:
         )
 
 
+def _trusted_git_binary() -> str:
+    """Select root-managed Git on classic Linux or NixOS, never ambient PATH."""
+    candidates = (Path("/usr/bin/git"), Path("/run/current-system/sw/bin/git"))
+    for candidate in candidates:
+        if not os.path.lexists(candidate):
+            continue
+        try:
+            original = candidate.lstat()
+            if candidate == candidates[0] and not stat.S_ISREG(original.st_mode):
+                raise RuntimeError("classic system Git must be a regular file")
+            resolved = candidate.resolve(strict=True)
+            if candidate == candidates[1] and not resolved.is_relative_to(Path("/nix/store")):
+                raise RuntimeError("NixOS Git must resolve inside the immutable Nix store")
+            for node in (candidate, *candidate.parents, resolved, *resolved.parents):
+                info = node.lstat()
+                if info.st_uid != 0:
+                    raise RuntimeError("trusted Git path is not root-owned")
+                if stat.S_ISLNK(info.st_mode):
+                    continue  # The checked root-owned parent controls link replacement.
+                if info.st_mode & 0o022 and not (
+                    node == Path("/nix/store") and info.st_mode & stat.S_ISVTX
+                ):
+                    raise RuntimeError("trusted Git path is writable")
+            actual = resolved.stat()
+            if not stat.S_ISREG(actual.st_mode) or not os.access(resolved, os.X_OK):
+                raise RuntimeError("trusted Git executable is not a runnable regular file")
+        except OSError as exc:
+            raise RuntimeError("trusted system Git path cannot be verified") from exc
+        return str(candidate)
+    raise RuntimeError("no trusted system Git executable is installed")
+
+
 def _git_prefix(repo: Path) -> list[str]:
     return [
-        "git",
+        _trusted_git_binary(),
         "-c",
         "core.hooksPath=/dev/null",
         "-c",

@@ -17,6 +17,24 @@ import run_scheduled_deploy as worker
 class ScheduledWorkerGitFilterTests(unittest.TestCase):
     """Only disposable Git repositories: no real release/host effects."""
 
+    def test_repository_checks_pin_system_git_outside_ambient_path(self) -> None:
+        with patch.dict(os.environ, {"PATH": "/tmp/poisoned", "GIT_EXEC_PATH": "/tmp/poisoned"}):
+            binary = worker._git_prefix(Path("/tmp/example"))[0]
+        self.assertTrue(Path(binary).is_absolute())
+        self.assertIn(binary, ("/usr/bin/git", "/run/current-system/sw/bin/git"))
+
+    def test_nixos_git_must_resolve_inside_immutable_store(self) -> None:
+        # Even a root-managed system symlink must not redirect to /tmp.
+        with (
+            patch.object(
+                worker.os.path, "lexists",
+                side_effect=lambda path: str(path) == "/run/current-system/sw/bin/git",
+            ),
+            patch.object(Path, "resolve", return_value=Path("/tmp/attacker-git")),
+            self.assertRaisesRegex(RuntimeError, "NixOS Git"),
+        ):
+            worker._trusted_git_binary()
+
     @staticmethod
     def git(repo: Path, *args: str) -> str:
         environment = {
@@ -27,7 +45,7 @@ class ScheduledWorkerGitFilterTests(unittest.TestCase):
             "GIT_CONFIG_COUNT": "0",
         }
         completed = subprocess.run(
-            ["/usr/bin/git", "-C", str(repo), *args],
+            [worker._trusted_git_binary(), "-C", str(repo), *args],
             env=environment,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
