@@ -9,6 +9,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import stat
 import struct
@@ -3901,10 +3902,13 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
     def test_unix_socket_seccomp_fails_before_child_exec_when_library_missing(
         self,
     ) -> None:
-        bad_program = runner._UNIX_SOCKET_DENY_CHILD_PROGRAM.replace(
-            '_SECCOMP_TRUSTED_LIBRARY_ROOTS = ("/usr/lib", "/usr/lib64", "/lib", "/lib64")',
+        bad_program, replacements = re.subn(
+            r"(?ms)^_SECCOMP_TRUSTED_LIBRARY_ROOTS = \(.*?^\)",
             '_SECCOMP_TRUSTED_LIBRARY_ROOTS = ("/unavailable",)',
+            runner._UNIX_SOCKET_DENY_CHILD_PROGRAM,
+            count=1,
         )
+        self.assertEqual(replacements, 1)
         self.assertNotEqual(bad_program, runner._UNIX_SOCKET_DENY_CHILD_PROGRAM)
         with patch.object(runner, "_UNIX_SOCKET_DENY_CHILD_PROGRAM", bad_program):
             command = runner._unix_socket_restricted_codex_argv(
@@ -3923,10 +3927,13 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
         # merely because a file with the expected soname exists.
         with tempfile.TemporaryDirectory() as directory:
             (Path(directory) / "libseccomp.so.2").write_bytes(b"malicious ELF")
-            bad_program = runner._UNIX_SOCKET_DENY_CHILD_PROGRAM.replace(
-                '_SECCOMP_TRUSTED_LIBRARY_ROOTS = ("/usr/lib", "/usr/lib64", "/lib", "/lib64")',
+            bad_program, replacements = re.subn(
+                r"(?ms)^_SECCOMP_TRUSTED_LIBRARY_ROOTS = \(.*?^\)",
                 f"_SECCOMP_TRUSTED_LIBRARY_ROOTS = ({directory!r},)",
+                runner._UNIX_SOCKET_DENY_CHILD_PROGRAM,
+                count=1,
             )
+            self.assertEqual(replacements, 1)
             self.assertNotEqual(bad_program, runner._UNIX_SOCKET_DENY_CHILD_PROGRAM)
             with patch.object(runner, "_UNIX_SOCKET_DENY_CHILD_PROGRAM", bad_program):
                 command = runner._unix_socket_restricted_codex_argv(
