@@ -335,6 +335,8 @@ def _server_source_marker() -> dict[str, Any]:
         "path": str(SERVER_RECOVERY), "exists": SERVER_RECOVERY.exists(),
         "valid": False, "timestamp_unix": None, "age_seconds": None,
         "source_record_sha256": None,
+        "snapshot_time_unix": None, "snapshot_age_seconds": None,
+        "snapshot_fresh": False,
         "snapshot_id": None, "restore_probe_valid": False,
         "repository_check_valid": False, "target": None,
         "configured_target": SERVER_RECOVERY_TARGET,
@@ -355,21 +357,39 @@ def _server_source_marker() -> dict[str, Any]:
         result["error"] = str(exc)
         return result
     required = {"schema_version", "completed_at_unix", "snapshot_id", "restore_probe_valid", "repository_check_valid", "target"}
-    if not isinstance(value, dict) or set(value) != required or value.get("schema_version") != 1:
+    optional = {"snapshot_time_unix"}
+    if (not isinstance(value, dict)
+            or set(value) not in (required, required | optional)
+            or value.get("schema_version") != 1):
         result["error"] = "server marker contract is invalid"
         return result
     stamp = value["completed_at_unix"]
     if not isinstance(stamp, int):
         result["error"] = "server marker timestamp is invalid"
         return result
-    delta = int(time.time()) - stamp
+    now = int(time.time())
+    delta = now - stamp
     age = max(0, delta)
+    has_snapshot_time = "snapshot_time_unix" in value
+    snapshot_time = value.get("snapshot_time_unix")
+    snapshot_age = (
+        now - snapshot_time
+        if has_snapshot_time and type(snapshot_time) is int else None
+    )
+    snapshot_fresh = bool(
+        has_snapshot_time and type(snapshot_time) is int
+        and snapshot_time <= stamp
+        and snapshot_age is not None and 0 <= snapshot_age <= MAX_AGE_SECONDS
+    )
     marker_target = value["target"]
     target_info = _configured_recovery_target_info()
     configured_target_valid = bool(target_info.get("valid"))
     target_matches_configured = configured_target_valid and marker_target == SERVER_RECOVERY_TARGET
     result.update({
         "timestamp_unix": stamp, "age_seconds": age,
+        "snapshot_time_unix": snapshot_time if type(snapshot_time) is int else None,
+        "snapshot_age_seconds": snapshot_age,
+        "snapshot_fresh": snapshot_fresh,
         "source_record_sha256": hashlib.sha256(raw).hexdigest(),
         "snapshot_id": value["snapshot_id"],
         "restore_probe_valid": value["restore_probe_valid"] is True,
@@ -381,6 +401,7 @@ def _server_source_marker() -> dict[str, Any]:
     })
     base_valid = all((
         0 <= delta <= MAX_AGE_SECONDS,
+        not has_snapshot_time or snapshot_fresh,
         isinstance(result["snapshot_id"], str) and bool(result["snapshot_id"]),
         result["restore_probe_valid"], result["repository_check_valid"],
         isinstance(result["target"], str) and bool(result["target"]),
@@ -829,7 +850,9 @@ def _snapshot_from_backup_output(output: str) -> str:
     raise RuntimeError("restic backup did not report a snapshot id")
 
 
-def _write_server_marker(*, completed_at_unix: int, snapshot_id: str) -> dict[str, Any]:
+def _write_server_marker(
+    *, completed_at_unix: int, snapshot_id: str, snapshot_time_unix: int | None = None
+) -> dict[str, Any]:
     payload = {
         "schema_version": 1,
         "completed_at_unix": completed_at_unix,
@@ -838,6 +861,11 @@ def _write_server_marker(*, completed_at_unix: int, snapshot_id: str) -> dict[st
         "repository_check_valid": True,
         "target": SERVER_RECOVERY_TARGET,
     }
+    if snapshot_time_unix is not None:
+        if (type(snapshot_time_unix) is not int
+                or not 0 <= completed_at_unix - snapshot_time_unix <= MAX_AGE_SECONDS):
+            raise ValueError("NixOS Restic snapshot timestamp is invalid or stale")
+        payload["snapshot_time_unix"] = snapshot_time_unix
     SERVER_RECOVERY.parent.mkdir(parents=True, exist_ok=True)
     raw = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
     descriptor, temporary_name = tempfile.mkstemp(
@@ -1259,7 +1287,8 @@ def _local_recovery_inventory(root: Path) -> dict[str, Any]:
 
 @contextmanager
 def _local_recovery_repository_operation_lock():
-    path = LOCAL_RECOVERY_OPERATION_STATE
+    # NixOS uses the already provisioned operator state root, not Pop's Fundus state.
+    path = operator.STATE_DIR if _NIXOS_RESTIC_TIMER_PRESENT else LOCAL_RECOVERY_OPERATION_STATE
     try:
         path_meta = os.lstat(path)
     except OSError as exc:
@@ -1621,7 +1650,8 @@ def _nixos_local_recovery_probe_locked(target_info: dict[str, Any]) -> dict[str,
     if not 0 <= completed_at - snapshot_time <= MAX_AGE_SECONDS:
         raise RuntimeError("NixOS Restic snapshot became stale")
     source_write = _write_server_marker(
-        completed_at_unix=completed_at, snapshot_id=snapshot_id[:8]
+        completed_at_unix=completed_at, snapshot_id=snapshot_id[:8],
+        snapshot_time_unix=snapshot_time,
     )
     publication = privileged.publish_recovery_marker_reference(
         source_record_sha256=source_write["source_record_sha256"],
@@ -1636,6 +1666,7 @@ def _nixos_local_recovery_probe_locked(target_info: dict[str, Any]) -> dict[str,
     audit_record = {
         "timestamp_unix": completed_at,
         "operation": "nixos-restic-recovery-probe",
+        "snapshot_time_unix": snapshot_time,
         "snapshot_id": snapshot_id[:8],
         "snapshot_full_id": snapshot_id,
         "target": SERVER_RECOVERY_TARGET,
@@ -1836,10 +1867,14 @@ def recovery_status() -> dict[str, Any]:
     local_backup = (
         {
             "path": server_source["path"], "exists": server_source["exists"],
-            "valid": server_source["valid"],
-            "timestamp_unix": server_source["timestamp_unix"],
-            "age_seconds": server_source["age_seconds"],
-            "error": server_source["error"],
+            "valid": server_source["valid"] and bool(server_source.get("snapshot_fresh")),
+            "timestamp_unix": server_source.get("snapshot_time_unix"),
+            "age_seconds": server_source.get("snapshot_age_seconds"),
+            "error": (
+                server_source["error"] if not server_source["valid"]
+                else None if server_source.get("snapshot_fresh")
+                else "NixOS snapshot timestamp is missing or stale"
+            ),
             "source": "verified-nixos-native-restic",
         }
         if _NIXOS_RESTIC_TIMER_PRESENT else _fresh_text_marker(BACKUP_SUCCESS)

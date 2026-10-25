@@ -418,7 +418,9 @@ class RecoveryToolTests(unittest.TestCase):
             descriptor = os.open(state, os.O_RDONLY)
             try:
                 fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                with patch.object(recovery, "LOCAL_RECOVERY_OPERATION_STATE", state):
+                with patch.object(recovery, "_NIXOS_RESTIC_TIMER_PRESENT", False), patch.object(
+                    recovery, "LOCAL_RECOVERY_OPERATION_STATE", state
+                ):
                     with self.assertRaisesRegex(
                         RuntimeError, "local recovery repository operation is busy"
                     ):
@@ -729,11 +731,12 @@ class RecoveryToolTests(unittest.TestCase):
 
     def test_recovery_status_allows_custom_target_with_matching_fresh_evidence(self) -> None:
         target = "wg-prod-1:rest-server/grabowski-recovery-probe"
-        result = _run_ready_recovery_status(
-            _fresh_server_marker(target),
-            host="wg-prod-1",
-            target=target,
-        )
+        with patch.object(recovery, "_NIXOS_RESTIC_TIMER_PRESENT", False):
+            result = _run_ready_recovery_status(
+                _fresh_server_marker(target),
+                host="wg-prod-1",
+                target=target,
+            )
 
         self.assertTrue(result["checks"]["server_recovery_fresh"])
         self.assertTrue(result["ready_for_user_power_worker"])

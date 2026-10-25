@@ -363,6 +363,8 @@ class NativeNixOSResticProofTests(unittest.TestCase):
             "path": "/tmp/native-recovery.json", "exists": True, "valid": True,
             "timestamp_unix": self.now, "age_seconds": 0, "error": None,
             "source_record_sha256": "a" * 64, "snapshot_id": "c" * 8,
+            "snapshot_time_unix": self.now - 60,
+            "snapshot_age_seconds": 60, "snapshot_fresh": True,
             "target": recovery.SERVER_RECOVERY_TARGET,
         }
         with patch.object(recovery, "_NIXOS_RESTIC_TIMER_PRESENT", True), patch.object(
@@ -390,6 +392,89 @@ class NativeNixOSResticProofTests(unittest.TestCase):
             result = recovery.recovery_status()
         self.assertTrue(result["checks"]["local_backup_fresh"])
         self.assertEqual(result["local_backup"]["source"], "verified-nixos-native-restic")
+        legacy.assert_not_called()
+
+
+    def test_native_lock_uses_existing_operator_state_without_legacy_directory(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.object(recovery, "_NIXOS_RESTIC_TIMER_PRESENT", True), patch.object(
+                recovery.operator, "STATE_DIR", root
+            ), patch.object(
+                recovery, "LOCAL_RECOVERY_OPERATION_STATE", root / "absent-legacy"
+            ):
+                with recovery._local_recovery_repository_operation_lock():
+                    self.assertFalse((root / "absent-legacy").exists())
+            with patch.object(recovery, "_NIXOS_RESTIC_TIMER_PRESENT", True), patch.object(
+                recovery.operator, "STATE_DIR", root / "not-provisioned"
+            ):
+                with self.assertRaisesRegex(RuntimeError, "lock is unavailable"):
+                    with recovery._local_recovery_repository_operation_lock():
+                        self.fail("missing native state lock was accepted")
+
+    def test_native_source_binds_original_snapshot_time_and_expires(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / "recovery.json"
+            with patch.object(recovery, "SERVER_RECOVERY", marker), patch.object(
+                recovery.time, "time", return_value=self.now
+            ):
+                recovery._write_server_marker(
+                    completed_at_unix=self.now,
+                    snapshot_id="a" * 8,
+                    snapshot_time_unix=self.now - 60,
+                )
+                payload = json.loads(marker.read_text())
+                self.assertEqual(payload["snapshot_time_unix"], self.now - 60)
+                recent = recovery._server_source_marker()
+                self.assertTrue(recent["valid"])
+                self.assertTrue(recent["snapshot_fresh"])
+                self.assertEqual(recent["snapshot_age_seconds"], 60)
+                payload["snapshot_time_unix"] = self.now - recovery.MAX_AGE_SECONDS - 1
+                marker.write_text(json.dumps(payload), encoding="utf-8")
+                marker.chmod(0o600)
+                old = recovery._server_source_marker()
+                self.assertFalse(old["valid"])
+                self.assertFalse(old["snapshot_fresh"])
+                with self.assertRaisesRegex(ValueError, "snapshot timestamp"):
+                    recovery._write_server_marker(
+                        completed_at_unix=self.now,
+                        snapshot_id="a" * 8,
+                        snapshot_time_unix=self.now - recovery.MAX_AGE_SECONDS - 1,
+                    )
+
+    def test_nixos_gate_rejects_legacy_source_without_snapshot_timestamp(self) -> None:
+        now = self.now
+        source = {
+            "path": "/tmp/legacy-proof.json", "exists": True,
+            "valid": True, "timestamp_unix": now, "age_seconds": 0,
+            "snapshot_time_unix": None, "snapshot_age_seconds": None,
+            "snapshot_fresh": False, "error": None, "source_record_sha256": "a" * 64,
+            "snapshot_id": "c" * 8, "target": recovery.SERVER_RECOVERY_TARGET,
+        }
+        with patch.object(recovery, "_NIXOS_RESTIC_TIMER_PRESENT", True), patch.object(
+            recovery.base, "_verify_audit_log", return_value={"valid": True}
+        ), patch.object(
+            recovery.base, "_deployment_metadata", return_value={"provenance_valid": True}
+        ), patch.object(
+            recovery, "_canonical_server_marker", return_value={"valid": True}
+        ), patch.object(
+            recovery, "_server_source_marker", return_value=source
+        ), patch.object(
+            recovery, "_source_publication_state", return_value={"current": True}
+        ), patch.object(
+            recovery.base, "_kill_switch_state", return_value={"engaged": False}
+        ), patch.object(
+            recovery, "_test_kill_switch_recovery_status", return_value={}
+        ), patch.object(
+            recovery, "_timer_probe", return_value={"ok": True}
+        ), patch.object(
+            recovery.privileged, "grabowski_privileged_broker_status", return_value={"ready": True}
+        ), patch.object(recovery, "_fresh_text_marker") as legacy:
+            status = recovery.recovery_status()
+        self.assertFalse(status["checks"]["local_backup_fresh"])
+        self.assertFalse(status["ready_for_privileged_actions"])
         legacy.assert_not_called()
 
 

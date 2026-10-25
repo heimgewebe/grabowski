@@ -32,6 +32,7 @@ RECOVERY_SOURCE_KEYS = frozenset({
     "schema_version", "completed_at_unix", "snapshot_id",
     "restore_probe_valid", "repository_check_valid", "target",
 })
+RECOVERY_SOURCE_OPTIONAL_KEYS = frozenset({"snapshot_time_unix"})
 RECOVERY_RECORD_KEYS = frozenset({
     "schema_version", "kind", "generated_at_unix", "max_age_seconds",
     "snapshot_id", "restore_probe_valid", "repository_check_valid",
@@ -631,7 +632,8 @@ def _validate_recovery_source_record(
     now: int,
 ) -> dict[str, Any]:
     value = _decode_json_object(raw, label="recovery source record")
-    if set(value) != RECOVERY_SOURCE_KEYS or value.get("schema_version") != RECOVERY_SOURCE_SCHEMA_VERSION:
+    if (set(value) not in (RECOVERY_SOURCE_KEYS, RECOVERY_SOURCE_KEYS | RECOVERY_SOURCE_OPTIONAL_KEYS)
+            or value.get("schema_version") != RECOVERY_SOURCE_SCHEMA_VERSION):
         raise ValueError("recovery source record contract is invalid")
     generated_at = value.get("completed_at_unix")
     if isinstance(generated_at, bool) or not isinstance(generated_at, int):
@@ -640,6 +642,11 @@ def _validate_recovery_source_record(
         raise PermissionError("recovery source record is future-dated")
     if now - generated_at > max_age_seconds:
         raise PermissionError("recovery source record is stale")
+    if "snapshot_time_unix" in value:
+        snapshot_time = value["snapshot_time_unix"]
+        if (type(snapshot_time) is not int or snapshot_time > generated_at
+                or now - snapshot_time > max_age_seconds):
+            raise PermissionError("recovery source record snapshot is stale or invalid")
     snapshot_id = value.get("snapshot_id")
     if not isinstance(snapshot_id, str) or not snapshot_id:
         raise PermissionError("recovery source record snapshot is invalid")

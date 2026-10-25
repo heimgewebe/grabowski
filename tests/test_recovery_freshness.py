@@ -72,6 +72,31 @@ def _execution(source: Path, destination: Path, digest: str, generated_at: int) 
 
 
 class RecoveryFreshnessContractTests(unittest.TestCase):
+    def test_native_optional_snapshot_age_is_bound_without_breaking_legacy(self) -> None:
+        now = 200000
+        def validated(source: dict[str, object]) -> dict[str, object]:
+            raw = (json.dumps(source, sort_keys=True, separators=(",", ":")) + "\n").encode()
+            return broker._validate_recovery_source_record(
+                raw, source_owner_uid=os.getuid(), max_age_seconds=MAX_AGE,
+                configured_target=TARGET, now=now,
+            )
+        legacy = _source_payload(now - 1, snapshot_id="legacy-123")
+        self.assertEqual(validated(legacy)["source"]["snapshot_id"], "legacy-123")
+        native = dict(legacy, snapshot_time_unix=now - 100)
+        self.assertEqual(validated(native)["source"]["snapshot_time_unix"], now - 100)
+        for invalid in (
+            dict(native, snapshot_time_unix=now - MAX_AGE - 1),
+            dict(native, snapshot_time_unix=now + 1),
+            dict(native, snapshot_time_unix=True),
+            dict(native, snapshot_time_unix="1970-01-01"),
+        ):
+            with self.subTest(snapshot_timestamp=invalid["snapshot_time_unix"]):
+                with self.assertRaises(PermissionError):
+                    validated(invalid)
+        with self.assertRaises(ValueError):
+            validated(dict(native, untrusted_extra="ignored"))
+
+
     def test_example_config_keeps_recovery_root_task_but_decouples_power(self) -> None:
         config = json.loads((ROOT / "config/privileged-actions.example.json").read_text(encoding="utf-8"))
         publisher = config["actions"]["publish_recovery_marker"]
