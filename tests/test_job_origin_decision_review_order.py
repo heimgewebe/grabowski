@@ -1,4 +1,6 @@
 from pathlib import Path
+import errno
+import hashlib
 import json
 import os
 import tempfile
@@ -63,6 +65,23 @@ def build(suffix: str, observed_ns: int | None) -> tuple[dict, str]:
 
 
 class RepoGroundReservedJobOriginTests(unittest.TestCase):
+    def test_reserved_unit_must_not_allocate_decision_review_clock(self) -> None:
+        unit = "grabowski-job-rgpm-" + "a" * 16 + "-01"
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            with self.assertRaisesRegex(ValueError, "canonical 12-hex"):
+                job_origin.build_origin(
+                    unit=unit, owner=f"uid:{os.getuid()}",
+                    argv_sha256="e" * 64,
+                    scope=scope(1_900_000_000_100_000_000),
+                    notify_on_done={"requested": False, "channels": []},
+                    created_at_unix=1_900_000_000,
+                    started_at="2030-03-17T17:46:40Z",
+                    invoker_tool="grabowski_job_start",
+                    jobs_root=root / "jobs", order_root=root / "order",
+                )
+            self.assertFalse((root / "order").exists())
+
     def test_reserved_unit_origin_round_trip_remains_exact(self) -> None:
         unit = "grabowski-job-rgpm-" + "a" * 16 + "-01"
         origin, digest = job_origin.build_origin(
@@ -105,6 +124,139 @@ class RepoGroundReservedJobOriginTests(unittest.TestCase):
 
 
 class DecisionReviewLogicalClockTests(unittest.TestCase):
+    def test_historical_over_10k_job_dirs_keep_causal_frontier(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            a, b = self.roots(temp)
+            with a, b:
+                previous, previous_hash = build("ffffffffffff", 2_000_000_000_500_000_000)
+                jobs = job_origin.DECISION_REVIEW_JOBS_ROOT
+                jobs.mkdir(parents=True, exist_ok=True, mode=0o700)
+                folder = jobs / "grabowski-job-ffffffffffff"
+                folder.mkdir(mode=0o700)
+                metadata = folder / "metadata.json"
+                metadata.write_text(
+                    json.dumps({"origin": previous, "origin_sha256": previous_hash}),
+                    encoding="utf-8",
+                )
+                os.chmod(metadata, 0o600)
+                next(job_origin.DECISION_REVIEW_ORDER_ROOT.glob("*.json")).unlink()
+                for number in range(10_010):
+                    (jobs / f"grabowski-job-{number:012x}").mkdir(mode=0o700)
+                current, _ = build("eeeeeeeeeeee", 1_900_000_000_100_000_000)
+        self.assertEqual(current["scope"]["started_at_unix_ns"],
+                         previous["scope"]["started_at_unix_ns"] + 1)
+
+    def test_hard_typed_scan_budget_stays_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            a, b = self.roots(temp)
+            with a, b, mock.patch.object(job_origin, "DECISION_REVIEW_ORDER_MAX_JOB_DIRECTORIES", 2):
+                jobs = job_origin.DECISION_REVIEW_JOBS_ROOT
+                jobs.mkdir(parents=True, mode=0o700)
+                for number in range(3):
+                    (jobs / f"grabowski-job-{number:012x}").mkdir(mode=0o700)
+                with self.assertRaisesRegex(ValueError, "directory limit"):
+                    build("ffffffffffff", 1_900_000_000_100_000_000)
+
+    def test_noncanonical_metadata_never_disappears_from_frontier(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            a, b = self.roots(temp)
+            with a, b:
+                jobs = job_origin.DECISION_REVIEW_JOBS_ROOT
+                jobs.mkdir(parents=True, mode=0o700)
+                other = jobs / "foreign-claimed-review"
+                other.mkdir(mode=0o700)
+                metadata = other / "metadata.json"
+                metadata.write_text("{}", encoding="utf-8")
+                metadata.chmod(0o600)
+                with self.assertRaisesRegex(ValueError, "noncanonical job metadata"):
+                    build("aaaaaaaaaaaa", 1_900_000_000_100_000_000)
+
+    def test_nonmatching_names_still_consume_global_scan_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            a, b = self.roots(temp)
+            with a, b, mock.patch.object(
+                job_origin, "DECISION_REVIEW_ORDER_MAX_JOB_DIRECTORIES", 2
+            ):
+                jobs = job_origin.DECISION_REVIEW_JOBS_ROOT
+                jobs.mkdir(parents=True, mode=0o700)
+                for number in range(3):
+                    (jobs / f"unrelated-{number}.json").write_text("{}", encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "directory limit"):
+                    build("aaaaaaaaaaaa", 1_900_000_000_100_000_000)
+
+    def test_canonical_job_symlink_cannot_redirect_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            a, b = self.roots(temp)
+            with a, b:
+                jobs = job_origin.DECISION_REVIEW_JOBS_ROOT
+                jobs.mkdir(parents=True, mode=0o700)
+                outside = Path(temp) / "outside"
+                outside.mkdir(mode=0o700)
+                (jobs / "grabowski-job-ffffffffffff").symlink_to(outside)
+                with self.assertRaisesRegex(ValueError, "directory changed or is unsafe"):
+                    build("aaaaaaaaaaaa", 1_900_000_000_100_000_000)
+
+    def test_metadata_symlink_not_followed_even_inside_owned_job(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            a, b = self.roots(temp)
+            with a, b:
+                jobs = job_origin.DECISION_REVIEW_JOBS_ROOT
+                jobs.mkdir(parents=True, mode=0o700)
+                job = jobs / "grabowski-job-ffffffffffff"
+                job.mkdir(mode=0o700)
+                target = Path(temp) / "secret.txt"
+                target.write_text("secret", encoding="utf-8")
+                (job / "metadata.json").symlink_to(target)
+                with self.assertRaises(OSError) as failure:
+                    build("aaaaaaaaaaaa", 1_900_000_000_100_000_000)
+                self.assertEqual(failure.exception.errno, errno.ELOOP)
+
+    def test_aggregate_metadata_budget_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            a, b = self.roots(temp)
+            with a, b, mock.patch.object(
+                job_origin, "DECISION_REVIEW_ORDER_MAX_TOTAL_METADATA_BYTES", 3
+            ):
+                jobs = job_origin.DECISION_REVIEW_JOBS_ROOT
+                jobs.mkdir(parents=True, mode=0o700)
+                job = jobs / "grabowski-job-ffffffffffff"
+                job.mkdir(mode=0o700)
+                metadata = job / "metadata.json"
+                metadata.write_text("{}", encoding="utf-8")
+                os.chmod(metadata, 0o600)
+                (job / "metadata.json").write_text('{"scope":null}', encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "aggregate budget"):
+                    build("aaaaaaaaaaaa", 1_900_000_000_100_000_000)
+
+    def test_noncanonical_symlink_cannot_hide_review_origin(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            a, b = self.roots(temp)
+            with a, b:
+                jobs = job_origin.DECISION_REVIEW_JOBS_ROOT
+                jobs.mkdir(parents=True, mode=0o700)
+                other = Path(temp) / "other"
+                other.mkdir(mode=0o700)
+                (jobs / "foreign-claimed-review").symlink_to(other)
+                with self.assertRaisesRegex(ValueError, "directory changed or is unsafe"):
+                    build("aaaaaaaaaaaa", 1_900_000_000_100_000_000)
+
+    def test_noncanonical_unreadable_directory_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            a, b = self.roots(temp)
+            with a, b:
+                jobs = job_origin.DECISION_REVIEW_JOBS_ROOT
+                jobs.mkdir(parents=True, mode=0o700)
+                other = jobs / "foreign-unreadable"
+                other.mkdir(mode=0o700)
+                other.chmod(0)
+                try:
+                    with self.assertRaisesRegex(
+                        ValueError, "directory changed or is unsafe"
+                    ):
+                        build("aaaaaaaaaaaa", 1_900_000_000_100_000_000)
+                finally:
+                    other.chmod(0o700)
+
     def roots(self, temporary: str):
         root = Path(temporary)
         return (
@@ -164,7 +316,8 @@ class DecisionReviewLogicalClockTests(unittest.TestCase):
                     job_origin.DECISION_REVIEW_JOBS_ROOT
                     / "grabowski-job-000000000004"
                 )
-                job_directory.mkdir(parents=True, mode=0o700)
+                job_directory.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+                job_directory.mkdir(mode=0o700)
                 metadata_path = job_directory / "metadata.json"
                 metadata_path.write_text(
                     json.dumps(
@@ -216,6 +369,133 @@ class DecisionReviewLogicalClockTests(unittest.TestCase):
             third["scope"]["started_at_unix_ns"],
             first["scope"]["started_at_unix_ns"] + 1,
         )
+
+    def test_child_metadata_published_after_visit_invalidates_bootstrap(self) -> None:
+        # Updating an already visited child leaves the JOBS ROOT timestamp
+        # unchanged. An order-state rebuild must not accept that stale scan.
+        with tempfile.TemporaryDirectory() as temporary:
+            order_patch, jobs_patch = self.roots(temporary)
+            with order_patch, jobs_patch:
+                initial, digest = build("000000000004", 2_000_000_000_500_000_000)
+                jobs = job_origin.DECISION_REVIEW_JOBS_ROOT
+                jobs.mkdir(parents=True, mode=0o700)
+                first = jobs / "grabowski-job-000000000004"
+                second = jobs / "grabowski-job-000000000005"
+                first.mkdir(mode=0o700)
+                second.mkdir(mode=0o700)
+                metadata = first / "metadata.json"
+                metadata.write_text(
+                    json.dumps({"origin": initial, "origin_sha256": digest}),
+                    encoding="utf-8",
+                )
+                metadata.chmod(0o600)
+                ordinary = second / "metadata.json"
+                ordinary.write_text("{}", encoding="utf-8")
+                ordinary.chmod(0o600)
+                key = job_origin._decision_review_order_key(initial["scope"])
+                original_open = job_origin.os.open
+                visited = []
+                triggered = []
+
+                def inject(path, flags, *args, **kwargs):
+                    if (
+                        path in (first.name, second.name)
+                        and kwargs.get("dir_fd") is not None
+                    ):
+                        if not visited:
+                            visited.append(path)
+                        elif path != visited[0] and not triggered:
+                            # Mutate the child already visited, regardless of
+                            # filesystem-dependent scandir iteration order.
+                            prior = jobs / visited[0]
+                            changed = json.loads(json.dumps(initial))
+                            changed["unit"] = prior.name
+                            changed["scope"]["started_at_unix_ns"] += 1000
+                            changed_digest = hashlib.sha256(
+                                job_origin.canonical_json_bytes(changed)
+                            ).hexdigest()
+                            replacement = prior / "metadata.next"
+                            replacement.write_text(
+                                json.dumps({
+                                    "origin": changed,
+                                    "origin_sha256": changed_digest,
+                                }), encoding="utf-8",
+                            )
+                            replacement.chmod(0o600)
+                            os.replace(replacement, prior / "metadata.json")
+                            triggered.append(True)
+                    return original_open(path, flags, *args, **kwargs)
+
+                with mock.patch.object(job_origin.os, "open", side_effect=inject):
+                    with self.assertRaisesRegex(
+                        ValueError, "changed during scan"
+                    ):
+                        job_origin._existing_decision_review_max_ns(
+                            key, jobs_root=jobs,
+                        )
+                self.assertEqual(triggered, [True])
+
+    def test_inplace_metadata_rewrite_after_visit_invalidates_bootstrap(self) -> None:
+        # A byte rewrite of an existing metadata inode updates file ctime,
+        # but leaves the containing job directory timestamps unchanged.
+        with tempfile.TemporaryDirectory() as temporary:
+            order_patch, jobs_patch = self.roots(temporary)
+            with order_patch, jobs_patch:
+                initial, digest = build("000000000004", 2_000_000_000_500_000_000)
+                jobs = job_origin.DECISION_REVIEW_JOBS_ROOT
+                jobs.mkdir(parents=True, mode=0o700, exist_ok=True)
+                first = jobs / "grabowski-job-000000000004"
+                second = jobs / "grabowski-job-000000000005"
+                for directory in (first, second):
+                    directory.mkdir(mode=0o700)
+                metadata = first / "metadata.json"
+                metadata.write_text(
+                    json.dumps({"origin": initial, "origin_sha256": digest}),
+                    encoding="utf-8",
+                )
+                metadata.chmod(0o600)
+                ordinary = second / "metadata.json"
+                ordinary.write_text("{}", encoding="utf-8")
+                ordinary.chmod(0o600)
+                key = job_origin._decision_review_order_key(initial["scope"])
+                original_open = job_origin.os.open
+                visited = []
+                rewritten = []
+
+                def inject(path, flags, *args, **kwargs):
+                    if path in (first.name, second.name) and kwargs.get("dir_fd") is not None:
+                        if not visited:
+                            visited.append(path)
+                        elif path != visited[0] and not rewritten:
+                            prior = jobs / visited[0]
+                            old_dir = prior.stat()
+                            old_inode = (prior / "metadata.json").stat().st_ino
+                            changed = json.loads(json.dumps(initial))
+                            changed["unit"] = prior.name
+                            changed["job_id"] = prior.name.removeprefix("grabowski-job-")
+                            changed["scope"]["started_at_unix_ns"] += 1000
+                            changed_digest = hashlib.sha256(
+                                job_origin.canonical_json_bytes(changed)
+                            ).hexdigest()
+                            # Retain the same pathname and inode.
+                            (prior / "metadata.json").write_text(
+                                json.dumps({
+                                    "origin": changed,
+                                    "origin_sha256": changed_digest,
+                                }), encoding="utf-8",
+                            )
+                            self.assertEqual((prior / "metadata.json").stat().st_ino, old_inode)
+                            self.assertEqual(
+                                (prior.stat().st_mtime_ns, prior.stat().st_ctime_ns),
+                                (old_dir.st_mtime_ns, old_dir.st_ctime_ns),
+                            )
+                            rewritten.append(True)
+                    return original_open(path, flags, *args, **kwargs)
+
+                with mock.patch.object(job_origin.os, "open", side_effect=inject):
+                    with self.assertRaisesRegex(ValueError, "metadata changed during scan"):
+                        job_origin._existing_decision_review_max_ns(key, jobs_root=jobs)
+                self.assertEqual(rewritten, [True])
 
     def test_corrupt_order_state_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
