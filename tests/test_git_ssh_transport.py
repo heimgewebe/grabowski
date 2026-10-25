@@ -131,5 +131,40 @@ class GitSshTransportTests(unittest.TestCase):
         self.assertEqual(home / ".ssh" / "heimgewebe-github-ed25519", transport._trusted_identity())
 
 
+    def test_module_is_in_setuptools_distribution(self) -> None:
+        pyproject = (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text()
+        modules = next(line for line in pyproject.splitlines() if line.startswith("py-modules = "))
+        self.assertIn('"grabowski_git_ssh"', modules)
+
+    def test_classic_usr_bin_ssh_is_selected_before_nixos_fallback(self) -> None:
+        with (
+            patch.object(transport.os.path, "lexists", return_value=True),
+            patch.object(transport, "_trusted_executable", return_value=Path("/usr/bin/ssh")) as trust,
+        ):
+            self.assertEqual(Path("/usr/bin/ssh"), transport._selected_ssh_executable())
+        trust.assert_called_once_with(Path("/usr/bin/ssh"))
+
+    def test_nixos_system_link_must_resolve_inside_store(self) -> None:
+        with patch.object(Path, "resolve", return_value=Path("/tmp/attacker-ssh")):
+            with self.assertRaises(PermissionError):
+                transport._trusted_executable(Path("/run/current-system/sw/bin/ssh"))
+
+    def test_caller_ssh_transport_overrides_cannot_change_command(self) -> None:
+        with (
+            patch.dict(os.environ, {
+                "PATH": "/tmp/evil",
+                "GIT_SSH": "/tmp/evil-ssh",
+                "GIT_SSH_COMMAND": "/tmp/evil-command",
+                "SSH_AUTH_SOCK": "/tmp/evil-agent",
+            }),
+            patch.object(transport, "_selected_ssh_executable", return_value=Path("/usr/bin/ssh")),
+            patch.object(transport, "_trusted_identity", return_value=Path("/home/test/.ssh/heimgewebe-github-ed25519")),
+        ):
+            command = transport.hardened_git_ssh_command()
+        self.assertTrue(command.startswith("/usr/bin/ssh -F /dev/null "))
+        self.assertNotIn("/tmp/evil", command)
+        self.assertIn("-oIdentityAgent=none", command)
+
+
 if __name__ == "__main__":
     unittest.main()
