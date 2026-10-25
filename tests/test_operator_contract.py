@@ -6001,11 +6001,15 @@ class OperatorContractTests(unittest.TestCase):
             "SSH_ASKPASS": "/tmp/evil-ssh-askpass",
             "GIT_ALLOW_PROTOCOL": "ext:file:ssh:https",
         }
-        with patch.object(operator, "_git_environment", return_value=injected):
+        fixed_command = "/usr/bin/ssh -F /dev/null -oBatchMode=yes -oIdentityFile=/trusted/key"
+        with (
+            patch.object(operator, "_git_environment", return_value=injected),
+            patch.object(operator.grabowski_git_ssh, "hardened_git_ssh_command", return_value=fixed_command),
+        ):
             environment = operator._git_push_environment()
         self.assertNotIn("GIT_SSH", environment)
         self.assertNotIn("GIT_PROXY_COMMAND", environment)
-        self.assertEqual("/usr/bin/ssh -F /dev/null -oBatchMode=yes -oProxyCommand=none -oPermitLocalCommand=no -oClearAllForwardings=yes", environment["GIT_SSH_COMMAND"])
+        self.assertEqual(fixed_command, environment["GIT_SSH_COMMAND"])
         self.assertEqual("ssh", environment["GIT_SSH_VARIANT"])
         self.assertEqual("/bin/false", environment["GIT_ASKPASS"])
         self.assertEqual("/bin/false", environment["SSH_ASKPASS"])

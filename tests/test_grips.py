@@ -9784,6 +9784,17 @@ class GripFoundationTests(unittest.TestCase):
         self.assertFalse(any("fetch" in call for call in fake.calls))
         operator.grabowski_git.assert_not_called()
 
+    def test_branch_publish_uses_shared_hardened_ssh(self) -> None:
+        hardened = "/trusted/ssh -F /dev/null -oBatchMode=yes -i /trusted/key"
+        with (
+            patch.object(grips.grabowski_git_ssh, "hardened_git_ssh_command", return_value=hardened) as command,
+            patch.object(grips.subprocess, "run", return_value=types.SimpleNamespace(returncode=0, stdout="", stderr="")) as run,
+        ):
+            grips._default_command_runner(Path("/does-not-need-to-exist"), ["push", "origin", "HEAD:refs/heads/feature"])
+        command.assert_called_once_with()
+        self.assertEqual(hardened, run.call_args.kwargs["env"]["GIT_SSH_COMMAND"])
+        self.assertEqual("ssh", run.call_args.kwargs["env"]["GIT_ALLOW_PROTOCOL"])
+
     def test_branch_publish_requires_allow_mutation(self) -> None:
         result = grips.run_grip(
             "branch-publish",
@@ -10896,7 +10907,7 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual("protocol.ext.allow", env["GIT_CONFIG_KEY_2"])
         self.assertEqual("never", env["GIT_CONFIG_VALUE_2"])
         self.assertEqual("ssh", env["GIT_ALLOW_PROTOCOL"])
-        self.assertEqual("/usr/bin/ssh -F /dev/null -oBatchMode=yes -oProxyCommand=none -oPermitLocalCommand=no -oClearAllForwardings=yes", env["GIT_SSH_COMMAND"])
+        self.assertEqual("/__grabowski_ssh_transport_disabled__/ssh", env["GIT_SSH_COMMAND"])
         self.assertEqual("/bin/false", env["GIT_ASKPASS"])
         self.assertEqual("cat", env["GIT_PAGER"])
         self.assertEqual("cat", env["PAGER"])

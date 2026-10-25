@@ -54,6 +54,7 @@ import grabowski_transport_assertion
 import grabowski_transport_roundtrip
 import grabowski_serving_process
 import grabowski_physical_checkout
+import grabowski_git_ssh
 
 
 HOME = Path.home().resolve()
@@ -7213,7 +7214,7 @@ def _git_push_environment() -> dict[str, str]:
     environment.update(
         {
             "GIT_ALLOW_PROTOCOL": "ssh",
-            "GIT_SSH_COMMAND": "/usr/bin/ssh -F /dev/null -oBatchMode=yes -oProxyCommand=none -oPermitLocalCommand=no -oClearAllForwardings=yes",
+            "GIT_SSH_COMMAND": grabowski_git_ssh.hardened_git_ssh_command(),
             "GIT_SSH_VARIANT": "ssh",
             "GIT_ASKPASS": "/bin/false",
             "SSH_ASKPASS": "/bin/false",
