@@ -4373,6 +4373,67 @@ class RuntimeRetentionTests(unittest.TestCase):
                     )).exists()
                 )
 
+    def test_receipt_temp_race_after_reset_cannot_leave_unreceipted_effect(self) -> None:
+        # Inject a same-UID temp-capacity race after the preflight but during
+        # the mocked external reset. An actual reset must never be followed by
+        # an unreceipted failure to publish the terminal evidence.
+        self._simulated_protected_authority.return_value = False
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs, archive, receipts = root / "jobs", root / "archive", root / "receipts"
+            for directory in (jobs, archive, receipts):
+                directory.mkdir(mode=0o700)
+            task_unit = "grabowski-task-" + "e" * 24 + "-a1.service"
+            task_db = self._task_db(root / "tasks.sqlite3", task_unit, "failed")
+            plan = RETENTION.build_plan(
+                minimum_job_age_seconds=50, now=1000,
+                jobs_root=jobs, archive_root=archive, receipt_root=receipts,
+                task_db=task_db, failed_units=[task_unit], unit_states={},
+            )
+            deploy = types.ModuleType("grabowski_self_deploy")
+            deploy.DEPLOY_INDEX_FILENAME = "runtime-deploy-index.json"
+            deploy._deploy_schedule_lock = lambda: nullcontext()
+            base = types.ModuleType("grabowski_mcp")
+            base._append_audit = Mock()
+            base._require_mutations_enabled = Mock()
+            base._require_capability = Mock()
+            resets = []
+
+            def inject_after_reset(argv):
+                if argv == ["systemctl", "--user", "reset-failed", task_unit]:
+                    resets.append(argv)
+                    for index in range(1, 4):
+                        (receipts / (
+                            "." + plan["plan_sha256"] + ".json.1."
+                            + str(index) + ".tmp"
+                        )).write_text("")
+                return Mock(returncode=0, stdout="", stderr="")
+
+            result = None
+            with (
+                patch.dict("sys.modules", {
+                    "grabowski_self_deploy": deploy, "grabowski_mcp": base,
+                }),
+                patch.object(RETENTION, "_run", side_effect=inject_after_reset),
+                patch.object(RETENTION, "MAX_RETAINED_JSON_TEMPS", 3),
+            ):
+                try:
+                    result = RETENTION.apply_plan(
+                        plan, expected_plan_sha256=plan["plan_sha256"]
+                    )
+                except RuntimeError:
+                    pass
+            # A future protected reservation may complete the reset, but a
+            # bare preflight alone cannot justify an unreceipted reset.
+            self.assertTrue(
+                not resets or (
+                    result is not None
+                    and bool(result.get("completed"))
+                    and Path(result["receipt_path"]).is_file()
+                ),
+                "external task reset completed without durable final receipt",
+            )
+
     def test_receipt_temp_capacity_scan_restarts_advanced_directory_cursor(self) -> None:
         # The plan may have scanned the same pinned directory FD earlier.
         # Its existing offset must not hide failed receipt temp evidence.
