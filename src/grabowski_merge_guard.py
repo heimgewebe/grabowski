@@ -17,6 +17,7 @@ from urllib.parse import quote, urlsplit
 import weakref
 
 import grabowski_decision_reviews as decision_reviews
+import grabowski_git_ssh
 from grabowski_pr_diff import (
     GITHUB_PR_DIFF_IDENTITY_CANONICALIZATION,
     canonicalize_github_pr_diff_identity,
@@ -1217,7 +1218,7 @@ def _merge_guard_identifier(namespace: str, value: str) -> str:
 def merge_guard_repository_root(repo_path: Path) -> Path:
     completed = subprocess.run(
         [
-            "git",
+            grabowski_git_ssh.trusted_git_cli_path(),
             "-C",
             str(repo_path),
             "rev-parse",
@@ -1283,7 +1284,7 @@ def _merge_guard_github_repository_identity(remote: str) -> str:
 def merge_guard_repository_identity(repo_path: Path) -> tuple[Path, str]:
     repository = merge_guard_repository_root(repo_path)
     completed = subprocess.run(
-        ["git", "-C", str(repository), "remote", "get-url", "origin"],
+        [grabowski_git_ssh.trusted_git_cli_path(), "-C", str(repository), "remote", "get-url", "origin"],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -1376,7 +1377,7 @@ def _merge_guard_local_git_bytes(
 ) -> dict[str, Any]:
     completed = subprocess.run(
         [
-            "git",
+            grabowski_git_ssh.trusted_git_cli_path(),
             "-C",
             str(repo_path),
             "-c",
@@ -2084,7 +2085,7 @@ def _github_rules_plan_limit_error(stderr: str) -> bool:
 
 def _merge_guard_git_command(repo_path: Path, args: list[str], *, timeout: int = 60) -> dict[str, Any]:
     completed = subprocess.run(
-        ["git", "-C", str(repo_path), *args],
+        [grabowski_git_ssh.trusted_git_cli_path(), "-C", str(repo_path), *args],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,

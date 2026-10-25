@@ -29,6 +29,7 @@ import grabowski_operator_obligation_evidence
 import grabowski_worktree_ensure
 import grabowski_merge_guard
 import grabowski_physical_checkout
+import grabowski_git_ssh
 
 Receipt = dict[str, Any]
 CommandRunner = Callable[[Path, list[str]], dict[str, Any]]
@@ -2012,8 +2013,11 @@ def utc_now() -> str:
 
 
 def _default_command_runner(repo: Path, argv: list[str]) -> dict[str, Any]:
-    command = ["git", "--no-optional-locks", "-C", str(repo), *argv]
+    command = [grabowski_git_ssh.trusted_git_cli_path(), "--no-optional-locks", "-C", str(repo), *argv]
     env = os.environ.copy()
+    # Purely local reads must not depend on any GitHub writer credential.
+    # Unknown/aliased operations remain SSH-disabled rather than falling back.
+    remote_ssh_operation = any(token in {"push", "fetch", "pull", "clone", "ls-remote"} for token in argv)
     exact_deny = {
         "GIT_DIR",
         "GIT_WORK_TREE",
@@ -2054,7 +2058,11 @@ def _default_command_runner(repo: Path, argv: list[str]) -> dict[str, Any]:
             "GIT_PAGER": "cat",
             "PAGER": "cat",
             "GIT_ALLOW_PROTOCOL": "ssh",
-            "GIT_SSH_COMMAND": "/usr/bin/ssh -F /dev/null -oBatchMode=yes -oProxyCommand=none -oPermitLocalCommand=no -oClearAllForwardings=yes",
+            "GIT_SSH_COMMAND": (
+                grabowski_git_ssh.hardened_git_ssh_command()
+                if remote_ssh_operation
+                else "/__grabowski_ssh_transport_disabled__/ssh"
+            ),
             "GIT_SSH_VARIANT": "ssh",
             "GIT_ASKPASS": "/bin/false",
             "SSH_ASKPASS": "/bin/false",
