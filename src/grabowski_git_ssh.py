@@ -73,7 +73,21 @@ def trusted_git_cli_path() -> str:
         # Preserve the classic Linux contract: /usr/bin/git must be a regular
         # root-owned binary, never a user-rewritable or redirected symlink.
         if path == candidates[0] and not stat.S_ISREG(original.st_mode):
-            raise PermissionError("trusted classic Git CLI must be a regular file")
+            if not stat.S_ISLNK(original.st_mode):
+                raise PermissionError("trusted classic Git CLI must be a regular file")
+            # Accept only a root-managed alias to exactly the NixOS system Git.
+            nix_git = candidates[1]
+            if not os.path.lexists(nix_git):
+                raise PermissionError("legacy Git symlink lacks trusted NixOS Git")
+            try:
+                legacy_target = path.resolve(strict=True)
+                nix_target = nix_git.resolve(strict=True)
+            except (OSError, RuntimeError) as exc:
+                raise PermissionError("legacy Git symlink lacks trusted NixOS Git") from exc
+            if legacy_target != nix_target or not nix_target.is_relative_to(_NIX_STORE):
+                raise PermissionError("legacy Git symlink does not match NixOS system Git")
+            _root_managed_chain(path)
+            continue  # The canonical NixOS path is checked by this same loop.
         actual = path.resolve(strict=True)
         if path == candidates[1] and not actual.is_relative_to(_NIX_STORE):
             raise PermissionError("NixOS Git must resolve into the Nix store")

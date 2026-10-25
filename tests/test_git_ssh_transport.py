@@ -136,6 +136,24 @@ class GitSshTransportTests(unittest.TestCase):
         modules = next(line for line in pyproject.splitlines() if line.startswith("py-modules = "))
         self.assertIn('"grabowski_git_ssh"', modules)
 
+    def test_real_nixos_git_alias_uses_canonical_nix_git(self) -> None:
+        legacy = Path("/usr/bin/git")
+        nix = Path("/run/current-system/sw/bin/git")
+        if not legacy.is_symlink() or not nix.exists():
+            self.skipTest("NixOS legacy Git alias unavailable")
+        if legacy.resolve(strict=True) != nix.resolve(strict=True):
+            self.skipTest("NixOS Git alias differs")
+        self.assertEqual(str(nix), transport.trusted_git_cli_path())
+
+    def test_foreign_legacy_git_symlink_is_denied(self) -> None:
+        with (
+            patch.object(transport.os.path, "lexists", return_value=True),
+            patch.object(transport.Path, "lstat", return_value=SimpleNamespace(st_mode=stat.S_IFLNK | 0o777, st_uid=0)),
+            patch.object(transport.Path, "resolve", side_effect=[Path("/nix/store/foreign/bin/git"), Path("/nix/store/system/bin/git")]),
+        ):
+            with self.assertRaisesRegex(PermissionError, "does not match NixOS"):
+                transport.trusted_git_cli_path()
+
     def test_classic_usr_bin_ssh_is_selected_before_nixos_fallback(self) -> None:
         with (
             patch.object(transport.os.path, "lexists", return_value=True),

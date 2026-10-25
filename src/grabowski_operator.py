@@ -4290,6 +4290,8 @@ def _trusted_github_cli_path() -> str:
 
 def _trusted_git_cli_path() -> str:
     if os.path.lexists(TRUSTED_GIT_CLI_PATH):
+        if stat.S_ISLNK(TRUSTED_GIT_CLI_PATH.lstat().st_mode):
+            return grabowski_git_ssh.trusted_git_cli_path()
         return _trusted_root_owned_executable_path(TRUSTED_GIT_CLI_PATH, "Git CLI")
     return _trusted_nixos_cli_path("git", "Git CLI")
 

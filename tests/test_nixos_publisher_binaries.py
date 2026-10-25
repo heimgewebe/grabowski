@@ -24,6 +24,7 @@ class NixosPublisherBinariesTests(unittest.TestCase):
         operator = _load_operator_module()
         with (
             patch.object(operator.os.path, "lexists", return_value=True),
+            patch.object(operator.Path, "lstat", return_value=SimpleNamespace(st_mode=stat.S_IFREG | 0o755)),
             patch.object(operator, "_trusted_root_owned_executable_path", return_value="/usr/bin/git") as check,
         ):
             self.assertEqual("/usr/bin/git", operator._trusted_git_cli_path())
@@ -33,6 +34,7 @@ class NixosPublisherBinariesTests(unittest.TestCase):
         operator = _load_operator_module()
         with (
             patch.object(operator.os.path, "lexists", return_value=True),
+            patch.object(operator.Path, "lstat", return_value=SimpleNamespace(st_mode=stat.S_IFREG | 0o755)),
             patch.object(operator, "_trusted_root_owned_executable_path", side_effect=PermissionError("unsafe legacy")),
         ):
             with self.assertRaisesRegex(PermissionError, "unsafe legacy"):
@@ -82,6 +84,26 @@ class NixosPublisherBinariesTests(unittest.TestCase):
         expected = operator._trusted_git_cli_path()
         with patch.dict(os.environ, {"PATH": "/tmp/attacker/bin", "GIT_SSH_COMMAND": "/tmp/evil"}):
             self.assertEqual(expected, operator._trusted_git_cli_path())
+
+    def test_real_nixos_legacy_git_alias_uses_canonical_system_git(self) -> None:
+        operator = _load_operator_module()
+        legacy = Path("/usr/bin/git")
+        nix = Path("/run/current-system/sw/bin/git")
+        if not legacy.is_symlink() or not nix.exists():
+            self.skipTest("NixOS legacy Git alias unavailable")
+        if legacy.resolve(strict=True) != nix.resolve(strict=True):
+            self.skipTest("NixOS Git alias is not identical")
+        self.assertEqual(str(nix), operator._trusted_git_cli_path())
+
+    def test_untrusted_legacy_git_alias_is_not_bypassed(self) -> None:
+        operator = _load_operator_module()
+        with (
+            patch.object(operator.os.path, "lexists", return_value=True),
+            patch.object(operator.Path, "lstat", return_value=SimpleNamespace(st_mode=stat.S_IFLNK | 0o777)),
+            patch.object(operator.grabowski_git_ssh, "trusted_git_cli_path", side_effect=PermissionError("foreign Git")),
+        ):
+            with self.assertRaisesRegex(PermissionError, "foreign Git"):
+                operator._trusted_git_cli_path()
 
     def test_real_nixos_github_cli_when_usr_bin_missing(self) -> None:
         operator = _load_operator_module()
