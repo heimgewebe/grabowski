@@ -7199,6 +7199,23 @@ def _git_environment() -> dict[str, str]:
     return environment
 
 
+def _git_push_ssh_binary() -> str:
+    """Use only known, root-owned OpenSSH executables (also on NixOS)."""
+    for binary in ("/usr/bin/ssh", "/run/current-system/sw/bin/ssh"):
+        try:
+            info = os.stat(binary)
+        except OSError:
+            continue
+        if (
+            stat.S_ISREG(info.st_mode)
+            and info.st_uid == 0
+            and not (info.st_mode & 0o022)
+            and os.access(binary, os.X_OK)
+        ):
+            return binary
+    raise FileNotFoundError("No trusted Git SSH executable is available")
+
+
 def _git_push_environment() -> dict[str, str]:
     environment = _git_environment()
     for key in (
@@ -7213,7 +7230,7 @@ def _git_push_environment() -> dict[str, str]:
     environment.update(
         {
             "GIT_ALLOW_PROTOCOL": "ssh",
-            "GIT_SSH_COMMAND": "/usr/bin/ssh -F /dev/null -oBatchMode=yes -oProxyCommand=none -oPermitLocalCommand=no -oClearAllForwardings=yes",
+            "GIT_SSH_COMMAND": f"{_git_push_ssh_binary()} -F /dev/null -oBatchMode=yes -oProxyCommand=none -oPermitLocalCommand=no -oClearAllForwardings=yes",
             "GIT_SSH_VARIANT": "ssh",
             "GIT_ASKPASS": "/bin/false",
             "SSH_ASKPASS": "/bin/false",

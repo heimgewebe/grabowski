@@ -6005,11 +6005,44 @@ class OperatorContractTests(unittest.TestCase):
             environment = operator._git_push_environment()
         self.assertNotIn("GIT_SSH", environment)
         self.assertNotIn("GIT_PROXY_COMMAND", environment)
-        self.assertEqual("/usr/bin/ssh -F /dev/null -oBatchMode=yes -oProxyCommand=none -oPermitLocalCommand=no -oClearAllForwardings=yes", environment["GIT_SSH_COMMAND"])
+        self.assertEqual(f"{operator._git_push_ssh_binary()} -F /dev/null -oBatchMode=yes -oProxyCommand=none -oPermitLocalCommand=no -oClearAllForwardings=yes", environment["GIT_SSH_COMMAND"])
         self.assertEqual("ssh", environment["GIT_SSH_VARIANT"])
         self.assertEqual("/bin/false", environment["GIT_ASKPASS"])
         self.assertEqual("/bin/false", environment["SSH_ASKPASS"])
         self.assertEqual("ssh", environment["GIT_ALLOW_PROTOCOL"])
+
+    def test_git_push_uses_root_owned_nixos_ssh_if_usr_bin_missing(self) -> None:
+        operator = _load_operator_module()
+
+        class SafeBinary:
+            st_uid = 0
+            st_mode = 0o100555
+
+        def fake_stat(path: str) -> SafeBinary:
+            if path == "/usr/bin/ssh":
+                raise FileNotFoundError(path)
+            self.assertEqual("/run/current-system/sw/bin/ssh", path)
+            return SafeBinary()
+
+        with patch.object(operator.os, "stat", side_effect=fake_stat), patch.object(
+            operator.os, "access", return_value=True
+        ):
+            self.assertEqual(
+                "/run/current-system/sw/bin/ssh", operator._git_push_ssh_binary()
+            )
+
+    def test_git_push_rejects_non_root_or_writable_ssh_binary(self) -> None:
+        operator = _load_operator_module()
+
+        class UnsafeBinary:
+            st_uid = 1000
+            st_mode = 0o100777
+
+        with patch.object(operator.os, "stat", return_value=UnsafeBinary()), patch.object(
+            operator.os, "access", return_value=True
+        ):
+            with self.assertRaisesRegex(FileNotFoundError, "No trusted Git SSH"):
+                operator._git_push_ssh_binary()
 
     def test_benign_global_config_and_normal_feature_push_remain_allowed(self) -> None:
         operator = _load_operator_module()

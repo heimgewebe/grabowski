@@ -48,7 +48,19 @@ CANONICAL_RECOVERY = Path(os.environ.get(
     "GRABOWSKI_CANONICAL_RECOVERY_MARKER",
     "/var/lib/grabowski/power-worker-recovery-gate.json",
 )).expanduser()
-BACKUP_TIMER = os.environ.get("GRABOWSKI_BACKUP_TIMER", "restic-backup-1930.timer")
+# Only auto-select the native system timer when both the NixOS marker and the
+# actual systemd unit are present. Explicit settings retain precedence.
+_NIXOS_RESTIC_TIMER_PRESENT = (
+    Path("/etc/NIXOS").is_file()
+    and Path("/etc/systemd/system/restic-backups-heim-pc.timer").is_file()
+)
+BACKUP_TIMER = os.environ.get(
+    "GRABOWSKI_BACKUP_TIMER",
+    "restic-backups-heim-pc.timer" if _NIXOS_RESTIC_TIMER_PRESENT else "restic-backup-1930.timer",
+)
+BACKUP_TIMER_SCOPE = os.environ.get(
+    "GRABOWSKI_BACKUP_TIMER_SCOPE", "system" if _NIXOS_RESTIC_TIMER_PRESENT else "user",
+)
 MAX_AGE_SECONDS = int(os.environ.get("GRABOWSKI_RECOVERY_MAX_AGE_SECONDS", str(24 * 60 * 60)))
 DEFAULT_SERVER_RECOVERY_HOST = "heimberry"
 DEFAULT_SERVER_RECOVERY_TARGET = "local-backup-disk:UUID=9b626294-7913-4be0-88fa-96b314e96ee5/restic/heim-pc"
@@ -1611,9 +1623,18 @@ def server_recovery_probe() -> dict[str, Any]:
 
 
 def _timer_probe(action: str) -> dict[str, Any]:
+    if BACKUP_TIMER_SCOPE not in ("user", "system"):
+        return {
+            "action": action,
+            "ok": False,
+            "result": {"returncode": 2, "stderr": "invalid backup timer scope"},
+        }
+    argv = ["systemctl"]
+    if BACKUP_TIMER_SCOPE == "user":
+        argv.append("--user")
+    argv.extend([action, BACKUP_TIMER])
     result = operator._run(
-        ["systemctl", "--user", action, BACKUP_TIMER],
-        cwd=operator.HOME, timeout_seconds=30,
+        argv, cwd=operator.HOME, timeout_seconds=30,
         max_output_bytes=operator.DEFAULT_OUTPUT_BYTES,
     )
     return {"action": action, "ok": result["returncode"] == 0, "result": result}

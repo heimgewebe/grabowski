@@ -191,5 +191,44 @@ class StagedFundusRecoveryTests(unittest.TestCase):
         )
 
 
+class NativeResticTimerScopeTests(unittest.TestCase):
+    def test_system_timer_uses_system_manager(self) -> None:
+        with patch.object(recovery, "BACKUP_TIMER_SCOPE", "system"), patch.object(
+            recovery, "BACKUP_TIMER", "restic-backups-heim-pc.timer"
+        ), patch.object(
+            recovery.operator, "_run", return_value={"returncode": 0}
+        ) as run:
+            result = recovery._timer_probe("is-enabled")
+
+        self.assertTrue(result["ok"])
+        run.assert_called_once_with(
+            ["systemctl", "is-enabled", "restic-backups-heim-pc.timer"],
+            cwd=recovery.operator.HOME,
+            timeout_seconds=30,
+            max_output_bytes=recovery.operator.DEFAULT_OUTPUT_BYTES,
+        )
+
+    def test_legacy_timer_stays_on_user_manager(self) -> None:
+        with patch.object(recovery, "BACKUP_TIMER_SCOPE", "user"), patch.object(
+            recovery, "BACKUP_TIMER", "restic-backup-1930.timer"
+        ), patch.object(
+            recovery.operator, "_run", return_value={"returncode": 0}
+        ) as run:
+            result = recovery._timer_probe("is-active")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            run.call_args.args[0],
+            ["systemctl", "--user", "is-active", "restic-backup-1930.timer"],
+        )
+
+    def test_invalid_scope_fails_closed_without_command(self) -> None:
+        with patch.object(recovery, "BACKUP_TIMER_SCOPE", "nonsense"), patch.object(
+            recovery.operator, "_run"
+        ) as run:
+            result = recovery._timer_probe("is-active")
+        self.assertFalse(result["ok"])
+        run.assert_not_called()
+
 if __name__ == "__main__":
     unittest.main()
