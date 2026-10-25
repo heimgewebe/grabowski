@@ -7323,7 +7323,7 @@ class GitServerVerifiedReadTransportTests(unittest.TestCase):
                 )
 
             self.assertEqual(result["returncode"], 0)
-            self.assertEqual(result["argv"][0], "/usr/bin/git")
+            self.assertEqual(result["argv"][0], operator._trusted_git_cli_path())
             self.assertFalse(invoked.exists())
             mutation.assert_not_called()
 

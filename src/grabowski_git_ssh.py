@@ -63,6 +63,35 @@ def _selected_ssh_executable() -> Path:
     raise FileNotFoundError("No trusted system OpenSSH executable is installed")
 
 
+def trusted_git_cli_path() -> str:
+    """Return one root-managed Git executable, never resolved via PATH."""
+    candidates = (Path("/usr/bin/git"), Path("/run/current-system/sw/bin/git"))
+    for path in candidates:
+        if not os.path.lexists(path):
+            continue
+        original = path.lstat()
+        # Preserve the classic Linux contract: /usr/bin/git must be a regular
+        # root-owned binary, never a user-rewritable or redirected symlink.
+        if path == candidates[0] and not stat.S_ISREG(original.st_mode):
+            raise PermissionError("trusted classic Git CLI must be a regular file")
+        actual = path.resolve(strict=True)
+        if path == candidates[1] and not actual.is_relative_to(_NIX_STORE):
+            raise PermissionError("NixOS Git must resolve into the Nix store")
+        _root_managed_chain(path)
+        _root_managed_chain(actual)
+        info = actual.stat()
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != 0
+            or info.st_mode & 0o022
+            or not info.st_mode & stat.S_IXUSR
+            or not os.access(actual, os.X_OK)
+        ):
+            raise PermissionError("Git CLI is not a trusted system executable")
+        return str(path)
+    raise FileNotFoundError("No root-managed Git CLI is installed")
+
+
 def _trusted_identity() -> Path:
     # passwd is the account authority; HOME or caller-provided paths are not.
     home = Path(pwd.getpwuid(os.geteuid()).pw_dir)

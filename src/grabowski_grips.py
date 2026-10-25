@@ -2013,7 +2013,7 @@ def utc_now() -> str:
 
 
 def _default_command_runner(repo: Path, argv: list[str]) -> dict[str, Any]:
-    command = ["git", "--no-optional-locks", "-C", str(repo), *argv]
+    command = [grabowski_git_ssh.trusted_git_cli_path(), "--no-optional-locks", "-C", str(repo), *argv]
     env = os.environ.copy()
     # Purely local reads must not depend on any GitHub writer credential.
     # Unknown/aliased operations remain SSH-disabled rather than falling back.
