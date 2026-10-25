@@ -1407,6 +1407,113 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
                         for item in second["errors"]
                     ))
 
+    def test_late_created_external_v1_receipt_or_parent_blocks_first_scan(self) -> None:
+        # A failed historical V1 reviewer may have no external receipt at
+        # first inspection. Later publication must not be hidden by a PASS.
+        for missing in ("file", "parent"):
+            with self.subTest(missing=missing):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    jobs = root / "jobs"
+                    jobs.mkdir(mode=0o700)
+                    shared = root / "shared-audit"
+                    shared.mkdir(mode=0o755)
+                    make_job(
+                        jobs, suffix="a00000000223", slot="independent-reviewer",
+                        terminal_status="failed", review_result=None, review_role=True,
+                        legacy_role_receipt_parent=shared,
+                        created_at_unix=1_787_000_100,
+                    )
+                    later = make_job(
+                        jobs, suffix="b00000000224", slot="independent-reviewer",
+                        terminal_status="succeeded", review_result=None,
+                        review_role=True, created_at_unix=1_787_000_200,
+                    )
+                    receipt = shared / "review-role-receipt.json"
+                    original = json.loads(receipt.read_text(encoding="utf-8"))
+                    receipt.unlink()
+                    if missing == "parent":
+                        shared.rmdir()
+                    previous_validator = reviews._validated_origin_binding
+                    published = False
+
+                    def publish_late(directory, *args, **kwargs):
+                        nonlocal published
+                        if directory == later and not published:
+                            value = dict(original)
+                            value.update(
+                                verdict="NEEDS_CHANGE",
+                                findings=[{"severity": "P1", "summary": "late reject"}],
+                                failure_classification="review_verdict",
+                                returncode=1,
+                            )
+                            value["receipt_sha256"] = reviews._agent_role_receipt_sha256(value)
+                            if missing == "parent":
+                                shared.mkdir(mode=0o755)
+                            write_private(receipt, json.dumps(value))
+                            published = True
+                        return previous_validator(directory, *args, **kwargs)
+
+                    with mock.patch.object(
+                        reviews, "_validated_origin_binding", side_effect=publish_late
+                    ):
+                        first = self.reconcile(jobs)
+                    self.assertTrue(published)
+                    self.assertEqual(first["status"], "blocked")
+                    if missing == "file":
+                        self.assertIn(
+                            "decision_review_external_role_receipt_changed",
+                            first["errors"],
+                        )
+                    else:
+                        self.assertTrue(any(
+                            error.startswith("decision_review_result_invalid:")
+                            for error in first["errors"]
+                        ))
+                    second = self.reconcile(jobs)
+                    self.assertEqual(second["status"], "blocked")
+                    self.assertTrue(any(
+                        error.startswith("decision_review_material_reject:")
+                        for error in second["errors"]
+                    ))
+
+    def test_still_missing_external_v1_receipt_has_conservative_parent_policy(self) -> None:
+        for missing in ("file", "parent"):
+            with self.subTest(missing=missing):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    jobs = root / "jobs"
+                    jobs.mkdir(mode=0o700)
+                    shared = root / "shared-audit"
+                    shared.mkdir(mode=0o755)
+                    make_job(
+                        jobs, suffix="a00000000225", slot="independent-reviewer",
+                        terminal_status="failed", review_result=None, review_role=True,
+                        legacy_role_receipt_parent=shared,
+                        created_at_unix=1_787_000_100,
+                    )
+                    make_job(
+                        jobs, suffix="b00000000226", slot="independent-reviewer",
+                        terminal_status="succeeded", review_result=None,
+                        review_role=True, created_at_unix=1_787_000_200,
+                    )
+                    receipt = shared / "review-role-receipt.json"
+                    receipt.unlink()
+                    if missing == "parent":
+                        shared.rmdir()
+                    result_state = self.reconcile(jobs)
+                if missing == "file":
+                    self.assertEqual(result_state["status"], "settled")
+                    self.assertEqual(result_state["errors"], [])
+                    self.assertEqual(result_state["slots"][0]["independent_pass_count"], 1)
+                else:
+                    self.assertEqual(result_state["status"], "blocked")
+                    self.assertTrue(any(
+                        error.startswith("decision_review_result_invalid:")
+                        for error in result_state["errors"]
+                    ))
+
+
     def test_v1_shared_parent_still_rejects_symlinks_hardlinks_and_fifos(self) -> None:
         for attack in ("symlink", "hardlink", "fifo"):
             with self.subTest(attack=attack):

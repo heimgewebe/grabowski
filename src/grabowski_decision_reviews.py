@@ -442,7 +442,7 @@ def _read_private_bytes(
     parent_fd: int | None = None,
     aggregate_metadata_bytes: list[int] | None = None,
     allow_legacy_readable: bool = False,
-    external_v1_snapshots: list[tuple[Path, tuple[int, ...], tuple[int, ...]]] | None = None,
+    external_v1_snapshots: list[tuple[Path, tuple[int, ...], tuple[int, ...] | None]] | None = None,
 ) -> bytes:
     """Read bounded stable owner-owned bytes; ordinary legacy logs may be 0644.
 
@@ -454,7 +454,13 @@ def _read_private_bytes(
     flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
     owns_parent = parent_fd is None
     if parent_fd is None:
-        parent_fd = os.open(path.parent, flags | os.O_DIRECTORY)
+        try:
+            parent_fd = os.open(path.parent, flags | os.O_DIRECTORY)
+        except FileNotFoundError as exc:
+            if external_v1_snapshots is not None:
+                # Without a pinned parent, late V1 evidence could hide a REJECT.
+                raise ValueError("external V1 role receipt parent missing") from exc
+            raise
     try:
         parent = os.fstat(parent_fd)
         if not stat.S_ISDIR(parent.st_mode):
@@ -468,7 +474,21 @@ def _read_private_bytes(
             or stat.S_IMODE(parent.st_mode) & 0o077
         ):
             raise ValueError("review evidence parent is not owner-private")
-        descriptor = os.open(path.name, flags, dir_fd=parent_fd)
+        try:
+            descriptor = os.open(path.name, flags, dir_fd=parent_fd)
+        except FileNotFoundError:
+            if external_v1_snapshots is not None:
+                # A missing V1 role receipt can publish later during the scan.
+                # Pin that negative observation just like a previously read file.
+                if (
+                    _review_stat_parent_identity(os.fstat(parent_fd))
+                    != external_parent_identity
+                ):
+                    raise ValueError("external V1 role receipt parent changed")
+                external_v1_snapshots.append(
+                    (path, external_parent_identity, None)
+                )
+            raise
         try:
             before = os.fstat(descriptor)
             if (
@@ -538,7 +558,7 @@ def _read_private_json(
     path: Path, max_bytes: int, *, require_private_parent: bool = True,
     parent_fd: int | None = None,
     aggregate_metadata_bytes: list[int] | None = None,
-    external_v1_snapshots: list[tuple[Path, tuple[int, ...], tuple[int, ...]]] | None = None,
+    external_v1_snapshots: list[tuple[Path, tuple[int, ...], tuple[int, ...] | None]] | None = None,
 ) -> dict[str, Any]:
     """Read one stable owner-private JSON object without following its path."""
     content = _read_private_bytes(
@@ -1567,7 +1587,7 @@ def _validated_review_role_evidence(
     metadata: dict[str, Any], binding: dict[str, Any], provenance: dict[str, Any] | None,
     *, directory: Path | None = None, parent_fd: int | None = None,
     aggregate_bytes: list[int] | None = None,
-    external_v1_snapshots: list[tuple[Path, tuple[int, ...], tuple[int, ...]]] | None = None,
+    external_v1_snapshots: list[tuple[Path, tuple[int, ...], tuple[int, ...] | None]] | None = None,
 ) -> dict[str, Any] | None:
     if provenance is None:
         return None
@@ -1692,7 +1712,7 @@ def _attempt_started_after(candidate: dict[str, Any], prior: dict[str, Any]) -> 
 
 
 def _external_v1_role_receipts_unchanged(
-    snapshots: list[tuple[Path, tuple[int, ...], tuple[int, ...]]],
+    snapshots: list[tuple[Path, tuple[int, ...], tuple[int, ...] | None]],
 ) -> bool:
     """Recheck every earlier external V1 receipt after the full registry scan.
 
@@ -1708,11 +1728,19 @@ def _external_v1_role_receipts_unchanged(
             try:
                 if _review_stat_parent_identity(os.fstat(parent_fd)) != parent_identity:
                     return False
-                observed = os.stat(
-                    path.name, dir_fd=parent_fd, follow_symlinks=False
-                )
-                if _review_stat_file_identity(observed) != file_identity:
-                    return False
+                try:
+                    observed = os.stat(
+                        path.name, dir_fd=parent_fd, follow_symlinks=False
+                    )
+                except FileNotFoundError:
+                    if file_identity is not None:
+                        return False
+                else:
+                    if (
+                        file_identity is None
+                        or _review_stat_file_identity(observed) != file_identity
+                    ):
+                        return False
             finally:
                 os.close(parent_fd)
         except OSError:
@@ -2080,7 +2108,7 @@ def reconcile(
         }
     metadata_budget = [0]
     unbound_stdout_budget = [0]
-    external_v1_snapshots: list[tuple[Path, tuple[int, ...], tuple[int, ...]]] = []
+    external_v1_snapshots: list[tuple[Path, tuple[int, ...], tuple[int, ...] | None]] = []
     skipped_prelaunch_stubs: list[str] = []
     iterator = _iter_pinned_review_job_directories(
         root, errors, metadata_budget, expected=expected,
