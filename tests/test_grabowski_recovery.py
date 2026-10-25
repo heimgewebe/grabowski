@@ -238,7 +238,7 @@ class NativeNixOSResticProofTests(unittest.TestCase):
         self.now = int(time.time())
         self.snapshot = {
             "id": "c" * 64, "hostname": "heim-pc-nixos",
-            "tags": ["nixos-seagate"], "paths": ["/etc", "/home/alex", "/persist"],
+            "tags": ["nixos-seagate"], "paths": ["/etc", str(recovery.operator.HOME), "/persist"],
             "time": datetime.fromtimestamp(self.now - 60, timezone.utc).isoformat(),
         }
         self.target = {
@@ -268,7 +268,7 @@ class NativeNixOSResticProofTests(unittest.TestCase):
         cases = (
             dict(self.snapshot, hostname="heim-pc"),
             dict(self.snapshot, tags=["daily"]),
-            dict(self.snapshot, paths=["/etc", "/home/alex"]),
+            dict(self.snapshot, paths=["/etc", str(recovery.operator.HOME)]),
             dict(self.snapshot, id="not-a-snapshot"),
             dict(
                 self.snapshot,
