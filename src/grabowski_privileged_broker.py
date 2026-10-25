@@ -39,6 +39,7 @@ RECOVERY_RECORD_KEYS = frozenset({
     "target", "configured_target", "configured_target_valid",
     "target_matches_configured", "source_record_sha256", "source_owner_uid",
 })
+RECOVERY_RECORD_OPTIONAL_KEYS = frozenset({"snapshot_time_unix"})
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 REQUEST_ID = re.compile(r"[0-9a-f]{32}\Z")
 SHELL_EXECUTABLES = {
@@ -606,7 +607,7 @@ def _canonical_recovery_payload(
     max_age_seconds: int,
     configured_target: str,
 ) -> dict[str, Any]:
-    return {
+    record = {
         "schema_version": RECOVERY_RECORD_SCHEMA_VERSION,
         "kind": RECOVERY_RECORD_KIND,
         "generated_at_unix": source["completed_at_unix"],
@@ -621,6 +622,9 @@ def _canonical_recovery_payload(
         "source_record_sha256": source_record_sha256,
         "source_owner_uid": source_owner_uid,
     }
+    if "snapshot_time_unix" in source:
+        record["snapshot_time_unix"] = source["snapshot_time_unix"]
+    return record
 
 
 def _validate_recovery_source_record(
@@ -686,6 +690,8 @@ def inspect_canonical_recovery_record(
         "generated_at_unix": None,
         "age_seconds": None,
         "max_age_seconds": None,
+        "snapshot_time_unix": None,
+        "snapshot_age_seconds": None,
         "record_sha256": None,
         "source_record_sha256": None,
         "snapshot_id": None,
@@ -712,7 +718,7 @@ def inspect_canonical_recovery_record(
     except ValueError as exc:
         result.update({"freshness_reason": "malformed", "error": str(exc)})
         return result
-    if set(value) != RECOVERY_RECORD_KEYS:
+    if set(value) not in (RECOVERY_RECORD_KEYS, RECOVERY_RECORD_KEYS | RECOVERY_RECORD_OPTIONAL_KEYS):
         result.update({"freshness_reason": "contract-mismatch", "error": "canonical recovery record keys are invalid"})
         return result
     if value.get("schema_version") != RECOVERY_RECORD_SCHEMA_VERSION or value.get("kind") != RECOVERY_RECORD_KIND:
@@ -745,6 +751,17 @@ def inspect_canonical_recovery_record(
     if age > max_age:
         result.update({"freshness_reason": "stale", "error": "canonical recovery record is stale"})
         return result
+    if "snapshot_time_unix" in value:
+        snapshot_time = value["snapshot_time_unix"]
+        if type(snapshot_time) is not int or snapshot_time > generated_at:
+            result.update({"freshness_reason": "malformed", "error": "canonical snapshot timestamp is invalid"})
+            return result
+        snapshot_age = current - snapshot_time
+        result["snapshot_time_unix"] = snapshot_time
+        result["snapshot_age_seconds"] = snapshot_age
+        if snapshot_age > max_age:
+            result.update({"freshness_reason": "stale", "error": "canonical backup snapshot is stale"})
+            return result
     if value.get("restore_probe_valid") is not True or value.get("repository_check_valid") is not True:
         result.update({"freshness_reason": "incomplete", "error": "canonical recovery evidence is incomplete"})
         return result

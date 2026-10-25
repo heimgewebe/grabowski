@@ -97,6 +97,59 @@ class RecoveryFreshnessContractTests(unittest.TestCase):
             validated(dict(native, untrusted_extra="ignored"))
 
 
+    def test_native_canonical_marker_and_both_broker_gates_expire_with_original_snapshot(self) -> None:
+        now = 200000
+        original_snapshot_time = now - 23 * 3600
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source = root / "source.json"
+            destination = root / "canonical.json"
+            payload = dict(
+                _source_payload(now, snapshot_id="native-snapshot"),
+                snapshot_time_unix=original_snapshot_time,
+            )
+            encoded = (
+                json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+            ).encode("utf-8")
+            source.write_bytes(encoded)
+            source.chmod(0o600)
+            digest = hashlib.sha256(encoded).hexdigest()
+            execution = _execution(source, destination, digest, now)
+            published = broker.publish_recovery_marker(execution, now=now)
+            self.assertTrue(published["published"])
+
+            fresh = broker.inspect_canonical_recovery_record(
+                destination, now=now, expected_max_age_seconds=MAX_AGE,
+                expected_target=TARGET, require_root_owned=False,
+            )
+            self.assertTrue(fresh["valid"], fresh["error"])
+            self.assertEqual(fresh["snapshot_time_unix"], original_snapshot_time)
+
+            later = now + 2 * 3600
+            stale = broker.inspect_canonical_recovery_record(
+                destination, now=later, expected_max_age_seconds=MAX_AGE,
+                expected_target=TARGET, require_root_owned=False,
+            )
+            self.assertFalse(stale["valid"])
+            self.assertEqual(stale["freshness_reason"], "stale")
+            self.assertEqual(stale["age_seconds"], 2 * 3600)
+            self.assertEqual(stale["snapshot_age_seconds"], 25 * 3600)
+
+            gate = {
+                "recovery_marker_path": str(destination),
+                "max_recovery_age_seconds": MAX_AGE,
+                "require_root_owned_gate_files": False,
+                "configured_target": TARGET,
+            }
+            with self.assertRaisesRegex(PermissionError, "stale"):
+                broker._validate_recovery_gate(gate, now=later)
+            with self.assertRaisesRegex(PermissionError, "stale"):
+                broker._validate_power_gate(
+                    {
+                        **gate, "kill_switch_path": str(root / "absent-kill-switch"),
+                    }, now=later,
+                )
+
     def test_example_config_keeps_recovery_root_task_but_decouples_power(self) -> None:
         config = json.loads((ROOT / "config/privileged-actions.example.json").read_text(encoding="utf-8"))
         publisher = config["actions"]["publish_recovery_marker"]
