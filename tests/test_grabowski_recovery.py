@@ -230,5 +230,168 @@ class NativeResticTimerScopeTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         run.assert_not_called()
 
+
+class NativeNixOSResticProofTests(unittest.TestCase):
+    def setUp(self) -> None:
+        import time
+        from datetime import datetime, timezone
+        self.now = int(time.time())
+        self.snapshot = {
+            "id": "c" * 64, "hostname": "heim-pc-nixos",
+            "tags": ["nixos-seagate"], "paths": ["/etc", "/home/alex", "/persist"],
+            "time": datetime.fromtimestamp(self.now - 60, timezone.utc).isoformat(),
+        }
+        self.target = {
+            "kind": "local_backup_disk",
+            "backup_uuid": "9b626294-7913-4be0-88fa-96b314e96ee5",
+            "repository_name": "heim-pc",
+        }
+
+    def test_accepts_fresh_complete_nixos_snapshot(self) -> None:
+        result = recovery._nixos_restic_snapshot([self.snapshot], now=self.now)
+        self.assertEqual(result["id"], "c" * 64)
+
+    def test_ignores_smoke_and_prefers_latest_full_snapshot(self) -> None:
+        from datetime import datetime, timezone
+        smoke = dict(self.snapshot, id="d" * 64, paths=["/etc"])
+        older = dict(
+            self.snapshot, id="e" * 64,
+            time=datetime.fromtimestamp(self.now - 600, timezone.utc).isoformat(),
+        )
+        result = recovery._nixos_restic_snapshot(
+            [smoke, older, self.snapshot], now=self.now
+        )
+        self.assertEqual(result["id"], self.snapshot["id"])
+
+    def test_missing_tag_wrong_host_missing_path_and_staleness_rejected(self) -> None:
+        from datetime import datetime, timezone
+        cases = (
+            dict(self.snapshot, hostname="heim-pc"),
+            dict(self.snapshot, tags=["daily"]),
+            dict(self.snapshot, paths=["/etc", "/home/alex"]),
+            dict(self.snapshot, id="not-a-snapshot"),
+            dict(
+                self.snapshot,
+                time=datetime.fromtimestamp(
+                    self.now - recovery.MAX_AGE_SECONDS - 5, timezone.utc
+                ).isoformat(),
+            ),
+        )
+        for row in cases:
+            with self.subTest(row=row):
+                with self.assertRaisesRegex(RuntimeError, "fresh complete"):
+                    recovery._nixos_restic_snapshot([row], now=self.now)
+
+    def test_backend_dispatch_keeps_legacy_probe(self) -> None:
+        from contextlib import nullcontext
+        with patch.object(recovery, "_local_recovery_repository_operation_lock",
+                          return_value=nullcontext()), patch.object(
+            recovery, "_local_recovery_probe_locked", return_value={"mode": "legacy"}
+        ) as legacy, patch.object(
+            recovery, "_nixos_local_recovery_probe_locked",
+            return_value={"mode": "nixos"}
+        ) as native:
+            with patch.object(recovery, "_NIXOS_RESTIC_TIMER_PRESENT", False):
+                self.assertEqual(recovery._local_recovery_probe(self.target)["mode"], "legacy")
+            with patch.object(recovery, "_NIXOS_RESTIC_TIMER_PRESENT", True):
+                self.assertEqual(recovery._local_recovery_probe(self.target)["mode"], "nixos")
+            legacy.assert_called_once()
+            native.assert_called_once()
+
+    def test_missing_medium_wrong_uuid_repo_id_and_failed_restore_never_publish(self) -> None:
+        import tempfile
+        real_is_dir = Path.is_dir
+        repository = "/var/lib/heim-pc-backup/restic/heim-pc"
+        for scenario in ("missing_medium", "wrong_uuid", "wrong_repo", "restore_failure"):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as tmp:
+                def is_dir(path: Path) -> bool:
+                    if str(path) == repository:
+                        return scenario != "missing_medium"
+                    return real_is_dir(path)
+
+                def fake_run(argv: list[str], **_kwargs: object) -> types.SimpleNamespace:
+                    command = " ".join(argv)
+                    if "/findmnt " in command:
+                        output = "/var/lib/heim-pc-backup /dev/sda1 ext4\n"
+                    elif "/lsblk " in command:
+                        output = (
+                            "wrong-uuid\n" if scenario == "wrong_uuid"
+                            else self.target["backup_uuid"] + "\n"
+                        )
+                    elif " cat config" in command:
+                        value = (
+                            "0" * 64 if scenario == "wrong_repo"
+                            else recovery.LOCAL_RECOVERY_REPOSITORY_ID
+                        )
+                        output = json.dumps({"id": value})
+                    elif argv[0] == "systemctl":
+                        output = "Result=success\nExecMainStatus=0\n"
+                    elif " snapshots " in command:
+                        output = json.dumps([self.snapshot])
+                    elif " ls " in command:
+                        output = json.dumps({
+                            "message_type": "node",
+                            "path": "/persist/secrets/restic/heim-pc-excludes",
+                            "type": "file", "size": 879,
+                        })
+                    elif " restore " in command:
+                        raise RuntimeError("simulated restore error")
+                    elif "/rm " in command:
+                        output = ""
+                    else:
+                        raise AssertionError("unexpected command: " + command)
+                    return types.SimpleNamespace(stdout=output, returncode=0)
+
+                with patch.object(recovery.Path, "is_dir", new=is_dir), patch.object(
+                    recovery.operator, "STATE_DIR", Path(tmp)
+                ), patch.object(
+                    recovery, "_run_logged", side_effect=fake_run
+                ), patch.object(
+                    recovery, "_timer_probe", return_value={"ok": True}
+                ), patch.object(
+                    recovery, "_write_server_marker"
+                ) as marker, patch.object(
+                    recovery.privileged, "publish_recovery_marker_reference"
+                ) as publish:
+                    with self.assertRaises(RuntimeError):
+                        recovery._nixos_local_recovery_probe_locked(self.target)
+                    marker.assert_not_called()
+                    publish.assert_not_called()
+
+    def test_valid_nixos_source_replaces_only_legacy_local_marker(self) -> None:
+        source = {
+            "path": "/tmp/native-recovery.json", "exists": True, "valid": True,
+            "timestamp_unix": self.now, "age_seconds": 0, "error": None,
+            "source_record_sha256": "a" * 64, "snapshot_id": "c" * 8,
+            "target": recovery.SERVER_RECOVERY_TARGET,
+        }
+        with patch.object(recovery, "_NIXOS_RESTIC_TIMER_PRESENT", True), patch.object(
+            recovery.base, "_verify_audit_log", return_value={"valid": True}
+        ), patch.object(
+            recovery.base, "_deployment_metadata", return_value={"provenance_valid": True}
+        ), patch.object(
+            recovery, "_canonical_server_marker", return_value={"valid": True}
+        ), patch.object(
+            recovery, "_server_source_marker", return_value=source
+        ), patch.object(
+            recovery, "_source_publication_state", return_value={"current": True}
+        ), patch.object(
+            recovery.base, "_kill_switch_state", return_value={"engaged": False}
+        ), patch.object(
+            recovery, "_test_kill_switch_recovery_status", return_value={}
+        ), patch.object(
+            recovery, "_timer_probe", return_value={"ok": True}
+        ), patch.object(
+            recovery.privileged, "grabowski_privileged_broker_status",
+            return_value={"ready": True}
+        ), patch.object(
+            recovery, "_fresh_text_marker"
+        ) as legacy:
+            result = recovery.recovery_status()
+        self.assertTrue(result["checks"]["local_backup_fresh"])
+        self.assertEqual(result["local_backup"]["source"], "verified-nixos-native-restic")
+        legacy.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

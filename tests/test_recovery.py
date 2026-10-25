@@ -440,6 +440,8 @@ class RecoveryToolTests(unittest.TestCase):
             "_local_recovery_repository_operation_lock",
             return_value=nullcontext(),
         ) as lock, patch.object(
+            recovery, "_NIXOS_RESTIC_TIMER_PRESENT", False
+        ), patch.object(
             recovery, "_local_recovery_probe_locked", return_value=expected
         ) as probe:
             result = recovery._local_recovery_probe(target_info)
