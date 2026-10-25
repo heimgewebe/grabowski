@@ -87,6 +87,19 @@ def _protected_job_retention_authority() -> bool:
     return False
 
 
+def _protected_retention_receipt_authority() -> bool:
+    """No independently protected receipt reservation/commit transaction exists.
+
+    A same-UID writer can fill the receipt temp budget AFTER preflight but
+    BEFORE final publication, even if the scanned directory FD is pinned.
+    Without an OS-protected transaction the completed systemd effect could
+    lack its terminal receipt. Do not make this a mutable environment switch.
+    Job and task/worker effects must fail closed until protected authority
+    is implemented and proven independently.
+    """
+    return False
+
+
 def _canonical_json(value: Any) -> bytes:
     return json.dumps(
         value,
@@ -1318,7 +1331,10 @@ def build_plan(
     planned_jobs_root_identity = (root_stat.st_dev, root_stat.st_ino)
     jobs_root = _private_directory(jobs_root)
     _archive_require_unchanged_root(jobs_root, pinned.jobs_fd)
-    authorized_job_effects = _protected_job_retention_authority()
+    authorized_receipt_effects = _protected_retention_receipt_authority()
+    authorized_job_effects = (
+        _protected_job_retention_authority() and authorized_receipt_effects
+    )
     if receipt_root.is_symlink() or (
         authorized_job_effects and archive_root.is_symlink()
     ):
@@ -1611,6 +1627,9 @@ def build_plan(
             reset_units.append(unit)
             continue
         if TASK_UNIT.fullmatch(unit):
+            if not authorized_receipt_effects:
+                block(unit, "automatic task reset requires protected receipt authority")
+                continue
             state = _task_state(unit, task_db)
             if state in TERMINAL_TASK_STATES:
                 reset_units.append(unit)
@@ -1618,6 +1637,9 @@ def build_plan(
                 block(unit, f"task state is not proven terminal: {state}")
             continue
         if WORKER_UNIT.fullmatch(unit):
+            if not authorized_receipt_effects:
+                block(unit, "automatic worker reset requires protected receipt authority")
+                continue
             try:
                 evidence = _worker_reset_evidence(
                     unit,
@@ -3138,6 +3160,12 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
     ) and not _protected_job_retention_authority():
         raise RuntimeError(
             "automatic job archive/reset requires protected root/index authority"
+        )
+    if (
+        plan["archive_jobs"] or plan["reset_failed_units"]
+    ) and not _protected_retention_receipt_authority():
+        raise RuntimeError(
+            "automatic retention effects require protected receipt publication authority"
         )
     source = str(SRC)
     if source not in sys.path:

@@ -24,6 +24,7 @@ SPEC.loader.exec_module(RETENTION)
 # Production always refuses unsafe job effects until a privileged
 # root/index transaction actually exists; never patch this reference.
 PRODUCTION_JOB_RETENTION_AUTHORITY = RETENTION._protected_job_retention_authority
+PRODUCTION_RECEIPT_RETENTION_AUTHORITY = RETENTION._protected_retention_receipt_authority
 
 
 class RuntimeRetentionTests(unittest.TestCase):
@@ -36,6 +37,13 @@ class RuntimeRetentionTests(unittest.TestCase):
         )
         self._simulated_protected_authority = grant.start()
         self.addCleanup(grant.stop)
+        # Positive reset/archive fixtures also simulate an independently
+        # protected receipt finalization authority. Production never has it.
+        receipt_grant = patch.object(
+            RETENTION, "_protected_retention_receipt_authority", return_value=True
+        )
+        self._simulated_protected_receipt_authority = receipt_grant.start()
+        self.addCleanup(receipt_grant.stop)
 
     def _task_db(self, path: Path, unit: str, state: str) -> Path:
         connection = sqlite3.connect(path)
@@ -4378,6 +4386,7 @@ class RuntimeRetentionTests(unittest.TestCase):
         # the mocked external reset. An actual reset must never be followed by
         # an unreceipted failure to publish the terminal evidence.
         self._simulated_protected_authority.return_value = False
+        self._simulated_protected_receipt_authority.return_value = False
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             jobs, archive, receipts = root / "jobs", root / "archive", root / "receipts"
@@ -4433,6 +4442,59 @@ class RuntimeRetentionTests(unittest.TestCase):
                 ),
                 "external task reset completed without durable final receipt",
             )
+
+    def test_missing_receipt_authority_blocks_reset_on_stale_plan(self) -> None:
+        # A preexisting/forged plan cannot make task or worker resets eligible
+        # after protected receipt authority has been withdrawn.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs, archive, receipts = root / "jobs", root / "archive", root / "receipts"
+            for directory in (jobs, archive, receipts):
+                directory.mkdir(mode=0o700)
+            unit = "grabowski-task-" + "b" * 24 + "-a1.service"
+            task_db = self._task_db(root / "tasks.sqlite3", unit, "failed")
+            plan = RETENTION.build_plan(
+                minimum_job_age_seconds=50, now=1000,
+                jobs_root=jobs, archive_root=archive, receipt_root=receipts,
+                task_db=task_db, failed_units=[unit], unit_states={},
+            )
+            self.assertEqual(plan["reset_failed_units"], [unit])
+            self._simulated_protected_receipt_authority.return_value = False
+            reset = Mock()
+            with patch.object(RETENTION, "_run", reset):
+                with self.assertRaisesRegex(
+                    RuntimeError, "protected receipt publication authority"
+                ):
+                    RETENTION.apply_plan(
+                        plan, expected_plan_sha256=plan["plan_sha256"]
+                    )
+            reset.assert_not_called()
+            self.assertEqual(list(receipts.iterdir()), [])
+
+    def test_unprotected_receipt_planner_preserves_terminal_task_state(self) -> None:
+        self._simulated_protected_authority.return_value = False
+        self._simulated_protected_receipt_authority.return_value = False
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs, archive, receipts = root / "jobs", root / "archive", root / "receipts"
+            for directory in (jobs, archive, receipts):
+                directory.mkdir(mode=0o700)
+            unit = "grabowski-task-" + "c" * 24 + "-a1.service"
+            task_db = self._task_db(root / "tasks.sqlite3", unit, "failed")
+            plan = RETENTION.build_plan(
+                minimum_job_age_seconds=50, now=1000,
+                jobs_root=jobs, archive_root=archive, receipt_root=receipts,
+                task_db=task_db, failed_units=[unit], unit_states={},
+            )
+            self.assertEqual(plan["reset_failed_units"], [])
+            self.assertEqual(plan["archive_jobs"], [])
+            self.assertTrue(any(
+                row["unit"] == unit and "protected receipt authority" in row["reason"]
+                for row in plan["blocked"]
+            ))
+
+    def test_production_has_no_receipt_effect_authority(self) -> None:
+        self.assertIs(PRODUCTION_RECEIPT_RETENTION_AUTHORITY(), False)
 
     def test_receipt_temp_capacity_scan_restarts_advanced_directory_cursor(self) -> None:
         # The plan may have scanned the same pinned directory FD earlier.
