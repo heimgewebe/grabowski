@@ -4252,6 +4252,32 @@ class RuntimeRetentionTests(unittest.TestCase):
                     )).exists()
                 )
 
+    def test_receipt_temp_capacity_scan_restarts_advanced_directory_cursor(self) -> None:
+        # The plan may have scanned the same pinned directory FD earlier.
+        # Its existing offset must not hide failed receipt temp evidence.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for index in range(1, 4):
+                (root / f".sample.json.1.{index}.tmp").write_text("")
+            descriptor = os.open(
+                root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+            )
+            try:
+                os.lseek(descriptor, 10, os.SEEK_SET)
+                with patch.object(RETENTION, "MAX_RETAINED_JSON_TEMPS", 3):
+                    with self.assertRaisesRegex(
+                        RuntimeError, "retained atomic temp bound exceeded"
+                    ):
+                        RETENTION._archive_require_json_temp_capacity(
+                            descriptor, target_basename="sample.json"
+                        )
+            finally:
+                os.close(descriptor)
+            self.assertEqual(
+                sorted(item.name for item in root.iterdir()),
+                [f".sample.json.1.{index}.tmp" for index in range(1, 4)],
+            )
+
     def test_systemd_retention_requires_preprovisioned_receipt_root(self) -> None:
         unit = (
             ROOT / "systemd/grabowski-runtime-retention.service.example"
