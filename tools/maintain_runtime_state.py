@@ -1985,20 +1985,31 @@ def _archive_require_json_temp_capacity(
     prefix = f".{target_basename}." if target_basename is not None else None
     retained_temps = 0
     scanned_entries = 0
-    with os.scandir(directory_fd) as entries:
-        for entry in entries:
-            if prefix is not None and not entry.name.startswith(prefix):
-                continue
-            scanned_entries += 1
-            if prefix is None and scanned_entries > MAX_JOB_REGISTRY_ENTRIES:
-                raise RuntimeError("retained atomic temp scan bound exceeded")
-            if re.fullmatch(
-                r"\..+\.[1-9][0-9]{0,11}\.[1-9][0-9]{0,19}\.tmp",
-                entry.name,
-            ):
-                retained_temps += 1
-                if retained_temps >= MAX_RETAINED_JSON_TEMPS:
-                    raise RuntimeError("retained atomic temp bound exceeded")
+    # A caller may have advanced the pinned directory FD cursor while
+    # selecting the receipt. Reopen its current directory inode via "." to
+    # obtain an independent cursor; otherwise preflight can miss retained
+    # temps and allow a reset before the eventual receipt write fails.
+    scan_fd = os.open(
+        ".", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        dir_fd=directory_fd,
+    )
+    try:
+        with os.scandir(scan_fd) as entries:
+            for entry in entries:
+                if prefix is not None and not entry.name.startswith(prefix):
+                    continue
+                scanned_entries += 1
+                if prefix is None and scanned_entries > MAX_JOB_REGISTRY_ENTRIES:
+                    raise RuntimeError("retained atomic temp scan bound exceeded")
+                if re.fullmatch(
+                    r"\..+\.[1-9][0-9]{0,11}\.[1-9][0-9]{0,19}\.tmp",
+                    entry.name,
+                ):
+                    retained_temps += 1
+                    if retained_temps >= MAX_RETAINED_JSON_TEMPS:
+                        raise RuntimeError("retained atomic temp bound exceeded")
+    finally:
+        os.close(scan_fd)
 
 
 def _archive_restore_exchanged_target(
