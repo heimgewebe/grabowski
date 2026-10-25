@@ -77,7 +77,11 @@ import sysconfig
 
 # Search only deterministic system library directories, never an environment
 # influenced dynamic loader search path or a relative library name.
-_SECCOMP_TRUSTED_LIBRARY_ROOTS = ("/usr/lib", "/usr/lib64", "/lib", "/lib64")
+_SECCOMP_TRUSTED_LIBRARY_ROOTS = (
+    "/usr/lib", "/usr/lib64", "/lib", "/lib64",
+    # Read-only, root-owned Nix store dependency on this pinned benchmark host.
+    "/nix/store/31qzjx1vrkwcrl4zlhiarn2y9ynpyxr5-libseccomp-2.6.1-lib/lib",
+)
 
 def trusted_seccomp_library():
     multiarch = sysconfig.get_config_var("MULTIARCH")
@@ -104,8 +108,15 @@ def trusted_seccomp_library():
         for part in binary.split(os.sep)[1:-1]:
             current = os.path.join(current, part)
             info = os.lstat(current)
+            # NixOS gives the store root mode 1775 to nixbld. Accept that
+            # *exact* parent only when the current kernel mount is read-only;
+            # all package path components must still be root-owned and private.
+            readonly_nix_store = (
+                current == "/nix/store"
+                and bool(os.statvfs(current).f_flag & getattr(os, "ST_RDONLY", 1))
+            )
             if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or (
-                stat.S_IMODE(info.st_mode) & 0o022
+                stat.S_IMODE(info.st_mode) & 0o022 and not readonly_nix_store
             ):
                 raise RuntimeError("untrusted kernel socket filter directory")
         info = os.lstat(binary)
@@ -310,8 +321,10 @@ if not command or not os.path.isabs(command[0]):
 if pid_isolated:
     # The only relaxed prlimit profile is allowed for a fixed, root-owned
     # bwrap stage that unshares PID before executing any provider bytes.
+    if command[0] not in ("/usr/bin/bwrap", "/nix/store/kxcgm56aqlvgffr88i2d76zhiklxj3r7-bubblewrap-0.11.2/bin/bwrap"):
+        raise RuntimeError("provider PID namespace executable is not pinned")
     required = [
-        "/usr/bin/bwrap", "--ro-bind", "/", "/", "--unshare-pid",
+        command[0], "--ro-bind", "/", "/", "--unshare-pid",
         "--unshare-ipc", "--die-with-parent", "--proc", "/proc",
     ]
     if block_network or command[:len(required)] != required:
@@ -991,6 +1004,44 @@ def _validate_support_executable(
     return str(path)
 
 
+def _root_system_program(fhs: str, nixos_name: str) -> str:
+    """Fixed FHS binary or root-owned, read-only NixOS system program.
+
+    Resolve only the system generation's root-controlled symlink, not PATH,
+    HOME or an input-selected executable. Fail closed on a non-store target.
+    """
+    current = Path(fhs)
+    if current.exists():
+        return _validate_support_executable(current, owner_uid=0)
+    link = Path("/run/current-system/sw/bin") / nixos_name
+    try:
+        resolved = link.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise RunnerError("required NixOS system program is unavailable") from exc
+    if Path("/nix/store") not in resolved.parents:
+        raise RunnerError("NixOS program escaped immutable store")
+    return _validate_support_executable(
+        resolved, owner_uid=0, require_read_only_mount=True
+    )
+
+
+def _no_provider_true() -> str:
+    """Keep Pop!_OS smoke argv unchanged; use immutable NixOS true if absent."""
+    if Path("/bin/true").is_file():
+        return "/bin/true"
+    return _root_system_program("/usr/bin/true", "true")
+
+
+def _bwrap_path() -> str:
+    """Existing FHS executable or the exact pinned immutable NixOS binary.
+
+    validate_toolchain() retains root-ownership and read-only-mount checks
+    before any provider start. PATH or user-selected overrides are forbidden.
+    """
+    fhs = Path("/usr/bin/bwrap")
+    return str(fhs) if fhs.exists() else "/nix/store/kxcgm56aqlvgffr88i2d76zhiklxj3r7-bubblewrap-0.11.2/bin/bwrap"
+
+
 def _validated_mcp_proxy_python(
     authorized_files: Sequence[Mapping[str, Any]] | None = None,
 ) -> str:
@@ -1076,7 +1127,7 @@ def _unix_socket_restricted_codex_argv(
         block_network
         or list(command[:9])
         != [
-            "/usr/bin/bwrap",
+            _bwrap_path(),
             "--ro-bind",
             "/",
             "/",
@@ -1216,7 +1267,7 @@ def _provider_pid_namespaced_codex_argv(
     ):
         raise RunnerError("provider PID sandbox cannot shadow bound paths")
     bwrap = [
-        "/usr/bin/bwrap",
+        _bwrap_path(),
         "--ro-bind",
         "/",
         "/",
@@ -1337,7 +1388,7 @@ def _assert_provider_pid_namespace_ready(
         "--cd",
         str(cwd),
         "--",
-        "/bin/true",
+        _no_provider_true(),
     ]
     nested = _provider_pid_namespaced_codex_argv(
         nested_command,
@@ -1381,11 +1432,12 @@ from pathlib import Path
 import struct
 import sys
 
-if len(sys.argv) != 5:
+if len(sys.argv) != 6:
     raise RuntimeError("invalid frozen checkout readback arguments")
 base_path, checkout_path, source_path = map(Path, sys.argv[1:4])
 expected_base_sha256 = sys.argv[4]
-if not all(path.is_absolute() for path in (base_path, checkout_path, source_path)):
+git_executable = Path(sys.argv[5])
+if not all(path.is_absolute() for path in (base_path, checkout_path, source_path, git_executable)):
     raise RuntimeError("post-provider attestation must use absolute paths")
 # The trusted parent passes an immutable source-byte snapshot in its pipe.
 # The child MUST NOT reload Python code from a mutable filesystem pathname.
@@ -1553,7 +1605,7 @@ for relative in controls:
 
 # Inspect committed tree with Git in the immutable source, NEVER in checkout.
 listing = subprocess.run(
-    ["/usr/bin/git", "-C", str(source), "ls-tree", "-r",
+    [str(git_executable), "-C", str(source), "ls-tree", "-r",
      "--full-tree", "-z", expected],
     env=base._git_environment(),
     stdin=subprocess.DEVNULL,
@@ -1664,9 +1716,9 @@ if setup == "dirty":
 # and the original clean-source attestation, but it cannot delegate via the
 # mutable provider checkout.
 if (
-    base._run_checked(["git", "rev-parse", "HEAD"], cwd=source) != expected
+    base._run_checked([str(git_executable), "rev-parse", "HEAD"], cwd=source) != expected
     or base._run_checked(
-        ["git", "status", "--porcelain=v1", "--untracked-files=all"], cwd=source
+        [str(git_executable), "status", "--porcelain=v1", "--untracked-files=all"], cwd=source
     )
 ):
     raise RuntimeError("historical benchmark source checkout changed")
@@ -1723,7 +1775,7 @@ def _secure_post_provider_checkout_readback(
         raise RunnerError("post-provider base source differs from captured code")
     frozen_input = struct.pack("!I", len(encoded_request)) + encoded_request + base_raw
     command = [
-        "/usr/bin/bwrap",
+        _bwrap_path(),
         "--ro-bind",
         "/",
         "/",
@@ -1749,6 +1801,7 @@ def _secure_post_provider_checkout_readback(
         str(checkout),
         str(source),
         base_identity["sha256"],
+        _root_system_program("/usr/bin/git", "git"),
     ]
     try:
         completed = run_bounded(
@@ -1823,13 +1876,18 @@ def _secure_post_provider_checkout_readback(
 def validate_toolchain(codex: str) -> str:
     bundled_rg = Path(codex).parent.parent / "codex-path" / "rg"
     _validate_support_executable(bundled_rg, require_read_only_mount=True)
-    for path in (Path("/usr/bin/cat"), Path("/usr/bin/sed"), Path("/bin/bash")):
-        _validate_support_executable(path, owner_uid=0)
+    for fhs, name in (
+        ("/usr/bin/cat", "cat"),
+        ("/usr/bin/sed", "sed"),
+        ("/bin/bash", "bash"),
+    ):
+        _root_system_program(fhs, name)
     _validated_mcp_proxy_python()
     _validate_support_executable(
-        Path("/usr/bin/bwrap"), owner_uid=0, require_read_only_mount=True
+        Path(_bwrap_path()), owner_uid=0, require_read_only_mount=True
     )
-    return f"{bundled_rg.parent}:/usr/bin:/bin"
+    system_paths = "/usr/bin:/bin" if Path("/usr/bin/cat").exists() else "/run/current-system/sw/bin"
+    return f"{bundled_rg.parent}:{system_paths}"
 
 
 def _kernel_procfs_mount_id(fd: int) -> int:
@@ -2311,7 +2369,7 @@ def _assert_root_owned_device_policy() -> None:
         "Delegate": "no",
     }
     argv = [
-        "/usr/bin/systemctl",
+        _root_system_program("/usr/bin/systemctl", "systemctl"),
         "--system",
         "show",
         unit,
@@ -3586,7 +3644,7 @@ def validate_codex_linux_sandbox_before_intent(
             "--cd",
             str(source),
             "--",
-            "/bin/true",
+            _no_provider_true(),
         ]
         try:
             completed = subprocess.run(
@@ -8792,7 +8850,7 @@ def _start_trusted_parent_mcp_broker(
         if profile == MCP_PROFILE_FROZEN_G1:
             proxy_args.append(profile)
         bwrap = [
-            "/usr/bin/bwrap",
+            _bwrap_path(),
             "--ro-bind",
             "/",
             "/",

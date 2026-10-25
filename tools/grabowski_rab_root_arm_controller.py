@@ -48,8 +48,18 @@ _INPUT_PROJECTION = _INPUT_ROOT / ("plan-" + _FROZEN_PLAN_SHA256)
 # Hash from a fixed fd in chunks; never load that executable into RAM.
 _MAX_INSTALLED_BYTES = 512 * 1024 * 1024
 _HASH_CHUNK_BYTES = 1024 * 1024
-_SYSTEMD_RUN = "/usr/bin/systemd-run"
-_SYSTEMCTL = "/usr/bin/systemctl"
+# Pop!_OS uses /usr/bin; the installed NixOS system exposes the same
+# root-managed systemd executables through its immutable system profile.
+_SYSTEMD_RUN = (
+    "/usr/bin/systemd-run"
+    if Path("/usr/bin/systemd-run").is_file()
+    else "/run/current-system/sw/bin/systemd-run"
+)
+_SYSTEMCTL = (
+    "/usr/bin/systemctl"
+    if Path("/usr/bin/systemctl").is_file()
+    else "/run/current-system/sw/bin/systemctl"
+)
 _VERSION = 2
 
 

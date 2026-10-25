@@ -52,7 +52,7 @@ class RootCredentialMountTests(unittest.TestCase):
                 "assert Path('/etc/os-release').is_file()\n"
             )
             base = [
-                "/usr/bin/bwrap", "--ro-bind", "/", "/",
+                runner._bwrap_path(), "--ro-bind", "/", "/",
                 "--unshare-pid", "--unshare-ipc", "--die-with-parent",
                 "--proc", "/proc", "--dev", "/dev",
                 "--ro-bind", str(source), "/run/credentials",
@@ -69,6 +69,56 @@ class RootCredentialMountTests(unittest.TestCase):
             )
             self.assertEqual(masked.returncode, 0, masked.stderr[-1024:])
             self.assertEqual(masked.stdout, b"DENIED\n")
+
+
+    def test_real_seccomp_denies_unix_socket_to_model_tool(self) -> None:
+        # Exercise the runner's existing kernel filter, not a mock or the
+        # Codex permission TOML alone. No model or real credential is loaded.
+        child = (
+            "import socket\n"
+            "try:\n"
+            "    socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
+            "except PermissionError:\n"
+            "    print('AF_UNIX_DENIED')\n"
+            "else:\n"
+            "    raise SystemExit(8)\n"
+        )
+        argv = runner._unix_socket_restricted_codex_argv(
+            ["/usr/bin/python3", "-I", "-B", "-c", child],
+            block_network=True,
+        )
+        result = subprocess.run(
+            argv, capture_output=True, check=False, timeout=25,
+            start_new_session=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr[-1024:])
+        self.assertEqual(result.stdout, b"AF_UNIX_DENIED\n")
+
+
+    def test_real_seccomp_rejects_unix_and_network_sockets(self) -> None:
+        # This invokes the actual runner wrapper and Linux syscall filter.
+        # No provider, live credentials, privileged socket or outbound traffic.
+        program = (
+            "import socket, sys\n"
+            "for family in (socket.AF_UNIX, socket.AF_INET):\n"
+            "    try:\n"
+            "        sock = socket.socket(family, socket.SOCK_STREAM)\n"
+            "    except PermissionError:\n"
+            "        continue\n"
+            "    sock.close()\n"
+            "    sys.exit(9)\n"
+            "print('SECURITY_SYSCALLS_DENIED')\n"
+        )
+        command = runner._unix_socket_restricted_codex_argv(
+            [runner._validated_mcp_proxy_python(), "-I", "-c", program],
+            block_network=True,
+        )
+        completed = subprocess.run(
+            command, capture_output=True, check=False, timeout=25,
+            start_new_session=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr[-1024:])
+        self.assertEqual(completed.stdout, b"SECURITY_SYSCALLS_DENIED\n")
 
 
 if __name__ == "__main__":
