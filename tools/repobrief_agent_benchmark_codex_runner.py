@@ -1029,7 +1029,14 @@ def _no_provider_true() -> str:
     """Keep Pop!_OS smoke argv unchanged; use immutable NixOS true if absent."""
     if Path("/bin/true").is_file():
         return "/bin/true"
-    return _root_system_program("/usr/bin/true", "true")
+    # Nix coreutils is a multicall executable; argv[0] must remain "true".
+    # Validate the resolved root-owned, read-only binary first, then invoke
+    # its fixed root-owned system-profile symlink rather than "coreutils".
+    _root_system_program("/usr/bin/true", "true")
+    link = Path("/run/current-system/sw/bin/true")
+    if not link.is_symlink() or link.lstat().st_uid != 0:
+        raise RunnerError("NixOS true invocation link is untrusted")
+    return str(link)
 
 
 def _bwrap_path() -> str:
@@ -1886,8 +1893,12 @@ def validate_toolchain(codex: str) -> str:
     _validate_support_executable(
         Path(_bwrap_path()), owner_uid=0, require_read_only_mount=True
     )
-    system_paths = "/usr/bin:/bin" if Path("/usr/bin/cat").exists() else "/run/current-system/sw/bin"
-    return f"{bundled_rg.parent}:{system_paths}"
+    if Path("/usr/bin/cat").exists():
+        return f"{bundled_rg.parent}:/usr/bin:/bin"
+    # Codex must select this already validated immutable Nix bwrap, not its
+    # bundled static helper, which cannot initialize loopback under the
+    # existing AF_UNIX datagram denial. The security filter stays unchanged.
+    return f"{Path(_bwrap_path()).parent}:{bundled_rg.parent}:/run/current-system/sw/bin"
 
 
 def _kernel_procfs_mount_id(fd: int) -> int:

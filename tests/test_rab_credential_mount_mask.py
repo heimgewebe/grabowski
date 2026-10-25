@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 TOOLS = Path(__file__).resolve().parents[1] / "tools"
 sys.path.insert(0, str(TOOLS))
@@ -119,6 +120,36 @@ class RootCredentialMountTests(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, 0, completed.stderr[-1024:])
         self.assertEqual(completed.stdout, b"SECURITY_SYSCALLS_DENIED\n")
+
+
+    def test_nixos_trusted_bwrap_is_first_on_provider_path(self) -> None:
+        # The nested Codex sandbox must select the same reviewed immutable
+        # bwrap binary as the outer PID namespace, not its bundled helper.
+        with (
+            patch.object(runner, "_validate_support_executable", return_value="/verified"),
+            patch.object(runner, "_validated_mcp_proxy_python", return_value="/verified"),
+        ):
+            search_path = runner.validate_toolchain("/immutable/codex/bin/codex")
+        if Path("/usr/bin/cat").is_file():
+            self.assertEqual(search_path, "/immutable/codex/codex-path:/usr/bin:/bin")
+        else:
+            self.assertTrue(search_path.startswith(
+                str(Path(runner._bwrap_path()).parent)
+                + ":/immutable/codex/codex-path:"
+            ))
+
+    def test_nixos_no_provider_true_preserves_coreutils_argv0(self) -> None:
+        # The Nix profile's 'true' symlink invokes a multicall binary that
+        # does not behave like 'true' if given its resolved 'coreutils' name.
+        command = runner._no_provider_true()
+        if Path("/bin/true").is_file():
+            self.assertEqual(command, "/bin/true")
+            return
+        self.assertEqual(command, "/run/current-system/sw/bin/true")
+        completed = subprocess.run(
+            [command], capture_output=True, check=False, timeout=10,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr[-1024:])
 
 
 if __name__ == "__main__":
