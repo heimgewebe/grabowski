@@ -118,8 +118,10 @@ def _trusted_identity() -> Path:
         info = directory.lstat()
         if not stat.S_ISDIR(info.st_mode) or info.st_uid != uid or info.st_mode & 0o022:
             raise PermissionError("GitHub writer identity directory is not private")
+        if directory == ssh_dir and info.st_mode & 0o077:
+            raise PermissionError("GitHub writer SSH directory is not owner-private")
     info = key.lstat()
-    if not stat.S_ISREG(info.st_mode) or info.st_uid != uid or info.st_mode & 0o077 or info.st_size == 0:
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != uid or info.st_mode & 0o077 or info.st_size == 0 or info.st_nlink != 1:
         raise PermissionError("GitHub writer identity is not a private regular file")
     return key
 

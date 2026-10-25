@@ -82,6 +82,23 @@ class GitSshTransportTests(unittest.TestCase):
                 with self.assertRaises(PermissionError):
                     transport._trusted_identity()
 
+    def test_ssh_directory_must_be_owner_private(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = self._home_with_key(Path(tmp))
+            (home / ".ssh").chmod(0o755)
+            with patch.object(transport.pwd, "getpwuid", return_value=SimpleNamespace(pw_dir=str(home))):
+                with self.assertRaises(PermissionError):
+                    transport._trusted_identity()
+
+    def test_hardlinked_github_writer_key_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = self._home_with_key(Path(tmp))
+            key = home / ".ssh" / "heimgewebe-github-ed25519"
+            os.link(key, home / ".ssh" / "linked-key")
+            with patch.object(transport.pwd, "getpwuid", return_value=SimpleNamespace(pw_dir=str(home))):
+                with self.assertRaises(PermissionError):
+                    transport._trusted_identity()
+
     def test_key_symlink_is_denied(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             home = self._home_with_key(Path(tmp))
