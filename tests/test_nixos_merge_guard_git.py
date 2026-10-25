@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 import sys
@@ -64,6 +65,28 @@ class TrustedCaptainNixosGitTests(unittest.TestCase):
                 guard._merge_guard_local_git_bytes(Path("/tmp/repo"), ["rev-parse", "HEAD"])
         select.assert_called_once_with()
         run.assert_not_called()
+
+    def test_real_nixos_git_binds_github_origin_and_rejects_other_hosts(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "git-fixture"
+            trusted_git = git_ssh.trusted_git_cli_path()
+            subprocess.run([trusted_git, "init", "-q", str(root)], check=True, capture_output=True)
+            subprocess.run(
+                [trusted_git, "-C", str(root), "remote", "add",
+                 "origin", "git@github.com:heimgewebe/grabowski.git"],
+                check=True, capture_output=True,
+            )
+            observed, identity = guard.merge_guard_repository_identity(root)
+            self.assertEqual(root.resolve(), observed)
+            self.assertEqual("heimgewebe/grabowski", identity)
+            subprocess.run(
+                [trusted_git, "-C", str(root), "remote", "set-url",
+                 "origin", "git@other.example:heimgewebe/grabowski.git"],
+                check=True, capture_output=True,
+            )
+            with self.assertRaisesRegex(RuntimeError, "origin remote"):
+                guard.merge_guard_repository_identity(root)
+
 
 
 if __name__ == "__main__":
