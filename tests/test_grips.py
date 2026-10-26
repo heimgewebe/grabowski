@@ -65,12 +65,14 @@ def _self_review_audit(
     return {
         "schema_version": 1,
         "kind": "grabowski_self_review_audit",
+        "review_policy_version": merge_guard.REVIEW_POLICY_VERSION,
         "repo": "heimgewebe/grabowski",
         "pr": 7,
         "generated_at": "2026-07-10T12:00:00+00:00",
         "head_sha": head,
         "diff_sha256": diff_sha256,
         "review_tier": tier,
+        "independent_review_required": False,
         "gate_verdict": "PASS",
         "self_review_gate_valid": True,
         "minimum_review_iterations": minimum,
@@ -6748,12 +6750,14 @@ class GripFoundationTests(unittest.TestCase):
         audit = {
             "schema_version": 1,
             "kind": "grabowski_self_review_audit",
+        "review_policy_version": merge_guard.REVIEW_POLICY_VERSION,
             "repo": "heimgewebe/grabowski",
             "pr": 7,
             "generated_at": "2026-07-10T12:00:00+00:00",
             "head_sha": head,
             "diff_sha256": "0" * 64,
             "review_tier": "extreme",
+            "independent_review_required": False,
             "gate_verdict": "PASS",
             "self_review_gate_valid": True,
             "minimum_review_iterations": 2,
@@ -6785,12 +6789,14 @@ class GripFoundationTests(unittest.TestCase):
         audit = {
             "schema_version": 1,
             "kind": "grabowski_self_review_audit",
+        "review_policy_version": merge_guard.REVIEW_POLICY_VERSION,
             "repo": "heimgewebe/grabowski",
             "pr": 7,
             "generated_at": "2026-07-10T12:00:00+00:00",
             "head_sha": head,
             "diff_sha256": "0" * 64,
             "review_tier": "standard",
+            "independent_review_required": False,
             "gate_verdict": "PASS",
             "self_review_gate_valid": True,
             "minimum_review_iterations": 2,
@@ -12300,6 +12306,7 @@ def captain_parameters(actions: list[dict[str, object]] | None = None, **overrid
         "review_evidence": {
             "schema_version": 1,
             "kind": "grabowski_self_review_audit",
+        "review_policy_version": merge_guard.REVIEW_POLICY_VERSION,
             "repo": "heimgewebe/grabowski",
             "pr": 96,
             "generated_at": "2026-07-10T12:00:00+00:00",
@@ -12307,7 +12314,7 @@ def captain_parameters(actions: list[dict[str, object]] | None = None, **overrid
             "base_sha": CAPTAIN_BASE_SHA,
             "diff_sha256": CAPTAIN_DIFF,
             "review_tier": "high_critical",
-            "independent_review_required": True,
+            "independent_review_required": False,
             "minimum_review_iterations": 4,
             "actual_review_iterations": 4,
             "all_findings_triaged": True,
@@ -12397,6 +12404,9 @@ def authorized_captain_run_parameters(**overrides) -> dict[str, object]:
     review_evidence = parameters.get("review_evidence")
     if isinstance(review_evidence, dict):
         review_evidence.setdefault("external_review_required", True)
+        # Explicit additional review for legacy high-assurance merge/security tests;
+        # ordinary captain_parameters() remains self-review-first by default.
+        review_evidence["independent_review_required"] = True
     parameters.pop("human_authorization")
     parameters.pop("execution_authority")
     parameters["execution_intent"] = captain_execution_intent(parameters)
@@ -13133,15 +13143,16 @@ class CaptainAuthorityPathTests(unittest.TestCase):
 
         self.assertIn("review_evidence_missing", result["output"]["blocked_reasons"])
 
-    def test_high_critical_merge_uses_independent_policy_without_codex_or_external_transport(self) -> None:
+    def test_high_critical_selfreview_policy_without_codex_or_external_transport(self) -> None:
         parameters = captain_parameters(codex_review_required=False)
         parameters.pop("codex_review_evidence")
         result = self.run_captain(parameters)
 
         independent = self.gate(result, "independent-review-policy")
         self.assertEqual("pass", independent["status"])
-        self.assertTrue(independent["details"]["required"])
-        self.assertTrue(independent["details"]["high_critical_floor"])
+        self.assertFalse(independent["details"]["required"])
+        self.assertTrue(independent["details"]["high_critical_risk"])
+        self.assertFalse(independent["details"]["high_critical_floor"])
         self.assertEqual(
             "captain-preflight-and-atomic-merge-guard",
             independent["details"]["settlement_stage"],
@@ -13153,6 +13164,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
 
     def test_high_critical_preflight_ignores_generic_decision_bound_pass(self) -> None:
         parameters = captain_parameters(codex_review_required=False)
+        parameters["review_evidence"]["independent_review_required"] = True
         parameters.pop("codex_review_evidence")
         with patch.object(
             merge_guard.decision_reviews,
@@ -13169,6 +13181,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
 
     def test_high_critical_preflight_rejects_unproven_independent_named_pass(self) -> None:
         parameters = captain_parameters(codex_review_required=False)
+        parameters["review_evidence"]["independent_review_required"] = True
         parameters.pop("codex_review_evidence")
         with patch.object(
             merge_guard.decision_reviews,
@@ -13208,7 +13221,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertEqual(1, gate["details"]["deferred_diff_identity_count"])
         self.assertTrue(reconcile.call_args.kwargs["defer_diff_identity"])
 
-    def test_high_critical_preflight_blocks_without_independent_pass(self) -> None:
+    def test_high_critical_preflight_accepts_current_selfreview_without_independent_pass(self) -> None:
         parameters = captain_parameters(codex_review_required=False)
         parameters.pop("codex_review_evidence")
         with patch.object(
@@ -13221,9 +13234,9 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             result = self.run_captain(parameters)
 
         gate = self.gate(result, "independent-review-policy")
-        self.assertEqual("blocked", gate["status"])
-        self.assertIn("independent_review_pass_missing", result["output"]["blocked_reasons"])
-        self.assertIn("independent_review_pass_missing", gate["details"])
+        self.assertEqual("pass", gate["status"])
+        self.assertFalse(gate["details"]["required"])
+        self.assertNotIn("independent_review_pass_missing", result["output"]["blocked_reasons"])
 
     def test_high_critical_preflight_blocks_infrastructure_only_review(self) -> None:
         parameters = captain_parameters(codex_review_required=False)
@@ -13246,9 +13259,53 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             "decision_review_slot_without_pass:independent-reviewer",
             result["output"]["blocked_reasons"],
         )
-        self.assertIn("independent_review_pass_missing", result["output"]["blocked_reasons"])
+        self.assertNotIn("independent_review_pass_missing", result["output"]["blocked_reasons"])
 
-    def test_high_critical_audit_cannot_omit_independent_review_floor(self) -> None:
+    def test_high_critical_preflight_ignores_only_verified_pre_result_outage(self) -> None:
+        parameters = captain_parameters(codex_review_required=False)
+        parameters.pop("codex_review_evidence")
+        unit = "grabowski-job-aaaaaaaaaaaa"
+        attempt = {
+            "unit": unit, "slot": "independent-reviewer",
+            "origin_sha256": "1" * 64,
+            "terminal": True, "classification": "infrastructure_error",
+            "verdict": None, "material_findings": None,
+            "result_sha256": None, "diff_identity_deferred": False,
+        }
+        reconciliation = {
+            "status": "blocked", "attempt_count": 1, "slot_count": 1,
+            "slots": [{
+                "slot": "independent-reviewer", "attempt_count": 1,
+                "pass_count": 0, "independent_pass_count": 0,
+                "material_reject_count": 0, "infrastructure_error_count": 1,
+                "unresolved_count": 0,
+                "units_sha256": merge_guard._sha256_json([unit]),
+            }],
+            "attempts": [attempt],
+            "errors": [
+                "decision_review_slot_without_pass:independent-reviewer",
+                f"decision_review_infrastructure_not_superseded:independent-reviewer:{unit}",
+            ],
+        }
+        with patch.object(
+            merge_guard.decision_reviews, "reconcile", return_value=reconciliation,
+        ):
+            result = self.run_captain(parameters)
+        gate = self.gate(result, "independent-review-policy")
+        self.assertEqual(gate["status"], "pass")
+        self.assertFalse(gate["details"]["required"])
+        self.assertEqual(len(gate["details"]["optional_review_unavailability"]), 2)
+        # A real material finding is never advisory, even beside quota errors.
+        reconciliation["errors"].append(
+            "decision_review_material_reject:independent-reviewer:grabowski-job-bbbbbbbbbbbb"
+        )
+        with patch.object(
+            merge_guard.decision_reviews, "reconcile", return_value=reconciliation,
+        ):
+            blocked = self.run_captain(parameters)
+        self.assertEqual(self.gate(blocked, "independent-review-policy")["status"], "blocked")
+
+    def test_current_v4_audit_cannot_omit_independent_review_contract(self) -> None:
         parameters = captain_parameters()
         del parameters["review_evidence"]["independent_review_required"]
         result = self.run_captain(parameters)
@@ -13256,11 +13313,11 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         gate = self.gate(result, "independent-review-policy")
         self.assertEqual("blocked", gate["status"])
         self.assertIn(
-            "independent_review_high_critical_floor_not_acknowledged",
+            "independent_review_policy_invalid",
             result["output"]["blocked_reasons"],
         )
 
-    def test_caller_false_cannot_downgrade_high_critical_independent_review(self) -> None:
+    def test_high_critical_caller_false_does_not_lower_risk_or_require_provider(self) -> None:
         parameters = captain_parameters(
             independent_review_required=False,
             codex_review_required=False,
@@ -13269,9 +13326,10 @@ class CaptainAuthorityPathTests(unittest.TestCase):
 
         gate = self.gate(result, "independent-review-policy")
         self.assertEqual("pass", gate["status"])
-        self.assertTrue(gate["details"]["required"])
+        self.assertFalse(gate["details"]["required"])
         self.assertFalse(gate["details"]["explicitly_required"])
-        self.assertTrue(gate["details"]["high_critical_floor"])
+        self.assertTrue(gate["details"]["high_critical_risk"])
+        self.assertFalse(gate["details"]["high_critical_floor"])
 
     def test_invalid_independent_review_requirement_blocks(self) -> None:
         parameters = captain_parameters(independent_review_required="yes")
@@ -13336,7 +13394,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertEqual("pass", independent["status"])
         self.assertFalse(independent["details"]["required"])
 
-    def test_legacy_standard_audit_without_independent_field_remains_compatible(self) -> None:
+    def test_missing_current_audit_review_requirement_contract_blocks(self) -> None:
         parameters = captain_parameters()
         parameters["review_evidence"]["review_tier"] = "standard"
         del parameters["review_evidence"]["independent_review_required"]
@@ -13345,8 +13403,8 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         result = self.run_captain(parameters)
 
         gate = self.gate(result, "independent-review-policy")
-        self.assertEqual("pass", gate["status"])
-        self.assertFalse(gate["details"]["required"])
+        self.assertEqual("blocked", gate["status"])
+        self.assertIn("independent_review_policy_invalid", result["output"]["blocked_reasons"])
 
     def test_standard_preflight_still_blocks_existing_material_reject(self) -> None:
         parameters = captain_parameters()

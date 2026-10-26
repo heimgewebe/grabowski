@@ -184,6 +184,130 @@ def _large_git_repo(
     return temporary, repo, base_sha, head_sha, paths
 
 
+class RiskScaledIndependentReviewContractTests(unittest.TestCase):
+    @staticmethod
+    def _request(**overrides: object) -> dict[str, object]:
+        review: dict[str, object] = {
+            "review_policy_version": merge_guard.REVIEW_POLICY_VERSION,
+            "review_tier": "high_critical",
+            "independent_review_required": False,
+            "minimum_review_iterations": 4,
+            "actual_review_iterations": 4,
+        }
+        result: dict[str, object] = {"review_evidence": review}
+        result.update(overrides)
+        return result
+
+    def test_r3_valid_self_review_does_not_automatically_need_an_external_provider(self) -> None:
+        requirement = merge_guard.independent_review_requirement(self._request())
+        self.assertFalse(requirement["required"])
+        self.assertTrue(requirement["high_critical_risk"])
+        self.assertEqual(requirement["errors"], [])
+
+    def test_independent_review_remains_explicit_per_pr_opt_in(self) -> None:
+        requirement = merge_guard.independent_review_requirement(
+            self._request(independent_review_required=True)
+        )
+        self.assertTrue(requirement["required"])
+        self.assertTrue(requirement["explicitly_required"])
+        self.assertFalse(requirement["high_critical_floor"])
+
+    def test_v3_cannot_satisfy_v4_captain_even_with_valid_depth(self) -> None:
+        old = self._request()
+        old["review_evidence"]["review_policy_version"] = 3
+        self.assertIn(
+            "review_policy_version_stale_or_invalid",
+            merge_guard.independent_review_requirement(old)["errors"],
+        )
+
+    def test_critical_self_review_below_four_passes_remains_invalid(self) -> None:
+        weak = self._request()
+        weak["review_evidence"]["minimum_review_iterations"] = 3
+        weak["review_evidence"]["actual_review_iterations"] = 3
+        self.assertIn(
+            "high_critical_self_review_depth_invalid",
+            merge_guard.independent_review_requirement(weak)["errors"],
+        )
+
+    @staticmethod
+    def _infra_only_reconciliation() -> dict[str, object]:
+        import grabowski_decision_reviews as decisions
+        unit = "grabowski-job-aaaaaaaaaaaa"
+        attempt = {
+            "unit": unit, "slot": "independent-reviewer",
+            "origin_sha256": "1" * 64,
+            "terminal": True, "classification": "infrastructure_error",
+            "verdict": None, "material_findings": None,
+            "result_sha256": None, "diff_identity_deferred": False,
+        }
+        return {
+            "status": "blocked", "attempt_count": 1,
+            "slot_count": 1,
+            "slots": [{
+                "slot": "independent-reviewer", "attempt_count": 1,
+                "pass_count": 0, "independent_pass_count": 0,
+                "material_reject_count": 0, "infrastructure_error_count": 1,
+                "unresolved_count": 0,
+                "units_sha256": decisions.sha256_json([unit]),
+            }],
+            "attempts": [attempt], "attempts_sha256": decisions.sha256_json([attempt]),
+            "errors": [
+                "decision_review_slot_without_pass:independent-reviewer",
+                f"decision_review_infrastructure_not_superseded:independent-reviewer:{unit}",
+            ],
+        }
+
+    def test_optional_authenticated_pre_result_outage_does_not_block_captain(self) -> None:
+        info = merge_guard.decision_review_blocking_errors(
+            self._infra_only_reconciliation(), independent_required=False
+        )
+        self.assertEqual(info["errors"], [])
+        self.assertEqual(len(info["ignored_unavailable"]), 2)
+        self.assertEqual(info["status"], "optional_unavailable")
+
+    def test_explicit_independent_review_keeps_transport_failure_blocking(self) -> None:
+        info = merge_guard.decision_review_blocking_errors(
+            self._infra_only_reconciliation(), independent_required=True
+        )
+        self.assertEqual(len(info["errors"]), 2)
+        self.assertEqual(info["ignored_unavailable"], [])
+
+    def test_optional_outage_never_suppresses_material_reject(self) -> None:
+        proof = self._infra_only_reconciliation()
+        proof["errors"].append(
+            "decision_review_material_reject:independent-reviewer:grabowski-job-bbbbbbbbbbbb"
+        )
+        info = merge_guard.decision_review_blocking_errors(
+            proof, independent_required=False
+        )
+        self.assertTrue(any("material_reject" in x for x in info["errors"]))
+
+    def test_optional_outage_never_suppresses_ambiguous_result(self) -> None:
+        proof = self._infra_only_reconciliation()
+        proof["attempts"][0]["classification"] = "invalid_result"
+        info = merge_guard.decision_review_blocking_errors(
+            proof, independent_required=False
+        )
+        self.assertIn("decision_review_slot_without_pass:independent-reviewer", info["errors"])
+        self.assertEqual(info["ignored_unavailable"], [])
+
+    def test_optional_outage_requires_actual_attempt_evidence(self) -> None:
+        proof = self._infra_only_reconciliation()
+        proof["attempts"] = []
+        info = merge_guard.decision_review_blocking_errors(
+            proof, independent_required=False
+        )
+        self.assertNotEqual(info["errors"], [])
+
+    def test_provider_flag_cannot_hide_malformed_self_review(self) -> None:
+        missing = self._request()
+        del missing["review_evidence"]["independent_review_required"]
+        self.assertIn(
+            "independent_review_policy_invalid",
+            merge_guard.independent_review_requirement(missing)["errors"],
+        )
+
+
 class CaptainLargePrMergeGuardTests(unittest.TestCase):
     def test_github_diff_too_large_is_narrowly_detected(self) -> None:
         info = {

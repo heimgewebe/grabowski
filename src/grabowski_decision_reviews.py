@@ -25,9 +25,10 @@ BINDING_SCHEMA_VERSION = 1
 RESULT_KIND = "grabowski_decision_bound_review_result"
 RESULT_SCHEMA_VERSION = 1
 RESULT_PREFIX = "GRABOWSKI_DECISION_REVIEW_V1="
-# Full registry scan retains late material REJECTs; this is not an archive solution.
-MAX_JOB_DIRECTORIES = 16_384  # Hard cap on all scanned directory entries
-MAX_BOUND_REVIEW_JOBS = 10_000  # Independent attempts, not unrelated job entries
+# Full scan (including late material REJECTs) is already bounded by all job
+# directories and aggregate metadata bytes; an extra global review-attempt
+# cap cannot safely terminate an unrelated PR before the full scan completes.
+MAX_JOB_DIRECTORIES = 16_384  # Hard cap on *all* scanned directory entries
 MAX_METADATA_BYTES = 256 * 1024
 MAX_TOTAL_METADATA_BYTES = 128 * 1024 * 1024
 MAX_FINALIZATION_BYTES = 256 * 1024
@@ -2114,7 +2115,6 @@ def reconcile(
         root, errors, metadata_budget, expected=expected,
         unbound_stdout_budget=unbound_stdout_budget,
     )
-    review_attempt_count = 0
     with closing(iterator):
         for directory, directory_fd in iterator:
             raw_targets_pr_head = False
@@ -2148,12 +2148,10 @@ def reconcile(
                     _raw_binding_targets_pr_head(raw_review_binding, expected)
                     or _raw_binding_targets_pr_head(raw_origin_binding, expected)
                 )
-                if raw_review_binding is not None or raw_origin_binding is not None:
-                    review_attempt_count += 1
-                    if review_attempt_count > MAX_BOUND_REVIEW_JOBS:
-                        errors.append("decision_review_attempt_inventory_truncated")
-                        attempts = []
-                        break
+                # Do not cap the number of unrelated historic review attempts:
+                # _iter_pinned_review_job_directories and the aggregate
+                # metadata budget already guarantee a finite authenticated
+                # full scan, including a later same-revision REJECT.
                 metadata, binding, provenance = _validated_origin_binding(
                     directory, raw_metadata=raw_metadata, parent_fd=directory_fd
                 )

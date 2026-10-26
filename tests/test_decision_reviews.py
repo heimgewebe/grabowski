@@ -555,7 +555,7 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
         self.assertEqual(checked["errors"], [])
         self.assertEqual(checked["attempt_count"], 1)
 
-    def test_review_attempt_hard_cap_never_yields_partial_pass(self) -> None:
+    def test_unrelated_historical_review_count_cannot_hide_material_reject(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             jobs = Path(temp) / "jobs"
             jobs.mkdir(mode=0o700)
@@ -569,11 +569,17 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
                 terminal_status="succeeded",
                 review_result=result("A", "REJECT_THIS_REVISION", 1),
             )
-            with mock.patch.object(reviews, "MAX_BOUND_REVIEW_JOBS", 1):
+            # A historic attempt count is not an admission budget. The bounded
+            # full directory and metadata scan must still find the late REJECT.
+            with mock.patch.object(reviews, "MAX_BOUND_REVIEW_JOBS", 1, create=True):
                 checked = self.reconcile(jobs)
         self.assertEqual(checked["status"], "blocked")
-        self.assertIn("decision_review_attempt_inventory_truncated", checked["errors"])
-        self.assertEqual(checked["attempt_count"], 0)
+        self.assertEqual(checked["attempt_count"], 2)
+        self.assertEqual(checked["slots"][0]["material_reject_count"], 1)
+        self.assertFalse(
+            any("inventory_truncated" in error for error in checked["errors"]),
+            checked["errors"],
+        )
 
     def test_noncanonical_renamed_reject_blocks_inventory(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

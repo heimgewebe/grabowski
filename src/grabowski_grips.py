@@ -2694,6 +2694,11 @@ def _self_review_audit_errors(
         errors.append("schema_version must be integer 1")
     if evidence.get("kind") != "grabowski_self_review_audit":
         errors.append("kind must be grabowski_self_review_audit")
+    version = evidence.get("review_policy_version")
+    if type(version) is not int or version != grabowski_merge_guard.REVIEW_POLICY_VERSION:
+        errors.append("review_policy_version is stale or invalid")
+    if type(evidence.get("independent_review_required")) is not bool:
+        errors.append("independent_review_required must be a boolean")
     if evidence.get("review_tier") not in {
         "documentation",
         "very_small",
@@ -2754,15 +2759,17 @@ def _self_review_audit_errors(
         errors.append("actual_review_iterations must be a positive integer")
     elif isinstance(minimum, int) and not isinstance(minimum, bool) and actual < minimum:
         errors.append("actual_review_iterations is below required minimum")
+    if evidence.get("review_tier") == "high_critical" and (
+        type(minimum) is not int or minimum < 4
+    ):
+        errors.append("high-critical self-review depth must be at least 4")
     remaining = evidence.get("material_findings_remaining")
     if isinstance(remaining, bool) or not isinstance(remaining, int) or remaining < 0:
         errors.append("material_findings_remaining must be an integer >= 0")
     elif remaining > 0:
-        if evidence.get("residual_risk_accepted") is not True:
-            errors.append("material findings remain without accepted residual risk")
-        reason = evidence.get("residual_risk_reason")
-        if not isinstance(reason, str) or not reason.strip():
-            errors.append("accepted residual risk requires a reason")
+        errors.append(
+            "material findings remain; each must be resolved or disproven"
+        )
     if evidence.get("tuning_signal") != "observe":
         errors.append("tuning_signal must be observe for merge evidence")
     return errors
@@ -14058,11 +14065,10 @@ def _captain_independent_review_gate(
         )
         pass_count = int(independent_summary["pass_count"])
         errors.extend(independent_summary["errors"])
-        raw_errors = reconciliation.get("errors", [])
-        if isinstance(raw_errors, list):
-            errors.extend(str(item) for item in raw_errors if isinstance(item, str))
-        else:
-            errors.append("independent_review_reconciliation_errors_invalid")
+        optional_review = grabowski_merge_guard.decision_review_blocking_errors(
+            reconciliation, independent_required=requirement["required"],
+        )
+        errors.extend(optional_review["errors"])
         if reconciliation_status not in {"settled", "not_applicable", "blocked"}:
             errors.append("independent_review_reconciliation_status_invalid")
     if requirement["required"] and (
@@ -14092,6 +14098,10 @@ def _captain_independent_review_gate(
             else "exact-request-digest"
         ),
         "settlement_stage": "captain-preflight-and-atomic-merge-guard",
+        "optional_review_unavailability": (
+            optional_review["ignored_unavailable"]
+            if isinstance(reconciliation, dict) else []
+        ),
         "errors": errors,
     }
     if errors:
@@ -14108,7 +14118,7 @@ def _captain_independent_review_gate(
             "provider-neutral independent review role evidence is settled for the exact PR/head/base; "
             "diff-identity aliases are authoritative only after live atomic-guard revalidation"
             if requirement["required"]
-            else "no independent-review floor applies and no decision-bound review debt is present"
+            else "no independent-review floor applies and no blocking decision-bound review debt remains"
         ),
         details,
     )

@@ -542,8 +542,16 @@ def captain_request_sha256(parameters: dict[str, Any]) -> str:
     return _sha256_json(visible)
 
 
+REVIEW_POLICY_VERSION = 4  # Bound to tools/review_evidence_schemas.py; checked by regression tests.
+
+
 def independent_review_requirement(parameters: dict[str, Any]) -> dict[str, Any]:
-    """Resolve the provider-neutral independent-review floor for one Captain request."""
+    """Separate risk-scaled self-review quality from explicit reviewer opt-in.
+
+    Missing, malformed or obsolete audit policy evidence blocks every merge.
+    A historical high-critical requirement is not silently waived: it must be
+    replaced by a fresh current-policy audit bound to this exact PR revision.
+    """
     review_evidence = parameters.get("review_evidence")
     review_tier = (
         review_evidence.get("review_tier")
@@ -557,23 +565,168 @@ def independent_review_requirement(parameters: dict[str, Any]) -> dict[str, Any]
     )
     explicit_value = parameters.get("independent_review_required")
     errors: list[str] = []
-    if policy_value is not None and not isinstance(policy_value, bool):
-        errors.append("independent_review_policy_invalid")
-    if explicit_value is not None and not isinstance(explicit_value, bool):
+    if not isinstance(review_evidence, dict):
+        errors.append("review_evidence_missing")
+    else:
+        version = review_evidence.get("review_policy_version")
+        if type(version) is not int or version != REVIEW_POLICY_VERSION:
+            errors.append("review_policy_version_stale_or_invalid")
+        if type(policy_value) is not bool:
+            errors.append("independent_review_policy_invalid")
+    if explicit_value is not None and type(explicit_value) is not bool:
         errors.append("independent_review_required_invalid")
-    high_critical_floor = review_tier == "high_critical"
+    high_critical_risk = review_tier == "high_critical"
+    if high_critical_risk:
+        minimum = (
+            review_evidence.get("minimum_review_iterations")
+            if isinstance(review_evidence, dict) else None
+        )
+        actual = (
+            review_evidence.get("actual_review_iterations")
+            if isinstance(review_evidence, dict) else None
+        )
+        if (
+            type(minimum) is not int or minimum < 4 or minimum > 5
+            or type(actual) is not int or actual < minimum
+        ):
+            errors.append("high_critical_self_review_depth_invalid")
     policy_required = policy_value is True
     explicitly_required = explicit_value is True
-    required = high_critical_floor or policy_required or explicitly_required
-    if high_critical_floor and policy_value is not True:
-        errors.append("independent_review_high_critical_floor_not_acknowledged")
     return {
         "review_tier": review_tier,
-        "high_critical_floor": high_critical_floor,
+        "high_critical_risk": high_critical_risk,
+        "high_critical_floor": False,
+        "review_policy_version": REVIEW_POLICY_VERSION,
         "policy_required": policy_required,
         "explicitly_required": explicitly_required,
-        "required": required,
+        "required": policy_required or explicitly_required,
         "errors": errors,
+    }
+
+
+def decision_review_blocking_errors(
+    reconciliation: Any, *, independent_required: bool,
+) -> dict[str, Any]:
+    """Preserve all review debt; distinguish *proven* pre-result outages.
+
+    Optional reviewer unavailability is not a semantic review verdict. Ignore
+    only three precisely classified infrastructure-only error families when
+    every same-slot attempt is a terminal, authentic, result-free infrastructure
+    attempt. A material REJECT, unresolved job, malformed origin, stale diff,
+    or any other error always survives. Do not synthesize a PASS or 'settled'.
+    """
+    if not isinstance(reconciliation, dict):
+        return {
+            "errors": ["decision_review_reconciliation_invalid"],
+            "ignored_unavailable": [], "status": "blocked",
+        }
+    raw_errors = reconciliation.get("errors")
+    if not isinstance(raw_errors, list) or any(
+        not isinstance(item, str) or not item for item in raw_errors
+    ):
+        return {
+            "errors": ["decision_review_reconciliation_errors_invalid"],
+            "ignored_unavailable": [], "status": "blocked",
+        }
+    if independent_required or not raw_errors:
+        return {
+            "errors": list(raw_errors),
+            "ignored_unavailable": [],
+            "status": reconciliation.get("status"),
+        }
+
+    attempts = reconciliation.get("attempts")
+    slots = reconciliation.get("slots")
+    total = reconciliation.get("attempt_count")
+    if (
+        not isinstance(attempts, list) or not isinstance(slots, list)
+        or type(total) is not int or total != len(attempts)
+        or type(reconciliation.get("slot_count")) is not int
+        or reconciliation["slot_count"] != len(slots)
+        or not attempts or not slots
+    ):
+        return {
+            "errors": list(raw_errors),
+            "ignored_unavailable": [], "status": "blocked",
+        }
+    by_slot: dict[str, list[dict[str, Any]]] = {}
+    for item in attempts:
+        if not isinstance(item, dict) or not isinstance(item.get("slot"), str):
+            return {
+                "errors": list(raw_errors), "ignored_unavailable": [], "status": "blocked",
+            }
+        by_slot.setdefault(item["slot"], []).append(item)
+    eligible: dict[str, set[str]] = {}
+    for slot in slots:
+        if not isinstance(slot, dict) or not isinstance(slot.get("slot"), str):
+            continue
+        name = slot["slot"]
+        rows = by_slot.get(name, [])
+        if any(
+            not isinstance(row, dict) or not isinstance(row.get("unit"), str)
+            for row in rows
+        ):
+            continue
+        if (
+            not rows or type(slot.get("attempt_count")) is not int
+            or slot["attempt_count"] != len(rows)
+            or any(
+                type(slot.get(field)) is not int or slot[field] != expected
+                for field, expected in (
+                    ("pass_count", 0),
+                    ("independent_pass_count", 0),
+                    ("material_reject_count", 0),
+                    ("unresolved_count", 0),
+                    ("infrastructure_error_count", len(rows)),
+                )
+            )
+            or slot.get("units_sha256")
+            != _sha256_json(sorted(row.get("unit") for row in rows))
+            or any(
+                not isinstance(row.get("unit"), str)
+                or re.fullmatch(r"grabowski-job-[0-9a-f]{12}", row["unit"]) is None
+                or re.fullmatch(r"[0-9a-f]{64}", str(row.get("origin_sha256"))) is None
+                or row.get("terminal") is not True
+                or row.get("classification") != "infrastructure_error"
+                or row.get("verdict") is not None
+                or row.get("material_findings") is not None
+                or row.get("result_sha256") is not None
+                or row.get("diff_identity_deferred") is not False
+                for row in rows
+            )
+        ):
+            continue
+        eligible[name] = {str(row["unit"]) for row in rows}
+
+    ignored: list[str] = []
+    blocking: list[str] = []
+    for error in raw_errors:
+        slot_error = error.split(":", 2)
+        if (
+            len(slot_error) == 2
+            and slot_error[0] in {
+                "decision_review_slot_without_pass",
+                "decision_review_named_provider_slot_without_independent_pass",
+            }
+            and slot_error[1] in eligible
+        ):
+            ignored.append(error)
+        elif (
+            len(slot_error) == 3
+            and slot_error[0] == "decision_review_infrastructure_not_superseded"
+            and slot_error[1] in eligible
+            and slot_error[2] in eligible[slot_error[1]]
+        ):
+            ignored.append(error)
+        else:
+            blocking.append(error)
+    return {
+        "errors": blocking,
+        "ignored_unavailable": ignored,
+        "status": (
+            "blocked" if blocking else "optional_unavailable" if ignored
+            else reconciliation.get("status")
+        ),
     }
 
 
@@ -5903,7 +6056,15 @@ class CaptainMergeGuardRunner:
                 ),
                 "errors": independent_errors,
             }
-            revalidation_errors = list(decision_reconciliation.get("errors", []))
+            optional_review = decision_review_blocking_errors(
+                decision_reconciliation,
+                independent_required=independent_requirement["required"],
+            )
+            self.receipt["optional_review_unavailability"] = {
+                "status": optional_review["status"],
+                "ignored_unavailable": optional_review["ignored_unavailable"],
+            }
+            revalidation_errors = list(optional_review["errors"])
             revalidation_errors.extend(independent_errors)
             revalidation_errors.extend(self._revalidate_dispatch_bindings(bindings))
             revalidation_errors.extend(self._revalidate_repository_policy())
