@@ -2096,8 +2096,10 @@ def _default_command_runner(repo: Path, argv: list[str]) -> dict[str, Any]:
 
 
 def _default_github_runner(repo: Path, argv: list[str]) -> dict[str, Any]:
-    command = ["gh", *argv]
+    command = [grabowski_git_ssh.trusted_github_cli_path(), *argv]
     env = os.environ.copy()
+    # Prevent gh child Git/helpers from inheriting a caller-controlled PATH.
+    env["PATH"] = "/run/current-system/sw/bin:/usr/bin:/bin"
     for key in (
         "GIT_EXTERNAL_DIFF",
         "GIT_DIFF_OPTS",
