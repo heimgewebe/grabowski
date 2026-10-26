@@ -53,11 +53,11 @@ class NixosPublisherBinariesTests(unittest.TestCase):
         operator = _load_operator_module()
         with (
             patch.object(operator.os.path, "lexists", return_value=False),
-            patch.object(operator.Path, "resolve", return_value=Path("/tmp/evil/git")),
+            # Mock the complete-hop resolver: this test covers the Nix store
+            # boundary, not existence of /run/current-system on the runner.
+            patch.object(operator.grabowski_git_ssh, "_root_managed_resolution", return_value=Path("/tmp/evil/git")),
         ):
-            # The complete-hop guard may reject the mocked /tmp target
-            # earlier as a resolution drift rather than at the store gate.
-            with self.assertRaisesRegex(PermissionError, "Nix store|resolution changed"):
+            with self.assertRaisesRegex(PermissionError, "Nix store"):
                 operator._trusted_git_cli_path()
 
     def test_untrusted_symlink_chain_rejected(self) -> None:
