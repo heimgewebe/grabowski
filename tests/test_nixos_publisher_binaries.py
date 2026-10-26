@@ -44,7 +44,10 @@ class NixosPublisherBinariesTests(unittest.TestCase):
         operator = _load_operator_module()
         with (
             patch.object(operator.os.path, "lexists", return_value=False),
-            patch.object(operator.Path, "resolve", side_effect=FileNotFoundError("missing")),
+            patch.object(
+                operator.grabowski_git_ssh, "_root_managed_resolution",
+                side_effect=FileNotFoundError("missing"),
+            ),
         ):
             with self.assertRaisesRegex(RuntimeError, "trusted Git CLI path is unavailable"):
                 operator._trusted_git_cli_path()
@@ -53,18 +56,18 @@ class NixosPublisherBinariesTests(unittest.TestCase):
         operator = _load_operator_module()
         with (
             patch.object(operator.os.path, "lexists", return_value=False),
-            patch.object(operator.Path, "resolve", return_value=Path("/tmp/evil/git")),
+            patch.object(
+                operator.grabowski_git_ssh, "_root_managed_resolution",
+                return_value=Path("/tmp/evil/git"),
+            ),
         ):
-            # The complete-hop guard may reject the mocked /tmp target
-            # earlier as a resolution drift rather than at the store gate.
-            with self.assertRaisesRegex(PermissionError, "Nix store|resolution changed"):
+            with self.assertRaisesRegex(PermissionError, "must resolve into the Nix store"):
                 operator._trusted_git_cli_path()
 
     def test_untrusted_symlink_chain_rejected(self) -> None:
         operator = _load_operator_module()
         with (
             patch.object(operator.os.path, "lexists", return_value=False),
-            patch.object(operator.Path, "resolve", return_value=Path("/nix/store/fixture/bin/git")),
             patch.object(operator.grabowski_git_ssh, "_root_managed_chain", side_effect=PermissionError("mutable symlink")),
         ):
             with self.assertRaisesRegex(PermissionError, "mutable symlink"):
@@ -83,11 +86,14 @@ class NixosPublisherBinariesTests(unittest.TestCase):
         operator = _load_operator_module()
         with (
             patch.object(operator.os.path, "lexists", return_value=False),
-            patch.object(operator.Path, "resolve", return_value=Path("/nix/store/safe-store-path/bin/git")),
+            patch.object(
+                operator.grabowski_git_ssh, "_root_managed_resolution",
+                return_value=Path("/nix/store/safe-store-path/bin/git"),
+            ),
             patch.object(operator.grabowski_git_ssh, "_root_managed_chain"),
             patch.object(operator.Path, "stat", return_value=SimpleNamespace(st_mode=stat.S_IFREG | 0o644, st_uid=0)),
         ):
-            with self.assertRaises(PermissionError):
+            with self.assertRaisesRegex(PermissionError, "not a root-owned executable"):
                 operator._trusted_git_cli_path()
 
     def test_untrusted_path_environment_ignored(self) -> None:

@@ -227,8 +227,13 @@ class GitSshTransportTests(unittest.TestCase):
         trust.assert_called_once_with(Path("/usr/bin/ssh"))
 
     def test_nixos_system_link_must_resolve_inside_store(self) -> None:
-        with patch.object(Path, "resolve", return_value=Path("/tmp/attacker-ssh")):
-            with self.assertRaises(PermissionError):
+        # Mock the new complete-hop resolver rather than Path.resolve: Ubuntu
+        # has no /run/current-system, but the Nix-store guard must still run.
+        with patch.object(
+            transport, "_root_managed_resolution",
+            return_value=Path("/tmp/attacker-ssh"),
+        ):
+            with self.assertRaisesRegex(PermissionError, "NixOS OpenSSH does not resolve into the Nix store"):
                 transport._trusted_executable(Path("/run/current-system/sw/bin/ssh"))
 
     def test_caller_ssh_transport_overrides_cannot_change_command(self) -> None:
