@@ -1451,7 +1451,8 @@ def classify_complexity(
         "high_critical": bool(high_critical_reasons),
         "high_critical_reasons": high_critical_reasons,
         "external_review_required": False,
-        "independent_review_required": review_tier == "high_critical",
+        # Risk still controls review depth; reviewer independence is explicit opt-in.
+        "independent_review_required": False,
         "claude_cli_required": False,
         "self_review_required": True,
         "minimum_self_review_iterations": minimum_self_review_iterations,
@@ -3505,7 +3506,7 @@ def build_self_review_audit(
         "review_policy_version": REVIEW_POLICY_VERSION,
         "diff_sha256": _normalize_sha256(state.get("pr_diff_sha256")),
         "review_tier": complexity.get("review_tier"),
-        "independent_review_required": complexity.get("independent_review_required") is True,
+        "independent_review_required": review_sources.get("independent_review_required") is True,
         "minimum_review_iterations": complexity.get("minimum_self_review_iterations"),
         "actual_review_iterations": actual_iterations,
         "all_findings_triaged": (
@@ -4086,6 +4087,7 @@ def evaluate_review_gate(
     claude_evidence: dict[str, Any] | None = None,
     external_review_evidence: dict[str, Any] | None = None,
     external_review_artifact_root: Path | None = None,
+    require_independent_review: bool = False,
     policy_waiver: dict[str, Any] | None = None,
     expected_check_names: tuple[str, ...] = DEFAULT_EXPECTED_CHECK_NAMES,
 ) -> dict[str, Any]:
@@ -4239,8 +4241,11 @@ def evaluate_review_gate(
         remaining = _material_findings_remaining(self_review, self_review_failures)
         residual = self_review.get("residual_risk")
         accepted_residual = isinstance(residual, dict) and residual.get("accepted") is True and bool(residual.get("reason"))
-        if remaining is not None and remaining > 0 and not accepted_residual:
-            self_review_failures.append("material findings remain without accepted residual-risk reason")
+        # An accepted residual risk is not a terminal P1/P2 resolution.
+        if remaining is not None and remaining > 0:
+            self_review_failures.append(
+                "material findings remain; each must be resolved or disproven"
+            )
     failures.extend(self_review_failures)
 
     claude = self_review.get("claude_review") if isinstance(self_review, dict) else None
@@ -4256,18 +4261,21 @@ def evaluate_review_gate(
     if isinstance(deprecated_external_review, dict):
         warnings.append("Deprecated self_review.external_review ignored; pass --external-review-evidence instead")
 
-    external_required = False
+    external_required = require_independent_review is True
     external_failures = _external_review_failures(
         state,
         pr,
         external_review,
-        required=False,
+        required=external_required,
         repo_name=repo_name,
         claude_cli_required=False,
         external_review_artifact_root=external_review_artifact_root,
     )
     for failure in external_failures:
-        warnings.append(f"Optional external review evidence invalid and ignored: {failure}")
+        if external_required:
+            failures.append(f"explicit independent review requirement: {failure}")
+        else:
+            warnings.append(f"Optional external review evidence invalid and ignored: {failure}")
 
     if not checks:
         failures.append("no status checks observed")
@@ -4364,7 +4372,7 @@ def evaluate_review_gate(
             "claude_cli_required": complexity["claude_cli_required"],
             "claude_cli_waived": claude_cli_waived,
             "external_review_required": external_required,
-            "independent_review_required": complexity["independent_review_required"],
+            "independent_review_required": external_required,
             "external_reviews_received": _external_review_count(external_review),
             "platform_review_required": platform_review_required,
             "platform_review_seen": platform_review_seen,
@@ -4443,6 +4451,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--self-review")
     parser.add_argument("--claude-evidence")
     parser.add_argument("--external-review-evidence")
+    parser.add_argument("--require-independent-review", action="store_true", help="Explicit additional requirement; never implied by high_critical risk")
     parser.add_argument("--policy-waiver")
     parser.add_argument("--write-external-review-packet")
     parser.add_argument("--write-self-review-template")
@@ -4482,6 +4491,7 @@ def main(argv: list[str] | None = None) -> int:
             self_review=self_review,
             claude_evidence=claude_evidence,
             external_review_evidence=external_review_evidence,
+            require_independent_review=args.require_independent_review,
             external_review_artifact_root=(
                 external_review_evidence_path.parent
                 if external_review_evidence_path is not None

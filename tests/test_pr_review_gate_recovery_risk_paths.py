@@ -33,13 +33,13 @@ class RecoveryEvidenceAuthorityRiskTests(unittest.TestCase):
         result = complexity(paths)
         self.assertEqual(result["review_tier"], "high_critical", result)
         self.assertTrue(result["high_critical"], result)
-        self.assertTrue(result["independent_review_required"], result)
+        self.assertFalse(result["independent_review_required"], result)
         self.assertGreaterEqual(result["minimum_self_review_iterations"], 4)
 
-    def test_actual_recovery_authority_pr2_file_set_requires_independent_review(self) -> None:
+    def test_actual_recovery_authority_pr2_file_set_requires_deep_self_review(self) -> None:
         self.assert_high_critical(["ci_selftest.py", "tests/test_validator.py", "validator.py"])
 
-    def test_actual_recovery_authority_pr3_ci_selftest_requires_independent_review(self) -> None:
+    def test_actual_recovery_authority_pr3_ci_selftest_requires_deep_self_review(self) -> None:
         self.assert_high_critical(["ci_selftest.py"])
 
     def test_signer_root_and_attestation_workflow_are_high_critical(self) -> None:
@@ -78,7 +78,7 @@ class RecoveryEvidenceAuthorityRiskTests(unittest.TestCase):
         }
         result = gate.classify_complexity(pr, None, repo_name=RECOVERY_REPO)
         self.assertEqual(result["review_tier"], "high_critical", result)
-        self.assertTrue(result["independent_review_required"], result)
+        self.assertFalse(result["independent_review_required"], result)
 
     def test_rename_without_previous_filename_fails_closed(self) -> None:
         pr = {
@@ -97,7 +97,7 @@ class RecoveryEvidenceAuthorityRiskTests(unittest.TestCase):
         }
         result = gate.classify_complexity(pr, None, repo_name=RECOVERY_REPO)
         self.assertEqual(result["review_tier"], "high_critical", result)
-        self.assertTrue(result["independent_review_required"], result)
+        self.assertFalse(result["independent_review_required"], result)
 
     def test_graphql_change_type_without_verified_origin_stays_high_critical(self) -> None:
         for value in ({}, {"changeType": "UNKNOWN"}, {"changeType": 0}):
@@ -118,7 +118,7 @@ class RecoveryEvidenceAuthorityRiskTests(unittest.TestCase):
         }
         result = gate.classify_complexity(pr, None, repo_name=RECOVERY_REPO)
         self.assertEqual(result["review_tier"], "high_critical", result)
-        self.assertTrue(result["independent_review_required"], result)
+        self.assertFalse(result["independent_review_required"], result)
 
     def test_invalid_changed_file_count_is_high_critical(self) -> None:
         for value in (None, True, "1", -1, 0, 2):
@@ -170,7 +170,7 @@ class RecoveryEvidenceAuthorityRiskTests(unittest.TestCase):
                     }
                     result = gate.classify_complexity(pr, None, repo_name=RECOVERY_REPO)
                     self.assertEqual(result["review_tier"], "high_critical", result)
-                    self.assertTrue(result["independent_review_required"], result)
+                    self.assertFalse(result["independent_review_required"], result)
 
     def test_duplicate_docs_paths_do_not_prove_complete_changed_file_list(self) -> None:
         # Another genuine independent finding (P3): a repeated path can mask
@@ -184,7 +184,7 @@ class RecoveryEvidenceAuthorityRiskTests(unittest.TestCase):
         }
         result = gate.classify_complexity(pr, None, repo_name=RECOVERY_REPO)
         self.assertEqual(result["review_tier"], "high_critical", result)
-        self.assertTrue(result["independent_review_required"], result)
+        self.assertFalse(result["independent_review_required"], result)
 
     def test_missing_or_incomplete_path_list_is_explicitly_rejected(self) -> None:
         for pr in (

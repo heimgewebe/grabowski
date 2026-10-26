@@ -146,7 +146,35 @@ The status may become required only when all of the following are true:
 5. The selected supersession contract has been tested across queued, cancelled, failed-before-publication, superseded and runner-unavailable executions, with no stale green status remaining merge-authoritative contrary to that contract.
 6. The signer allowlist and default-branch evaluator are protected by the resulting gate.
 7. Key rotation and key-loss recovery have a tested, auditable path.
-8. Independent high-critical/platform review requirements remain separate.
+8. High-critical review **depth** and any explicitly requested additional independent review remain separately enforced; reviewer-provider availability never substitutes for review evidence.
+
+## PR self-review policy v4 (2026-10-26)
+
+The PR risk tier and the independent reviewer obligation are separate contracts.
+Even `high_critical` uses a substantive, diff-bound self-review as the default;
+the classification still increases the minimum review depth and enforces all
+existing file, head, base, diff, testing, security and CI checks. A particular
+PR may explicitly require an additional independent review, but its absence due
+to provider quota, authentication or transport is **not** an automatic default.
+`pr_review_gate.py --require-independent-review` is the explicit opt-in at the
+operator gate boundary. It requires real valid independent evidence and blocks
+rather than manufacturing a PASS when that evidence is missing or invalid.
+
+Genuine material findings must be resolved or disproven, not waived by a generic
+`residual_risk.accepted`. PR-specific unresolved review threads and Captain
+authorization continue to be evaluated by Captain and the atomic merge guard;
+the standalone status gate does not confer merge authority.
+
+The signed public status and private audit bind policy version 4. Historic
+version 3 audits/statuses cannot authorize a new policy-v4 decision. Historical
+records remain immutable and available as evidence for the former policy.
+
+**Release safety:** An independent-review-required boolean is not a
+classification of critical *release source*. Do not deploy this policy change
+without the separately migrated explicit release-risk admission contract:
+post-merge source/CI, integrity, recovery evidence and Captain session authority
+remain mandatory for critical deployments. This source-only change does not
+authorize any release, merge or GitHub Ruleset bypass.
 
 ## Operational commands
 

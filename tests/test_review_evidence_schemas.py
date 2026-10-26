@@ -111,6 +111,38 @@ class ReviewEvidenceSchemaTests(unittest.TestCase):
             with self.subTest(label=label):
                 self.assertEqual(schemas.validate_evidence(payload, label=label), ())
 
+    def test_old_policy_audit_cannot_requalify_as_current_release_review(self) -> None:
+        self.assertEqual(schemas.REVIEW_POLICY_VERSION, 4)
+        audit = {
+            "schema_version": 1,
+            "kind": "grabowski_self_review_audit",
+            "repo": "heimgewebe/grabowski",
+            "pr": 42,
+            "head_sha": "a" * 40,
+            "base_sha": "b" * 40,
+            "diff_sha256": "c" * 64,
+            "review_policy_version": schemas.REVIEW_POLICY_VERSION,
+            "review_tier": "high_critical",
+            "minimum_review_iterations": 4,
+            "actual_review_iterations": 4,
+            "all_findings_triaged": True,
+            "material_findings_remaining": 0,
+            "gate_verdict": "PASS",
+            "self_review_gate_valid": True,
+            "tuning_signal": "observe",
+        }
+        self.assertEqual(
+            schemas.validate_evidence(audit, label="self-review audit"), (),
+        )
+        audit["review_policy_version"] = 3
+        self.assertTrue(
+            any(
+                "review_policy_version" in failure
+                for failure in schemas.validate_evidence(audit, label="self-review audit")
+            ),
+            "historical v3 evidence must not authorize policy v4",
+        )
+
     def test_missing_required_field_is_rejected(self) -> None:
         payload = _self_review()
         payload.pop("schema_version")

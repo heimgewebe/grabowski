@@ -286,6 +286,46 @@ class SelfReviewDepthPolicyTests(unittest.TestCase):
         self.assertEqual(result["verdict"], "PASS")
         self.assertFalse(result["review_sources"]["external_review_required"])
 
+    def test_high_critical_selfreview_has_no_automatic_external_obligation(self) -> None:
+        state = _state("tools/pr_review_gate.py")
+        result = gate.evaluate_review_gate(
+            state, self_review=_self_review("tools/pr_review_gate.py", iterations=4),
+        )
+        self.assertEqual(result["verdict"], "PASS", result["failures"])
+        self.assertTrue(result["complexity"]["high_critical"])
+        self.assertFalse(result["review_sources"]["independent_review_required"])
+
+    def test_explicit_extra_review_blocks_when_evidence_is_absent(self) -> None:
+        state = _state("tools/pr_review_gate.py")
+        result = gate.evaluate_review_gate(
+            state,
+            self_review=_self_review("tools/pr_review_gate.py", iterations=4),
+            require_independent_review=True,
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(result["review_sources"]["independent_review_required"])
+        self.assertTrue(_has_failure(result, "external"), result["failures"])
+
+    def test_explicit_extra_review_rejects_malformed_evidence(self) -> None:
+        state = _state("tools/pr_review_gate.py")
+        result = gate.evaluate_review_gate(
+            state,
+            self_review=_self_review("tools/pr_review_gate.py", iterations=4),
+            external_review_evidence={"kind": "forged-PASS"},
+            require_independent_review=True,
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(_has_failure(result, "external"), result["failures"])
+
+    def test_remaining_material_findings_cannot_be_waived(self) -> None:
+        state = _state("tools/pr_review_gate.py")
+        review = _self_review("tools/pr_review_gate.py", iterations=4)
+        review["material_findings_remaining"] = 1
+        review["residual_risk"] = {"accepted": True, "reason": "not a finding resolution"}
+        result = gate.evaluate_review_gate(state, self_review=review)
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(_has_failure(result, "material findings remain"), result["failures"])
+
     def test_invalid_optional_external_evidence_warns_but_does_not_block(self) -> None:
         state = _state("tools/pr_review_gate.py")
         result = gate.evaluate_review_gate(
