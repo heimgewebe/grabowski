@@ -3277,6 +3277,10 @@
         "source": "src/grabowski_grips.py"
       },
       {
+        "module": "grabowski_git_ssh",
+        "source": "src/grabowski_git_ssh.py"
+      },
+      {
         "module": "grabowski_post_merge_sync_apply",
         "source": "src/grabowski_post_merge_sync_apply.py"
       },
@@ -3706,7 +3710,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "8414018c4b85bab3fa58581cc113720bb750a1da70c76400c046f8caf516f48c"
+      "sha256": "650f923c4cfbb4a70dc4e2162e642460bffffb7b9eefab031e07e8b65dbb542c"
     },
     "runtime_source_digest_contract": "mcp-tool-surface-v1",
     "runtime_sources": {
@@ -3766,6 +3770,7 @@
       "src/grabowski_forrest_server_exit.py": "f7a709556197a5c15240e1b0be9c2015f35cad198ce29fe98c4b6fe1204f9cea",
       "src/grabowski_friction.py": "524d7839aabd0cbb8b710714b7656214f17aa3bc9504dc635f890231e3a37e4f",
       "src/grabowski_git_preimage.py": "dce907040db976bffbac92b8428b925cf75cfdf44c119ffa4549a8393a17fe96",
+      "src/grabowski_git_ssh.py": "130e13382073665bcecb6c7fc98beae9ca253fc6ed9ae92b76b7dacb112736bc",
       "src/grabowski_github_workflow_dispatch.py": "ed0ab161c864ea16c9e843b29f947c9a35f71ce1d030944b80f4ae8a55979e12",
       "src/grabowski_grip_orchestration.py": "b16576878f5e4313e3f16535d4cdb1333ea5cc1e76b58c4c38ffb2fc9ab46ed8",
       "src/grabowski_grips.py": "73d6b30209b6b892866c9f6c56c834187be9e6b787ad74cb5850da1a2c501643",
