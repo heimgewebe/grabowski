@@ -34,7 +34,7 @@ class RecoveryEvidenceAuthorityRiskTests(unittest.TestCase):
         self.assertEqual(result["review_tier"], "high_critical", result)
         self.assertTrue(result["high_critical"], result)
         self.assertFalse(result["independent_review_required"], result)
-        self.assertGreaterEqual(result["minimum_self_review_iterations"], 4)
+        self.assertGreaterEqual(result["minimum_self_review_iterations"], 5)
 
     def test_actual_recovery_authority_pr2_file_set_requires_deep_self_review(self) -> None:
         self.assert_high_critical(["ci_selftest.py", "tests/test_validator.py", "validator.py"])

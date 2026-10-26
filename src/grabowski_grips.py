@@ -2759,10 +2759,14 @@ def _self_review_audit_errors(
         errors.append("actual_review_iterations must be a positive integer")
     elif isinstance(minimum, int) and not isinstance(minimum, bool) and actual < minimum:
         errors.append("actual_review_iterations is below required minimum")
-    if evidence.get("review_tier") == "high_critical" and (
-        type(minimum) is not int or minimum < 4
-    ):
-        errors.append("high-critical self-review depth must be at least 4")
+    if evidence.get("review_tier") == "high_critical":
+        if type(minimum) is not int or minimum != 5 or type(actual) is not int or actual < 5:
+            errors.append("high-critical self-review depth must be at least 5")
+        if evidence.get("review_pass_axes") != list(grabowski_merge_guard.HIGH_CRITICAL_REVIEW_AXES):
+            errors.append("high-critical review axes are absent, duplicated or not methodologically distinct")
+        digest = evidence.get("review_pass_evidence_sha256")
+        if not isinstance(digest, str) or not _is_sha256_hex(digest):
+            errors.append("high-critical review pass evidence digest is missing or invalid")
     remaining = evidence.get("material_findings_remaining")
     if isinstance(remaining, bool) or not isinstance(remaining, int) or remaining < 0:
         errors.append("material_findings_remaining must be an integer >= 0")

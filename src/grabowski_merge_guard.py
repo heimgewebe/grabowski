@@ -543,6 +543,13 @@ def captain_request_sha256(parameters: dict[str, Any]) -> str:
 
 
 REVIEW_POLICY_VERSION = 4  # Bound to tools/review_evidence_schemas.py; checked by regression tests.
+HIGH_CRITICAL_REVIEW_AXES = (
+    "contracts_correctness",
+    "regression_compatibility",
+    "tests_negative_cases",
+    "security_authority_concurrency",
+    "adversarial_countercheck",
+)
 
 
 def independent_review_requirement(parameters: dict[str, Any]) -> dict[str, Any]:
@@ -586,10 +593,15 @@ def independent_review_requirement(parameters: dict[str, Any]) -> dict[str, Any]
             if isinstance(review_evidence, dict) else None
         )
         if (
-            type(minimum) is not int or minimum < 4 or minimum > 5
-            or type(actual) is not int or actual < minimum
+            type(minimum) is not int or minimum != 5
+            or type(actual) is not int or actual < 5
         ):
             errors.append("high_critical_self_review_depth_invalid")
+        if review_evidence.get("review_pass_axes") != list(HIGH_CRITICAL_REVIEW_AXES):
+            errors.append("high_critical_review_axes_invalid")
+        proof_digest = review_evidence.get("review_pass_evidence_sha256")
+        if not isinstance(proof_digest, str) or _SHA256_RE.fullmatch(proof_digest) is None:
+            errors.append("high_critical_review_pass_evidence_digest_invalid")
     policy_required = policy_value is True
     explicitly_required = explicit_value is True
     return {

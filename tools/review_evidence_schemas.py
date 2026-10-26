@@ -333,6 +333,8 @@ SELF_REVIEW_AUDIT_SCHEMA = EvidenceSchema(
         "independent_review_required": BOOLEAN,
         "minimum_review_iterations": NON_NEGATIVE_INTEGER,
         "actual_review_iterations": NON_NEGATIVE_INTEGER,
+        "review_pass_axes": FieldRule(("array",), items=STRING),
+        "review_pass_evidence_sha256": STRING,
         "all_findings_triaged": BOOLEAN,
         "finding_count": FieldRule(("integer", "null"), minimum=0),
         "material_findings_after_first_review": FieldRule(("integer", "null"), minimum=0),

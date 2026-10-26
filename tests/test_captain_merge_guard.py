@@ -191,8 +191,10 @@ class RiskScaledIndependentReviewContractTests(unittest.TestCase):
             "review_policy_version": merge_guard.REVIEW_POLICY_VERSION,
             "review_tier": "high_critical",
             "independent_review_required": False,
-            "minimum_review_iterations": 4,
-            "actual_review_iterations": 4,
+            "minimum_review_iterations": 5,
+            "actual_review_iterations": 5,
+            "review_pass_axes": list(merge_guard.HIGH_CRITICAL_REVIEW_AXES),
+            "review_pass_evidence_sha256": "a" * 64,
         }
         result: dict[str, object] = {"review_evidence": review}
         result.update(overrides)
@@ -218,6 +220,31 @@ class RiskScaledIndependentReviewContractTests(unittest.TestCase):
         self.assertIn(
             "review_policy_version_stale_or_invalid",
             merge_guard.independent_review_requirement(old)["errors"],
+        )
+
+    def test_critical_four_passes_cannot_replace_the_required_five(self) -> None:
+        review = self._request()
+        review["review_evidence"]["minimum_review_iterations"] = 4
+        review["review_evidence"]["actual_review_iterations"] = 4
+        self.assertIn(
+            "high_critical_self_review_depth_invalid",
+            merge_guard.independent_review_requirement(review)["errors"],
+        )
+
+    def test_critical_duplicate_or_absent_review_axes_are_blocking(self) -> None:
+        review = self._request()
+        review["review_evidence"]["review_pass_axes"] = [
+            "contracts_correctness" for _ in range(5)
+        ]
+        self.assertIn(
+            "high_critical_review_axes_invalid",
+            merge_guard.independent_review_requirement(review)["errors"],
+        )
+        review["review_evidence"]["review_pass_axes"] = list(merge_guard.HIGH_CRITICAL_REVIEW_AXES)
+        review["review_evidence"].pop("review_pass_evidence_sha256")
+        self.assertIn(
+            "high_critical_review_pass_evidence_digest_invalid",
+            merge_guard.independent_review_requirement(review)["errors"],
         )
 
     def test_critical_self_review_below_four_passes_remains_invalid(self) -> None:

@@ -773,8 +773,17 @@ class PrReviewGateCliTests(unittest.TestCase):
             "diff_reviewed": True,
             "all_findings_triaged": True,
             "review_iterations": [
-                {"n": n, "summary": f"review pass {n}", "material_findings": 0}
-                for n in range(1, 5)
+                {
+                    "n": n,
+                    "axis": pr_review_gate.REQUIRED_HIGH_CRITICAL_REVIEW_AXES[n - 1],
+                    "summary": (
+                        f"Pass {n} reviewed exact current contract, behavior, test coverage "
+                        "and adversarial negative risks; verified evidence locally."
+                    ),
+                    "evidence_refs": [f"tests/test_pr_review_gate_cli.py:pass-{n}-evidence"],
+                    "material_findings": 0,
+                }
+                for n in range(1, 6)
             ],
             "stop_reason": "clean_pass",
             "findings": [],
@@ -786,7 +795,7 @@ class PrReviewGateCliTests(unittest.TestCase):
         result = pr_review_gate.evaluate_review_gate(state, self_review=review)
         self.assertEqual(result["verdict"], "PASS")
         self.assertTrue(result["complexity"]["high_critical"])
-        self.assertEqual(result["complexity"]["minimum_self_review_iterations"], 4)
+        self.assertEqual(result["complexity"]["minimum_self_review_iterations"], 5)
         self.assertIn("high-critical Grabowski operator path touched: src/grabowski_mcp.py", result["complexity"]["reasons"])
         self.assertFalse(result["review_sources"]["external_review_required"])
 

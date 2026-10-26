@@ -160,6 +160,20 @@ to provider quota, authentication or transport is **not** an automatic default.
 operator gate boundary. It requires real valid independent evidence and blocks
 rather than manufacturing a PASS when that evidence is missing or invalid.
 
+For every `high_critical` change, exactly **five distinct mandatory
+method passes** form the minimum substantive review: (1) contracts and
+correctness, (2) regression and compatibility, (3) tests and negative cases,
+(4) security, authority, data and concurrency, and (5) adversarial
+countercheck. The `review_iterations` must carry these five distinct ordered
+`axis` values (`contracts_correctness`, `regression_compatibility`,
+`tests_negative_cases`, `security_authority_concurrency`,
+`adversarial_countercheck`), non-boilerplate summaries and nonempty concrete
+`evidence_refs`. Repeated methods, missing details, or four passes BLOCK;
+external reviewer unavailability never substitutes for one of the five.
+The private audit retains the exact method axes and a SHA-256 over the
+individual review-iteration records; Captain revalidates both and the
+real head/base/diff binding before an atomic merge decision.
+
 Genuine material findings must be resolved or disproven, not waived by a generic
 `residual_risk.accepted`. PR-specific unresolved review threads and Captain
 authorization continue to be evaluated by Captain and the atomic merge guard;

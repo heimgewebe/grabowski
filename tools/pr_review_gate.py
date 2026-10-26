@@ -203,6 +203,14 @@ REQUIRED_SELF_REVIEW_FOCUS = (
 SELF_REVIEW_DIFF_BYPASS_REASON = "legacy unit seam without live PR diff"
 SELF_REVIEW_AUDIT_KIND = "grabowski_self_review_audit"
 SELF_REVIEW_MAX_REQUIRED_ITERATIONS = 5
+REQUIRED_HIGH_CRITICAL_REVIEW_AXES = (
+    "contracts_correctness",
+    "regression_compatibility",
+    "tests_negative_cases",
+    "security_authority_concurrency",
+    "adversarial_countercheck",
+)
+MIN_SUBSTANTIVE_REVIEW_SUMMARY_CHARS = 36
 RISK_PATH_MARKERS = (
     "auth",
     "access",
@@ -1411,10 +1419,8 @@ def classify_complexity(
     large_documentation_change = docs_only and (changed_files > 15 or changed_lines > 500)
     if high_critical_reasons:
         review_tier = "high_critical"
-        minimum_self_review_iterations = min(
-            SELF_REVIEW_MAX_REQUIRED_ITERATIONS,
-            3 + min(2, len(high_critical_reasons)),
-        )
+        # Five distinct reviews, not merely four repeated summaries.
+        minimum_self_review_iterations = SELF_REVIEW_MAX_REQUIRED_ITERATIONS
     elif important_repo and not docs_only:
         review_tier = "important_repo"
         minimum_self_review_iterations = 3
@@ -3509,6 +3515,16 @@ def build_self_review_audit(
         "independent_review_required": review_sources.get("independent_review_required") is True,
         "minimum_review_iterations": complexity.get("minimum_self_review_iterations"),
         "actual_review_iterations": actual_iterations,
+        # The private audit retains method diversity without posting review
+        # prose or private evidence paths into the public CI status.
+        "review_pass_axes": [
+            item.get("axis") for item in iterations
+            if isinstance(item, dict) and isinstance(item.get("axis"), str)
+        ] if isinstance(iterations, list) else [],
+        "review_pass_evidence_sha256": hashlib.sha256(
+            json.dumps(iterations if isinstance(iterations, list) else [],
+                       sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        ).hexdigest(),
         "all_findings_triaged": (
             self_review.get("all_findings_triaged") is True
             if isinstance(self_review, dict) else False
@@ -4207,6 +4223,38 @@ def evaluate_review_gate(
             ]
             if len(iteration_summaries) == len(iterations) and len(set(iteration_summaries)) != len(iteration_summaries):
                 self_review_failures.append("self-review iteration summaries must be distinct")
+            if complexity["review_tier"] == "high_critical":
+                observed_axes = [
+                    item.get("axis") if isinstance(item, dict) else None
+                    for item in iterations[:SELF_REVIEW_MAX_REQUIRED_ITERATIONS]
+                ]
+                if observed_axes != list(REQUIRED_HIGH_CRITICAL_REVIEW_AXES):
+                    self_review_failures.append(
+                        "high-critical review passes must cover five distinct axes in order: "
+                        + ", ".join(REQUIRED_HIGH_CRITICAL_REVIEW_AXES)
+                    )
+                for index, item in enumerate(iterations):
+                    if not isinstance(item, dict):
+                        continue
+                    summary = item.get("summary")
+                    if (
+                        not isinstance(summary, str)
+                        or len(" ".join(summary.split())) < MIN_SUBSTANTIVE_REVIEW_SUMMARY_CHARS
+                    ):
+                        self_review_failures.append(
+                            f"high-critical review_iteration {index} lacks a substantive summary"
+                        )
+                    evidence_refs = item.get("evidence_refs")
+                    if (
+                        not isinstance(evidence_refs, list) or not evidence_refs
+                        or any(
+                            not isinstance(ref, str) or len(ref.strip()) < 8
+                            for ref in evidence_refs
+                        )
+                    ):
+                        self_review_failures.append(
+                            f"high-critical review_iteration {index} lacks concrete evidence_refs"
+                        )
             first_iteration = iterations[0] if iterations and isinstance(iterations[0], dict) else None
             first_iteration_material = (
                 first_iteration.get("material_findings")
