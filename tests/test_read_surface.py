@@ -1270,6 +1270,31 @@ class ReadSurfaceTests(unittest.TestCase):
                 self.assertEqual(identity["integrity"], {key: True for key in native_fields})
                 native.store_root.assert_called_with(base_module)
 
+                for python_version in ("python3.10", "python3.13"):
+                    with self.subTest(python_version=python_version):
+                        site = root / "lib" / python_version / "site-packages"
+                        site.mkdir(parents=True)
+                        alternate_module = site / "grabowski_mcp.py"
+                        alternate_adapter = site / "grabowski_nixos_integrity.py"
+                        alternate_module.write_text("# pinned module\n")
+                        alternate_adapter.write_text("# pinned adapter\n")
+
+                        def pinned_site(candidate):
+                            if candidate != alternate_module:
+                                raise ValueError("not the installed pinned module")
+                            return root
+
+                        with (
+                            patch.object(read_surface.base, "__file__", str(alternate_module)),
+                            patch.object(native, "__file__", str(alternate_adapter)),
+                            patch.object(native, "store_root", side_effect=pinned_site) as verified,
+                        ):
+                            self.assertTrue(
+                                read_surface.grabowski_runtime_health()[
+                                    "deployment_integrity_valid"
+                                ]
+                            )
+                            verified.assert_called_once_with(alternate_module)
                 for changed in (
                     {"manifest_schema_valid": False},
                     {"agent_instructions_identity_valid": False},

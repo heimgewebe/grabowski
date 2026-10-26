@@ -1626,7 +1626,7 @@ def _deployment_integrity_projection(
                 == "share/grabowski/nixos-integrity-manifest.json"
                 and Path(manifest) == root / native.MANIFEST_RELATIVE
                 and adapter
-                == root / "lib/python3.12/site-packages/grabowski_nixos_integrity.py"
+                == source.with_name("grabowski_nixos_integrity.py")
             ):
                 contract = "nixos-immutable-v1"
                 fields = NIXOS_NATIVE_INTEGRITY_FIELDS
