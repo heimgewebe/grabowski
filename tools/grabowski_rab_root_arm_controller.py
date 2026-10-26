@@ -572,9 +572,17 @@ def _unit_argv(policy: dict[str, Any], index: int) -> list[str]:
         f"ReadWritePaths={' '.join(outputs)}",
         "TemporaryFileSystem=/dev/shm:rw,nosuid,nodev,noexec,mode=1777",
         "ProtectControlGroups=yes",
-        "ProtectKernelTunables=yes",
+        # On NixOS, ProtectKernelTunables/Logs=yes mounts locked-down
+        # procfs overlays. Real PID1 probes show these prevent the already
+        # required nested bwrap from mounting its own PID-namespace procfs.
+        # Keep DynamicUser, NoNewPrivileges, empty capabilities, private
+        # devices, strict readonly host filesystem and nested seccomp.
+        # Pop!_OS retains both original kernel protection properties.
+        ("ProtectKernelTunables=no" if _SYSTEMD_RUN.startswith("/run/current-system/sw/bin/")
+         else "ProtectKernelTunables=yes"),
         "ProtectKernelModules=yes",
-        "ProtectKernelLogs=yes",
+        ("ProtectKernelLogs=no" if _SYSTEMD_RUN.startswith("/run/current-system/sw/bin/")
+         else "ProtectKernelLogs=yes"),
         "KillMode=control-group",
         "SendSIGKILL=yes",
         "UMask=0077",

@@ -106,6 +106,30 @@ class RootArmPolicyTests(unittest.TestCase):
         changed["pair_id"] = "separate-frozen-pair"
         self.assertNotEqual(pair, controller._pair_state_directory(changed))
 
+    def test_kernel_guard_mount_compatibility_keeps_parent_unprivileged(self) -> None:
+        # Real NixOS PID1 DynamicUser probes established that either
+        # ProtectKernelTunables=yes or ProtectKernelLogs=yes locks the private
+        # proc mount required by the nested bwrap PID namespace. The parent
+        # must still lack capabilities and privilege escalation.
+        cmd = controller._unit_argv(_pair(), 0)
+        props = cmd[:cmd.index("--")]
+        self.assertIn("--property=DynamicUser=yes", props)
+        self.assertIn("--property=NoNewPrivileges=yes", props)
+        self.assertIn("--property=CapabilityBoundingSet=", props)
+        self.assertIn("--property=AmbientCapabilities=", props)
+        self.assertIn("--property=PrivateDevices=yes", props)
+        self.assertIn("--property=ProtectSystem=strict", props)
+        self.assertIn("--property=ProtectKernelModules=yes", props)
+        self.assertIn("--property=ProtectControlGroups=yes", props)
+        if controller._SYSTEMD_RUN == "/run/current-system/sw/bin/systemd-run":
+            self.assertIn("--property=ProtectKernelTunables=no", props)
+            self.assertIn("--property=ProtectKernelLogs=no", props)
+            self.assertNotIn("--property=ProtectKernelTunables=yes", props)
+            self.assertNotIn("--property=ProtectKernelLogs=yes", props)
+        else:
+            self.assertIn("--property=ProtectKernelTunables=yes", props)
+            self.assertIn("--property=ProtectKernelLogs=yes", props)
+
     def test_uninstalled_input_projection_denied_before_root_dispatch(self) -> None:
         # Neither a real provider nor a root-owned systemd unit is started.
         with tempfile.TemporaryDirectory() as tmp:
