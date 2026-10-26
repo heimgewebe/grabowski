@@ -339,11 +339,12 @@ def inventory_native_wal_readonly_sqlite(
         raise _changed(error_type, message, cause=exc)
     finally:
         if connection is not None:
-            try:
-                connection.rollback()
-            finally:
-                connection.close()
-
+            # The outer inventory scope can outlive individual legacy readers
+            # that explicitly close their handle. SQLite connection.close()
+            # safely releases a pinned read-only WAL transaction and is
+            # idempotent; rollback() on an already-closed handle would raise
+            # ProgrammingError and hide the actual observation result.
+            connection.close()
 
 
 @contextmanager

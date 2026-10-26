@@ -1611,7 +1611,7 @@ class AgentWorkspaceTests(unittest.TestCase):
                 workspace._workspace_dir("gaw-absent-workspace")
         self.assertFalse(root.exists())
 
-    def test_lane_backed_status_rejects_checkout_wal_without_sidecar_writes(self) -> None:
+    def test_lane_backed_status_reads_checkout_wal_without_sidecar_writes(self) -> None:
         lane = self.lane_receipt(idempotency_key="lane-strict-checkout-wal")
         plan = self.normalize_lane(lane)
         database = workspace.checkouts.CHECKOUT_DB
@@ -1624,19 +1624,23 @@ class AgentWorkspaceTests(unittest.TestCase):
             shm = Path(str(database) + "-shm")
             self.assertTrue(wal.is_file())
             self.assertTrue(shm.is_file())
-            before = {path: path.read_bytes() for path in (database, wal, shm)}
+            # Logical DB and committed WAL bytes are immutable for a reader.
+            # Existing SHM may change only as SQLite updates transient read marks.
+            before = {path: path.read_bytes() for path in (database, wal)}
+            shm_inode = shm.stat().st_ino
             with mock.patch.object(
                 workspace.operator,
                 "_require_operator_mutation",
                 side_effect=AssertionError("READ_ONLY workspace status requested mutation"),
             ) as gate:
                 observed = workspace._lane_binding_status(plan)
-            self.assertFalse(observed["valid"])
-            self.assertIn("Strict read-only snapshot unavailable", observed["error"])
+            # A regular, complete WAL/SHM pair is a supported pinned read.
+            self.assertTrue(observed["valid"], observed)
             gate.assert_not_called()
             self.assertEqual(
-                before, {path: path.read_bytes() for path in (database, wal, shm)}
+                before, {path: path.read_bytes() for path in (database, wal)}
             )
+            self.assertEqual(shm_inode, shm.stat().st_ino)
         finally:
             keeper.close()
 
@@ -1650,7 +1654,7 @@ class AgentWorkspaceTests(unittest.TestCase):
             keeper.commit()
             self.assertTrue(Path(str(workspace.resources.RESOURCE_DB) + "-wal").is_file())
             self.assertTrue(Path(str(workspace.resources.RESOURCE_DB) + "-shm").is_file())
-            self.assertFalse(workspace._lane_binding_status(plan)["valid"])
+            self.assertTrue(workspace._lane_binding_status(plan)["valid"])
             with mock.patch.object(
                 workspace.operator, "_require_operator_mutation"
             ) as mutation_gate:
@@ -1661,18 +1665,19 @@ class AgentWorkspaceTests(unittest.TestCase):
             self.assertEqual([mock.call("resource_lease")] * mutation_gate.call_count, mutation_gate.call_args_list)
         finally:
             keeper.close()
-        # SQLite fixture connections may survive keeper.close() on Python 3.12.
-        # Strict public READ_ONLY must reject any remaining WAL/SHM sidecars.
+        # Depending on SQLite/Python shutdown timing, sidecars may remain.
+        # A complete pair is permitted; an orphaned WAL or SHM must fail closed.
         wal = Path(str(workspace.resources.RESOURCE_DB) + "-wal")
         shm = Path(str(workspace.resources.RESOURCE_DB) + "-shm")
         checkout_wal = Path(str(workspace.checkouts.CHECKOUT_DB) + "-wal")
         checkout_shm = Path(str(workspace.checkouts.CHECKOUT_DB) + "-shm")
         observed = workspace._lane_binding_status(plan)
-        if any(path.exists() for path in (wal, shm, checkout_wal, checkout_shm)):
+        unpaired = wal.exists() != shm.exists() or checkout_wal.exists() != checkout_shm.exists()
+        if unpaired:
             self.assertFalse(observed["valid"])
             self.assertIn("Strict read-only snapshot unavailable", observed["error"])
         else:
-            self.assertTrue(observed["valid"])
+            self.assertTrue(observed["valid"], observed)
         # The exact lease must remain readable from a genuinely quiescent
         # SQLite backup, independent of other fixture writers' lifetimes.
         snapshot = self.root / "quiescent-resource-snapshot.sqlite3"
@@ -1970,8 +1975,12 @@ class AgentWorkspaceTests(unittest.TestCase):
             before = {
                 str(path): path.read_bytes()
                 for database in databases
-                for path in (database, Path(str(database) + "-wal"), Path(str(database) + "-shm"))
+                for path in (database, Path(str(database) + "-wal"))
             }
+            # SHM read-mark bytes are allowed to vary. Identity and data/WAL
+            # durability remain independently asserted under actual SQLite locks.
+            shms = {str(database): Path(str(database) + "-shm").stat().st_ino
+                    for database in databases}
             with (
                 mock.patch.object(workspace, "_writer_attempts", return_value=[{"actor": "initial_writer"}]),
                 mock.patch.object(workspace, "_writer_task_binding_reasons", return_value=[]),
@@ -2007,11 +2016,16 @@ class AgentWorkspaceTests(unittest.TestCase):
                         manifest, writer, snapshot, read_only=True
                     )
                 gate.assert_not_called()
-                self.assertIn("work_lane_binding_invalid", strict["reasons"])
-                self.assertIn("checkout_lifecycle_unobservable", strict["reasons"])
-                self.assertIn("workspace_lease_unobservable", strict["reasons"])
+                # Legitimate WAL no longer makes a READ_ONLY status appear
+                # unobservable; writer permission remains independently gated.
+                self.assertNotIn("work_lane_binding_invalid", strict["reasons"])
+                self.assertNotIn("checkout_lifecycle_unobservable", strict["reasons"])
+                self.assertNotIn("workspace_lease_unobservable", strict["reasons"])
                 for filename, payload in before.items():
                     self.assertEqual(Path(filename).read_bytes(), payload)
+                for database in databases:
+                    shm = Path(str(database) + "-shm")
+                    self.assertEqual(shms[str(database)], shm.stat().st_ino)
         finally:
             for connection in keepers:
                 connection.close()
