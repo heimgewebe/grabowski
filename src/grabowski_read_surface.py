@@ -1616,7 +1616,14 @@ def _deployment_integrity_projection(
     manifest = deployment.get("manifest_path")
     if isinstance(manifest, str) and Path(manifest).name == "nixos-integrity-manifest.json":
         try:
-            import grabowski_nixos_integrity as native
+            # This adapter is installed only in the pinned NixOS store, not
+            # in the portable release source set. Its optional lookup must
+            # leave portable import closure complete and unchanged.
+            # The immutable store-root, exact sibling and manifest checks
+            # below still decide whether native fields may be trusted.
+            import importlib
+
+            native = importlib.import_module("grabowski_nixos_integrity")
 
             source = Path(base.__file__).resolve(strict=True)
             root = native.store_root(source)

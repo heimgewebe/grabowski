@@ -1328,6 +1328,21 @@ class ReadSurfaceTests(unittest.TestCase):
                         read_surface.grabowski_runtime_health()["deployment_integrity_valid"]
                     )
 
+    def test_native_named_manifest_without_adapter_cannot_relax_portable_integrity(self) -> None:
+        # Even an apparently complete native manifest cannot reduce the
+        # portable release's full integrity contract without the pinned
+        # system-provided NixOS attestator.
+        deployment = {
+            "manifest_path": "/nix/store/fixture/share/grabowski/nixos-integrity-manifest.json",
+            "completion_status": "complete",
+            **{field: True for field in read_surface.NIXOS_NATIVE_INTEGRITY_FIELDS},
+        }
+        with patch.dict(sys.modules, {"grabowski_nixos_integrity": None}):
+            contract, integrity = read_surface._deployment_integrity_projection(deployment)
+        self.assertEqual("portable-v6", contract)
+        self.assertEqual(set(read_surface.DEPLOYMENT_INTEGRITY_FIELDS), set(integrity))
+        self.assertFalse(all(integrity.values()))
+
     def test_runtime_health_is_not_healthy_when_audit_is_valid_but_not_writable(self) -> None:
         deployment = {"completion_status": "complete"}
         deployment.update({key: True for key in read_surface.DEPLOYMENT_INTEGRITY_FIELDS})
