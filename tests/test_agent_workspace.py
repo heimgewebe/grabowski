@@ -1611,7 +1611,7 @@ class AgentWorkspaceTests(unittest.TestCase):
                 workspace._workspace_dir("gaw-absent-workspace")
         self.assertFalse(root.exists())
 
-    def test_lane_backed_status_reads_checkout_wal_without_sidecar_writes(self) -> None:
+    def test_lane_backed_status_gates_live_checkout_wal_read_marks(self) -> None:
         lane = self.lane_receipt(idempotency_key="lane-strict-checkout-wal")
         plan = self.normalize_lane(lane)
         database = workspace.checkouts.CHECKOUT_DB
@@ -1628,15 +1628,25 @@ class AgentWorkspaceTests(unittest.TestCase):
             # Existing SHM may change only as SQLite updates transient read marks.
             before = {path: path.read_bytes() for path in (database, wal)}
             shm_inode = shm.stat().st_ino
+            before_shm = shm.read_bytes()
             with mock.patch.object(
                 workspace.operator,
                 "_require_operator_mutation",
-                side_effect=AssertionError("READ_ONLY workspace status requested mutation"),
-            ) as gate:
+                side_effect=PermissionError("WAL SHM mutation admission denied"),
+            ) as denied_gate:
+                denied = workspace._lane_binding_status(plan)
+            # A status-only caller cannot update SQLite SHM read marks.
+            self.assertFalse(denied["valid"], denied)
+            self.assertIn("WAL SHM mutation admission denied", denied["error"])
+            denied_gate.assert_any_call("resource_lease")
+            self.assertEqual(before_shm, shm.read_bytes())
+            # An admitted operator may pin a normal live WAL snapshot.
+            with mock.patch.object(
+                workspace.operator, "_require_operator_mutation"
+            ) as admitted_gate:
                 observed = workspace._lane_binding_status(plan)
-            # A regular, complete WAL/SHM pair is a supported pinned read.
             self.assertTrue(observed["valid"], observed)
-            gate.assert_not_called()
+            admitted_gate.assert_any_call("resource_lease")
             self.assertEqual(
                 before, {path: path.read_bytes() for path in (database, wal)}
             )
@@ -2007,20 +2017,40 @@ class AgentWorkspaceTests(unittest.TestCase):
                             manifest, writer, snapshot, read_only=False
                         )
 
+                # Status-only access must also pass admission when native WAL
+                # observation would mutate existing SHM read marks.
                 with mock.patch.object(
-                    workspace.operator,
-                    "_require_operator_mutation",
-                    side_effect=AssertionError("READ_ONLY must not enter mutation"),
-                ) as gate:
-                    strict = workspace._writer_handoff_eligibility(
+                    workspace.operator, "_require_operator_mutation"
+                ) as admission:
+                    admitted = workspace._writer_handoff_eligibility(
                         manifest, writer, snapshot, read_only=True
                     )
-                gate.assert_not_called()
-                # Legitimate WAL no longer makes a READ_ONLY status appear
-                # unobservable; writer permission remains independently gated.
-                self.assertNotIn("work_lane_binding_invalid", strict["reasons"])
-                self.assertNotIn("checkout_lifecycle_unobservable", strict["reasons"])
-                self.assertNotIn("workspace_lease_unobservable", strict["reasons"])
+                admission.assert_any_call("resource_lease")
+                self.assertNotIn("work_lane_binding_invalid", admitted["reasons"])
+                self.assertNotIn("checkout_lifecycle_unobservable", admitted["reasons"])
+                self.assertNotIn("workspace_lease_unobservable", admitted["reasons"])
+                before_denied_shm = {
+                    str(database): Path(str(database) + "-shm").read_bytes()
+                    for database in databases
+                }
+                with mock.patch.object(
+                    workspace.operator, "_require_operator_mutation",
+                    side_effect=PermissionError("WAL SHM admission denied"),
+                ) as denied_gate:
+                    denied = workspace._writer_handoff_eligibility(
+                        manifest, writer, snapshot, read_only=True
+                    )
+                denied_gate.assert_any_call("resource_lease")
+                self.assertIn("work_lane_binding_invalid", denied["reasons"])
+                self.assertIn("checkout_lifecycle_unobservable", denied["reasons"])
+                self.assertIn("workspace_lease_unobservable", denied["reasons"])
+                self.assertEqual(
+                    before_denied_shm,
+                    {
+                        str(database): Path(str(database) + "-shm").read_bytes()
+                        for database in databases
+                    },
+                )
                 for filename, payload in before.items():
                     self.assertEqual(Path(filename).read_bytes(), payload)
                 for database in databases:
@@ -12910,9 +12940,7 @@ class AgentWorkspaceTests(unittest.TestCase):
                 side_effect=AssertionError("READ_ONLY candidate requested writer lane"),
             ) as writer_lane,
             mock.patch.object(
-                workspace.operator,
-                "_require_operator_mutation",
-                side_effect=AssertionError("READ_ONLY candidate requested mutation"),
+                workspace.operator, "_require_operator_mutation"
             ) as mutation_gate,
         ):
             status = workspace.grabowski_agent_workspace_status(
@@ -12920,7 +12948,9 @@ class AgentWorkspaceTests(unittest.TestCase):
             )
 
         writer_lane.assert_not_called()
-        mutation_gate.assert_not_called()
+        # The task/resource WAL inventory conditionally requires SHM mutation
+        # admission even for a status projection; that permission was granted.
+        mutation_gate.assert_any_call("resource_lease")
         self.assertTrue(status["candidate_revision"]["eligible"])
         self.assertEqual(
             status["candidate_revision"]["candidate_id"], candidate["candidate_id"]
