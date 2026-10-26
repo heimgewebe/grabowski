@@ -2762,11 +2762,9 @@ def _self_review_audit_errors(
     if evidence.get("review_tier") == "high_critical":
         if type(minimum) is not int or minimum != 5 or type(actual) is not int or actual < 5:
             errors.append("high-critical self-review depth must be at least 5")
-        if evidence.get("review_pass_axes") != list(grabowski_merge_guard.HIGH_CRITICAL_REVIEW_AXES):
-            errors.append("high-critical review axes are absent, duplicated or not methodologically distinct")
-        digest = evidence.get("review_pass_evidence_sha256")
-        if not isinstance(digest, str) or not _is_sha256_hex(digest):
-            errors.append("high-critical review pass evidence digest is missing or invalid")
+        errors.extend(
+            grabowski_merge_guard.high_critical_review_pass_evidence_errors(evidence)
+        )
     remaining = evidence.get("material_findings_remaining")
     if isinstance(remaining, bool) or not isinstance(remaining, int) or remaining < 0:
         errors.append("material_findings_remaining must be an integer >= 0")

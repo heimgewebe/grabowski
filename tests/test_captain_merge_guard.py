@@ -184,17 +184,40 @@ def _large_git_repo(
     return temporary, repo, base_sha, head_sha, paths
 
 
+def _five_material_review_passes() -> list[dict[str, object]]:
+    return [
+        {
+            "n": n,
+            "axis": axis,
+            "summary": (
+                f"Verified contract and failure semantics for methodology {axis} "
+                f"against the test fixtures and exact diff in pass {n}."
+            ),
+            "evidence_refs": [f"tests/test_captain_merge_guard.py:method-{n}-negative"],
+            "material_findings": 0,
+        }
+        for n, axis in enumerate(merge_guard.HIGH_CRITICAL_REVIEW_AXES, start=1)
+    ]
+
+
 class RiskScaledIndependentReviewContractTests(unittest.TestCase):
     @staticmethod
     def _request(**overrides: object) -> dict[str, object]:
+        passes = _five_material_review_passes()
         review: dict[str, object] = {
+            "review_iterations": passes,
             "review_policy_version": merge_guard.REVIEW_POLICY_VERSION,
             "review_tier": "high_critical",
             "independent_review_required": False,
             "minimum_review_iterations": 5,
             "actual_review_iterations": 5,
             "review_pass_axes": list(merge_guard.HIGH_CRITICAL_REVIEW_AXES),
-            "review_pass_evidence_sha256": "a" * 64,
+            "review_pass_evidence_sha256": hashlib.sha256(
+                json.dumps(
+                    passes, sort_keys=True, separators=(",", ":"),
+                    ensure_ascii=False,
+                ).encode("utf-8")
+            ).hexdigest(),
         }
         result: dict[str, object] = {"review_evidence": review}
         result.update(overrides)
@@ -205,6 +228,20 @@ class RiskScaledIndependentReviewContractTests(unittest.TestCase):
         self.assertFalse(requirement["required"])
         self.assertTrue(requirement["high_critical_risk"])
         self.assertEqual(requirement["errors"], [])
+
+    def test_fabricated_digest_without_reports_is_blocked(self) -> None:
+        request = self._request()
+        request["review_evidence"].pop("review_iterations")
+        failures = merge_guard.independent_review_requirement(request)["errors"]
+        self.assertIn("high_critical_review_pass_records_missing_or_invalid", failures)
+
+    def test_tampered_or_boilerplate_report_is_blocked(self) -> None:
+        request = self._request()
+        passes = request["review_evidence"]["review_iterations"]
+        passes[0]["summary"] = "PASS"
+        failures = merge_guard.independent_review_requirement(request)["errors"]
+        self.assertIn("high_critical_review_pass_summary_invalid", failures)
+        self.assertIn("high_critical_review_pass_evidence_digest_invalid", failures)
 
     def test_independent_review_remains_explicit_per_pr_opt_in(self) -> None:
         requirement = merge_guard.independent_review_requirement(

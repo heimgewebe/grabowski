@@ -12284,6 +12284,22 @@ def captain_action(**overrides) -> dict[str, object]:
     return action
 
 
+def _captain_material_review_passes() -> list[dict[str, object]]:
+    return [
+        {
+            "n": n,
+            "axis": axis,
+            "summary": (
+                f"Verified the actual review method {axis} in iteration {n} "
+                "against the concrete review gate and regression fixtures."
+            ),
+            "evidence_refs": [f"tests/test_grips.py:critical-pass-{n}-negative"],
+            "material_findings": 0,
+        }
+        for n, axis in enumerate(merge_guard.HIGH_CRITICAL_REVIEW_AXES, start=1)
+    ]
+
+
 def captain_parameters(actions: list[dict[str, object]] | None = None, **overrides) -> dict[str, object]:
     source = str(overrides.get("status_projection_source", "bureau status-projection"))
     projection = {
@@ -12293,6 +12309,7 @@ def captain_parameters(actions: list[dict[str, object]] | None = None, **overrid
         "generated_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
         "run_id": "captain-status-projection-test-run",
     }
+    passes = _captain_material_review_passes()
     parameters: dict[str, object] = {
         "actions": actions if actions is not None else [captain_action()],
         "status_projection": projection,
@@ -12318,7 +12335,13 @@ def captain_parameters(actions: list[dict[str, object]] | None = None, **overrid
             "minimum_review_iterations": 5,
             "actual_review_iterations": 5,
             "review_pass_axes": list(merge_guard.HIGH_CRITICAL_REVIEW_AXES),
-            "review_pass_evidence_sha256": "a" * 64,
+            "review_iterations": passes,
+            "review_pass_evidence_sha256": hashlib.sha256(
+                json.dumps(
+                    passes, sort_keys=True, separators=(",", ":"),
+                    ensure_ascii=False,
+                ).encode("utf-8")
+            ).hexdigest(),
             "all_findings_triaged": True,
             "finding_count": 0,
             "material_findings_remaining": 0,

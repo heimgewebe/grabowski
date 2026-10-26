@@ -3521,9 +3521,12 @@ def build_self_review_audit(
             item.get("axis") for item in iterations
             if isinstance(item, dict) and isinstance(item.get("axis"), str)
         ] if isinstance(iterations, list) else [],
+        "review_iterations": iterations if isinstance(iterations, list) else [],
         "review_pass_evidence_sha256": hashlib.sha256(
-            json.dumps(iterations if isinstance(iterations, list) else [],
-                       sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+            json.dumps(
+                iterations if isinstance(iterations, list) else [],
+                sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+            ).encode("utf-8")
         ).hexdigest(),
         "all_findings_triaged": (
             self_review.get("all_findings_triaged") is True

@@ -552,6 +552,79 @@ HIGH_CRITICAL_REVIEW_AXES = (
 )
 
 
+def high_critical_review_pass_evidence_errors(evidence: Any) -> list[str]:
+    """Validate the full five-pass audit records, not a caller-supplied hex digest.
+
+    Structural integrity does not independently authenticate who performed a
+    review. The trusted review producer and existing PR/CI origin gates remain
+    mandatory and cannot be inferred from this function.
+    """
+    if not isinstance(evidence, dict):
+        return ["high_critical_review_pass_records_missing_or_invalid"]
+    passes = evidence.get("review_iterations")
+    if not isinstance(passes, list) or not 5 <= len(passes) <= 32:
+        return ["high_critical_review_pass_records_missing_or_invalid"]
+    errors: list[str] = []
+    if type(evidence.get("actual_review_iterations")) is not int or (
+        evidence["actual_review_iterations"] != len(passes)
+    ):
+        errors.append("high_critical_review_pass_count_mismatch")
+    axes = [
+        item.get("axis") if isinstance(item, dict) else None
+        for item in passes
+    ]
+    if (
+        axes[:5] != list(HIGH_CRITICAL_REVIEW_AXES)
+        or evidence.get("review_pass_axes") != axes
+    ):
+        errors.append("high_critical_review_axes_invalid")
+    summaries: list[str] = []
+    for index, item in enumerate(passes, start=1):
+        if not isinstance(item, dict):
+            errors.append("high_critical_review_pass_record_invalid")
+            continue
+        if type(item.get("n")) is not int or item["n"] != index:
+            errors.append("high_critical_review_pass_number_invalid")
+        summary = item.get("summary")
+        if not isinstance(summary, str) or len(" ".join(summary.split())) < 36:
+            errors.append("high_critical_review_pass_summary_invalid")
+        else:
+            summaries.append(" ".join(summary.split()).casefold())
+        refs = item.get("evidence_refs")
+        if (
+            not isinstance(refs, list) or not refs
+            or len(refs) > 64
+            or any(
+                not isinstance(ref, str) or not 8 <= len(ref) <= 1024
+                or any(ord(ch) < 32 or ord(ch) == 127 for ch in ref)
+                for ref in refs
+            )
+        ):
+            errors.append("high_critical_review_pass_refs_invalid")
+        count = item.get("material_findings")
+        if type(count) is not int or count < 0:
+            errors.append("high_critical_review_pass_findings_invalid")
+    if len(summaries) != len(set(summaries)):
+        errors.append("high_critical_review_pass_summaries_duplicated")
+    try:
+        encoded = json.dumps(
+            passes, sort_keys=True, separators=(",", ":"),
+            ensure_ascii=False, allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError):
+        return [*errors, "high_critical_review_pass_serialization_invalid"]
+    if len(encoded) > 64 * 1024:
+        errors.append("high_critical_review_pass_records_oversized")
+    digest = evidence.get("review_pass_evidence_sha256")
+    if (
+        not isinstance(digest, str)
+        or _SHA256_RE.fullmatch(digest) is None
+        or digest != hashlib.sha256(encoded).hexdigest()
+    ):
+        errors.append("high_critical_review_pass_evidence_digest_invalid")
+    return errors
+
+
 def independent_review_requirement(parameters: dict[str, Any]) -> dict[str, Any]:
     """Separate risk-scaled self-review quality from explicit reviewer opt-in.
 
@@ -597,11 +670,7 @@ def independent_review_requirement(parameters: dict[str, Any]) -> dict[str, Any]
             or type(actual) is not int or actual < 5
         ):
             errors.append("high_critical_self_review_depth_invalid")
-        if review_evidence.get("review_pass_axes") != list(HIGH_CRITICAL_REVIEW_AXES):
-            errors.append("high_critical_review_axes_invalid")
-        proof_digest = review_evidence.get("review_pass_evidence_sha256")
-        if not isinstance(proof_digest, str) or _SHA256_RE.fullmatch(proof_digest) is None:
-            errors.append("high_critical_review_pass_evidence_digest_invalid")
+        errors.extend(high_critical_review_pass_evidence_errors(review_evidence))
     policy_required = policy_value is True
     explicitly_required = explicit_value is True
     return {

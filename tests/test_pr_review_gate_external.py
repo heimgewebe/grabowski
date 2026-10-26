@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -238,6 +239,16 @@ class SelfReviewDepthPolicyTests(unittest.TestCase):
         self.assertEqual(result["verdict"], "PASS", result["failures"])
         audit = gate.build_self_review_audit(state, result, review)
         self.assertEqual(audit["review_pass_axes"], list(gate.REQUIRED_HIGH_CRITICAL_REVIEW_AXES))
+        self.assertEqual(audit["review_iterations"], review["review_iterations"])
+        self.assertEqual(
+            audit["review_pass_evidence_sha256"],
+            hashlib.sha256(
+                json.dumps(
+                    audit["review_iterations"], sort_keys=True,
+                    separators=(",", ":"), ensure_ascii=False,
+                ).encode("utf-8")
+            ).hexdigest(),
+        )
         self.assertRegex(audit["review_pass_evidence_sha256"], r"^[0-9a-f]{64}$")
 
     def test_multiple_critical_signals_raise_depth_to_five(self) -> None:
