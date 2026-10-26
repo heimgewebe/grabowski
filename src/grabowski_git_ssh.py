@@ -7,6 +7,7 @@ transport override is consulted. No key material is read or logged here.
 from __future__ import annotations
 
 import os
+from collections import deque
 from pathlib import Path
 import pwd
 import shlex
@@ -37,10 +38,53 @@ def _root_managed_chain(path: Path) -> None:
             raise PermissionError(f"SSH executable parent is not a directory: {node}")
 
 
+
+def _root_managed_resolution(path: Path) -> Path:
+    """Audit every symlink hop and pin the validated final executable.
+
+    Checking only the spelling of an alias and its final realpath misses
+    intermediate symlink targets in attacker-controlled directories.
+    """
+    if not path.is_absolute():
+        raise PermissionError("System executable must use an absolute path")
+    remaining = deque(path.parts[1:])
+    current = Path("/")
+    link_count = 0
+    while remaining:
+        component = remaining.popleft()
+        if component in ("", "."):
+            continue
+        if component == "..":
+            current = current.parent
+            continue
+        step = current / component
+        _root_managed_chain(step)
+        info = step.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            link_count += 1
+            if link_count > 40:
+                raise PermissionError("Too many executable symlink hops")
+            target = Path(os.readlink(step))
+            if target.is_absolute():
+                current = Path("/")
+            remaining.extendleft(reversed(target.parts[1:] if target.is_absolute() else target.parts))
+            continue
+        if remaining and not stat.S_ISDIR(info.st_mode):
+            raise PermissionError("Executable symlink traverses a non-directory")
+        current = step
+    # A concurrent retarget is harmless only when we never execute the
+    # original alias again. Reconciliation additionally rejects path drift.
+    final = path.resolve(strict=True)
+    if final != current:
+        raise PermissionError("System executable resolution changed during validation")
+    _root_managed_chain(final)
+    return final
+
+
 def _trusted_executable(path: Path) -> Path:
     if path not in SSH_CANDIDATES:
         raise PermissionError("SSH executable outside the supported system paths")
-    real = path.resolve(strict=True)
+    real = _root_managed_resolution(path)
     if path == _NIX_SSH and not real.is_relative_to(_NIX_STORE):
         raise PermissionError("NixOS OpenSSH does not resolve into the Nix store")
     _root_managed_chain(path)
@@ -58,8 +102,7 @@ def _selected_ssh_executable() -> Path:
         if os.path.lexists(path):
             # If a preferred path exists but is untrusted, never silently fall
             # through to a second implementation.
-            _trusted_executable(path)
-            return path
+            return _trusted_executable(path)
     raise FileNotFoundError("No trusted system OpenSSH executable is installed")
 
 
@@ -80,15 +123,15 @@ def trusted_git_cli_path() -> str:
             if not os.path.lexists(nix_git):
                 raise PermissionError("legacy Git symlink lacks trusted NixOS Git")
             try:
-                legacy_target = path.resolve(strict=True)
-                nix_target = nix_git.resolve(strict=True)
+                legacy_target = _root_managed_resolution(path)
+                nix_target = _root_managed_resolution(nix_git)
             except (OSError, RuntimeError) as exc:
                 raise PermissionError("legacy Git symlink lacks trusted NixOS Git") from exc
             if legacy_target != nix_target or not nix_target.is_relative_to(_NIX_STORE):
                 raise PermissionError("legacy Git symlink does not match NixOS system Git")
             _root_managed_chain(path)
             continue  # The canonical NixOS path is checked by this same loop.
-        actual = path.resolve(strict=True)
+        actual = _root_managed_resolution(path)
         if path == candidates[1] and not actual.is_relative_to(_NIX_STORE):
             raise PermissionError("NixOS Git must resolve into the Nix store")
         _root_managed_chain(path)
@@ -102,7 +145,7 @@ def trusted_git_cli_path() -> str:
             or not os.access(actual, os.X_OK)
         ):
             raise PermissionError("Git CLI is not a trusted system executable")
-        return str(path)
+        return str(actual)
     raise FileNotFoundError("No root-managed Git CLI is installed")
 
 

@@ -66,6 +66,53 @@ class GitSshTransportTests(unittest.TestCase):
             with self.assertRaises(PermissionError):
                 transport._trusted_executable(link)
 
+    def test_symlink_hop_is_audited_before_executing_resolved_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            trusted = base / "trusted-ssh"
+            trusted.write_text("#!/bin/sh\\nexit 0\\n")
+            trusted.chmod(0o755)
+            relay = base / "relay"
+            relay.symlink_to(trusted)
+            intermediate = base / "staging"
+            intermediate.mkdir()
+            entry = intermediate / "ssh"
+            entry.symlink_to(relay)
+            inspected = []
+            with patch.object(transport, "_root_managed_chain", side_effect=inspected.append):
+                self.assertEqual(trusted, transport._root_managed_resolution(entry))
+            self.assertIn(entry, inspected)
+            self.assertIn(relay, inspected)
+            self.assertIn(trusted, inspected)
+
+    def test_mutable_intermediate_symlink_hop_blocks_before_use(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            trusted = base / "trusted-ssh"
+            trusted.write_text("#!/bin/sh\\nexit 0\\n")
+            intermediate = base / "mutable"
+            intermediate.mkdir()
+            relay = intermediate / "redirect"
+            relay.symlink_to(trusted)
+            entry = base / "ssh"
+            entry.symlink_to(relay)
+
+            def root_managed_check(path: Path) -> None:
+                if path == relay:
+                    raise PermissionError("mutable intermediate symlink")
+            with patch.object(transport, "_root_managed_chain", side_effect=root_managed_check):
+                with self.assertRaisesRegex(PermissionError, "mutable intermediate"):
+                    transport._root_managed_resolution(entry)
+
+    def test_selected_ssh_pins_realpath_instead_of_using_validated_alias(self) -> None:
+        real = Path("/nix/store/pinned-openssh/bin/ssh")
+        with (
+            patch.object(transport.os.path, "lexists", return_value=True),
+            patch.object(transport, "_trusted_executable", return_value=real) as validate,
+        ):
+            self.assertEqual(real, transport._selected_ssh_executable())
+        validate.assert_called_once_with(Path("/usr/bin/ssh"))
+
     def test_key_from_non_private_directory_is_denied(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             home = self._home_with_key(Path(tmp))
@@ -160,13 +207,13 @@ class GitSshTransportTests(unittest.TestCase):
             self.skipTest("NixOS legacy Git alias unavailable")
         if legacy.resolve(strict=True) != nix.resolve(strict=True):
             self.skipTest("NixOS Git alias differs")
-        self.assertEqual(str(nix), transport.trusted_git_cli_path())
+        self.assertEqual(str(nix.resolve(strict=True)), transport.trusted_git_cli_path())
 
     def test_foreign_legacy_git_symlink_is_denied(self) -> None:
         with (
             patch.object(transport.os.path, "lexists", return_value=True),
             patch.object(transport.Path, "lstat", return_value=SimpleNamespace(st_mode=stat.S_IFLNK | 0o777, st_uid=0)),
-            patch.object(transport.Path, "resolve", side_effect=[Path("/nix/store/foreign/bin/git"), Path("/nix/store/system/bin/git")]),
+            patch.object(transport, "_root_managed_resolution", side_effect=[Path("/nix/store/foreign/bin/git"), Path("/nix/store/system/bin/git")]),
         ):
             with self.assertRaisesRegex(PermissionError, "does not match NixOS"):
                 transport.trusted_git_cli_path()
