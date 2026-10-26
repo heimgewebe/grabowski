@@ -177,6 +177,31 @@ class NixStoreSandboxTests(unittest.TestCase):
                             **kwargs,
                         )
 
+    def test_nix_store_cannot_be_shadowed_through_parent_escape_or_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            worktree = Path(raw) / "repo"
+            worktree.mkdir()
+            fixture = worktree / "private"
+            fixture.write_text("fixture", encoding="utf-8")
+            fixture.chmod(0o600)
+            alias = worktree / "store_alias"
+            alias.symlink_to(Path("/nix/store"), target_is_directory=True)
+            cases = (
+                {"extra_read_only": ((fixture, Path("/var/../nix/store/override")),)},
+                {"extra_read_only": ((fixture, Path("/tmp/../nix/store/override")),)},
+                {"extra_read_only": ((fixture, alias / "override"),)},
+                {"extra_read_write": ((fixture, Path("/tmp/../nix/store/override")),)},
+            )
+            with mock.patch.object(sandbox, "_trusted_nix_store", return_value=Path("/nix/store")):
+                for kwargs in cases:
+                    with self.subTest(kwargs=kwargs), self.assertRaises(sandbox.AgentSandboxError):
+                        sandbox.minimal_sandbox_argv(
+                            workspace=worktree,
+                            command=["/usr/bin/true"],
+                            workspace_writable=False,
+                            **kwargs,
+                        )
+
     def test_real_nixos_bwrap_executes_from_immutable_store(self) -> None:
         if not Path("/nix/store").is_dir():
             self.skipTest("not running on NixOS")

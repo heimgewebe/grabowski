@@ -956,7 +956,9 @@ def minimal_sandbox_argv(
         if (
             not target_value.is_absolute()
             or "\x00" in str(target_value)
+            or ".." in target_value.parts
             or target_value.is_relative_to(Path("/nix"))
+            or target_value.resolve(strict=False).is_relative_to(Path("/nix"))
         ):
             raise AgentSandboxError("extra_read_only target must be absolute and outside /nix")
         target = str(target_value)
@@ -990,6 +992,7 @@ def minimal_sandbox_argv(
         if (
             not target_path.is_absolute()
             or "\x00" in str(target_path)
+            or ".." in target_path.parts
             or target_path == Path("/tmp")
             or not target_path.is_relative_to(Path("/tmp"))
         ):
