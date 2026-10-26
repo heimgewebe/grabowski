@@ -1119,10 +1119,14 @@ def _reserve_checkout_lifecycle(
     )
     branch = _expected_branch(expected_branch)
     checkout_key = _checkout_key(common_dir, checkout)
-    now = _now()
-    live_leases = _live_checkout_lease_keys(now=now)
     with closing(_database()) as connection, connection:
+        # Capacity and the lease snapshot must share one serialized checkout
+        # admission point. A snapshot taken before BEGIN IMMEDIATE can omit
+        # another lane's newly committed checkout despite seeing its lifecycle
+        # row, allowing an extra active writer beyond the configured limit.
         connection.execute("BEGIN IMMEDIATE")
+        now = _now()
+        live_leases = _live_checkout_lease_keys(now=now)
         existing = connection.execute(
             "SELECT * FROM lifecycle_bindings WHERE checkout_key=?",
             (checkout_key,),
