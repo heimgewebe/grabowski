@@ -3349,6 +3349,50 @@ class OperatorContractTests(unittest.TestCase):
                 self.assertEqual(persisted["origin_sha256"], job["origin_sha256"])
 
 
+    def test_failed_review_origin_bootstrap_leaves_no_canonical_prelaunch_stub(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state, jobs, cwd = root / "state", root / "state/jobs", root / "cwd"
+            cwd.mkdir(mode=0o700)
+            binding = {
+                "schema_version": 1,
+                "kind": operator.decision_reviews.BINDING_KIND,
+                "repo": "heimgewebe/vibe-lab",
+                "pr": 350,
+                "head_sha": "a" * 40,
+                "base_sha": "b" * 40,
+                "diff_sha256": "c" * 64,
+                "slot": "independent-reviewer",
+            }
+            with (
+                patch.object(operator, "STATE_DIR", state),
+                patch.object(operator, "JOBS_DIR", jobs),
+                patch.object(operator.uuid, "uuid4", return_value=types.SimpleNamespace(
+                    hex="abc123def456" + "f" * 20
+                )),
+                patch.object(
+                    operator.decision_reviews, "bind_job_review_role_argv",
+                    side_effect=lambda command, *_args, **_kwargs: command,
+                ),
+                patch.object(operator.decision_reviews, "review_role_provenance", return_value=None),
+                patch.object(
+                    operator.job_origin, "build_origin",
+                    side_effect=ValueError("origin bootstrap intentionally failed"),
+                ),
+                patch.object(operator, "_run", side_effect=AssertionError("must not dispatch")),
+            ):
+                with self.assertRaisesRegex(ValueError, "origin bootstrap intentionally failed"):
+                    operator._start_job(
+                        ["/usr/bin/python3", "-c", "print('review')"],
+                        cwd=str(cwd), runtime_seconds=60,
+                        decision_review_binding=binding,
+                    )
+            self.assertFalse(
+                list(jobs.glob("grabowski-job-*")),
+                "failed origin allocation must not leave any canonical prelaunch directory",
+            )
+
     def test_noncanonical_review_module_cannot_create_job_directory(self) -> None:
         operator = _load_operator_module()
         with tempfile.TemporaryDirectory() as temporary:
@@ -5970,7 +6014,10 @@ class OperatorContractTests(unittest.TestCase):
                 ["git", "-C", str(repo), "remote", "add", "origin", f"ssh://test.invalid{bare}"],
                 check=True,
             )
-            environment = operator._git_push_environment()
+            # This refspec test uses an isolated fake SSH transport, not a real
+            # GitHub writer identity on the GitHub Actions runner.
+            with patch.object(operator.grabowski_git_ssh, "hardened_git_ssh_command", return_value=str(fake_ssh)):
+                environment = operator._git_push_environment()
             environment["GIT_SSH_COMMAND"] = str(fake_ssh)
             with (
                 patch.object(operator, "_require_operator_mutation", return_value=None),
@@ -6001,11 +6048,15 @@ class OperatorContractTests(unittest.TestCase):
             "SSH_ASKPASS": "/tmp/evil-ssh-askpass",
             "GIT_ALLOW_PROTOCOL": "ext:file:ssh:https",
         }
-        with patch.object(operator, "_git_environment", return_value=injected):
+        fixed_command = "/usr/bin/ssh -F /dev/null -oBatchMode=yes -oIdentityFile=/trusted/key"
+        with (
+            patch.object(operator, "_git_environment", return_value=injected),
+            patch.object(operator.grabowski_git_ssh, "hardened_git_ssh_command", return_value=fixed_command),
+        ):
             environment = operator._git_push_environment()
         self.assertNotIn("GIT_SSH", environment)
         self.assertNotIn("GIT_PROXY_COMMAND", environment)
-        self.assertEqual("/usr/bin/ssh -F /dev/null -oBatchMode=yes -oProxyCommand=none -oPermitLocalCommand=no -oClearAllForwardings=yes", environment["GIT_SSH_COMMAND"])
+        self.assertEqual(fixed_command, environment["GIT_SSH_COMMAND"])
         self.assertEqual("ssh", environment["GIT_SSH_VARIANT"])
         self.assertEqual("/bin/false", environment["GIT_ASKPASS"])
         self.assertEqual("/bin/false", environment["SSH_ASKPASS"])
@@ -7319,7 +7370,7 @@ class GitServerVerifiedReadTransportTests(unittest.TestCase):
                 )
 
             self.assertEqual(result["returncode"], 0)
-            self.assertEqual(result["argv"][0], "/usr/bin/git")
+            self.assertEqual(result["argv"][0], operator._trusted_git_cli_path())
             self.assertFalse(invoked.exists())
             mutation.assert_not_called()
 
