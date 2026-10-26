@@ -552,7 +552,7 @@ def _sandbox_probe_python() -> str:
             continue
         if resolved.is_file() and os.access(resolved, os.X_OK):
             return str(resolved)
-    raise RuntimeError("no trusted Python interpreter is available inside the minimal role sandbox")
+    raise RuntimeError("no Python interpreter is available inside trusted read-only role sandbox roots")
 
 
 def toolchain_probe(repo: Path, command: list[str]) -> dict[str, Any]:
