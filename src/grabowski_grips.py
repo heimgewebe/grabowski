@@ -2012,12 +2012,46 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _git_transport_subcommand(arguments: list[str]) -> str | None:
+    """Extract only the Git verb; option values and operands are not verbs.
+
+    Unknown global options fail closed to the SSH-disabled local runner.
+    """
+    index = 0
+    no_value = frozenset({
+        "--no-optional-locks", "--no-pager", "--paginate", "-p", "-P",
+        "--no-replace-objects", "--literal-pathspecs", "--glob-pathspecs",
+        "--noglob-pathspecs", "--icase-pathspecs", "--no-lazy-fetch",
+    })
+    value_options = frozenset({
+        "-c", "-C", "--git-dir", "--work-tree", "--namespace", "--config-env",
+        "--exec-path", "--super-prefix",
+    })
+    assigned_options = (
+        "--git-dir=", "--work-tree=", "--namespace=", "--config-env=",
+        "--exec-path=", "--super-prefix=",
+    )
+    while index < len(arguments):
+        item = arguments[index]
+        if item in value_options:
+            index += 2
+            continue
+        if item in no_value or (
+            item.startswith(("-c", "-C")) and len(item) > 2
+        ) or item.startswith(assigned_options):
+            index += 1
+            continue
+        # A new/unknown Git switch is not grounds to expose writer credentials.
+        return None if item.startswith("-") else item
+    return None
+
+
 def _default_command_runner(repo: Path, argv: list[str]) -> dict[str, Any]:
     command = [grabowski_git_ssh.trusted_git_cli_path(), "--no-optional-locks", "-C", str(repo), *argv]
     env = os.environ.copy()
     # Purely local reads must not depend on any GitHub writer credential.
     # Unknown/aliased operations remain SSH-disabled rather than falling back.
-    remote_ssh_operation = any(token in {"push", "fetch", "pull", "clone", "ls-remote"} for token in argv)
+    remote_ssh_operation = _git_transport_subcommand(argv) in {"push", "fetch", "pull", "clone", "ls-remote"}
     exact_deny = {
         "GIT_DIR",
         "GIT_WORK_TREE",
