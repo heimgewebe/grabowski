@@ -13,7 +13,7 @@ import time
 import uuid
 from typing import Any
 
-from grabowski_agent_sandbox import minimal_sandbox_argv, prepare_external_agent_command, runtime_sandbox_argv, safe_git_environment, run_bounded_capture
+from grabowski_agent_sandbox import _trusted_nix_store, minimal_sandbox_argv, prepare_external_agent_command, runtime_sandbox_argv, safe_git_environment, run_bounded_capture
 
 SHA40 = __import__("re").compile(r"^[0-9a-f]{40}$")
 SHA256 = __import__("re").compile(r"^[0-9a-f]{64}$")
@@ -533,6 +533,8 @@ def _sandbox_probe_python() -> str:
     be used as the probe runner.
     """
     usr_root = Path("/usr")
+    # Use the same root-owned non-writable Nix store admitted by minimal_sandbox_argv.
+    nix_store = _trusted_nix_store()
     candidates = [Path(sys.executable), Path("/usr/bin/python3")]
     seen: set[Path] = set()
     for candidate in candidates:
@@ -543,11 +545,14 @@ def _sandbox_probe_python() -> str:
         if resolved in seen:
             continue
         seen.add(resolved)
-        if not resolved.is_relative_to(usr_root):
+        if not (
+            resolved.is_relative_to(usr_root)
+            or (nix_store is not None and resolved.is_relative_to(nix_store))
+        ):
             continue
         if resolved.is_file() and os.access(resolved, os.X_OK):
             return str(resolved)
-    raise RuntimeError("no Python interpreter is available inside the minimal role sandbox")
+    raise RuntimeError("no trusted Python interpreter is available inside the minimal role sandbox")
 
 
 def toolchain_probe(repo: Path, command: list[str]) -> dict[str, Any]:
@@ -1388,7 +1393,15 @@ def classify_result(role: str, command: list[str], repo: Path, payload: dict[str
     elif returncode == 0:
         return "passed"
     if isinstance(returncode, int) and not isinstance(returncode, bool) and returncode != 0:
-        probe = toolchain_probe(repo, command)
+        # A secondary diagnostic must not erase the original review result.
+        try:
+            probe = toolchain_probe(repo, command)
+        except (OSError, RuntimeError) as exc:
+            probe = {
+                "passed": False,
+                "failure_classification": "toolchain_probe_error",
+                "probe_error_type": type(exc).__name__,
+            }
         payload["post_failure_toolchain_probe"] = probe
         if probe.get("failure_classification") == "environment_toolchain_failure":
             return "environment_toolchain_failure"
