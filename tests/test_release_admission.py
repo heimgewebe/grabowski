@@ -1531,7 +1531,7 @@ class RealGitDocumentationModeTests(unittest.TestCase):
                 return subprocess.run(
                     ["git", "-C", str(repo), *args],
                     capture_output=True, text=True, check=True,
-                    env={"PATH": "/usr/bin:/bin", "HOME": str(repo)},
+                    env={"PATH": "/run/current-system/sw/bin:/usr/bin:/bin", "HOME": str(repo)},
                 ).stdout.strip()
 
             git("init", "-q")

@@ -29,6 +29,7 @@ import grabowski_operator_obligation_evidence
 import grabowski_worktree_ensure
 import grabowski_merge_guard
 import grabowski_physical_checkout
+import grabowski_git_ssh
 
 Receipt = dict[str, Any]
 CommandRunner = Callable[[Path, list[str]], dict[str, Any]]
@@ -2011,9 +2012,46 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _git_transport_subcommand(arguments: list[str]) -> str | None:
+    """Extract only the Git verb; option values and operands are not verbs.
+
+    Unknown global options fail closed to the SSH-disabled local runner.
+    """
+    index = 0
+    no_value = frozenset({
+        "--no-optional-locks", "--no-pager", "--paginate", "-p", "-P",
+        "--no-replace-objects", "--literal-pathspecs", "--glob-pathspecs",
+        "--noglob-pathspecs", "--icase-pathspecs", "--no-lazy-fetch",
+    })
+    value_options = frozenset({
+        "-c", "-C", "--git-dir", "--work-tree", "--namespace", "--config-env",
+        "--exec-path", "--super-prefix",
+    })
+    assigned_options = (
+        "--git-dir=", "--work-tree=", "--namespace=", "--config-env=",
+        "--exec-path=", "--super-prefix=",
+    )
+    while index < len(arguments):
+        item = arguments[index]
+        if item in value_options:
+            index += 2
+            continue
+        if item in no_value or (
+            item.startswith(("-c", "-C")) and len(item) > 2
+        ) or item.startswith(assigned_options):
+            index += 1
+            continue
+        # A new/unknown Git switch is not grounds to expose writer credentials.
+        return None if item.startswith("-") else item
+    return None
+
+
 def _default_command_runner(repo: Path, argv: list[str]) -> dict[str, Any]:
-    command = ["git", "--no-optional-locks", "-C", str(repo), *argv]
+    command = [grabowski_git_ssh.trusted_git_cli_path(), "--no-optional-locks", "-C", str(repo), *argv]
     env = os.environ.copy()
+    # Purely local reads must not depend on any GitHub writer credential.
+    # Unknown/aliased operations remain SSH-disabled rather than falling back.
+    remote_ssh_operation = _git_transport_subcommand(argv) in {"push", "fetch", "pull", "clone", "ls-remote"}
     exact_deny = {
         "GIT_DIR",
         "GIT_WORK_TREE",
@@ -2054,7 +2092,11 @@ def _default_command_runner(repo: Path, argv: list[str]) -> dict[str, Any]:
             "GIT_PAGER": "cat",
             "PAGER": "cat",
             "GIT_ALLOW_PROTOCOL": "ssh",
-            "GIT_SSH_COMMAND": "/usr/bin/ssh -F /dev/null -oBatchMode=yes -oProxyCommand=none -oPermitLocalCommand=no -oClearAllForwardings=yes",
+            "GIT_SSH_COMMAND": (
+                grabowski_git_ssh.hardened_git_ssh_command()
+                if remote_ssh_operation
+                else "/__grabowski_ssh_transport_disabled__/ssh"
+            ),
             "GIT_SSH_VARIANT": "ssh",
             "GIT_ASKPASS": "/bin/false",
             "SSH_ASKPASS": "/bin/false",
@@ -2088,8 +2130,10 @@ def _default_command_runner(repo: Path, argv: list[str]) -> dict[str, Any]:
 
 
 def _default_github_runner(repo: Path, argv: list[str]) -> dict[str, Any]:
-    command = ["gh", *argv]
+    command = [grabowski_git_ssh.trusted_github_cli_path(), *argv]
     env = os.environ.copy()
+    # Prevent gh child Git/helpers from inheriting a caller-controlled PATH.
+    env["PATH"] = "/run/current-system/sw/bin:/usr/bin:/bin"
     for key in (
         "GIT_EXTERNAL_DIFF",
         "GIT_DIFF_OPTS",
@@ -7456,6 +7500,30 @@ def _run_branch_publish(
         else ""
     )
     expected_upstream = f"{remote}/{branch}"
+    if not upstream:
+        # git push --set-upstream writes branch.* configuration even when the
+        # remote-tracking ref has not been locally fetched yet. The remote SHA
+        # has already been checked against expected_head above, so fall back
+        # only to exact local branch.remote + branch.merge config identities.
+        configured_remote = _git_optional(
+            repo=Path(orientation["root"]),
+            runner=runner,
+            argv=["config", "--get-all", f"branch.{branch}.remote"],
+        )
+        configured_merge = _git_optional(
+            repo=Path(orientation["root"]),
+            runner=runner,
+            argv=["config", "--get-all", f"branch.{branch}.merge"],
+        )
+        remote_values = str(configured_remote.get("stdout", "")).splitlines()
+        merge_values = str(configured_merge.get("stdout", "")).splitlines()
+        if (
+            int(configured_remote.get("returncode", 1)) == 0
+            and int(configured_merge.get("returncode", 1)) == 0
+            and remote_values == [remote]
+            and merge_values == [ref]
+        ):
+            upstream = expected_upstream
     if upstream != expected_upstream:
         _check(
             receipt,
