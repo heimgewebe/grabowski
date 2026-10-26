@@ -126,8 +126,24 @@ class RootArmPolicyTests(unittest.TestCase):
             self.assertIn("--property=ProtectKernelLogs=no", props)
             self.assertNotIn("--property=ProtectKernelTunables=yes", props)
             self.assertNotIn("--property=ProtectKernelLogs=yes", props)
+            # A real PID1 probe failed with 'bwrap: setting up uid map:
+            # Read-only file system' when ReadOnlyPaths included /proc.
+            # Readonly /run and /sys independently passed with the same
+            # zero-capability DynamicUser profile and nested /proc mount.
+            readonly = next(
+                item.partition("ReadOnlyPaths=")[2].split()
+                for item in props if item.startswith("--property=ReadOnlyPaths=")
+            )
+            self.assertIn("/run", readonly)
+            self.assertIn("/sys", readonly)
+            self.assertNotIn("/proc", readonly)
         else:
             self.assertIn("--property=ProtectKernelTunables=yes", props)
+            readonly = next(
+                item.partition("ReadOnlyPaths=")[2].split()
+                for item in props if item.startswith("--property=ReadOnlyPaths=")
+            )
+            self.assertIn("/proc", readonly)
             self.assertIn("--property=ProtectKernelLogs=yes", props)
 
     def test_nixos_original_inputs_use_readonly_root_owned_nix_store(self) -> None:

@@ -570,8 +570,15 @@ def _unit_argv(policy: dict[str, Any], index: int) -> list[str]:
         # PID1 binds only the root-controlled curated home projection. The
         # original /home/alex (mode 0700) is never traversed by DynamicUser.
         f"BindReadOnlyPaths={input_projection}:/home/alex",
+        # Linux user namespaces require writing the nested uid_map under
+        # /proc. NixOS systemd ReadOnlyPaths=/proc returns EROFS *before*
+        # the trusted bwrap can create its private, sandboxed proc mount.
+        # The real PID1 zero-capability test passed with /run and /sys RO.
+        # Preserve the original stronger Pop!_OS unit profile unchanged.
         f"ReadOnlyPaths=/run /run/{scratch_tmp} /run/{scratch_var} "
-        f"{home} {home}/repos /proc /sys",
+        f"{home} {home}/repos "
+        + ("/sys" if _SYSTEMD_RUN.startswith("/run/current-system/sw/bin/")
+           else "/proc /sys"),
         "InaccessiblePaths=-/run/user -/run/docker -/mnt/backup "
         "-/dev/hugepages /var/lib/private "
         f"-{_INPUT_ROOT}",
