@@ -149,6 +149,44 @@ def trusted_git_cli_path() -> str:
     raise FileNotFoundError("No root-managed Git CLI is installed")
 
 
+def trusted_github_cli_path() -> str:
+    """Return a root-owned, audited gh realpath without consulting PATH."""
+    classic = Path("/usr/bin/gh")
+    nixos = Path("/run/current-system/sw/bin/gh")
+    for path in (classic, nixos):
+        if not os.path.lexists(path):
+            continue
+        if path == classic:
+            original = path.lstat()
+            if stat.S_ISLNK(original.st_mode):
+                if not os.path.lexists(nixos):
+                    raise PermissionError("legacy gh alias lacks canonical NixOS gh")
+                legacy_real = _root_managed_resolution(classic)
+                nix_real = _root_managed_resolution(nixos)
+                if legacy_real != nix_real or not nix_real.is_relative_to(_NIX_STORE):
+                    raise PermissionError("legacy gh alias does not match NixOS system gh")
+                _root_managed_chain(classic)
+                continue
+            if not stat.S_ISREG(original.st_mode):
+                raise PermissionError("classic GitHub CLI must be a regular executable")
+        real = _root_managed_resolution(path)
+        if path == nixos and not real.is_relative_to(_NIX_STORE):
+            raise PermissionError("NixOS GitHub CLI must resolve into the Nix store")
+        _root_managed_chain(path)
+        _root_managed_chain(real)
+        info = real.stat()
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != 0
+            or info.st_mode & 0o022
+            or not info.st_mode & stat.S_IXUSR
+            or not os.access(real, os.X_OK)
+        ):
+            raise PermissionError("GitHub CLI is not a trusted system executable")
+        return str(real)
+    raise FileNotFoundError("No root-managed GitHub CLI is installed")
+
+
 def _trusted_identity() -> Path:
     # passwd is the account authority; HOME or caller-provided paths are not.
     home = Path(pwd.getpwuid(os.geteuid()).pw_dir)
