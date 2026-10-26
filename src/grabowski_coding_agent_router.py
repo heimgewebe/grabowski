@@ -41,7 +41,7 @@ CLAUDE_PLAN_TYPES = {"pro", "max", "team", "enterprise"}
 QUALITY_CLASSES = {"S", "A", "B", "C", "HARNESS", "CONTROLLER"}
 EFFORT_LEVELS = {"low", "medium", "high", "xhigh", "max"}
 PAID_ONLY_MODEL_IDS = frozenset({"claude-fable-5"})
-VERIFICATION_POLICIES = frozenset({"deterministic", "independent_review", "competition"})
+VERIFICATION_POLICIES = frozenset({"deterministic", "self_review", "independent_review", "competition"})
 MANDATORY_INDEPENDENT_VERIFICATION_TASK_CLASSES = frozenset(
     {"architecture", "complex-patch", "deep-debug", "migration"}
 )
@@ -2770,7 +2770,7 @@ def canonical_execution_route(
         or verification_policy not in VERIFICATION_POLICIES
     ):
         raise CodingAgentRouterError(
-            "verification_policy must be deterministic, independent_review or competition"
+            "verification_policy must be deterministic, self_review, independent_review or competition"
         )
     if effect_profile not in {"candidate", "delivery"}:
         raise CodingAgentRouterError(
@@ -2789,24 +2789,27 @@ def canonical_execution_route(
             )
         verification_policy_value = "independent_review"
     elif verification_floor_required:
-        if verification_policy not in (None, "independent_review"):
+        if verification_policy not in (None, "self_review", "independent_review"):
             raise CodingAgentRouterError(
-                "verification floor requires verification_policy=independent_review; "
-                "run competition through the separate contrast surface"
+                "verification floor requires verification_policy=self_review "
+                "or independent_review; run competition through the separate contrast surface"
             )
-        verification_policy_value = "independent_review"
+        verification_policy_value = verification_policy or "self_review"
     else:
         verification_policy_value = verification_policy or "deterministic"
     independent_review_required = bool(
-        direct_review_task
-        or review_value
-        or verification_floor_required
+        direct_review_task or review_value
         or verification_policy_value == "independent_review"
     )
-    if effect_profile == "delivery" and verification_policy_value != "independent_review":
+    self_review_required = verification_policy_value == "self_review"
+    if effect_profile == "delivery" and verification_policy_value not in {
+        "self_review", "independent_review",
+    }:
         raise CodingAgentRouterError(
-            "effect_profile=delivery requires verification_policy=independent_review"
+            "effect_profile=delivery requires verification_policy=self_review or independent_review"
         )
+    # Routing chooses the obligation, not a PASS: Captain and the PR gate
+    # still validate substantive, exact-diff review evidence before merging.
     external_review_requested = independent_review_required
     external_review_block_reasons = [
         f"sensitive_context:{flag}" for flag in sensitive_external_review_flags
@@ -2845,7 +2848,7 @@ def canonical_execution_route(
     review_fallbacks: list[dict[str, Any]] = []
     review_ranked_candidates: list[dict[str, Any]] = []
     excluded: dict[str, list[str]] = {}
-    review_status = "not-requested"
+    review_status = "self-review-required" if self_review_required else "not-requested"
     review_state_error_type: str | None = None
 
     state: dict[str, Any] | None = None
@@ -3075,6 +3078,7 @@ def canonical_execution_route(
         "effect_profile": effect_profile,
         "verification_policy": verification_policy_value,
         "independent_review_required": independent_review_required,
+        "self_review_required": self_review_required,
         "review_task_class": review_task_class,
         "external_review_selection_allowed": external_review_selection_allowed,
         "external_review_block_reasons": external_review_block_reasons,
