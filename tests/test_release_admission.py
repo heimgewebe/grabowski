@@ -1409,6 +1409,8 @@ class DecisionBoundReleaseReviewTests(unittest.TestCase):
                 diff_sha256=DIFF, review_pr=1452,
             )
         self.assertEqual("authenticated-post-merge-r3-ci", result["status"])
+        self.assertIs(result["critical_release_source"], True)
+        self.assertIs(result["independent_review_required"], True)
         self.assertIn("Captain runtime-deploy decision", result["does_not_establish"])
         self.assertIn("historical pre-merge review authorization", result["does_not_establish"])
 
@@ -1466,6 +1468,31 @@ class DirectSchedulerDenialTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "Captain release action"):
                 deploy._require_release_source_admission(TARGET, release_review_pr=1452)
         self.assertEqual(2, read.call_count)
+
+    def test_critical_source_without_independent_flag_never_becomes_exempt(self):
+        import grabowski_self_deploy as deploy
+        # A future genuine self-review mode may no longer require an external
+        # provider. That may NEVER waive critical release Captain authority.
+        forged = {
+            "status": "authenticated-post-merge-r3-ci",
+            "critical_release_source": True,
+            "independent_review_required": False,
+            "target_head": TARGET,
+            "release_review_identity_sha256": "a" * 64,
+        }
+        with self.assertRaisesRegex(RuntimeError, "critical-source|Captain"):
+            deploy._claim_captain_schedule_effect(TARGET, forged)
+
+    def test_unknown_release_criticality_never_admits_effect(self):
+        import grabowski_self_deploy as deploy
+        record = {
+            "status": "already-serving-exact-source",
+            "independent_review_required": False,
+            "target_repo_head": TARGET,
+            "serving_repo_head": TARGET,
+        }
+        with self.assertRaisesRegex(RuntimeError, "critical-source|criticality"):
+            deploy._claim_captain_schedule_effect(TARGET, record)
 
     def test_captain_scoped_token_is_ephemeral_and_exact(self):
         import grabowski_self_deploy as deploy

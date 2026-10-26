@@ -470,6 +470,7 @@ class SelfDeployToolTests(unittest.TestCase):
                 ),
                 "target_repo_head": head,
                 "changed_path_count": 1,
+                "critical_release_source": False,
                 "independent_review_required": False,
             },
         )

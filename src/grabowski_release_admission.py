@@ -739,6 +739,10 @@ def validate_release(
     return {
         **material,
         "release_review_identity_sha256": _sha256_json(material),
+        # Semantic release risk and reviewer-provider policy are distinct.
+        # Any actual serving->target delta remains critical and must retain
+        # whole-delta R3, CI and Captain provenance, regardless of provider.
+        "critical_release_source": True,
         "independent_review_required": True,
         "status": "authenticated-post-merge-r3-ci",
         "does_not_establish": [
