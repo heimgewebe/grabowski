@@ -1220,6 +1220,89 @@ class ReadSurfaceTests(unittest.TestCase):
         self.assertEqual(health["audit_active_bytes"], 123)
         self.assertEqual(health["audit_archived_segment_count"], 2)
 
+    def test_native_nixos_health_uses_only_attested_immutable_integrity_fields(self) -> None:
+        """A native Nix attestator must not be misclassified as a Pop venv."""
+        native_fields = (
+            "manifest_parse_valid", "manifest_schema_valid", "repo_head_valid",
+            "agent_instructions_identity_valid", "runtime_binding_valid",
+            "environment_compatibility_valid", "provenance_valid",
+            "artifact_integrity_valid",
+        )
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            python_site = root / "lib/python3.12/site-packages"
+            python_site.mkdir(parents=True)
+            base_module = python_site / "grabowski_mcp.py"
+            native_module = python_site / "grabowski_nixos_integrity.py"
+            base_module.write_text("# isolated base module\n")
+            native_module.write_text("# isolated attestation module\n")
+            native = types.ModuleType("grabowski_nixos_integrity")
+            native.__file__ = str(native_module)
+            native.MANIFEST_RELATIVE = "share/grabowski/nixos-integrity-manifest.json"
+
+            def trusted_store_root(path):
+                if path != base_module:
+                    raise ValueError("not the immutable pinned module")
+                return root
+
+            native.store_root = Mock(side_effect=trusted_store_root)
+            metadata = {
+                "manifest_path": str(root / native.MANIFEST_RELATIVE),
+                "completion_status": "complete",
+                "release_id": "native-pinned",
+                "repo_head": "a" * 40,
+                **{key: True for key in native_fields},
+            }
+            audit = {"valid": True, "audit_writable": True}
+            with (
+                patch.dict(sys.modules, {"grabowski_nixos_integrity": native}),
+                patch.object(read_surface.base, "__file__", str(base_module), create=True),
+                patch.object(read_surface.base, "_deployment_metadata", return_value=metadata),
+                patch.object(read_surface.base, "_verify_audit_log", return_value=audit),
+                patch.object(read_surface.base, "serving_process_identity", return_value={}, create=True),
+            ):
+                health = read_surface.grabowski_runtime_health()
+                identity = read_surface.grabowski_deployment_identity()
+                self.assertTrue(health["deployment_integrity_valid"])
+                self.assertTrue(health["healthy"])
+                self.assertEqual(health["integrity_contract"], "nixos-immutable-v1")
+                self.assertEqual(identity["integrity_contract"], "nixos-immutable-v1")
+                self.assertEqual(identity["integrity"], {key: True for key in native_fields})
+                native.store_root.assert_called_with(base_module)
+
+                for changed in (
+                    {"manifest_schema_valid": False},
+                    {"agent_instructions_identity_valid": False},
+                    {"artifact_integrity_valid": False},
+                    {"runtime_binding_valid": False},
+                    {"provenance_valid": False},
+                    {"completion_status": "incomplete"},
+                    {"manifest_path": str(root / "other/nixos-integrity-manifest.json")},
+                ):
+                    with self.subTest(changed=changed), patch.object(
+                        read_surface.base, "_deployment_metadata",
+                        return_value={**metadata, **changed},
+                    ):
+                        self.assertFalse(
+                            read_surface.grabowski_runtime_health()["healthy"]
+                        )
+                with patch.object(read_surface.base, "_verify_audit_log", return_value={
+                    "valid": True, "audit_writable": False,
+                }):
+                    self.assertFalse(read_surface.grabowski_runtime_health()["healthy"])
+                with patch.object(read_surface.base, "_kill_switch_state", return_value={
+                    "engaged": True,
+                }):
+                    self.assertFalse(read_surface.grabowski_runtime_health()["healthy"])
+                with patch.object(native, "store_root", side_effect=ValueError("untrusted root")):
+                    self.assertFalse(
+                        read_surface.grabowski_runtime_health()["deployment_integrity_valid"]
+                    )
+                with patch.object(native, "__file__", str(root / "foreign.py")):
+                    self.assertFalse(
+                        read_surface.grabowski_runtime_health()["deployment_integrity_valid"]
+                    )
+
     def test_runtime_health_is_not_healthy_when_audit_is_valid_but_not_writable(self) -> None:
         deployment = {"completion_status": "complete"}
         deployment.update({key: True for key in read_surface.DEPLOYMENT_INTEGRITY_FIELDS})

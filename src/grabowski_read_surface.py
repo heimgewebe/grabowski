@@ -130,6 +130,16 @@ DEPLOYMENT_INTEGRITY_FIELDS = (
     "environment_compatibility_valid",
     "provenance_valid",
 )
+NIXOS_NATIVE_INTEGRITY_FIELDS = (
+    "manifest_parse_valid",
+    "manifest_schema_valid",
+    "repo_head_valid",
+    "agent_instructions_identity_valid",
+    "runtime_binding_valid",
+    "environment_compatibility_valid",
+    "provenance_valid",
+    "artifact_integrity_valid",
+)
 SERVICE_PROPERTIES = (
     "LoadState",
     "ActiveState",
@@ -1591,15 +1601,48 @@ def _tailscale_status_projection(payload: Any) -> dict[str, Any]:
     }
 
 
+def _deployment_integrity_projection(
+    deployment: dict[str, Any],
+) -> tuple[str, dict[str, bool]]:
+    """Select the trusted runtime manifest contract, never a caller label.
+
+    Portable releases retain every original required field. The shorter
+    NixOS contract is valid only when the executing, installed module and
+    its exact immutable manifest are identified by the native store-owned
+    attestation module. A matching manifest filename alone grants nothing.
+    """
+    contract = "portable-v6"
+    fields = DEPLOYMENT_INTEGRITY_FIELDS
+    manifest = deployment.get("manifest_path")
+    if isinstance(manifest, str) and Path(manifest).name == "nixos-integrity-manifest.json":
+        try:
+            import grabowski_nixos_integrity as native
+
+            source = Path(base.__file__).resolve(strict=True)
+            root = native.store_root(source)
+            adapter = Path(native.__file__).resolve(strict=True)
+            if (
+                native.MANIFEST_RELATIVE
+                == "share/grabowski/nixos-integrity-manifest.json"
+                and Path(manifest) == root / native.MANIFEST_RELATIVE
+                and adapter
+                == root / "lib/python3.12/site-packages/grabowski_nixos_integrity.py"
+            ):
+                contract = "nixos-immutable-v1"
+                fields = NIXOS_NATIVE_INTEGRITY_FIELDS
+        except (ImportError, AttributeError, OSError, TypeError, ValueError):
+            # Missing, stale or untrusted Nix adapters may not relax
+            # the complete portable deployment contract.
+            pass
+    return contract, {key: bool(deployment.get(key)) for key in fields}
+
+
 @mcp.tool(name="grabowski_runtime_health", annotations=LOCAL_READ)
 def grabowski_runtime_health() -> dict[str, Any]:
     """Return original deployment, audit and kill-switch integrity health."""
     deployment = base._deployment_metadata()
     audit = base._verify_audit_log(base.AUDIT_LOG)
-    integrity = {
-        key: bool(deployment.get(key))
-        for key in DEPLOYMENT_INTEGRITY_FIELDS
-    }
+    integrity_contract, integrity = _deployment_integrity_projection(deployment)
     audit_writable = bool(audit.get("audit_writable"))
     kill_switch_engaged = bool(base._kill_switch_state().get("engaged"))
     return {
@@ -1614,6 +1657,7 @@ def grabowski_runtime_health() -> dict[str, Any]:
         ),
         "deployment_complete": deployment.get("completion_status") == "complete",
         "deployment_integrity_valid": all(integrity.values()),
+        "integrity_contract": integrity_contract,
         "audit_valid": bool(audit.get("valid")),
         "audit_writable": audit_writable,
         "audit_state": audit.get("audit_state"),
@@ -1895,15 +1939,14 @@ def grabowski_audit_projection(
 def grabowski_deployment_identity() -> dict[str, Any]:
     """Return bounded runtime identity and integrity flags without local paths."""
     deployment = base._deployment_metadata()
+    integrity_contract, integrity = _deployment_integrity_projection(deployment)
     return {
         "identity": {
             key: deployment.get(key)
             for key in DEPLOYMENT_IDENTITY_FIELDS
         },
-        "integrity": {
-            key: bool(deployment.get(key))
-            for key in DEPLOYMENT_INTEGRITY_FIELDS
-        },
+        "integrity_contract": integrity_contract,
+        "integrity": integrity,
         "serving_process": base.serving_process_identity(),
         "source_identity_by_module": deployment.get("source_identity_by_module", {}),
         "source_snapshot_identity_by_module": deployment.get(
