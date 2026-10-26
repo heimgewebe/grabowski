@@ -95,8 +95,18 @@ class RootArmPolicyTests(unittest.TestCase):
             self.assertIn("--property=Environment=HOME=" + home, before)
             self.assertIn("--property=ReadWritePaths=" + " ".join(outputs), before)
             self.assertIn("--property=TemporaryFileSystem=/dev/shm:rw,nosuid,nodev,noexec,mode=1777", before)
-            self.assertTrue(any(item.startswith("--property=BindPaths=") and
-                "/var/lib/private/" + pair + ":" + home in item for item in before))
+            binds = [item.removeprefix("--property=BindPaths=")
+                     for item in before if item.startswith("--property=BindPaths=")]
+            self.assertEqual(len(binds), 1)
+            self.assertIn(":/tmp", binds[0])
+            self.assertIn(":/var/tmp", binds[0])
+            if controller._SYSTEMD_RUN.startswith("/run/current-system/sw/bin/"):
+                # PID1 already exposes its DynamicUser StateDirectory.
+                # A second manual bind onto HOME triggers 226/NAMESPACE on NixOS.
+                self.assertEqual(len(binds[0].split()), 2)
+                self.assertNotIn("/var/lib/private/" + pair + ":" + home, binds[0])
+            else:
+                self.assertIn("/var/lib/private/" + pair + ":" + home, binds[0])
             self.assertTrue(any(item.startswith("--property=ReadOnlyPaths=") and
                 home + "/repos" in item for item in before))
             self.assertTrue(any(item.startswith("--property=InaccessiblePaths=") and

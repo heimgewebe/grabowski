@@ -565,8 +565,14 @@ def _unit_argv(policy: dict[str, Any], index: int) -> list[str]:
         # and isolated pseudo-device filesystems. Mask physical state aliases.
         f"RuntimeDirectory={scratch_tmp} {scratch_var}",
         "RuntimeDirectoryMode=0700",
-        f"BindPaths=/run/{scratch_tmp}:/tmp /run/{scratch_var}:/var/tmp "
-        f"/var/lib/private/{pair_state}:{home}",
+        # NixOS systemd mounts DynamicUser StateDirectory itself. Binding
+        # the same private directory again onto HOME causes 226/NAMESPACE.
+        # Preserve the older manual Pop!_OS alias and both scratch mounts.
+        f"BindPaths=/run/{scratch_tmp}:/tmp /run/{scratch_var}:/var/tmp"
+        + (
+            "" if _SYSTEMD_RUN.startswith("/run/current-system/sw/bin/")
+            else f" /var/lib/private/{pair_state}:{home}"
+        ),
         # PID1 binds only the root-controlled curated home projection. The
         # original /home/alex (mode 0700) is never traversed by DynamicUser.
         f"BindReadOnlyPaths={input_projection}:/home/alex",
