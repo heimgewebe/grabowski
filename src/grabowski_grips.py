@@ -13923,6 +13923,7 @@ def _captain_independent_review_gate(
                 and release.get("serving_head") != expected_head
                 and isinstance(release.get("serving_release_id"), str)
                 and bool(release["serving_release_id"])
+                and release.get("critical_release_source") is True
                 and release.get("independent_review_required") is True
                 and _is_hex_sha(
                     release.get("release_review_identity_sha256"), lengths=(64,)
@@ -13957,6 +13958,7 @@ def _captain_independent_review_gate(
             and _is_hex_sha(expected_head, lengths=(40,))
             and isinstance(release, dict)
             and release.get("target_repo_head") == expected_head
+            and release.get("critical_release_source") is False
             and release.get("independent_review_required") is False
         )
         bound_serving = (
@@ -16801,9 +16803,14 @@ def _run_captain_runtime_deploy(
                 "authenticated review PR and Captain action"
             )
             return execution_result
-        if not isinstance(noncritical, dict) or noncritical.get(
-            "independent_review_required"
-        ) is not False:
+        if (
+            not isinstance(noncritical, dict)
+            or noncritical.get("critical_release_source") is not False
+            or noncritical.get("independent_review_required") is not False
+            or noncritical.get("status") not in {
+                "already-serving-exact-source", "non-runtime-documentation",
+            }
+        ):
             execution_result["preflight_errors"] = ["release_review_pr_required"]
             execution_result["verification_error"] = (
                 "runtime deploy refused: no proven noncritical source exemption"

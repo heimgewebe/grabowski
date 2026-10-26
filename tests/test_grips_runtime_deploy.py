@@ -83,7 +83,7 @@ class RuntimeDeployScheduleReceiptTests(unittest.TestCase):
             return_value=["not", "an", "object"],
         ), patch.object(
             real_deploy, "_require_release_source_admission",
-            return_value={"critical_release_source": False, "independent_review_required": False},
+            return_value={"status": "already-serving-exact-source", "critical_release_source": False, "independent_review_required": False, "serving_repo_head": "a" * 40, "target_repo_head": "a" * 40},
         ):
             result = grips._run_captain_runtime_deploy(action, {})
 
@@ -174,7 +174,7 @@ class RuntimeDeployScheduleReceiptTests(unittest.TestCase):
             return_value=[],
         ), patch.object(
             real_deploy, "_require_release_source_admission",
-            return_value={"critical_release_source": False, "independent_review_required": False},
+            return_value={"status": "already-serving-exact-source", "critical_release_source": False, "independent_review_required": False, "serving_repo_head": "a" * 40, "target_repo_head": "a" * 40},
         ):
             result = grips._run_captain_runtime_deploy(action, {})
 
@@ -1755,7 +1755,7 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
                          return_value={"ready": True, "job_prefix": "grabowski-job-"}),
             patch.object(grips, "_runtime_deploy_self_schedule", side_effect=error),
             patch.object(real_deploy, "_require_release_source_admission",
-                         return_value={"critical_release_source": False, "independent_review_required": False}),
+                         return_value={"status": "already-serving-exact-source", "critical_release_source": False, "independent_review_required": False, "serving_repo_head": "b" * 40, "target_repo_head": "b" * 40}),
         ):
             result = grips._run_captain_runtime_deploy(action, {})
         self.assertTrue(result["mutation_outcome_unknown"])
@@ -1805,7 +1805,7 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
                          return_value={"ready": True, "job_prefix": "grabowski-job-"}),
             patch.object(grips, "_runtime_deploy_self_schedule", side_effect=denied),
             patch.object(real_deploy, "_require_release_source_admission",
-                         return_value={"critical_release_source": False, "independent_review_required": False}),
+                         return_value={"status": "already-serving-exact-source", "critical_release_source": False, "independent_review_required": False, "serving_repo_head": "b" * 40, "target_repo_head": "b" * 40}),
         ):
             typed = grips._run_captain_runtime_deploy(action, {})
         self.assertTrue(typed["pre_effect_refusal"])
@@ -1813,6 +1813,39 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
         self.assertTrue(typed["mutation_outcome_unknown"])
         self.assertFalse(typed["local_mutation_observed"])
         self.assertEqual(evidence, typed["local_mutation_uncertainty_evidence"])
+
+    def test_critical_source_false_reviewer_flag_never_starts_captain_deploy(self) -> None:
+        expected_head = "b" * 40
+        action = {
+            "action": "runtime-deploy",
+            "target": {"adapter": "grabowski-self", "service": "grabowski-mcp",
+                       "runtime_target": "heim-pc"},
+        }
+        # A critical source cannot use the obsolete independent-review false
+        # field to masquerade as noncritical before any preflight/effect.
+        for criticality in (True, None):
+            with (
+                self.subTest(criticality=criticality),
+                patch.object(grips, "_runtime_deploy_expected_head", return_value=expected_head),
+                patch.object(grips, "_runtime_deploy_delay_seconds", return_value=8),
+                patch.object(grips, "_runtime_deploy_source_parameters", return_value=(None, None)),
+                patch.object(grips, "_captain_runtime_deploy_target_errors", return_value=[]),
+                patch.object(grips, "_runtime_deploy_self_preflight") as preflight,
+                patch.object(grips, "_runtime_deploy_self_schedule") as schedule,
+                patch.object(real_deploy, "_require_release_source_admission", return_value={
+                    "status": "non-runtime-documentation",
+                    "critical_release_source": criticality,
+                    "independent_review_required": False,
+                    "target_repo_head": expected_head,
+                    "serving_repo_head": "a" * 40,
+                    "changed_path_count": 1,
+                }),
+            ):
+                result = grips._run_captain_runtime_deploy(action, {})
+            self.assertEqual(result["preflight_errors"], ["release_review_pr_required"])
+            self.assertFalse(result["execution_attempted"])
+            preflight.assert_not_called()
+            schedule.assert_not_called()
 
     def test_captain_admission_only_passes_explicit_bound_document_or_serving_proof(self) -> None:
         """A helper's arbitrary success-shaped return is never R3 authority."""
@@ -1838,6 +1871,8 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
             ("empty", {}, False),
             ("unknown-status", {**valid_docs, "status": "provisional"}, False),
             ("required-r3", {**valid_docs, "critical_release_source": True, "independent_review_required": True}, False),
+            ("critical-false-review-flag", {**valid_docs, "critical_release_source": True, "independent_review_required": False}, False),
+            ("missing-source-criticality", {k: v for k, v in valid_docs.items() if k != "critical_release_source"}, False),
             ("missing-review-flag", {k:v for k,v in valid_docs.items()
                                      if k != "independent_review_required"}, False),
             ("target-spoof", {**valid_docs, "target_repo_head": "c"*40}, False),

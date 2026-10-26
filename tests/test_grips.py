@@ -12674,7 +12674,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         }:
             self._noncritical_source_fixture = patch(
                 "grabowski_self_deploy._require_release_source_admission",
-                return_value={"status": "non-runtime-documentation", "serving_repo_head": "a" * 40, "target_repo_head": CAPTAIN_HEAD, "changed_path_count": 1, "independent_review_required": False},
+                return_value={"status": "non-runtime-documentation", "serving_repo_head": "a" * 40, "target_repo_head": CAPTAIN_HEAD, "changed_path_count": 1, "critical_release_source": False, "independent_review_required": False},
             )
             self._noncritical_source_fixture.start()
             self.addCleanup(self._noncritical_source_fixture.stop)
