@@ -345,6 +345,42 @@ def inventory_native_wal_readonly_sqlite(
                 connection.close()
 
 
+
+@contextmanager
+def inventory_coherent_readonly_sqlite(
+    path: Path,
+    *,
+    temporary_prefix: str,
+    error_type: type[ChangedError],
+    message: str = INVENTORY_CHANGED_MESSAGE,
+    allow_checkpointed_empty_wal: bool = False,
+) -> Iterator[sqlite3.Connection]:
+    """Observe a pinned WAL transaction or a quiescent immutable database.
+
+    An existing WAL+SHM pair is normal SQLite operation, not a reason to
+    report an unavailable inventory. Never make, delete or checkpoint sidecars:
+    a missing half of a pair still fails closed rather than letting SQLite
+    create SHM during observation.
+    """
+    wal = Path(str(path) + "-wal")
+    shm = Path(str(path) + "-shm")
+    if (wal.exists() or wal.is_symlink()) and (shm.exists() or shm.is_symlink()):
+        with inventory_native_wal_readonly_sqlite(
+            path, error_type=error_type, message=message,
+        ) as connection:
+            yield connection
+    else:
+        with inventory_readonly_sqlite(
+            path,
+            temporary_prefix=temporary_prefix,
+            error_type=error_type,
+            message=message,
+            allow_wal_copy=False,
+            allow_checkpointed_empty_wal=allow_checkpointed_empty_wal,
+        ) as connection:
+            yield connection
+
+
 def sqlite_integrity(
     connection: sqlite3.Connection,
     label: str,

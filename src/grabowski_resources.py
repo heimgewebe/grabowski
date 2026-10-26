@@ -8160,11 +8160,13 @@ def inspect_resources(resource_keys: Iterable[str]) -> dict[str, dict[str, Any]]
 
 @contextmanager
 def _resource_readonly_snapshot() -> Iterator[sqlite3.Connection]:
-    """Observe a stable store without writes; active WAL sidecars fail closed."""
+    """Observe a stable, transaction-pinned WAL or quiescent store without writes."""
     if RESOURCE_DB.is_symlink() or not RESOURCE_DB.is_file() or RESOURCE_DB.stat().st_size == 0:
         raise RuntimeError("Resource store cannot be observed without explicit initialization")
-    with _resource_inventory_readonly_sqlite(
-        RESOURCE_DB, allow_wal_copy=False
+    with sqlite_store.inventory_coherent_readonly_sqlite(
+        RESOURCE_DB,
+        temporary_prefix="unused-resource-readonly.",
+        error_type=ResourceSchemaInventoryChanged,
     ) as connection:
         if _resource_schema_version(connection) != RESOURCE_CURRENT_SCHEMA_VERSION:
             raise RuntimeError("Resource store requires an explicit schema migration")

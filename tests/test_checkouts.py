@@ -5677,8 +5677,10 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self.assertEqual(capacity["expired_unclassified_active_rows"], 0)
         self.assertTrue(capacity["path_classification_complete"])
         self.assertEqual(capacity["path_observations_attempted"], 2)
-        self.assertEqual(capacity["used"], 1)
-        self.assertEqual(capacity["free"], checkouts.MAX_ACTIVE_CHECKOUTS_PER_REPO - 1)
+        self.assertEqual(capacity["unexpired_active_rows"], 1)
+        self.assertEqual(capacity["retained_without_live_lease_rows"], 1)
+        self.assertEqual(capacity["used"], 0)
+        self.assertEqual(capacity["free"], checkouts.MAX_ACTIVE_CHECKOUTS_PER_REPO)
         self.assertFalse(capacity["saturated"])
         self.assertIn("checkout_path_reuse_authority", capacity["does_not_establish"])
 
@@ -6917,6 +6919,27 @@ class CheckoutLifecycleTests(unittest.TestCase):
         for call in gate.call_args_list:
             self.assertEqual(call.args, ("resource_lease",))
         reader.assert_not_called()
+
+    def test_public_checkout_inventory_reads_ordinary_live_wal(self) -> None:
+        writer = checkouts._database()
+        try:
+            writer.execute("PRAGMA wal_autocheckpoint=0")
+            writer.execute("CREATE TABLE live_snapshot_probe(value INTEGER)")
+            writer.execute("INSERT INTO live_snapshot_probe VALUES(1)")
+            writer.commit()
+            wal = Path(str(self.checkout_db) + "-wal")
+            shm = Path(str(self.checkout_db) + "-shm")
+            self.assertTrue(wal.is_file())
+            self.assertTrue(shm.is_file())
+            inventory = checkouts.checkout_inventory(
+                self.repo, include_processes=False,
+                include_tasks=False, include_resources=False,
+            )
+            self.assertTrue(inventory["active_capacity"]["available"])
+            self.assertTrue(wal.is_file())
+            self.assertTrue(shm.is_file())
+        finally:
+            writer.close()
 
     def test_public_checkout_inventory_refuses_live_wal_without_shm(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

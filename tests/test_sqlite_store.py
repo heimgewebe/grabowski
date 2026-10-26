@@ -4,9 +4,15 @@ from pathlib import Path
 import sqlite3
 import os
 import stat
+import sys
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
+
+# Always exercise the candidate source, not the previously deployed Nix package.
+SRC = Path(__file__).resolve().parents[1] / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
 
 import grabowski_sqlite_store as sqlite_store
 
@@ -360,6 +366,61 @@ class SQLiteStoreTests(unittest.TestCase):
                         allow_wal_copy=False,
                     ):
                         self.fail("Zero-length WAL alone cannot grant global strict-read permission")
+            finally:
+                writer.close()
+
+    def test_coherent_reader_pins_wal_snapshot_during_concurrent_commit(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "live.sqlite3"
+            writer = sqlite3.connect(path)
+            try:
+                writer.execute("PRAGMA journal_mode=WAL")
+                writer.execute("PRAGMA wal_autocheckpoint=0")
+                writer.execute("CREATE TABLE sample(value INTEGER)")
+                writer.execute("INSERT INTO sample VALUES(1)")
+                writer.commit()
+                wal = Path(str(path) + "-wal")
+                shm = Path(str(path) + "-shm")
+                before_names = sorted(p.name for p in Path(directory).iterdir())
+                self.assertIn(wal.name, before_names)
+                self.assertIn(shm.name, before_names)
+                with sqlite_store.inventory_coherent_readonly_sqlite(
+                    path, temporary_prefix="unused-coherent-",
+                    error_type=InventoryChanged,
+                ) as reader:
+                    self.assertEqual(reader.execute("SELECT count(*) FROM sample").fetchone()[0], 1)
+                    writer.execute("INSERT INTO sample VALUES(2)")
+                    writer.commit()
+                    self.assertEqual(reader.execute("SELECT count(*) FROM sample").fetchone()[0], 1)
+                self.assertEqual(sorted(p.name for p in Path(directory).iterdir()), before_names)
+                self.assertEqual(writer.execute("SELECT count(*) FROM sample").fetchone()[0], 2)
+            finally:
+                writer.close()
+
+    def test_coherent_reader_rejects_wal_without_shm_without_creating_it(self) -> None:
+        from shutil import copyfile
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.sqlite3"
+            target = root / "target.sqlite3"
+            writer = sqlite3.connect(source)
+            try:
+                writer.execute("PRAGMA journal_mode=WAL")
+                writer.execute("CREATE TABLE sample(value INTEGER)")
+                writer.execute("INSERT INTO sample VALUES(42)")
+                writer.commit()
+                copyfile(source, target)
+                copyfile(Path(str(source) + "-wal"), Path(str(target) + "-wal"))
+                before = {p.name: p.read_bytes() for p in root.iterdir() if p.name.startswith("target")}
+                with self.assertRaisesRegex(InventoryChanged, "Strict read-only snapshot unavailable"):
+                    with sqlite_store.inventory_coherent_readonly_sqlite(
+                        target, temporary_prefix="unused-coherent-",
+                        error_type=InventoryChanged,
+                    ):
+                        pass
+                after = {p.name: p.read_bytes() for p in root.iterdir() if p.name.startswith("target")}
+                self.assertEqual(before, after)
+                self.assertFalse(Path(str(target) + "-shm").exists())
             finally:
                 writer.close()
 
