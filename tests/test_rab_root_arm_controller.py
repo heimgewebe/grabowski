@@ -130,6 +130,30 @@ class RootArmPolicyTests(unittest.TestCase):
             self.assertIn("--property=ProtectKernelTunables=yes", props)
             self.assertIn("--property=ProtectKernelLogs=yes", props)
 
+    def test_nixos_original_inputs_use_readonly_root_owned_nix_store(self) -> None:
+        original = controller._INPUT_ROOT / ("plan-" + controller._FROZEN_PLAN_SHA256)
+        if controller._SYSTEMD_RUN == "/run/current-system/sw/bin/systemd-run":
+            self.assertEqual(
+                controller._INPUT_PROJECTION,
+                Path("/nix/store/d94g4fnrar2n1xwmp5dy4q9j6zfjw6cr-rab-original-inputs-plan-2795584ac0c1"),
+            )
+            self.assertTrue(
+                os.statvfs(controller._INPUT_PROJECTION).f_flag & os.ST_RDONLY
+            )
+            controller._require_input_projection(_pair())
+            # A writable /nix/store must never be used as the group-writable
+            # parent in root FD attestation, even with the correct plan SHA.
+            with mock.patch.object(
+                controller.os, "statvfs",
+                return_value=SimpleNamespace(f_flag=0),
+            ):
+                with self.assertRaisesRegex(
+                    controller.ArmDenied, "installed program parent is mutable"
+                ):
+                    controller._require_input_projection(_pair())
+        else:
+            self.assertEqual(controller._INPUT_PROJECTION, original)
+
     def test_uninstalled_input_projection_denied_before_root_dispatch(self) -> None:
         # Neither a real provider nor a root-owned systemd unit is started.
         with tempfile.TemporaryDirectory() as tmp:

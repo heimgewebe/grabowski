@@ -60,6 +60,12 @@ _SYSTEMCTL = (
     if Path("/usr/bin/systemctl").is_file()
     else "/run/current-system/sw/bin/systemctl"
 )
+# Frozen NixOS input is a daemon-installed, root-owned, read-only Nix store
+# projection, rather than a mutable owner-home or ad hoc /var/lib copy.
+if _SYSTEMD_RUN == "/run/current-system/sw/bin/systemd-run":
+    _INPUT_PROJECTION = Path(
+        "/nix/store/d94g4fnrar2n1xwmp5dy4q9j6zfjw6cr-rab-original-inputs-plan-2795584ac0c1"
+    )
 _VERSION = 2
 
 
@@ -648,12 +654,25 @@ def _verify_root_owned_file(path: Path, expected_sha256: str) -> None:
     flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
     parent = os.open("/", flags)
     try:
-        for part in path.parts[1:-1]:
+        for index, part in enumerate(path.parts[1:-1]):
             child = os.open(part, flags, dir_fd=parent)
             os.close(parent)
             parent = child
             info = os.fstat(parent)
-            if info.st_uid != 0 or info.st_mode & 0o022:
+            # NixOS uses mode 1775 on /nix/store (nixbld group). Only
+            # this exact root-owned directory may have writable mode bits,
+            # and only while the kernel mount is actually read-only.
+            immutable_store_parent = (
+                index == 1
+                and path.parts[:3] == ("/", "nix", "store")
+                and bool(
+                    os.statvfs("/nix/store").f_flag
+                    & getattr(os, "ST_RDONLY", 1)
+                )
+            )
+            if info.st_uid != 0 or (
+                info.st_mode & 0o022 and not immutable_store_parent
+            ):
                 raise ArmDenied("installed program parent is mutable")
         descriptor = os.open(
             path.name,
