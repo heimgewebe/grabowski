@@ -7464,6 +7464,28 @@ def _run_branch_publish(
         else ""
     )
     expected_upstream = f"{remote}/{branch}"
+    if not upstream:
+        # git push --set-upstream writes branch.* configuration even when the
+        # remote-tracking ref has not been locally fetched yet. The remote SHA
+        # has already been checked against expected_head above, so fall back
+        # only to exact local branch.remote + branch.merge config identities.
+        configured_remote = _git_optional(
+            repo=Path(orientation["root"]),
+            runner=runner,
+            argv=["config", "--get", f"branch.{branch}.remote"],
+        )
+        configured_merge = _git_optional(
+            repo=Path(orientation["root"]),
+            runner=runner,
+            argv=["config", "--get", f"branch.{branch}.merge"],
+        )
+        if (
+            int(configured_remote.get("returncode", 1)) == 0
+            and int(configured_merge.get("returncode", 1)) == 0
+            and str(configured_remote.get("stdout", "")).strip() == remote
+            and str(configured_merge.get("stdout", "")).strip() == ref
+        ):
+            upstream = expected_upstream
     if upstream != expected_upstream:
         _check(
             receipt,

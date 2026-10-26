@@ -9837,6 +9837,53 @@ class GripFoundationTests(unittest.TestCase):
         checks = {item["id"]: item["status"] for item in result["receipt"]["checks"]}
         self.assertEqual("pass", checks["upstream"])
 
+    def test_branch_publish_accepts_configured_upstream_when_remote_tracking_ref_is_absent(self) -> None:
+        class MissingLocalTrackingRef(FakeGit):
+            def __call__(self, repo: Path, argv: list[str]) -> dict[str, object]:
+                if argv == ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]:
+                    self.calls.append(tuple(argv))
+                    return {"returncode": 128, "stdout": "", "stderr": "upstream remote-tracking ref not fetched"}
+                return super().__call__(repo, argv)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = MissingLocalTrackingRef(
+                upstream=None,
+                configured_upstream_remote="origin",
+                configured_upstream_merge="refs/heads/feat/work",
+            )
+            result = grips.run_grip(
+                "branch-publish",
+                {"repo": tmp, "branch": "feat/work", "expected_head": "a" * 40},
+                allow_mutation=True,
+                command_runner=fake,
+            )
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertEqual("origin/feat/work", result["output"]["upstream"])
+        self.assertEqual("pass", {c["id"]: c["status"] for c in result["receipt"]["checks"]}["upstream"])
+
+    def test_branch_publish_rejects_configured_upstream_mismatch_after_remote_readback(self) -> None:
+        class MissingLocalTrackingRef(FakeGit):
+            def __call__(self, repo: Path, argv: list[str]) -> dict[str, object]:
+                if argv == ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]:
+                    self.calls.append(tuple(argv))
+                    return {"returncode": 128, "stdout": "", "stderr": "upstream not fetched"}
+                return super().__call__(repo, argv)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = MissingLocalTrackingRef(
+                upstream=None,
+                configured_upstream_remote="origin",
+                configured_upstream_merge="refs/heads/unrelated",
+            )
+            result = grips.run_grip(
+                "branch-publish",
+                {"repo": tmp, "branch": "feat/work", "expected_head": "a" * 40},
+                allow_mutation=True,
+                command_runner=fake,
+            )
+        self.assertEqual("failed", result["receipt"]["status"])
+        self.assertEqual("fail", {c["id"]: c["status"] for c in result["receipt"]["checks"]}["upstream"])
+
     def test_branch_publish_rejects_remote_option_injection_before_git(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             fake = FakeGit(branch="feat/work")
