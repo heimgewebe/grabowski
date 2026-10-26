@@ -2136,7 +2136,7 @@ class OperatorSignedTransportTests(unittest.TestCase):
         self.assertEqual(environment["GH_HOST"], "github.com")
         self.assertEqual(environment["GH_TOKEN"], "fixture-token")
         self.assertNotIn("GH_ENTERPRISE_TOKEN", environment)
-        self.assertEqual(environment["PATH"], "/usr/bin")
+        self.assertEqual(environment["PATH"], str(Path(operator._trusted_github_cli_path()).parent))
         self.assertEqual(environment["GH_PAGER"], "cat")
         self.assertEqual(environment["GH_PROMPT_DISABLED"], "1")
         for key in (
@@ -2641,7 +2641,7 @@ class OperatorSignedTransportTests(unittest.TestCase):
         self.assertEqual(
             run.call_args_list[2].args[0],
             [
-                "/usr/bin/git",
+                operator._trusted_git_cli_path(),
                 "-C",
                 str(ROOT),
                 "remote",
@@ -2678,7 +2678,7 @@ class OperatorSignedTransportTests(unittest.TestCase):
         self.assertEqual(
             run.call_args_list[2].args[0],
             [
-                "/usr/bin/git",
+                operator._trusted_git_cli_path(),
                 "-C",
                 str(ROOT),
                 "remote",
