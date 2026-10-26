@@ -107,10 +107,18 @@ def _self_review() -> dict[str, object]:
         "review_iterations": [
             {
                 "n": n,
-                "summary": f"distinct review pass {n}",
+                "axis": gate.REQUIRED_HIGH_CRITICAL_REVIEW_AXES[n - 1],
+                "summary": (
+                    f"Reviewed {gate.REQUIRED_HIGH_CRITICAL_REVIEW_AXES[n - 1]} "
+                    f"against the exact PR diff, provider packet reconstruction, "
+                    f"authority constraints, and relevant negative test cases."
+                ),
+                "evidence_refs": [
+                    f"tests/test_plain_llm_review_gate.py:review-axis-{n}-fixture"
+                ],
                 "material_findings": 0,
             }
-            for n in range(1, 5)
+            for n in range(1, 6)
         ],
         "all_findings_triaged": True,
         "findings": [],
@@ -378,6 +386,21 @@ def _warnings(result: dict[str, object]) -> str:
 
 
 class PlainLlmReviewGateTests(unittest.TestCase):
+    def test_external_pass_cannot_substitute_missing_fifth_self_review_axis(self) -> None:
+        state = _state()
+        review = _self_review()
+        review["review_iterations"].pop()
+        result = _evaluate_review_gate(
+            state,
+            self_review=review,
+            external_review_evidence=_plain_external_evidence(state),
+        )
+        self.assertEqual(result["verdict"], "BLOCK", result["failures"])
+        self.assertTrue(
+            any("minimum 5" in failure for failure in result["failures"]),
+            result["failures"],
+        )
+
     def test_previous_v1_evidence_reconstructs_previous_diff_prompt(self) -> None:
         raw = (
             b"diff --git a/x b/x\n"

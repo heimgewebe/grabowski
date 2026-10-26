@@ -286,6 +286,7 @@ class Pr1366CurrentHeadReviewRegressions(unittest.TestCase):
                 "status": "already-serving-exact-source",
                 "serving_repo_head": expected,
                 "target_repo_head": expected,
+                "critical_release_source": False,
                 "independent_review_required": False,
             },
         ), patch.object(
@@ -449,6 +450,7 @@ class Pr1366CurrentHeadReviewRegressions(unittest.TestCase):
                 "status": "already-serving-exact-source",
                 "serving_repo_head": expected,
                 "target_repo_head": expected,
+                "critical_release_source": False,
                 "independent_review_required": False,
             },
         ), patch.object(
@@ -1110,6 +1112,7 @@ class Pr1366CurrentHeadReviewRegressions(unittest.TestCase):
                 "status": "already-serving-exact-source",
                 "serving_repo_head": expected,
                 "target_repo_head": expected,
+                "critical_release_source": False,
                 "independent_review_required": False,
             },
         ), patch.object(
