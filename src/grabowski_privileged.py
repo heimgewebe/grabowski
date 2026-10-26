@@ -724,7 +724,7 @@ def root_task_systemd_request(
         and parsed["dispatch_started"] is False
         and parsed["reason_code"] in {"action_resolution", "peer_authority"}
         and type(invoked.get("broker_client_returncode")) is int
-        and invoked["broker_client_returncode"] == 0
+        and invoked["broker_client_returncode"] == 1
         and invoked["broker_client_timed_out"] is False
         and invoked["stdout_truncated"] is False
         and invoked["stderr_truncated"] is False

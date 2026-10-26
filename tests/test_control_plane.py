@@ -2104,7 +2104,7 @@ class PrivilegedAndConnectorTests(unittest.TestCase):
         invoked = {
             "request_id": refusal["request_id"],
             "reference_sha256": refusal["reference_sha256"],
-            "broker_client_returncode": 0,
+            "broker_client_returncode": 1,
             "broker_client_timed_out": False,
             "broker_response": refusal,
             "stdout": json.dumps(refusal),
@@ -2157,7 +2157,7 @@ class PrivilegedAndConnectorTests(unittest.TestCase):
                 self.assertNotIn("launch_not_dispatched", denied)
         for override in (
             {"broker_client_timed_out": True},
-            {"broker_client_returncode": 1},
+            {"broker_client_returncode": 0},
             {"stdout_truncated": True},
         ):
             with self.subTest(override=override):
@@ -2170,6 +2170,100 @@ class PrivilegedAndConnectorTests(unittest.TestCase):
                     )
                 self.assertTrue(ambiguous["outcome_unknown"])
                 self.assertNotIn("launch_not_dispatched", ambiguous)
+
+    def test_real_request_client_exit_one_binds_root_preclaim_refusal(self) -> None:
+        """Exercise the real unprivileged request client's exit, not a mocked 0."""
+        import io
+
+        request_tool = _load_privileged_request_tool()
+        refusal = {
+            "schema_version": 1,
+            "kind": "grabowski.root_task_systemd_pre_effect_refusal.v1",
+            "request_id": "a" * 32,
+            "reference_sha256": "b" * 64,
+            "action": privileged.ROOT_TASK_SYSTEMD_ACTION,
+            "phase": "pre_claim",
+            "claim_started": False,
+            "dispatch_started": False,
+            "reason_code": "action_resolution",
+        }
+        response_bytes = json.dumps(refusal, sort_keys=True).encode("utf-8")
+
+        class ReplyOnlySocket:
+            def __init__(self):
+                self.received = 0
+                self.sent = None
+                self.connected = None
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def settimeout(self, seconds):
+                self.timeout = seconds
+
+            def connect(self, path):
+                self.connected = path
+
+            def sendall(self, data):
+                self.sent = data
+
+            def shutdown(self, how):
+                self.how = how
+
+            def recv(self, size):
+                self.received += 1
+                return response_bytes if self.received == 1 else b""
+
+        with tempfile.TemporaryDirectory() as directory:
+            reference = Path(directory) / "reference.json"
+            reference.write_text(json.dumps({
+                "request_id": refusal["request_id"],
+                "reference_sha256": refusal["reference_sha256"],
+                "action": refusal["action"],
+            }), encoding="utf-8")
+            socket_stub = ReplyOnlySocket()
+            output = io.StringIO()
+            with (
+                patch.object(request_tool.socket, "socket", return_value=socket_stub),
+                patch.object(sys, "argv", [
+                    "grabowski-privileged-request", str(reference),
+                    "--socket", "/tmp/virtual-rootbroker-test.sock",
+                ]),
+                patch.object(sys, "stdout", output),
+            ):
+                actual_client_exit = request_tool.main()
+            self.assertEqual(socket_stub.sent, reference.read_bytes())
+            self.assertEqual(socket_stub.connected, "/tmp/virtual-rootbroker-test.sock")
+            self.assertEqual(actual_client_exit, 1)
+            self.assertEqual(json.loads(output.getvalue()), refusal)
+
+        invoked = {
+            "request_id": refusal["request_id"],
+            "reference_sha256": refusal["reference_sha256"],
+            "broker_client_returncode": actual_client_exit,
+            "broker_client_timed_out": False,
+            "broker_response": json.loads(output.getvalue()),
+            "stdout": output.getvalue(),
+            "stderr": "",
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+        }
+        unit = "grabowski-task-0123456789abcdef01234567-a1.service"
+        with patch.object(privileged, "_invoke_privileged_reference", return_value=invoked):
+            result = privileged.root_task_systemd_request({
+                "operation": "start", "unit": unit,
+            })
+            show = privileged.root_task_systemd_request({
+                "operation": "show", "unit": unit, "properties": ["LoadState"],
+            })
+        self.assertIs(result["pre_effect_refused"], True)
+        self.assertIs(result["launch_not_dispatched"], True)
+        self.assertIs(result["outcome_unknown"], False)
+        self.assertIs(show["outcome_unknown"], True)
+        self.assertNotIn("launch_not_dispatched", show)
 
     def test_root_task_garbage_broker_response_is_outcome_unknown(self) -> None:
         invoked = {
