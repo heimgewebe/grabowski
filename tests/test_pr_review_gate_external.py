@@ -251,6 +251,19 @@ class SelfReviewDepthPolicyTests(unittest.TestCase):
         )
         self.assertRegex(audit["review_pass_evidence_sha256"], r"^[0-9a-f]{64}$")
 
+    def test_sixth_critical_method_does_not_invalidate_five_required_axes(self) -> None:
+        state = _state("tools/pr_review_gate.py")
+        review = _self_review("tools/pr_review_gate.py", iterations=6)
+        result = gate.evaluate_review_gate(state, self_review=review)
+        self.assertEqual(result["verdict"], "PASS", result["failures"])
+        audit = gate.build_self_review_audit(state, result, review)
+        self.assertEqual(audit["actual_review_iterations"], 6)
+        self.assertEqual(len(audit["review_pass_axes"]), 6)
+        self.assertEqual(audit["review_pass_axes"][:5], list(
+            gate.REQUIRED_HIGH_CRITICAL_REVIEW_AXES
+        ))
+        self.assertEqual(audit["review_iterations"], review["review_iterations"])
+
     def test_multiple_critical_signals_raise_depth_to_five(self) -> None:
         state = _state("tools/pr_review_gate.py", additions=700, changed_files=16)
         state["pr"]["files"] = [

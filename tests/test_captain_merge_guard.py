@@ -284,6 +284,32 @@ class RiskScaledIndependentReviewContractTests(unittest.TestCase):
             merge_guard.independent_review_requirement(review)["errors"],
         )
 
+    def test_valid_sixth_adversarial_pass_is_not_rejected(self) -> None:
+        request = self._request()
+        evidence = request["review_evidence"]
+        extra = {
+            "n": 6,
+            "axis": "additional_adversarial_pass",
+            "summary": (
+                "Additional adversarial review confirms the negative case and "
+                "regression evidence for the protected merge-policy boundary."
+            ),
+            "evidence_refs": ["tests/test_captain_merge_guard.py:extra-pass-negative"],
+            "material_findings": 0,
+        }
+        evidence["review_iterations"].append(extra)
+        evidence["review_pass_axes"].append(extra["axis"])
+        evidence["actual_review_iterations"] = 6
+        evidence["review_pass_evidence_sha256"] = hashlib.sha256(
+            json.dumps(
+                evidence["review_iterations"],
+                sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+            ).encode("utf-8")
+        ).hexdigest()
+        self.assertEqual(
+            merge_guard.independent_review_requirement(request)["errors"], []
+        )
+
     def test_critical_self_review_below_four_passes_remains_invalid(self) -> None:
         weak = self._request()
         weak["review_evidence"]["minimum_review_iterations"] = 3
@@ -300,7 +326,14 @@ class RiskScaledIndependentReviewContractTests(unittest.TestCase):
         attempt = {
             "unit": unit, "slot": "independent-reviewer",
             "origin_sha256": "1" * 64,
-            "terminal": True, "classification": "infrastructure_error",
+            "terminal": True, "terminal_status": "launch_failed",
+            "classification": "infrastructure_error",
+            "stdout_tail_sha256": None,
+            "review_role_receipt_sha256": None,
+            "pre_result_quota_failure_verified": False,
+            "review_role_verified": False,
+            "review_route_verified": False,
+            "independence_verified": False,
             "verdict": None, "material_findings": None,
             "result_sha256": None, "diff_identity_deferred": False,
         }
@@ -328,6 +361,55 @@ class RiskScaledIndependentReviewContractTests(unittest.TestCase):
         self.assertEqual(info["errors"], [])
         self.assertEqual(len(info["ignored_unavailable"]), 2)
         self.assertEqual(info["status"], "optional_unavailable")
+
+    def test_legacy_successful_job_without_result_cannot_be_ignored(self) -> None:
+        proof = self._infra_only_reconciliation()
+        attempt = proof["attempts"][0]
+        attempt["terminal_status"] = "succeeded"
+        attempt["stdout_tail_sha256"] = "a" * 64
+        outcome = merge_guard.decision_review_blocking_errors(
+            proof, independent_required=False
+        )
+        self.assertEqual(outcome["ignored_unavailable"], [])
+        self.assertEqual(outcome["errors"], proof["errors"])
+
+    def test_legacy_failed_job_without_result_cannot_be_ignored(self) -> None:
+        proof = self._infra_only_reconciliation()
+        proof["attempts"][0]["terminal_status"] = "failed"
+        outcome = merge_guard.decision_review_blocking_errors(
+            proof, independent_required=False
+        )
+        self.assertEqual(outcome["ignored_unavailable"], [])
+        self.assertEqual(outcome["errors"], proof["errors"])
+
+    def test_claimed_quota_without_authenticated_role_receipt_stays_blocked(self) -> None:
+        proof = self._infra_only_reconciliation()
+        attempt = proof["attempts"][0]
+        attempt["terminal_status"] = "failed"
+        attempt["pre_result_quota_failure_verified"] = True
+        outcome = merge_guard.decision_review_blocking_errors(
+            proof, independent_required=False
+        )
+        self.assertEqual(outcome["ignored_unavailable"], [])
+        self.assertEqual(outcome["errors"], proof["errors"])
+
+    def test_verified_v2_pre_result_quota_is_optional_but_never_pass(self) -> None:
+        proof = self._infra_only_reconciliation()
+        attempt = proof["attempts"][0]
+        attempt.update({
+            "terminal_status": "failed",
+            "pre_result_quota_failure_verified": True,
+            "review_role_verified": True,
+            "review_route_verified": True,
+            "independence_verified": True,
+            "review_role_receipt_sha256": "c" * 64,
+        })
+        outcome = merge_guard.decision_review_blocking_errors(
+            proof, independent_required=False
+        )
+        self.assertEqual(outcome["errors"], [])
+        self.assertEqual(outcome["status"], "optional_unavailable")
+        self.assertEqual(outcome["ignored_unavailable"], proof["errors"])
 
     def test_explicit_independent_review_keeps_transport_failure_blocking(self) -> None:
         info = merge_guard.decision_review_blocking_errors(

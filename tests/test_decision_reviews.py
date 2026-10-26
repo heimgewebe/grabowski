@@ -893,6 +893,9 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
             self.assertEqual(prior["status"], "blocked")
             self.assertIn("decision_review_slot_without_pass:claude", prior["errors"])
             self.assertEqual(prior["attempts"][0]["classification"], "infrastructure_error")
+            self.assertTrue(prior["attempts"][0]["pre_result_quota_failure_verified"])
+            self.assertEqual(prior["attempts"][0]["terminal_status"], "failed")
+            self.assertTrue(prior["attempts"][0]["review_role_verified"])
             make_job(
                 jobs, suffix="b99999999999", slot="claude",
                 terminal_status="succeeded", review_result=None,

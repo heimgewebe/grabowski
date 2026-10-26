@@ -773,6 +773,27 @@ def decision_review_blocking_errors(
                 or row.get("material_findings") is not None
                 or row.get("result_sha256") is not None
                 or row.get("diff_identity_deferred") is not False
+                # Legacy "infrastructure_error" can mean an unstructured
+                # semantic REJECT. Optional absence is advisory only for
+                # a server-proven never-started job or a fully verified V2
+                # role receipt proving quota exhaustion before review work.
+                or not (
+                    (
+                        row.get("terminal_status") == "launch_failed"
+                        and row.get("stdout_tail_sha256") is None
+                        and row.get("review_role_receipt_sha256") is None
+                        and row.get("pre_result_quota_failure_verified") is False
+                    )
+                    or (
+                        row.get("terminal_status") == "failed"
+                        and row.get("pre_result_quota_failure_verified") is True
+                        and row.get("review_role_verified") is True
+                        and row.get("review_route_verified") is True
+                        and row.get("independence_verified") is True
+                        and isinstance(row.get("review_role_receipt_sha256"), str)
+                        and _SHA256_RE.fullmatch(row["review_role_receipt_sha256"]) is not None
+                    )
+                )
                 for row in rows
             )
         ):

@@ -2204,6 +2204,7 @@ def reconcile(
                 "review_provider_family": None,
                 "independence_verified": False,
                 "review_role_receipt_sha256": None,
+                "pre_result_quota_failure_verified": False,
                 "diff_identity_deferred": False,
             }
             if binding["base_sha"] != expected["base_sha"]:
@@ -2458,6 +2459,7 @@ def reconcile(
                 "review_provider_family",
                 "independence_verified",
                 "review_role_receipt_sha256",
+                "pre_result_quota_failure_verified",
                 "diff_identity_deferred",
             )
         }

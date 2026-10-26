@@ -13293,7 +13293,11 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         attempt = {
             "unit": unit, "slot": "independent-reviewer",
             "origin_sha256": "1" * 64,
-            "terminal": True, "classification": "infrastructure_error",
+            "terminal": True, "terminal_status": "launch_failed",
+            "classification": "infrastructure_error",
+            "stdout_tail_sha256": None,
+            "review_role_receipt_sha256": None,
+            "pre_result_quota_failure_verified": False,
             "verdict": None, "material_findings": None,
             "result_sha256": None, "diff_identity_deferred": False,
         }
