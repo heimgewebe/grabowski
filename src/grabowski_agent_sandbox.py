@@ -534,6 +534,32 @@ def _safe_existing_path(value: Path, field: str, *, directory: bool | None = Non
     return resolved
 
 
+_NIX_STORE = Path("/nix/store")
+
+
+def _trusted_nix_store() -> Path | None:
+    """Only mount the fixed, root-controlled Nix store; never trust caller paths."""
+    if not os.path.lexists(_NIX_STORE):
+        return None
+    caller_groups = {os.getegid(), *os.getgroups()}
+    for directory in (_NIX_STORE.parent, _NIX_STORE):
+        try:
+            metadata = directory.lstat()
+            caller_can_write = os.access(directory, os.W_OK)
+        except OSError as exc:
+            raise AgentSandboxError("Nix store is not safely inspectable") from exc
+        mode = stat.S_IMODE(metadata.st_mode)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != 0
+            or mode & 0o002
+            or (mode & 0o020 and metadata.st_gid in caller_groups)
+            or caller_can_write
+        ):
+            raise AgentSandboxError("Nix store must be root-owned and non-writable by the reviewer UID")
+    return _NIX_STORE
+
+
 def _bind_file(arguments: list[str], source: str, target: str | None = None) -> None:
     path = Path(source)
     if path.is_file() and not path.is_symlink():
@@ -855,6 +881,12 @@ def minimal_sandbox_argv(
         directory=True,
     )
     writable = _normalized_writable_paths(worktree, writable_paths)
+    nix_store = _trusted_nix_store()
+    if nix_store is not None and (
+        worktree.is_relative_to(nix_store.parent)
+        or (common is not None and common.is_relative_to(nix_store.parent))
+    ):
+        raise AgentSandboxError("workspace and git metadata may not shadow the read-only Nix store")
     adler_read_only, adler_directories = _adler_inbox_sandbox_binding(worktree)
     if workspace_writable and not writable:
         raise AgentSandboxError("writer sandbox requires at least one bounded writable path")
@@ -881,12 +913,20 @@ def minimal_sandbox_argv(
     ]
     if Path("/usr/lib64").exists():
         arguments.extend(["--symlink", "usr/lib64", "/lib64"])
+    if nix_store is not None:
+        arguments.extend(["--dir", "/nix", "--ro-bind", str(nix_store), str(nix_store)])
     arguments.extend(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--dir", "/etc"])
     normalized_directories: list[str] = []
     for value in (*adler_directories, *tuple(extra_directories)):
         raw = str(value)
         path = Path(raw)
-        if not path.is_absolute() or raw in {"/", "/proc", "/dev", "/usr", "/etc"} or "\x00" in raw or ".." in path.parts:
+        if (
+            not path.is_absolute()
+            or raw in {"/", "/proc", "/dev", "/usr", "/etc"}
+            or path.is_relative_to(Path("/nix"))
+            or "\x00" in raw
+            or ".." in path.parts
+        ):
             raise AgentSandboxError("extra sandbox directory must be a safe absolute path")
         normalized_directories.append(raw.rstrip("/"))
     for directory in sorted(set(normalized_directories), key=lambda item: (len(Path(item).parts), item)):
@@ -913,8 +953,12 @@ def minimal_sandbox_argv(
         seen_targets.add(str(common))
     for source_value, target_value in (*adler_read_only, *tuple(extra_read_only)):
         source = _safe_existing_path(source_value, "extra_read_only source")
-        if not target_value.is_absolute() or "\x00" in str(target_value):
-            raise AgentSandboxError("extra_read_only target must be absolute")
+        if (
+            not target_value.is_absolute()
+            or "\x00" in str(target_value)
+            or target_value.is_relative_to(Path("/nix"))
+        ):
+            raise AgentSandboxError("extra_read_only target must be absolute and outside /nix")
         target = str(target_value)
         if target in seen_targets:
             raise AgentSandboxError(f"duplicate sandbox target: {target}")
