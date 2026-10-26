@@ -397,6 +397,48 @@ class SQLiteStoreTests(unittest.TestCase):
             finally:
                 writer.close()
 
+    def test_coherent_reader_tolerates_legacy_client_close_without_wal_write(self) -> None:
+        # Some legacy inventory callers explicitly close the connection;
+        # outer snapshot cleanup must not rollback() an already closed handle.
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "live.sqlite3"
+            writer = sqlite3.connect(database)
+            try:
+                writer.execute("PRAGMA journal_mode=WAL")
+                writer.execute("PRAGMA wal_autocheckpoint=0")
+                writer.execute("CREATE TABLE sample(value INTEGER)")
+                writer.execute("INSERT INTO sample VALUES(7)")
+                writer.commit()
+                sources = [
+                    database,
+                    Path(str(database) + "-wal"),
+                    Path(str(database) + "-shm"),
+                ]
+                self.assertTrue(all(path.is_file() for path in sources))
+                # SHM is transient SQLite synchronization memory: a
+                # legitimate reader may update its read mark. The database
+                # and WAL bytes, sidecar existence and inode must stay intact.
+                before = {str(path): path.read_bytes() for path in sources[:2]}
+                names = sorted(item.name for item in Path(directory).iterdir())
+                shm_inode = sources[2].stat().st_ino
+                with sqlite_store.inventory_coherent_readonly_sqlite(
+                    database, temporary_prefix="unused-coherent-",
+                    error_type=InventoryChanged,
+                ) as reader:
+                    self.assertEqual(
+                        7, reader.execute("SELECT value FROM sample").fetchone()[0]
+                    )
+                    reader.close()
+                self.assertEqual(
+                    before, {str(path): path.read_bytes() for path in sources[:2]}
+                )
+                self.assertEqual(
+                    names, sorted(item.name for item in Path(directory).iterdir())
+                )
+                self.assertEqual(shm_inode, sources[2].stat().st_ino)
+            finally:
+                writer.close()
+
     def test_coherent_reader_rejects_wal_without_shm_without_creating_it(self) -> None:
         from shutil import copyfile
         with TemporaryDirectory() as directory:
