@@ -7633,6 +7633,9 @@ def _task_readonly_snapshot() -> Iterator[sqlite3.Connection]:
         temporary_prefix="unused-task-readonly.",
         error_type=TaskSchemaInventoryChanged,
         allow_checkpointed_empty_wal=True,
+        wal_mutation_admission=lambda: operator._require_operator_mutation(
+            "durable_job"
+        ),
     ) as connection:
         if _task_schema_version(connection) != TASK_CURRENT_SCHEMA_VERSION:
             raise RuntimeError("Task store requires an explicit schema migration")

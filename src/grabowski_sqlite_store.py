@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 import fcntl
 import hashlib
@@ -355,17 +355,24 @@ def inventory_coherent_readonly_sqlite(
     error_type: type[ChangedError],
     message: str = INVENTORY_CHANGED_MESSAGE,
     allow_checkpointed_empty_wal: bool = False,
+    wal_mutation_admission: Callable[[], None] | None = None,
 ) -> Iterator[sqlite3.Connection]:
-    """Observe a pinned WAL transaction or a quiescent immutable database.
+    """Pin a live WAL image only after explicit mutation admission.
 
-    An existing WAL+SHM pair is normal SQLite operation, not a reason to
-    report an unavailable inventory. Never make, delete or checkpoint sidecars:
-    a missing half of a pair still fails closed rather than letting SQLite
-    create SHM during observation.
+    SQLite mode=ro may update existing SHM read marks. A genuinely read-only
+    caller must not open a native WAL reader without the operator's mutation
+    gate. Quiescent immutable reads remain write-free and ungated. Never make,
+    delete, copy or checkpoint sidecars; incomplete pairs still fail closed.
     """
     wal = Path(str(path) + "-wal")
     shm = Path(str(path) + "-shm")
     if (wal.exists() or wal.is_symlink()) and (shm.exists() or shm.is_symlink()):
+        if wal_mutation_admission is None:
+            raise PermissionError(
+                "Native SQLite WAL observation requires mutation admission "
+                "before SHM read-mark writes"
+            )
+        wal_mutation_admission()
         with inventory_native_wal_readonly_sqlite(
             path, error_type=error_type, message=message,
         ) as connection:

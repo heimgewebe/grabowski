@@ -8167,6 +8167,9 @@ def _resource_readonly_snapshot() -> Iterator[sqlite3.Connection]:
         RESOURCE_DB,
         temporary_prefix="unused-resource-readonly.",
         error_type=ResourceSchemaInventoryChanged,
+        wal_mutation_admission=lambda: operator._require_operator_mutation(
+            "resource_lease"
+        ),
     ) as connection:
         if _resource_schema_version(connection) != RESOURCE_CURRENT_SCHEMA_VERSION:
             raise RuntimeError("Resource store requires an explicit schema migration")
