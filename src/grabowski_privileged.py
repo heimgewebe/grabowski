@@ -703,6 +703,46 @@ def root_task_systemd_request(
         max_output_bytes=max_output_bytes,
     )
     parsed = invoked["broker_response"]
+    # Only a complete request-bound root-owned pre-claim refusal proves a new
+    # start did not dispatch. Denied show/journal/stop cannot settle old tasks.
+    # Malformed and timed-out responses remain outcome_unknown.
+    preclaim_refused = (
+        isinstance(parsed, dict)
+        and set(parsed) == {
+            "schema_version", "kind", "request_id", "reference_sha256",
+            "action", "phase", "claim_started", "dispatch_started",
+            "reason_code",
+        }
+        and type(parsed.get("schema_version")) is int
+        and parsed["schema_version"] == 1
+        and parsed["kind"] == "grabowski.root_task_systemd_pre_effect_refusal.v1"
+        and parsed["request_id"] == invoked["request_id"]
+        and parsed["reference_sha256"] == invoked["reference_sha256"]
+        and parsed["action"] == ROOT_TASK_SYSTEMD_ACTION
+        and parsed["phase"] == "pre_claim"
+        and parsed["claim_started"] is False
+        and parsed["dispatch_started"] is False
+        and parsed["reason_code"] in {"action_resolution", "peer_authority"}
+        and type(invoked.get("broker_client_returncode")) is int
+        and invoked["broker_client_returncode"] == 0
+        and invoked["broker_client_timed_out"] is False
+        and invoked["stdout_truncated"] is False
+        and invoked["stderr_truncated"] is False
+    )
+    if preclaim_refused and payload.get("operation") == "start":
+        return {
+            "returncode": 1,
+            "stdout": "",
+            "stderr": "root task refused before claim and dispatch",
+            "timed_out": False,
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+            "root_truth_observable": False,
+            "outcome_unknown": False,
+            "launch_not_dispatched": True,
+            "pre_effect_refused": True,
+            "privileged_broker": invoked,
+        }
     broker_returncode = parsed.get("returncode") if isinstance(parsed, dict) else None
     broker_timed_out = bool(parsed.get("timed_out")) if isinstance(parsed, dict) else False
     root_truth_observable = (

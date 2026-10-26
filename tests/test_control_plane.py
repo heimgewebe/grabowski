@@ -1212,6 +1212,39 @@ class PrivilegedBrokerTests(unittest.TestCase):
             },
         }
 
+    def test_root_task_unconfigured_action_emits_bound_preclaim_refusal(self) -> None:
+        broker_tool = _load_root_broker_tool()
+        reference = self._root_task_reference({
+            "operation": "start",
+            "unit": "grabowski-task-0123456789abcdef01234567-a1.service",
+        }, now=int(time.time()))
+        with patch.object(
+            broker_tool, "load_root_config",
+            return_value={"schema_version": 2, "actions": {}},
+        ), patch.object(
+            broker_tool, "claim_once", side_effect=AssertionError("must not claim"),
+        ), patch.object(
+            broker_tool, "_execute_broker_command",
+            side_effect=AssertionError("must not execute"),
+        ), patch("builtins.print") as printed:
+            result = broker_tool._run_non_secret_reference_request(
+                json.dumps(reference).encode("utf-8")
+            )
+        self.assertEqual(result, 0)
+        printed.assert_called_once()
+        refusal = json.loads(printed.call_args.args[0])
+        self.assertEqual(
+            refusal["kind"], "grabowski.root_task_systemd_pre_effect_refusal.v1"
+        )
+        self.assertEqual(refusal["schema_version"], 1)
+        self.assertEqual(refusal["request_id"], reference["request_id"])
+        self.assertEqual(refusal["reference_sha256"], reference["reference_sha256"])
+        self.assertEqual(refusal["action"], "operator_root_task_systemd_unit")
+        self.assertEqual(refusal["phase"], "pre_claim")
+        self.assertEqual(refusal["reason_code"], "action_resolution")
+        self.assertIs(refusal["claim_started"], False)
+        self.assertIs(refusal["dispatch_started"], False)
+
     def test_root_task_start_resolves_to_root_owned_systemd_unit(self) -> None:
         unit = "grabowski-task-0123456789abcdef01234567-a1.service"
         reference = self._root_task_reference({
@@ -2055,6 +2088,88 @@ class PrivilegedAndConnectorTests(unittest.TestCase):
             self.assertEqual(list(root.iterdir()), [])
             append_audit.assert_called_once()
             self.assertTrue(append_audit.call_args.args[0]["broker_client_timed_out"])
+
+    def test_root_task_preclaim_refusal_settles_only_current_start(self) -> None:
+        refusal = {
+            "schema_version": 1,
+            "kind": "grabowski.root_task_systemd_pre_effect_refusal.v1",
+            "request_id": "a" * 32,
+            "reference_sha256": "b" * 64,
+            "action": privileged.ROOT_TASK_SYSTEMD_ACTION,
+            "phase": "pre_claim",
+            "claim_started": False,
+            "dispatch_started": False,
+            "reason_code": "action_resolution",
+        }
+        invoked = {
+            "request_id": refusal["request_id"],
+            "reference_sha256": refusal["reference_sha256"],
+            "broker_client_returncode": 0,
+            "broker_client_timed_out": False,
+            "broker_response": refusal,
+            "stdout": json.dumps(refusal),
+            "stderr": "",
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+        }
+        unit = "grabowski-task-0123456789abcdef01234567-a1.service"
+        with patch.object(
+            privileged, "_invoke_privileged_reference", return_value=invoked
+        ):
+            started = privileged.root_task_systemd_request(
+                {"operation": "start", "unit": unit}
+            )
+            observed = privileged.root_task_systemd_request(
+                {"operation": "show", "unit": unit, "properties": ["LoadState"]}
+            )
+        self.assertEqual(started["returncode"], 1)
+        self.assertIs(started["pre_effect_refused"], True)
+        self.assertIs(started["launch_not_dispatched"], True)
+        self.assertIs(started["outcome_unknown"], False)
+        self.assertIs(started["root_truth_observable"], False)
+        self.assertIs(observed["outcome_unknown"], True)
+        self.assertNotIn("launch_not_dispatched", observed)
+
+        malformed = [
+            ("request_id", "c" * 32),
+            ("reference_sha256", "d" * 64),
+            ("action", "not-the-requested-action"),
+            ("kind", "arbitrary-refusal"),
+            ("phase", "after_claim"),
+            ("claim_started", True),
+            ("dispatch_started", True),
+            ("reason_code", "unknown_stage"),
+            ("schema_version", True),
+        ]
+        for field, value in malformed:
+            with self.subTest(field=field):
+                with patch.object(
+                    privileged, "_invoke_privileged_reference",
+                    return_value={
+                        **invoked,
+                        "broker_response": {**refusal, field: value},
+                    },
+                ):
+                    denied = privileged.root_task_systemd_request(
+                        {"operation": "start", "unit": unit}
+                    )
+                self.assertTrue(denied["outcome_unknown"])
+                self.assertNotIn("launch_not_dispatched", denied)
+        for override in (
+            {"broker_client_timed_out": True},
+            {"broker_client_returncode": 1},
+            {"stdout_truncated": True},
+        ):
+            with self.subTest(override=override):
+                with patch.object(
+                    privileged, "_invoke_privileged_reference",
+                    return_value={**invoked, **override},
+                ):
+                    ambiguous = privileged.root_task_systemd_request(
+                        {"operation": "start", "unit": unit}
+                    )
+                self.assertTrue(ambiguous["outcome_unknown"])
+                self.assertNotIn("launch_not_dispatched", ambiguous)
 
     def test_root_task_garbage_broker_response_is_outcome_unknown(self) -> None:
         invoked = {
