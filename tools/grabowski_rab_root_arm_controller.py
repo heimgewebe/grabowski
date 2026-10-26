@@ -585,9 +585,15 @@ def _unit_argv(policy: dict[str, Any], index: int) -> list[str]:
         f"{home} {home}/repos "
         + ("/sys" if _SYSTEMD_RUN.startswith("/run/current-system/sw/bin/")
            else "/proc /sys"),
+        # On NixOS systemd's DynamicUser maps private StateDirectory leaves
+        # through /var/lib/private. Masking that parent makes our own private
+        # epoch outputs EACCES; the real PID1 differential probe confirmed it.
+        # Keep all other inaccessible paths and the Pop!_OS mask unchanged.
         "InaccessiblePaths=-/run/user -/run/docker -/mnt/backup "
-        "-/dev/hugepages /var/lib/private "
-        f"-{_INPUT_ROOT}",
+        "-/dev/hugepages "
+        + ("" if _SYSTEMD_RUN.startswith("/run/current-system/sw/bin/")
+           else "/var/lib/private ")
+        + f"-{_INPUT_ROOT}",
         f"ReadWritePaths={' '.join(outputs)}",
         "TemporaryFileSystem=/dev/shm:rw,nosuid,nodev,noexec,mode=1777",
         "ProtectControlGroups=yes",

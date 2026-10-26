@@ -109,8 +109,14 @@ class RootArmPolicyTests(unittest.TestCase):
                 self.assertIn("/var/lib/private/" + pair + ":" + home, binds[0])
             self.assertTrue(any(item.startswith("--property=ReadOnlyPaths=") and
                 home + "/repos" in item for item in before))
-            self.assertTrue(any(item.startswith("--property=InaccessiblePaths=") and
-                "/var/lib/private" in item for item in before))
+            inaccessible = next(item for item in before
+                                if item.startswith("--property=InaccessiblePaths="))
+            if controller._SYSTEMD_RUN.startswith("/run/current-system/sw/bin/"):
+                # PID1 DynamicUser StateDirectory uses /var/lib/private itself.
+                # Masking its parent makes all output leaves EACCES.
+                self.assertNotIn("/var/lib/private", inaccessible)
+            else:
+                self.assertIn("/var/lib/private", inaccessible)
             self.assertTrue(any(item.startswith("--property=RuntimeDirectory=") for item in before))
         changed = _pair()
         changed["pair_id"] = "separate-frozen-pair"
@@ -229,8 +235,12 @@ class RootArmPolicyTests(unittest.TestCase):
         self.assertIn("--property=StandardInput=null", before)
         self.assertIn("--property=StandardOutput=null", before)
         self.assertIn("--property=StandardError=null", before)
-        self.assertTrue(any(item.startswith("--property=InaccessiblePaths=") and
-                            "/var/lib/private" in item for item in before))
+        inaccessible = next(item for item in before
+                            if item.startswith("--property=InaccessiblePaths="))
+        if controller._SYSTEMD_RUN.startswith("/run/current-system/sw/bin/"):
+            self.assertNotIn("/var/lib/private", inaccessible)
+        else:
+            self.assertIn("/var/lib/private", inaccessible)
         self.assertIn("--property=KillMode=control-group", before)
         self.assertEqual(after[0], str(controller._INSTALLED_RUNNER))
         self.assertFalse(any("sh -c" in item for item in argv))
