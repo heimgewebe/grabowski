@@ -18,7 +18,7 @@ class NixosPublisherBinariesTests(unittest.TestCase):
         operator = _load_operator_module()
         if os.path.lexists("/usr/bin/git") or not os.path.lexists("/run/current-system/sw/bin/git"):
             self.skipTest("NixOS-specific fixture unavailable")
-        self.assertEqual("/run/current-system/sw/bin/git", operator._trusted_git_cli_path())
+        self.assertEqual(str(Path("/run/current-system/sw/bin/git").resolve(strict=True)), operator._trusted_git_cli_path())
 
     def test_classic_linux_keeps_strict_original_guard(self) -> None:
         operator = _load_operator_module()
@@ -55,7 +55,9 @@ class NixosPublisherBinariesTests(unittest.TestCase):
             patch.object(operator.os.path, "lexists", return_value=False),
             patch.object(operator.Path, "resolve", return_value=Path("/tmp/evil/git")),
         ):
-            with self.assertRaisesRegex(PermissionError, "Nix store"):
+            # The complete-hop guard may reject the mocked /tmp target
+            # earlier as a resolution drift rather than at the store gate.
+            with self.assertRaisesRegex(PermissionError, "Nix store|resolution changed"):
                 operator._trusted_git_cli_path()
 
     def test_untrusted_symlink_chain_rejected(self) -> None:
@@ -67,6 +69,15 @@ class NixosPublisherBinariesTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(PermissionError, "mutable symlink"):
                 operator._trusted_git_cli_path()
+
+    def test_github_nixos_cli_rejects_untrusted_intermediate_symlink(self) -> None:
+        operator = _load_operator_module()
+        with patch.object(
+            operator.grabowski_git_ssh, "_root_managed_resolution",
+            side_effect=PermissionError("mutable intermediate hop"),
+        ):
+            with self.assertRaisesRegex(PermissionError, "mutable intermediate"):
+                operator._trusted_nixos_cli_path("gh", "GitHub CLI")
 
     def test_nonexecutable_nixos_binary_denied(self) -> None:
         operator = _load_operator_module()
@@ -93,7 +104,7 @@ class NixosPublisherBinariesTests(unittest.TestCase):
             self.skipTest("NixOS legacy Git alias unavailable")
         if legacy.resolve(strict=True) != nix.resolve(strict=True):
             self.skipTest("NixOS Git alias is not identical")
-        self.assertEqual(str(nix), operator._trusted_git_cli_path())
+        self.assertEqual(str(nix.resolve(strict=True)), operator._trusted_git_cli_path())
 
     def test_untrusted_legacy_git_alias_is_not_bypassed(self) -> None:
         operator = _load_operator_module()
@@ -109,7 +120,7 @@ class NixosPublisherBinariesTests(unittest.TestCase):
         operator = _load_operator_module()
         if os.path.lexists("/usr/bin/gh") or not os.path.lexists("/run/current-system/sw/bin/gh"):
             self.skipTest("NixOS-specific fixture unavailable")
-        self.assertEqual("/run/current-system/sw/bin/gh", operator._trusted_github_cli_path())
+        self.assertEqual(str(Path("/run/current-system/sw/bin/gh").resolve(strict=True)), operator._trusted_github_cli_path())
 
     def test_github_legacy_cli_is_not_bypassed(self) -> None:
         operator = _load_operator_module()

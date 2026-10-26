@@ -4263,7 +4263,11 @@ def _trusted_nixos_cli_path(command: str, label: str) -> str:
         raise ValueError("unsupported NixOS CLI executable")
     path = Path("/run/current-system/sw/bin") / command
     try:
-        resolved = path.resolve(strict=True)
+        resolved = grabowski_git_ssh._root_managed_resolution(path)
+    except PermissionError:
+        # An untrusted intermediate symlink is a security violation, not
+        # an unavailable system executable. Keep the fail-closed signal.
+        raise
     except OSError as exc:
         raise RuntimeError(f"trusted {label} path is unavailable") from exc
     if not resolved.is_relative_to(Path("/nix/store")):
@@ -4279,7 +4283,7 @@ def _trusted_nixos_cli_path(command: str, label: str) -> str:
         or not os.access(resolved, os.X_OK)
     ):
         raise PermissionError(f"trusted {label} is not a root-owned executable")
-    return str(path)
+    return str(resolved)
 
 
 def _trusted_github_cli_path() -> str:
