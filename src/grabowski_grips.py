@@ -7472,18 +7472,20 @@ def _run_branch_publish(
         configured_remote = _git_optional(
             repo=Path(orientation["root"]),
             runner=runner,
-            argv=["config", "--get", f"branch.{branch}.remote"],
+            argv=["config", "--get-all", f"branch.{branch}.remote"],
         )
         configured_merge = _git_optional(
             repo=Path(orientation["root"]),
             runner=runner,
-            argv=["config", "--get", f"branch.{branch}.merge"],
+            argv=["config", "--get-all", f"branch.{branch}.merge"],
         )
+        remote_values = str(configured_remote.get("stdout", "")).splitlines()
+        merge_values = str(configured_merge.get("stdout", "")).splitlines()
         if (
             int(configured_remote.get("returncode", 1)) == 0
             and int(configured_merge.get("returncode", 1)) == 0
-            and str(configured_remote.get("stdout", "")).strip() == remote
-            and str(configured_merge.get("stdout", "")).strip() == ref
+            and remote_values == [remote]
+            and merge_values == [ref]
         ):
             upstream = expected_upstream
     if upstream != expected_upstream:
