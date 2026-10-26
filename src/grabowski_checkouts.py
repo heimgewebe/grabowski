@@ -673,6 +673,9 @@ def _readonly_connection(path: Path) -> sqlite3.Connection | None:
                 temporary_prefix="unused-checkout-inventory-readonly.",
                 error_type=RuntimeError,
                 message="Strict read-only checkout inventory changed",
+                wal_mutation_admission=lambda: operator._require_operator_mutation(
+                    "resource_lease"
+                ),
             )
         )
     resolved = path.resolve(strict=True)
@@ -4595,6 +4598,9 @@ def grabowski_checkout_uncertainty_status(fence_id: str = "") -> dict[str, Any]:
         temporary_prefix="unused-checkout-uncertainty.",
         error_type=RuntimeError,
         message="Checkout uncertainty snapshot changed",
+        wal_mutation_admission=lambda: operator._require_operator_mutation(
+            "resource_lease"
+        ),
     ) as connection:
         try:
             version = connection.execute(

@@ -22,6 +22,39 @@ class InventoryChanged(RuntimeError):
 
 
 class SQLiteStoreTests(unittest.TestCase):
+    def test_ungated_native_wal_public_snapshot_never_opens_sqlite(self) -> None:
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "live.sqlite3"
+            writer = sqlite3.connect(database)
+            try:
+                writer.execute("PRAGMA journal_mode=WAL")
+                writer.execute("PRAGMA wal_autocheckpoint=0")
+                writer.execute("CREATE TABLE sample(value INTEGER)")
+                writer.execute("INSERT INTO sample VALUES(1)")
+                writer.commit()
+                sidecars = [database, Path(str(database) + "-wal"),
+                            Path(str(database) + "-shm")]
+                self.assertTrue(all(path.is_file() for path in sidecars))
+                before = {path.name: path.read_bytes() for path in sidecars}
+                # mode=ro can still write a WAL SHM read mark: a public
+                # observation must reject before attempting SQLite.connect.
+                with patch.object(
+                    sqlite_store.sqlite3, "connect",
+                    side_effect=AssertionError("unadmitted WAL reader opened SQLite"),
+                ) as connect:
+                    with self.assertRaisesRegex(PermissionError, "mutation admission"):
+                        with sqlite_store.inventory_coherent_readonly_sqlite(
+                            database, temporary_prefix="unused-coherent-",
+                            error_type=InventoryChanged,
+                        ):
+                            pass
+                    connect.assert_not_called()
+                self.assertEqual(before, {
+                    path.name: path.read_bytes() for path in sidecars
+                })
+            finally:
+                writer.close()
+
     def test_copy_regular_file_preserves_bytes_and_private_mode(self) -> None:
         with TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -384,14 +417,17 @@ class SQLiteStoreTests(unittest.TestCase):
                 before_names = sorted(p.name for p in Path(directory).iterdir())
                 self.assertIn(wal.name, before_names)
                 self.assertIn(shm.name, before_names)
+                admissions = []
                 with sqlite_store.inventory_coherent_readonly_sqlite(
                     path, temporary_prefix="unused-coherent-",
                     error_type=InventoryChanged,
+                    wal_mutation_admission=lambda: admissions.append(True),
                 ) as reader:
                     self.assertEqual(reader.execute("SELECT count(*) FROM sample").fetchone()[0], 1)
                     writer.execute("INSERT INTO sample VALUES(2)")
                     writer.commit()
                     self.assertEqual(reader.execute("SELECT count(*) FROM sample").fetchone()[0], 1)
+                self.assertEqual(admissions, [True])
                 self.assertEqual(sorted(p.name for p in Path(directory).iterdir()), before_names)
                 self.assertEqual(writer.execute("SELECT count(*) FROM sample").fetchone()[0], 2)
             finally:
@@ -424,6 +460,7 @@ class SQLiteStoreTests(unittest.TestCase):
                 with sqlite_store.inventory_coherent_readonly_sqlite(
                     database, temporary_prefix="unused-coherent-",
                     error_type=InventoryChanged,
+                    wal_mutation_admission=lambda: None,
                 ) as reader:
                     self.assertEqual(
                         7, reader.execute("SELECT value FROM sample").fetchone()[0]
