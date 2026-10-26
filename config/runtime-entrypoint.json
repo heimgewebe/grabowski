@@ -314,6 +314,10 @@
       "source": "src/grabowski_grips.py"
     },
     {
+      "module": "grabowski_git_ssh",
+      "source": "src/grabowski_git_ssh.py"
+    },
+    {
       "module": "grabowski_post_merge_sync_apply",
       "source": "src/grabowski_post_merge_sync_apply.py"
     },
