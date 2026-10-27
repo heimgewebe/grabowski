@@ -627,6 +627,25 @@ class SemanticV2RoleContractTests(unittest.TestCase):
             len({item["provenance"]["unit"] for item in result.values()}), 5,
         )
 
+    def test_unicode_v2_document_preserves_exact_digest_and_bytes(self):
+        unit = "grabowski-job-000000000001"
+        receipt = self.receipts[unit]
+        document = json.loads(receipt["stdout_tail"])
+        document["summary"] += " – Prüfung mit Umlauten: Sicherheit und Integrität."
+        wire = json.dumps(
+            document, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        )
+        receipt["stdout_tail"] = wire
+        receipt["stdout_bytes"] = len(wire.encode("utf-8"))
+        receipt["stdout_sha256"] = hashlib.sha256(wire.encode("utf-8")).hexdigest()
+        receipt["review_document_object_sha256"] = (
+            decisions._agent_role_command_sha256(document)
+        )
+        receipt["receipt_sha256"] = decisions._agent_role_receipt_sha256(receipt)
+        self.attempts[0]["review_role_receipt_sha256"] = receipt["receipt_sha256"]
+        result = self.verify_fixture()
+        self.assertEqual(len(result), len(execution.REQUIRED_AXES))
+
     def test_missing_axis_role_blocks(self):
         self.attempts.pop()
         with self.assertRaisesRegex(
@@ -756,6 +775,11 @@ class WorkerCoverageIntegrationTests(unittest.TestCase):
         report = self.report(binding, result)
         self.assertEqual(report["measurements"]["changed_paths"], 2)
         self.assertEqual(report["measurements"]["inspected_paths"], 2)
+        source = execution.trusted_phase_source(
+            binding, "contracts_correctness", str(self.repo),
+        )
+        self.assertIn("fields=delta.stdout.split(b'\\x00')", source)
+        self.assertNotIn("inspection=run('diff'", source)
 
     def test_chmod_only_counts_full_path(self):
         (self.repo / "obsolete.py").chmod(0o755)
@@ -777,6 +801,26 @@ class WorkerCoverageIntegrationTests(unittest.TestCase):
         self.commit("symlink")
         _, result = self.worker()
         self.assertEqual(result.returncode, 95)
+        self.assertNotIn(execution.PHASE_OBSERVATION_PREFIX, result.stdout)
+
+    def test_gitlink_changed_path_cannot_be_silently_skipped(self):
+        nested = self.repo / "nested"
+        nested.mkdir()
+        def subgit(*args):
+            child = subprocess.run(
+                ["git", "-C", str(nested), *args],
+                capture_output=True, text=True, check=False, timeout=15,
+            )
+            self.assertEqual(0, child.returncode, child.stderr)
+        subgit("init", "-q")
+        (nested / "file.txt").write_text("nested\n", encoding="utf-8")
+        subgit("add", "-A")
+        subgit("-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+               "commit", "--no-gpg-sign", "-qm", "nested")
+        self.git("add", "nested")
+        self.commit("gitlink")
+        _, result = self.worker()
+        self.assertEqual(95, result.returncode, result.stderr[:300])
         self.assertNotIn(execution.PHASE_OBSERVATION_PREFIX, result.stdout)
 
     def test_oversize_blob_stream_is_bounded(self):
