@@ -10797,6 +10797,31 @@ class CompleteBootstrapIndexCensusTests(unittest.TestCase):
         self.assertEqual(result["units"], [unit])
 
 
+    def test_slow_metadata_aborts_inside_a_page_before_lock_starvation(self) -> None:
+        entries = [Path("/jobs") / f"grabowski-job-{n:012x}" for n in range(2051)]
+        root = mock.Mock()
+        root.iterdir.side_effect = lambda: iter(entries)
+        logical = [0.0]
+        examined = []
+        def metadata(unit):
+            examined.append(unit)
+            logical[0] += 0.2
+            return {"argv": self._ordinary(), "final_status": "completed"}
+        with (
+            mock.patch.object(SELF_DEPLOY.time, "monotonic", side_effect=lambda: logical[0]),
+            mock.patch.object(SELF_DEPLOY.operator, "_read_job_metadata", side_effect=metadata),
+            mock.patch.object(SELF_DEPLOY, "_write_deploy_index") as write,
+            mock.patch.object(Path, "is_symlink", return_value=False),
+            mock.patch.object(Path, "is_dir", return_value=True),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "census timed out"):
+                SELF_DEPLOY._bootstrap_deploy_index(root)
+        # The 75-second deadline must be enforced within a page, not after
+        # processing all 2,000 entries with a potentially held schedule lock.
+        self.assertLess(len(examined), 400)
+        write.assert_not_called()
+
+
 class LegacyRedactedDeployIndexTests(unittest.TestCase):
     """Historical redacted deploy argv may be recovered only from exact bindings."""
 

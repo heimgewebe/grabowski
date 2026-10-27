@@ -1580,6 +1580,10 @@ def _bootstrap_deploy_index(
         if time.monotonic() - scan_started > DEPLOY_BOOTSTRAP_TIMEOUT_SECONDS:
             raise RuntimeError("runtime deploy bootstrap census timed out")
         for entry in entries[offset: offset + MAX_JOB_SCAN_ENTRIES]:
+            # A slow metadata filesystem must not hold the global deployment
+            # schedule lock for an entire 2,000-entry page past the deadline.
+            if time.monotonic() - scan_started > DEPLOY_BOOTSTRAP_TIMEOUT_SECONDS:
+                raise RuntimeError("runtime deploy bootstrap census timed out")
             if entry.is_symlink() or not entry.is_dir():
                 raise RuntimeError(f"durable job entry is not a real directory: {entry.name}")
             try:
