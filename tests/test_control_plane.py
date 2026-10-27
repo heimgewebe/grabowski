@@ -2910,9 +2910,16 @@ class SecretPtyContractTests(unittest.TestCase):
 
     def test_secret_pty_peer_rejects_foreign_interpreter_wrapper(self) -> None:
         root_tool = _load_root_broker_tool()
-        # Use a stable root-controlled executable so this regression reaches the
-        # interpreter-identity guard on both local hosts and GitHub runners.
-        expected_client = str(Path(shutil.which("true") or "/usr/bin/true").resolve(strict=True))
+        # Resolve the platform's root-controlled executable, not a fixed
+        # /bin path that does not exist on native NixOS. The broker must still
+        # enforce the resolved regular-file/root-ownership contract itself.
+        expected_client = str(
+            Path(
+                "/bin/true"
+                if Path("/bin/true").exists()
+                else "/run/current-system/sw/bin/true"
+            ).resolve(strict=True)
+        )
         fake_control_group = "/system.slice/grabowski-operator.service"
         execution = {
             "allowed_peer_uid": os.getuid(),
