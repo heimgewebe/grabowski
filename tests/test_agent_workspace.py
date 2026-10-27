@@ -4315,7 +4315,7 @@ class AgentWorkspaceTests(unittest.TestCase):
             prepared.probe_executable, str(sandbox.CODEX_SANDBOX_EXECUTABLE)
         )
         self.assertEqual(
-            prepared.command[:4], ("/usr/bin/python3", "-I", "-S", "-c")
+            prepared.command[:4], (str(sandbox.sandbox_python_executable()), "-I", "-S", "-c")
         )
         self.assertIn(str(sandbox.CODEX_SANDBOX_AUTH_LOCK), prepared.command)
         self.assertIn(str(sandbox.CODEX_SANDBOX_EXECUTABLE), prepared.command)
@@ -4439,7 +4439,7 @@ class AgentWorkspaceTests(unittest.TestCase):
         auth.chmod(0o600)
         executable = self.root / "codex-persistent-bin"
         executable.write_text(
-            "#!/usr/bin/python3\n"
+            f"#!{sandbox.sandbox_python_executable()}\n"
             "from pathlib import Path\n"
             "auth = Path.home() / '.codex' / 'auth.json'\n"
             "config = Path.home() / '.codex' / 'config.toml'\n"
@@ -4507,7 +4507,7 @@ class AgentWorkspaceTests(unittest.TestCase):
         auth.chmod(0o600)
         executable = self.root / "codex-concurrent-bin"
         executable.write_text(
-            "#!/usr/bin/python3\n"
+            f"#!{sandbox.sandbox_python_executable()}\n"
             "from pathlib import Path\n"
             "import time\n"
             "auth = Path.home() / '.codex' / 'auth.json'\n"
