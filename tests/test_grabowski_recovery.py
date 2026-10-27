@@ -372,8 +372,8 @@ class NativeNixOSResticProofTests(unittest.TestCase):
     def test_broker_service_waits_for_unit_success_and_exact_new_root_proof(self) -> None:
         proof = self._root_proof()
         sequence = iter([
-            {"returncode": 0, "stdout": "ActiveState=activating\nResult=success\nExecMainStatus=0\n"},
-            {"returncode": 0, "stdout": "ActiveState=inactive\nResult=success\nExecMainStatus=0\n"},
+            {"returncode": 0, "stdout": "LoadState=loaded\nJob=\nActiveState=activating\nResult=success\nExecMainStatus=0\n"},
+            {"returncode": 0, "stdout": "LoadState=loaded\nJob=\nActiveState=inactive\nResult=success\nExecMainStatus=0\n"},
         ])
         with patch.object(
             recovery.operator, "_run", side_effect=lambda *a, **kw: next(sequence)
@@ -389,10 +389,26 @@ class NativeNixOSResticProofTests(unittest.TestCase):
         self.assertEqual(run.call_count, 2)
         read.assert_called_once()
 
+    def test_broker_wait_rejects_missing_root_unit_with_success_looking_systemd_status(self) -> None:
+        # systemctl show of an unknown unit exits 0 with inactive/success/0.
+        with patch.object(recovery.operator, "_run", return_value={
+            "returncode": 0,
+            "stdout": "LoadState=not-found\nJob=\nActiveState=inactive\nResult=success\nExecMainStatus=0\n",
+        }), patch.object(recovery, "_nixos_root_proof_read") as proof, patch.object(
+            recovery.time, "sleep",
+        ) as sleep:
+            with self.assertRaisesRegex(RuntimeError, "missing"):
+                recovery._await_nixos_root_proof(
+                    started_at_unix=self.now,
+                    expected_backup_uuid=self.target["backup_uuid"],
+                )
+            proof.assert_not_called()
+            sleep.assert_not_called()
+
     def test_broker_wait_refuses_failed_systemd_result_and_unverified_root_proof(self) -> None:
         with patch.object(recovery.operator, "_run", return_value={
             "returncode": 0,
-            "stdout": "ActiveState=failed\nResult=exit-code\nExecMainStatus=1\n",
+            "stdout": "LoadState=loaded\nJob=\nActiveState=failed\nResult=exit-code\nExecMainStatus=1\n",
         }), patch.object(recovery, "_nixos_root_proof_read") as read:
             with self.assertRaisesRegex(RuntimeError, "failed"):
                 recovery._await_nixos_root_proof(
@@ -401,7 +417,7 @@ class NativeNixOSResticProofTests(unittest.TestCase):
             read.assert_not_called()
         with patch.object(recovery.operator, "_run", return_value={
             "returncode": 0,
-            "stdout": "ActiveState=inactive\nResult=success\nExecMainStatus=0\n",
+            "stdout": "LoadState=loaded\nJob=\nActiveState=inactive\nResult=success\nExecMainStatus=0\n",
         }), patch.object(
             recovery, "_nixos_root_proof_read", side_effect=RuntimeError("stale prior proof")
         ), patch.object(recovery.time, "monotonic", side_effect=[0.0, 2.0]):

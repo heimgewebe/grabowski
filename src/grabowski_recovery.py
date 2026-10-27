@@ -1652,6 +1652,7 @@ def _await_nixos_root_proof(
     while True:
         status = operator._run(
             ["systemctl", "--system", "show", NIXOS_RESTIC_ROOT_PROOF_UNIT,
+             "--property=LoadState", "--property=Job",
              "--property=ActiveState", "--property=Result", "--property=ExecMainStatus"],
             cwd=operator.HOME, timeout_seconds=30,
             max_output_bytes=operator.DEFAULT_OUTPUT_BYTES,
@@ -1663,12 +1664,19 @@ def _await_nixos_root_proof(
             if "=" in line:
                 key, value = line.split("=", 1)
                 values[key] = value
+        # systemctl show returns exit 0 even for LoadState=not-found, which
+        # otherwise looks like inactive/Result=success/ExecMainStatus=0.
+        if values.get("LoadState") != "loaded" or values.get("Job") is None:
+            raise RuntimeError("NixOS root Restic service is missing or its job state is unavailable")
         active = values.get("ActiveState")
         result = values.get("Result")
         exit_status = values.get("ExecMainStatus")
+        pending_job = values["Job"] not in {"", "0"}
         if active == "failed" or (active == "inactive" and result not in {"success", None, ""}):
             raise RuntimeError("NixOS root Restic service failed before recovery proof")
-        if active == "inactive" and result == "success" and exit_status == "0":
+        if active == "inactive" and not pending_job and result == "success" and exit_status != "0":
+            raise RuntimeError("NixOS root Restic service did not exit successfully")
+        if active == "inactive" and not pending_job and result == "success" and exit_status == "0":
             try:
                 # Unit may report the preceding successful result while the new
                 # start job is still queued. The root proof must be NEW.
