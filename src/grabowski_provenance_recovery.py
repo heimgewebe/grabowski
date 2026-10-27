@@ -768,13 +768,18 @@ def evaluate_resume_gate(expected_head: str) -> dict[str, Any]:
 
 
 def _local_backup_evidence_for_repair() -> dict[str, Any]:
-    """Read the OS-specific backup contract, never forge a Pop! marker on NixOS."""
+    """Use successful native backup evidence, never require a restore probe.
+
+    Recovery provenance repair intentionally has a backup-only freshness
+    prerequisite. The separate privileged recovery gate still requires its
+    root-owned restore/repository-check proof; this read-only assessment does
+    not consult or waive that proof.
+    """
     nixos = bool(
         getattr(recovery, "_NIXOS_OS_PRESENT", False)
         or getattr(recovery, "_NIXOS_RESTIC_TIMER_PRESENT", False)
     )
     if not nixos:
-        # Preserve the complete pre-existing Pop!_OS contract.
         return recovery._fresh_text_marker(recovery.BACKUP_SUCCESS)
 
     unavailable: dict[str, Any] = {
@@ -783,25 +788,35 @@ def _local_backup_evidence_for_repair() -> dict[str, Any]:
         "timestamp_unix": None, "age_seconds": None,
         "backup_invocation_id": None, "snapshot_id": None,
     }
+    # On NixOS a missing native timer never authorizes the Pop! success file.
+    if not getattr(recovery, "_NIXOS_RESTIC_TIMER_PRESENT", False):
+        return unavailable
     try:
-        row = recovery._local_backup_freshness()
+        # This helper verifies systemd's completed successful InvocationID
+        # and the matching trusted journal snapshot-save event. Unlike
+        # _local_backup_freshness it does not read recovery/restore markers.
+        row = recovery._nixos_native_backup_service_fresh()
         if not isinstance(row, dict):
             return unavailable
         age, stamp = row.get("age_seconds"), row.get("timestamp_unix")
-        source, path = row.get("source"), row.get("path")
         invocation, snapshot = row.get("backup_invocation_id"), row.get("snapshot_id")
+        start = row.get("service_start_unix")
+        end = row.get("service_exit_unix")
+        saved = row.get("snapshot_saved_at_unix")
         now = int(time.time())
         max_age = recovery.MAX_AGE_SECONDS
         valid = (
-            row.get("valid") is True and row.get("exists") is True
+            row.get("valid") is True
+            and row.get("exists") is True
+            and row.get("source") == "nixos-system-restic-backup-completion"
+            and row.get("path") == "systemd:restic-backups-heim-pc.service"
             and type(age) is int and type(stamp) is int
+            and type(start) is int and type(end) is int
+            and type(saved) is int
             and type(max_age) is int and max_age > 0
+            and 0 < start <= saved <= end == stamp <= now
             and 0 <= age <= max_age and 0 <= now - stamp <= max_age
             and abs(now - stamp - age) <= 5
-            and source in {"verified-nixos-native-restic", "nixos-system-restic-backup-completion"}
-            and isinstance(path, str) and bool(path)
-            and (source != "nixos-system-restic-backup-completion"
-                 or path == "systemd:restic-backups-heim-pc.service")
             and isinstance(invocation, str)
             and len(invocation) == 32
             and all(char in "0123456789abcdef" for char in invocation)
@@ -811,9 +826,8 @@ def _local_backup_evidence_for_repair() -> dict[str, Any]:
         )
         return {**unavailable, **row, "valid": valid}
     except Exception:
-        # A failed proof read must never turn into a legacy-marker fallback.
+        # A broken native proof never falls back to a legacy text marker.
         return unavailable
-
 
 def evaluate_gate(
     expected_head: str,
