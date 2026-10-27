@@ -931,6 +931,7 @@ def _explicit_http_statuses(payload: dict[str, Any]) -> list[int]:
             r"(?<![\w])(?:status(?:_?code)?|http_?status(?:_?code)?|response_?(?:status|code)|code)\s*[=:]\s*(\d{3})(?![\w])",
             r"\bHTTP(?:/\d+(?:\.\d+)?)?(?:\s+status)?\s*[:=]?\s*(\d{3})(?![\w])",
             r"received exception from stream\s*:\s*([45]\d{2})(?=\s+(?:upstream|external|http|bad gateway|service error))",
+            r"\bMCP SSE probe returned\s+([45]\d{2})(?![\w.])",
             r"(?:upstream(?: or|/)external service|external service error)[^0-9]{0,32}([45]\d{2})(?!\d)",
         )
         for pattern in explicit_patterns:
