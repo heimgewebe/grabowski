@@ -136,7 +136,27 @@ class ReviewExecutionProvenanceTests(unittest.TestCase):
         argv = hashlib.sha256(json.dumps(
             sandbox_argv, separators=(",", ":"), ensure_ascii=False,
         ).encode("utf-8")).hexdigest()
-        output = ("source_raw_diff_sha256:" + "f" * 64 + f"\nRan {n+9} tests in 0.10s\n\nOK\n").encode()
+        report_observation = {
+            "schema_version": 1,
+            "kind": "grabowski_trusted_source_inspection_v1",
+            "axis": axis,
+            "binding_sha256": execution._digest(binding),
+            "source_raw_diff_sha256": "f" * 64,
+            "method_kind": "deterministic-source-inspection-and-isolated-tests",
+            "summary": phase["summary"],
+            "evidence_refs": phase["evidence_refs"],
+            "material_findings": 0,
+            "measurements": {
+                "changed_paths": 1, "inspected_paths": 1,
+                "python_statements": 1, "defined_symbols": 0,
+                "json_contracts": 0,
+            },
+        }
+        output = (
+            ("source_raw_diff_sha256:" + "f" * 64 + f"\nRan {n+9} tests in 0.10s\n\nOK\n").encode()
+            + b"\n" + execution.PHASE_OBSERVATION_PREFIX
+            + execution._canonical(report_observation) + b"\n"
+        )
         output_sha = hashlib.sha256(output).hexdigest()
         isolation_sha = execution._digest({
             "argv_sha256": argv,
@@ -232,6 +252,23 @@ class ReviewExecutionProvenanceTests(unittest.TestCase):
         ]
         with self.assertRaises(execution.ReviewExecutionRejected):
             self._validate()
+
+    def test_task_without_actual_source_inspection_marker_blocks_even_with_green_tests(self):
+        binding = {
+            "repo": self.audit["repo"], "pr": self.audit["pr"],
+            "base_sha": self.audit["base_sha"],
+            "head_sha": self.audit["head_sha"],
+            "diff_sha256": self.audit["diff_sha256"],
+            "review_batch_id": self.audit["review_batch_id"],
+            "review_purpose": "pull_request",
+        }
+        with self.assertRaisesRegex(
+            execution.ReviewExecutionRejected, "source review report absent",
+        ):
+            execution.observed_phase_report(
+                b"source_raw_diff_sha256:" + b"f" * 64 + b"\nRan 11 tests in 0.1s\n\nOK\n",
+                binding=binding, axis=execution.REQUIRED_AXES[0],
+            )
 
     def test_wrong_producer_rejected_even_with_valid_signature(self) -> None:
         self._five(producer="caller")

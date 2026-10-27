@@ -416,6 +416,17 @@ def _seal_review(
                 phase_reports[axis], axis=axis, sequence=sequence,
                 head=binding["head_sha"], repo=repository,
             )
+            observed_report = provenance.observed_phase_report(
+                output, binding=binding, axis=axis,
+            )
+            if observed_report != {
+                "summary": phase["summary"],
+                "evidence_refs": phase["evidence_refs"],
+                "material_findings": phase["material_findings"],
+            }:
+                raise provenance.ReviewExecutionRejected(
+                    "caller self-review report differs from server task observation"
+                )
             if phase["summary"] in seen:
                 raise provenance.ReviewExecutionRejected("review phase reports duplicated")
             seen.add(phase["summary"])

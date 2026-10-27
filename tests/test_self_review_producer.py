@@ -114,7 +114,27 @@ class ServerReviewProducerTests(unittest.TestCase):
                 json.dumps(argv, ensure_ascii=False, separators=(",", ":")).encode()
             ).hexdigest()
             unit = f"grabowski-task-{task_id}-a1.service"
-            output = f"source_raw_diff_sha256:{self.raw}\nRan {i+12} tests in 0.05s\n\nOK\n".encode()
+            observation_report = {
+                "schema_version": 1,
+                "kind": "grabowski_trusted_source_inspection_v1",
+                "axis": axis,
+                "binding_sha256": execute._digest(self.binding),
+                "source_raw_diff_sha256": self.raw,
+                "method_kind": "deterministic-source-inspection-and-isolated-tests",
+                "summary": self.reports[axis]["summary"],
+                "evidence_refs": self.reports[axis]["evidence_refs"],
+                "material_findings": 0,
+                "measurements": {
+                    "changed_paths": 1, "inspected_paths": 1,
+                    "python_statements": 2, "defined_symbols": 0,
+                    "json_contracts": 0,
+                },
+            }
+            output = (
+                f"source_raw_diff_sha256:{self.raw}\nRan {i+12} tests in 0.05s\n\nOK\n".encode()
+                + b"\n" + execute.PHASE_OBSERVATION_PREFIX
+                + execute._canonical(observation_report) + b"\n"
+            )
             observation = {
                 "state": "completed",
                 "properties": {"Result": "success", "ExecMainStatus": "0"},
@@ -287,6 +307,19 @@ class ServerReviewProducerTests(unittest.TestCase):
     def test_duplicate_task_id_cannot_reuse_execution(self):
         self.tasks["adversarial_countercheck"] = self.tasks["contracts_correctness"]
         with self.assertRaisesRegex(execute.ReviewExecutionRejected, "five tasks incomplete"):
+            self.seal()
+
+    def test_genuine_five_green_test_tasks_with_invented_reports_cannot_be_signed(self):
+        # Real (fixture-verified) task identities, lifecycle receipts, captures
+        # and test PASS must NOT turn caller-invented semantic prose into PASS.
+        self.reports["security_authority_concurrency"]["summary"] = (
+            "Invented green security review: all risks were inspected deeply "
+            "and every concurrent authority race was ruled out by my personal "
+            "assurance, despite there being no task-observed report of that work."
+        )
+        with self.assertRaisesRegex(
+            execute.ReviewExecutionRejected, "differs from server task observation",
+        ):
             self.seal()
 
     def test_untriaged_findings_block_producer(self):

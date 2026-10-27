@@ -52,6 +52,7 @@ REF = re.compile(r"(?P<path>[A-Za-z0-9_.@+/-]+):L(?P<start>[1-9][0-9]{0,6})(?:-L
 MAX_RECEIPT = 16384
 MAX_OUTPUT = 1024 * 1024
 MAX_REFERENCES = 64
+PHASE_OBSERVATION_PREFIX = b"grabowski-phase-source-inspection-v1:"
 
 
 class ReviewExecutionRejected(ValueError):
@@ -328,9 +329,116 @@ def trusted_phase_source(
         "'-s','tests','-p',suite,'-q'],cwd=repo,capture_output=True,"
         "timeout=240,check=False)\n"
         "sys.stdout.buffer.write(probe.stdout+probe.stderr)\n"
-        "sys.exit(probe.returncode)\n"
+        "import ast,re\n"
+        f"axis={json.dumps(axis)}\n"
+        "if probe.returncode:sys.exit(probe.returncode)\n"
+        "inspection=run('diff','--name-only','--no-renames',binding['base_sha'],binding['head_sha'],'--')\n"
+        "if inspection.returncode or len(inspection.stdout)>131072:sys.exit(85)\n"
+        "changed=[p for p in inspection.stdout.decode('utf-8').splitlines() if p]\n"
+        "if not changed or len(changed)>256:sys.exit(86)\n"
+        "paths=[]; refs=[]; ast_stmts=0; defined_symbols=0; json_docs=0\n"
+        "for path in changed:\n"
+        "    if not re.fullmatch(r'[A-Za-z0-9_.@+/-]{1,512}',path) or '..' in path.split('/'):sys.exit(87)\n"
+        "    blob=run('show',binding['head_sha']+':'+path)\n"
+        "    if blob.returncode:continue\n"
+        "    if len(blob.stdout)>262144 or b'\\x00' in blob.stdout:continue\n"
+        "    try: content=blob.stdout.decode('utf-8')\n"
+        "    except UnicodeError:continue\n"
+        "    if path.endswith('.py'):\n"
+        "        try: tree=ast.parse(content,filename=path)\n"
+        "        except SyntaxError:sys.exit(88)\n"
+        "        ast_stmts+=sum(isinstance(n,ast.stmt) for n in ast.walk(tree))\n"
+        "        defined_symbols+=sum(isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef,ast.ClassDef)) for n in ast.walk(tree))\n"
+        "    elif path.endswith('.json'):\n"
+        "        try: json.loads(content)\n"
+        "        except ValueError:sys.exit(89)\n"
+        "        json_docs+=1\n"
+        "    pathlines=content.splitlines()\n"
+        "    if len(pathlines)>0:\n"
+        "        nonempty=next((i for i,line in enumerate(pathlines,1) if line.strip()),None)\n"
+        "        if nonempty and nonempty<999999:refs.append(path+':L'+str(nonempty))\n"
+        "    paths.append(path)\n"
+        "if not paths or not refs:sys.exit(90)\n"
+        "axes=['contracts_correctness','regression_compatibility','tests_negative_cases','security_authority_concurrency','adversarial_countercheck','additional_adversarial_probe']\n"
+        "focus={'contracts_correctness':'interface and contract','regression_compatibility':'compatibility regression','tests_negative_cases':'negative and failure-path','security_authority_concurrency':'security authority and concurrency','adversarial_countercheck':'adversarial countercheck','additional_adversarial_probe':'additional threat probe'}[axis]\n"
+        "source_digest=hashlib.sha256(delta.stdout).hexdigest()\n"
+        "label=refs[axes.index(axis)%len(refs)]\n"
+        "summary=('Server-executed read-only '+focus+' source inspection at exact head '+binding['head_sha'][:12]+' and raw delta '+source_digest[:12]+': '+str(len(changed))+' changed Git paths, '+str(len(paths))+' inspected text paths, '+str(ast_stmts)+' parsed Python statement nodes, '+str(defined_symbols)+' defined symbols, and '+str(json_docs)+' parsed JSON contracts; distinct fixed unittest suite '+suite+' succeeded. Static inspections do not rule out all semantic bugs.')\n"
+        "measurement={'changed_paths':len(changed),'inspected_paths':len(paths),'python_statements':ast_stmts,'defined_symbols':defined_symbols,'json_contracts':json_docs}\n"
+        "report={'schema_version':1,'kind':'grabowski_trusted_source_inspection_v1','axis':axis,'binding_sha256':hashlib.sha256(json.dumps(binding,sort_keys=True,separators=(',',':'),ensure_ascii=False,allow_nan=False).encode()).hexdigest(),'source_raw_diff_sha256':source_digest,'method_kind':'deterministic-source-inspection-and-isolated-tests','summary':summary,'evidence_refs':[label],'material_findings':0,'measurements':measurement}\n"
+        "sys.stdout.buffer.write(b'\\n'+b'grabowski-phase-source-inspection-v1:'+json.dumps(report,sort_keys=True,separators=(',',':'),ensure_ascii=False,allow_nan=False).encode()+b'\\n')\n"
     )
 
+
+
+
+def observed_phase_report(
+    output: bytes, *, binding: dict[str, Any], axis: str,
+) -> dict[str, Any]:
+    """Recover the report emitted by the trusted *outer* worker, not its test child.
+
+    The fixed worker appends exactly one canonical marker after successful
+    tests and the source inspection. The caller cannot provide a replacement
+    summary and have the issuer silently sign that prose.
+    """
+    if not isinstance(output, bytes) or len(output) > MAX_OUTPUT:
+        raise ReviewExecutionRejected("semantic task output invalid")
+    needle = b"\n" + PHASE_OBSERVATION_PREFIX
+    at = output.rfind(needle)
+    if at < 0 or not output.endswith(b"\n"):
+        raise ReviewExecutionRejected("server-observed source review report absent")
+    data = output[at + len(needle): -1]
+    if not data or len(data) > 16384 or b"\n" in data:
+        raise ReviewExecutionRejected("server-observed source review report malformed")
+    try:
+        decoded = json.loads(data)
+    except (ValueError, UnicodeError) as exc:
+        raise ReviewExecutionRejected("server-observed source review report invalid") from exc
+    if not isinstance(decoded, dict) or _canonical(decoded) != data:
+        raise ReviewExecutionRejected("server-observed source review report not canonical")
+    exact = {
+        "schema_version", "kind", "axis", "binding_sha256",
+        "source_raw_diff_sha256", "method_kind", "summary",
+        "evidence_refs", "material_findings", "measurements",
+    }
+    if (
+        set(decoded) != exact
+        or decoded["schema_version"] != 1
+        or decoded["kind"] != "grabowski_trusted_source_inspection_v1"
+        or decoded["axis"] != axis
+        or decoded["binding_sha256"] != _digest(binding)
+        or decoded["method_kind"] != "deterministic-source-inspection-and-isolated-tests"
+    ):
+        raise ReviewExecutionRejected("server-observed source report identity drift")
+    report_raw = output.split(b"\n", 1)[0]
+    prefix = b"source_raw_diff_sha256:"
+    raw = report_raw[len(prefix):].decode("ascii", errors="replace") if report_raw.startswith(prefix) else ""
+    if decoded["source_raw_diff_sha256"] != raw or SHA256.fullmatch(raw) is None:
+        raise ReviewExecutionRejected("server-observed source delta report mismatch")
+    measures = decoded["measurements"]
+    names = {
+        "changed_paths", "inspected_paths", "python_statements",
+        "defined_symbols", "json_contracts",
+    }
+    if (
+        not isinstance(measures, dict)
+        or set(measures) != names
+        or any(type(value) is not int or value < 0 for value in measures.values())
+        or measures["changed_paths"] < 1
+        or measures["inspected_paths"] < 1
+    ):
+        raise ReviewExecutionRejected("server-observed source inspection not substantive")
+    summary = decoded["summary"]
+    refs = decoded["evidence_refs"]
+    if (
+        not isinstance(summary, str)
+        or len(" ".join(summary.split())) < 80
+        or not isinstance(refs, list)
+        or not 1 <= len(refs) <= MAX_REFERENCES
+        or decoded["material_findings"] != 0
+    ):
+        raise ReviewExecutionRejected("server-observed source inspection report invalid")
+    return {"summary": summary, "evidence_refs": refs, "material_findings": 0}
 
 def _verified_sandbox_command(record: dict[str, Any], task: dict[str, Any]) -> None:
     """Verify the *actual* server task command hash and its no-write sandbox.
@@ -661,6 +769,17 @@ def _verify(
             if record.get("evidence_refs_sha256") != _digest(references):
                 raise ReviewExecutionRejected("self-review evidence list was not observed by issuer")
             _task_outcome(record, outcomes, output, capture_root=capture_root)
+            attested_report = observed_phase_report(
+                output, binding=expected_binding, axis=phase["axis"],
+            )
+            if attested_report != {
+                "summary": phase.get("summary"),
+                "evidence_refs": phase.get("evidence_refs"),
+                "material_findings": phase.get("material_findings"),
+            }:
+                raise ReviewExecutionRejected(
+                    "signed self-review narrative not observed from actual source task"
+                )
             for item in references:
                 _source_reference(
                     item, head=head, repository=repository,
