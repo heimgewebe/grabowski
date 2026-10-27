@@ -1536,6 +1536,13 @@ def _references_runtime_runner(command: list[str], runner: Path) -> bool:
     )
 
 
+def _iter_bootstrap_job_entries(jobs_root: Path):
+    """Stream real directory records without eager pathlib materialization."""
+    with os.scandir(jobs_root) as records:
+        for item in records:
+            yield Path(item.path)
+
+
 def _bootstrap_job_directory_snapshot(
     jobs_root: Path, started_monotonic: float,
 ) -> list[Path]:
@@ -1546,7 +1553,10 @@ def _bootstrap_job_directory_snapshot(
     """
     entries: list[Path] = []
     name_bytes = 0
-    for entry in jobs_root.iterdir():
+    for entry in _iter_bootstrap_job_entries(jobs_root):
+        # Check EVERY record, including names filtered out as non-durable.
+        if time.monotonic() - started_monotonic > DEPLOY_BOOTSTRAP_TIMEOUT_SECONDS:
+            raise RuntimeError("runtime deploy bootstrap census timed out")
         if not _durable_job_unit(entry.name):
             continue
         name_bytes += len(entry.name.encode("utf-8")) + 1

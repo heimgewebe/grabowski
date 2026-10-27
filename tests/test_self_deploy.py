@@ -10599,6 +10599,15 @@ class BootstrapIndexRunnerRecognitionTests(unittest.TestCase):
     into the recovery it was meant to wait for.
     """
 
+    def setUp(self):
+        # Fake directory fixtures exercise the same streaming seam as scandir.
+        patcher = mock.patch.object(
+            SELF_DEPLOY, "_iter_bootstrap_job_entries",
+            side_effect=lambda root: iter(root.iterdir()),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def _bootstrap(self, jobs, *, final_status="running"):
         entries = [Path(f"/jobs/{unit}") for unit in jobs]
 
@@ -10674,6 +10683,15 @@ class BootstrapIndexRunnerRecognitionTests(unittest.TestCase):
 
 class CompleteBootstrapIndexCensusTests(unittest.TestCase):
     """The first index bootstrap must inspect the whole registry, not 2,000 names."""
+
+    def setUp(self):
+        # Fake directory fixtures exercise the same streaming seam as scandir.
+        patcher = mock.patch.object(
+            SELF_DEPLOY, "_iter_bootstrap_job_entries",
+            side_effect=lambda root: iter(root.iterdir()),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     @staticmethod
     def _ordinary():
@@ -10821,6 +10839,28 @@ class CompleteBootstrapIndexCensusTests(unittest.TestCase):
         self.assertLess(len(examined), 400)
         write.assert_not_called()
 
+
+    def test_enumeration_timeout_includes_irrelevant_names(self):
+        root = mock.Mock()
+        entries = [Path("/jobs") / f"noise-{n}" for n in range(600)]
+        root.iterdir.return_value = entries
+        clock = [0.0]
+        seen = []
+        def slow():
+            for entry in entries:
+                clock[0] += 0.3
+                seen.append(entry)
+                yield entry
+        with (
+            mock.patch.object(SELF_DEPLOY, "_iter_bootstrap_job_entries", create=True,
+                              side_effect=lambda _root: slow()),
+            mock.patch.object(SELF_DEPLOY.time, "monotonic", side_effect=lambda: clock[0]),
+            mock.patch.object(SELF_DEPLOY, "_write_deploy_index") as write,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "census timed out"):
+                SELF_DEPLOY._bootstrap_deploy_index(root)
+        self.assertLess(len(seen), 300)
+        write.assert_not_called()
 
 class LegacyRedactedDeployIndexTests(unittest.TestCase):
     """Historical redacted deploy argv may be recovered only from exact bindings."""
