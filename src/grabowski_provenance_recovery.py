@@ -767,6 +767,54 @@ def evaluate_resume_gate(expected_head: str) -> dict[str, Any]:
     }
 
 
+def _local_backup_evidence_for_repair() -> dict[str, Any]:
+    """Read the OS-specific backup contract, never forge a Pop! marker on NixOS."""
+    nixos = bool(
+        getattr(recovery, "_NIXOS_OS_PRESENT", False)
+        or getattr(recovery, "_NIXOS_RESTIC_TIMER_PRESENT", False)
+    )
+    if not nixos:
+        # Preserve the complete pre-existing Pop!_OS contract.
+        return recovery._fresh_text_marker(recovery.BACKUP_SUCCESS)
+
+    unavailable: dict[str, Any] = {
+        "valid": False, "exists": False, "source": "nixos-native-unavailable",
+        "path": "systemd:restic-backups-heim-pc.service",
+        "timestamp_unix": None, "age_seconds": None,
+        "backup_invocation_id": None, "snapshot_id": None,
+    }
+    try:
+        row = recovery._local_backup_freshness()
+        if not isinstance(row, dict):
+            return unavailable
+        age, stamp = row.get("age_seconds"), row.get("timestamp_unix")
+        source, path = row.get("source"), row.get("path")
+        invocation, snapshot = row.get("backup_invocation_id"), row.get("snapshot_id")
+        now = int(time.time())
+        max_age = recovery.MAX_AGE_SECONDS
+        valid = (
+            row.get("valid") is True and row.get("exists") is True
+            and type(age) is int and type(stamp) is int
+            and type(max_age) is int and max_age > 0
+            and 0 <= age <= max_age and 0 <= now - stamp <= max_age
+            and abs(now - stamp - age) <= 5
+            and source in {"verified-nixos-native-restic", "nixos-system-restic-backup-completion"}
+            and isinstance(path, str) and bool(path)
+            and (source != "nixos-system-restic-backup-completion"
+                 or path == "systemd:restic-backups-heim-pc.service")
+            and isinstance(invocation, str)
+            and len(invocation) == 32
+            and all(char in "0123456789abcdef" for char in invocation)
+            and isinstance(snapshot, str)
+            and 8 <= len(snapshot) <= 64
+            and all(char in "0123456789abcdef" for char in snapshot)
+        )
+        return {**unavailable, **row, "valid": valid}
+    except Exception:
+        # A failed proof read must never turn into a legacy-marker fallback.
+        return unavailable
+
+
 def evaluate_gate(
     expected_head: str,
     source_repository: str | None = None,
@@ -779,7 +827,7 @@ def evaluate_gate(
     """
     audit = base._verify_audit_log(base.AUDIT_LOG)
     kill_switch = base._kill_switch_state()
-    local_backup = recovery._fresh_text_marker(recovery.BACKUP_SUCCESS)
+    local_backup = _local_backup_evidence_for_repair()
     broker = privileged.grabowski_privileged_broker_status()
     integrity = _integrity_evidence()
 
@@ -820,9 +868,8 @@ def evaluate_gate(
         "audit_writable": bool(audit.get("audit_writable", audit.get("valid"))),
         "kill_switch_clear": not bool(kill_switch.get("engaged")),
         "no_blocking_operator_blockade": bool(blockade["allows_mutation"]),
-        # Named for what is actually checked: a freshness marker, not a proven
-        # restore.  Restore provability lives in the separate server-recovery
-        # gate, which this lane deliberately does not require.
+        # Backup freshness only: the root-owned restore/canonical recovery
+        # proof remains a separate security gate, never implicitly waived.
         "local_backup_marker_fresh": bool(local_backup.get("valid")),
         "privileged_broker_ready": bool(broker.get("ready")),
         # Revision binding of the repair target.
@@ -861,8 +908,18 @@ def evaluate_gate(
         "kill_switch": {"engaged": bool(kill_switch.get("engaged"))},
         "local_backup_marker": {
             "fresh": bool(local_backup.get("valid")),
+            "source": local_backup.get("source", "legacy-backup-text-marker"),
+            "path": str(local_backup.get("path", recovery.BACKUP_SUCCESS)),
+            "timestamp_unix": local_backup.get("timestamp_unix"),
             "age_seconds": local_backup.get("age_seconds"),
-            "proves": "a recent successful backup run wrote its marker",
+            "backup_invocation_id": local_backup.get("backup_invocation_id"),
+            "snapshot_id": local_backup.get("snapshot_id"),
+            "proves": (
+                "a completed NixOS systemd backup with its bound Restic journal snapshot"
+                if getattr(recovery, "_NIXOS_OS_PRESENT", False)
+                or getattr(recovery, "_NIXOS_RESTIC_TIMER_PRESENT", False)
+                else "a recent successful backup run wrote its marker"
+            ),
             "does_not_prove": "that a restore was performed or verified",
         },
         "privileged_broker": {"ready": bool(broker.get("ready"))},

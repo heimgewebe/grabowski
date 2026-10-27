@@ -762,6 +762,13 @@ class NativeNixOSResticProofTests(unittest.TestCase):
             recovery.privileged, "grabowski_privileged_broker_status",
             return_value={"ready": True}
         ), patch.object(
+            recovery, "_nixos_native_backup_service_fresh",
+            return_value={
+                "exists": True, "valid": True, "backup_invocation_id": "a" * 32,
+                "snapshot_id": "c" * 8, "service_start_unix": self.now - 90,
+                "service_exit_unix": self.now - 30,
+            }
+        ), patch.object(
             recovery, "_fresh_text_marker"
         ) as legacy:
             result = recovery.recovery_status()
@@ -821,61 +828,156 @@ class NativeNixOSResticProofTests(unittest.TestCase):
 
     def test_nixos_native_backup_completion_requires_actual_fresh_systemd_exit(self) -> None:
         reference_monotonic = 100000
-        fresh_completion = reference_monotonic * 1000000 - 30000000
-        def output(completion=fresh_completion, **overrides):
+        start_mono = (reference_monotonic - 50) * 1_000_000
+        end_mono = (reference_monotonic - 30) * 1_000_000
+        invitation = "a" * 32
+        def output(**overrides):
             fields = {
-                "LoadState": "loaded", "ActiveState": "inactive",
+                "LoadState": "loaded", "ActiveState": "inactive", "Job": "",
                 "Result": "success", "ExecMainCode": "1",
                 "ExecMainStatus": "0",
-                "ExecMainExitTimestampMonotonic": str(completion),
+                "ExecMainStartTimestampMonotonic": str(start_mono),
+                "ExecMainExitTimestampMonotonic": str(end_mono),
+                "ExecMainStartTimestamp": f"@{self.now - 50}",
                 "ExecMainExitTimestamp": f"@{self.now - 30}",
+                "InvocationID": invitation,
             }
             fields.update(overrides)
             return "\n".join(f"{key}={value}" for key, value in fields.items()) + "\n"
 
-        for label, payload, returncode, expected in (
-            ("valid", output(), 0, True),
-            ("valid_fractional", output(ExecMainExitTimestamp=f"@{self.now - 30}.123456"), 0, True),
-            # CLOCK_MONOTONIC counts just 30 seconds awake even after 48h
-            # suspended; systemd's epoch second value must still expire.
-            ("suspend_48h", output(ExecMainExitTimestamp=f"@{self.now - 48 * 3600}"), 0, False),
-            ("stale_realtime", output(ExecMainExitTimestamp=f"@{self.now - recovery.MAX_AGE_SECONDS - 1}"), 0, False),
-            ("future_realtime", output(ExecMainExitTimestamp=f"@{self.now + 10}"), 0, False),
-            ("localized_date", output(ExecMainExitTimestamp="Mon 2026-10-26 19:31:02 CET"), 0, False),
-            ("missing_realtime", output().replace(f"ExecMainExitTimestamp=@{self.now - 30}\n", ""), 0, False),
-            ("invalid_fraction", output(ExecMainExitTimestamp=f"@{self.now - 30}.a"), 0, False),
-            ("never_run", output(completion=0), 0, False),
-            ("failed_backup", output(Result="exit-code"), 0, False),
-            ("unit_not_loaded", output(LoadState="not-found"), 0, False),
-            ("still_running", output(ActiveState="activating"), 0, False),
-            ("not_exited", output(ExecMainCode="0"), 0, False),
-            ("exit_failure", output(ExecMainStatus="1"), 0, False),
-            ("stale", output(completion=(reference_monotonic - recovery.MAX_AGE_SECONDS - 1) * 1000000), 0, False),
-            ("future", output(completion=(reference_monotonic + 5) * 1000000), 0, False),
-            ("invalid_timestamp", output(completion="not-a-timestamp"), 0, False),
-            ("duplicate_field", output() + "Result=success\n", 0, False),
-            ("missing_field", output().replace("ExecMainCode=1\n", ""), 0, False),
-            ("systemctl_error", "", 1, False),
-        ):
+        event = {
+            "_SYSTEMD_INVOCATION_ID": invitation,
+            "_SYSTEMD_UNIT": "restic-backups-heim-pc.service",
+            "MESSAGE": "snapshot cef8366c saved",
+            "__REALTIME_TIMESTAMP": str((self.now - 31) * 1_000_000 + 123456),
+            "__MONOTONIC_TIMESTAMP": str((reference_monotonic - 31) * 1_000_000),
+        }
+        def journal(**overrides):
+            return json.dumps({**event, **overrides}) + "\n"
+
+        cases = (
+            ("valid", output(), journal(), 0, 0, True),
+            ("valid_fractional", output(ExecMainExitTimestamp=f"@{self.now - 30}.123456"), journal(), 0, 0, True),
+            ("suspend_48h", output(ExecMainExitTimestamp=f"@{self.now - 48 * 3600}"), journal(), 0, 0, False),
+            ("stale_realtime", output(ExecMainExitTimestamp=f"@{self.now - recovery.MAX_AGE_SECONDS - 1}"), journal(), 0, 0, False),
+            ("future_realtime", output(ExecMainExitTimestamp=f"@{self.now + 10}"), journal(), 0, 0, False),
+            ("localized_date", output(ExecMainExitTimestamp="Mon 2026-10-26 19:31:02 CET"), journal(), 0, 0, False),
+            ("missing_realtime", output().replace(f"ExecMainExitTimestamp=@{self.now - 30}\n", ""), journal(), 0, 0, False),
+            ("invalid_fraction", output(ExecMainExitTimestamp=f"@{self.now - 30}.a"), journal(), 0, 0, False),
+            ("never_run", output(ExecMainExitTimestampMonotonic="0"), journal(), 0, 0, False),
+            ("failed_backup", output(Result="exit-code"), journal(), 0, 0, False),
+            ("unit_not_loaded", output(LoadState="not-found"), journal(), 0, 0, False),
+            ("still_running", output(ActiveState="activating"), journal(), 0, 0, False),
+            ("queued_new_backup", output(Job="(321,restic-backups-heim-pc.service,start)"), journal(), 0, 0, False),
+            ("missing_job_property", output().replace("Job=\n", ""), journal(), 0, 0, False),
+            ("not_exited", output(ExecMainCode="0"), journal(), 0, 0, False),
+            ("exit_failure", output(ExecMainStatus="1"), journal(), 0, 0, False),
+            ("stale", output(ExecMainExitTimestampMonotonic=str((reference_monotonic - recovery.MAX_AGE_SECONDS - 1) * 1_000_000)), journal(), 0, 0, False),
+            ("future", output(ExecMainExitTimestampMonotonic=str((reference_monotonic + 5) * 1_000_000)), journal(), 0, 0, False),
+            ("invalid_timestamp", output(ExecMainExitTimestampMonotonic="not-a-timestamp"), journal(), 0, 0, False),
+            ("duplicate_field", output() + "Result=success\n", journal(), 0, 0, False),
+            ("missing_field", output().replace("ExecMainCode=1\n", ""), journal(), 0, 0, False),
+            ("missing_invocation", output(InvocationID=""), journal(), 0, 0, False),
+            ("other_invocation", output(), journal(_SYSTEMD_INVOCATION_ID="b" * 32), 0, 0, False),
+            ("other_service", output(), journal(_SYSTEMD_UNIT="restic-backups-foreign.service"), 0, 0, False),
+            ("old_journal", output(), journal(__REALTIME_TIMESTAMP=str((self.now - 70) * 1_000_000)), 0, 0, False),
+            ("future_journal", output(), journal(__REALTIME_TIMESTAMP=str((self.now - 28) * 1_000_000)), 0, 0, False),
+            ("old_monotonic_journal", output(), journal(__MONOTONIC_TIMESTAMP=str((reference_monotonic - 70) * 1_000_000)), 0, 0, False),
+            ("future_monotonic_journal", output(), journal(__MONOTONIC_TIMESTAMP=str((reference_monotonic - 28) * 1_000_000)), 0, 0, False),
+            ("missing_journal", output(), "", 0, 0, False),
+            ("malformed_journal", output(), "{", 0, 0, False),
+            ("invalid_snapshot_id", output(), journal(MESSAGE="snapshot not-restic saved"), 0, 0, False),
+            ("duplicate_snapshot", output(), journal() + journal(), 0, 0, False),
+            ("missing_realtime_journal", output(), journal(__REALTIME_TIMESTAMP=None), 0, 0, False),
+            ("systemctl_error", "", journal(), 1, 0, False),
+            ("journalctl_error", output(), journal(), 0, 1, False),
+        )
+        for label, payload, journal_text, unit_rc, journal_rc, expected in cases:
+            calls = []
+            def run(argv, **_kwargs):
+                calls.append(argv)
+                if argv[0].endswith("/systemctl"):
+                    return {"returncode": unit_rc, "stdout": payload}
+                if argv[0].endswith("/journalctl"):
+                    return {"returncode": journal_rc, "stdout": journal_text}
+                raise AssertionError(f"unexpected external command: {argv}")
+
             with self.subTest(case=label), patch.object(
-                recovery.operator, "_run",
-                return_value={"returncode": returncode, "stdout": payload},
-            ) as run, patch.object(
+                recovery.operator, "_run", side_effect=run
+            ), patch.object(
                 recovery.time, "monotonic", return_value=reference_monotonic
             ), patch.object(recovery.time, "time", return_value=self.now):
                 state = recovery._nixos_native_backup_service_fresh()
-            self.assertEqual(state["valid"], expected)
+            self.assertEqual(state["valid"], expected, label)
             self.assertEqual(
-                run.call_args.args[0][:5],
+                calls[0][:5],
                 ["/run/current-system/sw/bin/systemctl", "--system",
                  "--timestamp=unix", "show", "restic-backups-heim-pc.service"],
             )
             if expected:
                 self.assertEqual(state["timestamp_unix"], self.now - 30)
                 self.assertEqual(state["age_seconds"], 30)
+                self.assertEqual(state["backup_invocation_id"], invitation)
+                self.assertEqual(state["snapshot_id"], "cef8366c")
                 self.assertIsNone(state["error"])
+                self.assertEqual(len(calls), 2)
+                self.assertIn(f"_SYSTEMD_INVOCATION_ID={invitation}", calls[1])
             else:
                 self.assertIsNotNone(state["error"])
+
+    def test_nixos_source_requires_matching_backup_journal_snapshot_and_window(self) -> None:
+        native = {
+            "path": "systemd:restic-backups-heim-pc.service",
+            "exists": True, "valid": True, "timestamp_unix": self.now - 30,
+            "age_seconds": 30, "source": "nixos-system-restic-backup-completion",
+            "backup_invocation_id": "a" * 32, "snapshot_id": "cef8366c",
+            "service_start_unix": self.now - 50,
+            "service_exit_unix": self.now - 30,
+            "error": None,
+        }
+        source = {
+            "path": "/tmp/native-record", "exists": True, "valid": True,
+            "snapshot_id": "cef8366c", "snapshot_time_unix": self.now - 50,
+            "snapshot_age_seconds": 50, "snapshot_fresh": True,
+        }
+        for label, changed_service, changed_source, allowed in (
+            ("valid", native, source, True),
+            ("foreign_snapshot", {**native, "snapshot_id": "deadbeef"}, source, False),
+            ("stale_snapshot", native, {**source, "snapshot_time_unix": self.now - recovery.MAX_AGE_SECONDS - 1,
+                                         "snapshot_age_seconds": recovery.MAX_AGE_SECONDS + 1}, False),
+            ("older_invocation", {**native, "service_start_unix": self.now - 25}, source, False),
+            ("newer_invocation", {**native, "service_exit_unix": self.now - 70}, source, False),
+            ("missing_backup_run", {**native, "valid": False}, source, False),
+            ("missing_root_source", native, {**source, "valid": False}, False),
+            ("reused_snapshot", native, {**source, "snapshot_id": "deadbeef"}, False),
+        ):
+            with self.subTest(case=label), patch.object(
+                recovery, "_NIXOS_OS_PRESENT", True
+            ), patch.object(
+                recovery, "_NIXOS_RESTIC_TIMER_PRESENT", True
+            ), patch.object(
+                recovery, "_configured_recovery_target_info", return_value={"kind": "local_backup_disk"}
+            ), patch.object(
+                recovery, "_nixos_native_backup_service_fresh", return_value=changed_service
+            ), patch.object(recovery.time, "time", return_value=self.now):
+                value = recovery._local_backup_freshness(server_source=changed_source)
+            self.assertEqual(value["valid"], allowed, label)
+            if allowed:
+                self.assertEqual(value["backup_invocation_id"], "a" * 32)
+
+    def test_nixos_missing_native_timer_never_falls_back_to_pop_marker(self) -> None:
+        with patch.object(recovery, "_NIXOS_OS_PRESENT", True), patch.object(
+            recovery, "_NIXOS_RESTIC_TIMER_PRESENT", False
+        ), patch.object(
+            recovery, "_fresh_text_marker", return_value={"valid": True}
+        ) as legacy, patch.object(
+            recovery, "_nixos_native_backup_service_fresh"
+        ) as native:
+            result = recovery._local_backup_freshness()
+        self.assertFalse(result["valid"])
+        self.assertEqual(result["source"], "nixos-system-restic-backup-completion")
+        legacy.assert_not_called()
+        native.assert_not_called()
 
     def test_nixos_remote_target_keeps_independent_local_backup_freshness(self) -> None:
         remote_target = "wg-prod-1:rest-server/grabowski-recovery-probe"

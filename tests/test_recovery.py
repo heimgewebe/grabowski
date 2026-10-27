@@ -731,7 +731,9 @@ class RecoveryToolTests(unittest.TestCase):
 
     def test_recovery_status_allows_custom_target_with_matching_fresh_evidence(self) -> None:
         target = "wg-prod-1:rest-server/grabowski-recovery-probe"
-        with patch.object(recovery, "_NIXOS_RESTIC_TIMER_PRESENT", False):
+        with patch.object(recovery, "_NIXOS_OS_PRESENT", False), patch.object(
+            recovery, "_NIXOS_RESTIC_TIMER_PRESENT", False
+        ):
             result = _run_ready_recovery_status(
                 _fresh_server_marker(target),
                 host="wg-prod-1",
