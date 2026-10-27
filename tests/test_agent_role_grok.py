@@ -48,6 +48,17 @@ def _create_only_process_writer(
         results.put("created")
 
 
+class NixOSRoleToolchainTests(unittest.TestCase):
+    def test_failed_secondary_toolchain_probe_keeps_invalid_review_receipt(self) -> None:
+        payload = {"returncode": 126, "verdict": "INVALID"}
+        with mock.patch.object(role, "toolchain_probe", side_effect=RuntimeError("unavailable")):
+            result = role.classify_result("review", ["claude"], Path("/unused"), payload)
+        self.assertEqual(result, "invalid_review_output")
+        self.assertEqual(payload["returncode"], 126)
+        self.assertEqual(payload["post_failure_toolchain_probe"]["failure_classification"], "toolchain_probe_error")
+        self.assertEqual(payload["post_failure_toolchain_probe"]["probe_error_type"], "RuntimeError")
+
+
 class GrokReviewRoleTests(unittest.TestCase):
 
     def test_create_only_receipt_is_private_and_cannot_be_replaced(self) -> None:
