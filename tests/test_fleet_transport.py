@@ -136,7 +136,10 @@ class FleetTransportGateTests(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         module.load_fleet()
             # task_home cannot authenticate the implicit username of a host-only SSH target.
-            for bad_target in ("heim-pc", "example.org", "bob@heim-pc"):
+            for bad_target in (
+                "heim-pc", "example.org", "bob@heim-pc",
+                "alex@heim-pc@other.example", "alex@@other.example", "alex@",
+            ):
                 with self.subTest(bad_target=bad_target):
                     candidate = json.loads(json.dumps(original))
                     candidate["hosts"]["remote"] = {**host, "target": bad_target}

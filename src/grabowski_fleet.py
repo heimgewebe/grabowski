@@ -176,7 +176,8 @@ def validate_fleet(raw: dict[str, Any]) -> dict[str, Any]:
                 or not task_home_value.startswith("/home/")
                 or TASK_HOME_USERNAME.fullmatch(task_home_value[6:]) is None
                 or task_home_value[6:] in {".", ".."}
-                or "@" not in target
+                or target.count("@") != 1
+                or not target.rsplit("@", 1)[1]
                 or target.split("@", 1)[0] != task_home_value[6:]
             ):
                 raise ValueError(f"Fleet host {name} task_home is invalid or mismatched")
