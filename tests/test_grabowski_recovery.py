@@ -1066,10 +1066,22 @@ class NativeNixOSResticProofTests(unittest.TestCase):
             recovery, "_timer_probe", return_value={"ok": True}
         ), patch.object(
             recovery.privileged, "grabowski_privileged_broker_status", return_value={"ready": True}
-        ), patch.object(recovery, "_fresh_text_marker") as legacy:
+        ), patch.object(
+            recovery, "_nixos_native_backup_service_fresh",
+            return_value={
+                "path": "systemd:restic-backups-heim-pc.service",
+                "exists": True, "valid": True,
+                "timestamp_unix": now - 30, "age_seconds": 30,
+                "source": "nixos-system-restic-backup-completion",
+                "backup_invocation_id": "a" * 32, "snapshot_id": "c" * 8,
+                "service_start_unix": now - 60,
+                "service_exit_unix": now - 30,
+            },
+        ) as native, patch.object(recovery, "_fresh_text_marker") as legacy:
             status = recovery.recovery_status()
         self.assertFalse(status["checks"]["local_backup_fresh"])
         self.assertFalse(status["ready_for_privileged_actions"])
+        native.assert_called_once_with()
         legacy.assert_not_called()
 
 
