@@ -414,7 +414,7 @@ def _invoke_mainpid_privileged_reference(
         NIXOS_RESTIC_ROOT_UNIT_ACTION,
     }:
         raise ValueError("MainPID privileged action is not allowed")
-    max_timeout = 2700 if action == NIXOS_RESTIC_ROOT_UNIT_ACTION else 120
+    max_timeout = 120
     if (
         isinstance(timeout_seconds, bool)
         or not isinstance(timeout_seconds, int)
@@ -745,7 +745,7 @@ def start_nixos_root_restic_unit_reference() -> dict[str, Any]:
         action=NIXOS_RESTIC_ROOT_UNIT_ACTION,
         target=NIXOS_RESTIC_ROOT_UNIT,
         justification="Start one fixed root-owned NixOS Restic restore proof service",
-        timeout_seconds=2700,
+        timeout_seconds=60,
         max_output_bytes=20000,
     )
     response = invoked.get("broker_response")

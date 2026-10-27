@@ -44,7 +44,7 @@ NIXOS_RESTIC_TARGET = "local-backup-disk:UUID=9b626294-7913-4be0-88fa-96b314e96e
 NIXOS_RESTIC_ROOT_UNIT_ACTION = "nixos_restic_root_unit"
 NIXOS_RESTIC_ROOT_UNIT = "heim-pc-restic-recovery-probe.service"
 NIXOS_RESTIC_ROOT_UNIT_ARGV = [
-    "/run/current-system/sw/bin/systemctl", "--system", "start", NIXOS_RESTIC_ROOT_UNIT,
+    "/run/current-system/sw/bin/systemctl", "--system", "--no-block", "start", NIXOS_RESTIC_ROOT_UNIT,
 ]
 NIXOS_RESTIC_ROOT_PROOF = Path("/var/lib/heim-pc-restic-recovery-probe/proof.json")
 NIXOS_RESTIC_REPO_ID = "85ee278eeb58f42c26745796cb7b23239d4c7c01f5f4d00f2c10e216cefa4972"
@@ -416,7 +416,7 @@ def _resolve_template_action(
         if (
             reference["target"] != NIXOS_RESTIC_ROOT_UNIT
             or argv != NIXOS_RESTIC_ROOT_UNIT_ARGV
-            or type(timeout) is not int or timeout != 2700
+            or type(timeout) is not int or timeout != 60
             or type(peer_uid) is not int or peer_uid != 1000
             or peer_unit != "grabowski-operator.service"
             or kill_switch_value != "/var/lib/grabowski/operator-blockade/operator-kill-switch"

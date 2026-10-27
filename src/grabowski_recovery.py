@@ -1638,6 +1638,46 @@ def _nixos_root_proof_read(
     )
 
 
+def _await_nixos_root_proof(
+    *, started_at_unix: int, expected_backup_uuid: str, timeout_seconds: int = 4800,
+) -> dict[str, Any]:
+    """Check a fresh systemd oneshot outcome after broker's non-blocking start."""
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        status = operator._run(
+            ["systemctl", "--system", "show", NIXOS_RESTIC_ROOT_PROOF_UNIT,
+             "--property=ActiveState", "--property=Result", "--property=ExecMainStatus"],
+            cwd=operator.HOME, timeout_seconds=30,
+            max_output_bytes=operator.DEFAULT_OUTPUT_BYTES,
+        )
+        if status.get("returncode") != 0 or not isinstance(status.get("stdout"), str):
+            raise RuntimeError("NixOS root Restic unit outcome cannot be observed")
+        values: dict[str, str] = {}
+        for line in status["stdout"].splitlines():
+            if "=" in line:
+                key, value = line.split("=", 1)
+                values[key] = value
+        active = values.get("ActiveState")
+        result = values.get("Result")
+        exit_status = values.get("ExecMainStatus")
+        if active == "failed" or (active == "inactive" and result not in {"success", None, ""}):
+            raise RuntimeError("NixOS root Restic service failed before recovery proof")
+        if active == "inactive" and result == "success" and exit_status == "0":
+            try:
+                # Unit may report the preceding successful result while the new
+                # start job is still queued. The root proof must be NEW.
+                return _nixos_root_proof_read(
+                    not_before_unix=started_at_unix,
+                    now=int(time.time()),
+                    expected_backup_uuid=expected_backup_uuid,
+                )
+            except (OSError, RuntimeError, ValueError):
+                pass
+        if time.monotonic() >= deadline:
+            raise TimeoutError("NixOS native Restic root proof did not complete in the allowed window")
+        time.sleep(2)
+
+
 def _nixos_local_recovery_probe_locked(target_info: dict[str, Any]) -> dict[str, Any]:
     """Delegate privileged Restic to one fixed NixOS systemd oneshot."""
     if target_info.get("kind") != "local_backup_disk":
@@ -1654,12 +1694,11 @@ def _nixos_local_recovery_probe_locked(target_info: dict[str, Any]) -> dict[str,
     # Privileged unit start is allowed ONLY through the rootbroker's
     # MainPID-bound, fixed-action contract. No operator-side sudo remains.
     privileged.start_nixos_root_restic_unit_reference()
-    completed_at = int(time.time())
-    proof = _nixos_root_proof_read(
-        not_before_unix=started_at,
-        now=completed_at,
+    proof = _await_nixos_root_proof(
+        started_at_unix=started_at,
         expected_backup_uuid=backup_uuid,
     )
+    completed_at = int(time.time())
     if not _timer_probe("is-enabled")["ok"] or not _timer_probe("is-active")["ok"]:
         raise RuntimeError("NixOS Restic system timer is not enabled and active")
     snapshot_id = proof["snapshot_id"]

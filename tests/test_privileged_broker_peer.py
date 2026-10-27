@@ -2033,7 +2033,7 @@ class NixOSResticRootUnitPeerBoundaryTests(unittest.TestCase):
             "mode": "template",
             "argv": list(_broker_lib.NIXOS_RESTIC_ROOT_UNIT_ARGV),
             "cwd": None,
-            "timeout_seconds": 2700,
+            "timeout_seconds": 60,
             "allowed_peer_uid": 1000,
             "allowed_peer_unit": "grabowski-operator.service",
             "kill_switch_path": "/var/lib/grabowski/operator-blockade/operator-kill-switch",
@@ -2136,7 +2136,7 @@ class NativeRootProofClientReceiptTests(unittest.TestCase):
             action=privileged_client.NIXOS_RESTIC_ROOT_UNIT_ACTION,
             target=privileged_client.NIXOS_RESTIC_ROOT_UNIT,
             justification="Start one fixed root-owned NixOS Restic restore proof service",
-            timeout_seconds=2700,
+            timeout_seconds=60,
             max_output_bytes=20000,
         )
         audit.assert_called_once()

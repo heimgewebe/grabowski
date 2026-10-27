@@ -23,7 +23,7 @@ class FixedRootResticServiceActionTests(unittest.TestCase):
             "enabled": True, "mode": "template",
             "target_pattern": r"heim-pc-restic-recovery-probe\.service",
             "argv": list(broker.NIXOS_RESTIC_ROOT_UNIT_ARGV),
-            "timeout_seconds": 2700,
+            "timeout_seconds": 60,
             "allowed_peer_uid": 1000,
             "allowed_peer_unit": "grabowski-operator.service",
             "kill_switch_path": "/var/lib/grabowski/operator-blockade/operator-kill-switch",
@@ -46,7 +46,7 @@ class FixedRootResticServiceActionTests(unittest.TestCase):
         self.assertEqual(execution["argv"], broker.NIXOS_RESTIC_ROOT_UNIT_ARGV)
         self.assertEqual(execution["allowed_peer_uid"], 1000)
         self.assertEqual(execution["allowed_peer_unit"], "grabowski-operator.service")
-        self.assertEqual(execution["timeout_seconds"], 2700)
+        self.assertEqual(execution["timeout_seconds"], 60)
 
     def test_target_argv_peer_timeout_and_kill_switch_substitutions_fail(self) -> None:
         for modified in (
@@ -56,7 +56,7 @@ class FixedRootResticServiceActionTests(unittest.TestCase):
             {"allowed_peer_uid": 0},
             {"allowed_peer_uid": True},
             {"allowed_peer_unit": "grabowski-job-evil.service"},
-            {"timeout_seconds": 60},
+            {"timeout_seconds": 30},
             {"kill_switch_path": "/tmp/absent"},
             {"legacy_kill_switch_path": "/tmp/absent"},
             {"untrusted": "extra"},

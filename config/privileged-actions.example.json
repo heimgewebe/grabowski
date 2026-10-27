@@ -60,10 +60,11 @@
       "argv": [
         "/run/current-system/sw/bin/systemctl",
         "--system",
+        "--no-block",
         "start",
         "heim-pc-restic-recovery-probe.service"
       ],
-      "timeout_seconds": 2700,
+      "timeout_seconds": 60,
       "allowed_peer_uid": 1000,
       "allowed_peer_unit": "grabowski-operator.service",
       "kill_switch_path": "/var/lib/grabowski/operator-blockade/operator-kill-switch",
