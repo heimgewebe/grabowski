@@ -50,6 +50,15 @@ NIXOS_RESTIC_ROOT_PROOF = Path("/var/lib/heim-pc-restic-recovery-probe/proof.jso
 NIXOS_RESTIC_REPO_ID = "85ee278eeb58f42c26745796cb7b23239d4c7c01f5f4d00f2c10e216cefa4972"
 NIXOS_RESTIC_UUID = "9b626294-7913-4be0-88fa-96b314e96ee5"
 
+
+def _native_nixos_root_proof_required(target: Any) -> bool:
+    """Distinguish root-controlled NixOS from legacy Pop sharing the disk target.
+
+    A missing NixOS timer cannot silently downgrade the native recovery
+    requirement to legacy because the trusted OS marker is independent.
+    """
+    return target == NIXOS_RESTIC_TARGET and Path("/etc/NIXOS").is_file()
+
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 REQUEST_ID = re.compile(r"[0-9a-f]{32}\Z")
 SHELL_EXECUTABLES = {
@@ -750,7 +759,7 @@ def inspect_canonical_recovery_record(
     except ValueError as exc:
         result.update({"freshness_reason": "malformed", "error": str(exc)})
         return result
-    if value.get("target") == NIXOS_RESTIC_TARGET:
+    if _native_nixos_root_proof_required(value.get("target")):
         if (
             set(value) != RECOVERY_RECORD_KEYS | RECOVERY_RECORD_OPTIONAL_KEYS
             or not isinstance(value.get("root_proof_sha256"), str)
@@ -828,7 +837,7 @@ def inspect_canonical_recovery_record(
     if not isinstance(snapshot_id, str) or not snapshot_id:
         result.update({"freshness_reason": "malformed", "error": "canonical recovery snapshot is invalid"})
         return result
-    if target == NIXOS_RESTIC_TARGET:
+    if _native_nixos_root_proof_required(target):
         # The NixOS oneshot unlinks its previous proof before attempting a new
         # restore. A failure must revoke the old canonical gate immediately;
         # a syntactically valid stored proof SHA alone is not current authority.
@@ -1133,9 +1142,10 @@ def _resolve_recovery_marker_publish_action(
     )
     if validated["source_record_sha256"] != expected_sha:
         raise PermissionError("recovery source digest changed before publication")
+    native_nixos_proof_required = _native_nixos_root_proof_required(configured_target)
     proof_digest = (
         _validated_nixos_root_oneshot_proof(validated["source"], now=current)
-        if configured_target == NIXOS_RESTIC_TARGET else None
+        if native_nixos_proof_required else None
     )
     if validated["source"]["completed_at_unix"] != expected_generated:
         raise PermissionError("recovery source generation changed before publication")
@@ -1154,6 +1164,7 @@ def _resolve_recovery_marker_publish_action(
         "legacy_kill_switch_path": (str(legacy_switch) if legacy_switch is not None else None),
         "require_root_owned_destination": require_root_destination,
         "nixos_root_proof_sha256": proof_digest,
+        "native_nixos_proof_required": native_nixos_proof_required,
     }
 
 
@@ -1234,7 +1245,10 @@ def _validated_recovery_source_for_execution(
         or generated_at != execution["expected_generated_at_unix"]
     ):
         raise PermissionError("recovery source changed after reference validation")
-    if execution["configured_target"] == NIXOS_RESTIC_TARGET:
+    require_native = _native_nixos_root_proof_required(execution["configured_target"])
+    if execution.get("native_nixos_proof_required", False) is not require_native:
+        raise PermissionError("root recovery mode changed after authorization")
+    if require_native:
         digest = _validated_nixos_root_oneshot_proof(
             validated["source"], now=now,
             expected_digest=execution.get("nixos_root_proof_sha256"),

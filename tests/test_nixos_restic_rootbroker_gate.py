@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import stat
 import sys
@@ -77,6 +78,11 @@ class FixedRootResticServiceActionTests(unittest.TestCase):
 
 class RootOwnedResticProofBindingTests(unittest.TestCase):
     def setUp(self) -> None:
+        self._nixos_mode_patch = patch.object(
+            broker, "_native_nixos_root_proof_required", return_value=True
+        )
+        self._nixos_mode_patch.start()
+        self.addCleanup(self._nixos_mode_patch.stop)
         self.now = 200000
         self.proof = {
             "schema_version": 1,
@@ -218,6 +224,67 @@ class RootOwnedResticProofBindingTests(unittest.TestCase):
                 with self.assertRaises(PermissionError):
                     broker._validate_recovery_gate(gate, now=self.now)
             self.assertFalse(status({**record, "root_proof_sha256": "/tmp/evil"})["valid"])
+
+    def test_shared_disk_target_legacy_source_and_gate_remain_valid_outside_nixos(self) -> None:
+        # The target identity is common to both Pop and NixOS. A legacy
+        # restore does not include snapshot_time_unix or a NixOS root proof.
+        legacy = dict(self.source)
+        legacy.pop("snapshot_time_unix")
+        raw = (json.dumps(legacy, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        digest = hashlib.sha256(raw).hexdigest()
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.json"
+            marker = Path(directory) / "canonical.json"
+            source.write_bytes(raw)
+            source.chmod(0o600)
+            execution = {
+                "source_path": str(source),
+                "expected_source_uid": os.getuid(),
+                "expected_source_record_sha256": digest,
+                "expected_generated_at_unix": legacy["completed_at_unix"],
+                "max_recovery_age_seconds": 86400,
+                "configured_target": broker.NIXOS_RESTIC_TARGET,
+                "native_nixos_proof_required": False,
+            }
+            with patch.object(
+                broker, "_native_nixos_root_proof_required", return_value=False
+            ), patch.object(
+                broker, "_validated_nixos_root_oneshot_proof"
+            ) as root_proof:
+                validated = broker._validated_recovery_source_for_execution(execution, now=self.now)
+                self.assertNotIn("root_proof_sha256", validated["canonical_record"])
+                marker.write_text(json.dumps(validated["canonical_record"]) + "\n")
+                inspected = broker.inspect_canonical_recovery_record(
+                    marker, now=self.now, expected_target=broker.NIXOS_RESTIC_TARGET,
+                    expected_max_age_seconds=86400, require_root_owned=False,
+                )
+                self.assertTrue(inspected["valid"], inspected["error"])
+                self.assertEqual(
+                    broker._validate_recovery_gate(
+                        {
+                            "recovery_marker_path": str(marker),
+                            "max_recovery_age_seconds": 86400,
+                            "require_root_owned_gate_files": False,
+                            "configured_target": broker.NIXOS_RESTIC_TARGET,
+                        },
+                        now=self.now,
+                    )["recovery_marker_source_sha256"],
+                    digest,
+                )
+                root_proof.assert_not_called()
+
+            # The same legacy proof MUST NOT authorize a native-NixOS root gate.
+            with patch.object(
+                broker, "_native_nixos_root_proof_required", return_value=True
+            ):
+                blocked = broker.inspect_canonical_recovery_record(
+                    marker, now=self.now, expected_target=broker.NIXOS_RESTIC_TARGET,
+                    expected_max_age_seconds=86400, require_root_owned=False,
+                )
+                self.assertFalse(blocked["valid"])
+                self.assertEqual(blocked["freshness_reason"], "contract-mismatch")
+                with self.assertRaisesRegex(PermissionError, "mode changed"):
+                    broker._validated_recovery_source_for_execution(execution, now=self.now)
 
 
 if __name__ == "__main__":
