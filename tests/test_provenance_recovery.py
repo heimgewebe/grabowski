@@ -2477,6 +2477,127 @@ class IndexedInflightJobEvidenceGateTests(unittest.TestCase):
         self.assertEqual(evidence["idempotent_match"], match)
 
 
+class PersistedCutoverRecoveryHandoffTests(unittest.TestCase):
+    """Only exact proved *recovery* may exclude a failed deploy from competition."""
+
+    UNIT = "grabowski-job-444444444444"
+    BINDING = {"schema_version": 2, "cutover_id": "bgc-exact",
+               "binding_sha256": "a" * 64}
+
+    def _projection(self, blocking=None):
+        blocking = [self.UNIT] if blocking is None else blocking
+        return {
+            "inflight_units": list(blocking),
+            "blocking_units": list(blocking),
+            "idempotent_match": None,
+            "ambiguous_identical_units": [],
+            "pruned_units": [],
+            "error": None,
+        }
+
+    def test_failed_deploy_with_exact_cutover_may_handoff_only_to_resume(self):
+        with (
+            patch.object(provenance_recovery.self_deploy,
+                         "inflight_runtime_job_evidence",
+                         return_value=self._projection(), create=True),
+            patch.object(provenance_recovery.self_deploy,
+                         "_indexed_failed_deploy_is_cutover_handoff",
+                         return_value=True, create=True) as authenticated,
+        ):
+            ordinary = provenance_recovery._competing_deployment_evidence()
+            resume = provenance_recovery._competing_deployment_evidence(
+                resume_binding=self.BINDING
+            )
+        self.assertEqual(ordinary["inflight_deploy_jobs"], [self.UNIT])
+        self.assertEqual(resume["inflight_deploy_jobs"], [])
+        self.assertEqual(resume["recovery_handoff_units"], [self.UNIT])
+        authenticated.assert_called_once_with(self.UNIT, self.BINDING)
+
+    def test_ambiguous_two_failed_deploys_never_admit_handoff(self):
+        units = [self.UNIT, "grabowski-job-555555555555"]
+        with (
+            patch.object(provenance_recovery.self_deploy,
+                         "inflight_runtime_job_evidence",
+                         return_value=self._projection(units), create=True),
+            patch.object(provenance_recovery.self_deploy,
+                         "_indexed_failed_deploy_is_cutover_handoff",
+                         return_value=True, create=True) as authenticated,
+        ):
+            resume = provenance_recovery._competing_deployment_evidence(
+                resume_binding=self.BINDING
+            )
+        self.assertEqual(resume["inflight_deploy_jobs"], units)
+        authenticated.assert_not_called()
+
+    def test_resume_assessment_and_locked_recheck_bind_exact_same_cutover(self):
+        """The fast assessment and under-lock dispatch must evaluate one binding."""
+        from unittest.mock import Mock
+
+        valid_competition = {
+            "deploy_lock_free": True,
+            "inflight_deploy_jobs": [],
+            "recovery_handoff_units": [self.UNIT],
+            "error": None,
+        }
+        with (
+            patch.object(provenance_recovery.base, "_verify_audit_log",
+                         return_value={"valid": True, "audit_writable": True}),
+            patch.object(provenance_recovery.base, "_kill_switch_state",
+                         return_value={"engaged": False}),
+            patch.object(provenance_recovery.privileged,
+                         "grabowski_privileged_broker_status",
+                         return_value={"ready": True}),
+            patch.object(provenance_recovery, "_integrity_evidence",
+                         return_value={"repair_warranted": True}),
+            patch.object(provenance_recovery, "_blockade_evidence",
+                         return_value={"allows_mutation": True}),
+            patch.object(provenance_recovery, "_recovery_lane",
+                         return_value={
+                             "lane": provenance_recovery.midcutover.LANE_MID_CUTOVER_RESUME,
+                             "resume_binding": self.BINDING,
+                         }),
+            patch.object(provenance_recovery, "_competing_deployment_evidence",
+                         return_value=valid_competition) as competing,
+        ):
+            assessment = provenance_recovery.evaluate_resume_gate(HEAD)
+            self.assertTrue(assessment["allowed"], assessment["reasons"])
+            competing.assert_called_once_with(resume_binding=self.BINDING)
+            competing.reset_mock()
+            locked = provenance_recovery._volatile_gate_recheck(
+                ROOT, ["resume-argv"], resume_binding=self.BINDING
+            )
+            self.assertEqual(locked["reasons"], [])
+            competing.assert_called_once_with(
+                ["resume-argv"],
+                prune=True,
+                reconcile_stale_pending=True,
+                resume_binding=self.BINDING,
+            )
+            competing.reset_mock()
+            ordinary = provenance_recovery._volatile_gate_recheck(
+                ROOT, ["regular-deploy-argv"]
+            )
+            self.assertEqual(ordinary["reasons"], [])
+            competing.assert_called_once_with(
+                ["regular-deploy-argv"], prune=True,
+                reconcile_stale_pending=True,
+            )
+
+    def test_invalid_or_missing_cutover_proof_still_blocks_resume(self):
+        with (
+            patch.object(provenance_recovery.self_deploy,
+                         "inflight_runtime_job_evidence",
+                         return_value=self._projection(), create=True),
+            patch.object(provenance_recovery.self_deploy,
+                         "_indexed_failed_deploy_is_cutover_handoff",
+                         return_value=False, create=True),
+        ):
+            resume = provenance_recovery._competing_deployment_evidence(
+                resume_binding=self.BINDING
+            )
+        self.assertEqual(resume["inflight_deploy_jobs"], [self.UNIT])
+
+
 class DispatchCoalescingTests(unittest.TestCase):
     """The coalescing branch itself, not just the evidence that feeds it.
 

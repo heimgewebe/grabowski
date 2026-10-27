@@ -1648,6 +1648,132 @@ def _authentic_completed_cutover_remains_settled(
     return False
 
 
+def _authenticated_persisted_unknown_cutover(
+    entry: Path,
+    metadata: dict[str, Any],
+    command_fields: dict[str, str],
+    status: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]]] | None:
+    """Authenticate a failed, exited deploy and its exact persisted cutover.
+
+    This is evidence for a recovery handoff or for terminalizing an already
+    recovered cutover, NOT a new deploy authorization. A generic failed job,
+    missing primary cutover receipt or unpersisted outcome_unknown cannot use
+    it. The operator already validates the private runner finalization; the
+    bounded O_NOFOLLOW reread binds its nonprojected failure and summary.
+    """
+    if not isinstance(status, dict) or status.get("final_status") != "failed":
+        return None
+    unit = entry.name
+    argv = metadata.get("argv")
+    argv_sha256 = metadata.get("argv_sha256")
+    contract = metadata.get("finalization_contract")
+    receipt = status.get("finalization_receipt")
+    if (
+        not isinstance(argv, list)
+        or metadata.get("unit") != unit
+        or metadata.get("job_id") != unit.removeprefix(DEPLOY_JOB_PREFIX)
+        or argv_sha256 != _deploy_command_sha256(argv)
+        or _deploy_command_fields(argv) != command_fields
+        or metadata.get("cwd") != command_fields.get("repository")
+        or not isinstance(contract, dict)
+        or contract.get("kind") != "grabowski_runtime_deploy_finalization"
+        or contract.get("unit") != unit
+        or contract.get("job_id") != metadata["job_id"]
+        or contract.get("argv_sha256") != argv_sha256
+        or contract.get("expected_head") != command_fields.get("expected_head")
+        or not isinstance(receipt, dict)
+        or receipt.get("valid") is not True
+        or receipt.get("state") != "valid"
+        or receipt.get("final_status") != "failed"
+        or receipt.get("expected_head") != command_fields.get("expected_head")
+        or receipt.get("blind_retry_allowed") is False
+        or _SHA256_RE.fullmatch(str(receipt.get("receipt_sha256"))) is None
+        or _SHA256_RE.fullmatch(str(receipt.get("payload_sha256"))) is None
+        or _SHA256_RE.fullmatch(
+            str(receipt.get("blue_green_receipt_sha256"))
+        ) is None
+        or metadata.get("final_status") == "outcome_unknown"
+        or (
+            metadata.get("final_status") in TERMINAL_JOB_STATUSES
+            and metadata.get("final_status") not in {"failed", "launch_failed"}
+        )
+    ):
+        return None
+    reader = getattr(operator, "_read_finalization_receipt_file", None)
+    if not callable(reader):
+        return None
+    try:
+        data = reader(entry / "finalization.json")
+    except (OSError, RuntimeError, ValueError, PermissionError):
+        return None
+    if not isinstance(data, dict) or data.get("ok") is not True:
+        return None
+    raw = data.get("raw")
+    if not isinstance(raw, bytes) or len(raw) > 64 * 1024:
+        return None
+    if hashlib.sha256(raw).hexdigest() != receipt["receipt_sha256"]:
+        return None
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    digest = payload.get("payload_sha256")
+    summary = payload.get("blue_green")
+    if (
+        digest != receipt["payload_sha256"]
+        or digest != _sha256_json({k: v for k, v in payload.items() if k != "payload_sha256"})
+        or payload.get("kind") != "grabowski_runtime_deploy_finalization"
+        or payload.get("unit") != unit
+        or payload.get("job_id") != metadata["job_id"]
+        or payload.get("argv_sha256") != argv_sha256
+        or payload.get("expected_head") != command_fields.get("expected_head")
+        or payload.get("receipt_paths") != contract.get("receipt_paths")
+        or payload.get("final_status") != "failed"
+        or payload.get("completion_status") != "failed"
+        or payload.get("repo_head") is not None
+        or payload.get("release_id") is not None
+        or payload.get("failure_type") != "BlueGreenDeploymentIncomplete"
+        or not isinstance(summary, dict)
+        or summary.get("kind") != "grabowski_scheduled_blue_green_summary"
+        or summary.get("outcome") != "outcome_unknown"
+        or summary.get("receipt_persisted") is not True
+        or summary.get("receipt_persistence_error_type") is not None
+        or summary.get("blind_retry_allowed") is False
+        or summary.get("expected_head") != command_fields.get("expected_head")
+        or summary.get("source_identity_sha256") != command_fields.get("source_identity_sha256")
+        or summary.get("receipt_sha256") != receipt["blue_green_receipt_sha256"]
+        or payload.get("blue_green_receipt_sha256") != receipt["blue_green_receipt_sha256"]
+        or summary.get("summary_sha256") != _sha256_json(
+            {k: v for k, v in summary.items() if k != "summary_sha256"}
+        )
+    ):
+        return None
+    try:
+        loaded = midcutover.load_receipts()
+        if not loaded.get("present") or loaded.get("unreadable"):
+            return None
+        receipts = loaded.get("receipts")
+        if not isinstance(receipts, list):
+            return None
+        matching = [
+            candidate for candidate in receipts
+            if isinstance(candidate, dict)
+            and candidate.get("kind") == BLUE_GREEN_RECEIPT_KIND
+            and candidate.get("receipt_sha256") == summary["receipt_sha256"]
+            and candidate.get("outcome") == "outcome_unknown"
+            and candidate.get("expected_head") == command_fields["expected_head"]
+            and candidate.get("source_identity_sha256") == command_fields["source_identity_sha256"]
+        ]
+        if len(matching) != 1:
+            return None
+        return matching[0], receipts
+    except (OSError, RuntimeError, ValueError, midcutover.MidCutoverEvidenceError):
+        return None
+
+
 def _verified_runtime_terminal_receipt(
     entry: Path,
     metadata: dict[str, Any],
@@ -1728,12 +1854,23 @@ def _verified_runtime_terminal_receipt(
             and status.get("final_status") == "failed"
         ):
             return True
-        return bool(
+        if (
             isinstance(reason, str)
             and reason.startswith("MidCutoverPrerequisiteRecovered:")
             and _authentic_completed_cutover_remains_settled(
                 reason, fields["expected_head"]
             )
+        ):
+            return True
+        persisted = _authenticated_persisted_unknown_cutover(
+            entry, metadata, deploy, status
+        )
+        if persisted is None:
+            return False
+        cutover, receipts = persisted
+        return (
+            not midcutover.unresolved_post_switch_receipts(receipts)
+            and midcutover._lineage_resolved(receipts, cutover)
         )
 
     # A successful resume *process* may have produced outcome_unknown, a
@@ -1782,6 +1919,70 @@ def _verified_runtime_terminal_receipt(
         ):
             return True
     return False
+
+
+def _indexed_failed_deploy_is_cutover_handoff(
+    unit: str, resume_binding: dict[str, Any]
+) -> bool:
+    """Allow only one signed, persisted failed deploy to yield to its own resume.
+
+    This never deletes, marks terminal, or excludes the job from an ordinary
+    deployment assessment. The caller additionally requires exactly one
+    blocker; both assessment and locked dispatch recheck call this function.
+    """
+    if (
+        not _durable_job_unit(unit)
+        or not isinstance(resume_binding, dict)
+        or midcutover._validated_resume_binding(resume_binding) is None
+    ):
+        return False
+    try:
+        root = operator._jobs_root()
+        index = _deploy_index(root, read_only=True)
+        if (
+            index.get("pending_unit") is not None
+            or unit not in index.get("units", [])
+        ):
+            return False
+        entry = root / unit
+        if entry.is_symlink() or not entry.is_dir():
+            return False
+        classified = _classify_indexed_job(entry)
+        if classified.get("kind") != "deploy" or classified.get("terminal"):
+            return False
+        fields = classified.get("fields")
+        if not isinstance(fields, dict):
+            return False
+        persisted = _authenticated_persisted_unknown_cutover(
+            entry, classified["metadata"], fields, classified["status"]
+        )
+        if persisted is None:
+            return False
+        cutover, receipts = persisted
+        if (
+            cutover.get("cutover_id") != resume_binding.get("cutover_id")
+            or cutover.get("receipt_sha256")
+            != resume_binding.get("resumed_receipt_sha256")
+            or cutover.get("expected_head") != resume_binding.get("target_head")
+            or cutover.get("expected_head") != resume_binding.get("expected_head")
+            or cutover.get("source_identity_sha256")
+            != resume_binding.get("source_identity_sha256")
+            or cutover.get("cutover_generation")
+            != resume_binding.get("cutover_generation")
+            or cutover.get("blue_release_id")
+            != resume_binding.get("blue_release_id")
+            or cutover.get("green_release_id")
+            != resume_binding.get("expected_release_id")
+        ):
+            return False
+        open_cutovers = midcutover.unresolved_post_switch_receipts(receipts)
+        return (
+            len(open_cutovers) == 1
+            and open_cutovers[0].get("receipt_sha256") == cutover["receipt_sha256"]
+        )
+    except (OSError, RuntimeError, ValueError, PermissionError,
+            IndexedRuntimeJobConflict, midcutover.MidCutoverEvidenceError):
+        return False
 
 
 def _bootstrap_job_directory_snapshot(

@@ -341,6 +341,7 @@ def _competing_deployment_evidence(
     *,
     prune: bool = False,
     reconcile_stale_pending: bool = False,
+    resume_binding: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Detect an in-flight deployment that this lane must not race.
 
@@ -356,6 +357,7 @@ def _competing_deployment_evidence(
     evidence: dict[str, Any] = {
         "deploy_lock_free": False,
         "inflight_deploy_jobs": [],
+        "recovery_handoff_units": [],
         "idempotent_match": None,
         "pruned_units": [],
         "stale_pending_reconciliation": None,
@@ -395,6 +397,30 @@ def _competing_deployment_evidence(
     evidence["local_mutation_evidence"] = _recovery_local_mutation_evidence(evidence)
     if indexed["error"] is not None:
         evidence["error"] = indexed["error"]
+    # A persisted post-switch outcome_unknown cutover can leave its failed
+    # old deploy unit in the index. That unit must not block the precisely
+    # bound resume which completes its own cutover, but ordinary deployments
+    # must still see it as a blocker. No index write occurs in this exception.
+    # Multiple blockers, unknown status, pending dispatch, or an unrelated
+    # failed unit remain blocking. Every unit is rechecked under the schedule
+    # lock immediately before the recovery dispatcher acts.
+    if (
+        isinstance(resume_binding, dict)
+        and evidence["error"] is None
+        and len(indexed["blocking_units"]) == 1
+        and indexed.get("idempotent_match") is None
+        and not indexed.get("ambiguous_identical_units")
+    ):
+        unit = indexed["blocking_units"][0]
+        try:
+            handoff = self_deploy._indexed_failed_deploy_is_cutover_handoff(
+                unit, resume_binding
+            )
+        except (OSError, RuntimeError, ValueError, PermissionError, AttributeError):
+            handoff = False
+        if handoff:
+            evidence["inflight_deploy_jobs"] = []
+            evidence["recovery_handoff_units"] = [unit]
     return evidence
 
 
@@ -434,7 +460,10 @@ def _blockade_evidence(repository: Path | None) -> dict[str, Any]:
 
 
 def _volatile_gate_recheck(
-    repository: Path | None, command: list[str] | None = None
+    repository: Path | None,
+    command: list[str] | None = None,
+    *,
+    resume_binding: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Re-read the gates that can change between assessment and dispatch."""
     kill_switch = base._kill_switch_state()
@@ -447,10 +476,16 @@ def _volatile_gate_recheck(
     # Once either stop gate denies mutation, competing-deploy classification is
     # explicitly not evaluated; the failed stop gate already closes dispatch.
     if mutation_allowed:
+        resume_options = (
+            {"resume_binding": resume_binding}
+            if resume_binding is not None
+            else {}
+        )
         competing = _competing_deployment_evidence(
             command,
             prune=True,
             reconcile_stale_pending=True,
+            **resume_options,
         )
     else:
         competing = {
@@ -690,9 +725,13 @@ def evaluate_resume_gate(expected_head: str) -> dict[str, Any]:
     # narrower blockade scope than the execution would report a lane as open and
     # then have it close underneath the operator.
     blockade = _blockade_evidence(_resume_effect_repository())
-    competing = _competing_deployment_evidence()
     lane = _recovery_lane(expected_head)
     resume_binding = lane.get("resume_binding")
+    competing = _competing_deployment_evidence(
+        resume_binding=resume_binding
+        if lane.get("lane") == midcutover.LANE_MID_CUTOVER_RESUME
+        else None
+    )
     resume_phase = (
         resume_binding.get("resume_phase")
         if isinstance(resume_binding, dict)
@@ -1072,7 +1111,9 @@ def _resume_under_schedule_lock(
     }
     intent_sha256 = base._append_audit_with_digest(intent)
 
-    volatile = _volatile_gate_recheck(_resume_effect_repository(), command)
+    volatile = _volatile_gate_recheck(
+        _resume_effect_repository(), command, resume_binding=resume_binding
+    )
     # Absent evidence is not a match: a recheck that carries no competing-job
     # projection means nothing was recognised as ours, which must dispatch
     # normally rather than silently coalesce onto nothing.
