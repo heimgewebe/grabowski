@@ -296,7 +296,7 @@ def _sign(message: bytes, *, key: Path, signers: Path) -> bytes:
     _private_signing_key(key)
     try:
         result = subprocess.run(
-            ["ssh-keygen", "-Y", "sign", "-f", str(key), "-n", provenance.NAMESPACE],
+            [provenance._trusted_ssh_keygen(), "-Y", "sign", "-f", str(key), "-n", provenance.NAMESPACE],
             input=message, capture_output=True, timeout=15, check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:

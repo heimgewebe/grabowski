@@ -138,6 +138,46 @@ def _allowed_signers(path: Path, *, root_owned: bool) -> Path:
     return path
 
 
+def _trusted_ssh_keygen() -> str:
+    """Never let user-controlled PATH choose the signature verification binary.
+
+    NixOS and conventional Linux runners expose OpenSSH through known,
+    root-managed locations. A missing or replaced binary rejects the review;
+    the caller cannot supply a custom verifier.
+    """
+    for candidate in (
+        Path("/run/current-system/sw/bin/ssh-keygen"),
+        Path("/usr/bin/ssh-keygen"),
+    ):
+        try:
+            original = candidate.lstat()
+        except FileNotFoundError:
+            continue
+        try:
+            real = candidate.resolve(strict=True)
+            final = real.stat()
+            parent = candidate.parent.stat()
+        except OSError as exc:
+            raise ReviewExecutionRejected("trusted OpenSSH path unavailable") from exc
+        if (
+            original.st_uid != 0
+            or not (stat.S_ISREG(original.st_mode) or stat.S_ISLNK(original.st_mode))
+            or parent.st_uid != 0
+            or stat.S_IMODE(parent.st_mode) & 0o022
+            or not stat.S_ISREG(final.st_mode)
+            or final.st_uid != 0
+            or stat.S_IMODE(final.st_mode) & 0o022
+            or not final.st_mode & stat.S_IXUSR
+            or not (
+                real.is_relative_to(Path("/nix/store"))
+                or real == Path("/usr/bin/ssh-keygen")
+            )
+        ):
+            raise ReviewExecutionRejected("trusted OpenSSH binary authority invalid")
+        return str(real)
+    raise ReviewExecutionRejected("trusted OpenSSH signature verifier missing")
+
+
 def _check_signature(material: bytes, signature: bytes, signers: Path) -> None:
     # Pass the already-validated pinned bytes through an inherited private FD:
     # ssh-keygen never reopens an attacker-changeable signature pathname.
@@ -152,7 +192,7 @@ def _check_signature(material: bytes, signature: bytes, signers: Path) -> None:
         try:
             result = subprocess.run(
                 [
-                    "ssh-keygen", "-Y", "verify", "-f", str(signers),
+                    _trusted_ssh_keygen(), "-Y", "verify", "-f", str(signers),
                     "-I", PRINCIPAL, "-n", NAMESPACE,
                     "-s", f"/proc/self/fd/{fd}",
                 ],

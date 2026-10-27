@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import grabowski_self_review_execution as execution  # noqa: E402
@@ -273,6 +274,29 @@ class ReviewExecutionProvenanceTests(unittest.TestCase):
             self._phase(i)
         with self.assertRaisesRegex(execution.ReviewExecutionRejected, "coverage"):
             self._validate()
+
+    def test_poisoned_path_cannot_bypass_real_signature_verification(self) -> None:
+        self._five()
+        forged = self.receipts / ("1".zfill(32) + ".sig")
+        fake_signature = (
+            b"-----BEGIN SSH SIGNATURE-----\n"
+            b"fake signature body with no trusted private key\n"
+            b"-----END SSH SIGNATURE-----\n"
+        )
+        self._write(forged, fake_signature)
+        self.audit["review_pass_receipts"][0]["signature_sha256"] = hashlib.sha256(
+            fake_signature
+        ).hexdigest()
+        fake_bin = Path(self.temp.name) / "fake-bin"
+        fake_bin.mkdir(mode=0o700)
+        fake = fake_bin / "ssh-keygen"
+        fake.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        fake.chmod(0o755)
+        with mock.patch.dict(os.environ, {"PATH": str(fake_bin)}):
+            with self.assertRaisesRegex(
+                execution.ReviewExecutionRejected, "signature not authentic"
+            ):
+                self._validate()
 
     def test_tampered_private_receipt_rejected(self) -> None:
         self._five()
