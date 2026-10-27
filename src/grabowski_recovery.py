@@ -1601,7 +1601,9 @@ def _validated_nixos_root_proof(
         if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
             raise RuntimeError(f"NixOS root Restic proof {key} is invalid")
     device = payload["backup_source"]
-    if not isinstance(device, str) or re.fullmatch(r"/dev/[a-zA-Z0-9_./+-]{1,255}", device) is None:
+    if (not isinstance(device, str)
+            or re.fullmatch(r"/dev/[a-zA-Z0-9_./+-]{1,255}", device) is None
+            or ".." in Path(device).parts):
         raise RuntimeError("NixOS root Restic proof device is invalid")
     if (payload["restore_probe_valid"] is not True
             or payload["repository_check_valid"] is not True):
@@ -1614,24 +1616,28 @@ def _nixos_root_proof_read(
 ) -> dict[str, Any]:
     """Read bounded root-owned evidence without following an attacker symlink."""
     proof = NIXOS_RESTIC_ROOT_PROOF_PATH
-    parent_stat = proof.parent.lstat()
-    if (not stat.S_ISDIR(parent_stat.st_mode) or parent_stat.st_uid != 0
-            or parent_stat.st_mode & 0o022):
-        raise RuntimeError("NixOS root Restic proof directory is unsafe")
-    fd = os.open(str(proof), os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
     try:
-        file_stat = os.fstat(fd)
-        if (not stat.S_ISREG(file_stat.st_mode) or file_stat.st_uid != 0
-                or file_stat.st_mode & 0o022 or file_stat.st_nlink != 1
-                or not 0 < file_stat.st_size <= 8192):
-            raise RuntimeError("NixOS root Restic proof file is unsafe")
-        content = os.read(fd, 8193)
-        if len(content) != file_stat.st_size:
-            raise RuntimeError("NixOS root Restic proof file size changed")
-    finally:
-        os.close(fd)
+        parent_stat = proof.parent.lstat()
+        if (not stat.S_ISDIR(parent_stat.st_mode) or parent_stat.st_uid != 0
+                or parent_stat.st_mode & 0o022):
+            raise RuntimeError("NixOS root Restic proof directory is unsafe")
+        fd = os.open(str(proof), os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            file_stat = os.fstat(fd)
+            if (not stat.S_ISREG(file_stat.st_mode) or file_stat.st_uid != 0
+                    or file_stat.st_mode & 0o022 or file_stat.st_nlink != 1
+                    or not 0 < file_stat.st_size <= 8192):
+                raise RuntimeError("NixOS root Restic proof file is unsafe")
+            content = os.read(fd, 8193)
+            if len(content) != file_stat.st_size:
+                raise RuntimeError("NixOS root Restic proof file size changed")
+        finally:
+            os.close(fd)
+        payload = json.loads(content)
+    except (OSError, ValueError, UnicodeError) as exc:
+        raise RuntimeError("NixOS root Restic proof is unavailable or malformed") from exc
     return _validated_nixos_root_proof(
-        json.loads(content),
+        payload,
         not_before_unix=not_before_unix,
         now=now,
         expected_backup_uuid=expected_backup_uuid,
@@ -1651,16 +1657,17 @@ def _nixos_local_recovery_probe_locked(target_info: dict[str, Any]) -> dict[str,
     log_dir.mkdir(parents=True, exist_ok=True)
     started_at = int(time.time())
     log_path = log_dir / f"nixos-restic-recovery-{started_at}.log"
-    # The only sudo command is a fixed start of the root-owned NixOS unit.
-    # The operator never chooses privileged argv, a restore target or a cleanup
-    # path. This unit owns the Restic credentials and the 0700 restore stage.
+    # Polkit grants only start of this exact root-owned NixOS unit. The
+    # operator can retain NoNewPrivileges=yes, needs no sudo and chooses no
+    # privileged Restic argv or restore/cleanup directory.
     _run_logged(
-        ["/run/wrappers/bin/sudo", "-n",
-         "/run/current-system/sw/bin/systemctl", "--system", "start",
+        ["/run/current-system/sw/bin/systemctl", "--system", "start",
          NIXOS_RESTIC_ROOT_PROOF_UNIT],
         env=dict(os.environ),
         log=log_path,
-        timeout_seconds=2700,
+        # The root oneshot is bounded at 75 minutes; allow its error/result to
+        # propagate before the unprivileged caller stops waiting.
+        timeout_seconds=4800,
     )
     completed_at = int(time.time())
     proof = _nixos_root_proof_read(
