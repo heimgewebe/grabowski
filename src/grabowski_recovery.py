@@ -2039,7 +2039,7 @@ def _nixos_native_backup_service_fresh() -> dict[str, Any]:
 
     invocation = fields["InvocationID"]
     journal = operator._run(
-        ["/run/current-system/sw/bin/journalctl", "--system", "--no-pager",
+        ["/run/current-system/sw/bin/journalctl", "--system", "--boot", "--no-pager",
          "--output=json", "-n", "128",
          "--grep", r"^snapshot [0-9a-f]{8,64} saved$",
          f"_SYSTEMD_INVOCATION_ID={invocation}"],
@@ -2066,10 +2066,17 @@ def _nixos_native_backup_service_fresh() -> dict[str, Any]:
                     or re.fullmatch(r"[0-9]{1,20}", monotonic) is None):
                 return result
             saved_us, saved_mono = int(realtime), int(monotonic)
-            # systemctl --timestamp=unix may print second precision while
-            # journal events retain microseconds; monotonic bounds remain exact.
-            if not (start_unix * 1_000_000 <= saved_us < (completed_at + 1) * 1_000_000
-                    and start_mono <= saved_mono <= end_mono):
+            # A Restic oneshot may have multiple ExecStart commands: a
+            # later prune/check replaces ExecMainStartTimestamp, after the
+            # snapshot-save event. InvocationID plus trusted unit and boot
+            # bind that event to this run; the final exit is an upper bound,
+            # NOT an invocation-wide lower bound. Both clocks must agree.
+            if not (0 < saved_us < (completed_at + 1) * 1_000_000
+                    and 0 < saved_mono <= end_mono
+                    and 0 <= now - (saved_us // 1_000_000) <= MAX_AGE_SECONDS
+                    and 0 <= now_mono - saved_mono <= MAX_AGE_SECONDS * 1_000_000
+                    and abs((end_realtime - saved_us) - (end_mono - saved_mono))
+                        <= 2_000_000):
                 return result
             snapshots.append((match.group(1), saved_us))
     except (ValueError, TypeError, OverflowError):
@@ -2127,7 +2134,8 @@ def _local_backup_freshness(
         and (source_id.startswith(journal_id) or journal_id.startswith(source_id))
         and type(snapshot_time) is int and type(snapshot_age) is int
         and type(start) is int and type(end) is int
-        and start <= snapshot_time <= end <= now
+        and 0 < start <= end <= now
+        and 0 < snapshot_time <= end
         and 0 <= snapshot_age <= MAX_AGE_SECONDS
         and 0 <= now - snapshot_time <= MAX_AGE_SECONDS
         and abs((now - snapshot_time) - snapshot_age) <= 5

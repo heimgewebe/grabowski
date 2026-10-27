@@ -858,6 +858,20 @@ class NativeNixOSResticProofTests(unittest.TestCase):
         cases = (
             ("valid", output(), journal(), 0, 0, True),
             ("valid_fractional", output(ExecMainExitTimestamp=f"@{self.now - 30}.123456"), journal(), 0, 0, True),
+            # NixOS Restic may run prune/check as a later ExecStart in this same InvocationID.
+            # ExecMainStart is then the maintenance command, not the backup command.
+            ("multi_execstart_valid", output(),
+             journal(__REALTIME_TIMESTAMP=str((self.now - 70) * 1_000_000),
+                     __MONOTONIC_TIMESTAMP=str((reference_monotonic - 70) * 1_000_000)),
+             0, 0, True),
+            ("multi_execstart_clock_mismatch", output(),
+             journal(__REALTIME_TIMESTAMP=str((self.now - 70) * 1_000_000),
+                     __MONOTONIC_TIMESTAMP=str((reference_monotonic - 48) * 1_000_000)),
+             0, 0, False),
+            ("stale_invocation_snapshot", output(),
+             journal(__REALTIME_TIMESTAMP=str((self.now - recovery.MAX_AGE_SECONDS - 1) * 1_000_000),
+                     __MONOTONIC_TIMESTAMP=str((reference_monotonic - recovery.MAX_AGE_SECONDS - 1) * 1_000_000)),
+             0, 0, False),
             ("suspend_48h", output(ExecMainExitTimestamp=f"@{self.now - 48 * 3600}"), journal(), 0, 0, False),
             ("stale_realtime", output(ExecMainExitTimestamp=f"@{self.now - recovery.MAX_AGE_SECONDS - 1}"), journal(), 0, 0, False),
             ("future_realtime", output(ExecMainExitTimestamp=f"@{self.now + 10}"), journal(), 0, 0, False),
@@ -942,6 +956,8 @@ class NativeNixOSResticProofTests(unittest.TestCase):
         }
         for label, changed_service, changed_source, allowed in (
             ("valid", native, source, True),
+            ("multi_execstart_snapshot_before_maintenance",
+             {**native, "service_start_unix": self.now - 40}, source, True),
             ("foreign_snapshot", {**native, "snapshot_id": "deadbeef"}, source, False),
             ("stale_snapshot", native, {**source, "snapshot_time_unix": self.now - recovery.MAX_AGE_SECONDS - 1,
                                          "snapshot_age_seconds": recovery.MAX_AGE_SECONDS + 1}, False),

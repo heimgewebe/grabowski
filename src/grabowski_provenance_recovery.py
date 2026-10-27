@@ -814,7 +814,9 @@ def _local_backup_evidence_for_repair() -> dict[str, Any]:
             and type(start) is int and type(end) is int
             and type(saved) is int
             and type(max_age) is int and max_age > 0
-            and 0 < start <= saved <= end == stamp <= now
+            and 0 < start <= end == stamp <= now
+            and 0 < saved <= end
+            and 0 <= now - saved <= max_age
             and 0 <= age <= max_age and 0 <= now - stamp <= max_age
             and abs(now - stamp - age) <= 5
             and isinstance(invocation, str)

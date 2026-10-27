@@ -318,6 +318,19 @@ class ProvenanceRecoveryGateTests(unittest.TestCase):
         gate = self._native_gate(row, legacy={"valid": False})
         self.assertTrue(gate["checks"]["local_backup_marker_fresh"], gate["reasons"])
 
+    def test_native_backup_save_before_final_maintenance_execstart_is_valid(self):
+        stamp = int(time.time()) - 30
+        row = {"valid": True, "exists": True,
+               "source": "nixos-system-restic-backup-completion",
+               "path": "systemd:restic-backups-heim-pc.service",
+               "timestamp_unix": stamp, "age_seconds": 30,
+               "service_start_unix": stamp - 10,  # final prune/check ExecStart
+               "service_exit_unix": stamp,
+               "snapshot_saved_at_unix": stamp - 45,  # earlier backup ExecStart
+               "backup_invocation_id": "a" * 32, "snapshot_id": "b" * 8}
+        gate = self._native_gate(row, legacy={"valid": False})
+        self.assertTrue(gate["checks"]["local_backup_marker_fresh"], gate["reasons"])
+
     def test_native_stale_evidence_cannot_be_bypassed_by_legacy_success(self):
         row = {"valid": False, "source": "nixos-system-restic-backup-completion",
                "timestamp_unix": None, "age_seconds": None}
