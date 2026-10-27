@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import pwd
 from pathlib import Path
 import re
 import stat
@@ -138,6 +139,32 @@ def _allowed_signers(path: Path, *, root_owned: bool) -> Path:
     return path
 
 
+def _trusted_root_owner(uid: int) -> bool:
+    """Recognize host-root files mapped to overflow UID in a nested userns.
+
+    Ordinary host callers must see uid=0. In a bubblewrap user namespace the
+    outer root can be unmapped and appears as 65534; only accept that owner
+    if /proc/self/uid_map proves uid 0 is unmapped and our UID is mapped.
+    """
+    if uid == 0:
+        return True
+    if uid != 65534:
+        return False
+    try:
+        rows = [
+            tuple(int(value) for value in line.split())
+            for line in Path("/proc/self/uid_map").read_text(encoding="ascii").splitlines()
+        ]
+    except (OSError, ValueError, UnicodeError):
+        return False
+    if not rows or any(len(row) != 3 or row[2] <= 0 for row in rows):
+        return False
+    return (
+        not any(inside <= 0 < inside + count for inside, _, count in rows)
+        and any(inside <= os.getuid() < inside + count for inside, _, count in rows)
+    )
+
+
 def _trusted_ssh_keygen() -> str:
     """Never let user-controlled PATH choose the signature verification binary.
 
@@ -160,12 +187,12 @@ def _trusted_ssh_keygen() -> str:
         except OSError as exc:
             raise ReviewExecutionRejected("trusted OpenSSH path unavailable") from exc
         if (
-            original.st_uid != 0
+            not _trusted_root_owner(original.st_uid)
             or not (stat.S_ISREG(original.st_mode) or stat.S_ISLNK(original.st_mode))
-            or parent.st_uid != 0
+            or not _trusted_root_owner(parent.st_uid)
             or stat.S_IMODE(parent.st_mode) & 0o022
             or not stat.S_ISREG(final.st_mode)
-            or final.st_uid != 0
+            or not _trusted_root_owner(final.st_uid)
             or stat.S_IMODE(final.st_mode) & 0o022
             or not final.st_mode & stat.S_IXUSR
             or not (
@@ -215,14 +242,43 @@ METHOD_TEST_SUITE = {
     "regression_compatibility": "test_pr_review_gate_external.py",
     "tests_negative_cases": "test_self_review_execution.py",
     "security_authority_concurrency": "test_self_review_producer.py",
-    "adversarial_countercheck": "test_release_admission.py",
+    "adversarial_countercheck": "test_pr_review_gate_recovery_risk_paths.py",
     "additional_adversarial_probe": "test_release_admission.py",
 }
-_RO_BWRAP = [
-    "--die-with-parent", "--unshare-user", "--unshare-pid", "--unshare-net",
-    "--ro-bind", "/", "/", "--tmpfs", "/tmp",
-    "--dev", "/dev", "--proc", "/proc", "--chdir",
-]
+def _sandbox_bwrap_flags(worktree: str) -> list[str]:
+    """Minimal review mount namespace: PR tests cannot read operator secrets.
+
+    Bind only immutable Nix executables, system identity, the managed Git object
+    store and the exact candidate checkout. Never bind /, /home or /run/user.
+    An empty environment prevents secret-bearing parent variables leaking too.
+    """
+    candidate = Path(worktree)
+    if not candidate.is_absolute() or ".." in candidate.parts:
+        raise ReviewExecutionRejected("review sandbox checkout path invalid")
+    home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    if not home.is_absolute() or home == Path("/") or home == Path("/tmp"):
+        raise ReviewExecutionRejected("review sandbox account home invalid")
+    repos = home / "repos"
+    git_dir = repos / "grabowski" / ".git"
+    return [
+        "--die-with-parent", "--unshare-user", "--unshare-pid", "--unshare-net",
+        "--tmpfs", "/",
+        "--dir", "/nix", "--ro-bind", "/nix/store", "/nix/store",
+        "--dir", "/run", "--dir", "/run/current-system",
+        "--ro-bind", "/run/current-system/sw", "/run/current-system/sw",
+        "--dir", "/etc", "--ro-bind", "/etc/passwd", "/etc/passwd",
+        "--ro-bind", "/etc/group", "/etc/group",
+        "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp",
+        "--dir", "/home", "--dir", str(home),
+        "--dir", str(repos), "--dir", str(repos / "grabowski"),
+        "--ro-bind", str(git_dir), str(git_dir),
+        "--dir", str(repos / ".grabowski-worktrees"),
+        "--ro-bind", worktree, worktree,
+        "--clearenv", "--setenv", "HOME", "/tmp",
+        "--setenv", "PATH", "/run/current-system/sw/bin",
+        "--setenv", "LANG", "C.UTF-8",
+        "--chdir", worktree,
+    ]
 _BWRAP_NIX = re.compile(r"/nix/store/[0-9a-z]{32}-bubblewrap-[^/]+/bin/bwrap\Z")
 _PYTHON_NIX = re.compile(r"/nix/store/[0-9a-z]{32}-grabowski-operator-[^/]+/bin/python3\Z")
 
@@ -297,7 +353,7 @@ def _verified_sandbox_command(record: dict[str, Any], task: dict[str, Any]) -> N
         or _BWRAP_NIX.fullmatch(command[0]) is None
     ):
         raise ReviewExecutionRejected("self-review sandbox method/worktree invalid")
-    prefix = [command[0], *_RO_BWRAP, worktree, "--"]
+    prefix = [command[0], *_sandbox_bwrap_flags(worktree), "--"]
     binding = record.get("binding")
     tail = ["-B", "-c", trusted_phase_source(binding, record["axis"], worktree)]
     if (

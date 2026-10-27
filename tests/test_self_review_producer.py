@@ -168,7 +168,7 @@ class ServerReviewProducerTests(unittest.TestCase):
                 "test_pr_review_gate_external.py",
                 "test_self_review_execution.py",
                 "test_self_review_producer.py",
-                "test_release_admission.py",
+                "test_pr_review_gate_recovery_risk_paths.py",
             ],
             [execute.METHOD_TEST_SUITE[axis] for axis in producer.METHODS],
         )

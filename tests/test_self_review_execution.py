@@ -55,6 +55,25 @@ class ReviewExecutionProvenanceTests(unittest.TestCase):
             "review_pass_receipts": [],
         }
 
+    def test_isolated_phase_mounts_exclude_host_root_home_and_runtime_secrets(self) -> None:
+        worktree = "/home/alex/repos/.grabowski-worktrees/receipt-sandbox-test"
+        args = execution._sandbox_bwrap_flags(worktree)
+        sources = [args[i + 1] for i, item in enumerate(args[:-2]) if item == "--ro-bind"]
+        self.assertNotIn("/", sources)
+        self.assertNotIn("/home", sources)
+        self.assertNotIn("/run", sources)
+        self.assertNotIn("/home/alex", sources)
+        self.assertIn("/nix/store", sources)
+        self.assertIn(worktree, sources)
+        self.assertEqual(args.count("--clearenv"), 1)
+        self.assertIn(["--setenv", "HOME", "/tmp"], [args[i:i+3] for i in range(len(args)-2)])
+        self.assertIn(
+            ["--setenv", "PATH", "/run/current-system/sw/bin"],
+            [args[i:i+3] for i in range(len(args)-2)],
+        )
+        self.assertNotIn(".config", " ".join(sources))
+        self.assertNotIn(".local/state", " ".join(sources))
+
     def _write(self, path: Path, data: bytes) -> None:
         path.write_bytes(data)
         path.chmod(0o600)
@@ -110,7 +129,7 @@ class ReviewExecutionProvenanceTests(unittest.TestCase):
             ),
         }
         sandbox_argv = [
-            bwrap, *execution._RO_BWRAP, worktree, "--",
+            bwrap, *execution._sandbox_bwrap_flags(worktree), "--",
             python, "-B", "-c",
             execution.trusted_phase_source(binding, axis, worktree),
         ]

@@ -127,7 +127,7 @@ def _task_command(
     ):
         raise provenance.ReviewExecutionRejected("review runtime binary not installed from Nix")
     return [
-        bwrap, *provenance._RO_BWRAP, str(worktree), "--", python, "-B", "-c",
+        bwrap, *provenance._sandbox_bwrap_flags(str(worktree)), "--", python, "-B", "-c",
         provenance.trusted_phase_source(binding, axis, str(worktree)),
     ]
 
