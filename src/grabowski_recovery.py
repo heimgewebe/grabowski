@@ -1561,113 +1561,120 @@ def _nixos_restored_regular_file_stat(output: str, *, expected_size: int) -> boo
     )
 
 
+NIXOS_RESTIC_ROOT_PROOF_UNIT = "heim-pc-restic-recovery-probe.service"
+NIXOS_RESTIC_ROOT_PROOF_PATH = Path(
+    "/var/lib/heim-pc-restic-recovery-probe/proof.json"
+)
+
+
+def _validated_nixos_root_proof(
+    payload: Any, *, not_before_unix: int, now: int, expected_backup_uuid: str
+) -> dict[str, Any]:
+    """Accept only one complete proof bound to the fixed root NixOS oneshot."""
+    fields = {
+        "schema_version", "kind", "started_at_unix", "completed_at_unix",
+        "snapshot_id", "snapshot_time_unix", "repository_id", "backup_uuid",
+        "backup_source", "restore_sha256", "restore_probe_valid",
+        "repository_check_valid",
+    }
+    if not isinstance(payload, dict) or set(payload) != fields:
+        raise RuntimeError("NixOS root Restic proof has unexpected fields")
+    if (payload["schema_version"] != 1
+            or payload["kind"] != "heim_pc.nixos_restic_recovery_root_proof"):
+        raise RuntimeError("NixOS root Restic proof identity is invalid")
+    for key in ("started_at_unix", "completed_at_unix", "snapshot_time_unix"):
+        if isinstance(payload[key], bool) or not isinstance(payload[key], int):
+            raise RuntimeError(f"NixOS root Restic proof {key} is invalid")
+    started = payload["started_at_unix"]
+    completed = payload["completed_at_unix"]
+    snapshot_time = payload["snapshot_time_unix"]
+    if not (not_before_unix - 1 <= started <= completed <= now + 5
+            and 0 <= now - completed <= 120
+            and 0 <= completed - snapshot_time <= MAX_AGE_SECONDS
+            and 0 <= now - snapshot_time <= MAX_AGE_SECONDS):
+        raise RuntimeError("NixOS root Restic proof is stale or out of order")
+    if (payload["backup_uuid"] != expected_backup_uuid
+            or payload["repository_id"] != LOCAL_RECOVERY_REPOSITORY_ID):
+        raise RuntimeError("NixOS root Restic proof repository identity mismatch")
+    for key in ("snapshot_id", "restore_sha256"):
+        value = payload[key]
+        if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            raise RuntimeError(f"NixOS root Restic proof {key} is invalid")
+    device = payload["backup_source"]
+    if not isinstance(device, str) or re.fullmatch(r"/dev/[a-zA-Z0-9_./+-]{1,255}", device) is None:
+        raise RuntimeError("NixOS root Restic proof device is invalid")
+    if (payload["restore_probe_valid"] is not True
+            or payload["repository_check_valid"] is not True):
+        raise RuntimeError("NixOS root Restic proof has not verified a restore and check")
+    return payload
+
+
+def _nixos_root_proof_read(
+    *, not_before_unix: int, now: int, expected_backup_uuid: str
+) -> dict[str, Any]:
+    """Read bounded root-owned evidence without following an attacker symlink."""
+    proof = NIXOS_RESTIC_ROOT_PROOF_PATH
+    parent_stat = proof.parent.lstat()
+    if (not stat.S_ISDIR(parent_stat.st_mode) or parent_stat.st_uid != 0
+            or parent_stat.st_mode & 0o022):
+        raise RuntimeError("NixOS root Restic proof directory is unsafe")
+    fd = os.open(str(proof), os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        file_stat = os.fstat(fd)
+        if (not stat.S_ISREG(file_stat.st_mode) or file_stat.st_uid != 0
+                or file_stat.st_mode & 0o022 or file_stat.st_nlink != 1
+                or not 0 < file_stat.st_size <= 8192):
+            raise RuntimeError("NixOS root Restic proof file is unsafe")
+        content = os.read(fd, 8193)
+        if len(content) != file_stat.st_size:
+            raise RuntimeError("NixOS root Restic proof file size changed")
+    finally:
+        os.close(fd)
+    return _validated_nixos_root_proof(
+        json.loads(content),
+        not_before_unix=not_before_unix,
+        now=now,
+        expected_backup_uuid=expected_backup_uuid,
+    )
+
+
 def _nixos_local_recovery_probe_locked(target_info: dict[str, Any]) -> dict[str, Any]:
-    """Verify the installed Restic system backup; publish through the existing broker."""
+    """Delegate privileged Restic to one fixed NixOS systemd oneshot."""
     if target_info.get("kind") != "local_backup_disk":
         raise RuntimeError("NixOS recovery target is not a local disk")
     backup_uuid = target_info.get("backup_uuid")
     repository_name = target_info.get("repository_name")
-    if not isinstance(backup_uuid, str) or not isinstance(repository_name, str):
-        raise RuntimeError("NixOS recovery target is incomplete")
-    mount = Path("/var/lib/heim-pc-backup")
-    repository = mount / "restic" / repository_name
-    password = Path("/persist/secrets/restic/heim-pc-password")
-    system_bin = Path("/run/current-system/sw/bin")
-    sudo = "/run/wrappers/bin/sudo"
-    restic_argv = [sudo, "-n", str(system_bin / "restic"), "--repo",
-                   str(repository), "--password-file", str(password)]
+    if (not isinstance(backup_uuid, str) or repository_name != "heim-pc"):
+        raise RuntimeError("NixOS recovery target is incomplete or unexpected")
+
     log_dir = operator.STATE_DIR / "recovery"
     log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / f"nixos-restic-recovery-{int(time.time())}.log"
-
-    def run(args: list[str], *, timeout: int = 300) -> subprocess.CompletedProcess[str]:
-        return _run_logged(args, env=dict(os.environ), log=log_path, timeout_seconds=timeout)
-
-    def restic(*args: str, timeout: int = 300) -> subprocess.CompletedProcess[str]:
-        return run(restic_argv + list(args), timeout=timeout)
-
-    def identity() -> str:
-        # Accessing the repository triggers the native systemd automount.
-        if not repository.is_dir() or repository.is_symlink():
-            raise RuntimeError("NixOS backup repository is not mounted")
-        mounted = run([sudo, "-n", str(system_bin / "findmnt"), "-rn", "-T",
-                       str(mount), "-t", "ext4", "-o", "TARGET,SOURCE,FSTYPE"])
-        lines = [line.split() for line in mounted.stdout.splitlines() if line.strip()]
-        if len(lines) != 1 or len(lines[0]) != 3:
-            raise RuntimeError("NixOS backup filesystem identity is ambiguous")
-        target, device, fs_type = lines[0]
-        if target != str(mount) or not device.startswith("/dev/") or fs_type != "ext4":
-            raise RuntimeError("NixOS backup filesystem mount mismatch")
-        uuid = run([sudo, "-n", str(system_bin / "lsblk"), "-ndo",
-                    "UUID", device]).stdout.strip()
-        if uuid != backup_uuid:
-            raise RuntimeError("NixOS backup filesystem UUID mismatch")
-        config = json.loads(restic("cat", "config", "--no-cache", "--no-lock").stdout)
-        if not isinstance(config, dict) or config.get("id") != LOCAL_RECOVERY_REPOSITORY_ID:
-            raise RuntimeError("NixOS Restic repository ID mismatch")
-        return device
-
-    mounted_device = identity()
+    started_at = int(time.time())
+    log_path = log_dir / f"nixos-restic-recovery-{started_at}.log"
+    # The only sudo command is a fixed start of the root-owned NixOS unit.
+    # The operator never chooses privileged argv, a restore target or a cleanup
+    # path. This unit owns the Restic credentials and the 0700 restore stage.
+    _run_logged(
+        ["/run/wrappers/bin/sudo", "-n",
+         "/run/current-system/sw/bin/systemctl", "--system", "start",
+         NIXOS_RESTIC_ROOT_PROOF_UNIT],
+        env=dict(os.environ),
+        log=log_path,
+        timeout_seconds=2700,
+    )
+    completed_at = int(time.time())
+    proof = _nixos_root_proof_read(
+        not_before_unix=started_at,
+        now=completed_at,
+        expected_backup_uuid=backup_uuid,
+    )
     if not _timer_probe("is-enabled")["ok"] or not _timer_probe("is-active")["ok"]:
         raise RuntimeError("NixOS Restic system timer is not enabled and active")
-    service = run(["systemctl", "show", "-p", "Result", "-p", "ExecMainStatus",
-                   "restic-backups-heim-pc.service"]).stdout.splitlines()
-    if "Result=success" not in service or "ExecMainStatus=0" not in service:
-        raise RuntimeError("NixOS Restic backup service has no successful result")
-    rows = json.loads(restic("snapshots", "--json", "--host", "heim-pc-nixos",
-                            "--tag", "nixos-seagate").stdout)
-    snapshot = _nixos_restic_snapshot(rows, now=int(time.time()))
-    snapshot_id = snapshot["id"]
-    snapshot_time = _iso_timestamp_unix(snapshot["time"])
-
-    # This small, root-owned regular file is part of the NixOS backup contract.
-    # Never print or persist its contents outside the isolated restore directory.
-    source = "/persist/secrets/restic/heim-pc-excludes"
-    nodes = [
-        json.loads(line) for line in restic("ls", "--json", snapshot_id, source).stdout.splitlines()
-        if line.strip()
-    ]
-    matching = [
-        node for node in nodes if isinstance(node, dict)
-        and node.get("message_type") == "node" and node.get("path") == source
-        and node.get("type") == "file" and isinstance(node.get("size"), int)
-        and 0 < node["size"] <= 65536
-    ]
-    if len(matching) != 1:
-        raise RuntimeError("NixOS Restic restore probe file missing or not regular")
-    size = matching[0]["size"]
-    stage = Path(tempfile.mkdtemp(prefix="nixos-restic-restore-", dir=str(log_dir)))
-    try:
-        restic("restore", snapshot_id, "--target", str(stage),
-               "--include", source, "--verify", timeout=600)
-        restored_file = stage / source.lstrip("/")
-        observed = run([sudo, "-n", str(system_bin / "stat"),
-                        "-c", "%f %s", str(restored_file)]).stdout
-        if not _nixos_restored_regular_file_stat(observed, expected_size=size):
-            raise RuntimeError("NixOS Restic restore file type or size mismatch")
-        restored_digest = run([sudo, "-n", str(system_bin / "sha256sum"),
-                               str(restored_file)]).stdout.split()[0]
-        # Binary dump is deliberately NOT passed to _run_logged: it may be private.
-        dump = subprocess.run(restic_argv + ["dump", snapshot_id, source],
-                              cwd=str(operator.HOME), stdout=subprocess.PIPE,
-                              stderr=subprocess.PIPE, timeout=300, check=False)
-        if dump.returncode != 0 or len(dump.stdout) != size:
-            raise RuntimeError("NixOS Restic snapshot dump failed or size mismatched")
-        expected_digest = hashlib.sha256(dump.stdout).hexdigest()
-        if restored_digest != expected_digest:
-            raise RuntimeError("NixOS Restic restored bytes differ from snapshot")
-    finally:
-        # Only the freshly created, fixed-prefix restore directory is removed.
-        run([sudo, "-n", str(system_bin / "rm"), "-rf", "--", str(stage)], timeout=60)
-
-    restic("check", "--read-data-subset=" + SERVER_RECOVERY_CHECK_SUBSET, timeout=1200)
-    if identity() != mounted_device:
-        raise RuntimeError("NixOS backup device changed before evidence publication")
-    completed_at = int(time.time())
-    if not 0 <= completed_at - snapshot_time <= MAX_AGE_SECONDS:
-        raise RuntimeError("NixOS Restic snapshot became stale")
+    snapshot_id = proof["snapshot_id"]
+    snapshot_time = proof["snapshot_time_unix"]
     source_write = _write_server_marker(
-        completed_at_unix=completed_at, snapshot_id=snapshot_id[:8],
+        completed_at_unix=completed_at,
+        snapshot_id=snapshot_id[:8],
         snapshot_time_unix=snapshot_time,
     )
     publication = privileged.publish_recovery_marker_reference(
@@ -1675,12 +1682,17 @@ def _nixos_local_recovery_probe_locked(target_info: dict[str, Any]) -> dict[str,
         generated_at_unix=completed_at,
     )
     if not publication.get("success"):
-        raise RuntimeError("canonical NixOS recovery publication failed: "
-                           + _publication_failure_detail(publication))
+        raise RuntimeError(
+            "canonical NixOS recovery publication failed: "
+            + _publication_failure_detail(publication)
+        )
     canonical = _canonical_server_marker()
-    if not canonical.get("valid") or canonical.get("source_record_sha256") != source_write["source_record_sha256"]:
+    if (not canonical.get("valid")
+            or canonical.get("source_record_sha256")
+            != source_write["source_record_sha256"]):
         raise RuntimeError("canonical NixOS recovery readback failed")
-    audit_record = {
+    log_sha256 = _sha256_file(log_path) if log_path.exists() else None
+    base._append_audit({
         "timestamp_unix": completed_at,
         "operation": "nixos-restic-recovery-probe",
         "snapshot_time_unix": snapshot_time,
@@ -1689,25 +1701,37 @@ def _nixos_local_recovery_probe_locked(target_info: dict[str, Any]) -> dict[str,
         "target": SERVER_RECOVERY_TARGET,
         "backup_uuid": backup_uuid,
         "repository_id": LOCAL_RECOVERY_REPOSITORY_ID,
-        "restore_sha256": restored_digest,
+        "restore_sha256": proof["restore_sha256"],
         "restore_probe_valid": True,
         "repository_check_valid": True,
+        "root_proof_path": str(NIXOS_RESTIC_ROOT_PROOF_PATH),
         "source_record_sha256": source_write["source_record_sha256"],
         "canonical_record_sha256": canonical.get("record_sha256"),
-        "log_sha256": _sha256_file(log_path),
-    }
-    base._append_audit(audit_record)
+        "log_sha256": log_sha256,
+    })
     return {
-        "schema_version": 1, "snapshot_id": snapshot_id[:8],
-        "snapshot_full_id": snapshot_id, "target": SERVER_RECOVERY_TARGET,
-        "backup_mount": str(mount), "backup_source": mounted_device,
-        "backup_uuid": backup_uuid, "repository": str(repository),
+        "schema_version": 1,
+        "snapshot_id": snapshot_id[:8],
+        "snapshot_full_id": snapshot_id,
+        "target": SERVER_RECOVERY_TARGET,
+        "backup_mount": "/var/lib/heim-pc-backup",
+        "backup_source": proof["backup_source"],
+        "backup_uuid": backup_uuid,
+        "repository": "/var/lib/heim-pc-backup/restic/heim-pc",
         "repository_id": LOCAL_RECOVERY_REPOSITORY_ID,
-        "restore_sha256": restored_digest,
-        "restore_probe_valid": True, "repository_check_valid": True,
+        "restore_sha256": proof["restore_sha256"],
+        "restore_probe_valid": True,
+        "repository_check_valid": True,
         "canonical_recovery": canonical,
         "source_recovery": _server_source_marker(),
-        "publication": publication, "log_path": str(log_path),
+        "publication": publication,
+        "root_proof": {
+            "path": str(NIXOS_RESTIC_ROOT_PROOF_PATH),
+            "completed_at_unix": proof["completed_at_unix"],
+            "validated": True,
+        },
+        "log_path": str(log_path),
+        "log_sha256": log_sha256,
     }
 
 

@@ -323,56 +323,69 @@ class NativeNixOSResticProofTests(unittest.TestCase):
             legacy.assert_called_once()
             native.assert_called_once()
 
-    def test_missing_medium_wrong_uuid_repo_id_and_failed_restore_never_publish(self) -> None:
+    def _root_proof(self) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "kind": "heim_pc.nixos_restic_recovery_root_proof",
+            "started_at_unix": self.now - 3,
+            "completed_at_unix": self.now - 1,
+            "snapshot_id": "c" * 64,
+            "snapshot_time_unix": self.now - 60,
+            "repository_id": recovery.LOCAL_RECOVERY_REPOSITORY_ID,
+            "backup_uuid": self.target["backup_uuid"],
+            "backup_source": "/dev/sda1",
+            "restore_sha256": "d" * 64,
+            "restore_probe_valid": True,
+            "repository_check_valid": True,
+        }
+
+    def test_root_owned_proof_payload_rejects_stale_or_invalid_sources(self) -> None:
+        proof = self._root_proof()
+        self.assertEqual(
+            recovery._validated_nixos_root_proof(
+                proof, not_before_unix=self.now - 5, now=self.now,
+                expected_backup_uuid=self.target["backup_uuid"]
+            ), proof,
+        )
+        cases = (
+            dict(proof, backup_uuid="wrong"),
+            dict(proof, repository_id="a" * 64),
+            dict(proof, restore_sha256="invalid"),
+            dict(proof, snapshot_id="not-a-real-snapshot"),
+            dict(proof, restore_probe_valid=False),
+            dict(proof, repository_check_valid=False),
+            dict(proof, started_at_unix=self.now - 120),
+            dict(proof, completed_at_unix=self.now - 200),
+            dict(proof, snapshot_time_unix=self.now - recovery.MAX_AGE_SECONDS - 1),
+            dict(proof, backup_source="/home/alex/unsafe"),
+            {**proof, "unexpected": True},
+        )
+        for case in cases:
+            with self.subTest(case=case):
+                with self.assertRaises(RuntimeError):
+                    recovery._validated_nixos_root_proof(
+                        case, not_before_unix=self.now - 5, now=self.now,
+                        expected_backup_uuid=self.target["backup_uuid"],
+                    )
+
+    def test_root_proof_failure_never_publishes_canonical_marker(self) -> None:
         import tempfile
-        real_is_dir = Path.is_dir
-        repository = "/var/lib/heim-pc-backup/restic/heim-pc"
-        for scenario in ("missing_medium", "wrong_uuid", "wrong_repo", "restore_failure"):
+        for scenario in ("unit_failure", "missing_proof", "invalid_proof"):
             with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as tmp:
-                def is_dir(path: Path) -> bool:
-                    if str(path) == repository:
-                        return scenario != "missing_medium"
-                    return real_is_dir(path)
-
-                def fake_run(argv: list[str], **_kwargs: object) -> types.SimpleNamespace:
-                    command = " ".join(argv)
-                    if "/findmnt " in command:
-                        output = "/var/lib/heim-pc-backup /dev/sda1 ext4\n"
-                    elif "/lsblk " in command:
-                        output = (
-                            "wrong-uuid\n" if scenario == "wrong_uuid"
-                            else self.target["backup_uuid"] + "\n"
-                        )
-                    elif " cat config" in command:
-                        value = (
-                            "0" * 64 if scenario == "wrong_repo"
-                            else recovery.LOCAL_RECOVERY_REPOSITORY_ID
-                        )
-                        output = json.dumps({"id": value})
-                    elif argv[0] == "systemctl":
-                        output = "Result=success\nExecMainStatus=0\n"
-                    elif " snapshots " in command:
-                        output = json.dumps([self.snapshot])
-                    elif " ls " in command:
-                        output = json.dumps({
-                            "message_type": "node",
-                            "path": "/persist/secrets/restic/heim-pc-excludes",
-                            "type": "file", "size": 879,
-                        })
-                    elif " restore " in command:
-                        raise RuntimeError("simulated restore error")
-                    elif "/rm " in command:
-                        output = ""
-                    else:
-                        raise AssertionError("unexpected command: " + command)
-                    return types.SimpleNamespace(stdout=output, returncode=0)
-
-                with patch.object(recovery.Path, "is_dir", new=is_dir), patch.object(
+                fake_run = (
+                    RuntimeError("NixOS recovery unit failed")
+                    if scenario == "unit_failure"
+                    else types.SimpleNamespace(returncode=0, stdout="")
+                )
+                with patch.object(
                     recovery.operator, "STATE_DIR", Path(tmp)
                 ), patch.object(
-                    recovery, "_run_logged", side_effect=fake_run
+                    recovery, "_run_logged",
+                    side_effect=fake_run if isinstance(fake_run, Exception) else None,
+                    return_value=None if isinstance(fake_run, Exception) else fake_run,
                 ), patch.object(
-                    recovery, "_timer_probe", return_value={"ok": True}
+                    recovery, "_nixos_root_proof_read",
+                    side_effect=RuntimeError(scenario)
                 ), patch.object(
                     recovery, "_write_server_marker"
                 ) as marker, patch.object(
@@ -382,6 +395,56 @@ class NativeNixOSResticProofTests(unittest.TestCase):
                         recovery._nixos_local_recovery_probe_locked(self.target)
                     marker.assert_not_called()
                     publish.assert_not_called()
+
+    def test_nixos_native_probe_invokes_only_fixed_root_unit_and_uses_root_receipt(self) -> None:
+        import tempfile
+        proof = self._root_proof()
+        digest = "a" * 64
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            recovery.operator, "STATE_DIR", Path(tmp)
+        ), patch.object(
+            recovery.time, "time", return_value=self.now
+        ), patch.object(
+            recovery, "_run_logged",
+            return_value=types.SimpleNamespace(returncode=0, stdout="")
+        ) as run, patch.object(
+            recovery, "_nixos_root_proof_read", return_value=proof
+        ) as read_proof, patch.object(
+            recovery, "_timer_probe", return_value={"ok": True}
+        ), patch.object(
+            recovery, "_write_server_marker",
+            return_value={"source_record_sha256": digest}
+        ) as marker, patch.object(
+            recovery.privileged, "publish_recovery_marker_reference",
+            return_value={"success": True}
+        ) as publish, patch.object(
+            recovery, "_canonical_server_marker",
+            return_value={
+                "valid": True, "source_record_sha256": digest,
+                "record_sha256": "b" * 64,
+            }
+        ), patch.object(
+            recovery, "_server_source_marker", return_value={"valid": True}
+        ), patch.object(recovery.base, "_append_audit"):
+            result = recovery._nixos_local_recovery_probe_locked(self.target)
+        run.assert_called_once()
+        self.assertEqual(run.call_args.args[0], [
+            "/run/wrappers/bin/sudo", "-n",
+            "/run/current-system/sw/bin/systemctl", "--system", "start",
+            "heim-pc-restic-recovery-probe.service",
+        ])
+        read_proof.assert_called_once()
+        marker.assert_called_once_with(
+            completed_at_unix=self.now,
+            snapshot_id="c" * 8,
+            snapshot_time_unix=self.now - 60,
+        )
+        publish.assert_called_once_with(
+            source_record_sha256=digest,
+            generated_at_unix=self.now,
+        )
+        self.assertEqual(result["restore_sha256"], "d" * 64)
+        self.assertTrue(result["root_proof"]["validated"])
 
     def test_valid_nixos_source_replaces_only_legacy_local_marker(self) -> None:
         source = {
