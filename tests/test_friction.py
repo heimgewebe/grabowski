@@ -528,6 +528,117 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
 
         self.assertEqual(module._explicit_http_statuses(payload), [200, 404, 503])
 
+    def test_connector_diagnostics_select_nixos_system_unit_without_leaking_scope(self) -> None:
+        module = self._load_module()
+        seen = []
+
+        def fake_run(argv, *, timeout_seconds=30, max_output_bytes=131_072):
+            seen.append(tuple(argv))
+            is_operator = "grabowski-operator.service" in argv
+            is_system = "--system" in argv
+            if argv[0] == "systemctl":
+                loaded = (is_operator and is_system) or (not is_operator and not is_system)
+                return {
+                    "returncode": 0, "timed_out": False,
+                    "stdout": ("LoadState=loaded\nActiveState=active\n"
+                               if loaded else "LoadState=not-found\nActiveState=inactive\n"),
+                    "stderr": "", "stdout_truncated": False, "stderr_truncated": False,
+                }
+            if argv[0] == "journalctl":
+                error = (is_operator and is_system and "--grep" not in argv)
+                message = json.dumps({"PRIORITY": "3", "MESSAGE": json.dumps({
+                    "level": "ERROR", "component": "dispatcher",
+                    "msg": "Received exception from stream: HTTP 429 upstream/external service error",
+                })}) + "\n" if error else ""
+                return {
+                    "returncode": 0, "timed_out": False, "stdout": message,
+                    "stderr": "", "stdout_truncated": False, "stderr_truncated": False,
+                }
+            raise AssertionError(argv)
+
+        module._run_diagnostic_command = fake_run
+        data = module.connector_transport_live_diagnostics(limit=1, max_log_lines=25)
+        self.assertEqual(data["service_statuses"]["grabowski-operator.service"]["scope"], "system")
+        self.assertEqual(data["service_statuses"]["tunnel-client-grabowski.service"]["scope"], "user")
+        self.assertEqual(
+            data["journal_transport_probes"]["grabowski-operator.service"]["http_status_counts"],
+            {"429": 1},
+        )
+        self.assertEqual(data["transport_health_state"], "unavailable_suspected")
+        self.assertTrue(any(a[0] == "journalctl" and "--system" in a
+                            and "grabowski-operator.service" in a for a in seen))
+        self.assertTrue(any(a[0] == "journalctl" and "--user" in a
+                            and "tunnel-client-grabowski.service" in a for a in seen))
+
+    def test_connector_diagnostics_no_service_or_events_is_not_healthy(self) -> None:
+        module = self._load_module()
+
+        def fake_run(argv, *, timeout_seconds=30, max_output_bytes=131_072):
+            return {
+                "returncode": 0, "timed_out": False,
+                "stdout": ("LoadState=not-found\nActiveState=inactive\n"
+                           if argv[0] == "systemctl" else ""),
+                "stderr": "", "stdout_truncated": False, "stderr_truncated": False,
+            }
+
+        module._run_diagnostic_command = fake_run
+        data = module.connector_transport_live_diagnostics(limit=1, max_log_lines=25)
+        self.assertEqual(data["transport_health_state"], "indeterminate")
+        self.assertEqual(
+            data["transport_window_state"], "indeterminate_service_unavailable"
+        )
+        self.assertEqual(
+            data["journal_transport_probes"]["grabowski-operator.service"]["transport_health_state"],
+            "indeterminate",
+        )
+
+    def test_connector_diagnostics_falls_back_to_legacy_user_operator(self) -> None:
+        module = self._load_module()
+
+        def fake_run(argv, *, timeout_seconds=30, max_output_bytes=131_072):
+            if argv[0] == "systemctl":
+                loaded = "--user" in argv
+                stdout = (
+                    "LoadState=loaded\nActiveState=active\n"
+                    if loaded else "LoadState=not-found\nActiveState=inactive\n"
+                )
+            elif argv[0] == "journalctl":
+                stdout = json.dumps({
+                    "PRIORITY": "6",
+                    "MESSAGE": json.dumps({
+                        "level": "INFO", "component": "dispatcher",
+                        "msg": "dispatcher forwarded command to MCP server",
+                    }),
+                }) + "\n"
+            else:
+                raise AssertionError(argv)
+            return {
+                "returncode": 0, "timed_out": False, "stdout": stdout,
+                "stderr": "", "stdout_truncated": False, "stderr_truncated": False,
+            }
+
+        module._run_diagnostic_command = fake_run
+        diagnostics = module.connector_transport_live_diagnostics(limit=1, max_log_lines=25)
+        self.assertEqual(diagnostics["service_statuses"]["grabowski-operator.service"]["scope"], "user")
+        self.assertEqual(diagnostics["journal_transport_probes"]["grabowski-operator.service"]["activity_counts"],
+                         {"forwarded_to_mcp": 1})
+
+    def test_connector_diagnostics_active_service_without_logs_is_indeterminate(self) -> None:
+        module = self._load_module()
+
+        def fake_run(argv, *, timeout_seconds=30, max_output_bytes=131_072):
+            return {
+                "returncode": 0, "timed_out": False,
+                "stdout": ("LoadState=loaded\nActiveState=active\n"
+                           if argv[0] == "systemctl" else ""),
+                "stderr": "", "stdout_truncated": False, "stderr_truncated": False,
+            }
+
+        module._run_diagnostic_command = fake_run
+        diagnostics = module.connector_transport_live_diagnostics(limit=1, max_log_lines=25)
+        self.assertEqual(diagnostics["transport_health_state"], "indeterminate")
+        self.assertEqual(diagnostics["transport_window_state"], "indeterminate_no_recent_activity")
+
     def test_connector_transport_live_diagnostics_captures_bounded_runtime_receipt(self) -> None:
         module = self._load_module()
         module.FRICTION_LOG.parent.mkdir(parents=True, exist_ok=True)
@@ -2808,6 +2919,100 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
                 evidence_ref="receipt:lock-smoke",
                 resolved_by="operator",
             )
+
+
+    def test_system_scope_completed_stop_uses_invocation_id_not_user_invocation_id(self) -> None:
+        module = self._load_module()
+        invocation = "a" * 32
+        other = "b" * 32
+        records = [
+            {
+                "__REALTIME_TIMESTAMP": "100",
+                "_SYSTEMD_INVOCATION_ID": invocation,
+                "MESSAGE": json.dumps({
+                    "level": "ERROR", "msg": "harpoon server stopped",
+                    "error": {"kind": "shutdown"},
+                }),
+            },
+            {
+                "__REALTIME_TIMESTAMP": "105",
+                "_SYSTEMD_INVOCATION_ID": invocation,
+                "MESSAGE": json.dumps({"level": "INFO", "msg": "OnStop hook executing"}),
+            },
+            {
+                "__REALTIME_TIMESTAMP": "106",
+                "_SYSTEMD_INVOCATION_ID": invocation,
+                "MESSAGE": json.dumps({"level": "INFO", "msg": "OnStop hook executed"}),
+            },
+            {
+                "__REALTIME_TIMESTAMP": "110",
+                "MESSAGE_ID": module.SYSTEMD_STOP_COMPLETED_MESSAGE_ID,
+                "UNIT": "grabowski-operator.service",
+                "INVOCATION_ID": invocation,
+                "USER_INVOCATION_ID": other,
+                "JOB_TYPE": "stop",
+                "JOB_RESULT": "done",
+                "MESSAGE": "Stopped Grabowski Operator.",
+            },
+        ]
+        module._run_diagnostic_command = lambda *args, **kwargs: {
+            "returncode": 0, "timed_out": False,
+            "stdout": "".join(json.dumps(r) + "\n" for r in records),
+            "stderr": "", "stdout_truncated": False, "stderr_truncated": False,
+        }
+        probe = module._journal_transport_probe(
+            "grabowski-operator.service", 25, scope="system"
+        )
+        self.assertEqual(probe["completed_stop_invocation_count"], 1)
+        self.assertEqual(probe["qualified_planned_stop_invocation_count"], 1)
+        self.assertEqual(probe["planned_lifecycle_issue_count"], 1)
+        self.assertEqual(probe["transport_error_count"], 0)
+
+    def test_system_scope_refuses_user_only_or_mismatched_stop_invocation(self) -> None:
+        module = self._load_module()
+        invocation = "a" * 32
+        other = "c" * 32
+        records = [
+            {
+                "__REALTIME_TIMESTAMP": "100",
+                "_SYSTEMD_INVOCATION_ID": invocation,
+                "MESSAGE": json.dumps({
+                    "level": "ERROR", "msg": "harpoon server stopped",
+                    "error": {"kind": "shutdown"},
+                }),
+            },
+            {
+                "__REALTIME_TIMESTAMP": "105",
+                "_SYSTEMD_INVOCATION_ID": invocation,
+                "MESSAGE": json.dumps({"level": "INFO", "msg": "OnStop hook executing"}),
+            },
+            {
+                "__REALTIME_TIMESTAMP": "106",
+                "_SYSTEMD_INVOCATION_ID": invocation,
+                "MESSAGE": json.dumps({"level": "INFO", "msg": "OnStop hook executed"}),
+            },
+            {
+                "__REALTIME_TIMESTAMP": "110",
+                "MESSAGE_ID": module.SYSTEMD_STOP_COMPLETED_MESSAGE_ID,
+                "UNIT": "grabowski-operator.service",
+                "INVOCATION_ID": other,
+                "USER_INVOCATION_ID": invocation,
+                "JOB_TYPE": "stop",
+                "JOB_RESULT": "done",
+            },
+        ]
+        module._run_diagnostic_command = lambda *args, **kwargs: {
+            "returncode": 0, "timed_out": False,
+            "stdout": "".join(json.dumps(r) + "\n" for r in records),
+            "stderr": "", "stdout_truncated": False, "stderr_truncated": False,
+        }
+        probe = module._journal_transport_probe(
+            "grabowski-operator.service", 25, scope="system"
+        )
+        self.assertEqual(probe["completed_stop_invocation_count"], 1)
+        self.assertEqual(probe["qualified_planned_stop_invocation_count"], 0)
+        self.assertEqual(probe["planned_lifecycle_issue_count"], 0)
+        self.assertEqual(probe["transport_error_count"], 1)
 
 
 class FrictionRepairContractTests(unittest.TestCase):
