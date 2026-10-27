@@ -247,6 +247,31 @@ class NativeNixOSResticProofTests(unittest.TestCase):
             "repository_name": "heim-pc",
         }
 
+    def test_restored_stat_numeric_mode_is_locale_independent(self) -> None:
+        import stat
+
+        regular = format(stat.S_IFREG | 0o600, "x")
+        symlink = format(stat.S_IFLNK | 0o777, "x")
+        directory = format(stat.S_IFDIR | 0o700, "x")
+        self.assertTrue(recovery._nixos_restored_regular_file_stat(
+            f"{regular} 879\n", expected_size=879
+        ))
+        for output in (
+            f"{symlink} 879",
+            f"{directory} 879",
+            f"{regular} 878",
+            "regular file 879",
+            "fichier régulier 879",
+            "0 879",
+            f"{regular} garbage",
+            f"{regular} 879 extra",
+            "",
+        ):
+            with self.subTest(output=output):
+                self.assertFalse(recovery._nixos_restored_regular_file_stat(
+                    output, expected_size=879
+                ))
+
     def test_accepts_fresh_complete_nixos_snapshot(self) -> None:
         result = recovery._nixos_restic_snapshot([self.snapshot], now=self.now)
         self.assertEqual(result["id"], "c" * 64)

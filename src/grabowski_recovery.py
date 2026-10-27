@@ -1544,6 +1544,23 @@ def _nixos_restic_snapshot(rows: Any, *, now: int) -> dict[str, Any]:
     return max(matches, key=lambda item: item[0])[1]
 
 
+
+def _nixos_restored_regular_file_stat(output: str, *, expected_size: int) -> bool:
+    """Check GNU stat's numeric mode/size, not a localized %F description."""
+    fields = output.split()
+    if len(fields) != 2:
+        return False
+    try:
+        observed_mode = int(fields[0], 16)  # stat -c %f: raw st_mode in hex.
+        observed_size = int(fields[1], 10)  # stat -c %s: byte count.
+    except ValueError:
+        return False
+    return (
+        stat.S_IFMT(observed_mode) == stat.S_IFREG
+        and observed_size == expected_size
+    )
+
+
 def _nixos_local_recovery_probe_locked(target_info: dict[str, Any]) -> dict[str, Any]:
     """Verify the installed Restic system backup; publish through the existing broker."""
     if target_info.get("kind") != "local_backup_disk":
@@ -1625,8 +1642,8 @@ def _nixos_local_recovery_probe_locked(target_info: dict[str, Any]) -> dict[str,
                "--include", source, "--verify", timeout=600)
         restored_file = stage / source.lstrip("/")
         observed = run([sudo, "-n", str(system_bin / "stat"),
-                        "-c", "%F %s", str(restored_file)]).stdout.strip()
-        if observed != f"regular file {size}":
+                        "-c", "%f %s", str(restored_file)]).stdout
+        if not _nixos_restored_regular_file_stat(observed, expected_size=size):
             raise RuntimeError("NixOS Restic restore file type or size mismatch")
         restored_digest = run([sudo, "-n", str(system_bin / "sha256sum"),
                                str(restored_file)]).stdout.split()[0]
