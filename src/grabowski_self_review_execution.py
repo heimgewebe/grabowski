@@ -700,6 +700,72 @@ def _source_reference(
 
 
 
+def _verified_provider_semantic_bytes(
+    receipt: dict[str, Any], raw: bytes, *,
+    provider_family: str, binding: dict[str, Any],
+) -> bytes:
+    """Reparse actual provider trace, never a caller-authored normalized claim.
+
+    The model's stdout is a Claude success envelope, a Grok event stream or
+    directly emitted JSON. All three are separately origin-bound by V2 role
+    reconciliation; only the verified complete document enters the producer.
+    """
+    from grabowski_agent_role import (
+        CLAUDE_REVIEW_JSON_CONTRACT,
+        GROK_REVIEW_STREAM_CONTRACT,
+        _extract_claude_review_document,
+        _extract_grok_stream_review_document,
+    )
+    if provider_family == "anthropic":
+        if (
+            receipt.get("review_provider_contract") != CLAUDE_REVIEW_JSON_CONTRACT
+            or receipt.get("review_provider_stream_contract") is not None
+        ):
+            raise ReviewExecutionRejected("semantic V2 Claude provider contract missing")
+        document, error, metadata = _extract_claude_review_document(raw)
+    elif provider_family == "xai":
+        if (
+            receipt.get("review_provider_stream_contract") != GROK_REVIEW_STREAM_CONTRACT
+            or receipt.get("review_provider_contract") is not None
+        ):
+            raise ReviewExecutionRejected("semantic V2 Grok provider contract missing")
+        document, error, metadata = _extract_grok_stream_review_document(
+            raw, expected_head=binding["head_sha"],
+            expected_base_head=binding["base_sha"],
+        )
+    else:
+        if (
+            receipt.get("review_provider_contract") is not None
+            or receipt.get("review_provider_stream_contract") is not None
+        ):
+            raise ReviewExecutionRejected("semantic V2 provider contract mismatched")
+        # Other cataloged V2 reviewer roles emit direct JSON. Their frozen
+        # command, output SHA, read-only sandbox and origin remain mandatory.
+        return raw
+    if error is not None or document is None:
+        raise ReviewExecutionRejected("semantic V2 provider output not authentic")
+    if any(receipt.get(k) != v for k, v in metadata.items()):
+        raise ReviewExecutionRejected("semantic V2 provider metadata altered")
+    if (
+        receipt.get("review_document_bytes") != len(document)
+        or receipt.get("review_document_sha256") != hashlib.sha256(document).hexdigest()
+        or receipt.get("review_document_normalizations") != []
+        or receipt.get("review_findings_normalized") is not False
+    ):
+        raise ReviewExecutionRejected("semantic V2 provider review document digest drift")
+    return document
+
+
+def _unique_semantic_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """Never let duplicate JSON keys hide REJECTs or wrong revision bindings."""
+    result: dict[str, Any] = {}
+    for name, value in pairs:
+        if name in result:
+            raise ReviewExecutionRejected("duplicate semantic V2 JSON field")
+        result[name] = value
+    return result
+
+
 def verified_semantic_review_passes(
     binding: dict[str, Any], *, repository: Path,
     axes_to_review: tuple[str, ...] = REQUIRED_AXES,
@@ -816,8 +882,16 @@ def verified_semantic_review_passes(
             or receipt.get("stdout_sha256") != hashlib.sha256(full).hexdigest()
         ):
             raise ReviewExecutionRejected("substantive V2 review output truncated")
+        observed = _verified_provider_semantic_bytes(
+            receipt, full,
+            provider_family=item["review_provider_family"],
+            binding=expected,
+        )
         try:
-            document = json.loads(stdout_tail)
+            document = json.loads(
+                observed.decode("utf-8"),
+                object_pairs_hook=_unique_semantic_json_object,
+            )
         except (ValueError, UnicodeError) as exc:
             raise ReviewExecutionRejected("substantive V2 review document invalid") from exc
         if receipt.get("review_document_object_sha256") != decisions._agent_role_command_sha256(document):

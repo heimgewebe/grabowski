@@ -1129,6 +1129,69 @@ class GrokReviewRoleTests(unittest.TestCase):
                 self.assertIsNone(document)
                 self.assertIsNotNone(rejected)
 
+    def test_claude_full_semantic_v2_output_roundtrip(self) -> None:
+        """Fixture validates bytes, not that a semantic reviewer actually ran."""
+        source = "src/grabowski_merge_guard.py:L555-L573"
+        payload = {
+            "schema_version": 1,
+            "kind": "grabowski_semantic_self_review_v1",
+            "repo": "heimgewebe/grabowski", "pr": 1649,
+            "base_sha": "b" * 40, "head_sha": "a" * 40,
+            "diff_sha256": "c" * 64, "review_batch_id": "d" * 32,
+            "review_purpose": "pull_request", "axis": "contracts_correctness",
+            "verdict": "PASS", "findings": [],
+            "summary": (
+                "This synthetic provider envelope represents an actual "
+                "contract-focused source inspection, with full head/base/diff "
+                "identity and two distinct analysed risks. It tests the "
+                "producer's ability to retain output, not review quality."
+            ),
+            "evidence_refs": [source],
+            "reviewed_risks": [
+                {"risk": "Falsified PASS origin without semantic execution",
+                 "assessment": (
+                     "The private role receipt and frozen execution origin must "
+                     "prove that a model truly produced a bounded review output, "
+                     "rather than a caller supplying arbitrary analysis text."
+                 ), "evidence_refs": [source]},
+                {"risk": "Truncated review content concealed by technical tests",
+                 "assessment": (
+                     "The complete structured output must be retained together "
+                     "with findings and exact source references. A green "
+                     "technical task is not an authentic semantic judgement."
+                 ), "evidence_refs": [source]},
+            ],
+        }
+        self.assertTrue(
+            set(payload).issubset(role.CLAUDE_REVIEW_SCHEMA["properties"]),
+            "Claude must be able to output all required semantic V2 fields",
+        )
+        base = self._clean_claude_success_envelope()
+        envelope = {**base, "structured_output": payload}
+        document, error, meta = role._extract_claude_review_document(
+            json.dumps(envelope, ensure_ascii=False).encode("utf-8")
+        )
+        self.assertIsNone(error)
+        self.assertEqual(payload, json.loads(document))
+        self.assertEqual(
+            role.digest(payload), meta["review_provider_structured_output_sha256"],
+        )
+        for invalid in (
+            {k: v for k, v in payload.items() if k != "reviewed_risks"},
+            {**payload, "fake_extra": "PASS"},
+            {**payload, "axis": []},
+            {**payload, "review_batch_id": "invalid"},
+            {**payload, "reviewed_risks": payload["reviewed_risks"][:1]},
+        ):
+            with self.subTest(invalid=tuple(invalid)):
+                rejected, reason, _ = role._extract_claude_review_document(
+                    json.dumps({
+                        **base, "structured_output": invalid,
+                    }).encode("utf-8")
+                )
+                self.assertIsNone(rejected)
+                self.assertIsNotNone(reason)
+
     def test_claude_result_rejects_server_web_and_subagent_activity(self) -> None:
         """Change one counter in a complete success envelope; assert the rejection cause."""
         base = self._clean_claude_success_envelope()

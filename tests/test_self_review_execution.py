@@ -17,6 +17,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import grabowski_self_review_execution as execution  # noqa: E402
 import grabowski_decision_reviews as decisions  # noqa: E402
+import grabowski_agent_role as roles  # noqa: E402
 
 
 class ReviewExecutionProvenanceTests(unittest.TestCase):
@@ -645,6 +646,124 @@ class SemanticV2RoleContractTests(unittest.TestCase):
         self.attempts[0]["review_role_receipt_sha256"] = receipt["receipt_sha256"]
         result = self.verify_fixture()
         self.assertEqual(len(result), len(execution.REQUIRED_AXES))
+
+    def test_claude_semantic_schema_contains_only_supported_constraints(self):
+        """The raw Claude structured-output API rejects unsupported bounds.
+
+        Server-local validation must retain all min/max/ref/risk checks.
+        """
+        forbidden = {
+            "minimum", "maximum", "minLength", "maxLength",
+            "minItems", "maxItems", "multipleOf",
+        }
+        def verify(value):
+            if isinstance(value, dict):
+                self.assertFalse(set(value) & forbidden)
+                for item in value.values():
+                    verify(item)
+            elif isinstance(value, list):
+                for item in value:
+                    verify(item)
+        verify(roles.CLAUDE_REVIEW_SCHEMA)
+
+    def _wrap_first_v2_provider_output(self, kind: str) -> tuple[dict, bytes]:
+        """Transform a synthetic V2 fixture into an actual provider wire shape.
+
+        The fixture is NOT an attested review or source of semantic authority.
+        """
+        unit = "grabowski-job-000000000001"
+        receipt = self.receipts[unit]
+        document = json.loads(receipt["stdout_tail"])
+        if kind == "claude":
+            wire = {
+                "type": "result", "subtype": "success", "is_error": False,
+                "permission_denials": [],
+                "usage": {"server_tool_use": {
+                    "web_search_requests": 0, "web_fetch_requests": 0,
+                }},
+                "modelUsage": {"claude-opus-5-5": {
+                    "inputTokens": 100, "outputTokens": 150,
+                    "webSearchRequests": 0,
+                }},
+                "subagent_stats": {
+                    "spawned": 0, "started_in_background": 0,
+                    "max_depth": 0, "spawned_by_subagents": 0,
+                    "completed": 0, "failed": 0,
+                    "requested": {"background": 0, "foreground": 0, "unset": 0},
+                    "refused": {"depth_limit": 0, "concurrency_limit": 0, "budget": 0},
+                    "killed": {"parent": 0, "user": 0, "system": 0},
+                },
+                "structured_output": document,
+            }
+            raw = json.dumps(wire, ensure_ascii=False).encode("utf-8")
+            semantic, error, metadata = roles._extract_claude_review_document(raw)
+            self.attempts[0]["review_provider_family"] = "anthropic"
+        elif kind == "grok":
+            raw = b"".join(json.dumps(event).encode("utf-8") + b"\n" for event in (
+                {"type": "available_commands", "tools": [], "commands": []},
+                {"type": "text", "data": json.dumps(document)},
+                {"type": "end", "stopReason": "end_turn", "num_turns": 1},
+            ))
+            semantic, error, metadata = roles._extract_grok_stream_review_document(
+                raw, expected_head=self.binding["head_sha"],
+                expected_base_head=self.binding["base_sha"],
+            )
+            self.attempts[0]["review_provider_family"] = "xai"
+        else:
+            raise AssertionError("unsupported fixture")
+        self.assertIsNone(error)
+        self.assertEqual(document, json.loads(semantic))
+        receipt.update({
+            **metadata,
+            "stdout_tail": raw.decode("utf-8"),
+            "stdout_bytes": len(raw),
+            "stdout_sha256": hashlib.sha256(raw).hexdigest(),
+            "review_document_bytes": len(semantic),
+            "review_document_sha256": hashlib.sha256(semantic).hexdigest(),
+            "review_document_object_sha256": decisions.sha256_json(document),
+            "review_document_contract": roles.REVIEW_DOCUMENT_CONTRACT,
+            "review_document_normalizations": [],
+            "review_findings_normalized": False,
+            "review_receipt_generated_by": "grabowski_agent_role",
+        })
+        receipt["receipt_sha256"] = decisions._agent_role_receipt_sha256(receipt)
+        self.attempts[0]["review_role_receipt_sha256"] = receipt["receipt_sha256"]
+        return receipt, raw
+
+    def test_full_claude_structured_semantic_v2_role_is_verified(self):
+        self._wrap_first_v2_provider_output("claude")
+        self.assertEqual(set(self.verify_fixture()), set(execution.REQUIRED_AXES))
+
+    def test_full_grok_stream_semantic_v2_role_is_verified(self):
+        self._wrap_first_v2_provider_output("grok")
+        self.assertEqual(set(self.verify_fixture()), set(execution.REQUIRED_AXES))
+
+    def test_claude_provider_envelope_drift_cannot_rehash_into_pass(self):
+        receipt, _ = self._wrap_first_v2_provider_output("claude")
+        receipt["review_provider_envelope_sha256"] = "e" * 64
+        receipt["receipt_sha256"] = decisions._agent_role_receipt_sha256(receipt)
+        self.attempts[0]["review_role_receipt_sha256"] = receipt["receipt_sha256"]
+        with self.assertRaisesRegex(
+            execution.ReviewExecutionRejected, "provider|document|semantic",
+        ):
+            self.verify_fixture()
+
+    def test_grok_stream_with_unauthorized_tool_cannot_rehash_into_pass(self):
+        receipt, original = self._wrap_first_v2_provider_output("grok")
+        rows = original.splitlines()
+        rows.insert(-1, json.dumps({
+            "type": "tool_call", "name": "disallowed_terminal",
+        }).encode("utf-8"))
+        mutated = b"\n".join(rows) + b"\n"
+        receipt["stdout_tail"] = mutated.decode("utf-8")
+        receipt["stdout_bytes"] = len(mutated)
+        receipt["stdout_sha256"] = hashlib.sha256(mutated).hexdigest()
+        receipt["receipt_sha256"] = decisions._agent_role_receipt_sha256(receipt)
+        self.attempts[0]["review_role_receipt_sha256"] = receipt["receipt_sha256"]
+        with self.assertRaisesRegex(
+            execution.ReviewExecutionRejected, "provider|document|semantic",
+        ):
+            self.verify_fixture()
 
     def _verify_with_optional_review_failure(self, *, kind: str):
         """Reconcile five synthetic V2 PASS fixtures plus one optional attempt."""
