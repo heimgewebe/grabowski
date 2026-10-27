@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 import hashlib
 import heapq
 import json
@@ -628,6 +629,33 @@ def _any_resource_values(record: dict[str, Any]) -> set[str]:
     return _held_resource_values(record) | _requested_resource_values(record)
 
 
+def _record_timestamp_unix(record: dict[str, Any]) -> int | None:
+    """Use canonical Unix time, or bounded aware ISO for older Captain records.
+
+    Historic Captain intent/completion events have a verified ISO timestamp but
+    no timestamp_unix. An explicitly present invalid Unix field must not be
+    silently replaced by a different time source. The audit chain authenticates
+    record bytes; this parser does not independently attest the host clock.
+    """
+    native = record.get("timestamp_unix")
+    if type(native) is int:
+        return native
+    if "timestamp_unix" in record:
+        return None
+    value = record.get("timestamp")
+    if not isinstance(value, str) or not 1 <= len(value) <= 64:
+        return None
+    try:
+        parsed = datetime.fromisoformat(
+            value[:-1] + "+00:00" if value.endswith("Z") else value
+        )
+        if parsed.tzinfo is None:
+            return None
+        return int(parsed.timestamp())
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
 def _record_matches_filters(item: dict[str, Any], filters: dict[str, Any]) -> bool:
     """Match already-validated filters without repeating static input validation."""
     record = item["record"]
@@ -653,12 +681,12 @@ def _record_matches_filters(item: dict[str, Any], filters: dict[str, Any]) -> bo
             if evidence.get("record_sha256") != expected:
                 return False
         elif key == "since_unix":
-            observed = record.get("timestamp_unix")
-            if not isinstance(observed, int) or isinstance(observed, bool) or observed < expected:
+            observed = _record_timestamp_unix(record)
+            if observed is None or observed < expected:
                 return False
         elif key == "until_unix":
-            observed = record.get("timestamp_unix")
-            if not isinstance(observed, int) or isinstance(observed, bool) or observed > expected:
+            observed = _record_timestamp_unix(record)
+            if observed is None or observed > expected:
                 return False
         elif key == "has_failure_signal":
             if _has_failure_signal(record) is not expected:
@@ -1473,8 +1501,8 @@ def analyze_audit(
             held_resources.add(resource)
         for resource in _requested_resource_values(record):
             requested_resources.add(resource)
-        timestamp_unix = record.get("timestamp_unix")
-        if isinstance(timestamp_unix, int) and not isinstance(timestamp_unix, bool):
+        timestamp_unix = _record_timestamp_unix(record)
+        if timestamp_unix is not None:
             minimum_timestamp = (
                 timestamp_unix
                 if minimum_timestamp is None
