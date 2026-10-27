@@ -665,6 +665,16 @@ def _readonly_connection(path: Path) -> sqlite3.Connection | None:
     if path.is_symlink():
         raise PermissionError(f"SQLite database may not be a symlink: {path}")
     if stack is not None:
+        # SQLite mode=ro can mutate an existing SHM read mark. The admission
+        # capability belongs to the observed store, not the checkout caller.
+        if path == tasks.TASK_DB:
+            wal_mutation_admission = lambda: operator._require_operator_mutation(
+                "durable_job"
+            )
+        else:
+            wal_mutation_admission = lambda: operator._require_operator_mutation(
+                "resource_lease"
+            )
         # Pin the existing WAL transaction when both private sidecars exist.
         # Missing/unsafe sidecars fail closed without creating SHM.
         return stack.enter_context(
@@ -673,9 +683,7 @@ def _readonly_connection(path: Path) -> sqlite3.Connection | None:
                 temporary_prefix="unused-checkout-inventory-readonly.",
                 error_type=RuntimeError,
                 message="Strict read-only checkout inventory changed",
-                wal_mutation_admission=lambda: operator._require_operator_mutation(
-                    "resource_lease"
-                ),
+                wal_mutation_admission=wal_mutation_admission,
             )
         )
     resolved = path.resolve(strict=True)
