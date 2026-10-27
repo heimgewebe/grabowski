@@ -161,6 +161,18 @@ class ServerReviewProducerTests(unittest.TestCase):
             source_observer=lambda repo, binding: self.raw,
         )
 
+    def test_review_suite_allowlist_is_readonly_compatible_and_distinct(self):
+        self.assertEqual(
+            [
+                "test_review_evidence_schemas.py",
+                "test_pr_review_gate_external.py",
+                "test_self_review_execution.py",
+                "test_self_review_producer.py",
+                "test_release_admission.py",
+            ],
+            [execute.METHOD_TEST_SUITE[axis] for axis in producer.METHODS],
+        )
+
     def test_five_genuine_origin_bound_tasks_seal_and_verify(self):
         result = self.seal()
         self.assertEqual("sealed_and_verified", result["status"])

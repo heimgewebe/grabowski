@@ -172,9 +172,9 @@ def _check_signature(material: bytes, signature: bytes, signers: Path) -> None:
 # a caller's prose description or a freely selected task id.
 METHOD_TEST_SUITE = {
     "contracts_correctness": "test_review_evidence_schemas.py",
-    "regression_compatibility": "test_grips.py",
+    "regression_compatibility": "test_pr_review_gate_external.py",
     "tests_negative_cases": "test_self_review_execution.py",
-    "security_authority_concurrency": "test_captain_merge_guard.py",
+    "security_authority_concurrency": "test_self_review_producer.py",
     "adversarial_countercheck": "test_release_admission.py",
     "additional_adversarial_probe": "test_release_admission.py",
 }
