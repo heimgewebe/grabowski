@@ -10862,6 +10862,136 @@ class CompleteBootstrapIndexCensusTests(unittest.TestCase):
         self.assertLess(len(seen), 300)
         write.assert_not_called()
 
+class TerminalReceiptBootstrapIndexTests(unittest.TestCase):
+    """Persistent launch_submitted metadata is not a terminal job verdict."""
+
+    def setUp(self):
+        patcher = mock.patch.object(
+            SELF_DEPLOY, "_iter_bootstrap_job_entries",
+            side_effect=lambda root: iter(root.iterdir()),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def _runtime(runner):
+        return ["/usr/bin/python3", f"/home/alex/repos/grabowski/{runner}"]
+
+    @staticmethod
+    def _finished():
+        return {
+            "final_status": "succeeded",
+            "finalization_receipt": {"valid": True, "final_status": "succeeded"},
+        }
+
+    def test_513_signed_terminal_deploys_do_not_exhaust_live_index(self):
+        terminal = [f"grabowski-job-{n:012x}" for n in range(513)]
+        resume = "grabowski-job-fffffffffff0"
+        names = [*terminal, resume]
+        rows = {
+            unit: {
+                "argv": self._runtime(SELF_DEPLOY.RUNNER_RELATIVE_PATH),
+                "final_status": "launch_submitted",
+            }
+            for unit in terminal
+        }
+        rows[resume] = {
+            "argv": self._runtime(SELF_DEPLOY.MIDCUTOVER_RESUME_RUNNER_RELATIVE_PATH),
+            "final_status": "launch_submitted",
+        }
+        statuses = {unit: self._finished() for unit in terminal}
+        statuses[resume] = {"final_status": "running", "finalization_receipt": {"valid": False}}
+        root = mock.Mock()
+        root.iterdir.side_effect = lambda: iter([Path("/jobs") / name for name in names])
+        with (
+            mock.patch.object(SELF_DEPLOY.operator, "_read_job_metadata", side_effect=lambda unit: rows[unit]),
+            mock.patch.object(SELF_DEPLOY.operator, "grabowski_job_status", side_effect=lambda unit: statuses[unit]) as read_status,
+            mock.patch.object(SELF_DEPLOY, "_deploy_finalization_retry_block", return_value=False),
+            mock.patch.object(Path, "is_symlink", return_value=False),
+            mock.patch.object(Path, "is_dir", return_value=True),
+        ):
+            result = SELF_DEPLOY._bootstrap_deploy_index(root, read_only=True)
+        self.assertEqual(result["units"], [resume])
+        self.assertEqual(read_status.call_count, 514)
+
+    def test_unverified_terminal_status_is_still_blocking(self):
+        unit = "grabowski-job-cccccccccccc"
+        root = mock.Mock()
+        root.iterdir.side_effect = lambda: iter([Path("/jobs") / unit])
+        with (
+            mock.patch.object(SELF_DEPLOY.operator, "_read_job_metadata",
+                              return_value={"argv": self._runtime(SELF_DEPLOY.RUNNER_RELATIVE_PATH),
+                                            "final_status": "launch_submitted"}),
+            mock.patch.object(SELF_DEPLOY.operator, "grabowski_job_status",
+                              return_value={"final_status": "succeeded",
+                                            "finalization_receipt": {"valid": False}}),
+            mock.patch.object(SELF_DEPLOY, "_deploy_finalization_retry_block", return_value=False),
+            mock.patch.object(Path, "is_symlink", return_value=False),
+            mock.patch.object(Path, "is_dir", return_value=True),
+        ):
+            result = SELF_DEPLOY._bootstrap_deploy_index(root, read_only=True)
+        self.assertEqual(result["units"], [unit])
+
+    def test_unreadable_status_refuses_partial_index_write(self):
+        unit = "grabowski-job-cccccccccccc"
+        root = mock.Mock()
+        root.iterdir.side_effect = lambda: iter([Path("/jobs") / unit])
+        with (
+            mock.patch.object(SELF_DEPLOY.operator, "_read_job_metadata",
+                              return_value={"argv": self._runtime(SELF_DEPLOY.RUNNER_RELATIVE_PATH),
+                                            "final_status": "launch_submitted"}),
+            mock.patch.object(SELF_DEPLOY.operator, "grabowski_job_status",
+                              side_effect=OSError("systemd and receipt unreadable")),
+            mock.patch.object(SELF_DEPLOY, "_deploy_finalization_retry_block", return_value=False),
+            mock.patch.object(SELF_DEPLOY, "_write_deploy_index") as write,
+            mock.patch.object(Path, "is_symlink", return_value=False),
+            mock.patch.object(Path, "is_dir", return_value=True),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "status is unreadable"):
+                SELF_DEPLOY._bootstrap_deploy_index(root)
+        write.assert_not_called()
+
+    def test_slow_status_read_refuses_partial_index_write(self):
+        unit = "grabowski-job-cccccccccccc"
+        root = mock.Mock()
+        root.iterdir.side_effect = lambda: iter([Path("/jobs") / unit])
+        clock = [0.0]
+        def slow_status(_unit):
+            clock[0] += 76.0
+            return self._finished()
+        with (
+            mock.patch.object(SELF_DEPLOY.time, "monotonic", side_effect=lambda: clock[0]),
+            mock.patch.object(SELF_DEPLOY.operator, "_read_job_metadata",
+                              return_value={"argv": self._runtime(SELF_DEPLOY.RUNNER_RELATIVE_PATH),
+                                            "final_status": "launch_submitted"}),
+            mock.patch.object(SELF_DEPLOY.operator, "grabowski_job_status", side_effect=slow_status),
+            mock.patch.object(SELF_DEPLOY, "_deploy_finalization_retry_block", return_value=False),
+            mock.patch.object(SELF_DEPLOY, "_write_deploy_index") as write,
+            mock.patch.object(Path, "is_symlink", return_value=False),
+            mock.patch.object(Path, "is_dir", return_value=True),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "census timed out"):
+                SELF_DEPLOY._bootstrap_deploy_index(root)
+        write.assert_not_called()
+
+    def test_unknown_outcome_overrides_signed_terminal_status(self):
+        unit = "grabowski-job-cccccccccccc"
+        root = mock.Mock()
+        root.iterdir.side_effect = lambda: iter([Path("/jobs") / unit])
+        with (
+            mock.patch.object(SELF_DEPLOY.operator, "_read_job_metadata",
+                              return_value={"argv": self._runtime(SELF_DEPLOY.RUNNER_RELATIVE_PATH),
+                                            "final_status": "launch_submitted"}),
+            mock.patch.object(SELF_DEPLOY.operator, "grabowski_job_status",
+                              return_value=self._finished()),
+            mock.patch.object(SELF_DEPLOY, "_deploy_finalization_retry_block", return_value=True),
+            mock.patch.object(Path, "is_symlink", return_value=False),
+            mock.patch.object(Path, "is_dir", return_value=True),
+        ):
+            result = SELF_DEPLOY._bootstrap_deploy_index(root, read_only=True)
+        self.assertEqual(result["units"], [unit])
+
+
 class LegacyRedactedDeployIndexTests(unittest.TestCase):
     """Historical redacted deploy argv may be recovered only from exact bindings."""
 

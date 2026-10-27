@@ -1624,9 +1624,43 @@ def _bootstrap_deploy_index(
                 if references_deploy_runner
                 else False
             )
+            final_status = metadata.get("final_status")
+            if (
+                references_runtime_job
+                and not unresolved_finalization
+                and final_status in {
+                    "launch_prepared", "launch_submitted", "launch_outcome_unknown"
+                }
+            ):
+                # Job metadata preserves its launch-time state. The worker
+                # writes a separate validated finalization receipt, so a
+                # completed historical deploy otherwise remains in the live
+                # index forever and eventually trips the 512-entry bound.
+                # Only a validated, status-matching terminal receipt may
+                # remove this conservative launch-time blocker.
+                try:
+                    status = operator.grabowski_job_status(entry.name)
+                except (OSError, ValueError, RuntimeError, PermissionError) as exc:
+                    raise RuntimeError(
+                        f"durable runtime job status is unreadable: {entry.name}"
+                    ) from exc
+                if not isinstance(status, dict):
+                    raise RuntimeError(
+                        f"durable runtime job status is unreadable: {entry.name}"
+                    )
+                receipt = status.get("finalization_receipt")
+                observed_status = status.get("final_status")
+                if (
+                    observed_status in TERMINAL_JOB_STATUSES
+                    and isinstance(receipt, dict)
+                    and receipt.get("valid") is True
+                    and receipt.get("final_status") == observed_status
+                ):
+                    final_status = observed_status
+                if time.monotonic() - scan_started > DEPLOY_BOOTSTRAP_TIMEOUT_SECONDS:
+                    raise RuntimeError("runtime deploy bootstrap census timed out")
             if references_runtime_job and (
-                unresolved_finalization
-                or metadata.get("final_status") not in TERMINAL_JOB_STATUSES
+                unresolved_finalization or final_status not in TERMINAL_JOB_STATUSES
             ):
                 units.append(entry.name)
     # A separate job can materialize while the census is in progress. Before
