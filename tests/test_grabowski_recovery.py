@@ -405,6 +405,62 @@ class NativeNixOSResticProofTests(unittest.TestCase):
             proof.assert_not_called()
             sleep.assert_not_called()
 
+    def test_pending_restart_does_not_inherit_previous_failed_result(self) -> None:
+        # A --no-block start acknowledges a queued new job while systemd
+        # can still expose the preceding oneshot's failed state/result.
+        proof = self._root_proof()
+        history = iter([
+            {"returncode": 0, "stdout": (
+                "LoadState=loaded\nJob=restart-job\nActiveState=failed\n"
+                "Result=exit-code\nExecMainStatus=1\n"
+            )},
+            {"returncode": 0, "stdout": (
+                "LoadState=loaded\nJob=\nActiveState=activating\n"
+                "Result=success\nExecMainStatus=0\n"
+            )},
+            {"returncode": 0, "stdout": (
+                "LoadState=loaded\nJob=\nActiveState=inactive\n"
+                "Result=success\nExecMainStatus=0\n"
+            )},
+        ])
+        with patch.object(
+            recovery.operator, "_run", side_effect=lambda *args, **kwargs: next(history)
+        ) as run, patch.object(
+            recovery, "_nixos_root_proof_read", return_value=proof
+        ) as read, patch.object(recovery.time, "sleep") as pause:
+            result = recovery._await_nixos_root_proof(
+                started_at_unix=self.now - 4, expected_backup_uuid=self.target["backup_uuid"]
+            )
+        self.assertEqual(result, proof)
+        self.assertEqual(run.call_count, 3)
+        self.assertEqual(pause.call_count, 2)
+        read.assert_called_once()
+
+    def test_queued_job_preserves_previous_failure_until_new_job_resolves(self) -> None:
+        outputs = iter([
+            {"returncode": 0, "stdout": (
+                "LoadState=loaded\nJob=start-job\nActiveState=inactive\n"
+                "Result=exit-code\nExecMainStatus=1\n"
+            )},
+            {"returncode": 0, "stdout": (
+                "LoadState=loaded\nJob=\nActiveState=failed\n"
+                "Result=exit-code\nExecMainStatus=1\n"
+            )},
+        ])
+        with patch.object(
+            recovery.operator, "_run", side_effect=lambda *args, **kwargs: next(outputs)
+        ) as run, patch.object(recovery.time, "sleep") as pause, patch.object(
+            recovery, "_nixos_root_proof_read"
+        ) as proof:
+            with self.assertRaisesRegex(RuntimeError, "failed"):
+                recovery._await_nixos_root_proof(
+                    started_at_unix=self.now,
+                    expected_backup_uuid=self.target["backup_uuid"],
+                )
+        self.assertEqual(run.call_count, 2)
+        pause.assert_called_once()
+        proof.assert_not_called()
+
     def test_broker_wait_refuses_failed_systemd_result_and_unverified_root_proof(self) -> None:
         with patch.object(recovery.operator, "_run", return_value={
             "returncode": 0,

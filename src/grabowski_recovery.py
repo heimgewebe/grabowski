@@ -1672,7 +1672,12 @@ def _await_nixos_root_proof(
         result = values.get("Result")
         exit_status = values.get("ExecMainStatus")
         pending_job = values["Job"] not in {"", "0"}
-        if active == "failed" or (active == "inactive" and result not in {"success", None, ""}):
+        # A queued start may still expose the *previous* failed result.
+        # Only treat the failure as final after systemd has no pending job.
+        if not pending_job and (
+            active == "failed"
+            or (active == "inactive" and result not in {"success", None, ""})
+        ):
             raise RuntimeError("NixOS root Restic service failed before recovery proof")
         if active == "inactive" and not pending_job and result == "success" and exit_status != "0":
             raise RuntimeError("NixOS root Restic service did not exit successfully")
