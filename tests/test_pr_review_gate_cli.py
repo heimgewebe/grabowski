@@ -792,7 +792,10 @@ class PrReviewGateCliTests(unittest.TestCase):
             "uncertainty": 0.1,
             "claude_review": {"required": False, "reason": "claimed small"},
         }
-        result = pr_review_gate.evaluate_review_gate(state, self_review=review)
+        # Isolate tier classification from server-signed execution provenance.
+        # Unmocked production review evidence must still fail closed.
+        with mock.patch.object(pr_review_gate, "review_receipt_errors", return_value=[]):
+            result = pr_review_gate.evaluate_review_gate(state, self_review=review)
         self.assertEqual(result["verdict"], "PASS")
         self.assertTrue(result["complexity"]["high_critical"])
         self.assertEqual(result["complexity"]["minimum_self_review_iterations"], 5)

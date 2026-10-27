@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 HEAD = "a" * 40
@@ -56,11 +57,18 @@ gate = _load_gate()
 
 
 def _evaluate_review_gate(state, **kwargs):
+    """Isolate plain-LLM packet tests from server-owned self-review execution.
+
+    Only this fixture bypasses the *separate* self-review provenance validator:
+    test_pr_review_gate_external verifies that fabricated self-review executions
+    really BLOCK without a server receipt. No production gate is patched.
+    """
     kwargs.setdefault(
         "external_review_artifact_root",
         PLAIN_ARTIFACT_ROOT,
     )
-    return gate.evaluate_review_gate(state, **kwargs)
+    with mock.patch.object(gate, "review_receipt_errors", return_value=[]):
+        return gate.evaluate_review_gate(state, **kwargs)
 
 
 def _state() -> dict[str, object]:
@@ -386,6 +394,17 @@ def _warnings(result: dict[str, object]) -> str:
 
 
 class PlainLlmReviewGateTests(unittest.TestCase):
+    def test_production_gate_rejects_unsigned_five_pass_fixtures(self) -> None:
+        # This assertion uses the unmodified gate, proving fixture mocks do
+        # not turn fabricated high-critical self-reviews into real PASSes.
+        state = _state()
+        result = gate.evaluate_review_gate(state, self_review=_self_review())
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(
+            any("high_critical_server_review_provenance_invalid" in f for f in result["failures"]),
+            result["failures"],
+        )
+
     def test_external_pass_cannot_substitute_missing_fifth_self_review_axis(self) -> None:
         state = _state()
         review = _self_review()

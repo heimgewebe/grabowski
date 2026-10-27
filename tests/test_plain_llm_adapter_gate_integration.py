@@ -191,12 +191,16 @@ class PlainLlmAdapterGateIntegrationTests(unittest.TestCase):
                     max_prompt_bytes=100_000,
                 )
 
-            result = gate.evaluate_review_gate(
-                state,
-                self_review=_self_review(state["pr_diff_sha256"]),
-                external_review_evidence=evidence,
-                external_review_artifact_root=root,
-            )
+            # This integration tests provider packet reconstruction. The
+            # server-owned five-pass signer is exercised independently in the
+            # self-review provenance suites, never forged in this fixture.
+            with mock.patch.object(gate, "review_receipt_errors", return_value=[]):
+                result = gate.evaluate_review_gate(
+                    state,
+                    self_review=_self_review(state["pr_diff_sha256"]),
+                    external_review_evidence=evidence,
+                    external_review_artifact_root=root,
+                )
             self.assertEqual(result["verdict"], "PASS")
             warnings = "\n".join(result["warnings"])
             self.assertNotIn(

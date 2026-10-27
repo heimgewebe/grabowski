@@ -797,7 +797,6 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
             "target_head": expected,
             "target_object_present": False,
         }
-
         def acquire(_plan: dict, _head: str) -> dict:
             events.append("acquire")
             return {"leases": leases}
@@ -2335,7 +2334,8 @@ class CaptainPositiveActionOriginTests(unittest.TestCase):
                     "checks": [{"name": "validate (3.10)", "id": 101},
                                {"name": "validate (3.12)", "id": 102}],
                     "workflow": {"id": 301891383, "path": ".github/workflows/validate.yml",
-                                 "head_sha": expected_head},
+                                 "head_sha": expected_head,
+                                 "ci_policy_transition_required": False},
                     "checks_sha256": "5" * 64,
                 },
             ) as real_ci_read,
