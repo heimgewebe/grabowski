@@ -2066,6 +2066,9 @@ def main() -> int:
     binding: dict[str, Any] | None = None
     blue_green_result: dict[str, Any] | None = None
     live: dict[str, Any] | None = None
+    # Signed no-runtime-effect failure only until the first potentially
+    # effectful resume/cutover call has been entered.
+    runtime_effect_started = False
     retained_validation: tempfile.TemporaryDirectory[str] | None = None
     sealed_yaml_fd: int | None = None
     try:
@@ -2118,6 +2121,7 @@ def main() -> int:
             if key != "classification"
         })
         if recovery_decision["resume_required"]:
+            runtime_effect_started = True
             return run_resume_only(
                 {
                     **recovery_decision,
@@ -2131,6 +2135,7 @@ def main() -> int:
                 "recovery classification is fail-closed; no deployment may start: "
                 + ",".join(recovery_decision.get("reasons") or ["unclassified"])
             )
+        runtime_effect_started = True
         blue_green_result = run_productive_blue_green(
             repo=repo,
             expected_head=args.expected_head,
@@ -2227,7 +2232,13 @@ def main() -> int:
                         if unresolved_without_primary_receipt and isinstance(live, dict)
                         else None
                     ),
-                    failure_type=type(exc).__name__,
+                    # Typed only by this runner before either effect boundary:
+                    # a plain failed finalization is never no-effect proof.
+                    failure_type=(
+                        f"PreRuntimeEffect:{type(exc).__name__}"
+                        if not runtime_effect_started
+                        else type(exc).__name__
+                    ),
                     blue_green=(
                         blue_green_result.get("summary")
                         if isinstance(blue_green_result, dict)

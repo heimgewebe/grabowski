@@ -10267,7 +10267,7 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
             final_status="failed",
             repo_head=None,
             release_id=None,
-            failure_type="RuntimeError",
+            failure_type="PreRuntimeEffect:RuntimeError",
             blue_green=None,
         )
 
@@ -11315,6 +11315,164 @@ class P1ActualRuntimeReceiptLineageTests(unittest.TestCase):
                         entry, metadata, argv, status
                     )
                 )
+
+
+    def test_authenticated_pre_effect_failure_retires_without_releasing_unknown(self):
+        argv = self._deploy()
+        with tempfile.TemporaryDirectory() as temporary:
+            entry = Path(temporary) / self.UNIT
+            entry.mkdir(mode=0o700)
+            metadata = self._meta(argv)
+            paths = {
+                "metadata": str(entry / "metadata.json"),
+                "stdout": str(entry / "stdout.log"),
+                "stderr": str(entry / "stderr.log"),
+                "finalization": str(entry / "finalization.json"),
+            }
+            metadata["finalization_contract"]["receipt_paths"] = paths
+            material = {
+                "schema_version": 1,
+                "kind": "grabowski_runtime_deploy_finalization",
+                "unit": self.UNIT,
+                "job_id": metadata["job_id"],
+                "argv_sha256": metadata["argv_sha256"],
+                "expected_head": "a" * 40,
+                "receipt_paths": paths,
+                "final_status": "failed",
+                "completion_status": "failed",
+                "repo_head": None,
+                "release_id": None,
+                "failure_type": "PreRuntimeEffect:RuntimeError",
+                "blue_green": None,
+            }
+            payload = {**material, "payload_sha256": SELF_DEPLOY._sha256_json(material)}
+            raw = json.dumps(payload, sort_keys=True).encode()
+            status = {
+                "final_status": "failed",
+                "finalization_receipt": {
+                    "valid": True, "state": "valid",
+                    "final_status": "failed",
+                    "expected_head": "a" * 40,
+                    "receipt_sha256": hashlib.sha256(raw).hexdigest(),
+                    "payload_sha256": payload["payload_sha256"],
+                    "blind_retry_allowed": None,
+                },
+            }
+            with mock.patch.object(
+                SELF_DEPLOY.operator, "_read_finalization_receipt_file",
+                return_value={"ok": True, "raw": raw, "bytes": len(raw)},
+                create=True,
+            ):
+                self.assertTrue(SELF_DEPLOY._verified_runtime_terminal_receipt(
+                    entry, metadata, argv, status
+                ))
+                self.assertFalse(SELF_DEPLOY._verified_runtime_terminal_receipt(
+                    entry, metadata, argv, {
+                        **status, "final_status": "outcome_unknown"
+                    }
+                ))
+                self.assertFalse(SELF_DEPLOY._verified_runtime_terminal_receipt(
+                    entry, metadata, argv, {
+                        **status,
+                        "finalization_receipt": {
+                            **status["finalization_receipt"],
+                            "receipt_sha256": "0" * 64,
+                        },
+                    }
+                ))
+                # Failed *after* starting a cutover is not no-effect evidence.
+                unsafe = {
+                    **material,
+                    "failure_type": "BlueGreenDeploymentIncomplete",
+                }
+                unsafe_payload = {
+                    **unsafe, "payload_sha256": SELF_DEPLOY._sha256_json(unsafe)
+                }
+                unsafe_raw = json.dumps(unsafe_payload, sort_keys=True).encode()
+                unsafe_status = {
+                    **status,
+                    "finalization_receipt": {
+                        **status["finalization_receipt"],
+                        "receipt_sha256": hashlib.sha256(unsafe_raw).hexdigest(),
+                        "payload_sha256": unsafe_payload["payload_sha256"],
+                    },
+                }
+                with mock.patch.object(
+                    SELF_DEPLOY.operator, "_read_finalization_receipt_file",
+                    return_value={"ok": True, "raw": unsafe_raw, "bytes": len(unsafe_raw)},
+                    create=True,
+                ):
+                    self.assertFalse(SELF_DEPLOY._verified_runtime_terminal_receipt(
+                        entry, metadata, argv, unsafe_status
+                    ))
+
+
+    def test_recovered_prerequisite_requires_authentic_completed_lineage(self):
+        # The deploy runner may finish successfully after recovering an older
+        # cutover, but this job has not deployed the requested new head.
+        # Only the exact signed failure type AND completed cutover evidence
+        # may retire this no-deploy prerequisite job.
+        import test_midcutover_resume as fixture
+
+        cutover = fixture.cutover_receipt()
+        resumed = fixture.resume_receipt()
+        self.assertTrue(SELF_DEPLOY.midcutover._lineage_resolved([resumed], cutover))
+        argv = self._deploy()
+        metadata = self._meta(argv)
+        status = {
+            "final_status": "succeeded",
+            "finalization_receipt": {
+                "valid": True,
+                "state": "valid",
+                "final_status": "failed",
+                "expected_head": "a" * 40,
+                "receipt_sha256": "1" * 64,
+                "payload_sha256": "2" * 64,
+                "blind_retry_allowed": None,
+            },
+        }
+        entry = Path("/jobs") / self.UNIT
+        with mock.patch.object(
+            SELF_DEPLOY, "_authenticated_failed_runtime_reason",
+            return_value="MidCutoverPrerequisiteRecovered",
+        ), mock.patch.object(
+            SELF_DEPLOY.midcutover, "load_receipts",
+            return_value={
+                "receipts": [cutover, resumed],
+                "present": True,
+                "unreadable": [],
+            },
+        ):
+            self.assertTrue(SELF_DEPLOY._verified_runtime_terminal_receipt(
+                entry, metadata, argv, status
+            ))
+        for evidence in (
+            {"receipts": [cutover], "present": True, "unreadable": []},
+            {
+                "receipts": [cutover, resumed],
+                "present": True,
+                "unreadable": [{"path": "/private/invalid", "error": "unreadable"}],
+            },
+            {"receipts": [], "present": False, "unreadable": []},
+        ):
+            with self.subTest(evidence=evidence["unreadable"] or len(evidence["receipts"])):
+                with mock.patch.object(
+                    SELF_DEPLOY, "_authenticated_failed_runtime_reason",
+                    return_value="MidCutoverPrerequisiteRecovered",
+                ), mock.patch.object(
+                    SELF_DEPLOY.midcutover, "load_receipts",
+                    return_value=evidence,
+                ):
+                    self.assertFalse(SELF_DEPLOY._verified_runtime_terminal_receipt(
+                        entry, metadata, argv, status
+                    ))
+        with mock.patch.object(
+            SELF_DEPLOY, "_authenticated_failed_runtime_reason",
+            return_value="MidCutoverResumeOutcomeUnknown",
+        ):
+            self.assertFalse(SELF_DEPLOY._verified_runtime_terminal_receipt(
+                entry, metadata, argv, status
+            ))
 
 
 class LegacyRedactedDeployIndexTests(unittest.TestCase):

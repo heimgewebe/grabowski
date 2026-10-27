@@ -1543,6 +1543,91 @@ def _iter_bootstrap_job_entries(jobs_root: Path):
             yield Path(item.path)
 
 
+def _authenticated_failed_runtime_reason(
+    entry: Path,
+    metadata: dict[str, Any],
+    receipt: dict[str, Any],
+) -> str | None:
+    """Read a canonical operator-validated failed receipt without inventing proof.
+
+    grabowski_job_status validates the private payload but omits failure_type.
+    Re-read it through the operator's bounded O_NOFOLLOW reader and require
+    both exact hashes from the authoritative validated status projection.
+    """
+    reader = getattr(operator, "_read_finalization_receipt_file", None)
+    if not callable(reader):
+        return None
+    try:
+        file_result = reader(entry / "finalization.json")
+    except (OSError, RuntimeError, ValueError, PermissionError):
+        return None
+    if not isinstance(file_result, dict) or file_result.get("ok") is not True:
+        return None
+    raw = file_result.get("raw")
+    if not isinstance(raw, bytes) or len(raw) > 64 * 1024:
+        return None
+    if hashlib.sha256(raw).hexdigest() != receipt.get("receipt_sha256"):
+        return None
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    digest = payload.get("payload_sha256")
+    material = {key: value for key, value in payload.items() if key != "payload_sha256"}
+    contract = metadata.get("finalization_contract")
+    if (
+        not isinstance(contract, dict)
+        or payload.get("kind") != "grabowski_runtime_deploy_finalization"
+        or payload.get("unit") != entry.name
+        or payload.get("job_id") != metadata.get("job_id")
+        or payload.get("argv_sha256") != metadata.get("argv_sha256")
+        or payload.get("expected_head") != contract.get("expected_head")
+        or payload.get("receipt_paths") != contract.get("receipt_paths")
+        or payload.get("final_status") != "failed"
+        or payload.get("completion_status") != "failed"
+        or payload.get("repo_head") is not None
+        or payload.get("release_id") is not None
+        or payload.get("blue_green") is not None
+        or payload.get("blind_retry_allowed") is False
+        or digest != receipt.get("payload_sha256")
+        or _sha256_json(material) != digest
+    ):
+        return None
+    reason = payload.get("failure_type")
+    return reason if isinstance(reason, str) and 0 < len(reason) <= 200 else None
+
+
+def _authentic_completed_cutover_remains_settled() -> bool:
+    """Recovery-terminal retry requires completed private cutover lineage.
+
+    Any unknown or unreadable sibling cutover prevents treating a resume-only
+    failed deploy as safely settled. A generic process outcome never suffices.
+    """
+    try:
+        loaded = midcutover.load_receipts()
+        if loaded.get("unreadable") or not loaded.get("present"):
+            return False
+        receipts = loaded.get("receipts")
+        if not isinstance(receipts, list) or midcutover.unresolved_post_switch_receipts(receipts):
+            return False
+        for original in receipts:
+            if not isinstance(original, dict) or original.get("kind") != BLUE_GREEN_RECEIPT_KIND:
+                continue
+            for resume in receipts:
+                if (
+                    isinstance(resume, dict)
+                    and resume.get("kind") == midcutover.RESUME_RECEIPT_KIND
+                    and resume.get("outcome") == "completed"
+                    and midcutover._lineage_resolved([resume], original)
+                ):
+                    return True
+    except (OSError, RuntimeError, ValueError, midcutover.MidCutoverEvidenceError):
+        return False
+    return False
+
+
 def _verified_runtime_terminal_receipt(
     entry: Path,
     metadata: dict[str, Any],
@@ -1599,16 +1684,34 @@ def _verified_runtime_terminal_receipt(
             or receipt.get("expected_head") != fields["expected_head"]
             or _SHA256_RE.fullmatch(str(receipt.get("receipt_sha256"))) is None
             or _SHA256_RE.fullmatch(str(receipt.get("payload_sha256"))) is None
-            or receipt.get("final_status") != "completed"
-            or status.get("final_status") not in {"completed", "succeeded"}
+            or receipt.get("final_status") not in {"completed", "failed"}
             or receipt.get("blind_retry_allowed") is False
         ):
             return False
         # A persisted terminal metadata claim that disagrees with completion
         # is not superseded by a process exit or an arbitrary status read.
-        if metadata.get("final_status") in TERMINAL_JOB_STATUSES and metadata["final_status"] not in {"completed", "succeeded"}:
+        if metadata.get("final_status") in TERMINAL_JOB_STATUSES and (
+            (receipt["final_status"] == "completed" and metadata["final_status"] not in {"completed", "succeeded"})
+            or (receipt["final_status"] == "failed" and metadata["final_status"] not in {"failed", "launch_failed"})
+        ):
             return False
-        return True
+        if receipt["final_status"] == "completed":
+            return status.get("final_status") in {"completed", "succeeded"}
+        # A bound failed receipt is not proof of no effect; typed runner
+        # failure before either effect boundary is a separate contract.
+        if status.get("final_status") not in {"failed", "succeeded"}:
+            return False
+        reason = _authenticated_failed_runtime_reason(entry, metadata, receipt)
+        if (
+            isinstance(reason, str)
+            and re.fullmatch(r"PreRuntimeEffect:[A-Za-z_][A-Za-z_0-9]{0,150}", reason)
+            and status.get("final_status") == "failed"
+        ):
+            return True
+        return bool(
+            reason == "MidCutoverPrerequisiteRecovered"
+            and _authentic_completed_cutover_remains_settled()
+        )
 
     # A successful resume *process* may have produced outcome_unknown, a
     # denial or an unpersisted receipt. Only the authentic completed lineage
