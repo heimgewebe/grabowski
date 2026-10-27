@@ -490,6 +490,31 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
             diagnostics["split_retry_policy"]["pre_runtime_http_404_rule"],
         )
 
+    def test_connector_transport_history_counts_explicit_sse_429_once(self) -> None:
+        module = self._load_module()
+        events = [
+            {
+                "event_id": "sse-429",
+                "kind": "connector_transport",
+                "surface": "connector",
+                "operation": "gegner gegenprobe",
+                "symptom": "UNAVAILABLE: MCP SSE probe returned 429 from openai.org; observed at 429 ms",
+                "resolved": False,
+            },
+            {
+                "event_id": "latency-only",
+                "kind": "connector_transport",
+                "surface": "connector",
+                "operation": "gegner gegenprobe",
+                "symptom": "MCP SSE probe finished after 429 ms",
+                "resolved": False,
+            },
+        ]
+
+        diagnostics = module.connector_transport_diagnostics(events)
+        self.assertEqual(diagnostics["event_count"], 2)
+        self.assertEqual(diagnostics["historical_http_status_counts"], {"429": 1})
+
     def test_explicit_http_status_parser_is_symmetric_deduplicated_and_bounded(self) -> None:
         module = self._load_module()
         cases = {
@@ -504,6 +529,16 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
             "httpStatus: 404": [404],
             "statusCode=503": [503],
             "HTTP 404; response_status=404": [404],
+            "MCP SSE probe returned 429 from openai.org": [429],
+            "mcp sse probe returned 503 from openai.org": [503],
+            "MCP SSE probe returned 404": [404],
+            "MCP SSE probe returned 200": [],
+            "MCP SSE probe returned 4290 from openai.org": [],
+            "MCP SSE probe returned 429ms from openai.org": [],
+            "MCP SSE probe returned 429.5ms": [],
+            "MCP SSE probe returned after 429 ms": [],
+            "MCP SSE probe failed at 12:429:00": [],
+            "SSE probe returned 429 from openai.org": [],
             "request completed after 404 ms": [],
             "error 404 in comment": [],
             "version 4040": [],
