@@ -203,6 +203,29 @@ class ServerReviewProducerTests(unittest.TestCase):
             source_observer=lambda repo, binding: self.raw,
         )
 
+    def test_official_five_axis_plan_above_32k_roundtrips_privately(self):
+        raw = execute._canonical(self.plan)
+        self.assertGreater(len(raw), 32768)
+        self.assertLessEqual(len(raw), producer.MAX_PLAN_BYTES)
+        with mock.patch.object(producer, "RECEIPTS", self.receipts):
+            stored = producer._store_plan(self.plan)
+            self.assertEqual(stored.read_bytes(), raw)
+            self.assertEqual(
+                producer._load_plan(self.binding["review_batch_id"]), self.plan,
+            )
+
+    def test_official_review_plan_over_budget_fails_before_create(self):
+        inflated = {
+            **self.plan,
+            "test_only_oversize": "X" * producer.MAX_PLAN_BYTES,
+        }
+        with mock.patch.object(producer, "RECEIPTS", self.receipts):
+            with self.assertRaisesRegex(
+                execute.ReviewExecutionRejected, "exceeds bounded private record",
+            ):
+                producer._store_plan(inflated)
+            self.assertFalse((self.receipts / "plans").exists())
+
     def test_plan_cli_does_not_log_private_task_arguments(self):
         marker = "SYNTHETIC_SECRET_CANARY_NEVER_LOG"
         self.plan["tasks"]["contracts_correctness"].append(marker)

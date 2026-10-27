@@ -25,6 +25,7 @@ from typing import Any, Callable
 
 import grabowski_self_review_execution as provenance
 
+MAX_PLAN_BYTES = 128 * 1024  # Five pinned outer Python worker argv records exceed 32 KiB.
 TASK_DB = Path.home() / ".local/state/grabowski/tasks.sqlite3"
 CAPTURE_ROOT = provenance.CAPTURE_ROOT
 OUTCOMES = provenance.OUTCOME_ROOT
@@ -610,10 +611,13 @@ def _require_live_pr(binding: dict[str, Any]) -> None:
 
 def _store_plan(plan: dict[str, Any]) -> Path:
     identifier = plan["binding"]["review_batch_id"]
+    raw = provenance._canonical(plan)
+    if len(raw) > MAX_PLAN_BYTES:
+        raise provenance.ReviewExecutionRejected("review plan exceeds bounded private record budget")
     root = RECEIPTS / "plans"
     fd = _ensure_private_root(root)
     try:
-        _create_only(fd, identifier + ".json", provenance._canonical(plan))
+        _create_only(fd, identifier + ".json", raw)
         os.fsync(fd)
     finally:
         os.close(fd)
@@ -625,7 +629,7 @@ def _load_plan(identifier: str) -> dict[str, Any]:
         raise provenance.ReviewExecutionRejected("review batch id invalid")
     fd = provenance._private_dir(RECEIPTS / "plans")
     try:
-        raw = provenance._private_read(fd, identifier + ".json", limit=32768)
+        raw = provenance._private_read(fd, identifier + ".json", limit=MAX_PLAN_BYTES)
     finally:
         os.close(fd)
     try:
