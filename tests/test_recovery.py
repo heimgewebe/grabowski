@@ -751,6 +751,24 @@ class RecoveryToolTests(unittest.TestCase):
         self.assertFalse(boundary["high_impact_actions_remain_blocked_until_fresh_server_evidence"])
 
 
+    def test_nixos_missing_native_timer_rejects_even_fresh_legacy_marker(self) -> None:
+        target = "wg-prod-1:rest-server/grabowski-recovery-probe"
+        with patch.object(recovery, "_NIXOS_OS_PRESENT", True), patch.object(
+            recovery, "_NIXOS_RESTIC_TIMER_PRESENT", False
+        ):
+            # All unrelated gates and the old text marker are deliberately green.
+            state = _run_ready_recovery_status(
+                _fresh_server_marker(target),
+                host="wg-prod-1",
+                target=target,
+            )
+        self.assertFalse(state["checks"]["local_backup_fresh"])
+        self.assertFalse(state["ready_for_user_power_worker"])
+        self.assertFalse(state["ready_for_privileged_actions"])
+        self.assertEqual(state["local_backup"]["source"], "nixos-system-restic-backup-completion")
+        self.assertFalse(state["local_backup"]["exists"])
+        self.assertIn("missing", state["local_backup"]["error"])
+
     def test_server_source_marker_reports_hash_of_exact_raw_record(self) -> None:
         target = "wg-prod-1:rest-server/grabowski-recovery-probe"
         with tempfile.TemporaryDirectory() as raw:

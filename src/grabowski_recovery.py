@@ -55,12 +55,13 @@ _NIXOS_RESTIC_TIMER_PRESENT = (
     _NIXOS_OS_PRESENT
     and Path("/etc/systemd/system/restic-backups-heim-pc.timer").is_file()
 )
+# Missing native units on NixOS never authorize the Pop! user timer.
 BACKUP_TIMER = os.environ.get(
     "GRABOWSKI_BACKUP_TIMER",
-    "restic-backups-heim-pc.timer" if _NIXOS_RESTIC_TIMER_PRESENT else "restic-backup-1930.timer",
+    "restic-backups-heim-pc.timer" if _NIXOS_OS_PRESENT else "restic-backup-1930.timer",
 )
 BACKUP_TIMER_SCOPE = os.environ.get(
-    "GRABOWSKI_BACKUP_TIMER_SCOPE", "system" if _NIXOS_RESTIC_TIMER_PRESENT else "user",
+    "GRABOWSKI_BACKUP_TIMER_SCOPE", "system" if _NIXOS_OS_PRESENT else "user",
 )
 MAX_AGE_SECONDS = int(os.environ.get("GRABOWSKI_RECOVERY_MAX_AGE_SECONDS", str(24 * 60 * 60)))
 DEFAULT_SERVER_RECOVERY_HOST = "heimberry"
