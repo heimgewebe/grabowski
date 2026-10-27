@@ -14,6 +14,7 @@ import http.client
 import json
 import os
 import re
+from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qs, urlsplit
 
@@ -453,8 +454,10 @@ def _trusted_validate_control_sources(
 def _fresh_github_checks(
     target_head: str, *, serving_head: str,
     review_pr: int | None = None, diff_sha256: str | None = None,
+    serving_release_id: str | None = None,
+    serving_tree: str | None = None, target_tree: str | None = None,
 ) -> dict[str, Any]:
-    """Bind CI origins; changed validation policy additionally needs an independent full-R3."""
+    """Bind CI origins; policy changes require authentic whole-delta R3."""
     if (
         not isinstance(target_head, str) or not _SHA40.fullmatch(target_head)
         or not isinstance(serving_head, str) or not _SHA40.fullmatch(serving_head)
@@ -472,31 +475,52 @@ def _fresh_github_checks(
                 or _SHA256.fullmatch(diff_sha256) is None
             ):
                 raise ReleaseAdmissionDenied(
-                    failure_reason + "; CI policy transition requires authentic independent full-delta R3"
+                    failure_reason + "; CI policy transition requires authentic full-delta R3"
                 )
             # Reconcile the entire immutable serving-to-target diff on each
             # admission. The caller can only name a reviewer namespace, not
             # assert its PASS or choose which CI control input has changed.
-            proof = validate_independent_release_review(
+            proof = validate_release_review(
                 serving_head=serving_head, target_head=target_head,
                 diff_sha256=diff_sha256, review_pr=review_pr,
+                serving_release_id=serving_release_id,
+                serving_tree=serving_tree, target_tree=target_tree,
             )
-            if (
-                not isinstance(proof, dict)
-                or proof.get("review_pr") != review_pr
-                or type(proof.get("independent_pass_count")) is not int
-                or proof["independent_pass_count"] < 1
-                or not isinstance(proof.get("admissible_slots"), list)
-                or not proof["admissible_slots"]
-                or not all(isinstance(slot, str) and slot.startswith("independent-")
-                           for slot in proof["admissible_slots"])
-                or not isinstance(proof.get("review_binding_sha256"), str)
-                or _SHA256.fullmatch(proof["review_binding_sha256"]) is None
-                or not isinstance(proof.get("review_attempts_sha256"), str)
-                or _SHA256.fullmatch(proof["review_attempts_sha256"]) is None
-            ):
+            if not isinstance(proof, dict):
+                raise ReleaseAdmissionDenied("authenticated full-delta R3 transition invalid")
+            common_valid = (
+                isinstance(proof, dict)
+                and proof.get("review_pr") == review_pr
+                and isinstance(proof.get("review_binding_sha256"), str)
+                and _SHA256.fullmatch(proof["review_binding_sha256"]) is not None
+                and isinstance(proof.get("review_attempts_sha256"), str)
+                and _SHA256.fullmatch(proof["review_attempts_sha256"]) is not None
+            )
+            if proof.get("review_mode") == "server_self":
+                authentic = (
+                    common_valid
+                    and proof.get("signed_task_origin_proven") is True
+                    and type(proof.get("self_review_pass_count")) is int
+                    and proof["self_review_pass_count"] >= 5
+                    and isinstance(proof.get("review_record_sha256"), str)
+                    and _SHA256.fullmatch(proof["review_record_sha256"]) is not None
+                )
+            else:
+                authentic = (
+                    common_valid
+                    and proof.get("review_mode") == "independent"
+                    and type(proof.get("independent_pass_count")) is int
+                    and proof["independent_pass_count"] >= 1
+                    and isinstance(proof.get("admissible_slots"), list)
+                    and bool(proof["admissible_slots"])
+                    and all(
+                        isinstance(slot, str) and slot.startswith("independent-")
+                        for slot in proof["admissible_slots"]
+                    )
+                )
+            if not authentic:
                 raise ReleaseAdmissionDenied(
-                    "authentic independent full-delta R3 result is invalid"
+                    "authenticated full-delta R3 transition invalid"
                 )
             transition_review = proof
         return transition_review
@@ -642,6 +666,149 @@ def _fresh_github_checks(
     }
 
 
+
+class ReleaseSelfReviewNotPresent(ReleaseAdmissionDenied):
+    """No private server-authenticated R3 batch exists for this exact release."""
+
+
+RELEASE_SELF_REVIEW_ROOT = (
+    Path.home() / ".local/state/grabowski/release-self-review-audits"
+)
+
+
+def validate_authenticated_self_release_review(
+    *, serving_head: str, target_head: str, diff_sha256: str, review_pr: int,
+    serving_release_id: str, serving_tree: str, target_tree: str,
+) -> dict[str, Any]:
+    """Re-read exact private signed phase executions, never a caller's PASS."""
+    from grabowski_self_review_execution import (
+        _canonical, _private_dir, _private_read, review_receipt_errors,
+        REQUIRED_AXES,
+    )
+    binding = {
+        "repo": REPOSITORY, "review_pr": review_pr,
+        "serving_head": serving_head, "target_head": target_head,
+        "diff_sha256": diff_sha256,
+        "serving_release_id": serving_release_id,
+        "serving_tree": serving_tree, "target_tree": target_tree,
+    }
+    if (
+        type(review_pr) is not int or review_pr <= 0
+        or not isinstance(serving_head, str) or not _SHA40.fullmatch(serving_head)
+        or not isinstance(target_head, str) or not _SHA40.fullmatch(target_head)
+        or not isinstance(diff_sha256, str) or not _SHA256.fullmatch(diff_sha256)
+        or not isinstance(serving_release_id, str) or not serving_release_id.strip()
+        or not isinstance(serving_tree, str) or not _SHA40.fullmatch(serving_tree)
+        or not isinstance(target_tree, str) or not _SHA40.fullmatch(target_tree)
+    ):
+        raise ReleaseAdmissionDenied("self-review release identity invalid")
+    if not RELEASE_SELF_REVIEW_ROOT.exists():
+        raise ReleaseSelfReviewNotPresent("server-owned release R3 archive missing")
+    try:
+        fd = _private_dir(RELEASE_SELF_REVIEW_ROOT)
+        try:
+            raw = _private_read(fd, _sha256_json(binding) + ".json", limit=65536)
+        finally:
+            os.close(fd)
+    except FileNotFoundError as exc:
+        raise ReleaseSelfReviewNotPresent("exact release R3 record missing") from exc
+    except (OSError, ValueError, PermissionError) as exc:
+        raise ReleaseAdmissionDenied("private R3 record not trustworthy") from exc
+    try:
+        audit = json.loads(raw)
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise ReleaseAdmissionDenied("private R3 audit JSON invalid") from exc
+    if not isinstance(audit, dict) or _canonical(audit) != raw:
+        raise ReleaseAdmissionDenied("private R3 audit not canonical")
+    phases = audit.get("review_iterations")
+    axes = (
+        [phase.get("axis") if isinstance(phase, dict) else None for phase in phases]
+        if isinstance(phases, list) else []
+    )
+    release_binding = {
+        "serving_release_id": serving_release_id,
+        "serving_tree": serving_tree, "target_tree": target_tree,
+    }
+    if (
+        audit.get("schema_version") != 1
+        or audit.get("kind") != "grabowski_self_review_audit"
+        or audit.get("review_policy_version") != 5
+        or audit.get("repo") != REPOSITORY
+        or audit.get("pr") != review_pr
+        or audit.get("base_sha") != serving_head
+        or audit.get("head_sha") != target_head
+        or audit.get("diff_sha256") != diff_sha256
+        or audit.get("review_purpose") != "post_merge_release"
+        or audit.get("release_binding") != release_binding
+        or audit.get("review_tier") != "high_critical"
+        or audit.get("minimum_review_iterations") != 5
+        or type(audit.get("actual_review_iterations")) is not int
+        or audit["actual_review_iterations"] != len(axes)
+        or not 5 <= len(axes) <= 32
+        or axes[:5] != list(REQUIRED_AXES)
+        or len(axes) != len(set(axes))
+        or audit.get("review_pass_axes") != axes
+        or audit.get("review_pass_evidence_sha256")
+           != hashlib.sha256(_canonical(phases)).hexdigest()
+        or audit.get("gate_verdict") != "PASS"
+        or audit.get("self_review_gate_valid") is not True
+        or audit.get("all_findings_triaged") is not True
+        or type(audit.get("material_findings_remaining")) is not int
+        or audit["material_findings_remaining"] != 0
+        or any(
+            not isinstance(phase, dict)
+            or type(phase.get("material_findings")) is not int
+            or phase["material_findings"] != 0
+            for phase in phases
+        )
+    ):
+        raise ReleaseAdmissionDenied("authenticated R3 metadata invalid")
+    if review_receipt_errors(audit):
+        raise ReleaseAdmissionDenied("authenticated R3 executions missing")
+    return {
+        "review_pr": review_pr, "review_mode": "server_self",
+        "self_review_pass_count": len(phases),
+        "independent_pass_count": 0, "admissible_slots": [],
+        "review_binding_sha256": _sha256_json(binding),
+        "review_attempts_sha256": hashlib.sha256(raw).hexdigest(),
+        "review_record_sha256": hashlib.sha256(raw).hexdigest(),
+        "signed_task_origin_proven": True,
+    }
+
+
+def validate_release_review(
+    *, serving_head: str, target_head: str, diff_sha256: str, review_pr: int,
+    serving_release_id: str | None = None,
+    serving_tree: str | None = None,
+    target_tree: str | None = None,
+) -> dict[str, Any]:
+    """Prefer verified server selfreview; optional independent R3 is fallback.
+
+    Invalid present selfreview evidence never falls back to a reviewer PASS.
+    """
+    if (
+        isinstance(serving_release_id, str)
+        and isinstance(serving_tree, str)
+        and isinstance(target_tree, str)
+    ):
+        try:
+            return validate_authenticated_self_release_review(
+                serving_head=serving_head, target_head=target_head,
+                diff_sha256=diff_sha256, review_pr=review_pr,
+                serving_release_id=serving_release_id,
+                serving_tree=serving_tree, target_tree=target_tree,
+            )
+        except ReleaseSelfReviewNotPresent:
+            pass
+    independent = validate_independent_release_review(
+        serving_head=serving_head, target_head=target_head,
+        diff_sha256=diff_sha256, review_pr=review_pr,
+    )
+    if not isinstance(independent, dict):
+        raise ReleaseAdmissionDenied("authenticated full-delta R3 result is invalid")
+    return {**independent, "review_mode": "independent"}
+
+
 def validate_independent_release_review(
     *, serving_head: str, target_head: str, diff_sha256: str,
     review_pr: int,
@@ -714,14 +881,34 @@ def validate_release(
         raise ReleaseAdmissionDenied("serving release ID is invalid")
     if not isinstance(diff_sha256, str) or not _SHA256.fullmatch(diff_sha256):
         raise ReleaseAdmissionDenied("release diff identity is invalid")
-    review = validate_independent_release_review(
+    review = validate_release_review(
         serving_head=serving_head, target_head=target_head,
         diff_sha256=diff_sha256, review_pr=review_pr,
+        serving_release_id=serving_release_id,
+        serving_tree=serving_tree, target_tree=target_tree,
     )
     checks = _fresh_github_checks(
         target_head, serving_head=serving_head,
         review_pr=review_pr, diff_sha256=diff_sha256,
+        serving_release_id=serving_release_id,
+        serving_tree=serving_tree, target_tree=target_tree,
     )
+    if not isinstance(checks, dict) or not isinstance(review, dict):
+        raise ReleaseAdmissionDenied("release review or CI origin malformed")
+    # Transition provenance is embedded inside the authenticated workflow
+    # receipt, not at the outer checks level. Inspect the actual nested value;
+    # the old top-level lookup silently skipped this cross-review CAS guard.
+    workflow = checks.get("workflow")
+    if not isinstance(workflow, dict):
+        raise ReleaseAdmissionDenied("authenticated CI workflow origin missing")
+    transition_required = workflow.get("ci_policy_transition_required")
+    if type(transition_required) is not bool:
+        raise ReleaseAdmissionDenied("CI policy transition status not authenticated")
+    if transition_required and (
+        workflow.get("ci_policy_transition_review_binding_sha256")
+        != review.get("review_binding_sha256")
+    ):
+        raise ReleaseAdmissionDenied("CI transition review identity changed during admission")
     material = {
         "schema_version": 1,
         "kind": "grabowski_post_merge_release_review",
@@ -743,7 +930,9 @@ def validate_release(
         # Any actual serving->target delta remains critical and must retain
         # whole-delta R3, CI and Captain provenance, regardless of provider.
         "critical_release_source": True,
-        "independent_review_required": True,
+        "independent_review_required": review.get("review_mode") != "server_self",
+        "review_mode": review.get("review_mode", "independent"),
+        "review_origin_proven": True,
         "status": "authenticated-post-merge-r3-ci",
         "does_not_establish": [
             "historical pre-merge review authorization",

@@ -22,6 +22,8 @@ _SRC_DIR = Path(__file__).resolve().parents[1] / "src"
 if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
 
+from grabowski_self_review_execution import review_receipt_errors  # noqa: E402
+
 from grabowski_pr_diff import (  # noqa: E402
     canonicalize_github_pr_diff_identity,
     canonicalize_github_pr_diff_identity_v1,
@@ -3522,6 +3524,14 @@ def build_self_review_audit(
             if isinstance(item, dict) and isinstance(item.get("axis"), str)
         ] if isinstance(iterations, list) else [],
         "review_iterations": iterations if isinstance(iterations, list) else [],
+        **(
+            {
+                "review_batch_id": self_review.get("review_batch_id"),
+                "review_pass_receipts": self_review.get("review_pass_receipts"),
+            }
+            if complexity.get("review_tier") == "high_critical"
+            and isinstance(self_review, dict) else {}
+        ),
         "review_pass_evidence_sha256": hashlib.sha256(
             json.dumps(
                 iterations if isinstance(iterations, list) else [],
@@ -4297,6 +4307,19 @@ def evaluate_review_gate(
             self_review_failures.append(
                 "material findings remain; each must be resolved or disproven"
             )
+        if complexity.get("review_tier") == "high_critical":
+            # Same server-issued, immutable execution receipts as Captain and
+            # the atomic merge guard. Caller text and hashes never suffice.
+            origin_audit = {
+                "repo": repo_name, "pr": pr.get("number"),
+                "base_sha": pr.get("baseRefOid"),
+                "head_sha": pr.get("headRefOid"),
+                "diff_sha256": _normalize_sha256(state.get("pr_diff_sha256")),
+                "review_batch_id": self_review.get("review_batch_id"),
+                "review_iterations": self_review.get("review_iterations"),
+                "review_pass_receipts": self_review.get("review_pass_receipts"),
+            }
+            self_review_failures.extend(review_receipt_errors(origin_audit))
     failures.extend(self_review_failures)
 
     claude = self_review.get("claude_review") if isinstance(self_review, dict) else None

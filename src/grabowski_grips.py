@@ -13924,7 +13924,7 @@ def _captain_independent_review_gate(
                 and isinstance(release.get("serving_release_id"), str)
                 and bool(release["serving_release_id"])
                 and release.get("critical_release_source") is True
-                and release.get("independent_review_required") is True
+                and release_deploy._critical_release_review_origin_valid(release, expected_head)
                 and _is_hex_sha(
                     release.get("release_review_identity_sha256"), lengths=(64,)
                 )

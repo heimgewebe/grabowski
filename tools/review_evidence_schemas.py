@@ -8,7 +8,7 @@ from typing import Any
 _MISSING = object()
 
 # Bump when review-gate policy semantics change in a way that invalidates prior audits.
-REVIEW_POLICY_VERSION = 4
+REVIEW_POLICY_VERSION = 5
 REVIEW_GATE_ATTESTATION_KIND = "grabowski_review_gate_attestation"
 REVIEW_GATE_SIGNER_PRINCIPAL = "grabowski-review-gate@heimgewebe"
 REVIEW_GATE_SIGNATURE_NAMESPACE = "review-evidence@grabowski.heimgewebe"
@@ -335,6 +335,8 @@ SELF_REVIEW_AUDIT_SCHEMA = EvidenceSchema(
         "actual_review_iterations": NON_NEGATIVE_INTEGER,
         "review_pass_axes": FieldRule(("array",), items=STRING),
         "review_pass_evidence_sha256": STRING,
+        "review_batch_id": STRING,
+        "review_pass_receipts": FieldRule(("array",), items=FieldRule(("object",))),
         "all_findings_triaged": BOOLEAN,
         "finding_count": FieldRule(("integer", "null"), minimum=0),
         "material_findings_after_first_review": FieldRule(("integer", "null"), minimum=0),

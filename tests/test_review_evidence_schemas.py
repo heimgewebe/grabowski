@@ -112,7 +112,7 @@ class ReviewEvidenceSchemaTests(unittest.TestCase):
                 self.assertEqual(schemas.validate_evidence(payload, label=label), ())
 
     def test_old_policy_audit_cannot_requalify_as_current_release_review(self) -> None:
-        self.assertEqual(schemas.REVIEW_POLICY_VERSION, 4)
+        self.assertEqual(schemas.REVIEW_POLICY_VERSION, 5)
         audit = {
             "schema_version": 1,
             "kind": "grabowski_self_review_audit",

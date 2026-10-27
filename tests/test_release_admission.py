@@ -397,7 +397,7 @@ class AuthoritativeCIReadTests(unittest.TestCase):
                     admission, "validate_independent_release_review", return_value=invalid,
                 ):
                     with self.assertRaisesRegex(
-                        admission.ReleaseAdmissionDenied, "authentic independent.*R3",
+                        admission.ReleaseAdmissionDenied, "authentic.*R3|authenticated.*R3",
                     ):
                         self.query(
                             pages, transition_review_pr=1452, transition_diff_sha256=DIFF,
@@ -1401,6 +1401,10 @@ class DecisionBoundReleaseReviewTests(unittest.TestCase):
             }),
             patch.object(admission, "_fresh_github_checks", return_value={
                 "checks": [], "checks_sha256": "e" * 64,
+                "workflow": {
+                    "ci_policy_transition_required": False,
+                    "ci_policy_transition_review_binding_sha256": None,
+                },
             }),
         ):
             result = admission.validate_release(
@@ -1413,6 +1417,48 @@ class DecisionBoundReleaseReviewTests(unittest.TestCase):
         self.assertIs(result["independent_review_required"], True)
         self.assertIn("Captain runtime-deploy decision", result["does_not_establish"])
         self.assertIn("historical pre-merge review authorization", result["does_not_establish"])
+
+
+    def test_release_rejects_missing_ci_transition_workflow_origin(self):
+        with (
+            patch.object(admission, "validate_release_review", return_value={
+                "review_pr": 1452, "review_mode": "independent",
+                "review_binding_sha256": "a" * 64,
+            }),
+            patch.object(admission, "_fresh_github_checks", return_value={
+                "checks": [], "checks_sha256": "c" * 64,
+            }),
+        ):
+            with self.assertRaisesRegex(admission.ReleaseAdmissionDenied, "workflow origin missing"):
+                admission.validate_release(
+                    serving_head=SERVING, target_head=TARGET,
+                    serving_release_id="release-blue",
+                    serving_tree="1" * 40, target_tree="2" * 40,
+                    diff_sha256=DIFF, review_pr=1452,
+                )
+
+    def test_release_rejects_drifted_ci_transition_review_identity(self):
+        with (
+            patch.object(admission, "validate_release_review", return_value={
+                "review_pr": 1452, "review_mode": "server_self",
+                "review_binding_sha256": "a" * 64,
+                "signed_task_origin_proven": True,
+            }),
+            patch.object(admission, "_fresh_github_checks", return_value={
+                "checks": [], "checks_sha256": "c" * 64,
+                "workflow": {
+                    "ci_policy_transition_required": True,
+                    "ci_policy_transition_review_binding_sha256": "b" * 64,
+                },
+            }),
+        ):
+            with self.assertRaisesRegex(admission.ReleaseAdmissionDenied, "identity changed"):
+                admission.validate_release(
+                    serving_head=SERVING, target_head=TARGET,
+                    serving_release_id="release-blue",
+                    serving_tree="1" * 40, target_tree="2" * 40,
+                    diff_sha256=DIFF, review_pr=1452,
+                )
 
 
 class DirectSchedulerDenialTests(unittest.TestCase):
@@ -1480,7 +1526,7 @@ class DirectSchedulerDenialTests(unittest.TestCase):
             "target_head": TARGET,
             "release_review_identity_sha256": "a" * 64,
         }
-        with self.assertRaisesRegex(RuntimeError, "critical-source|Captain"):
+        with self.assertRaisesRegex(RuntimeError, "critical-source|Captain|critical review origin"):
             deploy._claim_captain_schedule_effect(TARGET, forged)
 
     def test_unknown_release_criticality_never_admits_effect(self):

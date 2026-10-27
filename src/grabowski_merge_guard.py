@@ -542,7 +542,7 @@ def captain_request_sha256(parameters: dict[str, Any]) -> str:
     return _sha256_json(visible)
 
 
-REVIEW_POLICY_VERSION = 4  # Bound to tools/review_evidence_schemas.py; checked by regression tests.
+REVIEW_POLICY_VERSION = 5  # Server-attested phases; bound to review_evidence_schemas.py.
 HIGH_CRITICAL_REVIEW_AXES = (
     "contracts_correctness",
     "regression_compatibility",
@@ -622,6 +622,12 @@ def high_critical_review_pass_evidence_errors(evidence: Any) -> list[str]:
         or digest != hashlib.sha256(encoded).hexdigest()
     ):
         errors.append("high_critical_review_pass_evidence_digest_invalid")
+    # Hashes alone prove bytes, not that reviews actually ran. Do not accept
+    # a client-authored five-pass packet without server-signed, task-bound
+    # private execution receipts. Malformed records fail before private reads.
+    if not errors:
+        from grabowski_self_review_execution import review_receipt_errors
+        errors.extend(review_receipt_errors(evidence))
     return errors
 
 

@@ -224,10 +224,20 @@ class RiskScaledIndependentReviewContractTests(unittest.TestCase):
         return result
 
     def test_r3_valid_self_review_does_not_automatically_need_an_external_provider(self) -> None:
-        requirement = merge_guard.independent_review_requirement(self._request())
+        # This test isolates optional-provider semantics. The signed task
+        # origin is verified in test_self_review_execution and the next test.
+        with mock.patch("grabowski_self_review_execution.review_receipt_errors", return_value=[]):
+            requirement = merge_guard.independent_review_requirement(self._request())
         self.assertFalse(requirement["required"])
         self.assertTrue(requirement["high_critical_risk"])
         self.assertEqual(requirement["errors"], [])
+
+    def test_formally_valid_but_unexecuted_highcritical_reports_are_blocked(self) -> None:
+        untrusted = merge_guard.independent_review_requirement(self._request())
+        self.assertIn(
+            "high_critical_server_review_provenance_invalid:ReviewExecutionRejected",
+            untrusted["errors"],
+        )
 
     def test_fabricated_digest_without_reports_is_blocked(self) -> None:
         request = self._request()
@@ -251,9 +261,9 @@ class RiskScaledIndependentReviewContractTests(unittest.TestCase):
         self.assertTrue(requirement["explicitly_required"])
         self.assertFalse(requirement["high_critical_floor"])
 
-    def test_v3_cannot_satisfy_v4_captain_even_with_valid_depth(self) -> None:
+    def test_v4_cannot_satisfy_v5_captain_even_with_valid_depth(self) -> None:
         old = self._request()
-        old["review_evidence"]["review_policy_version"] = 3
+        old["review_evidence"]["review_policy_version"] = 4
         self.assertIn(
             "review_policy_version_stale_or_invalid",
             merge_guard.independent_review_requirement(old)["errors"],
@@ -306,9 +316,10 @@ class RiskScaledIndependentReviewContractTests(unittest.TestCase):
                 sort_keys=True, separators=(",", ":"), ensure_ascii=False,
             ).encode("utf-8")
         ).hexdigest()
-        self.assertEqual(
-            merge_guard.independent_review_requirement(request)["errors"], []
-        )
+        with mock.patch("grabowski_self_review_execution.review_receipt_errors", return_value=[]):
+            self.assertEqual(
+                merge_guard.independent_review_requirement(request)["errors"], []
+            )
 
     def test_critical_self_review_below_four_passes_remains_invalid(self) -> None:
         weak = self._request()

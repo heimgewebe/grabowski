@@ -5850,6 +5850,64 @@ def _active_captain_origin_valid(scope: Any, expected_head: str) -> bool:
     )
 
 
+def _critical_release_review_origin_valid(
+    admitted: dict[str, Any], expected_head: str,
+) -> bool:
+    """Check critical review provenance independently of provider requirement.
+
+    Legacy independent-mode proofs remain under their original admission
+    contract. Self-review requires re-reading the actual create-only signed
+    job and whole-release source evidence, never trusting a caller boolean.
+    """
+    if (
+        not isinstance(admitted, dict)
+        or admitted.get("status") != "authenticated-post-merge-r3-ci"
+        or admitted.get("critical_release_source") is not True
+    ):
+        return False
+    mode = admitted.get("review_mode")
+    if mode in {None, "independent"}:
+        return admitted.get("independent_review_required") is True
+    if (
+        mode != "server_self"
+        or admitted.get("independent_review_required") is not False
+        or admitted.get("review_origin_proven") is not True
+        or admitted.get("target_head") != expected_head
+    ):
+        return False
+    review = admitted.get("review")
+    if (
+        not isinstance(review, dict)
+        or review.get("review_mode") != "server_self"
+        or review.get("signed_task_origin_proven") is not True
+        or type(review.get("self_review_pass_count")) is not int
+        or review["self_review_pass_count"] < 5
+        or type(review.get("review_pr")) is not int
+    ):
+        return False
+    try:
+        import grabowski_release_admission as release_admission
+
+        proof = release_admission.validate_authenticated_self_release_review(
+            serving_head=admitted["serving_head"],
+            target_head=expected_head,
+            diff_sha256=admitted["diff_sha256"],
+            review_pr=review["review_pr"],
+            serving_release_id=admitted["serving_release_id"],
+            serving_tree=admitted["serving_tree"],
+            target_tree=admitted["target_tree"],
+        )
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError):
+        return False
+    return (
+        proof.get("review_mode") == "server_self"
+        and proof.get("signed_task_origin_proven") is True
+        and proof.get("review_record_sha256") == review.get("review_record_sha256")
+        and proof.get("review_binding_sha256") == review.get("review_binding_sha256")
+        and proof.get("review_attempts_sha256") == review.get("review_attempts_sha256")
+    )
+
+
 def _claim_captain_schedule_effect(expected_head: str, admitted: dict[str, Any]) -> None:
     """Atomically consume the accepted action at the job-registration boundary.
 
@@ -5874,6 +5932,8 @@ def _claim_captain_schedule_effect(expected_head: str, admitted: dict[str, Any])
         raise DeploySchedulePreEffectRefusal(
             "release admission blocked: malformed critical-source decision"
         )
+    if not _critical_release_review_origin_valid(admitted, expected_head):
+        raise DeploySchedulePreEffectRefusal("release admission blocked: critical review origin unverified")
     scope = _CAPTAIN_RUNTIME_RELEASE_SCOPE.get()
     if not _active_captain_origin_valid(scope, expected_head):
         raise DeploySchedulePreEffectRefusal(
@@ -5935,6 +5995,8 @@ def _captain_release_scope(
             raise DeploySchedulePreEffectRefusal(
                 "release admission blocked: malformed critical-source decision"
             )
+        if not _critical_release_review_origin_valid(reviewed, expected_head):
+            raise DeploySchedulePreEffectRefusal("release admission blocked: Captain R3 origin invalid")
         import grabowski_merge_guard as merge_guard
 
         actor = merge_guard.verify_server_runtime_actor_identity(server_actor_identity)
@@ -6255,7 +6317,7 @@ def _require_release_source_admission_under_lease(
             and admitted.get("status") == "authenticated-post-merge-r3-ci"
             and admitted.get("target_head") == expected_head
             and admitted.get("critical_release_source") is True
-            and admitted.get("independent_review_required") is True
+            and _critical_release_review_origin_valid(admitted, expected_head)
             and isinstance(admitted.get("release_review_identity_sha256"), str)
             and re.fullmatch(
                 r"[0-9a-f]{64}", admitted["release_review_identity_sha256"]
@@ -6843,6 +6905,7 @@ def _grabowski_runtime_deploy_schedule_impl(
                 )
             binding_fields = (
                 "status", "critical_release_source", "independent_review_required",
+                "review_mode", "review_origin_proven",
                 "target_head", "target_repo_head",
                 "serving_head", "serving_repo_head", "serving_release_id",
                 "changed_path_count", "release_review_identity_sha256",
@@ -6879,6 +6942,8 @@ def _grabowski_runtime_deploy_schedule_impl(
                 "independent_review_required": admitted.get(
                     "independent_review_required"
                 ),
+                "review_mode": admitted.get("review_mode"),
+                "review_origin_proven": admitted.get("review_origin_proven"),
             }
             _append_deploy_audit(intent)
             jobs_root = operator._jobs_root()

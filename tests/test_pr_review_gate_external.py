@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 HEAD = "a" * 40
@@ -117,6 +118,33 @@ def _has_failure(result: dict[str, object], needle: str) -> bool:
 
 
 class SelfReviewDepthPolicyTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # These unit tests isolate risk classification from execution provenance.
+        # The real signer/task/evidence verifier has its own positive/negative
+        # tests; the explicit test below restores it at this public gate.
+        patcher = mock.patch.object(gate, "review_receipt_errors", return_value=[])
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_fake_five_passes_are_blocked_without_private_server_receipts(self) -> None:
+        import grabowski_self_review_execution as provenance
+        with mock.patch.object(
+            gate, "review_receipt_errors",
+            side_effect=provenance.review_receipt_errors,
+        ):
+            state = _state("tools/pr_review_gate.py", additions=180)
+            result = gate.evaluate_review_gate(
+                state,
+                self_review=_self_review(
+                    "tools/pr_review_gate.py", iterations=5,
+                ),
+            )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(
+            _has_failure(result, "high_critical_server_review_provenance_invalid"),
+            result["failures"],
+        )
+
     def test_documentation_change_requires_one_self_review_iteration(self) -> None:
         result = gate.evaluate_review_gate(_state(), self_review=_self_review())
         self.assertEqual(result["verdict"], "PASS")

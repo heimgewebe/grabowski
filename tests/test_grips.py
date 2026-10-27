@@ -12658,6 +12658,15 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             return_value=captain_independent_review_reconciliation(),
         )
         self._decision_review_patch.start()
+        # These action-envelope fixtures isolate policy/dispatch from the
+        # separately tested signed task origin. The dedicated production
+        # no-origin rejection and real signer suite never apply this patch.
+        signer_origin_fixture = patch(
+            "grabowski_self_review_execution.review_receipt_errors",
+            return_value=[],
+        )
+        signer_origin_fixture.start()
+        self.addCleanup(signer_origin_fixture.stop)
         # These historical tests cover downstream scheduler receipt behavior,
         # not independent high-critical release authorization. A positive
         # source classification is explicit only for these bounded fixtures.
@@ -21965,6 +21974,15 @@ class CaptainExecutionIntentTests(unittest.TestCase):
             return_value=captain_independent_review_reconciliation(),
         )
         self._decision_review_patch.start()
+        # These action-envelope fixtures isolate policy/dispatch from the
+        # separately tested signed task origin. The dedicated production
+        # no-origin rejection and real signer suite never apply this patch.
+        signer_origin_fixture = patch(
+            "grabowski_self_review_execution.review_receipt_errors",
+            return_value=[],
+        )
+        signer_origin_fixture.start()
+        self.addCleanup(signer_origin_fixture.stop)
 
     def tearDown(self) -> None:
         self._decision_review_patch.stop()
