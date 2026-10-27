@@ -637,12 +637,22 @@ class NativeNixOSResticProofTests(unittest.TestCase):
                 "Result": "success", "ExecMainCode": "1",
                 "ExecMainStatus": "0",
                 "ExecMainExitTimestampMonotonic": str(completion),
+                "ExecMainExitTimestamp": f"@{self.now - 30}",
             }
             fields.update(overrides)
             return "\n".join(f"{key}={value}" for key, value in fields.items()) + "\n"
 
         for label, payload, returncode, expected in (
             ("valid", output(), 0, True),
+            ("valid_fractional", output(ExecMainExitTimestamp=f"@{self.now - 30}.123456"), 0, True),
+            # CLOCK_MONOTONIC counts just 30 seconds awake even after 48h
+            # suspended; systemd's epoch second value must still expire.
+            ("suspend_48h", output(ExecMainExitTimestamp=f"@{self.now - 48 * 3600}"), 0, False),
+            ("stale_realtime", output(ExecMainExitTimestamp=f"@{self.now - recovery.MAX_AGE_SECONDS - 1}"), 0, False),
+            ("future_realtime", output(ExecMainExitTimestamp=f"@{self.now + 10}"), 0, False),
+            ("localized_date", output(ExecMainExitTimestamp="Mon 2026-10-26 19:31:02 CET"), 0, False),
+            ("missing_realtime", output().replace(f"ExecMainExitTimestamp=@{self.now - 30}\n", ""), 0, False),
+            ("invalid_fraction", output(ExecMainExitTimestamp=f"@{self.now - 30}.a"), 0, False),
             ("never_run", output(completion=0), 0, False),
             ("failed_backup", output(Result="exit-code"), 0, False),
             ("unit_not_loaded", output(LoadState="not-found"), 0, False),
@@ -665,9 +675,9 @@ class NativeNixOSResticProofTests(unittest.TestCase):
                 state = recovery._nixos_native_backup_service_fresh()
             self.assertEqual(state["valid"], expected)
             self.assertEqual(
-                run.call_args.args[0][:4],
-                ["/run/current-system/sw/bin/systemctl", "--system", "show",
-                 "restic-backups-heim-pc.service"],
+                run.call_args.args[0][:5],
+                ["/run/current-system/sw/bin/systemctl", "--system",
+                 "--timestamp=unix", "show", "restic-backups-heim-pc.service"],
             )
             if expected:
                 self.assertEqual(state["timestamp_unix"], self.now - 30)

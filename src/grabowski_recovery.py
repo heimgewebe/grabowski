@@ -1911,7 +1911,8 @@ def _nixos_native_backup_service_fresh() -> dict[str, Any]:
 
     An NixOS system timer does not create Pop!_OS's user success-marker file.
     systemd's monotonic *exit* timestamp proves an actual successful run in
-    this boot; Result=success/ExecMainStatus=0 alone can mean "never started".
+    this boot; its realtime timestamp accounts for suspend. Result=success
+    and ExecMainStatus=0 alone can mean "never started".
     """
     unit = "restic-backups-heim-pc.service"
     result: dict[str, Any] = {
@@ -1923,9 +1924,11 @@ def _nixos_native_backup_service_fresh() -> dict[str, Any]:
     names = (
         "LoadState", "ActiveState", "Result", "ExecMainCode",
         "ExecMainStatus", "ExecMainExitTimestampMonotonic",
+        "ExecMainExitTimestamp",
     )
     observed = operator._run(
-        ["/run/current-system/sw/bin/systemctl", "--system", "show", unit,
+        ["/run/current-system/sw/bin/systemctl", "--system",
+         "--timestamp=unix", "show", unit,
          *[f"--property={name}" for name in names]],
         cwd=operator.HOME, timeout_seconds=30, max_output_bytes=4096,
     )
@@ -1955,14 +1958,28 @@ def _nixos_native_backup_service_fresh() -> dict[str, Any]:
         return result
     exit_microseconds = int(exit_text)
     now_microseconds = int(time.monotonic() * 1_000_000)
-    age_microseconds = now_microseconds - exit_microseconds
-    if (exit_microseconds <= 0 or age_microseconds < 0
-            or age_microseconds > MAX_AGE_SECONDS * 1_000_000):
+    monotonic_age = now_microseconds - exit_microseconds
+    # CLOCK_MONOTONIC excludes suspend on Linux. Inspect systemd's *same*
+    # completed invocation through an exact numerical realtime timestamp,
+    # which includes sleep and cannot be confused with a localized date.
+    realtime_text = fields["ExecMainExitTimestamp"]
+    if not realtime_text.startswith("@"):
+        return result
+    seconds_text, dot, fractional_text = realtime_text[1:].partition(".")
+    if (not seconds_text.isascii() or not seconds_text.isdecimal()
+            or (dot and (not fractional_text.isascii()
+                         or not fractional_text.isdecimal()
+                         or len(fractional_text) > 6))):
+        return result
+    completed_at = int(seconds_text)
+    age = int(time.time()) - completed_at
+    if (exit_microseconds <= 0 or monotonic_age < 0
+            or monotonic_age > MAX_AGE_SECONDS * 1_000_000
+            or completed_at <= 0 or age < 0 or age > MAX_AGE_SECONDS):
         result["error"] = "NixOS Restic backup completion is missing, stale or future-dated"
         return result
-    age = age_microseconds // 1_000_000
     result.update({
-        "valid": True, "timestamp_unix": int(time.time()) - age,
+        "valid": True, "timestamp_unix": completed_at,
         "age_seconds": age, "error": None,
     })
     return result
