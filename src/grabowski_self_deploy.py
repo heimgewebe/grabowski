@@ -1543,6 +1543,121 @@ def _iter_bootstrap_job_entries(jobs_root: Path):
             yield Path(item.path)
 
 
+def _verified_runtime_terminal_receipt(
+    entry: Path,
+    metadata: dict[str, Any],
+    command: list[str],
+    status: dict[str, Any],
+) -> bool:
+    """Require runner-specific durable proof before retiring a runtime job.
+
+    A generic systemd/job finalization signs a process exit, not a deployment.
+    The runtime finalization reader in grabowski_operator authenticates the
+    private file, receipt hash, full contract and expected-head/argv bindings.
+    Resume completion instead lives in the separately authenticated cutover
+    receipt lineage. Neither job's generic terminal status grants authority.
+    """
+    unit = entry.name
+    argv_sha256 = metadata.get("argv_sha256")
+    if (
+        metadata.get("unit") != unit
+        or metadata.get("job_id") != unit.removeprefix(DEPLOY_JOB_PREFIX)
+        or not isinstance(argv_sha256, str)
+        or _SHA256_RE.fullmatch(argv_sha256) is None
+        or argv_sha256 != _deploy_command_sha256(command)
+        or not isinstance(status, dict)
+    ):
+        return False
+    deploy = _deploy_command_fields(command)
+    resume = _midcutover_resume_command_fields(command) if deploy is None else None
+    fields = deploy or resume
+    if fields is None:
+        return False
+    repository = fields["repository"]
+    runner = RUNNER_RELATIVE_PATH if deploy is not None else MIDCUTOVER_RESUME_RUNNER_RELATIVE_PATH
+    if (
+        command[:2] != ["/usr/bin/python3", str(Path(repository) / runner)]
+        or metadata.get("cwd") != repository
+        or metadata.get("final_status") == "outcome_unknown"
+        or status.get("final_status") == "outcome_unknown"
+    ):
+        return False
+
+    if deploy is not None:
+        contract = metadata.get("finalization_contract")
+        receipt = status.get("finalization_receipt")
+        if (
+            not isinstance(contract, dict)
+            or contract.get("kind") != "grabowski_runtime_deploy_finalization"
+            or contract.get("unit") != unit
+            or contract.get("job_id") != metadata["job_id"]
+            or contract.get("argv_sha256") != argv_sha256
+            or contract.get("expected_head") != fields["expected_head"]
+            or not isinstance(receipt, dict)
+            or receipt.get("valid") is not True
+            or receipt.get("state") != "valid"
+            or receipt.get("expected_head") != fields["expected_head"]
+            or _SHA256_RE.fullmatch(str(receipt.get("receipt_sha256"))) is None
+            or _SHA256_RE.fullmatch(str(receipt.get("payload_sha256"))) is None
+            or receipt.get("final_status") != "completed"
+            or status.get("final_status") not in {"completed", "succeeded"}
+            or receipt.get("blind_retry_allowed") is False
+        ):
+            return False
+        # A persisted terminal metadata claim that disagrees with completion
+        # is not superseded by a process exit or an arbitrary status read.
+        if metadata.get("final_status") in TERMINAL_JOB_STATUSES and metadata["final_status"] not in {"completed", "succeeded"}:
+            return False
+        return True
+
+    # A successful resume *process* may have produced outcome_unknown, a
+    # denial or an unpersisted receipt. Only the authentic completed lineage
+    # for its exact --cutover-id, --expected-head and --resume-binding-sha256
+    # retires the reservation. load_receipts enforces private owner-only files.
+    if status.get("final_status") not in {"completed", "succeeded"}:
+        return False
+    if metadata.get("final_status") in TERMINAL_JOB_STATUSES and metadata["final_status"] not in {"completed", "succeeded"}:
+        return False
+    loaded = midcutover.load_receipts()
+    if loaded.get("unreadable") or not loaded.get("present"):
+        return False
+    receipts = loaded.get("receipts")
+    if not isinstance(receipts, list):
+        return False
+    matching_cutovers = [
+        receipt for receipt in receipts
+        if isinstance(receipt, dict)
+        and receipt.get("kind") == BLUE_GREEN_RECEIPT_KIND
+        and receipt.get("cutover_id") == fields["cutover_id"]
+    ]
+    if len(matching_cutovers) != 1:
+        return False
+    original = matching_cutovers[0]
+    for receipt in receipts:
+        if (
+            not isinstance(receipt, dict)
+            or receipt.get("kind") != midcutover.RESUME_RECEIPT_KIND
+            or receipt.get("outcome") != "completed"
+            or receipt.get("resumed_cutover_id") != fields["cutover_id"]
+        ):
+            continue
+        try:
+            receipt = midcutover.validate_resume_receipt(receipt)
+        except midcutover.MidCutoverEvidenceError:
+            return False
+        binding = midcutover._completed_lineage_binding(receipt)
+        if (
+            binding is not None
+            and receipt.get("expected_head") == fields["expected_head"]
+            and receipt.get("resume_binding_sha256") == fields["resume_binding_sha256"]
+            and binding.get("binding_sha256") == fields["resume_binding_sha256"]
+            and binding.get("expected_head") == fields["expected_head"]
+            and midcutover._lineage_resolved([receipt], original)
+        ):
+            return True
+    return False
+
+
 def _bootstrap_job_directory_snapshot(
     jobs_root: Path, started_monotonic: float,
 ) -> list[Path]:
@@ -1624,20 +1739,16 @@ def _bootstrap_deploy_index(
                 if references_deploy_runner
                 else False
             )
-            final_status = metadata.get("final_status")
-            if (
-                references_runtime_job
-                and not unresolved_finalization
-                and final_status in {
-                    "launch_prepared", "launch_submitted", "launch_outcome_unknown"
-                }
-            ):
-                # Job metadata preserves its launch-time state. The worker
-                # writes a separate validated finalization receipt, so a
-                # completed historical deploy otherwise remains in the live
-                # index forever and eventually trips the 512-entry bound.
-                # Only a validated, status-matching terminal receipt may
-                # remove this conservative launch-time blocker.
+            if not references_runtime_job:
+                continue
+            # Historical metadata is the launch-time state, not an end-of-
+            # deployment receipt. Even a terminal metadata claim must be
+            # corroborated by the runner-specific canonical evidence.
+            terminal_candidate = metadata.get("final_status") in (
+                TERMINAL_JOB_STATUSES
+                | {"launch_prepared", "launch_submitted", "launch_outcome_unknown"}
+            )
+            if not unresolved_finalization and terminal_candidate:
                 try:
                     status = operator.grabowski_job_status(entry.name)
                 except (OSError, ValueError, RuntimeError, PermissionError) as exc:
@@ -1648,21 +1759,13 @@ def _bootstrap_deploy_index(
                     raise RuntimeError(
                         f"durable runtime job status is unreadable: {entry.name}"
                     )
-                receipt = status.get("finalization_receipt")
-                observed_status = status.get("final_status")
-                if (
-                    observed_status in TERMINAL_JOB_STATUSES
-                    and isinstance(receipt, dict)
-                    and receipt.get("valid") is True
-                    and receipt.get("final_status") == observed_status
+                if _verified_runtime_terminal_receipt(
+                    entry, metadata, candidate_command, status
                 ):
-                    final_status = observed_status
+                    continue
                 if time.monotonic() - scan_started > DEPLOY_BOOTSTRAP_TIMEOUT_SECONDS:
                     raise RuntimeError("runtime deploy bootstrap census timed out")
-            if references_runtime_job and (
-                unresolved_finalization or final_status not in TERMINAL_JOB_STATUSES
-            ):
-                units.append(entry.name)
+            units.append(entry.name)
     # A separate job can materialize while the census is in progress. Before
     # publishing a compact index, prove the *entire directory name set* is
     # unchanged. Additions, removals and renames all fail closed. Deploy/
@@ -2048,8 +2151,15 @@ def _classify_indexed_job(entry: Path) -> dict[str, Any]:
         "noeffect_proven_terminal": noeffect_proven_terminal,
         "legacy_redacted_argv_recovered": legacy_redacted_argv_recovered,
         "terminal": (
-            final_status in TERMINAL_JOB_STATUSES and not readback_required
-        ) or runtime_proven_terminal or noeffect_proven_terminal,
+            not readback_required
+            and (
+                _verified_runtime_terminal_receipt(
+                    entry, metadata, candidate_command, status
+                )
+                or runtime_proven_terminal
+                or noeffect_proven_terminal
+            )
+        ),
         "reusable": final_status in REUSABLE_JOB_STATUSES and not readback_required,
     }
 
@@ -2733,14 +2843,11 @@ def _matching_inflight_deploy_job(command: list[str], _repository: Path) -> dict
             raise RuntimeError(f"self deploy job status is unavailable: {entry.name}")
         final_status = status.get("final_status")
         if resume_fields is not None:
-            # The provenance-recovery lane reserves its receipt-bound resume in
-            # this same index so an ordinary deploy cannot race it.  Once that
-            # job is terminal the index has served its concurrency purpose; its
-            # outcome authority remains the durable bgcr receipt and the fresh
-            # recovery classification performed by the scheduled runner before
-            # any deployment effect.  Never reinterpret the resume argv as a
-            # deploy argv, and never discard an in-flight or ambiguous resume.
-            if final_status in TERMINAL_JOB_STATUSES:
+            # Completion of the job wrapper is not a completed cutover.
+            # Reuse exactly the same authenticated lineage gate as bootstrap.
+            if _verified_runtime_terminal_receipt(
+                entry, metadata, candidate_command, status
+            ):
                 continue
             retained_units.append(entry.name)
             if final_status in REUSABLE_JOB_STATUSES:
@@ -2761,7 +2868,9 @@ def _matching_inflight_deploy_job(command: list[str], _repository: Path) -> dict
             raise RuntimeError(
                 f"self deploy job requires authoritative runtime readback before retry: {entry.name} (outcome_unknown)"
             )
-        if final_status in TERMINAL_JOB_STATUSES:
+        if _verified_runtime_terminal_receipt(
+            entry, metadata, candidate_command, status
+        ):
             continue
         if _missing_finalization_deploy_is_runtime_proven(
             status, candidate_fields, runtime_proof_cache=runtime_proof_cache
