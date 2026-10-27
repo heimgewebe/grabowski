@@ -10,6 +10,7 @@ import shutil
 import signal
 import stat
 import subprocess
+import sys
 import tempfile
 from typing import Iterable
 
@@ -385,7 +386,7 @@ def prepare_external_agent_command(command: list[str]) -> PreparedSandboxCommand
             )
         return PreparedSandboxCommand(
             command=(
-                "/usr/bin/python3",
+                str(sandbox_python_executable()),
                 "-I",
                 "-S",
                 "-c",
@@ -520,6 +521,40 @@ def require_bwrap() -> Path:
     if not BWRAP.is_absolute() or BWRAP.is_symlink() or not BWRAP.is_file() or not os.access(BWRAP, os.X_OK):
         raise AgentSandboxError(f"bubblewrap unavailable: {BWRAP}")
     return BWRAP.resolve(strict=True)
+
+
+def _sandbox_python_path_allowed(resolved: Path) -> bool:
+    """Only accept interpreters reachable through the minimal read-only mounts."""
+    if resolved.is_relative_to(Path("/usr")):
+        return True
+    if resolved.is_relative_to(Path("/nix/store")):
+        return _trusted_nix_store() == Path("/nix/store")
+    return False
+
+
+def sandbox_python_executable() -> Path:
+    """Select a real interpreter, never one outside /usr or trusted Nix store.
+
+    On NixOS, /usr/bin/python3 often resolves through /run/current-system to
+    /nix/store; only its immutable resolved target is mounted in role sandboxes.
+    The host user's private virtualenv and untrusted interpreter paths remain
+    unavailable to the read-only reviewer.
+    """
+    candidates = (Path(sys.executable), Path("/usr/bin/python3"))
+    seen: set[Path] = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve(strict=True)
+        except OSError:
+            continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if not _sandbox_python_path_allowed(resolved):
+            continue
+        if resolved.is_file() and os.access(resolved, os.X_OK):
+            return resolved
+    raise AgentSandboxError("no Python interpreter is available inside the minimal role sandbox")
 
 
 def _safe_existing_path(value: Path, field: str, *, directory: bool | None = None) -> Path:
