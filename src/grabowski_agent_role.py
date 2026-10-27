@@ -1375,7 +1375,15 @@ def classify_result(role: str, command: list[str], repo: Path, payload: dict[str
     elif returncode == 0:
         return "passed"
     if isinstance(returncode, int) and not isinstance(returncode, bool) and returncode != 0:
-        probe = toolchain_probe(repo, command)
+        # A secondary diagnostic must not erase the original review result.
+        try:
+            probe = toolchain_probe(repo, command)
+        except (OSError, RuntimeError) as exc:
+            probe = {
+                "passed": False,
+                "failure_classification": "toolchain_probe_error",
+                "probe_error_type": type(exc).__name__,
+            }
         payload["post_failure_toolchain_probe"] = probe
         if probe.get("failure_classification") == "environment_toolchain_failure":
             return "environment_toolchain_failure"
