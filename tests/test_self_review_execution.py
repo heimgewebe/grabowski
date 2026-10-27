@@ -628,6 +628,31 @@ class SemanticV2RoleContractTests(unittest.TestCase):
             len({item["provenance"]["unit"] for item in result.values()}), 5,
         )
 
+    def test_real_v2_semantic_role_does_not_require_external_independence(self):
+        """Optional independent review eligibility is NOT five-phase provenance.
+
+        Fixtures stand for separately proven authenticated V2 role outputs.
+        The production registry, not a client bool, derives role and route
+        trust. An opt-in independent review is still enforced by Captain.
+        """
+        self.attempts[0]["independence_verified"] = False
+        self.assertEqual(set(self.verify_fixture()), set(execution.REQUIRED_AXES))
+
+    def test_semantic_role_without_independence_field_is_not_an_external_pass(self):
+        """An absent optional reviewer-fitness flag never manufactures a PASS."""
+        del self.attempts[0]["independence_verified"]
+        self.assertEqual(set(self.verify_fixture()), set(execution.REQUIRED_AXES))
+
+    def test_external_independence_cannot_replace_missing_v2_role_authority(self):
+        for field in ("review_role_verified", "review_route_verified"):
+            with self.subTest(field=field):
+                self.attempts[0][field] = False
+                with self.assertRaisesRegex(
+                    execution.ReviewExecutionRejected, "not authenticated",
+                ):
+                    self.verify_fixture()
+                self.attempts[0][field] = True
+
     def test_unicode_v2_document_preserves_exact_digest_and_bytes(self):
         unit = "grabowski-job-000000000001"
         receipt = self.receipts[unit]

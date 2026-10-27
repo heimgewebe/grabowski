@@ -1165,19 +1165,39 @@ def _review_sandbox_argv(
     return sandbox, GROK_REVIEW_STREAM_CONTRACT, prompt_bytes
 
 
+class DuplicateReviewJSONKey(ValueError):
+    """Ambiguous reviewer or event JSON cannot be safely superseded."""
+
+
 def _terminal_json_object(text: str) -> dict[str, Any] | None:
     """Return the unique JSON object suffix of terminal assistant text."""
     stripped = text.rstrip()
     candidates: list[dict[str, Any]] = []
-    decoder = json.JSONDecoder()
+    decoder = json.JSONDecoder(object_pairs_hook=_unique_review_json_object)
     for index, character in enumerate(stripped):
         if character != "{":
             continue
         try:
             value, consumed = decoder.raw_decode(stripped[index:])
-        except json.JSONDecodeError:
+        except DuplicateReviewJSONKey:
+            # Never skip an earlier malformed material REJECT and accept a
+            # later apparently valid PASS from the same model output.
+            return None
+        except ValueError:
             continue
-        if stripped[index + consumed :].strip():
+        remaining = stripped[index + consumed :].strip()
+        # An earlier *complete* review verdict can contain material REJECT
+        # evidence. A later PASS in the same provider transcript may not
+        # supersede or silently discard it. Ordinary prose followed by one
+        # review object remains allowed, but multiple semantic decisions are
+        # an ambiguous and therefore inadmissible provider result.
+        if (
+            isinstance(value, dict)
+            and {"verdict", "findings"}.issubset(value)
+            and remaining
+        ):
+            return None
+        if remaining:
             continue
         if isinstance(value, dict):
             candidates.append(value)
@@ -1212,8 +1232,8 @@ def _extract_grok_stream_review_document(
         if not line:
             continue
         try:
-            event = json.loads(line)
-        except json.JSONDecodeError as exc:
+            event = json.loads(line, object_pairs_hook=_unique_review_json_object)
+        except ValueError as exc:
             return None, f"Grok review stream line {line_number} is invalid JSON: {exc}", metadata
         if not isinstance(event, dict) or not isinstance(event.get("type"), str):
             return None, f"Grok review stream line {line_number} is not a typed object", metadata
@@ -1346,12 +1366,12 @@ def _valid_complete_claude_semantic_review(value: dict[str, Any]) -> bool:
     return True
 
 
-def _unique_claude_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    """Reject duplicate keys even in nested source or provider envelopes."""
+def _unique_review_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """Reject duplicate keys in reviewer events, verdicts and envelopes."""
     result: dict[str, Any] = {}
     for key, value in pairs:
         if key in result:
-            raise ValueError("duplicate Claude JSON member")
+            raise DuplicateReviewJSONKey("duplicate reviewer JSON member")
         result[key] = value
     return result
 
@@ -1368,7 +1388,7 @@ def _extract_claude_review_document(
     try:
         envelope = json.loads(
             raw.decode("utf-8", errors="strict"),
-            object_pairs_hook=_unique_claude_json_object,
+            object_pairs_hook=_unique_review_json_object,
         )
     except (UnicodeDecodeError, ValueError) as exc:
         return None, f"Claude review result is not a valid JSON envelope: {exc}", metadata

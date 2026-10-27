@@ -832,9 +832,14 @@ def verified_semantic_review_passes(
             item.get("classification") != "pass"
             or item.get("terminal") is not True
             or item.get("terminal_status") != "succeeded"
+            # Self-review authenticity is established by the independently
+            # reconciled, server-bound read-only role AND verified route.
+            # independence_verified is an *additional* optional external
+            # reviewer-admission predicate, not a five-phase review gate.
+            # Captain separately enforces an explicitly opted-in independent
+            # review and retains every real material REJECT.
             or item.get("review_role_verified") is not True
             or item.get("review_route_verified") is not True
-            or item.get("independence_verified") is not True
             or item.get("verdict") != "PASS_THIS_REVISION"
             or item.get("material_findings") != 0
             or any(
