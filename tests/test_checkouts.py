@@ -7095,6 +7095,59 @@ class CheckoutLifecycleTests(unittest.TestCase):
         finally:
             writer.close()
 
+    def test_live_resource_wal_inventory_keeps_pinned_transaction(self) -> None:
+        writer = checkouts.resources._database()
+        try:
+            writer.execute("PRAGMA wal_autocheckpoint=0")
+            writer.execute("CREATE TABLE inventory_wal_probe(value INTEGER)")
+            writer.execute("INSERT INTO inventory_wal_probe VALUES(1)")
+            writer.commit()
+            wal = Path(str(self.resource_db) + "-wal")
+            shm = Path(str(self.resource_db) + "-shm")
+            self.assertTrue(wal.is_file())
+            self.assertTrue(shm.is_file())
+            # Exercise the exact lease-reader fanout inside the pinned WAL scope.
+            with checkouts._strict_inventory_readonly_scope():
+                leases = checkouts._read_resource_leases()
+            self.assertIsInstance(leases, list)
+            inventory = checkouts.checkout_inventory(
+                self.repo, include_processes=False,
+                include_tasks=False, include_resources=True,
+            )
+            self.assertIn("worktrees", inventory)
+            self.assertTrue(wal.is_file())
+            self.assertTrue(shm.is_file())
+        finally:
+            writer.close()
+
+    def test_live_task_wal_requires_durable_job_before_shm_access(self) -> None:
+        writer = checkouts.tasks._database()
+        try:
+            writer.execute("PRAGMA wal_autocheckpoint=0")
+            writer.execute("CREATE TABLE inventory_task_wal_probe(value INTEGER)")
+            writer.execute("INSERT INTO inventory_task_wal_probe VALUES(1)")
+            writer.commit()
+            files = [self.task_db, Path(str(self.task_db) + "-wal"),
+                     Path(str(self.task_db) + "-shm")]
+            self.assertTrue(all(f.is_file() for f in files))
+            before = {str(f): f.read_bytes() for f in files}
+
+            def deny_task_wal(capability: str) -> None:
+                if capability == "durable_job":
+                    raise PermissionError("task WAL admission denied")
+
+            with (
+                patch.object(checkouts.operator, "_require_operator_mutation",
+                             side_effect=deny_task_wal) as gate,
+                checkouts._strict_inventory_readonly_scope(),
+            ):
+                with self.assertRaisesRegex(PermissionError, "task WAL admission denied"):
+                    checkouts._readonly_connection(checkouts.tasks.TASK_DB)
+            gate.assert_called_once_with("durable_job")
+            self.assertEqual(before, {str(f): f.read_bytes() for f in files})
+        finally:
+            writer.close()
+
     def test_public_checkout_inventory_refuses_live_wal_without_shm(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)

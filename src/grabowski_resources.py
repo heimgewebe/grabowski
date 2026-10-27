@@ -471,7 +471,10 @@ def _validate_resource_lease_contract(connection: sqlite3.Connection) -> str:
 def _begin_resource_lease_projection_read(
     connection: sqlite3.Connection, *, quick_integrity: bool = False
 ) -> str:
-    connection.execute("BEGIN")
+    # The WAL inventory reader may already have pinned a transaction.
+    # A second BEGIN aborts the lease projection; retain that exact snapshot.
+    if not connection.in_transaction:
+        connection.execute("BEGIN")
     if quick_integrity:
         _resource_sqlite_integrity(connection, "Resource database", quick=True)
     return _validate_resource_lease_contract(connection)
