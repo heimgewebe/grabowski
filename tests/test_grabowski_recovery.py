@@ -316,12 +316,33 @@ class NativeNixOSResticProofTests(unittest.TestCase):
             recovery, "_nixos_local_recovery_probe_locked",
             return_value={"mode": "nixos"}
         ) as native:
-            with patch.object(recovery, "_NIXOS_RESTIC_TIMER_PRESENT", False):
-                self.assertEqual(recovery._local_recovery_probe(self.target)["mode"], "legacy")
-            with patch.object(recovery, "_NIXOS_RESTIC_TIMER_PRESENT", True):
-                self.assertEqual(recovery._local_recovery_probe(self.target)["mode"], "nixos")
+            with patch.object(recovery, "_NIXOS_OS_PRESENT", False):
+                with patch.object(recovery, "_NIXOS_RESTIC_TIMER_PRESENT", False):
+                    self.assertEqual(recovery._local_recovery_probe(self.target)["mode"], "legacy")
+                with patch.object(recovery, "_NIXOS_RESTIC_TIMER_PRESENT", True):
+                    self.assertEqual(recovery._local_recovery_probe(self.target)["mode"], "nixos")
             legacy.assert_called_once()
             native.assert_called_once()
+
+    def test_nixos_missing_native_timer_never_dispatches_legacy_restore(self) -> None:
+        from contextlib import nullcontext
+        with patch.object(recovery, "_NIXOS_OS_PRESENT", True), patch.object(
+            recovery, "_NIXOS_RESTIC_TIMER_PRESENT", False
+        ), patch.object(
+            recovery, "_local_recovery_repository_operation_lock",
+            return_value=nullcontext()
+        ) as lock, patch.object(
+            recovery, "_local_recovery_probe_locked",
+            return_value={"mode": "legacy-restore-bypass"}
+        ) as legacy, patch.object(
+            recovery, "_nixos_local_recovery_probe_locked",
+            return_value={"mode": "nixos"}
+        ) as native:
+            with self.assertRaisesRegex(RuntimeError, "native.*unavailable"):
+                recovery._local_recovery_probe(self.target)
+            legacy.assert_not_called()
+            native.assert_not_called()
+            lock.assert_not_called()
 
     def _root_proof(self) -> dict[str, object]:
         return {

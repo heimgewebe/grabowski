@@ -1801,6 +1801,11 @@ def _nixos_local_recovery_probe_locked(target_info: dict[str, Any]) -> dict[str,
 
 
 def _local_recovery_probe(target_info: dict[str, Any]) -> dict[str, Any]:
+    # Never migrate backwards to the legacy privileged restore executor if
+    # NixOS has lost its native systemd timer or unit. Fail before any lock,
+    # mount, Restic invocation or recovery publication.
+    if _NIXOS_OS_PRESENT and not _NIXOS_RESTIC_TIMER_PRESENT:
+        raise RuntimeError("NixOS native Restic timer is unavailable")
     with _local_recovery_repository_operation_lock():
         if _NIXOS_RESTIC_TIMER_PRESENT:
             return _nixos_local_recovery_probe_locked(target_info)
