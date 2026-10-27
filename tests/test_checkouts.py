@@ -115,6 +115,160 @@ class CheckoutLifecycleTests(unittest.TestCase):
             text=True,
         )
 
+    def test_parallel_checkout_reservations_never_admit_seventeenth_live_lease(self) -> None:
+        """Force the 15/16 stale-lease schedule without timing-dependent sleeps.
+
+        Resource lease evidence is simulated, but concurrent checkout
+        admissions use separate real SQLite connections and writer locks.
+        """
+        import threading
+
+        common_dir = self._common_dir()
+        until = int(time.time()) + 3600
+
+        def reserve(index: str) -> dict[str, object]:
+            return checkouts._reserve_checkout_lifecycle(
+                repo_common_dir=common_dir,
+                repo_path=self.repo,
+                checkout_path=self.root / "worktrees" / f"race-{index}",
+                owner_id=f"race-owner-{index}",
+                purpose=f"race admission {index}",
+                source_kind="work_lane",
+                source_id=f"race-{index}",
+                artifact_class="implementation-worktree",
+                retention_until_unix=until,
+                expected_head=self.head,
+                expected_branch=f"race-{index}",
+            )
+
+        leases: dict[str, str] = {}
+        for index in range(15):
+            binding = reserve(str(index))
+            leases[f"path:{binding['checkout_path']}"] = f"race-owner-{index}"
+        leases[f"path:{self.root / 'worktrees' / 'race-A'}"] = "race-owner-A"
+
+        a_snapshot_seen = threading.Event()
+        b_finished = threading.Event()
+        a_was_locked: list[bool] = []
+        successes: list[str] = []
+        failures: list[BaseException] = []
+
+        def controlled_snapshot(*, now: int) -> dict[str, str]:
+            del now
+            observed = dict(leases)
+            if threading.current_thread().name == "race-admission-A":
+                probe = sqlite3.connect(self.checkout_db, timeout=0)
+                try:
+                    try:
+                        probe.execute("BEGIN IMMEDIATE")
+                    except sqlite3.OperationalError as exc:
+                        if "locked" not in str(exc):
+                            raise
+                        admission_lock_held = True
+                    else:
+                        admission_lock_held = False
+                    finally:
+                        probe.rollback()
+                finally:
+                    probe.close()
+                a_was_locked.append(admission_lock_held)
+                a_snapshot_seen.set()
+                if not admission_lock_held:
+                    if not b_finished.wait(5):
+                        raise AssertionError("B did not finish before stale A snapshot")
+            return observed
+
+        def acquire_a() -> None:
+            try:
+                reserve("A")
+            except BaseException as exc:
+                failures.append(exc)
+            else:
+                successes.append("A")
+
+        with patch.object(
+            checkouts, "_live_checkout_lease_keys", side_effect=controlled_snapshot
+        ):
+            a = threading.Thread(target=acquire_a, name="race-admission-A", daemon=True)
+            a.start()
+            self.assertTrue(a_snapshot_seen.wait(5), "A never sampled leases")
+            try:
+                # B acquires its exact lease after A has sampled the store.
+                leases[f"path:{self.root / 'worktrees' / 'race-B'}"] = "race-owner-B"
+                try:
+                    reserve("B")
+                except RuntimeError as exc:
+                    failures.append(exc)
+                else:
+                    successes.append("B")
+            finally:
+                b_finished.set()
+            a.join(5)
+
+        self.assertFalse(a.is_alive(), "A admission did not terminate")
+        self.assertEqual(len(successes), 1, f"two writers admitted: {successes}")
+        self.assertEqual(len(failures), 1, f"expected one capacity rejection: {failures}")
+        self.assertIn("active checkout limit", str(failures[0]))
+        self.assertEqual(a_was_locked, [True])
+        connection = checkouts._database()
+        try:
+            rows = connection.execute(
+                "SELECT owner_id, checkout_path FROM lifecycle_bindings "
+                "WHERE repo_common_dir=? AND phase='active'",
+                (str(common_dir),),
+            ).fetchall()
+        finally:
+            connection.close()
+        actual_live = sum(
+            leases.get(f"path:{row['checkout_path']}") == row["owner_id"]
+            for row in rows
+        )
+        self.assertEqual(actual_live, 16)
+        self.assertEqual(len(rows), 16)
+
+    def test_checkout_reservation_pins_lease_snapshot_under_sqlite_write_lock(self) -> None:
+        # A snapshot taken before BEGIN IMMEDIATE can omit another lane's
+        # committed live leases even after its lifecycle row becomes visible.
+        # Probe the *second* SQLite connection: it must be denied the writer
+        # lock while the admission routine reads its resource lease snapshot.
+        initialized = checkouts._database()
+        initialized.close()
+        observed = []
+
+        def snapshot_after_admission_lock(*, now: int) -> dict[str, str]:
+            self.assertIsInstance(now, int)
+            probe = sqlite3.connect(self.checkout_db, timeout=0)
+            try:
+                with self.assertRaisesRegex(sqlite3.OperationalError, "locked"):
+                    probe.execute("BEGIN IMMEDIATE")
+            finally:
+                probe.rollback()
+                probe.close()
+            observed.append("checkout-write-lock-held")
+            return {}
+
+        target = self.root / "worktrees" / "serialized-admission"
+        with patch.object(
+            checkouts, "_live_checkout_lease_keys",
+            side_effect=snapshot_after_admission_lock,
+        ) as lease_snapshot:
+            result = checkouts._reserve_checkout_lifecycle(
+                repo_common_dir=self._common_dir(),
+                repo_path=self.repo,
+                checkout_path=target,
+                owner_id="owner-a",
+                purpose="verify serialized capacity lease snapshot",
+                source_kind="bureau_task",
+                source_id="CAPACITY-RACE-P2",
+                artifact_class="operator_worktree",
+                retention_until_unix=int(time.time()) + 3600,
+                expected_head=self.head,
+                expected_branch="feat/serialized-admission",
+            )
+        self.assertEqual(observed, ["checkout-write-lock-held"])
+        lease_snapshot.assert_called_once()
+        self.assertEqual(result["owner_id"], "owner-a")
+
     def test_operation_lock_deadline_uses_nonblocking_bounded_wait(self) -> None:
         lock_attempt = checkouts.fcntl.LOCK_EX | checkouts.fcntl.LOCK_NB
         calls: list[int] = []
@@ -5677,8 +5831,10 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self.assertEqual(capacity["expired_unclassified_active_rows"], 0)
         self.assertTrue(capacity["path_classification_complete"])
         self.assertEqual(capacity["path_observations_attempted"], 2)
-        self.assertEqual(capacity["used"], 1)
-        self.assertEqual(capacity["free"], checkouts.MAX_ACTIVE_CHECKOUTS_PER_REPO - 1)
+        self.assertEqual(capacity["unexpired_active_rows"], 1)
+        self.assertEqual(capacity["retained_without_live_lease_rows"], 1)
+        self.assertEqual(capacity["used"], 0)
+        self.assertEqual(capacity["free"], checkouts.MAX_ACTIVE_CHECKOUTS_PER_REPO)
         self.assertFalse(capacity["saturated"])
         self.assertIn("checkout_path_reuse_authority", capacity["does_not_establish"])
 
@@ -6917,6 +7073,80 @@ class CheckoutLifecycleTests(unittest.TestCase):
         for call in gate.call_args_list:
             self.assertEqual(call.args, ("resource_lease",))
         reader.assert_not_called()
+
+    def test_public_checkout_inventory_reads_ordinary_live_wal(self) -> None:
+        writer = checkouts._database()
+        try:
+            writer.execute("PRAGMA wal_autocheckpoint=0")
+            writer.execute("CREATE TABLE live_snapshot_probe(value INTEGER)")
+            writer.execute("INSERT INTO live_snapshot_probe VALUES(1)")
+            writer.commit()
+            wal = Path(str(self.checkout_db) + "-wal")
+            shm = Path(str(self.checkout_db) + "-shm")
+            self.assertTrue(wal.is_file())
+            self.assertTrue(shm.is_file())
+            inventory = checkouts.checkout_inventory(
+                self.repo, include_processes=False,
+                include_tasks=False, include_resources=False,
+            )
+            self.assertTrue(inventory["active_capacity"]["available"])
+            self.assertTrue(wal.is_file())
+            self.assertTrue(shm.is_file())
+        finally:
+            writer.close()
+
+    def test_live_resource_wal_inventory_keeps_pinned_transaction(self) -> None:
+        writer = checkouts.resources._database()
+        try:
+            writer.execute("PRAGMA wal_autocheckpoint=0")
+            writer.execute("CREATE TABLE inventory_wal_probe(value INTEGER)")
+            writer.execute("INSERT INTO inventory_wal_probe VALUES(1)")
+            writer.commit()
+            wal = Path(str(self.resource_db) + "-wal")
+            shm = Path(str(self.resource_db) + "-shm")
+            self.assertTrue(wal.is_file())
+            self.assertTrue(shm.is_file())
+            # Exercise the exact lease-reader fanout inside the pinned WAL scope.
+            with checkouts._strict_inventory_readonly_scope():
+                leases = checkouts._read_resource_leases()
+            self.assertIsInstance(leases, list)
+            inventory = checkouts.checkout_inventory(
+                self.repo, include_processes=False,
+                include_tasks=False, include_resources=True,
+            )
+            self.assertIn("worktrees", inventory)
+            self.assertTrue(wal.is_file())
+            self.assertTrue(shm.is_file())
+        finally:
+            writer.close()
+
+    def test_live_task_wal_requires_durable_job_before_shm_access(self) -> None:
+        writer = checkouts.tasks._database()
+        try:
+            writer.execute("PRAGMA wal_autocheckpoint=0")
+            writer.execute("CREATE TABLE inventory_task_wal_probe(value INTEGER)")
+            writer.execute("INSERT INTO inventory_task_wal_probe VALUES(1)")
+            writer.commit()
+            files = [self.task_db, Path(str(self.task_db) + "-wal"),
+                     Path(str(self.task_db) + "-shm")]
+            self.assertTrue(all(f.is_file() for f in files))
+            before = {str(f): f.read_bytes() for f in files}
+
+            def deny_task_wal(capability: str) -> None:
+                if capability == "durable_job":
+                    raise PermissionError("task WAL admission denied")
+
+            with (
+                patch.object(checkouts.operator, "_require_operator_mutation",
+                             side_effect=deny_task_wal) as gate,
+                checkouts._strict_inventory_readonly_scope(),
+            ):
+                with self.assertRaisesRegex(PermissionError, "task WAL admission denied"):
+                    checkouts._readonly_connection(checkouts.tasks.TASK_DB)
+            gate.assert_called_once_with("durable_job")
+            self.assertEqual(before, {str(f): f.read_bytes() for f in files})
+        finally:
+            writer.close()
 
     def test_public_checkout_inventory_refuses_live_wal_without_shm(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
