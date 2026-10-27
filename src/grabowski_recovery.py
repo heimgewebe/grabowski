@@ -1657,9 +1657,10 @@ def _nixos_local_recovery_probe_locked(target_info: dict[str, Any]) -> dict[str,
     log_dir.mkdir(parents=True, exist_ok=True)
     started_at = int(time.time())
     log_path = log_dir / f"nixos-restic-recovery-{started_at}.log"
-    # Polkit grants only start of this exact root-owned NixOS unit. The
-    # operator can retain NoNewPrivileges=yes, needs no sudo and chooses no
-    # privileged Restic argv or restore/cleanup directory.
+    # Polkit grants only this exact root-owned NixOS unit start; this
+    # recovery call needs no sudo and chooses no privileged Restic argv.
+    # NoNewPrivileges restricts this operator service's own process tree.
+    # Separately launched user@1000 jobs retain the host's sudo policy.
     _run_logged(
         ["/run/current-system/sw/bin/systemctl", "--system", "start",
          NIXOS_RESTIC_ROOT_PROOF_UNIT],
