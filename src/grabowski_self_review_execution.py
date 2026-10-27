@@ -48,9 +48,10 @@ TRUSTED_SIGNERS = (
 SHA40 = re.compile(r"[a-f0-9]{40}\Z")
 SHA256 = re.compile(r"[a-f0-9]{64}\Z")
 ID = re.compile(r"[a-f0-9]{32}\Z")
-REF = re.compile(r"(?P<path>[A-Za-z0-9_.@+/-]+):L(?P<start>[1-9][0-9]{0,6})(?:-L(?P<end>[1-9][0-9]{0,6}))?\Z")
+REF = re.compile(r"(?P<path>[A-Za-z0-9_.@+/-]+)(?::(?P<source_revision>[a-f0-9]{40}))?:L(?P<start>[1-9][0-9]{0,6})(?:-L(?P<end>[1-9][0-9]{0,6}))?\Z")
 MAX_RECEIPT = 16384
 MAX_OUTPUT = 1024 * 1024
+MAX_SOURCE_BLOB = 2 * 1024 * 1024
 MAX_REFERENCES = 64
 PHASE_OBSERVATION_PREFIX = b"grabowski-phase-source-inspection-v1:"
 
@@ -305,14 +306,37 @@ def trusted_phase_source(
     root = json.dumps(worktree)
     selected = json.dumps(suite)
     return (
-        "import hashlib,json,os,subprocess,sys\n"
+        "import hashlib,json,os,subprocess,sys,selectors,signal,time,types\n"
         f"binding=json.loads({literal})\n"
         f"repo={root}\n"
         f"suite={selected}\n"
-        "def run(*args):\n"
-        "    env=os.environ.copy(); env['GIT_OPTIONAL_LOCKS']='0'\n"
-        "    return subprocess.run(['git','--no-replace-objects','-C',repo,*args],"
-        "capture_output=True,timeout=60,env=env,check=False)\n"
+        "def bounded(argv,limit,timeout):\n"
+        "    env=os.environ.copy();env['GIT_OPTIONAL_LOCKS']='0'\n"
+        "    child=subprocess.Popen(argv,cwd=repo,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,env=env,start_new_session=True)\n"
+        "    chunks=[];size=0;deadline=time.monotonic()+timeout\n"
+        "    selector=selectors.DefaultSelector()\n"
+        "    try:\n"
+        "        selector.register(child.stdout,selectors.EVENT_READ)\n"
+        "        while True:\n"
+        "            remaining=deadline-time.monotonic()\n"
+        "            if remaining<=0 or not selector.select(remaining):\n"
+        "                raise TimeoutError('review subprocess deadline')\n"
+        "            chunk=os.read(child.stdout.fileno(),65536)\n"
+        "            if not chunk:break\n"
+        "            size+=len(chunk)\n"
+        "            if size>limit:raise ValueError('review command output over budget')\n"
+        "            chunks.append(chunk)\n"
+        "        status=child.wait(timeout=max(0.1,deadline-time.monotonic()))\n"
+        "        return types.SimpleNamespace(stdout=b''.join(chunks),stderr=b'',returncode=status)\n"
+        "    except (TimeoutError,ValueError,subprocess.TimeoutExpired):\n"
+        "        try:os.killpg(child.pid,signal.SIGKILL)\n"
+        "        except ProcessLookupError:pass\n"
+        "        child.wait()\n"
+        "        sys.exit(98)\n"
+        "    finally:\n"
+        "        selector.close();child.stdout.close()\n"
+        "def run(*args,limit=2097152):\n"
+        "    return bounded(['git','--no-replace-objects','-C',repo,*args],limit,60)\n"
         "head=run('rev-parse','HEAD')\n"
         "if head.returncode or head.stdout.strip().decode()!=binding['head_sha']:"
         "sys.exit(81)\n"
@@ -325,40 +349,57 @@ def trusted_phase_source(
         "binding['head_sha'],'--')\n"
         "if delta.returncode or len(delta.stdout)>1048576:sys.exit(84)\n"
         "sys.stdout.buffer.write(b'source_raw_diff_sha256:'+hashlib.sha256(delta.stdout).hexdigest().encode()+b'\\n')\n"
-        "probe=subprocess.run([sys.executable,'-B','-m','unittest','discover',"
-        "'-s','tests','-p',suite,'-q'],cwd=repo,capture_output=True,"
-        "timeout=240,check=False)\n"
-        "sys.stdout.buffer.write(probe.stdout+probe.stderr)\n"
+        "probe=bounded([sys.executable,'-B','-m','unittest','discover','-s','tests','-p',suite,'-q'],1048576,240)\n"
+        "sys.stdout.buffer.write(probe.stdout)\n"
         "import ast,re\n"
         f"axis={json.dumps(axis)}\n"
         "if probe.returncode:sys.exit(probe.returncode)\n"
-        "inspection=run('diff','--name-only','--no-renames',binding['base_sha'],binding['head_sha'],'--')\n"
-        "if inspection.returncode or len(inspection.stdout)>131072:sys.exit(85)\n"
-        "changed=[p for p in inspection.stdout.decode('utf-8').splitlines() if p]\n"
+        "inspection=run('diff','--name-status','-z','--no-renames',binding['base_sha'],binding['head_sha'],'--',limit=131072)\n"
+        "if inspection.returncode:sys.exit(85)\n"
+        "fields=inspection.stdout.split(b'\\x00')\n"
+        "if len(fields)<3 or fields[-1]!=b'':sys.exit(85)\n"
+        "fields=fields[:-1]\n"
+        "if len(fields)%2:sys.exit(85)\n"
+        "changed=[]\n"
+        "for pos in range(0,len(fields),2):\n"
+        "    try:status=fields[pos].decode('ascii');path=fields[pos+1].decode('utf-8')\n"
+        "    except UnicodeError:sys.exit(85)\n"
+        "    if status not in ('A','D','M','T') or not re.fullmatch(r'[A-Za-z0-9_.@+/-]{1,512}',path) or '..' in path.split('/'):sys.exit(87)\n"
+        "    changed.append((status,path))\n"
         "if not changed or len(changed)>256:sys.exit(86)\n"
-        "paths=[]; refs=[]; ast_stmts=0; defined_symbols=0; json_docs=0\n"
-        "for path in changed:\n"
-        "    if not re.fullmatch(r'[A-Za-z0-9_.@+/-]{1,512}',path) or '..' in path.split('/'):sys.exit(87)\n"
-        "    blob=run('show',binding['head_sha']+':'+path)\n"
-        "    if blob.returncode:sys.exit(91)\n"
-        "    if len(blob.stdout)>2097152 or b'\\x00' in blob.stdout:sys.exit(92)\n"
-        "    try: content=blob.stdout.decode('utf-8')\n"
+        "def blob_at(revision,path):\n"
+        "    tree=run('ls-tree','-z',revision,'--',path,limit=4096)\n"
+        "    if tree.returncode or tree.stdout.count(b'\\x00')!=1 or not tree.stdout.endswith(b'\\x00'):sys.exit(94)\n"
+        "    try:\n"
+        "        metadata,name=tree.stdout[:-1].split(b'\\t',1)\n"
+        "        mode,kind,sha=metadata.split()\n"
+        "        if name.decode('utf-8')!=path or mode not in (b'100644',b'100755') or kind!=b'blob' or len(sha)!=40:sys.exit(95)\n"
+        "    except (ValueError,UnicodeError):sys.exit(95)\n"
+        "    blob=run('show',revision+':'+path,limit=2097152)\n"
+        "    if blob.returncode or b'\\x00' in blob.stdout:sys.exit(92)\n"
+        "    try:return blob.stdout.decode('utf-8')\n"
         "    except UnicodeError:sys.exit(93)\n"
+        "paths=[];refs=[];ast_stmts=0;defined_symbols=0;json_docs=0\n"
+        "for status,path in changed:\n"
+        "    sides=([binding['head_sha']] if status=='A' else [binding['base_sha']] if status=='D' else [binding['base_sha'],binding['head_sha']])\n"
+        "    for revision in sides:\n"
+        "        content=blob_at(revision,path)\n"
         "    if path.endswith('.py'):\n"
-        "        try: tree=ast.parse(content,filename=path)\n"
+        "        try:tree=ast.parse(content,filename=path)\n"
         "        except SyntaxError:sys.exit(88)\n"
         "        ast_stmts+=sum(isinstance(n,ast.stmt) for n in ast.walk(tree))\n"
         "        defined_symbols+=sum(isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef,ast.ClassDef)) for n in ast.walk(tree))\n"
         "    elif path.endswith('.json'):\n"
-        "        try: json.loads(content)\n"
+        "        try:json.loads(content)\n"
         "        except ValueError:sys.exit(89)\n"
         "        json_docs+=1\n"
         "    pathlines=content.splitlines()\n"
-        "    if len(pathlines)>0:\n"
-        "        nonempty=next((i for i,line in enumerate(pathlines,1) if line.strip()),None)\n"
-        "        if nonempty and nonempty<999999:refs.append(path+':L'+str(nonempty))\n"
+        "    nonempty=next((i for i,line in enumerate(pathlines,1) if line.strip()),None)\n"
+        "    if nonempty is not None:\n"
+        "        revision_suffix=(':'+binding['base_sha']) if status=='D' else ''\n"
+        "        refs.append(path+revision_suffix+':L'+str(nonempty))\n"
         "    paths.append(path)\n"
-        "if not paths or not refs:sys.exit(90)\n"
+        "if len(paths)!=len(changed) or not refs:sys.exit(90)\n"
         "axes=['contracts_correctness','regression_compatibility','tests_negative_cases','security_authority_concurrency','adversarial_countercheck','additional_adversarial_probe']\n"
         "focus={'contracts_correctness':'interface and contract','regression_compatibility':'compatibility regression','tests_negative_cases':'negative and failure-path','security_authority_concurrency':'security authority and concurrency','adversarial_countercheck':'adversarial countercheck','additional_adversarial_probe':'additional threat probe'}[axis]\n"
         "source_digest=hashlib.sha256(delta.stdout).hexdigest()\n"
@@ -598,28 +639,49 @@ def _source_reference(
     head: str,
     repository: Path,
     read_source: Callable[[str, str], bytes] | None,
+    base: str | None = None,
 ) -> None:
     match = REF.fullmatch(ref) if isinstance(ref, str) else None
     if match is None or ".." in Path(match["path"]).parts:
         raise ReviewExecutionRejected("unresolvable self-review evidence reference")
+    chosen_revision = match["source_revision"] or head
+    if chosen_revision != head and (base is None or chosen_revision != base):
+        raise ReviewExecutionRejected("self-review source reference revision not bound")
     first = int(match["start"])
     last = int(match["end"] or match["start"])
     if first > last or last - first > 1000:
         raise ReviewExecutionRejected("self-review evidence range invalid")
     if read_source is not None:
-        data = read_source(head, match["path"])
+        data = read_source(chosen_revision, match["path"])
     else:
+        # Git blob SHA identities are content-addressed. Refuse oversized
+        # content *before* spawning a process that could buffer its contents.
+        target = f"{chosen_revision}:{match['path']}"
         try:
+            size = subprocess.run(
+                ["git", "--no-replace-objects", "-C", str(repository),
+                 "cat-file", "-s", target],
+                capture_output=True, timeout=15, check=False,
+            )
+            if (
+                size.returncode != 0 or len(size.stdout) > 20
+                or not size.stdout.strip().isdigit()
+            ):
+                raise ReviewExecutionRejected("self-review source blob size unavailable")
+            expected_bytes = int(size.stdout.strip())
+            if expected_bytes > MAX_SOURCE_BLOB:
+                raise ReviewExecutionRejected("self-review referenced file over budget")
             proc = subprocess.run(
-                ["git", "-C", str(repository), "show", f"{head}:{match['path']}"],
+                ["git", "--no-replace-objects", "-C", str(repository),
+                 "show", target],
                 capture_output=True, timeout=15, check=False,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise ReviewExecutionRejected("self-review Git evidence unavailable") from exc
-        if proc.returncode != 0 or len(proc.stdout) > MAX_OUTPUT:
+        if proc.returncode != 0 or len(proc.stdout) != expected_bytes:
             raise ReviewExecutionRejected("self-review referenced file unavailable")
         data = proc.stdout
-    if not isinstance(data, bytes) or b"\x00" in data:
+    if not isinstance(data, bytes) or len(data) > MAX_SOURCE_BLOB or b"\x00" in data:
         raise ReviewExecutionRejected("self-review referenced file is not reviewable text")
     try:
         lines = data.decode("utf-8").splitlines()
@@ -627,6 +689,194 @@ def _source_reference(
         raise ReviewExecutionRejected("self-review referenced text invalid") from exc
     if last > len(lines) or not any(lines[first - 1:last]):
         raise ReviewExecutionRejected("self-review evidence range not present")
+
+
+
+
+def verified_semantic_review_passes(
+    binding: dict[str, Any], *, repository: Path,
+    axes_to_review: tuple[str, ...] = REQUIRED_AXES,
+) -> dict[str, dict[str, Any]]:
+    """Use existing V2 role origins, never green test tasks, as semantic authority.
+
+    The reviewer role must have actually executed a catalog-bound, read-only
+    model route on the exact revision.  Its full structured JSON analysis must
+    survive unchanged inside the recorded, digest-bound role stdout. Missing,
+    abbreviated, provider-failed or fabricated reviews are a hard BLOCK.
+    """
+    import grabowski_decision_reviews as decisions
+
+    expected = {
+        key: binding[key] for key in (
+            "repo", "pr", "base_sha", "head_sha", "diff_sha256",
+            "review_batch_id", "review_purpose",
+        )
+    }
+    result = decisions.reconcile(
+        repo=expected["repo"], pr=expected["pr"],
+        head_sha=expected["head_sha"], base_sha=expected["base_sha"],
+        diff_sha256=expected["diff_sha256"],
+    )
+    if (
+        not isinstance(result, dict) or result.get("status") != "settled"
+        or result.get("errors") != []
+        or not isinstance(result.get("attempts"), list)
+    ):
+        raise ReviewExecutionRejected("substantive V2 reviewer execution not settled")
+    attempts = result["attempts"]
+    if not (
+        axes_to_review == REQUIRED_AXES
+        or axes_to_review == (*REQUIRED_AXES, "additional_adversarial_probe")
+    ):
+        raise ReviewExecutionRejected("semantic method scope invalid")
+    accepted: dict[str, dict[str, Any]] = {}
+    used_units: set[str] = set()
+    summaries: set[str] = set()
+    for sequence, axis in enumerate(axes_to_review, start=1):
+        slot = f"selfrev.{expected['review_batch_id'][:16]}.{axis}"
+        matches = [item for item in attempts if item.get("slot") == slot]
+        if len(matches) != 1:
+            raise ReviewExecutionRejected("substantive V2 reviewer axis absent or ambiguous")
+        item = matches[0]
+        if (
+            item.get("classification") != "pass"
+            or item.get("terminal") is not True
+            or item.get("terminal_status") != "succeeded"
+            or item.get("review_role_verified") is not True
+            or item.get("review_route_verified") is not True
+            or item.get("independence_verified") is not True
+            or item.get("verdict") != "PASS_THIS_REVISION"
+            or item.get("material_findings") != 0
+            or any(
+                not isinstance(item.get(key), str)
+                or not item[key]
+                for key in (
+                    "origin_sha256", "result_sha256",
+                    "review_role_receipt_sha256",
+                    "review_route_id", "review_provider_family",
+                )
+            )
+        ):
+            raise ReviewExecutionRejected("substantive V2 reviewer result not authenticated")
+        unit = item.get("unit")
+        if (
+            not isinstance(unit, str)
+            or re.fullmatch(r"grabowski-job-[0-9a-f]{12}", unit) is None
+            or unit in used_units
+        ):
+            raise ReviewExecutionRejected("substantive V2 reviewer task replayed")
+        used_units.add(unit)
+        path = decisions.JOBS_ROOT / unit / decisions.REVIEW_ROLE_ATTEMPT_RECEIPT_NAME
+        try:
+            receipt = decisions._read_private_json(
+                path, decisions.MAX_ROLE_RECEIPT_BYTES,
+                require_private_parent=True,
+            )
+        except (OSError, ValueError) as exc:
+            raise ReviewExecutionRejected("substantive V2 role receipt unavailable") from exc
+        if (
+            receipt.get("receipt_sha256") != item["review_role_receipt_sha256"]
+            or receipt.get("receipt_sha256") != decisions._agent_role_receipt_sha256(receipt)
+            or receipt.get("verdict") != "PASS"
+            or receipt.get("findings") != []
+            or receipt.get("failure_classification") != "passed"
+            or receipt.get("returncode") != 0
+        ):
+            raise ReviewExecutionRejected("substantive V2 role receipt drifted")
+        stdout_tail = receipt.get("stdout_tail")
+        if not isinstance(stdout_tail, str) or len(stdout_tail) > 262144:
+            raise ReviewExecutionRejected("substantive V2 review content missing")
+        full = stdout_tail.encode("utf-8")
+        if (
+            receipt.get("stdout_bytes") != len(full)
+            or receipt.get("stdout_sha256") != hashlib.sha256(full).hexdigest()
+        ):
+            raise ReviewExecutionRejected("substantive V2 review output truncated")
+        try:
+            document = json.loads(stdout_tail)
+        except (ValueError, UnicodeError) as exc:
+            raise ReviewExecutionRejected("substantive V2 review document invalid") from exc
+        if receipt.get("review_document_object_sha256") != decisions._agent_role_command_sha256(document):
+            raise ReviewExecutionRejected("substantive V2 document digest invalid")
+        fields = {
+            "schema_version", "kind", "repo", "pr",
+            "base_sha", "head_sha", "diff_sha256",
+            "review_batch_id", "review_purpose", "axis", "verdict",
+            "findings", "summary", "evidence_refs", "reviewed_risks",
+        }
+        if expected["review_purpose"] == "post_merge_release":
+            fields.add("release_binding")
+        if (
+            not isinstance(document, dict)
+            or set(document) != fields
+            or document.get("schema_version") != 1
+            or document.get("kind") != "grabowski_semantic_self_review_v1"
+            or document.get("verdict") != "PASS"
+            or document.get("findings") != []
+            or document.get("axis") != axis
+            or any(document.get(key) != value for key, value in expected.items())
+            or (
+                expected["review_purpose"] == "post_merge_release"
+                and document.get("release_binding") != binding.get("release_binding")
+            )
+        ):
+            raise ReviewExecutionRejected("substantive V2 review binding or findings invalid")
+        summary = document["summary"]
+        references = document["evidence_refs"]
+        risks = document["reviewed_risks"]
+        if (
+            not isinstance(summary, str) or len(" ".join(summary.split())) < 160
+            or summary in summaries
+            or not isinstance(references, list)
+            or not 1 <= len(references) <= MAX_REFERENCES
+            or not isinstance(risks, list)
+            or not 2 <= len(risks) <= 16
+        ):
+            raise ReviewExecutionRejected("substantive V2 review lacks analysis")
+        summaries.add(summary)
+        for reference in references:
+            _source_reference(
+                reference, head=expected["head_sha"], base=expected["base_sha"],
+                repository=repository, read_source=None,
+            )
+        named_risks: set[str] = set()
+        for risk in risks:
+            if (
+                not isinstance(risk, dict)
+                or set(risk) != {"risk", "assessment", "evidence_refs"}
+                or not isinstance(risk["risk"], str) or len(risk["risk"].strip()) < 15
+                or risk["risk"] in named_risks
+                or not isinstance(risk["assessment"], str)
+                or len(" ".join(risk["assessment"].split())) < 80
+                or not isinstance(risk["evidence_refs"], list)
+                or not 1 <= len(risk["evidence_refs"]) <= MAX_REFERENCES
+            ):
+                raise ReviewExecutionRejected("substantive V2 review risk analysis inadequate")
+            named_risks.add(risk["risk"])
+            for reference in risk["evidence_refs"]:
+                _source_reference(
+                    reference, head=expected["head_sha"], base=expected["base_sha"],
+                    repository=repository, read_source=None,
+                )
+        phase = {
+            "n": sequence, "axis": axis, "summary": summary,
+            "evidence_refs": references, "material_findings": 0,
+        }
+        accepted[axis] = {
+            "phase": phase,
+            "provenance": {
+                "slot": slot,
+                "unit": unit,
+                "origin_sha256": item["origin_sha256"],
+                "result_sha256": item["result_sha256"],
+                "review_role_receipt_sha256": item["review_role_receipt_sha256"],
+                "review_route_id": item["review_route_id"],
+                "review_provider_family": item["review_provider_family"],
+                "semantic_document_sha256": hashlib.sha256(full).hexdigest(),
+                "reviewed_risks_sha256": _digest(risks),
+            },
+        }
+    return accepted
 
 
 def _verify(
@@ -692,6 +942,15 @@ def _verify(
         or len(axes) != len(set(axes))
     ):
         raise ReviewExecutionRejected("self-review method axes invalid or duplicated")
+    semantic_binding = {
+        "repo": repo, "pr": pr, "base_sha": base, "head_sha": head,
+        "diff_sha256": diff, "review_batch_id": batch,
+        "review_purpose": purpose,
+        **({"release_binding": release_binding} if purpose == "post_merge_release" else {}),
+    }
+    semantic_reviews = verified_semantic_review_passes(
+        semantic_binding, repository=repository, axes_to_review=tuple(axes),
+    )
     signer = _allowed_signers(signers, root_owned=root_owned_signers)
     root_fd = _private_dir(receipts)
     seen_ids: set[str] = set()
@@ -737,6 +996,13 @@ def _verify(
             }
             if record.get("binding") != expected_binding:
                 raise ReviewExecutionRejected("self-review signed binding mismatch")
+            expected_semantic = semantic_reviews.get(phase.get("axis"))
+            if (
+                not isinstance(expected_semantic, dict)
+                or phase != expected_semantic.get("phase")
+                or record.get("semantic_v2") != expected_semantic.get("provenance")
+            ):
+                raise ReviewExecutionRejected("signed self-review not based on authentic V2 semantic review")
             if (
                 record.get("schema_version") != 1
                 or record.get("kind") != KIND
@@ -774,18 +1040,14 @@ def _verify(
             attested_report = observed_phase_report(
                 output, binding=expected_binding, axis=phase["axis"],
             )
-            if attested_report != {
-                "summary": phase.get("summary"),
-                "evidence_refs": phase.get("evidence_refs"),
-                "material_findings": phase.get("material_findings"),
-            }:
+            if record.get("source_inspection_report_sha256") != _digest(attested_report):
                 raise ReviewExecutionRejected(
-                    "signed self-review narrative not observed from actual source task"
+                    "signed source inspection differs from recorded technical task"
                 )
             for item in references:
                 _source_reference(
                     item, head=head, repository=repository,
-                    read_source=read_source,
+                    read_source=read_source, base=base,
                 )
     finally:
         os.close(root_fd)

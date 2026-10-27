@@ -329,7 +329,7 @@ def _ensure_private_root(path: Path) -> int:
     return provenance._private_dir(path)
 
 
-def _review_report(phase: Any, *, axis: str, sequence: int, head: str, repo: Path) -> dict[str, Any]:
+def _review_report(phase: Any, *, axis: str, sequence: int, head: str, base: str, repo: Path) -> dict[str, Any]:
     if not isinstance(phase, dict) or set(phase) != {"summary", "evidence_refs", "material_findings"}:
         raise provenance.ReviewExecutionRejected("semantic phase report is missing or incomplete")
     summary, refs, findings = (
@@ -342,7 +342,7 @@ def _review_report(phase: Any, *, axis: str, sequence: int, head: str, repo: Pat
     ):
         raise provenance.ReviewExecutionRejected("semantic phase report not fully triaged")
     for reference in refs:
-        provenance._source_reference(reference, head=head, repository=repo, read_source=None)
+        provenance._source_reference(reference, head=head, base=base, repository=repo, read_source=None)
     return {
         "n": sequence, "axis": axis, "summary": summary,
         "evidence_refs": list(refs), "material_findings": 0,
@@ -388,6 +388,9 @@ def _seal_review(
         raise provenance.ReviewExecutionRejected("R3 whole-delta review identity invalid")
     if not isinstance(repository, Path):
         raise provenance.ReviewExecutionRejected("review source repository invalid")
+    semantic_reviews = provenance.verified_semantic_review_passes(
+        binding, repository=repository,
+    )
     signer = provenance._allowed_signers(signers, root_owned=root_owned_signers)
     root_fd = _ensure_private_root(receipts)
     try:
@@ -415,18 +418,15 @@ def _seal_review(
             )
             phase = _review_report(
                 phase_reports[axis], axis=axis, sequence=sequence,
-                head=binding["head_sha"], repo=repository,
+                head=binding["head_sha"], base=binding["base_sha"], repo=repository,
             )
             observed_report = provenance.observed_phase_report(
                 output, binding=binding, axis=axis,
             )
-            if observed_report != {
-                "summary": phase["summary"],
-                "evidence_refs": phase["evidence_refs"],
-                "material_findings": phase["material_findings"],
-            }:
+            semantic = semantic_reviews[axis]
+            if phase != semantic["phase"]:
                 raise provenance.ReviewExecutionRejected(
-                    "caller self-review report differs from server task observation"
+                    "caller review narrative differs from authenticated V2 reviewer output"
                 )
             if phase["summary"] in seen:
                 raise provenance.ReviewExecutionRejected("review phase reports duplicated")
@@ -441,6 +441,8 @@ def _seal_review(
                 "evidence_refs_sha256": provenance._digest(phase["evidence_refs"]),
                 "stdout_sha256": hashlib.sha256(output).hexdigest(),
                 "source_raw_diff_sha256": plan["source_raw_diff_sha256"],
+                "source_inspection_report_sha256": provenance._digest(observed_report),
+                "semantic_v2": semantic["provenance"],
                 "sandbox": "isolated-read-only",
                 "sandbox_argv": command, "worktree_path": str(worktree),
                 "isolation_sha256": provenance._digest({
@@ -489,8 +491,12 @@ def _seal_review(
             if binding["review_purpose"] == "post_merge_release" else {}
         ),
         "review_iterations": phases, "review_pass_receipts": refs,
-        "all_findings_triaged": True, "finding_count": 0,
-        "material_findings_after_first_review": 0, "material_findings_remaining": 0,
+        # These zero counts originate in real V2 reviewer PASS verdicts;
+        # technical unittest success cannot supply or override findings.
+        "all_findings_triaged": all(phase["material_findings"] == 0 for phase in phases),
+        "finding_count": sum(phase["material_findings"] for phase in phases),
+        "material_findings_after_first_review": phases[0]["material_findings"],
+        "material_findings_remaining": sum(phase["material_findings"] for phase in phases),
         "uncertainty": 0.5, "residual_risk_accepted": False,
         "residual_risk_reason": "", "gate_verdict": "PASS",
         "self_review_gate_valid": True, "tuning_signal": "observe",

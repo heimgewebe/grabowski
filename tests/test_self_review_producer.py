@@ -80,6 +80,26 @@ class ServerReviewProducerTests(unittest.TestCase):
             }
             for axis in producer.METHODS
         }
+        # Fixture-only V2 role attestations, NOT production semantic evidence.
+        # A production review must obtain these from real authenticated V2 jobs.
+        self.semantic_fixture = {
+            axis: {
+                "phase": {
+                    "n": number, "axis": axis,
+                    "summary": self.reports[axis]["summary"],
+                    "evidence_refs": list(self.reports[axis]["evidence_refs"]),
+                    "material_findings": 0,
+                },
+                "provenance": {"fixture_v2_role_unit": f"grabowski-job-{number:012x}"},
+            }
+            for number, axis in enumerate(producer.METHODS, start=1)
+        }
+        self.semantic_patch = mock.patch.object(
+            execute, "verified_semantic_review_passes",
+            return_value=self.semantic_fixture,
+        )
+        self.semantic_patch.start()
+        self.addCleanup(self.semantic_patch.stop)
         self.tasks = {
             axis: f"{i:024x}" for i, axis in enumerate(producer.METHODS, start=1)
         }
@@ -258,7 +278,7 @@ class ServerReviewProducerTests(unittest.TestCase):
             [execute.METHOD_TEST_SUITE[axis] for axis in producer.METHODS],
         )
 
-    def test_five_genuine_origin_bound_tasks_seal_and_verify(self):
+    def test_unit_fixture_v2_attestations_and_source_tasks_seal_and_verify(self):
         result = self.seal()
         self.assertEqual("sealed_and_verified", result["status"])
         self.assertEqual(5, result["review_pass_count"])
@@ -326,9 +346,19 @@ class ServerReviewProducerTests(unittest.TestCase):
             "assurance, despite there being no task-observed report of that work."
         )
         with self.assertRaisesRegex(
-            execute.ReviewExecutionRejected, "differs from server task observation",
+            execute.ReviewExecutionRejected, "differs from authenticated V2 reviewer output",
         ):
             self.seal()
+
+    def test_five_green_source_tasks_without_authenticated_v2_reviews_block(self):
+        with mock.patch.object(
+            execute, "verified_semantic_review_passes",
+            side_effect=execute.ReviewExecutionRejected("substantive V2 reviewer missing"),
+        ):
+            with self.assertRaisesRegex(
+                execute.ReviewExecutionRejected, "substantive V2 reviewer missing",
+            ):
+                self.seal()
 
     def test_untriaged_findings_block_producer(self):
         self.reports["security_authority_concurrency"]["material_findings"] = 1
