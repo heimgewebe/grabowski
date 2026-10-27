@@ -10671,6 +10671,132 @@ class BootstrapIndexRunnerRecognitionTests(unittest.TestCase):
         self.assertEqual(written["units"], [])
 
 
+
+class CompleteBootstrapIndexCensusTests(unittest.TestCase):
+    """The first index bootstrap must inspect the whole registry, not 2,000 names."""
+
+    @staticmethod
+    def _ordinary():
+        return ["/usr/bin/python3", "/tmp/not-a-runtime-deployer.py"]
+
+    @staticmethod
+    def _runtime(runner):
+        return ["/usr/bin/python3", f"/home/alex/repos/grabowski/{runner}"]
+
+    def test_2050_terminal_unrelated_jobs_do_not_hide_late_live_deploy_and_resume(self) -> None:
+        ordinary = self._ordinary()
+        rows = {
+            f"grabowski-job-{n:012x}": {"argv": ordinary, "final_status": "completed"}
+            for n in range(2050)
+        }
+        deploy = "grabowski-job-fffffffffff0"
+        resume = "grabowski-job-fffffffffff1"
+        rows[deploy] = {"argv": self._runtime(SELF_DEPLOY.RUNNER_RELATIVE_PATH),
+                        "final_status": "running"}
+        rows[resume] = {"argv": self._runtime(SELF_DEPLOY.MIDCUTOVER_RESUME_RUNNER_RELATIVE_PATH),
+                        "final_status": "outcome_unknown"}
+        entries = [Path("/jobs") / key for key in rows]
+        root = mock.Mock()
+        root.iterdir.side_effect = lambda: iter(entries)
+        examined = []
+        def metadata(unit):
+            examined.append(unit)
+            return rows[unit]
+        with (
+            mock.patch.object(SELF_DEPLOY.operator, "_read_job_metadata", side_effect=metadata),
+            mock.patch.object(SELF_DEPLOY, "_deploy_finalization_retry_block", return_value=False),
+            mock.patch.object(Path, "is_symlink", return_value=False),
+            mock.patch.object(Path, "is_dir", return_value=True),
+        ):
+            result = SELF_DEPLOY._bootstrap_deploy_index(root, read_only=True)
+        self.assertEqual(len(examined), 2052)
+        self.assertEqual(set(examined), set(rows))
+        self.assertEqual(result["units"], [deploy, resume])
+
+    def test_changed_registry_during_bootstrap_fails_closed_without_writing_index(self) -> None:
+        original = [Path("/jobs/grabowski-job-000000000001")]
+        added = Path("/jobs/grabowski-job-000000000002")
+        root = mock.Mock()
+        root.iterdir.side_effect = [iter(original), iter([*original, added])]
+        with (
+            mock.patch.object(SELF_DEPLOY.operator, "_read_job_metadata",
+                              return_value={"argv": self._ordinary(), "final_status": "completed"}),
+            mock.patch.object(SELF_DEPLOY, "_write_deploy_index") as write,
+            mock.patch.object(Path, "is_symlink", return_value=False),
+            mock.patch.object(Path, "is_dir", return_value=True),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "changed during"):
+                SELF_DEPLOY._bootstrap_deploy_index(root)
+        write.assert_not_called()
+
+    def test_unreadable_late_job_still_blocks_full_bootstrap(self) -> None:
+        entries = [Path("/jobs") / f"grabowski-job-{n:012x}" for n in range(2051)]
+        root = mock.Mock()
+        root.iterdir.side_effect = lambda: iter(entries)
+        def metadata(unit):
+            if unit == entries[-1].name:
+                raise OSError("metadata unavailable")
+            return {"argv": self._ordinary(), "final_status": "completed"}
+        with (
+            mock.patch.object(SELF_DEPLOY.operator, "_read_job_metadata", side_effect=metadata),
+            mock.patch.object(SELF_DEPLOY, "_write_deploy_index") as write,
+            mock.patch.object(Path, "is_symlink", return_value=False),
+            mock.patch.object(Path, "is_dir", return_value=True),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "metadata is unreadable"):
+                SELF_DEPLOY._bootstrap_deploy_index(root)
+        write.assert_not_called()
+
+
+    def test_bootstrap_timeout_never_writes_a_partial_index(self) -> None:
+        root = mock.Mock()
+        path = Path("/jobs/grabowski-job-000000000001")
+        root.iterdir.side_effect = lambda: iter([path])
+        with (
+            mock.patch.object(SELF_DEPLOY.time, "monotonic", side_effect=[0.0, 0.0, 0.0, 99.0]),
+            mock.patch.object(SELF_DEPLOY.operator, "_read_job_metadata",
+                              return_value={"argv": self._ordinary(), "final_status": "completed"}),
+            mock.patch.object(SELF_DEPLOY, "_write_deploy_index") as write,
+            mock.patch.object(Path, "is_symlink", return_value=False),
+            mock.patch.object(Path, "is_dir", return_value=True),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "timed out"):
+                SELF_DEPLOY._bootstrap_deploy_index(root)
+        write.assert_not_called()
+
+    def test_entry_name_budget_is_checked_during_enumeration(self) -> None:
+        root = mock.Mock()
+        root.iterdir.side_effect = lambda: iter([
+            Path("/jobs/grabowski-job-000000000001"),
+        ])
+        with (
+            mock.patch.object(SELF_DEPLOY, "MAX_BOOTSTRAP_JOB_NAME_BYTES", 4),
+            mock.patch.object(SELF_DEPLOY.operator, "_read_job_metadata") as metadata,
+            mock.patch.object(SELF_DEPLOY, "_write_deploy_index") as write,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "name budget exceeded"):
+                SELF_DEPLOY._bootstrap_deploy_index(root)
+        metadata.assert_not_called()
+        write.assert_not_called()
+
+    def test_completed_deploy_with_outcome_unknown_finalization_remains_blocking(self) -> None:
+        unit = "grabowski-job-cccccccccccc"
+        root = mock.Mock()
+        root.iterdir.side_effect = lambda: iter([Path("/jobs") / unit])
+        with (
+            mock.patch.object(SELF_DEPLOY.operator, "_read_job_metadata",
+                              return_value={
+                                  "argv": self._runtime(SELF_DEPLOY.RUNNER_RELATIVE_PATH),
+                                  "final_status": "completed",
+                              }),
+            mock.patch.object(SELF_DEPLOY, "_deploy_finalization_retry_block", return_value=True),
+            mock.patch.object(Path, "is_symlink", return_value=False),
+            mock.patch.object(Path, "is_dir", return_value=True),
+        ):
+            result = SELF_DEPLOY._bootstrap_deploy_index(root, read_only=True)
+        self.assertEqual(result["units"], [unit])
+
+
 class LegacyRedactedDeployIndexTests(unittest.TestCase):
     """Historical redacted deploy argv may be recovered only from exact bindings."""
 

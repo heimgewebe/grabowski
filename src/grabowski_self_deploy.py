@@ -111,7 +111,11 @@ DEPLOY_JOB_ROOT = operator.JOBS_DIR
 DEPLOY_SCHEDULE_LOCK_TIMEOUT_SECONDS = 10.0
 DEPLOY_SCHEDULE_LOCK_POLL_SECONDS = 0.05
 AUDIT_LOCK_TIMEOUT_ERROR = "Audit lock acquisition timed out"
+# Bound per-pass work, not the total historical job count: a blanket 2,000
+# ceiling strands live deployments when ordinary terminal jobs accumulate.
 MAX_JOB_SCAN_ENTRIES = 2_000
+DEPLOY_BOOTSTRAP_TIMEOUT_SECONDS = 75.0
+MAX_BOOTSTRAP_JOB_NAME_BYTES = 8 * 1024 * 1024
 MAX_DEPLOY_INDEX_ENTRIES = 512
 DEPLOY_INDEX_FILENAME = "runtime-deploy-index.json"
 REUSABLE_JOB_STATUSES = frozenset({"running"})
@@ -1532,55 +1536,96 @@ def _references_runtime_runner(command: list[str], runner: Path) -> bool:
     )
 
 
+def _bootstrap_job_directory_snapshot(
+    jobs_root: Path, started_monotonic: float,
+) -> list[Path]:
+    """Census *all* durable job names with a bounded elapsed-time/byte budget.
+
+    Do not materialize an unbounded directory listing before checking its
+    budget. No pagination cutoff is allowed to exclude a late deploy/resume.
+    """
+    entries: list[Path] = []
+    name_bytes = 0
+    for entry in jobs_root.iterdir():
+        if not _durable_job_unit(entry.name):
+            continue
+        name_bytes += len(entry.name.encode("utf-8")) + 1
+        if name_bytes > MAX_BOOTSTRAP_JOB_NAME_BYTES:
+            raise RuntimeError("runtime deploy bootstrap job name budget exceeded")
+        if (len(entries) % MAX_JOB_SCAN_ENTRIES == 0
+                and time.monotonic() - started_monotonic > DEPLOY_BOOTSTRAP_TIMEOUT_SECONDS):
+            raise RuntimeError("runtime deploy bootstrap census timed out")
+        entries.append(entry)
+    if time.monotonic() - started_monotonic > DEPLOY_BOOTSTRAP_TIMEOUT_SECONDS:
+        raise RuntimeError("runtime deploy bootstrap census timed out")
+    return sorted(entries, key=lambda path: path.name)
+
+
 def _bootstrap_deploy_index(
     jobs_root: Path,
     _repository: Path | None = None,
     *,
     read_only: bool = False,
 ) -> dict[str, Any]:
-    entries = sorted(
-        (entry for entry in jobs_root.iterdir() if _durable_job_unit(entry.name)),
-        key=lambda path: path.name,
-    )
-    if len(entries) > MAX_JOB_SCAN_ENTRIES:
-        raise RuntimeError("job registry exceeds the bounded runtime deploy index bootstrap scan")
+    # The first index can be absent on a host that accumulated thousands of
+    # unrelated *terminal* durable jobs. Index every eligible name exactly once
+    # in bounded pages; time, name-bytes and the resulting live index remain
+    # bounded independently. No fixed number of historical jobs is silently
+    # ignored or treated as proof that a deploy runner cannot exist.
+    scan_started = time.monotonic()
+    entries = _bootstrap_job_directory_snapshot(jobs_root, scan_started)
+    names = [entry.name for entry in entries]
     units: list[str] = []
-    for entry in entries:
-        if entry.is_symlink() or not entry.is_dir():
-            raise RuntimeError(f"durable job entry is not a real directory: {entry.name}")
-        try:
-            metadata = operator._read_job_metadata(entry.name)
-        except (OSError, ValueError, PermissionError) as exc:
-            raise RuntimeError(f"durable job metadata is unreadable: {entry.name}") from exc
-        candidate_command = metadata.get("argv")
-        if not isinstance(candidate_command, list) or not all(isinstance(item, str) for item in candidate_command):
-            raise RuntimeError(f"durable job argv is malformed: {entry.name}")
-        # Both runners mutate the same live runtime, so both belong in the
-        # index this bootstrap rebuilds.  Recognising only the deploy runner
-        # here would drop a live mid-cutover resume before any later reader
-        # sees it, and an ordinary deployment could then be scheduled straight
-        # into the recovery it was supposed to wait for -- the same blindness
-        # this change removes one layer up.
-        references_deploy_runner = _references_runtime_runner(
-            candidate_command, RUNNER_RELATIVE_PATH
-        )
-        references_resume_runner = _references_runtime_runner(
-            candidate_command, MIDCUTOVER_RESUME_RUNNER_RELATIVE_PATH
-        )
-        references_runtime_job = references_deploy_runner or references_resume_runner
-        unresolved_finalization = (
-            # Only the deploy runner writes the runtime-deploy finalization
-            # receipt this predicate reads; a resume carries its outcome in its
-            # own durable receipt instead.
-            _deploy_finalization_retry_block(entry, metadata)
-            if references_deploy_runner
-            else False
-        )
-        if references_runtime_job and (
-            unresolved_finalization
-            or metadata.get("final_status") not in TERMINAL_JOB_STATUSES
-        ):
-            units.append(entry.name)
+    for offset in range(0, len(entries), MAX_JOB_SCAN_ENTRIES):
+        if time.monotonic() - scan_started > DEPLOY_BOOTSTRAP_TIMEOUT_SECONDS:
+            raise RuntimeError("runtime deploy bootstrap census timed out")
+        for entry in entries[offset: offset + MAX_JOB_SCAN_ENTRIES]:
+            if entry.is_symlink() or not entry.is_dir():
+                raise RuntimeError(f"durable job entry is not a real directory: {entry.name}")
+            try:
+                metadata = operator._read_job_metadata(entry.name)
+            except (OSError, ValueError, PermissionError) as exc:
+                raise RuntimeError(f"durable job metadata is unreadable: {entry.name}") from exc
+            candidate_command = metadata.get("argv")
+            if not isinstance(candidate_command, list) or not all(isinstance(item, str) for item in candidate_command):
+                raise RuntimeError(f"durable job argv is malformed: {entry.name}")
+            # Both runners mutate the same live runtime, so both belong in the
+            # index this bootstrap rebuilds.  Recognising only the deploy runner
+            # here would drop a live mid-cutover resume before any later reader
+            # sees it, and an ordinary deployment could then be scheduled straight
+            # into the recovery it was supposed to wait for -- the same blindness
+            # this change removes one layer up.
+            references_deploy_runner = _references_runtime_runner(
+                candidate_command, RUNNER_RELATIVE_PATH
+            )
+            references_resume_runner = _references_runtime_runner(
+                candidate_command, MIDCUTOVER_RESUME_RUNNER_RELATIVE_PATH
+            )
+            references_runtime_job = references_deploy_runner or references_resume_runner
+            unresolved_finalization = (
+                # Only the deploy runner writes the runtime-deploy finalization
+                # receipt this predicate reads; a resume carries its outcome in its
+                # own durable receipt instead.
+                _deploy_finalization_retry_block(entry, metadata)
+                if references_deploy_runner
+                else False
+            )
+            if references_runtime_job and (
+                unresolved_finalization
+                or metadata.get("final_status") not in TERMINAL_JOB_STATUSES
+            ):
+                units.append(entry.name)
+    # A separate job can materialize while the census is in progress. Before
+    # publishing a compact index, prove the *entire directory name set* is
+    # unchanged. Additions, removals and renames all fail closed. Deploy/
+    # resume dispatch is additionally serialized by the existing schedule lock.
+    observed = [
+        entry.name for entry in _bootstrap_job_directory_snapshot(jobs_root, scan_started)
+    ]
+    if observed != names:
+        raise RuntimeError("runtime deploy job registry changed during bootstrap")
+    if time.monotonic() - scan_started > DEPLOY_BOOTSTRAP_TIMEOUT_SECONDS:
+        raise RuntimeError("runtime deploy bootstrap census timed out")
     if read_only:
         if len(units) > MAX_DEPLOY_INDEX_ENTRIES:
             raise RuntimeError("runtime deploy index exceeds its bounded entry count")
