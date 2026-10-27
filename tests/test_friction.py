@@ -2921,6 +2921,100 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
             )
 
 
+    def test_system_scope_completed_stop_uses_invocation_id_not_user_invocation_id(self) -> None:
+        module = self._load_module()
+        invocation = "a" * 32
+        other = "b" * 32
+        records = [
+            {
+                "__REALTIME_TIMESTAMP": "100",
+                "_SYSTEMD_INVOCATION_ID": invocation,
+                "MESSAGE": json.dumps({
+                    "level": "ERROR", "msg": "harpoon server stopped",
+                    "error": {"kind": "shutdown"},
+                }),
+            },
+            {
+                "__REALTIME_TIMESTAMP": "105",
+                "_SYSTEMD_INVOCATION_ID": invocation,
+                "MESSAGE": json.dumps({"level": "INFO", "msg": "OnStop hook executing"}),
+            },
+            {
+                "__REALTIME_TIMESTAMP": "106",
+                "_SYSTEMD_INVOCATION_ID": invocation,
+                "MESSAGE": json.dumps({"level": "INFO", "msg": "OnStop hook executed"}),
+            },
+            {
+                "__REALTIME_TIMESTAMP": "110",
+                "MESSAGE_ID": module.SYSTEMD_STOP_COMPLETED_MESSAGE_ID,
+                "UNIT": "grabowski-operator.service",
+                "INVOCATION_ID": invocation,
+                "USER_INVOCATION_ID": other,
+                "JOB_TYPE": "stop",
+                "JOB_RESULT": "done",
+                "MESSAGE": "Stopped Grabowski Operator.",
+            },
+        ]
+        module._run_diagnostic_command = lambda *args, **kwargs: {
+            "returncode": 0, "timed_out": False,
+            "stdout": "".join(json.dumps(r) + "\n" for r in records),
+            "stderr": "", "stdout_truncated": False, "stderr_truncated": False,
+        }
+        probe = module._journal_transport_probe(
+            "grabowski-operator.service", 25, scope="system"
+        )
+        self.assertEqual(probe["completed_stop_invocation_count"], 1)
+        self.assertEqual(probe["qualified_planned_stop_invocation_count"], 1)
+        self.assertEqual(probe["planned_lifecycle_issue_count"], 1)
+        self.assertEqual(probe["transport_error_count"], 0)
+
+    def test_system_scope_refuses_user_only_or_mismatched_stop_invocation(self) -> None:
+        module = self._load_module()
+        invocation = "a" * 32
+        other = "c" * 32
+        records = [
+            {
+                "__REALTIME_TIMESTAMP": "100",
+                "_SYSTEMD_INVOCATION_ID": invocation,
+                "MESSAGE": json.dumps({
+                    "level": "ERROR", "msg": "harpoon server stopped",
+                    "error": {"kind": "shutdown"},
+                }),
+            },
+            {
+                "__REALTIME_TIMESTAMP": "105",
+                "_SYSTEMD_INVOCATION_ID": invocation,
+                "MESSAGE": json.dumps({"level": "INFO", "msg": "OnStop hook executing"}),
+            },
+            {
+                "__REALTIME_TIMESTAMP": "106",
+                "_SYSTEMD_INVOCATION_ID": invocation,
+                "MESSAGE": json.dumps({"level": "INFO", "msg": "OnStop hook executed"}),
+            },
+            {
+                "__REALTIME_TIMESTAMP": "110",
+                "MESSAGE_ID": module.SYSTEMD_STOP_COMPLETED_MESSAGE_ID,
+                "UNIT": "grabowski-operator.service",
+                "INVOCATION_ID": other,
+                "USER_INVOCATION_ID": invocation,
+                "JOB_TYPE": "stop",
+                "JOB_RESULT": "done",
+            },
+        ]
+        module._run_diagnostic_command = lambda *args, **kwargs: {
+            "returncode": 0, "timed_out": False,
+            "stdout": "".join(json.dumps(r) + "\n" for r in records),
+            "stderr": "", "stdout_truncated": False, "stderr_truncated": False,
+        }
+        probe = module._journal_transport_probe(
+            "grabowski-operator.service", 25, scope="system"
+        )
+        self.assertEqual(probe["completed_stop_invocation_count"], 1)
+        self.assertEqual(probe["qualified_planned_stop_invocation_count"], 0)
+        self.assertEqual(probe["planned_lifecycle_issue_count"], 0)
+        self.assertEqual(probe["transport_error_count"], 1)
+
+
 class FrictionRepairContractTests(unittest.TestCase):
     def setUp(self) -> None:
         loader = FrictionFailureRuntimeTests()

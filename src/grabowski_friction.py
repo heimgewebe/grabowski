@@ -995,11 +995,13 @@ def _stop_invocation_context(
             or record.get("JOB_RESULT") != "done"
         ):
             continue
-        user_invocation = record.get("USER_INVOCATION_ID")
-        if isinstance(user_invocation, str) and re.fullmatch(r"[0-9a-f]{32}", user_invocation):
-            completed.add(user_invocation)
+        stop_invocation = record.get(
+            "INVOCATION_ID" if scope == "system" else "USER_INVOCATION_ID"
+        )
+        if isinstance(stop_invocation, str) and re.fullmatch(r"[0-9a-f]{32}", stop_invocation):
+            completed.add(stop_invocation)
             if realtime is not None:
-                completed_at[user_invocation] = realtime
+                completed_at[stop_invocation] = realtime
     qualified = {
         invocation: completion_time
         for invocation, completion_time in completed_at.items()
