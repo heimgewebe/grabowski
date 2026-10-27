@@ -2527,7 +2527,67 @@ class PersistedCutoverRecoveryHandoffTests(unittest.TestCase):
                 resume_binding=self.BINDING
             )
         self.assertEqual(resume["inflight_deploy_jobs"], units)
-        authenticated.assert_not_called()
+        self.assertEqual(resume["recovery_handoff_units"], [])
+        # Prove each unit, but two positively classified original deploys
+        # are ambiguous and the all-or-nothing exemption must refuse both.
+        self.assertEqual(authenticated.call_count, 2)
+
+    def test_failed_deploy_and_verified_pre_resume_failure_can_handoff_together(self):
+        resumed_unit = "grabowski-job-555555555555"
+        units = [self.UNIT, resumed_unit]
+        with (
+            patch.object(
+                provenance_recovery.self_deploy, "inflight_runtime_job_evidence",
+                return_value=self._projection(units), create=True,
+            ),
+            patch.object(
+                provenance_recovery.self_deploy,
+                "_indexed_failed_deploy_is_cutover_handoff",
+                side_effect=lambda unit, _: unit == self.UNIT,
+                create=True,
+            ),
+            patch.object(
+                provenance_recovery.self_deploy,
+                "_indexed_failed_resume_is_noeffect_handoff",
+                side_effect=lambda unit, _: unit == resumed_unit,
+                create=True,
+            ),
+        ):
+            ordinary = provenance_recovery._competing_deployment_evidence()
+            resume = provenance_recovery._competing_deployment_evidence(
+                resume_binding=self.BINDING
+            )
+        self.assertEqual(ordinary["inflight_deploy_jobs"], units)
+        self.assertEqual(resume["inflight_deploy_jobs"], [])
+        self.assertEqual(resume["recovery_handoff_units"], units)
+
+    def test_one_invalid_resume_in_a_two_job_handoff_blocks_everything(self):
+        resumed_unit = "grabowski-job-555555555555"
+        units = [self.UNIT, resumed_unit]
+        with (
+            patch.object(
+                provenance_recovery.self_deploy, "inflight_runtime_job_evidence",
+                return_value=self._projection(units), create=True,
+            ),
+            patch.object(
+                provenance_recovery.self_deploy,
+                "_indexed_failed_deploy_is_cutover_handoff",
+                side_effect=lambda unit, _: unit == self.UNIT,
+                create=True,
+            ),
+            patch.object(
+                provenance_recovery.self_deploy,
+                "_indexed_failed_resume_is_noeffect_handoff",
+                return_value=False,
+                create=True,
+            ),
+        ):
+            resume = provenance_recovery._competing_deployment_evidence(
+                resume_binding=self.BINDING
+            )
+        self.assertEqual(resume["inflight_deploy_jobs"], units)
+        self.assertEqual(resume["recovery_handoff_units"], [])
+
 
     def test_resume_assessment_and_locked_recheck_bind_exact_same_cutover(self):
         """The fast assessment and under-lock dispatch must evaluate one binding."""

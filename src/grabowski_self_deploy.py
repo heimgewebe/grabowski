@@ -1648,7 +1648,7 @@ def _authentic_completed_cutover_remains_settled(
     return False
 
 
-def _authenticated_persisted_unknown_cutover(
+def _authenticated_persisted_incomplete_cutover(
     entry: Path,
     metadata: dict[str, Any],
     command_fields: dict[str, str],
@@ -1738,7 +1738,7 @@ def _authenticated_persisted_unknown_cutover(
         or payload.get("failure_type") != "BlueGreenDeploymentIncomplete"
         or not isinstance(summary, dict)
         or summary.get("kind") != "grabowski_scheduled_blue_green_summary"
-        or summary.get("outcome") != "outcome_unknown"
+        or summary.get("outcome") not in {"outcome_unknown", "rolled_back"}
         or summary.get("receipt_persisted") is not True
         or summary.get("receipt_persistence_error_type") is not None
         or summary.get("blind_retry_allowed") is False
@@ -1763,7 +1763,7 @@ def _authenticated_persisted_unknown_cutover(
             if isinstance(candidate, dict)
             and candidate.get("kind") == BLUE_GREEN_RECEIPT_KIND
             and candidate.get("receipt_sha256") == summary["receipt_sha256"]
-            and candidate.get("outcome") == "outcome_unknown"
+            and candidate.get("outcome") == summary["outcome"]
             and candidate.get("expected_head") == command_fields["expected_head"]
             and candidate.get("source_identity_sha256") == command_fields["source_identity_sha256"]
         ]
@@ -1772,6 +1772,157 @@ def _authenticated_persisted_unknown_cutover(
         return matching[0], receipts
     except (OSError, RuntimeError, ValueError, midcutover.MidCutoverEvidenceError):
         return None
+
+
+def _signed_clean_blue_rollback_is_terminal(
+    cutover: dict[str, Any],
+    receipts: list[dict[str, Any]],
+) -> bool:
+    """A real persisted rollback retires this old deploy, never a retry permit.
+
+    The returned cutover is already bound to the private job finalization,
+    command SHA, exact expected head/source identity, and a private persisted
+    canonical receipt. Terminality additionally needs unambiguous blue
+    preservation and an authoritative canonical ingress readback.
+    """
+    try:
+        recovery = cutover.get("recovery")
+        readback = cutover.get("authoritative_readback")
+        if not isinstance(recovery, dict) or not isinstance(readback, dict):
+            return False
+        rollback = recovery.get("rollback")
+        publication_rollback = recovery.get("platform_publication_rollback")
+        selector = readback.get("selector")
+        ingress = readback.get("ingress")
+        expected_readback = _sha256_json(
+            {k: v for k, v in readback.items() if k != "readback_sha256"}
+        )
+        return bool(
+            cutover.get("outcome") == "rolled_back"
+            and cutover.get("phase") == "rolled_back"
+            and cutover.get("selector_switch") is None
+            and cutover.get("snapshot_rebind") is None
+            and cutover.get("retirement") is None
+            and cutover.get("final_routing") is None
+            and recovery.get("action") == "retry_from_clean_blue"
+            and recovery.get("blue_preserved") is True
+            and isinstance(rollback, dict)
+            and rollback.get("blue_preserved") is True
+            and isinstance(publication_rollback, dict)
+            and readback.get("authoritative") is True
+            and readback.get("readback_sha256") == expected_readback
+            and isinstance(selector, dict)
+            and isinstance(ingress, dict)
+            and selector.get("selected_slot") == "canonical"
+            and ingress.get("selected_slot") == "canonical"
+            and selector.get("release_id") == cutover.get("blue_release_id")
+            and ingress.get("release_id") == cutover.get("blue_release_id")
+            and selector.get("repo_head") == ingress.get("repo_head")
+            and not midcutover.unresolved_post_switch_receipts(receipts)
+        )
+    except (OSError, RuntimeError, ValueError, midcutover.MidCutoverEvidenceError):
+        return False
+
+
+def _failed_resume_job_is_settled(
+    entry: Path,
+    metadata: dict[str, Any],
+    fields: dict[str, str],
+    status: dict[str, Any],
+) -> bool:
+    """Retire a failed S0 resume only after its exact cutover was completed.
+
+    This cannot call the index reader: terminal verification itself runs while
+    rebuilding the index. It authenticates this job's owner-private stdout
+    event, the exact failed receipt, original cutover, and later completed
+    lineage independently of any current S0 classification.
+    """
+    if (
+        status.get("final_status") != "failed"
+        or metadata.get("final_status") == "outcome_unknown"
+        or (
+            metadata.get("final_status") in TERMINAL_JOB_STATUSES
+            and metadata.get("final_status") not in {"failed", "launch_failed"}
+        )
+    ):
+        return False
+    output = _private_failed_resume_summary(entry)
+    if not isinstance(output, dict):
+        return False
+    scheduled, summary = output["scheduled"], output["summary"]
+    if (
+        scheduled.get("repo") != fields.get("repository")
+        or scheduled.get("expected_head") != fields.get("expected_head")
+        or scheduled.get("cutover_id") != fields.get("cutover_id")
+        or scheduled.get("resume_binding_sha256") != fields.get("resume_binding_sha256")
+        or summary.get("expected_head") != fields.get("expected_head")
+        or summary.get("resumed_cutover_id") != fields.get("cutover_id")
+        or _SHA256_RE.fullmatch(str(summary.get("receipt_sha256"))) is None
+    ):
+        return False
+    try:
+        loaded = midcutover.load_receipts()
+        if loaded.get("unreadable") or not loaded.get("present"):
+            return False
+        receipts = loaded.get("receipts")
+        if not isinstance(receipts, list):
+            return False
+        originals = [
+            item for item in receipts
+            if isinstance(item, dict)
+            and item.get("kind") == BLUE_GREEN_RECEIPT_KIND
+            and item.get("cutover_id") == fields["cutover_id"]
+            and item.get("expected_head") == fields["expected_head"]
+        ]
+        attempts = [
+            item for item in receipts
+            if isinstance(item, dict)
+            and item.get("kind") == midcutover.RESUME_RECEIPT_KIND
+            and item.get("resume_id") == summary.get("resume_id")
+            and item.get("receipt_sha256") == summary["receipt_sha256"]
+        ]
+        if len(originals) != 1 or len(attempts) != 1:
+            return False
+        original, attempt = originals[0], attempts[0]
+        previous = midcutover._validated_resume_binding(attempt.get("resume_binding"))
+        recovery = attempt.get("recovery")
+        if (
+            attempt.get("outcome") != "failed_pre_resume"
+            or attempt.get("phase") != "failed_pre_resume"
+            or attempt.get("resume_phase") != midcutover.PHASE_REBIND_SNAPSHOT
+            or previous is None
+            or previous.get("binding_sha256") != fields["resume_binding_sha256"]
+            or attempt.get("resume_binding_sha256") != fields["resume_binding_sha256"]
+            or attempt.get("resumed_cutover_id") != original["cutover_id"]
+            or attempt.get("resumed_receipt_sha256") != original["receipt_sha256"]
+            or summary.get("resumed_receipt_sha256") != original["receipt_sha256"]
+            or attempt.get("expected_head") != fields["expected_head"]
+            or attempt.get("green_release_id") != original.get("green_release_id")
+            or attempt.get("source_identity_sha256") != original.get("source_identity_sha256")
+            or summary.get("receipt_path")
+            != str(Path(loaded["root"]) / f"{attempt['resume_id']}.json")
+            or not isinstance(recovery, dict)
+            or recovery.get("blue_green_state_unchanged") is not True
+            or recovery.get("action") not in {
+                "reclassify_and_retry_resume",
+                "repair_preflight_evidence_and_retry",
+            }
+            or recovery.get("fresh_classification_required") is not True
+            or recovery.get("blind_retry_allowed") is not False
+            or any(
+                attempt.get(key) is not None
+                for key in (
+                    "snapshot_rebind", "pointer_promotion", "selector_switch",
+                    "canonical_operator", "retirement", "final_routing",
+                    "effect_terminalization",
+                )
+            )
+            or midcutover.unresolved_post_switch_receipts(receipts)
+        ):
+            return False
+        return midcutover._lineage_resolved(receipts, original)
+    except (OSError, RuntimeError, ValueError, midcutover.MidCutoverEvidenceError):
+        return False
 
 
 def _verified_runtime_terminal_receipt(
@@ -1862,14 +2013,17 @@ def _verified_runtime_terminal_receipt(
             )
         ):
             return True
-        persisted = _authenticated_persisted_unknown_cutover(
+        persisted = _authenticated_persisted_incomplete_cutover(
             entry, metadata, deploy, status
         )
         if persisted is None:
             return False
         cutover, receipts = persisted
+        if cutover.get("outcome") == "rolled_back":
+            return _signed_clean_blue_rollback_is_terminal(cutover, receipts)
         return (
-            not midcutover.unresolved_post_switch_receipts(receipts)
+            cutover.get("outcome") == "outcome_unknown"
+            and not midcutover.unresolved_post_switch_receipts(receipts)
             and midcutover._lineage_resolved(receipts, cutover)
         )
 
@@ -1877,6 +2031,8 @@ def _verified_runtime_terminal_receipt(
     # denial or an unpersisted receipt. Only the authentic completed lineage
     # for its exact --cutover-id, --expected-head and --resume-binding-sha256
     # retires the reservation. load_receipts enforces private owner-only files.
+    if status.get("final_status") == "failed":
+        return _failed_resume_job_is_settled(entry, metadata, fields, status)
     if status.get("final_status") not in {"completed", "succeeded"}:
         return False
     if metadata.get("final_status") in TERMINAL_JOB_STATUSES and metadata["final_status"] not in {"completed", "succeeded"}:
@@ -1953,14 +2109,15 @@ def _indexed_failed_deploy_is_cutover_handoff(
         fields = classified.get("fields")
         if not isinstance(fields, dict):
             return False
-        persisted = _authenticated_persisted_unknown_cutover(
+        persisted = _authenticated_persisted_incomplete_cutover(
             entry, classified["metadata"], fields, classified["status"]
         )
         if persisted is None:
             return False
         cutover, receipts = persisted
         if (
-            cutover.get("cutover_id") != resume_binding.get("cutover_id")
+            cutover.get("outcome") != "outcome_unknown"
+            or cutover.get("cutover_id") != resume_binding.get("cutover_id")
             or cutover.get("receipt_sha256")
             != resume_binding.get("resumed_receipt_sha256")
             or cutover.get("expected_head") != resume_binding.get("target_head")
@@ -1982,6 +2139,231 @@ def _indexed_failed_deploy_is_cutover_handoff(
         )
     except (OSError, RuntimeError, ValueError, PermissionError,
             IndexedRuntimeJobConflict, midcutover.MidCutoverEvidenceError):
+        return False
+
+
+def _private_failed_resume_summary(entry: Path) -> dict[str, Any] | None:
+    """Bind a failed runner's persisted receipt to this exact job's stdout.
+
+    Resume attempt IDs are deliberately generated by the runner, not chosen by
+    the operator. A failed_pre_resume receipt elsewhere in the shared receipt
+    directory therefore proves nothing about THIS exited job. Its private
+    stdout event sequence names the unique persisted receipt id, hash and
+    outcome. No owner-uncontrolled path, partial output or missing event is
+    allowed to create a retry exemption.
+    """
+    path = entry / "stdout.log"
+    try:
+        descriptor = os.open(
+            path, os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+        )
+    except OSError:
+        return None
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) & 0o077
+            or metadata.st_size > 2 * 1024 * 1024
+        ):
+            return None
+        raw = bytearray()
+        while len(raw) <= 2 * 1024 * 1024:
+            chunk = os.read(descriptor, min(65536, 2 * 1024 * 1024 + 1 - len(raw)))
+            if not chunk:
+                break
+            raw.extend(chunk)
+        if len(raw) > 2 * 1024 * 1024:
+            return None
+    except OSError:
+        return None
+    finally:
+        os.close(descriptor)
+    try:
+        lines = bytes(raw).decode("utf-8").splitlines()
+    except UnicodeDecodeError:
+        return None
+    if len(lines) > 4096:
+        return None
+    observed: list[dict[str, Any]] = []
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if (
+            isinstance(event, dict)
+            and event.get("phase")
+            in {
+                "midcutover-resume-scheduled",
+                "midcutover-resume-receipt",
+                "midcutover-resume-incomplete",
+                "midcutover-resume-receipt-persistence-failed",
+                "midcutover-resume-lineage-drift",
+            }
+        ):
+            observed.append(event)
+    phases = [item["phase"] for item in observed]
+    if phases != [
+        "midcutover-resume-scheduled",
+        "midcutover-resume-receipt",
+        "midcutover-resume-incomplete",
+    ]:
+        return None
+    scheduled, summary, incomplete = observed
+    if (
+        summary.get("kind") != "grabowski_midcutover_resume_summary"
+        or summary.get("schema_version") != 1
+        or summary.get("receipt_persisted") is not True
+        or summary.get("outcome") != "failed_pre_resume"
+        or summary.get("resume_receipt_phase") != "failed_pre_resume"
+        or summary.get("effect_applied") is not False
+        or summary.get("retry_requires_reclassification") is not True
+        or incomplete.get("outcome") != "failed_pre_resume"
+        or summary.get("summary_sha256") != _sha256_json({
+            k: v for k, v in summary.items()
+            if k not in {"phase", "timestamp_unix", "summary_sha256"}
+        })
+    ):
+        return None
+    return {"scheduled": scheduled, "summary": summary}
+
+
+def _indexed_failed_resume_is_noeffect_handoff(
+    unit: str, resume_binding: dict[str, Any],
+) -> bool:
+    """Exclude only a proven no-effect attempt for this exact current S0 resume.
+
+    The original post-switch cutover remains unresolved, so normal deployment
+    remains blocked. A current durable reclassification is compulsory; the
+    signed old failed-pre-resume attempt is never authority for blind retry.
+    The exception is projected read-only both at assessment and under lock.
+    """
+    if (
+        not _durable_job_unit(unit)
+        or not isinstance(resume_binding, dict)
+        or resume_binding.get("resume_phase") != midcutover.PHASE_REBIND_SNAPSHOT
+        or midcutover._validated_resume_binding(resume_binding) is None
+    ):
+        return False
+    try:
+        root = operator._jobs_root()
+        index = _deploy_index(root, read_only=True)
+        if index.get("pending_unit") is not None or unit not in index.get("units", []):
+            return False
+        entry = root / unit
+        if entry.is_symlink() or not entry.is_dir():
+            return False
+        classified = _classify_indexed_job(entry)
+        if classified.get("kind") != "midcutover_resume" or classified.get("terminal"):
+            return False
+        status = classified.get("status")
+        metadata = classified.get("metadata")
+        fields = classified.get("fields")
+        if (
+            not isinstance(status, dict)
+            or status.get("final_status") != "failed"
+            or not isinstance(metadata, dict)
+            or metadata.get("final_status") == "outcome_unknown"
+            or (
+                metadata.get("final_status") in TERMINAL_JOB_STATUSES
+                and metadata.get("final_status") not in {"failed", "launch_failed"}
+            )
+            or not isinstance(fields, dict)
+            or fields.get("cutover_id") != resume_binding.get("cutover_id")
+            or fields.get("expected_head") != resume_binding.get("expected_head")
+        ):
+            return False
+        output = _private_failed_resume_summary(entry)
+        if not isinstance(output, dict):
+            return False
+        scheduled, summary = output["scheduled"], output["summary"]
+        if (
+            scheduled.get("repo") != fields.get("repository")
+            or scheduled.get("expected_head") != fields.get("expected_head")
+            or scheduled.get("cutover_id") != fields.get("cutover_id")
+            or scheduled.get("resume_binding_sha256") != fields.get("resume_binding_sha256")
+            or summary.get("expected_head") != fields.get("expected_head")
+            or summary.get("resumed_cutover_id") != fields.get("cutover_id")
+            or summary.get("receipt_sha256") is None
+            or _SHA256_RE.fullmatch(str(summary.get("receipt_sha256"))) is None
+        ):
+            return False
+        loaded = midcutover.load_receipts()
+        if loaded.get("unreadable") or not loaded.get("present"):
+            return False
+        receipts = loaded.get("receipts")
+        if not isinstance(receipts, list):
+            return False
+        open_cutovers = midcutover.unresolved_post_switch_receipts(receipts)
+        if len(open_cutovers) != 1:
+            return False
+        cutover = open_cutovers[0]
+        if (
+            not midcutover.is_post_switch_outcome_unknown(cutover)
+            or cutover.get("cutover_id") != resume_binding.get("cutover_id")
+            or cutover.get("receipt_sha256") != resume_binding.get("resumed_receipt_sha256")
+            or cutover.get("expected_head") != resume_binding.get("expected_head")
+            or cutover.get("source_identity_sha256") != resume_binding.get("source_identity_sha256")
+        ):
+            return False
+        matches = [
+            receipt for receipt in receipts
+            if isinstance(receipt, dict)
+            and receipt.get("kind") == midcutover.RESUME_RECEIPT_KIND
+            and receipt.get("resume_id") == summary.get("resume_id")
+            and receipt.get("receipt_sha256") == summary["receipt_sha256"]
+        ]
+        if len(matches) != 1:
+            return False
+        receipt = matches[0]
+        previous = midcutover._validated_resume_binding(receipt.get("resume_binding"))
+        if (
+            receipt.get("outcome") != "failed_pre_resume"
+            or receipt.get("phase") != "failed_pre_resume"
+            or receipt.get("resume_phase") != midcutover.PHASE_REBIND_SNAPSHOT
+            or previous is None
+            or receipt.get("resume_binding_sha256") != fields["resume_binding_sha256"]
+            or previous.get("binding_sha256") != fields["resume_binding_sha256"]
+            or receipt.get("resumed_cutover_id") != cutover["cutover_id"]
+            or receipt.get("resumed_receipt_sha256") != cutover["receipt_sha256"]
+            or receipt.get("expected_head") != cutover["expected_head"]
+            or receipt.get("source_identity_sha256") != cutover["source_identity_sha256"]
+            or receipt.get("green_release_id") != cutover["green_release_id"]
+            or summary.get("resumed_receipt_sha256") != cutover["receipt_sha256"]
+            or summary.get("green_release_id") != cutover["green_release_id"]
+            or summary.get("resume_receipt_phase") != receipt.get("phase")
+            or summary.get("receipt_path")
+            != str(Path(loaded["root"]) / f"{receipt['resume_id']}.json")
+        ):
+            return False
+        recovery = receipt.get("recovery")
+        if (
+            not isinstance(recovery, dict)
+            or recovery.get("blue_green_state_unchanged") is not True
+            or recovery.get("action") not in {
+                "reclassify_and_retry_resume",
+                "repair_preflight_evidence_and_retry",
+            }
+            or recovery.get("fresh_classification_required") is not True
+            or recovery.get("blind_retry_allowed") is not False
+            or any(
+                receipt.get(key) is not None
+                for key in (
+                    "snapshot_rebind", "pointer_promotion", "selector_switch",
+                    "canonical_operator", "retirement", "final_routing",
+                    "effect_terminalization",
+                )
+            )
+        ):
+            return False
+        return True
+    except (
+        OSError, RuntimeError, ValueError, PermissionError,
+        IndexedRuntimeJobConflict, midcutover.MidCutoverEvidenceError,
+    ):
         return False
 
 

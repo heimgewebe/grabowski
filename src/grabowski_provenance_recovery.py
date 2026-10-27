@@ -397,30 +397,44 @@ def _competing_deployment_evidence(
     evidence["local_mutation_evidence"] = _recovery_local_mutation_evidence(evidence)
     if indexed["error"] is not None:
         evidence["error"] = indexed["error"]
-    # A persisted post-switch outcome_unknown cutover can leave its failed
-    # old deploy unit in the index. That unit must not block the precisely
-    # bound resume which completes its own cutover, but ordinary deployments
-    # must still see it as a blocker. No index write occurs in this exception.
-    # Multiple blockers, unknown status, pending dispatch, or an unrelated
-    # failed unit remain blocking. Every unit is rechecked under the schedule
-    # lock immediately before the recovery dispatcher acts.
+    # The retry of an already-switched cutover can encounter (1) the original
+    # authentic failed-deployment reservation and (2) one or more authentic
+    # *no-effect* failed resume attempts. Exclude a bounded complete set only
+    # from this exact recovery view. A second deploy, one unrelated job,
+    # unknown outcome, pending dispatch or failed proof blocks EVERYTHING.
+    # Normal scheduled deployments still observe the full original blockers.
+    # Assessment and under-lock recheck independently re-authenticate each.
+    blocking = list(indexed["blocking_units"])
     if (
         isinstance(resume_binding, dict)
         and evidence["error"] is None
-        and len(indexed["blocking_units"]) == 1
+        and 0 < len(blocking) <= 32
         and indexed.get("idempotent_match") is None
         and not indexed.get("ambiguous_identical_units")
     ):
-        unit = indexed["blocking_units"][0]
-        try:
-            handoff = self_deploy._indexed_failed_deploy_is_cutover_handoff(
-                unit, resume_binding
-            )
-        except (OSError, RuntimeError, ValueError, PermissionError, AttributeError):
-            handoff = False
-        if handoff:
+        authenticated: list[str] = []
+        original_deploy_count = 0
+        for unit in blocking:
+            try:
+                if self_deploy._indexed_failed_deploy_is_cutover_handoff(
+                    unit, resume_binding
+                ):
+                    original_deploy_count += 1
+                    verified = original_deploy_count == 1
+                else:
+                    verified = self_deploy._indexed_failed_resume_is_noeffect_handoff(
+                        unit, resume_binding
+                    )
+            except (
+                OSError, RuntimeError, ValueError, PermissionError, AttributeError
+            ):
+                verified = False
+            if not verified:
+                break
+            authenticated.append(unit)
+        if len(authenticated) == len(blocking):
             evidence["inflight_deploy_jobs"] = []
-            evidence["recovery_handoff_units"] = [unit]
+            evidence["recovery_handoff_units"] = authenticated
     return evidence
 
 
