@@ -358,6 +358,7 @@ class NativeNixOSResticProofTests(unittest.TestCase):
             dict(proof, completed_at_unix=self.now - 200),
             dict(proof, snapshot_time_unix=self.now - recovery.MAX_AGE_SECONDS - 1),
             dict(proof, backup_source="/home/alex/unsafe"),
+            dict(proof, backup_source="/dev/../tmp/unsafe"),
             {**proof, "unexpected": True},
         )
         for case in cases:
@@ -409,6 +410,102 @@ class NativeNixOSResticProofTests(unittest.TestCase):
                     started_at_unix=self.now, expected_backup_uuid=self.target["backup_uuid"],
                     timeout_seconds=1,
                 )
+
+
+    def test_root_proof_read_validates_root_owner_and_descriptor(self) -> None:
+        import os
+        import stat
+        import tempfile
+        real_lstat, real_fstat = Path.lstat, os.fstat
+        proof_payload = self._root_proof()
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            proof = parent / "proof.json"
+            proof.write_text(json.dumps(proof_payload), encoding="utf-8")
+
+            def trusted_lstat(path):
+                original = real_lstat(path)
+                if path == parent:
+                    return types.SimpleNamespace(st_mode=stat.S_IFDIR | 0o755, st_uid=0)
+                return original
+
+            def trusted_fstat(fd):
+                original = real_fstat(fd)
+                return types.SimpleNamespace(
+                    st_mode=original.st_mode, st_uid=0, st_nlink=original.st_nlink,
+                    st_size=original.st_size,
+                )
+
+            with patch.object(recovery, "NIXOS_RESTIC_ROOT_PROOF_PATH", proof), patch.object(
+                recovery.Path, "lstat", new=trusted_lstat
+            ), patch.object(recovery.os, "fstat", side_effect=trusted_fstat):
+                self.assertEqual(
+                    recovery._nixos_root_proof_read(
+                        not_before_unix=self.now - 5,
+                        now=self.now,
+                        expected_backup_uuid=self.target["backup_uuid"],
+                    ),
+                    proof_payload,
+                )
+
+    def test_root_proof_read_rejects_owner_modes_symlinks_and_size(self) -> None:
+        import os
+        import stat
+        import tempfile
+        real_lstat, real_fstat = Path.lstat, os.fstat
+        scenarios = (
+            "file_symlink", "parent_symlink", "parent_nonroot",
+            "parent_writable", "file_nonroot", "file_writable",
+            "hardlink", "oversize", "malformed_json", "missing",
+        )
+        for scenario in scenarios:
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as directory:
+                parent = Path(directory)
+                proof = parent / "proof.json"
+                proof.write_text(json.dumps(self._root_proof()), encoding="utf-8")
+                if scenario == "file_symlink":
+                    target = parent / "target.json"
+                    proof.rename(target)
+                    proof.symlink_to(target)
+                elif scenario == "hardlink":
+                    os.link(proof, parent / "second.json")
+                elif scenario == "oversize":
+                    proof.write_text(" " * 8193, encoding="utf-8")
+                elif scenario == "malformed_json":
+                    proof.write_text("{malformed", encoding="utf-8")
+                elif scenario == "missing":
+                    proof.unlink()
+
+                def synthetic_lstat(path):
+                    original = real_lstat(path)
+                    if path != parent:
+                        return original
+                    mode = (
+                        stat.S_IFLNK | 0o777 if scenario == "parent_symlink"
+                        else stat.S_IFDIR | (0o777 if scenario == "parent_writable" else 0o755)
+                    )
+                    return types.SimpleNamespace(
+                        st_mode=mode, st_uid=1000 if scenario == "parent_nonroot" else 0,
+                    )
+
+                def synthetic_fstat(fd):
+                    original = real_fstat(fd)
+                    return types.SimpleNamespace(
+                        st_mode=stat.S_IFREG | 0o666 if scenario == "file_writable" else original.st_mode,
+                        st_uid=1000 if scenario == "file_nonroot" else 0,
+                        st_nlink=original.st_nlink,
+                        st_size=original.st_size,
+                    )
+
+                with patch.object(recovery, "NIXOS_RESTIC_ROOT_PROOF_PATH", proof), patch.object(
+                    recovery.Path, "lstat", new=synthetic_lstat
+                ), patch.object(recovery.os, "fstat", side_effect=synthetic_fstat):
+                    with self.assertRaises(RuntimeError):
+                        recovery._nixos_root_proof_read(
+                            not_before_unix=self.now - 5,
+                            now=self.now,
+                            expected_backup_uuid=self.target["backup_uuid"],
+                        )
 
     def test_root_proof_failure_never_publishes_canonical_marker(self) -> None:
         import tempfile
