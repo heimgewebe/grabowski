@@ -3,8 +3,8 @@
 The producer does not accept PASS markers, arbitrary review commands, arbitrary
 signing keys or user-supplied task outcomes. Each phase must be the completed
 Grabowski systemd task whose immutable argv is a trusted, read-only, networkless
-review method. The separate semantic review report is still required: a test
-suite succeeding is not, by itself, a substantive security review.
+review method. The separate authenticated semantic reviewer execution remains required:
+a successful technical test suite cannot supply a substantive review.
 
 Production callers must use plan_review() and seal_review(); dependency
 injection is confined to the private _seal_review implementation and tests.
@@ -353,7 +353,7 @@ def _review_report(phase: Any, *, axis: str, sequence: int, head: str, base: str
 def _seal_review(
     plan: dict[str, Any],
     task_ids: dict[str, str],
-    phase_reports: dict[str, dict[str, Any]],
+    phase_reports: dict[str, dict[str, Any]] | None,
     *,
     key: Path, signers: Path, receipts: Path,
     task_db: Path, outcomes: Path, capture_root: Path,
@@ -361,6 +361,8 @@ def _seal_review(
     root_owned_signers: bool,
     source_observer: Callable[[Path, dict[str, Any]], str] = _current_source,
 ) -> dict[str, Any]:
+    if phase_reports is not None:
+        raise provenance.ReviewExecutionRejected("caller-provided semantic phase reports forbidden")
     if (
         not isinstance(plan, dict)
         or plan.get("schema_version") != 1
@@ -369,7 +371,6 @@ def _seal_review(
         or set(plan["tasks"]) != set(METHODS)
         or not isinstance(task_ids, dict) or set(task_ids) != set(METHODS)
         or len(set(task_ids.values())) != len(METHODS)
-        or not isinstance(phase_reports, dict) or set(phase_reports) != set(METHODS)
     ):
         raise provenance.ReviewExecutionRejected("review execution plan or five tasks incomplete")
     binding = _binding(plan.get("binding"))
@@ -417,18 +418,14 @@ def _seal_review(
                 task_id, command, worktree,
                 task_db=task_db, outcomes=outcomes, capture_root=capture_root,
             )
-            phase = _review_report(
-                phase_reports[axis], axis=axis, sequence=sequence,
-                head=binding["head_sha"], base=binding["base_sha"], repo=repository,
-            )
             observed_report = provenance.observed_phase_report(
                 output, binding=binding, axis=axis,
             )
+            # The real semantic reviewer role is independently reconciled,
+            # including its full source-bound model output and findings.
+            # Green technical source-inspection tasks are never review passes.
             semantic = semantic_reviews[axis]
-            if phase != semantic["phase"]:
-                raise provenance.ReviewExecutionRejected(
-                    "caller review narrative differs from authenticated V2 reviewer output"
-                )
+            phase = semantic["phase"]
             if phase["summary"] in seen:
                 raise provenance.ReviewExecutionRejected("review phase reports duplicated")
             seen.add(phase["summary"])
@@ -541,7 +538,7 @@ def _seal_review(
 
 def seal_review(
     plan: dict[str, Any], task_ids: dict[str, str],
-    phase_reports: dict[str, dict[str, Any]],
+    phase_reports: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Production entrypoint: no caller-selected signer or evidence roots."""
     return _seal_review(
@@ -663,7 +660,6 @@ def main(argv: list[str] | None = None) -> int:
     existing = commands.add_parser("seal", help="Sign real completed task executions only")
     existing.add_argument("--batch-id", required=True)
     existing.add_argument("--task-ids-json", required=True)
-    existing.add_argument("--phase-reports-json", required=True)
     args = parser.parse_args(argv)
     if args.operation == "plan":
         _require_installed_runtime(args.bwrap, args.python)
@@ -703,7 +699,7 @@ def main(argv: list[str] | None = None) -> int:
         _require_live_pr(plan["binding"])
         try:
             ids = json.loads(args.task_ids_json)
-            reports = json.loads(args.phase_reports_json)
+            reports = None
         except (UnicodeError, ValueError) as exc:
             raise provenance.ReviewExecutionRejected("phase task or review data invalid") from exc
         sealed = seal_review(plan, ids, reports)

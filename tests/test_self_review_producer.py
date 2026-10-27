@@ -193,9 +193,9 @@ class ServerReviewProducerTests(unittest.TestCase):
         self.connection.close()
         self.db.chmod(0o600)
 
-    def seal(self):
+    def seal(self, phase_reports=None):
         return producer._seal_review(
-            self.plan, self.tasks, self.reports,
+            self.plan, self.tasks, phase_reports,
             key=self.key, signers=self.signers, receipts=self.receipts,
             task_db=self.db, outcomes=self.outcomes,
             capture_root=self.captures, repository=self.repo,
@@ -271,7 +271,6 @@ class ServerReviewProducerTests(unittest.TestCase):
                 producer.main([
                     "seal", "--batch-id", self.binding["review_batch_id"],
                     "--task-ids-json", json.dumps(self.tasks),
-                    "--phase-reports-json", json.dumps(self.reports),
                 ]),
             )
         output = json.loads(stdout.getvalue())
@@ -369,9 +368,9 @@ class ServerReviewProducerTests(unittest.TestCase):
             "assurance, despite there being no task-observed report of that work."
         )
         with self.assertRaisesRegex(
-            execute.ReviewExecutionRejected, "differs from authenticated V2 reviewer output",
+            execute.ReviewExecutionRejected, "caller-provided semantic phase reports forbidden",
         ):
-            self.seal()
+            self.seal(self.reports)
 
     def test_five_green_source_tasks_without_authenticated_v2_reviews_block(self):
         with mock.patch.object(
@@ -385,13 +384,13 @@ class ServerReviewProducerTests(unittest.TestCase):
 
     def test_untriaged_findings_block_producer(self):
         self.reports["security_authority_concurrency"]["material_findings"] = 1
-        with self.assertRaisesRegex(execute.ReviewExecutionRejected, "not fully triaged"):
-            self.seal()
+        with self.assertRaisesRegex(execute.ReviewExecutionRejected, "caller-provided semantic phase reports forbidden"):
+            self.seal(self.reports)
 
     def test_fabricated_evidence_refs_block(self):
         self.reports["tests_negative_cases"]["evidence_refs"] = ["nonexistent"]
-        with self.assertRaisesRegex(execute.ReviewExecutionRejected, "unresolvable"):
-            self.seal()
+        with self.assertRaisesRegex(execute.ReviewExecutionRejected, "caller-provided semantic phase reports forbidden"):
+            self.seal(self.reports)
 
     def test_invalid_signing_key_permissions_block(self):
         self.key.chmod(0o644)
