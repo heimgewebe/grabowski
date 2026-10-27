@@ -8746,6 +8746,66 @@ class HashedDeployToolingBindingTests(unittest.TestCase):
 
 
 class ScheduledDeployRunnerTests(unittest.TestCase):
+    def test_resume_only_signs_exact_persisted_receipt(self) -> None:
+        decision = {
+            "repo": "/tmp/repository",
+            "resume_target_head": "a" * 40,
+            "execution_head": "b" * 40,
+        }
+        receipt = {
+            "resumed_cutover_id": "bgc-pr1662-authentic",
+            "receipt_sha256": "c" * 64,
+        }
+        with patch.object(
+            RUNNER, "run_midcutover_resume",
+            return_value={
+                "outcome": "completed",
+                "receipt_persisted": True,
+                "receipt": receipt,
+            },
+        ), patch.object(RUNNER, "write_finalization_receipt") as write:
+            self.assertEqual(RUNNER.run_resume_only(
+                decision, binding={"expected_head": "b" * 40}
+            ), 0)
+        material = {
+            "schema_version": 1,
+            "kind": "grabowski_resolved_midcutover_prerequisite",
+            "resumed_cutover_id": receipt["resumed_cutover_id"],
+            "resume_receipt_sha256": receipt["receipt_sha256"],
+            "execution_head": "b" * 40,
+        }
+        write.assert_called_once_with(
+            {"expected_head": "b" * 40},
+            final_status="failed",
+            repo_head=None,
+            release_id=None,
+            failure_type=(
+                "MidCutoverPrerequisiteRecovered:"
+                + RUNNER.canonical_json_sha256(material)
+            ),
+            blue_green=None,
+        )
+
+    def test_resume_only_refuses_completed_unbound_receipt(self) -> None:
+        decision = {
+            "repo": "/tmp/repository",
+            "resume_target_head": "a" * 40,
+            "execution_head": "b" * 40,
+        }
+        with patch.object(
+            RUNNER, "run_midcutover_resume",
+            return_value={
+                "outcome": "completed",
+                "receipt_persisted": True,
+                "receipt": {"resumed_cutover_id": "bgc-wrong"},
+            },
+        ), patch.object(RUNNER, "write_finalization_receipt") as write:
+            with self.assertRaisesRegex(
+                RuntimeError, "completed prerequisite lacks exact persisted"
+            ):
+                RUNNER.run_resume_only(decision, binding={"expected_head": "b" * 40})
+        write.assert_not_called()
+
     def setUp(self) -> None:
         self._yaml_binding_patch = patch.object(
             RUNNER, "_bind_hashed_deploy_tooling_yaml", return_value=None
@@ -11417,6 +11477,16 @@ class P1ActualRuntimeReceiptLineageTests(unittest.TestCase):
         cutover = fixture.cutover_receipt()
         resumed = fixture.resume_receipt()
         self.assertTrue(SELF_DEPLOY.midcutover._lineage_resolved([resumed], cutover))
+        material = {
+            "schema_version": 1,
+            "kind": "grabowski_resolved_midcutover_prerequisite",
+            "resumed_cutover_id": resumed["resumed_cutover_id"],
+            "resume_receipt_sha256": resumed["receipt_sha256"],
+            "execution_head": "a" * 40,
+        }
+        exact_failure_type = (
+            "MidCutoverPrerequisiteRecovered:" + SELF_DEPLOY._sha256_json(material)
+        )
         argv = self._deploy()
         metadata = self._meta(argv)
         status = {
@@ -11434,7 +11504,7 @@ class P1ActualRuntimeReceiptLineageTests(unittest.TestCase):
         entry = Path("/jobs") / self.UNIT
         with mock.patch.object(
             SELF_DEPLOY, "_authenticated_failed_runtime_reason",
-            return_value="MidCutoverPrerequisiteRecovered",
+            return_value=exact_failure_type,
         ), mock.patch.object(
             SELF_DEPLOY.midcutover, "load_receipts",
             return_value={
@@ -11458,7 +11528,7 @@ class P1ActualRuntimeReceiptLineageTests(unittest.TestCase):
             with self.subTest(evidence=evidence["unreadable"] or len(evidence["receipts"])):
                 with mock.patch.object(
                     SELF_DEPLOY, "_authenticated_failed_runtime_reason",
-                    return_value="MidCutoverPrerequisiteRecovered",
+                    return_value=exact_failure_type,
                 ), mock.patch.object(
                     SELF_DEPLOY.midcutover, "load_receipts",
                     return_value=evidence,
@@ -11468,10 +11538,53 @@ class P1ActualRuntimeReceiptLineageTests(unittest.TestCase):
                     ))
         with mock.patch.object(
             SELF_DEPLOY, "_authenticated_failed_runtime_reason",
+            return_value="MidCutoverPrerequisiteRecovered:" + "0" * 64,
+        ), mock.patch.object(
+            SELF_DEPLOY.midcutover, "load_receipts",
+            return_value={
+                "receipts": [cutover, resumed], "present": True, "unreadable": [],
+            },
+        ):
+            self.assertFalse(SELF_DEPLOY._verified_runtime_terminal_receipt(
+                entry, metadata, argv, status
+            ))
+        with mock.patch.object(
+            SELF_DEPLOY, "_authenticated_failed_runtime_reason",
             return_value="MidCutoverResumeOutcomeUnknown",
         ):
             self.assertFalse(SELF_DEPLOY._verified_runtime_terminal_receipt(
                 entry, metadata, argv, status
+            ))
+
+
+    def test_unrelated_completed_cutover_cannot_release_legacy_resume_failure(self):
+        # A completed *other* recovery is not authority for this job.
+        import test_midcutover_resume as fixture
+        cutover = fixture.cutover_receipt()
+        resumed = fixture.resume_receipt()
+        self.assertTrue(SELF_DEPLOY.midcutover._lineage_resolved([resumed], cutover))
+        entry = Path("/jobs") / self.UNIT
+        argv = self._deploy()
+        status = {
+            "final_status": "succeeded",
+            "finalization_receipt": {
+                "valid": True, "state": "valid", "final_status": "failed",
+                "expected_head": "a" * 40,
+                "receipt_sha256": "1" * 64,
+                "payload_sha256": "2" * 64,
+            },
+        }
+        with mock.patch.object(
+            SELF_DEPLOY, "_authenticated_failed_runtime_reason",
+            return_value="MidCutoverPrerequisiteRecovered",
+        ), mock.patch.object(
+            SELF_DEPLOY.midcutover, "load_receipts",
+            return_value={
+                "receipts": [cutover, resumed], "present": True, "unreadable": [],
+            },
+        ):
+            self.assertFalse(SELF_DEPLOY._verified_runtime_terminal_receipt(
+                entry, self._meta(argv), argv, status
             ))
 
 

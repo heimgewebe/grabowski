@@ -1599,12 +1599,22 @@ def _authenticated_failed_runtime_reason(
     return reason if isinstance(reason, str) and 0 < len(reason) <= 200 else None
 
 
-def _authentic_completed_cutover_remains_settled() -> bool:
-    """Recovery-terminal retry requires completed private cutover lineage.
+def _authentic_completed_cutover_remains_settled(
+    failure_type: str, execution_head: str
+) -> bool:
+    """Resolve only the *actual* signed resume receipt for this deploy job.
 
-    Any unknown or unreadable sibling cutover prevents treating a resume-only
-    failed deploy as safely settled. A generic process outcome never suffices.
+    A different completed cutover in the same receipt directory is not a
+    reason to free a pending job. Legacy unbound terminal labels never count.
     """
+    if (
+        not isinstance(failure_type, str)
+        or re.fullmatch(r"MidCutoverPrerequisiteRecovered:[0-9a-f]{64}", failure_type)
+        is None
+        or not isinstance(execution_head, str)
+        or OBJECT_ID_RE.fullmatch(execution_head) is None
+    ):
+        return False
     try:
         loaded = midcutover.load_receipts()
         if loaded.get("unreadable") or not loaded.get("present"):
@@ -1622,7 +1632,17 @@ def _authentic_completed_cutover_remains_settled() -> bool:
                     and resume.get("outcome") == "completed"
                     and midcutover._lineage_resolved([resume], original)
                 ):
-                    return True
+                    material = {
+                        "schema_version": 1,
+                        "kind": "grabowski_resolved_midcutover_prerequisite",
+                        "resumed_cutover_id": resume.get("resumed_cutover_id"),
+                        "resume_receipt_sha256": resume.get("receipt_sha256"),
+                        "execution_head": execution_head,
+                    }
+                    if failure_type == (
+                        "MidCutoverPrerequisiteRecovered:" + _sha256_json(material)
+                    ):
+                        return True
     except (OSError, RuntimeError, ValueError, midcutover.MidCutoverEvidenceError):
         return False
     return False
@@ -1709,8 +1729,11 @@ def _verified_runtime_terminal_receipt(
         ):
             return True
         return bool(
-            reason == "MidCutoverPrerequisiteRecovered"
-            and _authentic_completed_cutover_remains_settled()
+            isinstance(reason, str)
+            and reason.startswith("MidCutoverPrerequisiteRecovered:")
+            and _authentic_completed_cutover_remains_settled(
+                reason, fields["expected_head"]
+            )
         )
 
     # A successful resume *process* may have produced outcome_unknown, a
