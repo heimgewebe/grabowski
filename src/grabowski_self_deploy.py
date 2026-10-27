@@ -1824,6 +1824,37 @@ def _signed_clean_blue_rollback_is_terminal(
         return False
 
 
+def _progressed_resume_has_authentic_recovery_evidence(
+    receipt: dict[str, Any], summary: dict[str, Any],
+) -> bool:
+    """Strict no-blind-retry proof that this failed resume has applied effects.
+
+    A fresh independent durable classifier remains the only source of current
+    continuation authority. This predicate only authenticates the past attempt,
+    not current routing or any ordinary deployment permission.
+    """
+    recovery = receipt.get("recovery")
+    return bool(
+        receipt.get("outcome") == "outcome_unknown"
+        and receipt.get("phase") == "outcome_unknown"
+        and summary.get("outcome") == "outcome_unknown"
+        and summary.get("resume_receipt_phase") == "outcome_unknown"
+        and summary.get("effect_applied") is True
+        and receipt.get("resume_phase") in midcutover.RESUME_PHASES
+        and isinstance(recovery, dict)
+        and recovery.get("action") == "readback_active_runtime_and_recover"
+        and recovery.get("automatic_rollback_forbidden") is True
+        and recovery.get("blue_rollback_forbidden") is True
+        and recovery.get("fresh_classification_required") is True
+        and recovery.get("blind_retry_allowed") is False
+        and (
+            recovery.get("snapshot_rebind_applied") is True
+            or recovery.get("pointer_promoted") is True
+            or recovery.get("canonical_selected") is True
+        )
+    )
+
+
 def _failed_resume_job_is_settled(
     entry: Path,
     metadata: dict[str, Any],
@@ -1887,9 +1918,9 @@ def _failed_resume_job_is_settled(
         previous = midcutover._validated_resume_binding(attempt.get("resume_binding"))
         recovery = attempt.get("recovery")
         if (
-            attempt.get("outcome") != "failed_pre_resume"
-            or attempt.get("phase") != "failed_pre_resume"
-            or attempt.get("resume_phase") != midcutover.PHASE_REBIND_SNAPSHOT
+            attempt.get("outcome") not in {"failed_pre_resume", "outcome_unknown"}
+            or attempt.get("phase") != attempt.get("outcome")
+            or attempt.get("resume_phase") not in midcutover.RESUME_PHASES
             or previous is None
             or previous.get("binding_sha256") != fields["resume_binding_sha256"]
             or attempt.get("resume_binding_sha256") != fields["resume_binding_sha256"]
@@ -1901,20 +1932,29 @@ def _failed_resume_job_is_settled(
             or attempt.get("source_identity_sha256") != original.get("source_identity_sha256")
             or summary.get("receipt_path")
             != str(Path(loaded["root"]) / f"{attempt['resume_id']}.json")
-            or not isinstance(recovery, dict)
-            or recovery.get("blue_green_state_unchanged") is not True
-            or recovery.get("action") not in {
-                "reclassify_and_retry_resume",
-                "repair_preflight_evidence_and_retry",
-            }
-            or recovery.get("fresh_classification_required") is not True
-            or recovery.get("blind_retry_allowed") is not False
-            or any(
-                attempt.get(key) is not None
-                for key in (
-                    "snapshot_rebind", "pointer_promotion", "selector_switch",
-                    "canonical_operator", "retirement", "final_routing",
-                    "effect_terminalization",
+            or (
+                not _progressed_resume_has_authentic_recovery_evidence(
+                    attempt, summary
+                )
+                and not (
+                    attempt.get("outcome") == "failed_pre_resume"
+                    and attempt.get("resume_phase") == midcutover.PHASE_REBIND_SNAPSHOT
+                    and isinstance(recovery, dict)
+                    and recovery.get("blue_green_state_unchanged") is True
+                    and recovery.get("action") in {
+                        "reclassify_and_retry_resume",
+                        "repair_preflight_evidence_and_retry",
+                    }
+                    and recovery.get("fresh_classification_required") is True
+                    and recovery.get("blind_retry_allowed") is False
+                    and not any(
+                        attempt.get(key) is not None
+                        for key in (
+                            "snapshot_rebind", "pointer_promotion", "selector_switch",
+                            "canonical_operator", "retirement", "final_routing",
+                            "effect_terminalization",
+                        )
+                    )
                 )
             )
             or midcutover.unresolved_post_switch_receipts(receipts)
@@ -2217,11 +2257,13 @@ def _private_failed_resume_summary(entry: Path) -> dict[str, Any] | None:
         summary.get("kind") != "grabowski_midcutover_resume_summary"
         or summary.get("schema_version") != 1
         or summary.get("receipt_persisted") is not True
-        or summary.get("outcome") != "failed_pre_resume"
-        or summary.get("resume_receipt_phase") != "failed_pre_resume"
-        or summary.get("effect_applied") is not False
+        or summary.get("outcome") not in {"failed_pre_resume", "outcome_unknown"}
+        or summary.get("resume_receipt_phase") != summary.get("outcome")
+        or summary.get("effect_applied") is not (
+            summary.get("outcome") == "outcome_unknown"
+        )
         or summary.get("retry_requires_reclassification") is not True
-        or incomplete.get("outcome") != "failed_pre_resume"
+        or incomplete.get("outcome") != summary.get("outcome")
         or summary.get("summary_sha256") != _sha256_json({
             k: v for k, v in summary.items()
             if k not in {"phase", "timestamp_unix", "summary_sha256"}
@@ -2244,7 +2286,6 @@ def _indexed_failed_resume_is_noeffect_handoff(
     if (
         not _durable_job_unit(unit)
         or not isinstance(resume_binding, dict)
-        or resume_binding.get("resume_phase") != midcutover.PHASE_REBIND_SNAPSHOT
         or midcutover._validated_resume_binding(resume_binding) is None
     ):
         return False
@@ -2321,9 +2362,9 @@ def _indexed_failed_resume_is_noeffect_handoff(
         receipt = matches[0]
         previous = midcutover._validated_resume_binding(receipt.get("resume_binding"))
         if (
-            receipt.get("outcome") != "failed_pre_resume"
-            or receipt.get("phase") != "failed_pre_resume"
-            or receipt.get("resume_phase") != midcutover.PHASE_REBIND_SNAPSHOT
+            receipt.get("outcome") not in {"failed_pre_resume", "outcome_unknown"}
+            or receipt.get("phase") != receipt.get("outcome")
+            or receipt.get("resume_phase") not in midcutover.RESUME_PHASES
             or previous is None
             or receipt.get("resume_binding_sha256") != fields["resume_binding_sha256"]
             or previous.get("binding_sha256") != fields["resume_binding_sha256"]
@@ -2340,26 +2381,42 @@ def _indexed_failed_resume_is_noeffect_handoff(
         ):
             return False
         recovery = receipt.get("recovery")
-        if (
-            not isinstance(recovery, dict)
-            or recovery.get("blue_green_state_unchanged") is not True
-            or recovery.get("action") not in {
-                "reclassify_and_retry_resume",
-                "repair_preflight_evidence_and_retry",
-            }
-            or recovery.get("fresh_classification_required") is not True
-            or recovery.get("blind_retry_allowed") is not False
-            or any(
-                receipt.get(key) is not None
-                for key in (
-                    "snapshot_rebind", "pointer_promotion", "selector_switch",
-                    "canonical_operator", "retirement", "final_routing",
-                    "effect_terminalization",
+        if receipt.get("outcome") == "failed_pre_resume":
+            return bool(
+                resume_binding.get("resume_phase") == midcutover.PHASE_REBIND_SNAPSHOT
+                and receipt.get("phase") == "failed_pre_resume"
+                and receipt.get("resume_phase") == midcutover.PHASE_REBIND_SNAPSHOT
+                and isinstance(recovery, dict)
+                and recovery.get("blue_green_state_unchanged") is True
+                and recovery.get("action") in {
+                    "reclassify_and_retry_resume", "repair_preflight_evidence_and_retry",
+                }
+                and recovery.get("fresh_classification_required") is True
+                and recovery.get("blind_retry_allowed") is False
+                and not any(
+                    receipt.get(key) is not None
+                    for key in (
+                        "snapshot_rebind", "pointer_promotion", "selector_switch",
+                        "canonical_operator", "retirement", "final_routing",
+                        "effect_terminalization",
+                    )
                 )
             )
-        ):
+        if not _progressed_resume_has_authentic_recovery_evidence(receipt, summary):
             return False
-        return True
+        # An old failed attempt cannot prescribe the next phase. It may yield
+        # only to a fresh canonical classifier for the same cutover, head,
+        # source identity and a phase not earlier than its old evidence.
+        old_phase = receipt.get("resume_phase")
+        current_phase = resume_binding.get("resume_phase")
+        return bool(
+            old_phase in midcutover.RESUME_PHASES
+            and current_phase in midcutover.RESUME_PHASES[1:]
+            and midcutover.RESUME_PHASES.index(old_phase)
+            <= midcutover.RESUME_PHASES.index(current_phase)
+            and receipt.get("resumed_receipt_sha256")
+            == resume_binding.get("resumed_receipt_sha256")
+        )
     except (
         OSError, RuntimeError, ValueError, PermissionError,
         IndexedRuntimeJobConflict, midcutover.MidCutoverEvidenceError,
