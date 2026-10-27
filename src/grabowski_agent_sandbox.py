@@ -570,6 +570,13 @@ def _safe_existing_path(value: Path, field: str, *, directory: bool | None = Non
 
 
 _NIX_STORE = Path("/nix/store")
+_NIX_LD_LIBRARY_DIR = Path("/run/current-system/sw/share/nix-ld/lib")
+_NIX_VENDOR_ELF_TARGETS = frozenset({
+    ANTIGRAVITY_SANDBOX_EXECUTABLE,
+    CLAUDE_SANDBOX_EXECUTABLE,
+    CODEX_SANDBOX_EXECUTABLE,
+    GROK_SANDBOX_EXECUTABLE,
+})
 
 
 def _trusted_nix_store() -> Path | None:
@@ -593,6 +600,32 @@ def _trusted_nix_store() -> Path | None:
         ):
             raise AgentSandboxError("Nix store must be root-owned and non-writable by the reviewer UID")
     return _NIX_STORE
+
+
+def _trusted_nix_vendor_elf_runtime(nix_store: Path) -> tuple[Path, Path]:
+    """Pin a root-owned glibc loader and library closure inside the trusted store.
+
+    The mutable /run/current-system path is only a source of candidates, never
+    a sandbox mount or environment value. Fail closed if it resolves outside
+    the verified immutable Nix store or becomes writable by the caller.
+    """
+    try:
+        libraries = _NIX_LD_LIBRARY_DIR.resolve(strict=True)
+        loader = (_NIX_LD_LIBRARY_DIR / "ld.so").resolve(strict=True)
+        for candidate, is_directory in ((libraries, True), (loader, False)):
+            if not candidate.is_relative_to(nix_store):
+                raise AgentSandboxError("NixOS ELF runtime must resolve inside trusted Nix store")
+            metadata = candidate.stat()
+            if (
+                (not stat.S_ISDIR(metadata.st_mode) if is_directory else not stat.S_ISREG(metadata.st_mode))
+                or metadata.st_uid != 0
+                or stat.S_IMODE(metadata.st_mode) & 0o022
+                or os.access(candidate, os.W_OK)
+            ):
+                raise AgentSandboxError("NixOS ELF runtime must be root-owned and non-writable")
+    except (OSError, RuntimeError) as exc:
+        raise AgentSandboxError("NixOS ELF runtime is not safely available") from exc
+    return loader, libraries
 
 
 def _bind_file(arguments: list[str], source: str, target: str | None = None) -> None:
@@ -917,6 +950,17 @@ def minimal_sandbox_argv(
     )
     writable = _normalized_writable_paths(worktree, writable_paths)
     nix_store = _trusted_nix_store()
+    extra_read_only = tuple(extra_read_only)
+    # Only vendor binaries need the generic ELF compatibility loader. Nix-built
+    # Python and test processes keep their own RPATH/loader and clean environment.
+    needs_nix_elf_runtime = (
+        nix_store is not None
+        and not Path("/usr/lib64").exists()
+        and any(target in _NIX_VENDOR_ELF_TARGETS for _, target in extra_read_only)
+    )
+    nix_elf_runtime = (
+        _trusted_nix_vendor_elf_runtime(nix_store) if needs_nix_elf_runtime else None
+    )
     if nix_store is not None and (
         worktree.is_relative_to(nix_store.parent)
         or (common is not None and common.is_relative_to(nix_store.parent))
@@ -950,6 +994,13 @@ def minimal_sandbox_argv(
         arguments.extend(["--symlink", "usr/lib64", "/lib64"])
     if nix_store is not None:
         arguments.extend(["--dir", "/nix", "--ro-bind", str(nix_store), str(nix_store)])
+    if nix_elf_runtime is not None:
+        # Bind the actual immutable glibc loader, not the host nix-ld shim.
+        # No /run/current-system mount or host environment is exposed.
+        arguments.extend([
+            "--dir", "/lib64",
+            "--ro-bind", str(nix_elf_runtime[0]), "/lib64/ld-linux-x86-64.so.2",
+        ])
     arguments.extend(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--dir", "/etc"])
     normalized_directories: list[str] = []
     for value in (*adler_directories, *tuple(extra_directories)):
@@ -959,6 +1010,7 @@ def minimal_sandbox_argv(
             not path.is_absolute()
             or raw in {"/", "/proc", "/dev", "/usr", "/etc"}
             or path.is_relative_to(Path("/nix"))
+            or (nix_elf_runtime is not None and path.is_relative_to(Path("/lib64")))
             or "\x00" in raw
             or ".." in path.parts
         ):
@@ -986,7 +1038,9 @@ def minimal_sandbox_argv(
     seen_targets = {str(worktree), *(str(item) for item in writable)}
     if common is not None:
         seen_targets.add(str(common))
-    for source_value, target_value in (*adler_read_only, *tuple(extra_read_only)):
+    if nix_elf_runtime is not None:
+        seen_targets.update({"/lib64", "/lib64/ld-linux-x86-64.so.2"})
+    for source_value, target_value in (*adler_read_only, *extra_read_only):
         source = _safe_existing_path(source_value, "extra_read_only source")
         if (
             not target_value.is_absolute()
@@ -1067,6 +1121,8 @@ def minimal_sandbox_argv(
     )
     for key, value in _git_command_environment().items():
         arguments.extend(["--setenv", key, value])
+    if nix_elf_runtime is not None:
+        arguments.extend(["--setenv", "LD_LIBRARY_PATH", str(nix_elf_runtime[1])])
     arguments.extend(
         [
             "--chdir",
