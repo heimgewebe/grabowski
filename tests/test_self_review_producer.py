@@ -238,6 +238,14 @@ class ServerReviewProducerTests(unittest.TestCase):
         self.assertNotIn("audit_path", output)
         self.assertNotIn("arbitrary_future_field", output)
 
+    def test_every_trusted_outer_worker_uses_isolated_python_imports(self):
+        for axis, argv in self.plan["tasks"].items():
+            with self.subTest(axis=axis):
+                self.assertEqual(
+                    [self.python, "-I", "-B", "-c"], argv[-5:-1],
+                )
+                self.assertIn("grabowski-phase-source-inspection-v1", argv[-1])
+
     def test_review_suite_allowlist_is_readonly_compatible_and_distinct(self):
         self.assertEqual(
             [

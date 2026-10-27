@@ -340,10 +340,10 @@ def trusted_phase_source(
         "for path in changed:\n"
         "    if not re.fullmatch(r'[A-Za-z0-9_.@+/-]{1,512}',path) or '..' in path.split('/'):sys.exit(87)\n"
         "    blob=run('show',binding['head_sha']+':'+path)\n"
-        "    if blob.returncode:continue\n"
-        "    if len(blob.stdout)>262144 or b'\\x00' in blob.stdout:continue\n"
+        "    if blob.returncode:sys.exit(91)\n"
+        "    if len(blob.stdout)>2097152 or b'\\x00' in blob.stdout:sys.exit(92)\n"
         "    try: content=blob.stdout.decode('utf-8')\n"
-        "    except UnicodeError:continue\n"
+        "    except UnicodeError:sys.exit(93)\n"
         "    if path.endswith('.py'):\n"
         "        try: tree=ast.parse(content,filename=path)\n"
         "        except SyntaxError:sys.exit(88)\n"
@@ -426,6 +426,7 @@ def observed_phase_report(
         or any(type(value) is not int or value < 0 for value in measures.values())
         or measures["changed_paths"] < 1
         or measures["inspected_paths"] < 1
+        or measures["inspected_paths"] != measures["changed_paths"]
     ):
         raise ReviewExecutionRejected("server-observed source inspection not substantive")
     summary = decoded["summary"]
@@ -463,7 +464,8 @@ def _verified_sandbox_command(record: dict[str, Any], task: dict[str, Any]) -> N
         raise ReviewExecutionRejected("self-review sandbox method/worktree invalid")
     prefix = [command[0], *_sandbox_bwrap_flags(worktree), "--"]
     binding = record.get("binding")
-    tail = ["-B", "-c", trusted_phase_source(binding, record["axis"], worktree)]
+    # -I prevents untrusted PR-root json.py/ast.py/subprocess.py shadowing.
+    tail = ["-I", "-B", "-c", trusted_phase_source(binding, record["axis"], worktree)]
     if (
         command[:len(prefix)] != prefix
         or len(command) != len(prefix) + 1 + len(tail)

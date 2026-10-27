@@ -74,6 +74,28 @@ class ReviewExecutionProvenanceTests(unittest.TestCase):
         self.assertNotIn(".config", " ".join(sources))
         self.assertNotIn(".local/state", " ".join(sources))
 
+    def test_trusted_review_worker_ignores_pr_checkout_module_shadows(self) -> None:
+        # A PR may add json.py/ast.py/subprocess.py at repository root.
+        # Without Python -I the outer trusted review method could import it.
+        candidate = Path(self.temp.name) / "malicious-checkout"
+        candidate.mkdir(mode=0o700)
+        for name in ("json.py", "ast.py", "subprocess.py", "hashlib.py"):
+            (candidate / name).write_text(
+                "raise RuntimeError('SYNTHETIC_IMPORT_HIJACK_CANARY')\n",
+                encoding="utf-8",
+            )
+        protected = subprocess.run(
+            [
+                sys.executable, "-I", "-B", "-c",
+                "import json,ast,subprocess,hashlib;print('stdlib-verified')",
+            ],
+            cwd=candidate, capture_output=True, text=True,
+            check=False, timeout=10,
+        )
+        self.assertEqual(0, protected.returncode, protected.stderr)
+        self.assertEqual("stdlib-verified", protected.stdout.strip())
+        self.assertNotIn("SYNTHETIC_IMPORT_HIJACK_CANARY", protected.stderr)
+
     def _write(self, path: Path, data: bytes) -> None:
         path.write_bytes(data)
         path.chmod(0o600)
@@ -130,7 +152,7 @@ class ReviewExecutionProvenanceTests(unittest.TestCase):
         }
         sandbox_argv = [
             bwrap, *execution._sandbox_bwrap_flags(worktree), "--",
-            python, "-B", "-c",
+            python, "-I", "-B", "-c",
             execution.trusted_phase_source(binding, axis, worktree),
         ]
         argv = hashlib.sha256(json.dumps(
@@ -269,6 +291,36 @@ class ReviewExecutionProvenanceTests(unittest.TestCase):
                 b"source_raw_diff_sha256:" + b"f" * 64 + b"\nRan 11 tests in 0.1s\n\nOK\n",
                 binding=binding, axis=execution.REQUIRED_AXES[0],
             )
+
+    def test_partial_changed_file_inspection_cannot_count_as_review_pass(self):
+        self._phase(1)
+        identity = f"{1:032x}"
+        receipt = json.loads((self.receipts / (identity + ".json")).read_text())
+        original = (self.receipts / (identity + ".out")).read_bytes()
+        marker = execution.PHASE_OBSERVATION_PREFIX
+        at = original.rfind(marker)
+        self.assertGreaterEqual(at, 0)
+        observed = json.loads(original[at + len(marker):-1])
+        observed["measurements"]["changed_paths"] = 2
+        observed["measurements"]["inspected_paths"] = 1
+        modified = original[:at] + marker + execution._canonical(observed) + b"\n"
+        with self.assertRaisesRegex(
+            execution.ReviewExecutionRejected, "not substantive",
+        ):
+            execution.observed_phase_report(
+                modified, binding=receipt["binding"], axis=receipt["axis"],
+            )
+
+    def test_trusted_worker_fails_closed_on_uninspected_git_blob(self):
+        self._phase(1)
+        identity = f"{1:032x}"
+        receipt = json.loads((self.receipts / (identity + ".json")).read_text())
+        source = execution.trusted_phase_source(
+            receipt["binding"], receipt["axis"], receipt["worktree_path"],
+        )
+        self.assertIn("if blob.returncode:sys.exit(91)", source)
+        self.assertIn("len(blob.stdout)>2097152", source)
+        self.assertIn("except UnicodeError:sys.exit(93)", source)
 
     def test_wrong_producer_rejected_even_with_valid_signature(self) -> None:
         self._five(producer="caller")

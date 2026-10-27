@@ -127,7 +127,8 @@ def _task_command(
     ):
         raise provenance.ReviewExecutionRejected("review runtime binary not installed from Nix")
     return [
-        bwrap, *provenance._sandbox_bwrap_flags(str(worktree)), "--", python, "-B", "-c",
+        # Only the trusted outer method is import-isolated; child unittest can load candidate sources.
+        bwrap, *provenance._sandbox_bwrap_flags(str(worktree)), "--", python, "-I", "-B", "-c",
         provenance.trusted_phase_source(binding, axis, str(worktree)),
     ]
 
@@ -403,7 +404,7 @@ def _seal_review(
             ):
                 raise provenance.ReviewExecutionRejected("untrusted phase task argv")
             exact = _task_command(
-                binding, axis, worktree, bwrap=command[0], python=command[-4],
+                binding, axis, worktree, bwrap=command[0], python=command[-5],
             )
             if exact != command:
                 raise provenance.ReviewExecutionRejected("review plan task command altered")
