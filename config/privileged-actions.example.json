@@ -53,6 +53,22 @@
       ],
       "timeout_seconds": 3600
     },
+    "nixos_restic_root_unit": {
+      "enabled": true,
+      "mode": "template",
+      "target_pattern": "heim-pc-restic-recovery-probe\\.service",
+      "argv": [
+        "/run/current-system/sw/bin/systemctl",
+        "--system",
+        "start",
+        "heim-pc-restic-recovery-probe.service"
+      ],
+      "timeout_seconds": 2700,
+      "allowed_peer_uid": 1000,
+      "allowed_peer_unit": "grabowski-operator.service",
+      "kill_switch_path": "/var/lib/grabowski/operator-blockade/operator-kill-switch",
+      "legacy_kill_switch_path": "/home/alex/.local/state/grabowski/operator-kill-switch"
+    },
     "publish_recovery_marker": {
       "enabled": true,
       "mode": "recovery-marker-publish",

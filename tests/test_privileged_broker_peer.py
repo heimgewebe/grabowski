@@ -1747,7 +1747,6 @@ class PrivilegedBrokerPeerTests(unittest.TestCase):
         def replay_check(*args, **kwargs):
             events.append("replay-check")
             return {"binding": "ok"}
-
         def consume(*args, **kwargs):
             events.append("consume")
             return {"path": "/state/consumed.json", "sha256": "a" * 64}
@@ -2024,6 +2023,156 @@ class PrivilegedBrokerPeerTests(unittest.TestCase):
         self.assertIs(result["record"]["stderr_truncated"], True)
         self.assertEqual(result["output_evidence_status"], "unavailable")
         self._output_evidence.assert_not_called()
+
+
+
+class NixOSResticRootUnitPeerBoundaryTests(unittest.TestCase):
+    @staticmethod
+    def authority():
+        return {
+            "mode": "template",
+            "argv": list(_broker_lib.NIXOS_RESTIC_ROOT_UNIT_ARGV),
+            "cwd": None,
+            "timeout_seconds": 2700,
+            "allowed_peer_uid": 1000,
+            "allowed_peer_unit": "grabowski-operator.service",
+            "kill_switch_path": "/var/lib/grabowski/operator-blockade/operator-kill-switch",
+            "legacy_kill_switch_path": "/home/alex/.local/state/grabowski/operator-kill-switch",
+        }
+
+    @staticmethod
+    def ref():
+        return {
+            "request_id": "a" * 32,
+            "reference_sha256": "b" * 64,
+            "action": _broker_lib.NIXOS_RESTIC_ROOT_UNIT_ACTION,
+            "target": _broker_lib.NIXOS_RESTIC_ROOT_UNIT,
+        }
+
+    def test_foreign_child_peer_is_denied_before_claim_and_dispatch(self) -> None:
+        with mock.patch.object(
+            broker_tool, "parse_reference", return_value=self.ref()
+        ), mock.patch.object(
+            broker_tool, "load_root_config", return_value={}
+        ), mock.patch.object(
+            broker_tool, "resolve_regular_execution", return_value=self.authority()
+        ), mock.patch.object(
+            broker_tool, "_validate_blockade_lifecycle_peer",
+            side_effect=PermissionError("peer is not systemd MainPID"),
+        ) as peer, mock.patch.object(
+            broker_tool, "claim_once"
+        ) as claim, mock.patch.object(
+            broker_tool, "_execute_broker_command"
+        ) as command:
+            with self.assertRaisesRegex(PermissionError, "MainPID"):
+                broker_tool._run_non_secret_reference_request(b"{}")
+        peer.assert_called_once_with(self.authority())
+        claim.assert_not_called()
+        command.assert_not_called()
+
+    def test_broker_accepted_action_requires_mainpid_and_fixed_launch(self) -> None:
+        accepted = {
+            "pid": 1234, "uid": 1000, "gid": 1000,
+            "cgroup": "/system.slice/grabowski-operator.service",
+            "unit": "grabowski-operator.service", "starttime_ticks": 77,
+            "cgroup_process_count": 1, "systemd_main_pid": 1234,
+            "systemd_control_group": "/system.slice/grabowski-operator.service",
+        }
+        command = {
+            "stdout": "", "stderr": "",
+            "record": {"action": _broker_lib.NIXOS_RESTIC_ROOT_UNIT_ACTION},
+            "timed_out": False, "returncode": 0,
+            "output_evidence": None, "output_evidence_status": "unavailable",
+            "readback_retry_safe": False,
+        }
+        with mock.patch.object(
+            broker_tool, "parse_reference", return_value=self.ref()
+        ), mock.patch.object(
+            broker_tool, "load_root_config", return_value={}
+        ), mock.patch.object(
+            broker_tool, "resolve_regular_execution", return_value=self.authority()
+        ), mock.patch.object(
+            broker_tool, "_validate_blockade_lifecycle_peer", return_value=accepted
+        ) as peer, mock.patch.object(
+            broker_tool, "claim_once"
+        ) as claim, mock.patch.object(
+            broker_tool, "_execute_broker_command", return_value=command
+        ) as dispatch, redirect_stdout(io.StringIO()):
+            self.assertEqual(broker_tool._run_non_secret_reference_request(b"{}"), 0)
+        peer.assert_called_once_with(self.authority())
+        claim.assert_called_once()
+        dispatch.assert_called_once()
+        self.assertEqual(dispatch.call_args.kwargs["operator_peer"], accepted)
+
+
+
+
+class NativeRootProofClientReceiptTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.result = {
+            "request_id": "a" * 32,
+            "reference_sha256": "b" * 64,
+            "broker_client_timed_out": False,
+            "broker_client_transport_error": None,
+            "broker_response": {
+                "request_id": "a" * 32,
+                "action": privileged_client.NIXOS_RESTIC_ROOT_UNIT_ACTION,
+                "mode": "template",
+                "returncode": 0,
+                "timed_out": False,
+            },
+        }
+
+    def test_client_requires_matching_verified_rootbroker_receipt(self) -> None:
+        with mock.patch.object(
+            privileged_client, "_invoke_mainpid_privileged_reference",
+            return_value=self.result,
+        ) as invoke, mock.patch.object(
+            privileged_client, "_append_operator_audit"
+        ) as audit:
+            accepted = privileged_client.start_nixos_root_restic_unit_reference()
+        self.assertTrue(accepted["success"])
+        invoke.assert_called_once_with(
+            action=privileged_client.NIXOS_RESTIC_ROOT_UNIT_ACTION,
+            target=privileged_client.NIXOS_RESTIC_ROOT_UNIT,
+            justification="Start one fixed root-owned NixOS Restic restore proof service",
+            timeout_seconds=2700,
+            max_output_bytes=20000,
+        )
+        audit.assert_called_once()
+        self.assertTrue(audit.call_args.args[0]["success"])
+
+    def test_client_refuses_broker_forgery_ambiguous_timeout_and_wrong_action(self) -> None:
+        for modified in (
+            {"request_id": "0" * 32},
+            {"action": "operator_root_task_systemd_unit"},
+            {"mode": "argv-json"},
+            {"returncode": 1},
+            {"timed_out": True},
+        ):
+            result = {
+                **self.result,
+                "broker_response": {**self.result["broker_response"], **modified},
+            }
+            with self.subTest(modified=modified), mock.patch.object(
+                privileged_client, "_invoke_mainpid_privileged_reference",
+                return_value=result,
+            ), mock.patch.object(
+                privileged_client, "_append_operator_audit"
+            ) as audit, self.assertRaises(RuntimeError):
+                privileged_client.start_nixos_root_restic_unit_reference()
+            audit.assert_not_called()
+        for change in (
+            {"broker_client_timed_out": True},
+            {"broker_client_transport_error": "partial response"},
+            {"broker_response": None},
+        ):
+            with self.subTest(change=change), mock.patch.object(
+                privileged_client, "_invoke_mainpid_privileged_reference",
+                return_value={**self.result, **change},
+            ), self.assertRaises(RuntimeError):
+                privileged_client.start_nixos_root_restic_unit_reference()
+
 
 
 if __name__ == "__main__":

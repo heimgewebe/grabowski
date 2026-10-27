@@ -1651,17 +1651,9 @@ def _nixos_local_recovery_probe_locked(target_info: dict[str, Any]) -> dict[str,
     log_dir.mkdir(parents=True, exist_ok=True)
     started_at = int(time.time())
     log_path = log_dir / f"nixos-restic-recovery-{started_at}.log"
-    # The only sudo command is a fixed start of the root-owned NixOS unit.
-    # The operator never chooses privileged argv, a restore target or a cleanup
-    # path. This unit owns the Restic credentials and the 0700 restore stage.
-    _run_logged(
-        ["/run/wrappers/bin/sudo", "-n",
-         "/run/current-system/sw/bin/systemctl", "--system", "start",
-         NIXOS_RESTIC_ROOT_PROOF_UNIT],
-        env=dict(os.environ),
-        log=log_path,
-        timeout_seconds=2700,
-    )
+    # Privileged unit start is allowed ONLY through the rootbroker's
+    # MainPID-bound, fixed-action contract. No operator-side sudo remains.
+    privileged.start_nixos_root_restic_unit_reference()
     completed_at = int(time.time())
     proof = _nixos_root_proof_read(
         not_before_unix=started_at,

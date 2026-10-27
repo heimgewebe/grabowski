@@ -66,7 +66,9 @@ def _socket(path: Path) -> dict[str, Any]:
     }
     try:
         metadata = path.lstat()
-    except FileNotFoundError:
+    except (FileNotFoundError, PermissionError):
+        # Unprivileged callers outside the socket group must receive a
+        # fail-closed not-ready status, not an exception.
         return result
     result.update({
         "exists": True,
@@ -106,6 +108,8 @@ def grabowski_privileged_broker_status() -> dict[str, Any]:
 
 POWER_ACTION = "operator_power_argv"
 RECOVERY_PUBLISH_ACTION = "publish_recovery_marker"
+NIXOS_RESTIC_ROOT_UNIT_ACTION = "nixos_restic_root_unit"
+NIXOS_RESTIC_ROOT_UNIT = "heim-pc-restic-recovery-probe.service"
 PROCESS_REFERENCE_ACTION = "observe_process_references"
 PROCESS_REFERENCE_KIND = "grabowski_process_reference_observation"
 PROCESS_REFERENCE_ALLOWED_ROOTS = (
@@ -407,14 +411,16 @@ def _invoke_mainpid_privileged_reference(
     if action not in {
         CRITICAL_USER_DATA_INVENTORY_ACTION,
         CRITICAL_USER_DATA_INVENTORY_READ_ACTION,
+        NIXOS_RESTIC_ROOT_UNIT_ACTION,
     }:
-        raise ValueError("MainPID privileged inventory action is not allowed")
+        raise ValueError("MainPID privileged action is not allowed")
+    max_timeout = 2700 if action == NIXOS_RESTIC_ROOT_UNIT_ACTION else 120
     if (
         isinstance(timeout_seconds, bool)
         or not isinstance(timeout_seconds, int)
-        or not 1 <= timeout_seconds <= 120
+        or not 1 <= timeout_seconds <= max_timeout
     ):
-        raise ValueError("MainPID privileged inventory timeout is invalid")
+        raise ValueError("MainPID privileged action timeout is invalid")
     broker = _privileged_broker_status()
     if not broker.get("ready"):
         raise PermissionError("privileged broker is not ready")
@@ -731,6 +737,37 @@ def root_task_systemd_request(
         "outcome_unknown": not root_truth_observable,
         "privileged_broker": invoked,
     }
+
+
+def start_nixos_root_restic_unit_reference() -> dict[str, Any]:
+    """Only the existing rootbroker can start NixOS's fixed privileged proof unit."""
+    invoked = _invoke_mainpid_privileged_reference(
+        action=NIXOS_RESTIC_ROOT_UNIT_ACTION,
+        target=NIXOS_RESTIC_ROOT_UNIT,
+        justification="Start one fixed root-owned NixOS Restic restore proof service",
+        timeout_seconds=2700,
+        max_output_bytes=20000,
+    )
+    response = invoked.get("broker_response")
+    if not (
+        isinstance(response, dict)
+        and response.get("request_id") == invoked.get("request_id")
+        and response.get("action") == NIXOS_RESTIC_ROOT_UNIT_ACTION
+        and response.get("mode") == "template"
+        and response.get("returncode") == 0
+        and response.get("timed_out") is False
+        and invoked.get("broker_client_timed_out") is False
+        and invoked.get("broker_client_transport_error") is None
+    ):
+        raise RuntimeError("NixOS root Restic service was not verified as broker-started")
+    _append_operator_audit({
+        "tool": "start_nixos_root_restic_unit_reference",
+        "action": NIXOS_RESTIC_ROOT_UNIT_ACTION,
+        "reference_sha256": invoked.get("reference_sha256"),
+        "request_id": invoked.get("request_id"),
+        "success": True,
+    })
+    return {"success": True, "request_id": invoked.get("request_id")}
 
 
 def publish_recovery_marker_reference(

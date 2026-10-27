@@ -372,18 +372,16 @@ class NativeNixOSResticProofTests(unittest.TestCase):
         import tempfile
         for scenario in ("unit_failure", "missing_proof", "invalid_proof"):
             with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as tmp:
-                fake_run = (
-                    RuntimeError("NixOS recovery unit failed")
-                    if scenario == "unit_failure"
-                    else types.SimpleNamespace(returncode=0, stdout="")
+                failure = (
+                    RuntimeError("NixOS broker rejected fixed root unit")
+                    if scenario == "unit_failure" else None
                 )
                 with patch.object(
                     recovery.operator, "STATE_DIR", Path(tmp)
                 ), patch.object(
-                    recovery, "_run_logged",
-                    side_effect=fake_run if isinstance(fake_run, Exception) else None,
-                    return_value=None if isinstance(fake_run, Exception) else fake_run,
-                ), patch.object(
+                    recovery.privileged, "start_nixos_root_restic_unit_reference",
+                    side_effect=failure,
+                ) as broker_start, patch.object(
                     recovery, "_nixos_root_proof_read",
                     side_effect=RuntimeError(scenario)
                 ), patch.object(
@@ -395,6 +393,7 @@ class NativeNixOSResticProofTests(unittest.TestCase):
                         recovery._nixos_local_recovery_probe_locked(self.target)
                     marker.assert_not_called()
                     publish.assert_not_called()
+                    broker_start.assert_called_once_with()
 
     def test_nixos_native_probe_invokes_only_fixed_root_unit_and_uses_root_receipt(self) -> None:
         import tempfile
@@ -405,9 +404,9 @@ class NativeNixOSResticProofTests(unittest.TestCase):
         ), patch.object(
             recovery.time, "time", return_value=self.now
         ), patch.object(
-            recovery, "_run_logged",
-            return_value=types.SimpleNamespace(returncode=0, stdout="")
-        ) as run, patch.object(
+            recovery.privileged, "start_nixos_root_restic_unit_reference",
+            return_value={"success": True},
+        ) as broker_start, patch.object(
             recovery, "_nixos_root_proof_read", return_value=proof
         ) as read_proof, patch.object(
             recovery, "_timer_probe", return_value={"ok": True}
@@ -427,12 +426,7 @@ class NativeNixOSResticProofTests(unittest.TestCase):
             recovery, "_server_source_marker", return_value={"valid": True}
         ), patch.object(recovery.base, "_append_audit"):
             result = recovery._nixos_local_recovery_probe_locked(self.target)
-        run.assert_called_once()
-        self.assertEqual(run.call_args.args[0], [
-            "/run/wrappers/bin/sudo", "-n",
-            "/run/current-system/sw/bin/systemctl", "--system", "start",
-            "heim-pc-restic-recovery-probe.service",
-        ])
+        broker_start.assert_called_once_with()
         read_proof.assert_called_once()
         marker.assert_called_once_with(
             completed_at_unix=self.now,

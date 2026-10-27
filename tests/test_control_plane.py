@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 from pathlib import Path
@@ -2911,7 +2912,7 @@ class SecretPtyContractTests(unittest.TestCase):
         root_tool = _load_root_broker_tool()
         # Use a stable root-controlled executable so this regression reaches the
         # interpreter-identity guard on both local hosts and GitHub runners.
-        expected_client = "/bin/true"
+        expected_client = str(Path(shutil.which("true") or "/usr/bin/true").resolve(strict=True))
         fake_control_group = "/system.slice/grabowski-operator.service"
         execution = {
             "allowed_peer_uid": os.getuid(),
