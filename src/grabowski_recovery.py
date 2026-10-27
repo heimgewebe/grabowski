@@ -1913,6 +1913,15 @@ def recovery_status() -> dict[str, Any]:
     server_source = _server_source_marker()
     # NixOS publishes evidence only after a real restore and repository check.
     # Pop!_OS keeps its existing timestamp-marker contract.
+    # A native local-disk restore binds the source to the *actual* snapshot
+    # time; a configured remote recovery backend deliberately does not. A
+    # successful remote restore must therefore never be repurposed as NixOS
+    # local-backup freshness evidence. For remote targets use the separately
+    # freshness-bounded local backup completion marker as on the legacy path.
+    native_local_target = (
+        _NIXOS_RESTIC_TIMER_PRESENT
+        and _configured_recovery_target_info().get("kind") == "local_backup_disk"
+    )
     local_backup = (
         {
             "path": server_source["path"], "exists": server_source["exists"],
@@ -1926,7 +1935,7 @@ def recovery_status() -> dict[str, Any]:
             ),
             "source": "verified-nixos-native-restic",
         }
-        if _NIXOS_RESTIC_TIMER_PRESENT else _fresh_text_marker(BACKUP_SUCCESS)
+        if native_local_target else _fresh_text_marker(BACKUP_SUCCESS)
     )
     source_publication = _source_publication_state(server_backup, server_source)
     kill_switch = base._kill_switch_state()

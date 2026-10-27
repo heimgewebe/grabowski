@@ -628,6 +628,65 @@ class NativeNixOSResticProofTests(unittest.TestCase):
                         snapshot_time_unix=self.now - recovery.MAX_AGE_SECONDS - 1,
                     )
 
+    def test_nixos_remote_target_keeps_independent_local_backup_freshness(self) -> None:
+        remote_target = "wg-prod-1:rest-server/grabowski-recovery-probe"
+        remote_info = {
+            "valid": True, "kind": "rest_server", "host": "wg-prod-1",
+            "probe": "grabowski-recovery-probe",
+        }
+        source = {
+            "valid": True, "exists": True, "target": remote_target,
+            "snapshot_time_unix": None, "snapshot_age_seconds": None,
+            "snapshot_fresh": False, "source_record_sha256": "a" * 64,
+        }
+        for locally_fresh in (True, False):
+            with self.subTest(locally_fresh=locally_fresh), patch.object(
+                recovery, "_NIXOS_RESTIC_TIMER_PRESENT", True
+            ), patch.object(
+                recovery, "SERVER_RECOVERY_TARGET", remote_target
+            ), patch.object(
+                recovery, "_configured_recovery_target_info", return_value=remote_info
+            ), patch.object(
+                recovery.base, "_verify_audit_log", return_value={"valid": True}
+            ), patch.object(
+                recovery.base, "_deployment_metadata", return_value={"provenance_valid": True}
+            ), patch.object(
+                recovery, "_canonical_server_marker",
+                return_value={"valid": True, "target": remote_target, "freshness_reason": "ready"},
+            ), patch.object(
+                recovery, "_server_source_marker", return_value=source
+            ), patch.object(
+                recovery, "_source_publication_state",
+                return_value={"current": True, "reason": "ready"}
+            ), patch.object(
+                recovery, "_server_recovery_evidence_fresh", return_value=True
+            ), patch.object(
+                recovery, "_server_recovery_evidence_boundary", return_value={}
+            ), patch.object(
+                recovery.base, "_kill_switch_state", return_value={"engaged": False}
+            ), patch.object(
+                recovery, "_test_kill_switch_recovery_status", return_value={}
+            ), patch.object(
+                recovery, "_timer_probe", return_value={"ok": True}
+            ), patch.object(
+                recovery.privileged, "grabowski_privileged_broker_status",
+                return_value={"ready": True}
+            ), patch.object(
+                recovery, "_fresh_text_marker",
+                return_value={
+                    "path": str(recovery.BACKUP_SUCCESS), "exists": True,
+                    "valid": locally_fresh, "timestamp_unix": self.now - 60,
+                    "age_seconds": 60,
+                    "error": None if locally_fresh else "marker is stale",
+                }
+            ) as local_marker:
+                status = recovery.recovery_status()
+            local_marker.assert_called_once_with(recovery.BACKUP_SUCCESS)
+            self.assertEqual(status["checks"]["local_backup_fresh"], locally_fresh)
+            self.assertEqual(status["ready_for_user_power_worker"], locally_fresh)
+            self.assertEqual(status["ready_for_privileged_actions"], locally_fresh)
+            self.assertEqual(status["local_backup"]["path"], str(recovery.BACKUP_SUCCESS))
+
     def test_nixos_gate_rejects_legacy_source_without_snapshot_timestamp(self) -> None:
         now = self.now
         source = {
