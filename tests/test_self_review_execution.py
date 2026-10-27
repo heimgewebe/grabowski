@@ -646,6 +646,105 @@ class SemanticV2RoleContractTests(unittest.TestCase):
         result = self.verify_fixture()
         self.assertEqual(len(result), len(execution.REQUIRED_AXES))
 
+    def _verify_with_optional_review_failure(self, *, kind: str):
+        """Reconcile five synthetic V2 PASS fixtures plus one optional attempt."""
+        extra_slot = "optional-anthropic"
+        unit = "grabowski-job-000000000006"
+        extra = {
+            "slot": extra_slot, "unit": unit,
+            "origin_sha256": "e" * 64,
+            "terminal": True, "terminal_status": "failed",
+            "classification": "infrastructure_error",
+            "verdict": None, "material_findings": None,
+            "result_sha256": None, "diff_identity_deferred": False,
+            "pre_result_quota_failure_verified": True,
+            "review_role_verified": True, "review_route_verified": True,
+            "independence_verified": True,
+            "review_role_receipt_sha256": "f" * 64,
+        }
+        if kind == "unproven_quota":
+            extra["pre_result_quota_failure_verified"] = False
+        elif kind == "launch_failed":
+            extra.update({
+                "terminal_status": "launch_failed",
+                "pre_result_quota_failure_verified": False,
+                "review_role_receipt_sha256": None,
+                "stdout_tail_sha256": None,
+            })
+        elif kind == "material_reject":
+            extra.update({
+                "classification": "material_reject",
+                "terminal_status": "succeeded",
+                "verdict": "REJECT_THIS_REVISION",
+                "material_findings": 1,
+                "result_sha256": "1" * 64,
+            })
+        elif kind != "authentic_quota":
+            raise AssertionError("unknown test case")
+        attempts = [*self.attempts, extra]
+        slots = [
+            {
+                "slot": item["slot"], "attempt_count": 1,
+                "pass_count": 1, "independent_pass_count": 1,
+                "material_reject_count": 0, "unresolved_count": 0,
+                "infrastructure_error_count": 0,
+                "units_sha256": decisions.sha256_json([item["unit"]]),
+            }
+            for item in self.attempts
+        ]
+        slots.append({
+            "slot": extra_slot, "attempt_count": 1,
+            "pass_count": 0, "independent_pass_count": 0,
+            "material_reject_count": 1 if kind == "material_reject" else 0,
+            "unresolved_count": 0,
+            "infrastructure_error_count": 0 if kind == "material_reject" else 1,
+            "units_sha256": decisions.sha256_json([unit]),
+        })
+        if kind == "material_reject":
+            errors = [f"decision_review_material_reject:{extra_slot}:{unit}"]
+        else:
+            errors = [
+                f"decision_review_slot_without_pass:{extra_slot}",
+                f"decision_review_named_provider_slot_without_independent_pass:{extra_slot}",
+                f"decision_review_infrastructure_not_superseded:{extra_slot}:{unit}",
+            ]
+        reconciliation = {
+            "status": "blocked", "errors": errors, "attempts": attempts,
+            "attempt_count": len(attempts), "slots": slots,
+            "slot_count": len(slots),
+        }
+        with (
+            mock.patch.object(decisions, "reconcile", return_value=reconciliation),
+            mock.patch.object(
+                decisions, "_read_private_json",
+                side_effect=lambda path, *args, **kwargs:
+                    self.receipts[Path(path).parent.name],
+            ),
+        ):
+            return execution.verified_semantic_review_passes(
+                self.binding, repository=self.repo,
+            )
+
+    def test_optional_verified_pre_result_quota_does_not_erase_five_real_reviews(self):
+        verified = self._verify_with_optional_review_failure(kind="authentic_quota")
+        self.assertEqual(set(verified), set(execution.REQUIRED_AXES))
+
+    def test_optional_verified_nonstart_does_not_erase_five_real_reviews(self):
+        verified = self._verify_with_optional_review_failure(kind="launch_failed")
+        self.assertEqual(set(verified), set(execution.REQUIRED_AXES))
+
+    def test_optional_unverified_quota_must_remain_blocking(self):
+        with self.assertRaisesRegex(
+            execution.ReviewExecutionRejected, "not settled",
+        ):
+            self._verify_with_optional_review_failure(kind="unproven_quota")
+
+    def test_optional_authentic_material_reject_must_remain_blocking(self):
+        with self.assertRaisesRegex(
+            execution.ReviewExecutionRejected, "not settled",
+        ):
+            self._verify_with_optional_review_failure(kind="material_reject")
+
     def test_missing_axis_role_blocks(self):
         self.attempts.pop()
         with self.assertRaisesRegex(

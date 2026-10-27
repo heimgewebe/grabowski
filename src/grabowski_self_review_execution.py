@@ -725,10 +725,27 @@ def verified_semantic_review_passes(
         diff_sha256=expected["diff_sha256"],
     )
     if (
-        not isinstance(result, dict) or result.get("status") != "settled"
-        or result.get("errors") != []
+        not isinstance(result, dict)
         or not isinstance(result.get("attempts"), list)
+        or not isinstance(result.get("errors"), list)
     ):
+        raise ReviewExecutionRejected("substantive V2 reviewer execution not settled")
+    # The V2 registry also contains unrelated optional decision-bound reviews.
+    # Captain already distinguishes authenticated *pre-result* infrastructure
+    # absence from a semantic result. Apply that SAME exact classifier, rather
+    # than making five valid self-review role receipts depend on an optional
+    # provider's quota. Never ignore an ambiguous result, a REJECT, a running
+    # reviewer, malformed evidence, or failures of the mandatory selfrev slots.
+    if result.get("status") == "settled" and result["errors"] == []:
+        pass
+    elif result.get("status") == "blocked" and result["errors"]:
+        from grabowski_merge_guard import decision_review_blocking_errors
+        optional = decision_review_blocking_errors(
+            result, independent_required=False,
+        )
+        if optional["status"] != "optional_unavailable" or optional["errors"]:
+            raise ReviewExecutionRejected("substantive V2 reviewer execution not settled")
+    else:
         raise ReviewExecutionRejected("substantive V2 reviewer execution not settled")
     attempts = result["attempts"]
     if not (
