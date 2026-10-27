@@ -1588,7 +1588,7 @@ def _validated_nixos_root_proof(
     started = payload["started_at_unix"]
     completed = payload["completed_at_unix"]
     snapshot_time = payload["snapshot_time_unix"]
-    if not (not_before_unix - 1 <= started <= completed <= now + 5
+    if not (not_before_unix <= started <= completed <= now + 5
             and 0 <= now - completed <= 120
             and 0 <= completed - snapshot_time <= MAX_AGE_SECONDS
             and 0 <= now - snapshot_time <= MAX_AGE_SECONDS):
@@ -1612,7 +1612,8 @@ def _validated_nixos_root_proof(
 
 
 def _nixos_root_proof_read(
-    *, not_before_unix: int, now: int, expected_backup_uuid: str
+    *, not_before_unix: int, not_before_mtime_ns: int, now: int,
+    expected_backup_uuid: str,
 ) -> dict[str, Any]:
     """Read bounded root-owned evidence without following an attacker symlink."""
     proof = NIXOS_RESTIC_ROOT_PROOF_PATH
@@ -1628,6 +1629,15 @@ def _nixos_root_proof_read(
                     or file_stat.st_mode & 0o022 or file_stat.st_nlink != 1
                     or not 0 < file_stat.st_size <= 8192):
                 raise RuntimeError("NixOS root Restic proof file is unsafe")
+            # The root oneshot writes proof.json atomically with a new mtime.
+            # A prior success can still appear as inactive/success/0 while the
+            # broker-accepted --no-block start is only queued. Require a root-
+            # owned regular proof written no earlier than THIS broker dispatch,
+            # including two dispatches within the same Unix second.
+            if type(not_before_mtime_ns) is not int or not_before_mtime_ns <= 0:
+                raise RuntimeError("NixOS root Restic dispatch time is invalid")
+            if file_stat.st_mtime_ns < not_before_mtime_ns:
+                raise RuntimeError("NixOS root Restic proof predates broker dispatch")
             content = os.read(fd, 8193)
             if len(content) != file_stat.st_size:
                 raise RuntimeError("NixOS root Restic proof file size changed")
@@ -1645,7 +1655,8 @@ def _nixos_root_proof_read(
 
 
 def _await_nixos_root_proof(
-    *, started_at_unix: int, expected_backup_uuid: str, timeout_seconds: int = 4800,
+    *, started_at_unix: int, not_before_mtime_ns: int,
+    expected_backup_uuid: str, timeout_seconds: int = 4800,
 ) -> dict[str, Any]:
     """Check a fresh systemd oneshot outcome after broker's non-blocking start."""
     deadline = time.monotonic() + timeout_seconds
@@ -1687,6 +1698,7 @@ def _await_nixos_root_proof(
                 # start job is still queued. The root proof must be NEW.
                 return _nixos_root_proof_read(
                     not_before_unix=started_at_unix,
+                    not_before_mtime_ns=not_before_mtime_ns,
                     now=int(time.time()),
                     expected_backup_uuid=expected_backup_uuid,
                 )
@@ -1708,13 +1720,15 @@ def _nixos_local_recovery_probe_locked(target_info: dict[str, Any]) -> dict[str,
 
     log_dir = operator.STATE_DIR / "recovery"
     log_dir.mkdir(parents=True, exist_ok=True)
-    started_at = int(time.time())
+    started_at_ns = time.time_ns()
+    started_at = started_at_ns // 1_000_000_000
     log_path = log_dir / f"nixos-restic-recovery-{started_at}.log"
     # Privileged unit start is allowed ONLY through the rootbroker's
     # MainPID-bound, fixed-action contract. No operator-side sudo remains.
     privileged.start_nixos_root_restic_unit_reference()
     proof = _await_nixos_root_proof(
         started_at_unix=started_at,
+        not_before_mtime_ns=started_at_ns,
         expected_backup_uuid=backup_uuid,
     )
     completed_at = int(time.time())

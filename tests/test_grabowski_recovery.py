@@ -369,6 +369,74 @@ class NativeNixOSResticProofTests(unittest.TestCase):
                         expected_backup_uuid=self.target["backup_uuid"],
                     )
 
+    def test_root_proof_started_before_dispatch_is_replayed_and_rejected(self) -> None:
+        old = dict(self._root_proof(), started_at_unix=self.now - 1,
+                   completed_at_unix=self.now - 1)
+        with self.assertRaisesRegex(RuntimeError, "stale or out of order"):
+            recovery._validated_nixos_root_proof(
+                old, not_before_unix=self.now, now=self.now,
+                expected_backup_uuid=self.target["backup_uuid"],
+            )
+
+    def test_root_proof_mtime_requires_post_broker_dispatch_even_same_second(self) -> None:
+        import os
+        import stat
+        import tempfile
+
+        # A previously successful systemd unit can return inactive/success/0
+        # before its newly queued --no-block start actually runs.
+        old = dict(self._root_proof(), started_at_unix=self.now,
+                   completed_at_unix=self.now)
+        real_lstat, real_fstat = Path.lstat, os.fstat
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            file = parent / "proof.json"
+            file.write_text(json.dumps(old), encoding="utf-8")
+            previous_mtime_ns = file.stat().st_mtime_ns
+
+            def trusted_parent(path):
+                meta = real_lstat(path)
+                if path == parent:
+                    return types.SimpleNamespace(st_mode=stat.S_IFDIR | 0o755, st_uid=0)
+                return meta
+
+            def trusted_file(fd):
+                meta = real_fstat(fd)
+                return types.SimpleNamespace(
+                    st_mode=meta.st_mode, st_uid=0, st_nlink=meta.st_nlink,
+                    st_size=meta.st_size, st_mtime_ns=meta.st_mtime_ns,
+                )
+
+            with patch.object(recovery, "NIXOS_RESTIC_ROOT_PROOF_PATH", file), patch.object(
+                recovery.Path, "lstat", new=trusted_parent,
+            ), patch.object(recovery.os, "fstat", side_effect=trusted_file):
+                with self.assertRaisesRegex(RuntimeError, "predates"):
+                    recovery._nixos_root_proof_read(
+                        not_before_unix=self.now,
+                        not_before_mtime_ns=previous_mtime_ns + 1,
+                        now=self.now, expected_backup_uuid=self.target["backup_uuid"],
+                    )
+                self.assertEqual(recovery._nixos_root_proof_read(
+                    not_before_unix=self.now,
+                    not_before_mtime_ns=previous_mtime_ns,
+                    now=self.now, expected_backup_uuid=self.target["backup_uuid"],
+                ), old)
+
+                unit = {"returncode": 0, "stdout": (
+                    "LoadState=loaded\nJob=\nActiveState=inactive\n"
+                    "Result=success\nExecMainStatus=0\n"
+                )}
+                with patch.object(recovery.operator, "_run", return_value=unit), patch.object(
+                    recovery.time, "monotonic", side_effect=[0.0, 2.0],
+                ), patch.object(recovery.time, "sleep"):
+                    with self.assertRaises(TimeoutError):
+                        recovery._await_nixos_root_proof(
+                            started_at_unix=self.now,
+                            not_before_mtime_ns=previous_mtime_ns + 1,
+                            expected_backup_uuid=self.target["backup_uuid"],
+                            timeout_seconds=1,
+                        )
+
     def test_broker_service_waits_for_unit_success_and_exact_new_root_proof(self) -> None:
         proof = self._root_proof()
         sequence = iter([
@@ -383,6 +451,7 @@ class NativeNixOSResticProofTests(unittest.TestCase):
             recovery.time, "sleep",
         ):
             result = recovery._await_nixos_root_proof(
+                not_before_mtime_ns=(self.now - 10) * 1_000_000_000,
                 started_at_unix=self.now - 4, expected_backup_uuid=self.target["backup_uuid"],
             )
         self.assertEqual(result, proof)
@@ -399,6 +468,7 @@ class NativeNixOSResticProofTests(unittest.TestCase):
         ) as sleep:
             with self.assertRaisesRegex(RuntimeError, "missing"):
                 recovery._await_nixos_root_proof(
+                    not_before_mtime_ns=(self.now - 10) * 1_000_000_000,
                     started_at_unix=self.now,
                     expected_backup_uuid=self.target["backup_uuid"],
                 )
@@ -429,6 +499,7 @@ class NativeNixOSResticProofTests(unittest.TestCase):
             recovery, "_nixos_root_proof_read", return_value=proof
         ) as read, patch.object(recovery.time, "sleep") as pause:
             result = recovery._await_nixos_root_proof(
+                not_before_mtime_ns=(self.now - 10) * 1_000_000_000,
                 started_at_unix=self.now - 4, expected_backup_uuid=self.target["backup_uuid"]
             )
         self.assertEqual(result, proof)
@@ -454,6 +525,7 @@ class NativeNixOSResticProofTests(unittest.TestCase):
         ) as proof:
             with self.assertRaisesRegex(RuntimeError, "failed"):
                 recovery._await_nixos_root_proof(
+                    not_before_mtime_ns=(self.now - 10) * 1_000_000_000,
                     started_at_unix=self.now,
                     expected_backup_uuid=self.target["backup_uuid"],
                 )
@@ -468,6 +540,7 @@ class NativeNixOSResticProofTests(unittest.TestCase):
         }), patch.object(recovery, "_nixos_root_proof_read") as read:
             with self.assertRaisesRegex(RuntimeError, "failed"):
                 recovery._await_nixos_root_proof(
+                    not_before_mtime_ns=(self.now - 10) * 1_000_000_000,
                     started_at_unix=self.now, expected_backup_uuid=self.target["backup_uuid"],
                 )
             read.assert_not_called()
@@ -479,6 +552,7 @@ class NativeNixOSResticProofTests(unittest.TestCase):
         ), patch.object(recovery.time, "monotonic", side_effect=[0.0, 2.0]):
             with self.assertRaises(TimeoutError):
                 recovery._await_nixos_root_proof(
+                    not_before_mtime_ns=(self.now - 10) * 1_000_000_000,
                     started_at_unix=self.now, expected_backup_uuid=self.target["backup_uuid"],
                     timeout_seconds=1,
                 )
@@ -505,7 +579,7 @@ class NativeNixOSResticProofTests(unittest.TestCase):
                 original = real_fstat(fd)
                 return types.SimpleNamespace(
                     st_mode=original.st_mode, st_uid=0, st_nlink=original.st_nlink,
-                    st_size=original.st_size,
+                    st_size=original.st_size, st_mtime_ns=original.st_mtime_ns,
                 )
 
             with patch.object(recovery, "NIXOS_RESTIC_ROOT_PROOF_PATH", proof), patch.object(
@@ -513,6 +587,7 @@ class NativeNixOSResticProofTests(unittest.TestCase):
             ), patch.object(recovery.os, "fstat", side_effect=trusted_fstat):
                 self.assertEqual(
                     recovery._nixos_root_proof_read(
+                        not_before_mtime_ns=1,
                         not_before_unix=self.now - 5,
                         now=self.now,
                         expected_backup_uuid=self.target["backup_uuid"],
@@ -566,7 +641,7 @@ class NativeNixOSResticProofTests(unittest.TestCase):
                         st_mode=stat.S_IFREG | 0o666 if scenario == "file_writable" else original.st_mode,
                         st_uid=1000 if scenario == "file_nonroot" else 0,
                         st_nlink=original.st_nlink,
-                        st_size=original.st_size,
+                        st_size=original.st_size, st_mtime_ns=original.st_mtime_ns,
                     )
 
                 with patch.object(recovery, "NIXOS_RESTIC_ROOT_PROOF_PATH", proof), patch.object(
@@ -574,6 +649,7 @@ class NativeNixOSResticProofTests(unittest.TestCase):
                 ), patch.object(recovery.os, "fstat", side_effect=synthetic_fstat):
                     with self.assertRaises(RuntimeError):
                         recovery._nixos_root_proof_read(
+                            not_before_mtime_ns=1,
                             not_before_unix=self.now - 5,
                             now=self.now,
                             expected_backup_uuid=self.target["backup_uuid"],
@@ -615,6 +691,8 @@ class NativeNixOSResticProofTests(unittest.TestCase):
         ), patch.object(
             recovery.time, "time", return_value=self.now
         ), patch.object(
+            recovery.time, "time_ns", return_value=self.now * 1_000_000_000
+        ), patch.object(
             recovery.privileged, "start_nixos_root_restic_unit_reference",
             return_value={"success": True},
         ) as broker_start, patch.object(
@@ -638,7 +716,11 @@ class NativeNixOSResticProofTests(unittest.TestCase):
         ), patch.object(recovery.base, "_append_audit"):
             result = recovery._nixos_local_recovery_probe_locked(self.target)
         broker_start.assert_called_once_with()
-        read_proof.assert_called_once()
+        read_proof.assert_called_once_with(
+            started_at_unix=self.now,
+            not_before_mtime_ns=self.now * 1_000_000_000,
+            expected_backup_uuid=self.target["backup_uuid"],
+        )
         marker.assert_called_once_with(
             completed_at_unix=self.now,
             snapshot_id="c" * 8,
