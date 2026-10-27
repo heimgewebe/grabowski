@@ -257,6 +257,7 @@ class NixStoreSandboxTests(unittest.TestCase):
             for forbidden in (
                 {"extra_directories": (Path("/lib64"),)},
                 {"extra_read_only": (*binds, (vendor_fixture, Path("/lib64/ld-linux-x86-64.so.2")))},
+                {"extra_read_only": (*binds, (vendor_fixture, Path("/lib64/libc.so.6")))},
             ):
                 with self.subTest(forbidden=forbidden), self.assertRaises(sandbox.AgentSandboxError):
                     sandbox.minimal_sandbox_argv(

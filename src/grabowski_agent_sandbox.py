@@ -1048,6 +1048,10 @@ def minimal_sandbox_argv(
             or ".." in target_value.parts
             or target_value.is_relative_to(Path("/nix"))
             or target_value.resolve(strict=False).is_relative_to(Path("/nix"))
+            or (
+                nix_elf_runtime is not None
+                and target_value.is_relative_to(Path("/lib64"))
+            )
         ):
             raise AgentSandboxError("extra_read_only target must be absolute and outside /nix")
         target = str(target_value)
