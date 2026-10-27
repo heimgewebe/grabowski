@@ -127,19 +127,38 @@ class SelfReviewDepthPolicyTests(unittest.TestCase):
         self.addCleanup(patcher.stop)
 
     def test_fake_five_passes_are_blocked_without_private_server_receipts(self) -> None:
-        import grabowski_self_review_execution as provenance
+        # Other test fixtures mock the shared verifier. Import its unchanged
+        # reviewed implementation independently to ensure this negative gate
+        # case cannot inherit an unrelated mock.
+        spec = importlib.util.spec_from_file_location(
+            "isolated_real_self_review_verifier_negative_test",
+            ROOT / "src" / "grabowski_self_review_execution.py",
+        )
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        authentic = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(authentic)
+        state = _state("tools/pr_review_gate.py", additions=180)
+        fabricated = _self_review("tools/pr_review_gate.py", iterations=5)
+        origin_audit = {
+            "repo": state["repoName"], "pr": state["pr"]["number"],
+            "base_sha": state["pr"]["baseRefOid"],
+            "head_sha": state["pr"]["headRefOid"],
+            "diff_sha256": state["pr_diff_sha256"],
+            "review_batch_id": fabricated.get("review_batch_id"),
+            "review_iterations": fabricated["review_iterations"],
+            "review_pass_receipts": fabricated.get("review_pass_receipts"),
+        }
+        self.assertTrue(
+            authentic.review_receipt_errors(origin_audit),
+            "authentic verifier accepted five fabricated reports without receipts",
+        )
         with mock.patch.object(
             gate, "review_receipt_errors",
-            side_effect=provenance.review_receipt_errors,
+            side_effect=authentic.review_receipt_errors,
         ):
-            state = _state("tools/pr_review_gate.py", additions=180)
-            result = gate.evaluate_review_gate(
-                state,
-                self_review=_self_review(
-                    "tools/pr_review_gate.py", iterations=5,
-                ),
-            )
-        self.assertEqual(result["verdict"], "BLOCK")
+            result = gate.evaluate_review_gate(state, self_review=fabricated)
+        self.assertEqual(result["verdict"], "BLOCK", result)
         self.assertTrue(
             _has_failure(result, "high_critical_server_review_provenance_invalid"),
             result["failures"],

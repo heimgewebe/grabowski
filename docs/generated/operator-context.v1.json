@@ -3389,6 +3389,14 @@
         "source": "src/grabowski_release_admission.py"
       },
       {
+        "module": "grabowski_self_review_execution",
+        "source": "src/grabowski_self_review_execution.py"
+      },
+      {
+        "module": "grabowski_self_review_producer",
+        "source": "src/grabowski_self_review_producer.py"
+      },
+      {
         "module": "grabowski_self_deploy",
         "source": "src/grabowski_self_deploy.py"
       },
@@ -3710,7 +3718,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "650f923c4cfbb4a70dc4e2162e642460bffffb7b9eefab031e07e8b65dbb542c"
+      "sha256": "911675b539cf5eb53b0cc295fee58ebfbf1bf8f5cfdc138ff0326d7e81a02213"
     },
     "runtime_source_digest_contract": "mcp-tool-surface-v1",
     "runtime_sources": {
@@ -3829,6 +3837,8 @@
       "src/grabowski_runtime_contract.py": "4528ec08c1019a2b773a7e05250f4842ca2403d1c9171b19ef98a63c6e588054",
       "src/grabowski_runtime_extensions.py": "4bbaabe4120acc6879297e85d3664c69193fe0a9850e48522d1839b7844b2297",
       "src/grabowski_self_deploy.py": "1c2bd7e9800a1d98fa8d4f456dd33759b66c3d6b4523e63012a31684c86c3db1",
+      "src/grabowski_self_review_execution.py": "385f343b023982111b68dc3cd197e727753120c798c5a7340e5862fad9c3260c",
+      "src/grabowski_self_review_producer.py": "410aca53488069ea0b863632714e13032c7f8b5750e3422a22b05f6fa74e5735",
       "src/grabowski_serving_process.py": "6976c47f932c693f5b7a25e43354e31c3f300e48e4ec7284c66c3b6007cc7160",
       "src/grabowski_sqlite_store.py": "efad0f7cb515e6ab005edf3cbe596b5a4fbe8c097fa7c4361c46d344f9a7ec84",
       "src/grabowski_system_map.py": "cdb1aae6cce14f049160dd0ddadc29234bdc053a29b3c251a6f879079cc90cc3",
