@@ -737,6 +737,124 @@ class NativeNixOSResticProofTests(unittest.TestCase):
                         snapshot_time_unix=self.now - recovery.MAX_AGE_SECONDS - 1,
                     )
 
+    def test_nixos_native_backup_completion_requires_actual_fresh_systemd_exit(self) -> None:
+        reference_monotonic = 100000
+        fresh_completion = reference_monotonic * 1000000 - 30000000
+        def output(completion=fresh_completion, **overrides):
+            fields = {
+                "LoadState": "loaded", "ActiveState": "inactive",
+                "Result": "success", "ExecMainCode": "1",
+                "ExecMainStatus": "0",
+                "ExecMainExitTimestampMonotonic": str(completion),
+                "ExecMainExitTimestamp": f"@{self.now - 30}",
+            }
+            fields.update(overrides)
+            return "\n".join(f"{key}={value}" for key, value in fields.items()) + "\n"
+
+        for label, payload, returncode, expected in (
+            ("valid", output(), 0, True),
+            ("valid_fractional", output(ExecMainExitTimestamp=f"@{self.now - 30}.123456"), 0, True),
+            # CLOCK_MONOTONIC counts just 30 seconds awake even after 48h
+            # suspended; systemd's epoch second value must still expire.
+            ("suspend_48h", output(ExecMainExitTimestamp=f"@{self.now - 48 * 3600}"), 0, False),
+            ("stale_realtime", output(ExecMainExitTimestamp=f"@{self.now - recovery.MAX_AGE_SECONDS - 1}"), 0, False),
+            ("future_realtime", output(ExecMainExitTimestamp=f"@{self.now + 10}"), 0, False),
+            ("localized_date", output(ExecMainExitTimestamp="Mon 2026-10-26 19:31:02 CET"), 0, False),
+            ("missing_realtime", output().replace(f"ExecMainExitTimestamp=@{self.now - 30}\n", ""), 0, False),
+            ("invalid_fraction", output(ExecMainExitTimestamp=f"@{self.now - 30}.a"), 0, False),
+            ("never_run", output(completion=0), 0, False),
+            ("failed_backup", output(Result="exit-code"), 0, False),
+            ("unit_not_loaded", output(LoadState="not-found"), 0, False),
+            ("still_running", output(ActiveState="activating"), 0, False),
+            ("not_exited", output(ExecMainCode="0"), 0, False),
+            ("exit_failure", output(ExecMainStatus="1"), 0, False),
+            ("stale", output(completion=(reference_monotonic - recovery.MAX_AGE_SECONDS - 1) * 1000000), 0, False),
+            ("future", output(completion=(reference_monotonic + 5) * 1000000), 0, False),
+            ("invalid_timestamp", output(completion="not-a-timestamp"), 0, False),
+            ("duplicate_field", output() + "Result=success\n", 0, False),
+            ("missing_field", output().replace("ExecMainCode=1\n", ""), 0, False),
+            ("systemctl_error", "", 1, False),
+        ):
+            with self.subTest(case=label), patch.object(
+                recovery.operator, "_run",
+                return_value={"returncode": returncode, "stdout": payload},
+            ) as run, patch.object(
+                recovery.time, "monotonic", return_value=reference_monotonic
+            ), patch.object(recovery.time, "time", return_value=self.now):
+                state = recovery._nixos_native_backup_service_fresh()
+            self.assertEqual(state["valid"], expected)
+            self.assertEqual(
+                run.call_args.args[0][:5],
+                ["/run/current-system/sw/bin/systemctl", "--system",
+                 "--timestamp=unix", "show", "restic-backups-heim-pc.service"],
+            )
+            if expected:
+                self.assertEqual(state["timestamp_unix"], self.now - 30)
+                self.assertEqual(state["age_seconds"], 30)
+                self.assertIsNone(state["error"])
+            else:
+                self.assertIsNotNone(state["error"])
+
+    def test_nixos_remote_target_keeps_independent_local_backup_freshness(self) -> None:
+        remote_target = "wg-prod-1:rest-server/grabowski-recovery-probe"
+        remote_info = {
+            "valid": True, "kind": "rest_server", "host": "wg-prod-1",
+            "probe": "grabowski-recovery-probe",
+        }
+        source = {
+            "valid": True, "exists": True, "target": remote_target,
+            "snapshot_time_unix": None, "snapshot_age_seconds": None,
+            "snapshot_fresh": False, "source_record_sha256": "a" * 64,
+        }
+        for locally_fresh in (True, False):
+            with self.subTest(locally_fresh=locally_fresh), patch.object(
+                recovery, "_NIXOS_RESTIC_TIMER_PRESENT", True
+            ), patch.object(
+                recovery, "SERVER_RECOVERY_TARGET", remote_target
+            ), patch.object(
+                recovery, "_configured_recovery_target_info", return_value=remote_info
+            ), patch.object(
+                recovery.base, "_verify_audit_log", return_value={"valid": True}
+            ), patch.object(
+                recovery.base, "_deployment_metadata", return_value={"provenance_valid": True}
+            ), patch.object(
+                recovery, "_canonical_server_marker",
+                return_value={"valid": True, "target": remote_target, "freshness_reason": "ready"},
+            ), patch.object(
+                recovery, "_server_source_marker", return_value=source
+            ), patch.object(
+                recovery, "_source_publication_state",
+                return_value={"current": True, "reason": "ready"}
+            ), patch.object(
+                recovery, "_server_recovery_evidence_fresh", return_value=True
+            ), patch.object(
+                recovery, "_server_recovery_evidence_boundary", return_value={}
+            ), patch.object(
+                recovery.base, "_kill_switch_state", return_value={"engaged": False}
+            ), patch.object(
+                recovery, "_test_kill_switch_recovery_status", return_value={}
+            ), patch.object(
+                recovery, "_timer_probe", return_value={"ok": True}
+            ), patch.object(
+                recovery.privileged, "grabowski_privileged_broker_status",
+                return_value={"ready": True}
+            ), patch.object(
+                recovery, "_nixos_native_backup_service_fresh",
+                return_value={
+                    "path": "systemd:restic-backups-heim-pc.service", "exists": True,
+                    "valid": locally_fresh, "timestamp_unix": self.now - 60,
+                    "age_seconds": 60, "source": "nixos-system-restic-backup-completion",
+                    "error": None if locally_fresh else "native backup is stale",
+                }
+            ) as native_service, patch.object(recovery, "_fresh_text_marker") as legacy_marker:
+                status = recovery.recovery_status()
+            native_service.assert_called_once_with()
+            legacy_marker.assert_not_called()
+            self.assertEqual(status["checks"]["local_backup_fresh"], locally_fresh)
+            self.assertEqual(status["ready_for_user_power_worker"], locally_fresh)
+            self.assertEqual(status["ready_for_privileged_actions"], locally_fresh)
+            self.assertEqual(status["local_backup"]["path"], "systemd:restic-backups-heim-pc.service")
+
     def test_nixos_gate_rejects_legacy_source_without_snapshot_timestamp(self) -> None:
         now = self.now
         source = {

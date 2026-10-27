@@ -1948,6 +1948,85 @@ def _timer_probe(action: str) -> dict[str, Any]:
     return {"action": action, "ok": result["returncode"] == 0, "result": result}
 
 
+def _nixos_native_backup_service_fresh() -> dict[str, Any]:
+    """Bind a remote recovery target to a real native backup service exit.
+
+    An NixOS system timer does not create Pop!_OS's user success-marker file.
+    systemd's monotonic *exit* timestamp proves an actual successful run in
+    this boot; its realtime timestamp accounts for suspend. Result=success
+    and ExecMainStatus=0 alone can mean "never started".
+    """
+    unit = "restic-backups-heim-pc.service"
+    result: dict[str, Any] = {
+        "path": f"systemd:{unit}", "exists": False, "valid": False,
+        "timestamp_unix": None, "age_seconds": None,
+        "error": "NixOS Restic backup service has not completed successfully",
+        "source": "nixos-system-restic-backup-completion",
+    }
+    names = (
+        "LoadState", "ActiveState", "Result", "ExecMainCode",
+        "ExecMainStatus", "ExecMainExitTimestampMonotonic",
+        "ExecMainExitTimestamp",
+    )
+    observed = operator._run(
+        ["/run/current-system/sw/bin/systemctl", "--system",
+         "--timestamp=unix", "show", unit,
+         *[f"--property={name}" for name in names]],
+        cwd=operator.HOME, timeout_seconds=30, max_output_bytes=4096,
+    )
+    if observed.get("returncode") != 0:
+        return result
+    raw = observed.get("stdout")
+    if not isinstance(raw, str):
+        return result
+    fields: dict[str, str] = {}
+    for line in raw.splitlines():
+        if "=" not in line:
+            return result
+        key, value = line.split("=", 1)
+        if key not in names or key in fields:
+            return result
+        fields[key] = value
+    if set(fields) != set(names):
+        return result
+    result["exists"] = fields["LoadState"] == "loaded"
+    if (not result["exists"] or fields["ActiveState"] != "inactive"
+            or fields["Result"] != "success"
+            or fields["ExecMainCode"] != "1"
+            or fields["ExecMainStatus"] != "0"):
+        return result
+    exit_text = fields["ExecMainExitTimestampMonotonic"]
+    if not exit_text.isascii() or not exit_text.isdecimal():
+        return result
+    exit_microseconds = int(exit_text)
+    now_microseconds = int(time.monotonic() * 1_000_000)
+    monotonic_age = now_microseconds - exit_microseconds
+    # CLOCK_MONOTONIC excludes suspend on Linux. Inspect systemd's *same*
+    # completed invocation through an exact numerical realtime timestamp,
+    # which includes sleep and cannot be confused with a localized date.
+    realtime_text = fields["ExecMainExitTimestamp"]
+    if not realtime_text.startswith("@"):
+        return result
+    seconds_text, dot, fractional_text = realtime_text[1:].partition(".")
+    if (not seconds_text.isascii() or not seconds_text.isdecimal()
+            or (dot and (not fractional_text.isascii()
+                         or not fractional_text.isdecimal()
+                         or len(fractional_text) > 6))):
+        return result
+    completed_at = int(seconds_text)
+    age = int(time.time()) - completed_at
+    if (exit_microseconds <= 0 or monotonic_age < 0
+            or monotonic_age > MAX_AGE_SECONDS * 1_000_000
+            or completed_at <= 0 or age < 0 or age > MAX_AGE_SECONDS):
+        result["error"] = "NixOS Restic backup completion is missing, stale or future-dated"
+        return result
+    result.update({
+        "valid": True, "timestamp_unix": completed_at,
+        "age_seconds": age, "error": None,
+    })
+    return result
+
+
 def recovery_status() -> dict[str, Any]:
     audit = base._verify_audit_log(base.AUDIT_LOG)
     deployment = base._deployment_metadata()
@@ -1955,6 +2034,14 @@ def recovery_status() -> dict[str, Any]:
     server_source = _server_source_marker()
     # NixOS publishes evidence only after a real restore and repository check.
     # Pop!_OS keeps its existing timestamp-marker contract.
+    # Local-disk restores use their real snapshot time. Remote recovery
+    # records do not carry that time; on NixOS independently require an
+    # actually completed and fresh root-owned systemd backup service, not
+    # Pop!_OS's absent user session success marker.
+    native_local_target = (
+        _NIXOS_RESTIC_TIMER_PRESENT
+        and _configured_recovery_target_info().get("kind") == "local_backup_disk"
+    )
     local_backup = (
         {
             "path": server_source["path"], "exists": server_source["exists"],
@@ -1968,7 +2055,9 @@ def recovery_status() -> dict[str, Any]:
             ),
             "source": "verified-nixos-native-restic",
         }
-        if _NIXOS_RESTIC_TIMER_PRESENT else _fresh_text_marker(BACKUP_SUCCESS)
+        if native_local_target
+        else (_nixos_native_backup_service_fresh() if _NIXOS_RESTIC_TIMER_PRESENT
+              else _fresh_text_marker(BACKUP_SUCCESS))
     )
     source_publication = _source_publication_state(server_backup, server_source)
     kill_switch = base._kill_switch_state()
