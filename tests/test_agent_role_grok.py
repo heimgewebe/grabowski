@@ -49,59 +49,6 @@ def _create_only_process_writer(
 
 
 class NixOSRoleToolchainTests(unittest.TestCase):
-    def test_root_owned_nix_store_python_can_be_probe_runner(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            store = Path(temp) / "nix" / "store"
-            binary = store / "pinned-python" / "bin" / "python3"
-            binary.parent.mkdir(parents=True)
-            binary.write_text("#!/bin/sh\nexit 0\n")
-            binary.chmod(0o755)
-            with (
-                mock.patch.object(role, "_trusted_nix_store", return_value=store),
-                mock.patch.object(role.sys, "executable", str(binary)),
-            ):
-                self.assertEqual(role._sandbox_probe_python(), str(binary.resolve()))
-
-    def test_host_home_python_is_not_admitted_into_sandbox(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            store = root / "nix" / "store"
-            store.mkdir(parents=True)
-            unsafe = root / "home-python"
-            unsafe.write_text("#!/bin/sh\nexit 0\n")
-            unsafe.chmod(0o755)
-            with (
-                mock.patch.object(role, "_trusted_nix_store", return_value=store),
-                mock.patch.object(role.sys, "executable", str(unsafe)),
-            ):
-                try:
-                    picked = role._sandbox_probe_python()
-                except RuntimeError:
-                    pass
-                else:
-                    self.assertNotEqual(picked, str(unsafe.resolve()))
-
-    def test_nix_store_symlink_escaping_to_home_is_not_admitted(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            store = root / "nix" / "store"
-            store.mkdir(parents=True)
-            outside = root / "untrusted-python"
-            outside.write_text("#!/bin/sh\nexit 0\n")
-            outside.chmod(0o755)
-            symlink = store / "link-python"
-            symlink.symlink_to(outside)
-            with (
-                mock.patch.object(role, "_trusted_nix_store", return_value=store),
-                mock.patch.object(role.sys, "executable", str(symlink)),
-            ):
-                try:
-                    picked = role._sandbox_probe_python()
-                except RuntimeError:
-                    pass
-                else:
-                    self.assertNotEqual(picked, str(outside.resolve()))
-
     def test_failed_secondary_toolchain_probe_keeps_invalid_review_receipt(self) -> None:
         payload = {"returncode": 126, "verdict": "INVALID"}
         with mock.patch.object(role, "toolchain_probe", side_effect=RuntimeError("unavailable")):

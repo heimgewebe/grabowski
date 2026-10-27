@@ -13,7 +13,14 @@ import time
 import uuid
 from typing import Any
 
-from grabowski_agent_sandbox import _trusted_nix_store, minimal_sandbox_argv, prepare_external_agent_command, runtime_sandbox_argv, safe_git_environment, run_bounded_capture
+from grabowski_agent_sandbox import (
+    sandbox_python_executable,
+    minimal_sandbox_argv,
+    prepare_external_agent_command,
+    runtime_sandbox_argv,
+    safe_git_environment,
+    run_bounded_capture,
+)
 
 SHA40 = __import__("re").compile(r"^[0-9a-f]{40}$")
 SHA256 = __import__("re").compile(r"^[0-9a-f]{64}$")
@@ -526,33 +533,8 @@ def _probe_json_for_declared_command(
 
 
 def _sandbox_probe_python() -> str:
-    """Return a Python interpreter present in the minimal ``/usr`` sandbox.
-
-    The MCP service may itself run from a private virtualenv below ``$HOME``.
-    That path is intentionally absent from role sandboxes and therefore may not
-    be used as the probe runner.
-    """
-    usr_root = Path("/usr")
-    # Use the same root-owned non-writable Nix store admitted by minimal_sandbox_argv.
-    nix_store = _trusted_nix_store()
-    candidates = [Path(sys.executable), Path("/usr/bin/python3")]
-    seen: set[Path] = set()
-    for candidate in candidates:
-        try:
-            resolved = candidate.resolve(strict=True)
-        except OSError:
-            continue
-        if resolved in seen:
-            continue
-        seen.add(resolved)
-        if not (
-            resolved.is_relative_to(usr_root)
-            or (nix_store is not None and resolved.is_relative_to(nix_store))
-        ):
-            continue
-        if resolved.is_file() and os.access(resolved, os.X_OK):
-            return str(resolved)
-    raise RuntimeError("no Python interpreter is available inside trusted read-only role sandbox roots")
+    """Use the same trusted read-only Python path as the Codex auth wrapper."""
+    return str(sandbox_python_executable())
 
 
 def toolchain_probe(repo: Path, command: list[str]) -> dict[str, Any]:
