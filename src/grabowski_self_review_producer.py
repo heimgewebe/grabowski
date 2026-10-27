@@ -663,12 +663,18 @@ def main(argv: list[str] | None = None) -> int:
         )
         _require_live_pr(new_plan["binding"])
         stored = _store_plan(new_plan)
-        result = {
+        # Never write the complete task plan to process output: its embedded
+        # job arguments may contain operator-supplied material. The create-only
+        # private plan is retrieved by an authorized task dispatcher.
+        public_result = {
             "status": "planned_not_executed",
             "review_batch_id": new_plan["binding"]["review_batch_id"],
-            "plan_path": str(stored), "task_count": len(new_plan["tasks"]),
-            "tasks": new_plan["tasks"],
-            "does_not_establish": new_plan["does_not_establish"],
+            "task_count": len(new_plan["tasks"]),
+            "task_manifest_sha256": provenance._digest(new_plan["tasks"]),
+            "does_not_establish": [
+                "executed_phases", "task_completion", "semantic_review",
+                "signed_attestations", "Captain_authorization",
+            ],
         }
     else:
         plan = _load_plan(args.batch_id)
@@ -678,8 +684,17 @@ def main(argv: list[str] | None = None) -> int:
             reports = json.loads(args.phase_reports_json)
         except (UnicodeError, ValueError) as exc:
             raise provenance.ReviewExecutionRejected("phase task or review data invalid") from exc
-        result = seal_review(plan, ids, reports)
-    print(json.dumps(result, sort_keys=True, ensure_ascii=False))
+        sealed = seal_review(plan, ids, reports)
+        # Deliberately exclude arbitrary task output, private file paths and
+        # semantic report text from logging and machine-readable stdout.
+        public_result = {
+            "status": "sealed_and_verified",
+            "review_batch_id": args.batch_id,
+            "review_pass_count": sealed["review_pass_count"],
+            "review_audit_sha256": sealed["review_audit_sha256"],
+            "source_head": sealed["source_head"],
+        }
+    print(json.dumps(public_result, sort_keys=True, ensure_ascii=False))
     return 0
 
 

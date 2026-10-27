@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -10,6 +11,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+from contextlib import redirect_stdout
 import time
 import unittest
 from unittest import mock
@@ -160,6 +162,61 @@ class ServerReviewProducerTests(unittest.TestCase):
             root_owned_signers=False,
             source_observer=lambda repo, binding: self.raw,
         )
+
+    def test_plan_cli_does_not_log_private_task_arguments(self):
+        marker = "SYNTHETIC_SECRET_CANARY_NEVER_LOG"
+        self.plan["tasks"]["contracts_correctness"].append(marker)
+        stdout = io.StringIO()
+        arguments = [
+            "plan", "--repo", str(self.repo), "--base", self.base,
+            "--head", self.head, "--diff", "a" * 64,
+            "--bwrap", self.bwrap, "--python", self.python, "--pr", "1649",
+        ]
+        with (
+            mock.patch.object(producer, "_require_installed_runtime"),
+            mock.patch.object(producer, "plan_review", return_value=self.plan),
+            mock.patch.object(producer, "_require_live_pr"),
+            mock.patch.object(producer, "_store_plan", return_value=self.root / "private-plan.json"),
+            redirect_stdout(stdout),
+        ):
+            self.assertEqual(0, producer.main(arguments))
+        output = json.loads(stdout.getvalue())
+        self.assertEqual("planned_not_executed", output["status"])
+        self.assertNotIn(marker, stdout.getvalue())
+        self.assertNotIn("tasks", output)
+        self.assertNotIn("plan_path", output)
+        self.assertEqual(5, output["task_count"])
+
+    def test_seal_cli_does_not_log_private_reports_or_receipt_paths(self):
+        marker = "SYNTHETIC_SECRET_REPORT_CANARY_NEVER_LOG"
+        stdout = io.StringIO()
+        sealed = {
+            "status": "sealed_and_verified",
+            "review_batch_id": self.binding["review_batch_id"],
+            "review_pass_count": 5, "review_audit_sha256": "f" * 64,
+            "source_head": self.head, "audit_path": "/private/" + marker,
+            "arbitrary_future_field": marker,
+        }
+        with (
+            mock.patch.object(producer, "_load_plan", return_value=self.plan),
+            mock.patch.object(producer, "_require_live_pr"),
+            mock.patch.object(producer, "seal_review", return_value=sealed),
+            redirect_stdout(stdout),
+        ):
+            self.assertEqual(
+                0,
+                producer.main([
+                    "seal", "--batch-id", self.binding["review_batch_id"],
+                    "--task-ids-json", json.dumps(self.tasks),
+                    "--phase-reports-json", json.dumps(self.reports),
+                ]),
+            )
+        output = json.loads(stdout.getvalue())
+        self.assertEqual("sealed_and_verified", output["status"])
+        self.assertEqual(self.head, output["source_head"])
+        self.assertNotIn(marker, stdout.getvalue())
+        self.assertNotIn("audit_path", output)
+        self.assertNotIn("arbitrary_future_field", output)
 
     def test_review_suite_allowlist_is_readonly_compatible_and_distinct(self):
         self.assertEqual(
