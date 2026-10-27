@@ -148,6 +148,33 @@ The status may become required only when all of the following are true:
 7. Key rotation and key-loss recovery have a tested, auditable path.
 8. High-critical review **depth** and any explicitly requested additional independent review remain separately enforced; reviewer-provider availability never substitutes for review evidence.
 
+## Current source policy v5: task provenance is distinct from a signed assertion
+
+The v4 section below records the historical policy decision; it is **not** an
+active v5 admission format. On PR #1649, high-critical evidence now requires
+five authentic, ordered and substantive semantic review phases, each bound to
+repository, PR, base, head, diff, batch, isolated execution, full role output,
+source references and findings. A canonical SHA-256 or public status signature
+alone cannot establish the origin or content of a review, and five technical
+PASS tasks are **not** five semantic review results. The issuer must verify
+genuine, read-only review-role execution receipts before signing the private
+self-review audit; Captain and the atomic merge guard must independently
+revalidate the same producer/role evidence. Historical policy-v3/v4 audits do
+not authorize policy-v5 decisions.
+
+An independent external-provider review is **optional** unless explicitly
+required for the PR. A real, unresolved material finding or trusted review
+thread remains blocking regardless of whether the reviewer was optional.
+Authenticated pre-result provider unavailability never produces a PASS and
+cannot excuse one of the five mandatory substantive phases. The currently
+implemented V2 semantic-review path still only accepts catalog model-review
+role output, so genuinely provider-independent first-party review authority
+is **not yet proven** for PR #1649. Do not mark the PR ready, merge via Captain,
+or infer R3 deployment authority from its technical tests or current source
+changes. The separate critical release source and recovery contracts remain
+unchanged until their own authentic post-merge review and admission evidence
+is verified.
+
 ## PR self-review policy v4 (2026-10-26)
 
 The PR risk tier and the independent reviewer obligation are separate contracts.
