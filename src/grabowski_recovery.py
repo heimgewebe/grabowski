@@ -50,16 +50,18 @@ CANONICAL_RECOVERY = Path(os.environ.get(
 )).expanduser()
 # Only auto-select the native system timer when both the NixOS marker and the
 # actual systemd unit are present. Explicit settings retain precedence.
+_NIXOS_OS_PRESENT = Path("/etc/NIXOS").is_file()
 _NIXOS_RESTIC_TIMER_PRESENT = (
-    Path("/etc/NIXOS").is_file()
+    _NIXOS_OS_PRESENT
     and Path("/etc/systemd/system/restic-backups-heim-pc.timer").is_file()
 )
+# Missing native units on NixOS never authorize the Pop! user timer.
 BACKUP_TIMER = os.environ.get(
     "GRABOWSKI_BACKUP_TIMER",
-    "restic-backups-heim-pc.timer" if _NIXOS_RESTIC_TIMER_PRESENT else "restic-backup-1930.timer",
+    "restic-backups-heim-pc.timer" if _NIXOS_OS_PRESENT else "restic-backup-1930.timer",
 )
 BACKUP_TIMER_SCOPE = os.environ.get(
-    "GRABOWSKI_BACKUP_TIMER_SCOPE", "system" if _NIXOS_RESTIC_TIMER_PRESENT else "user",
+    "GRABOWSKI_BACKUP_TIMER_SCOPE", "system" if _NIXOS_OS_PRESENT else "user",
 )
 MAX_AGE_SECONDS = int(os.environ.get("GRABOWSKI_RECOVERY_MAX_AGE_SECONDS", str(24 * 60 * 60)))
 DEFAULT_SERVER_RECOVERY_HOST = "heimberry"
@@ -1744,6 +1746,10 @@ def _nixos_local_recovery_probe_locked(target_info: dict[str, Any]) -> dict[str,
 
 
 def _local_recovery_probe(target_info: dict[str, Any]) -> dict[str, Any]:
+    # Native unit disappearance must fail closed before any legacy restore,
+    # repository lock, mount operation or recovery proof publication.
+    if _NIXOS_OS_PRESENT and not _NIXOS_RESTIC_TIMER_PRESENT:
+        raise RuntimeError("NixOS native Restic timer is unavailable")
     with _local_recovery_repository_operation_lock():
         if _NIXOS_RESTIC_TIMER_PRESENT:
             return _nixos_local_recovery_probe_locked(target_info)
@@ -2000,23 +2006,31 @@ def recovery_status() -> dict[str, Any]:
         _NIXOS_RESTIC_TIMER_PRESENT
         and _configured_recovery_target_info().get("kind") == "local_backup_disk"
     )
-    local_backup = (
-        {
-            "path": server_source["path"], "exists": server_source["exists"],
-            "valid": server_source["valid"] and bool(server_source.get("snapshot_fresh")),
-            "timestamp_unix": server_source.get("snapshot_time_unix"),
-            "age_seconds": server_source.get("snapshot_age_seconds"),
-            "error": (
-                server_source["error"] if not server_source["valid"]
-                else None if server_source.get("snapshot_fresh")
-                else "NixOS snapshot timestamp is missing or stale"
-            ),
-            "source": "verified-nixos-native-restic",
+    if _NIXOS_OS_PRESENT and not _NIXOS_RESTIC_TIMER_PRESENT:
+        local_backup = {
+            "path": "systemd:restic-backups-heim-pc.service", "exists": False,
+            "valid": False, "timestamp_unix": None, "age_seconds": None,
+            "error": "NixOS native Restic timer is unavailable",
+            "source": "nixos-native-unavailable",
         }
-        if native_local_target
-        else (_nixos_native_backup_service_fresh() if _NIXOS_RESTIC_TIMER_PRESENT
-              else _fresh_text_marker(BACKUP_SUCCESS))
-    )
+    else:
+        local_backup = (
+            {
+                "path": server_source["path"], "exists": server_source["exists"],
+                "valid": server_source["valid"] and bool(server_source.get("snapshot_fresh")),
+                "timestamp_unix": server_source.get("snapshot_time_unix"),
+                "age_seconds": server_source.get("snapshot_age_seconds"),
+                "error": (
+                    server_source["error"] if not server_source["valid"]
+                    else None if server_source.get("snapshot_fresh")
+                    else "NixOS snapshot timestamp is missing or stale"
+                ),
+                "source": "verified-nixos-native-restic",
+            }
+            if native_local_target
+            else (_nixos_native_backup_service_fresh() if _NIXOS_RESTIC_TIMER_PRESENT
+                  else _fresh_text_marker(BACKUP_SUCCESS))
+        )
     source_publication = _source_publication_state(server_backup, server_source)
     kill_switch = base._kill_switch_state()
     test_switch_recovery = _test_kill_switch_recovery_status()

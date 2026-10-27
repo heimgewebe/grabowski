@@ -2302,6 +2302,8 @@ class PrivilegedAndConnectorTests(unittest.TestCase):
             with patch.object(privileged, "BROKER", root / "missing-broker"), patch.object(
                 privileged, "BROKER_CONFIG", root / "missing-config"
             ), patch.object(
+                privileged, "BROKER_SOCKET", root / "missing-socket"
+            ), patch.object(
                 privileged.operator,
                 "_require_operator_capability",
                 side_effect=AssertionError("status read must not require privileged authority"),
