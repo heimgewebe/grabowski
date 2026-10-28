@@ -1812,7 +1812,11 @@ def _signed_failed_pre_cutover_is_terminal(
             and recovery.get("connector_switch_attempted") is False
             and isinstance(recovery.get("error"), dict)
             and bool(recovery["error"])
-            and not midcutover.unresolved_post_switch_receipts(receipts)
+            # A later independent unknown B cannot undo proven no-effect A.
+            and not any(
+                item.get("cutover_id") == cutover.get("cutover_id")
+                for item in midcutover.unresolved_post_switch_receipts(receipts)
+            )
         )
     except (OSError, RuntimeError, ValueError, midcutover.MidCutoverEvidenceError):
         return False

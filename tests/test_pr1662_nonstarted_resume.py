@@ -364,6 +364,51 @@ class FailedPreCutoverDeployTerminalityTests(unittest.TestCase):
         self.assertEqual(self._check(status, raw, bootstrap=True), [])
         self.assertIsNone(self._check(status, raw, reconcile=True))
 
+    def test_proven_no_effect_pre_cutover_is_terminal_during_foreign_unknown(self) -> None:
+        import json
+        import test_midcutover_resume as fixture
+
+        status, raw = self._install_receipt()
+        self.assertTrue(self._check(status, raw), "A is terminal before B")
+        later = fixture.cutover_receipt(
+            cutover_id="bgc-foreign-after-preflight-failure",
+            outcome="outcome_unknown", phase="outcome_unknown",
+        )
+        later_path = self.cutovers / (later["cutover_id"] + ".json")
+        later_path.write_text(json.dumps(later), encoding="utf-8")
+        later_path.chmod(0o600)
+        loaded = DEPLOY.midcutover.load_receipts(self.cutovers)
+        unresolved = DEPLOY.midcutover.unresolved_post_switch_receipts(
+            loaded["receipts"]
+        )
+        self.assertEqual(
+            [later["cutover_id"]],
+            [receipt["cutover_id"] for receipt in unresolved],
+            "later B must remain unresolved and block ordinary deployment",
+        )
+        self.assertTrue(
+            self._check(status, raw),
+            "authentic no-effect preflight A must remain terminal during unrelated B",
+        )
+        self.assertEqual(
+            self._check(status, raw, bootstrap=True), [],
+            "bootstrap may not resurrect completed A next to unresolved B",
+        )
+        self.assertIsNone(
+            self._check(status, raw, reconcile=True),
+            "A may not become a second blocker during B recovery",
+        )
+        contradictory = fixture.cutover_receipt(
+            cutover_id=self.original["cutover_id"],
+            outcome="outcome_unknown", phase="outcome_unknown",
+        )
+        self.assertFalse(
+            DEPLOY._signed_failed_pre_cutover_is_terminal(
+                self.original, [self.original, contradictory]
+            ),
+            "unresolved proof for A's own cutover still denies terminality",
+        )
+
     def test_effectful_or_incomplete_pre_cutover_evidence_stays_blocking(self) -> None:
         cases = (
             ("blue_lost", ("recovery", "blue_preserved"), False),
