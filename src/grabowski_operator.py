@@ -179,6 +179,9 @@ MAX_FINALIZATION_RECEIPT_BYTES = 64 * 1024
 # Keep this bound identical on durable job publication and readback.
 # A genuine ordinary job may exceed the old 64-KiB read-only ceiling.
 MAX_JOB_METADATA_BYTES = 256 * 1024
+# Reserve space for bounded launcher evidence, state transitions and readback
+# BEFORE systemd-run; rewriter enforces the same absolute 256-KiB ceiling.
+MAX_JOB_POST_DISPATCH_METADATA_RESERVE_BYTES = 32 * 1024
 JOB_NOTIFICATION_RECEIPT_NAME = "notification.json"
 JOB_NOTIFICATION_ACK_NAME = "notification-ack.json"
 DYNAMIC_SECRET_GLOBAL_MIN_LENGTH = 8
@@ -6970,6 +6973,14 @@ def _bounded_job_metadata_bytes(payload: dict[str, Any]) -> bytes:
     return data
 
 
+def _require_job_metadata_pre_dispatch_headroom(payload: dict[str, Any]) -> None:
+    prepared = _bounded_job_metadata_bytes(payload)
+    if len(prepared) > (
+        MAX_JOB_METADATA_BYTES - MAX_JOB_POST_DISPATCH_METADATA_RESERVE_BYTES
+    ):
+        raise ValueError("Job metadata pre-dispatch headroom is insufficient")
+
+
 def _write_job_metadata(directory: Path, payload: dict[str, Any]) -> Path:
     path = directory / "metadata.json"
     data = _bounded_job_metadata_bytes(payload)
@@ -7147,8 +7158,8 @@ def _unit_dispatch_readback(unit: str) -> dict[str, Any]:
 
 def _replace_job_metadata(directory: Path, payload: dict[str, Any]) -> Path:
     path = directory / "metadata.json"
+    data = _bounded_job_metadata_bytes(payload)
     temp_path = directory / f"metadata.json.{uuid.uuid4().hex}.tmp"
-    data = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
     descriptor = os.open(
         temp_path,
         os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
@@ -8428,9 +8439,9 @@ def _start_job(
             terminalization,
         ),
     }
-    # Reject an unreadable future job before publishing even its directory.
-    # Producer/reader agreement matters to the global deployment census.
-    _bounded_job_metadata_bytes(metadata)
+    # Reject an unreadable future job, including the post-dispatch growth,
+    # before publishing a directory or dispatching a systemd unit.
+    _require_job_metadata_pre_dispatch_headroom(metadata)
     # All origin and metadata preparation has completed. Reserve and verify the
     # canonical destination only at the final pre-dispatch publication point.
     created_directory = _job_directory(unit, create=True)

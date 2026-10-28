@@ -97,5 +97,43 @@ class DurableJobMetadataBoundTests(unittest.TestCase):
             operator._read_job_metadata(link)
 
 
+    def test_post_dispatch_growth_cannot_replace_readable_metadata_with_oversize(self) -> None:
+        name = "grabowski-job-222222222222"
+        directory = self.new_job(name)
+        original = self.payload(name, size=100)
+        raw_size = len((json.dumps(original, indent=2, sort_keys=True) + "\n").encode())
+        original["argv"][-1] += "x" * (operator.MAX_JOB_METADATA_BYTES - 64 - raw_size)
+        location = operator._write_job_metadata(directory, original)
+        before = location.read_bytes()
+        self.assertEqual(len(before), operator.MAX_JOB_METADATA_BYTES - 64)
+        after_dispatch = {
+            **original,
+            "launcher_evidence": operator._job_launcher_evidence(
+                {"stdout": "", "stderr": "", "returncode": 0}
+            ),
+            "dispatch_outcome": "started",
+        }
+        self.assertGreater(
+            len((json.dumps(after_dispatch, indent=2, sort_keys=True) + "\n").encode()),
+            operator.MAX_JOB_METADATA_BYTES,
+        )
+        with self.assertRaisesRegex(ValueError, "metadata.*(large|limit|bounded)"):
+            operator._replace_job_metadata(directory, after_dispatch)
+        self.assertEqual(location.read_bytes(), before)
+        self.assertEqual(operator._read_job_metadata(name), original)
+        self.assertEqual(list(directory.iterdir()), [location])
+
+    def test_pre_dispatch_capacity_reserves_space_for_launcher_evidence(self) -> None:
+        name = "grabowski-job-333333333333"
+        prepared = self.payload(name, size=operator.MAX_JOB_METADATA_BYTES - 1500)
+        self.assertLess(
+            len((json.dumps(prepared, indent=2, sort_keys=True) + "\n").encode()),
+            operator.MAX_JOB_METADATA_BYTES,
+        )
+        with self.assertRaisesRegex(ValueError, "metadata.*(headroom|reserve|capacity)"):
+            operator._require_job_metadata_pre_dispatch_headroom(prepared)
+        self.assertFalse((self.root / name).exists())
+
+
 if __name__ == "__main__":
     unittest.main()
