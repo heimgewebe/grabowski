@@ -115,6 +115,43 @@ class CheckoutLifecycleTests(unittest.TestCase):
             text=True,
         )
 
+    def test_live_lease_snapshot_retries_one_transient_wal_change(self) -> None:
+        from contextlib import closing, contextmanager
+
+        with closing(checkouts.resources._database()) as connection:
+            connection.execute("SELECT 1 FROM leases").fetchone()
+        original = checkouts.resources._resource_readonly_snapshot
+        attempts: list[int] = []
+
+        @contextmanager
+        def checkpointed_once():
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise checkouts.resources.ResourceSchemaInventoryChanged(
+                    "Store changed while schema inventory was read; retry inventory"
+                )
+            with original() as connection:
+                yield connection
+
+        with patch.object(checkouts.resources, "_resource_readonly_snapshot", checkpointed_once):
+            self.assertEqual(checkouts._live_checkout_lease_keys(now=int(time.time())), {})
+        self.assertEqual(len(attempts), 2)
+
+        attempts.clear()
+
+        @contextmanager
+        def persistently_changed():
+            attempts.append(1)
+            raise checkouts.resources.ResourceSchemaInventoryChanged(
+                "Store changed while schema inventory was read; retry inventory"
+            )
+            yield  # generator contract, unreachable
+
+        with patch.object(checkouts.resources, "_resource_readonly_snapshot", persistently_changed):
+            with self.assertRaises(checkouts.resources.ResourceSchemaInventoryChanged):
+                checkouts._live_checkout_lease_keys(now=int(time.time()))
+        self.assertEqual(len(attempts), 2)
+
     def test_rereserving_stale_checkout_cannot_exceed_live_capacity(self) -> None:
         """Reacquiring a lease for a retained row must not create a 17th writer."""
         common_dir = self._common_dir()

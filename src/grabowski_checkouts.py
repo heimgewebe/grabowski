@@ -829,12 +829,21 @@ def _live_checkout_lease_keys(*, now: int) -> dict[str, str]:
     """
     if not resources.RESOURCE_DB.exists():
         return {}
-    with resources._resource_readonly_snapshot() as resource_connection:
-        rows = resource_connection.execute(
-            "SELECT resource_key, owner_id FROM leases WHERE expires_at_unix>?",
-            (now,),
-        ).fetchall()
-    return {str(row["resource_key"]): str(row["owner_id"]) for row in rows}
+
+    def read_once() -> dict[str, str]:
+        with resources._resource_readonly_snapshot() as resource_connection:
+            rows = resource_connection.execute(
+                "SELECT resource_key, owner_id FROM leases WHERE expires_at_unix>?",
+                (now,),
+            ).fetchall()
+        return {str(row["resource_key"]): str(row["owner_id"]) for row in rows}
+
+    try:
+        return read_once()
+    except resources.ResourceSchemaInventoryChanged:
+        # SQLite can remove a checkpointed WAL between the sidecar check and
+        # its first stat; one fresh read recovers a quiescent snapshot.
+        return read_once()
 
 
 def _active_lifecycle_consumes_capacity(

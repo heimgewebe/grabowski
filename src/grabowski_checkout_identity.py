@@ -609,7 +609,7 @@ def _active_slot_available(
     limit = checkouts._phase_limit("active")
     if count >= limit:
         raise CheckoutIdentityConflict(
-            f"identity supersession would exceed active checkout capacity: active={count} limit={limit}"
+            f"Per-repository active checkout limit reached: active={count} limit={limit}; identity supersession would exceed active checkout capacity"
         )
 
 
