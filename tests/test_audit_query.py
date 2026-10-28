@@ -738,6 +738,34 @@ class AuditQueryTests(unittest.TestCase):
         )
         self.assertEqual(result["matched"], 0)
 
+    def test_timestamp_window_never_falls_back_after_projected_invalid_unix(self) -> None:
+        """A dropped non-scalar Unix value is present but invalid, never absent."""
+        records = [
+            {
+                "operation": "captain-run-audit-intent",
+                "timestamp": "2026-10-27T18:00:15+00:00",
+                "timestamp_unix": {"secret": "not-a-timestamp"},
+                "record_sha256": "a" * 64,
+            },
+            {
+                "operation": "captain-run-audit-completion",
+                "timestamp": "2026-10-27T18:00:34+00:00",
+                "timestamp_unix": [1793124034],
+                "record_sha256": "b" * 64,
+            },
+        ]
+        module = self._load_module(
+            [_component("/tmp/grabowski-audit-test/write-audit.jsonl", records)]
+        )
+        unfiltered = module.query_audit({}, limit=2)
+        self.assertEqual(unfiltered["matched"], 2)
+        for item in unfiltered["items"]:
+            self.assertNotIn("timestamp_unix", item["record"])
+            self.assertIn("timestamp_unix", item["evidence"]["projection_omitted_fields"])
+        window = {"since_unix": 1793124015, "until_unix": 1793124034}
+        self.assertEqual(module.query_audit(window)["matched"], 0)
+        self.assertEqual(module.analyze_audit(window)["record_count"], 0)
+
     def test_unsupported_filter_and_anchor_fail_closed(self) -> None:
         module = self._load_module(self._components())
         with self.assertRaisesRegex(ValueError, "Unsupported audit query filter"):

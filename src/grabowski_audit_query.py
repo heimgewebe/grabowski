@@ -629,18 +629,21 @@ def _any_resource_values(record: dict[str, Any]) -> set[str]:
     return _held_resource_values(record) | _requested_resource_values(record)
 
 
-def _record_timestamp_unix(record: dict[str, Any]) -> int | None:
-    """Use canonical Unix time, or bounded aware ISO for older Captain records.
+def _record_timestamp_unix(item: dict[str, Any]) -> int | None:
+    """Use Unix time, or aware ISO only if no Unix field was supplied.
 
-    Historic Captain intent/completion events have a verified ISO timestamp but
-    no timestamp_unix. An explicitly present invalid Unix field must not be
-    silently replaced by a different time source. The audit chain authenticates
-    record bytes; this parser does not independently attest the host clock.
+    The verified projection omits non-scalar values from the public record
+    while preserving their field names in projection_omitted_fields. An
+    explicitly supplied malformed Unix field must not enable ISO fallback.
     """
+    record = item["record"]
     native = record.get("timestamp_unix")
     if type(native) is int:
         return native
-    if "timestamp_unix" in record:
+    if (
+        "timestamp_unix" in record
+        or "timestamp_unix" in item["evidence"]["projection_omitted_fields"]
+    ):
         return None
     value = record.get("timestamp")
     if not isinstance(value, str) or not 1 <= len(value) <= 64:
@@ -681,11 +684,11 @@ def _record_matches_filters(item: dict[str, Any], filters: dict[str, Any]) -> bo
             if evidence.get("record_sha256") != expected:
                 return False
         elif key == "since_unix":
-            observed = _record_timestamp_unix(record)
+            observed = _record_timestamp_unix(item)
             if observed is None or observed < expected:
                 return False
         elif key == "until_unix":
-            observed = _record_timestamp_unix(record)
+            observed = _record_timestamp_unix(item)
             if observed is None or observed > expected:
                 return False
         elif key == "has_failure_signal":
@@ -1501,7 +1504,7 @@ def analyze_audit(
             held_resources.add(resource)
         for resource in _requested_resource_values(record):
             requested_resources.add(resource)
-        timestamp_unix = _record_timestamp_unix(record)
+        timestamp_unix = _record_timestamp_unix(item)
         if timestamp_unix is not None:
             minimum_timestamp = (
                 timestamp_unix
