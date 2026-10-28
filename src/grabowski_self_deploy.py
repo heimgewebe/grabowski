@@ -1777,6 +1777,47 @@ def _authenticated_persisted_incomplete_cutover(
         return None
 
 
+def _signed_failed_pre_cutover_is_terminal(
+    cutover: dict[str, Any], receipts: list[dict[str, Any]],
+) -> bool:
+    """Retire only the exact persisted no-effect preflight failure.
+
+    The caller authenticates the owner-private job finalization, its command,
+    expected head/source and the matching private cutover receipt. The
+    pre-cutover failure shape must itself exclude all deployment effects.
+    A retry still runs the ordinary preflight; this is no permission to skip it.
+    """
+    recovery = cutover.get("recovery")
+    try:
+        return bool(
+            cutover.get("outcome") == "failed_pre_cutover"
+            and cutover.get("phase") == "failed_pre_cutover"
+            and cutover.get("runtime_snapshot_source_identity_sha256") is None
+            and cutover.get("blue_release_id") is None
+            and cutover.get("green_release_id") is None
+            and cutover.get("green_readiness") is None
+            and cutover.get("agent_instruction_transition") is None
+            and cutover.get("selector_switch") is None
+            and cutover.get("snapshot_rebind") is None
+            and cutover.get("effect_terminalization") is None
+            and cutover.get("retirement") is None
+            and cutover.get("final_routing") is None
+            and cutover.get("authoritative_readback") is None
+            and isinstance(recovery, dict)
+            and set(recovery) == {
+                "action", "blue_preserved", "connector_switch_attempted", "error"
+            }
+            and recovery.get("action") == "repair_preflight_evidence_and_retry"
+            and recovery.get("blue_preserved") is True
+            and recovery.get("connector_switch_attempted") is False
+            and isinstance(recovery.get("error"), dict)
+            and bool(recovery["error"])
+            and not midcutover.unresolved_post_switch_receipts(receipts)
+        )
+    except (OSError, RuntimeError, ValueError, midcutover.MidCutoverEvidenceError):
+        return False
+
+
 def _signed_clean_blue_rollback_is_terminal(
     cutover: dict[str, Any],
     receipts: list[dict[str, Any]],
@@ -2156,6 +2197,11 @@ def _verified_runtime_terminal_receipt(
     ):
         return False
 
+    # A proven systemd-run non-start has no runner-specific receipt for either
+    # scheduled deploy or mid-cutover resume. Bind it to the same strict proof.
+    if status.get("final_status") == "launch_failed":
+        return _verified_never_started_resume(entry, metadata, status)
+
     if deploy is not None:
         contract = metadata.get("finalization_contract")
         receipt = status.get("finalization_receipt")
@@ -2216,6 +2262,14 @@ def _verified_runtime_terminal_receipt(
                     not midcutover.unresolved_post_switch_receipts(receipts)
                     and midcutover._lineage_resolved(receipts, original)
                 )
+        # A persisted failed_pre_cutover receipt proves the switch was never
+        # attempted; unlike unknown/post-switch recovery it is terminal.
+        preflight = _authenticated_persisted_incomplete_cutover(
+            entry, metadata, deploy, status,
+            allowed_outcomes=frozenset({"failed_pre_cutover"}),
+        )
+        if preflight is not None:
+            return _signed_failed_pre_cutover_is_terminal(preflight[0], preflight[1])
         # Sidecar failures carry a blue-green summary, so the no-effect
         # authenticator deliberately cannot read their failure type. The
         # dedicated cutover proof checks the exact private finalization itself.
@@ -2246,8 +2300,6 @@ def _verified_runtime_terminal_receipt(
     # denial or an unpersisted receipt. Only the authentic completed lineage
     # for its exact --cutover-id, --expected-head and --resume-binding-sha256
     # retires the reservation. load_receipts enforces private owner-only files.
-    if status.get("final_status") == "launch_failed":
-        return _verified_never_started_resume(entry, metadata, status)
     if status.get("final_status") == "failed":
         return _failed_resume_job_is_settled(entry, metadata, fields, status)
     if status.get("final_status") not in {"completed", "succeeded"}:
