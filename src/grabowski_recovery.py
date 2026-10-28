@@ -1590,7 +1590,7 @@ def _validated_nixos_root_proof(
     started = payload["started_at_unix"]
     completed = payload["completed_at_unix"]
     snapshot_time = payload["snapshot_time_unix"]
-    if not (not_before_unix - 1 <= started <= completed <= now + 5
+    if not (not_before_unix <= started <= completed <= now + 5
             and 0 <= now - completed <= 120
             and 0 <= completed - snapshot_time <= MAX_AGE_SECONDS
             and 0 <= now - snapshot_time <= MAX_AGE_SECONDS):
@@ -1614,7 +1614,8 @@ def _validated_nixos_root_proof(
 
 
 def _nixos_root_proof_read(
-    *, not_before_unix: int, now: int, expected_backup_uuid: str
+    *, not_before_unix: int, not_before_mtime_ns: int, now: int,
+    expected_backup_uuid: str,
 ) -> dict[str, Any]:
     """Read bounded root-owned evidence without following an attacker symlink."""
     proof = NIXOS_RESTIC_ROOT_PROOF_PATH
@@ -1630,6 +1631,15 @@ def _nixos_root_proof_read(
                     or file_stat.st_mode & 0o022 or file_stat.st_nlink != 1
                     or not 0 < file_stat.st_size <= 8192):
                 raise RuntimeError("NixOS root Restic proof file is unsafe")
+            # The root oneshot writes proof.json atomically with a new mtime.
+            # A prior success can still appear as inactive/success/0 while the
+            # broker-accepted --no-block start is only queued. Require a root-
+            # owned regular proof written no earlier than THIS broker dispatch,
+            # including two dispatches within the same Unix second.
+            if type(not_before_mtime_ns) is not int or not_before_mtime_ns <= 0:
+                raise RuntimeError("NixOS root Restic dispatch time is invalid")
+            if file_stat.st_mtime_ns < not_before_mtime_ns:
+                raise RuntimeError("NixOS root Restic proof predates broker dispatch")
             content = os.read(fd, 8193)
             if len(content) != file_stat.st_size:
                 raise RuntimeError("NixOS root Restic proof file size changed")
@@ -1646,6 +1656,61 @@ def _nixos_root_proof_read(
     )
 
 
+def _await_nixos_root_proof(
+    *, started_at_unix: int, not_before_mtime_ns: int,
+    expected_backup_uuid: str, timeout_seconds: int = 4800,
+) -> dict[str, Any]:
+    """Check a fresh systemd oneshot outcome after broker's non-blocking start."""
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        status = operator._run(
+            ["systemctl", "--system", "show", NIXOS_RESTIC_ROOT_PROOF_UNIT,
+             "--property=LoadState", "--property=Job",
+             "--property=ActiveState", "--property=Result", "--property=ExecMainStatus"],
+            cwd=operator.HOME, timeout_seconds=30,
+            max_output_bytes=operator.DEFAULT_OUTPUT_BYTES,
+        )
+        if status.get("returncode") != 0 or not isinstance(status.get("stdout"), str):
+            raise RuntimeError("NixOS root Restic unit outcome cannot be observed")
+        values: dict[str, str] = {}
+        for line in status["stdout"].splitlines():
+            if "=" in line:
+                key, value = line.split("=", 1)
+                values[key] = value
+        # systemctl show returns exit 0 even for LoadState=not-found, which
+        # otherwise looks like inactive/Result=success/ExecMainStatus=0.
+        if values.get("LoadState") != "loaded" or values.get("Job") is None:
+            raise RuntimeError("NixOS root Restic service is missing or its job state is unavailable")
+        active = values.get("ActiveState")
+        result = values.get("Result")
+        exit_status = values.get("ExecMainStatus")
+        pending_job = values["Job"] not in {"", "0"}
+        # A queued start may still expose the *previous* failed result.
+        # Only treat the failure as final after systemd has no pending job.
+        if not pending_job and (
+            active == "failed"
+            or (active == "inactive" and result not in {"success", None, ""})
+        ):
+            raise RuntimeError("NixOS root Restic service failed before recovery proof")
+        if active == "inactive" and not pending_job and result == "success" and exit_status != "0":
+            raise RuntimeError("NixOS root Restic service did not exit successfully")
+        if active == "inactive" and not pending_job and result == "success" and exit_status == "0":
+            try:
+                # Unit may report the preceding successful result while the new
+                # start job is still queued. The root proof must be NEW.
+                return _nixos_root_proof_read(
+                    not_before_unix=started_at_unix,
+                    not_before_mtime_ns=not_before_mtime_ns,
+                    now=int(time.time()),
+                    expected_backup_uuid=expected_backup_uuid,
+                )
+            except (OSError, RuntimeError, ValueError):
+                pass
+        if time.monotonic() >= deadline:
+            raise TimeoutError("NixOS native Restic root proof did not complete in the allowed window")
+        time.sleep(2)
+
+
 def _nixos_local_recovery_probe_locked(target_info: dict[str, Any]) -> dict[str, Any]:
     """Delegate privileged Restic to one fixed NixOS systemd oneshot."""
     if target_info.get("kind") != "local_backup_disk":
@@ -1657,27 +1722,18 @@ def _nixos_local_recovery_probe_locked(target_info: dict[str, Any]) -> dict[str,
 
     log_dir = operator.STATE_DIR / "recovery"
     log_dir.mkdir(parents=True, exist_ok=True)
-    started_at = int(time.time())
+    started_at_ns = time.time_ns()
+    started_at = started_at_ns // 1_000_000_000
     log_path = log_dir / f"nixos-restic-recovery-{started_at}.log"
-    # Polkit grants only this exact root-owned NixOS unit start; this
-    # recovery call needs no sudo and chooses no privileged Restic argv.
-    # NoNewPrivileges restricts this operator service's own process tree.
-    # Separately launched user@1000 jobs retain the host's sudo policy.
-    _run_logged(
-        ["/run/current-system/sw/bin/systemctl", "--system", "start",
-         NIXOS_RESTIC_ROOT_PROOF_UNIT],
-        env=dict(os.environ),
-        log=log_path,
-        # The root oneshot is bounded at 75 minutes; allow its error/result to
-        # propagate before the unprivileged caller stops waiting.
-        timeout_seconds=4800,
-    )
-    completed_at = int(time.time())
-    proof = _nixos_root_proof_read(
-        not_before_unix=started_at,
-        now=completed_at,
+    # Privileged unit start is allowed ONLY through the rootbroker's
+    # MainPID-bound, fixed-action contract. No operator-side sudo remains.
+    privileged.start_nixos_root_restic_unit_reference()
+    proof = _await_nixos_root_proof(
+        started_at_unix=started_at,
+        not_before_mtime_ns=started_at_ns,
         expected_backup_uuid=backup_uuid,
     )
+    completed_at = int(time.time())
     if not _timer_probe("is-enabled")["ok"] or not _timer_probe("is-active")["ok"]:
         raise RuntimeError("NixOS Restic system timer is not enabled and active")
     snapshot_id = proof["snapshot_id"]
@@ -1746,8 +1802,9 @@ def _nixos_local_recovery_probe_locked(target_info: dict[str, Any]) -> dict[str,
 
 
 def _local_recovery_probe(target_info: dict[str, Any]) -> dict[str, Any]:
-    # Native unit disappearance must fail closed before any legacy restore,
-    # repository lock, mount operation or recovery proof publication.
+    # Never migrate backwards to the legacy privileged restore executor if
+    # NixOS has lost its native systemd timer or unit. Fail before any lock,
+    # mount, Restic invocation or recovery publication.
     if _NIXOS_OS_PRESENT and not _NIXOS_RESTIC_TIMER_PRESENT:
         raise RuntimeError("NixOS native Restic timer is unavailable")
     with _local_recovery_repository_operation_lock():
@@ -1913,24 +1970,25 @@ def _timer_probe(action: str) -> dict[str, Any]:
 
 
 def _nixos_native_backup_service_fresh() -> dict[str, Any]:
-    """Bind a remote recovery target to a real native backup service exit.
+    """Prove a completed NixOS backup AND its exact saved Restic snapshot.
 
-    An NixOS system timer does not create Pop!_OS's user success-marker file.
-    systemd's monotonic *exit* timestamp proves an actual successful run in
-    this boot; its realtime timestamp accounts for suspend. Result=success
-    and ExecMainStatus=0 alone can mean "never started".
+    Unit success alone is not backup evidence. Trusted journald invocation,
+    unit and both timestamp domains bind the saved-snapshot message to the
+    completed systemd service, without reading private Restic credentials.
     """
     unit = "restic-backups-heim-pc.service"
     result: dict[str, Any] = {
         "path": f"systemd:{unit}", "exists": False, "valid": False,
         "timestamp_unix": None, "age_seconds": None,
-        "error": "NixOS Restic backup service has not completed successfully",
+        "backup_invocation_id": None, "snapshot_id": None,
+        "error": "NixOS Restic service lacks bound backup snapshot evidence",
         "source": "nixos-system-restic-backup-completion",
     }
     names = (
-        "LoadState", "ActiveState", "Result", "ExecMainCode",
-        "ExecMainStatus", "ExecMainExitTimestampMonotonic",
-        "ExecMainExitTimestamp",
+        "LoadState", "ActiveState", "Job", "Result", "ExecMainCode",
+        "ExecMainStatus", "ExecMainStartTimestampMonotonic",
+        "ExecMainExitTimestampMonotonic", "ExecMainStartTimestamp",
+        "ExecMainExitTimestamp", "InvocationID",
     )
     observed = operator._run(
         ["/run/current-system/sw/bin/systemctl", "--system",
@@ -1938,99 +1996,171 @@ def _nixos_native_backup_service_fresh() -> dict[str, Any]:
          *[f"--property={name}" for name in names]],
         cwd=operator.HOME, timeout_seconds=30, max_output_bytes=4096,
     )
-    if observed.get("returncode") != 0:
-        return result
-    raw = observed.get("stdout")
-    if not isinstance(raw, str):
+    if observed.get("returncode") != 0 or not isinstance(observed.get("stdout"), str):
         return result
     fields: dict[str, str] = {}
-    for line in raw.splitlines():
-        if "=" not in line:
-            return result
-        key, value = line.split("=", 1)
-        if key not in names or key in fields:
+    for line in observed["stdout"].splitlines():
+        key, sep, value = line.partition("=")
+        if not sep or key not in names or key in fields:
             return result
         fields[key] = value
     if set(fields) != set(names):
         return result
     result["exists"] = fields["LoadState"] == "loaded"
     if (not result["exists"] or fields["ActiveState"] != "inactive"
-            or fields["Result"] != "success"
-            or fields["ExecMainCode"] != "1"
-            or fields["ExecMainStatus"] != "0"):
+            or fields["Job"] not in {"", "0"}
+            or fields["Result"] != "success" or fields["ExecMainCode"] != "1"
+            or fields["ExecMainStatus"] != "0"
+            or re.fullmatch(r"[0-9a-f]{32}", fields["InvocationID"]) is None):
         return result
-    exit_text = fields["ExecMainExitTimestampMonotonic"]
-    if not exit_text.isascii() or not exit_text.isdecimal():
+
+    def unix_microseconds(value: str) -> int | None:
+        match = re.fullmatch(r"@([0-9]+)(?:\.([0-9]{1,6}))?", value)
+        if match is None:
+            return None
+        return int(match.group(1)) * 1_000_000 + int((match.group(2) or "").ljust(6, "0") or "0")
+
+    mono_start = fields["ExecMainStartTimestampMonotonic"]
+    mono_end = fields["ExecMainExitTimestampMonotonic"]
+    if (re.fullmatch(r"[0-9]+", mono_start) is None
+            or re.fullmatch(r"[0-9]+", mono_end) is None):
         return result
-    exit_microseconds = int(exit_text)
-    now_microseconds = int(time.monotonic() * 1_000_000)
-    monotonic_age = now_microseconds - exit_microseconds
-    # CLOCK_MONOTONIC excludes suspend on Linux. Inspect systemd's *same*
-    # completed invocation through an exact numerical realtime timestamp,
-    # which includes sleep and cannot be confused with a localized date.
-    realtime_text = fields["ExecMainExitTimestamp"]
-    if not realtime_text.startswith("@"):
+    start_mono, end_mono = int(mono_start), int(mono_end)
+    start_realtime = unix_microseconds(fields["ExecMainStartTimestamp"])
+    end_realtime = unix_microseconds(fields["ExecMainExitTimestamp"])
+    now = int(time.time())
+    now_mono = int(time.monotonic() * 1_000_000)
+    if start_realtime is None or end_realtime is None:
         return result
-    seconds_text, dot, fractional_text = realtime_text[1:].partition(".")
-    if (not seconds_text.isascii() or not seconds_text.isdecimal()
-            or (dot and (not fractional_text.isascii()
-                         or not fractional_text.isdecimal()
-                         or len(fractional_text) > 6))):
+    start_unix, completed_at = start_realtime // 1_000_000, end_realtime // 1_000_000
+    age = now - completed_at
+    if (not 0 < start_mono < end_mono <= now_mono
+            or not 0 < start_realtime <= end_realtime
+            or start_unix <= 0 or completed_at > now
+            or not 0 <= age <= MAX_AGE_SECONDS
+            or not 0 <= now - start_unix <= MAX_AGE_SECONDS
+            or now_mono - end_mono > MAX_AGE_SECONDS * 1_000_000):
+        result["error"] = "NixOS backup invocation is missing, stale or future-dated"
         return result
-    completed_at = int(seconds_text)
-    age = int(time.time()) - completed_at
-    if (exit_microseconds <= 0 or monotonic_age < 0
-            or monotonic_age > MAX_AGE_SECONDS * 1_000_000
-            or completed_at <= 0 or age < 0 or age > MAX_AGE_SECONDS):
-        result["error"] = "NixOS Restic backup completion is missing, stale or future-dated"
+
+    invocation = fields["InvocationID"]
+    journal = operator._run(
+        ["/run/current-system/sw/bin/journalctl", "--system", "--boot", "--no-pager",
+         "--output=json", "-n", "128",
+         "--grep", r"^snapshot [0-9a-f]{8,64} saved$",
+         f"_SYSTEMD_INVOCATION_ID={invocation}"],
+        cwd=operator.HOME, timeout_seconds=30, max_output_bytes=65536,
+    )
+    if journal.get("returncode") != 0 or not isinstance(journal.get("stdout"), str):
+        return result
+    snapshots: list[tuple[str, int]] = []
+    try:
+        for line in journal["stdout"].splitlines():
+            event = json.loads(line)
+            if not isinstance(event, dict):
+                return result
+            if (event.get("_SYSTEMD_INVOCATION_ID") != invocation
+                    or event.get("_SYSTEMD_UNIT") != unit):
+                return result
+            message = event.get("MESSAGE")
+            match = re.fullmatch(r"snapshot ([0-9a-f]{8,64}) saved", message) if isinstance(message, str) else None
+            realtime = event.get("__REALTIME_TIMESTAMP")
+            monotonic = event.get("__MONOTONIC_TIMESTAMP")
+            if (match is None or not isinstance(realtime, str)
+                    or re.fullmatch(r"[0-9]{1,20}", realtime) is None
+                    or not isinstance(monotonic, str)
+                    or re.fullmatch(r"[0-9]{1,20}", monotonic) is None):
+                return result
+            saved_us, saved_mono = int(realtime), int(monotonic)
+            # A Restic oneshot may have multiple ExecStart commands: a
+            # later prune/check replaces ExecMainStartTimestamp, after the
+            # snapshot-save event. InvocationID plus trusted unit and boot
+            # bind that event to this run; the final exit is an upper bound,
+            # NOT an invocation-wide lower bound. Both clocks must agree.
+            if not (0 < saved_us < (completed_at + 1) * 1_000_000
+                    and 0 < saved_mono <= end_mono
+                    and 0 <= now - (saved_us // 1_000_000) <= MAX_AGE_SECONDS
+                    and 0 <= now_mono - saved_mono <= MAX_AGE_SECONDS * 1_000_000
+                    and abs((end_realtime - saved_us) - (end_mono - saved_mono))
+                        <= 2_000_000):
+                return result
+            snapshots.append((match.group(1), saved_us))
+    except (ValueError, TypeError, OverflowError):
+        return result
+    if len(snapshots) != 1:
         return result
     result.update({
-        "valid": True, "timestamp_unix": completed_at,
-        "age_seconds": age, "error": None,
+        "valid": True, "timestamp_unix": completed_at, "age_seconds": age,
+        "backup_invocation_id": invocation, "snapshot_id": snapshots[0][0],
+        "snapshot_saved_at_unix": snapshots[0][1] // 1_000_000,
+        "service_start_unix": start_unix, "service_exit_unix": completed_at,
+        "error": None,
     })
     return result
 
+
+def _local_backup_freshness(
+    *, server_source: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Use one fail-closed OS-specific backup contract in both recovery gates."""
+    if not (_NIXOS_OS_PRESENT or _NIXOS_RESTIC_TIMER_PRESENT):
+        return _fresh_text_marker(BACKUP_SUCCESS)
+
+    missing: dict[str, Any] = {
+        "path": "systemd:restic-backups-heim-pc.service",
+        "exists": False, "valid": False, "timestamp_unix": None,
+        "age_seconds": None, "backup_invocation_id": None,
+        "snapshot_id": None, "source": "nixos-system-restic-backup-completion",
+        "error": "NixOS native backup timer/service contract is missing",
+    }
+    if not _NIXOS_RESTIC_TIMER_PRESENT:
+        return missing
+    completed = _nixos_native_backup_service_fresh()
+    if _configured_recovery_target_info().get("kind") != "local_backup_disk":
+        return completed
+
+    if server_source is None:
+        server_source = _server_source_marker()
+    source_id = server_source.get("snapshot_id")
+    journal_id = completed.get("snapshot_id")
+    snapshot_time = server_source.get("snapshot_time_unix")
+    snapshot_age = server_source.get("snapshot_age_seconds")
+    start = completed.get("service_start_unix")
+    end = completed.get("service_exit_unix")
+    now = int(time.time())
+    identity_bound = (
+        server_source.get("valid") is True
+        and server_source.get("exists") is True
+        and server_source.get("snapshot_fresh") is True
+        and completed.get("valid") is True
+        and isinstance(source_id, str)
+        and re.fullmatch(r"[0-9a-f]{8,64}", source_id) is not None
+        and isinstance(journal_id, str)
+        and re.fullmatch(r"[0-9a-f]{8,64}", journal_id) is not None
+        and (source_id.startswith(journal_id) or journal_id.startswith(source_id))
+        and type(snapshot_time) is int and type(snapshot_age) is int
+        and type(start) is int and type(end) is int
+        and 0 < start <= end <= now
+        and 0 < snapshot_time <= end
+        and 0 <= snapshot_age <= MAX_AGE_SECONDS
+        and 0 <= now - snapshot_time <= MAX_AGE_SECONDS
+        and abs((now - snapshot_time) - snapshot_age) <= 5
+    )
+    return {
+        "path": server_source.get("path"), "exists": server_source.get("exists") is True,
+        "valid": identity_bound, "timestamp_unix": snapshot_time,
+        "age_seconds": snapshot_age, "source": "verified-nixos-native-restic",
+        "backup_invocation_id": completed.get("backup_invocation_id"),
+        "snapshot_id": source_id,
+        "error": None if identity_bound else "NixOS recovery snapshot lacks matching completed backup invocation",
+    }
 
 def recovery_status() -> dict[str, Any]:
     audit = base._verify_audit_log(base.AUDIT_LOG)
     deployment = base._deployment_metadata()
     server_backup = _canonical_server_marker()
     server_source = _server_source_marker()
-    # NixOS publishes evidence only after a real restore and repository check.
-    # Pop!_OS keeps its existing timestamp-marker contract.
-    # Local-disk restores use their real snapshot time. Remote recovery
-    # records do not carry that time; on NixOS independently require an
-    # actually completed and fresh root-owned systemd backup service, not
-    # Pop!_OS's absent user session success marker.
-    native_local_target = (
-        _NIXOS_RESTIC_TIMER_PRESENT
-        and _configured_recovery_target_info().get("kind") == "local_backup_disk"
-    )
-    if _NIXOS_OS_PRESENT and not _NIXOS_RESTIC_TIMER_PRESENT:
-        local_backup = {
-            "path": "systemd:restic-backups-heim-pc.service", "exists": False,
-            "valid": False, "timestamp_unix": None, "age_seconds": None,
-            "error": "NixOS native Restic timer is unavailable",
-            "source": "nixos-native-unavailable",
-        }
-    else:
-        local_backup = (
-            {
-                "path": server_source["path"], "exists": server_source["exists"],
-                "valid": server_source["valid"] and bool(server_source.get("snapshot_fresh")),
-                "timestamp_unix": server_source.get("snapshot_time_unix"),
-                "age_seconds": server_source.get("snapshot_age_seconds"),
-                "error": (
-                    server_source["error"] if not server_source["valid"]
-                    else None if server_source.get("snapshot_fresh")
-                    else "NixOS snapshot timestamp is missing or stale"
-                ),
-                "source": "verified-nixos-native-restic",
-            }
-            if native_local_target
-            else (_nixos_native_backup_service_fresh() if _NIXOS_RESTIC_TIMER_PRESENT
-                  else _fresh_text_marker(BACKUP_SUCCESS))
-        )
+    local_backup = _local_backup_freshness(server_source=server_source)
     source_publication = _source_publication_state(server_backup, server_source)
     kill_switch = base._kill_switch_state()
     test_switch_recovery = _test_kill_switch_recovery_status()
@@ -2072,7 +2202,7 @@ def recovery_status() -> dict[str, Any]:
         else:
             actions.append("remove the operator kill switch through an external operator-authorized path")
     if not checks["local_backup_fresh"]:
-        actions.append("produce a fresh local backup and restore sentinel")
+        actions.append("produce verified native Restic backup evidence or the legacy backup marker")
     if not checks["backup_timer_enabled"] or not checks["backup_timer_active"]:
         actions.append(f"enable and start {BACKUP_TIMER}")
     if not checks["server_recovery_fresh"]:

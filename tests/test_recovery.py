@@ -765,7 +765,9 @@ class RecoveryToolTests(unittest.TestCase):
         self.assertFalse(state["checks"]["local_backup_fresh"])
         self.assertFalse(state["ready_for_user_power_worker"])
         self.assertFalse(state["ready_for_privileged_actions"])
-        self.assertEqual(state["local_backup"]["source"], "nixos-native-unavailable")
+        self.assertEqual(state["local_backup"]["source"], "nixos-system-restic-backup-completion")
+        self.assertFalse(state["local_backup"]["exists"])
+        self.assertIn("missing", state["local_backup"]["error"])
 
     def test_server_source_marker_reports_hash_of_exact_raw_record(self) -> None:
         target = "wg-prod-1:rest-server/grabowski-recovery-probe"
