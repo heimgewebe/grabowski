@@ -692,8 +692,11 @@ def _grok_streaming_review_command(
         [
             "--disable-web-search",
             "--no-subagents",
+            # The enclosing minimal_sandbox_argv already provides an immutable
+            # read-only bubblewrap. A second Grok sandbox cannot start within
+            # its hermetic mount namespace; keep the outer sandbox and deny all tools.
             "--sandbox",
-            "read-only",
+            "off",
             "--tools",
             GROK_REVIEW_TOOLS,
             "--disallowed-tools",
