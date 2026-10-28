@@ -767,6 +767,70 @@ def evaluate_resume_gate(expected_head: str) -> dict[str, Any]:
     }
 
 
+def _local_backup_evidence_for_repair() -> dict[str, Any]:
+    """Use successful native backup evidence, never require a restore probe.
+
+    Recovery provenance repair intentionally has a backup-only freshness
+    prerequisite. The separate privileged recovery gate still requires its
+    root-owned restore/repository-check proof; this read-only assessment does
+    not consult or waive that proof.
+    """
+    nixos = bool(
+        getattr(recovery, "_NIXOS_OS_PRESENT", False)
+        or getattr(recovery, "_NIXOS_RESTIC_TIMER_PRESENT", False)
+    )
+    if not nixos:
+        return recovery._fresh_text_marker(recovery.BACKUP_SUCCESS)
+
+    unavailable: dict[str, Any] = {
+        "valid": False, "exists": False, "source": "nixos-native-unavailable",
+        "path": "systemd:restic-backups-heim-pc.service",
+        "timestamp_unix": None, "age_seconds": None,
+        "backup_invocation_id": None, "snapshot_id": None,
+    }
+    # On NixOS a missing native timer never authorizes the Pop! success file.
+    if not getattr(recovery, "_NIXOS_RESTIC_TIMER_PRESENT", False):
+        return unavailable
+    try:
+        # This helper verifies systemd's completed successful InvocationID
+        # and the matching trusted journal snapshot-save event. Unlike
+        # _local_backup_freshness it does not read recovery/restore markers.
+        row = recovery._nixos_native_backup_service_fresh()
+        if not isinstance(row, dict):
+            return unavailable
+        age, stamp = row.get("age_seconds"), row.get("timestamp_unix")
+        invocation, snapshot = row.get("backup_invocation_id"), row.get("snapshot_id")
+        start = row.get("service_start_unix")
+        end = row.get("service_exit_unix")
+        saved = row.get("snapshot_saved_at_unix")
+        now = int(time.time())
+        max_age = recovery.MAX_AGE_SECONDS
+        valid = (
+            row.get("valid") is True
+            and row.get("exists") is True
+            and row.get("source") == "nixos-system-restic-backup-completion"
+            and row.get("path") == "systemd:restic-backups-heim-pc.service"
+            and type(age) is int and type(stamp) is int
+            and type(start) is int and type(end) is int
+            and type(saved) is int
+            and type(max_age) is int and max_age > 0
+            and 0 < start <= end == stamp <= now
+            and 0 < saved <= end
+            and 0 <= now - saved <= max_age
+            and 0 <= age <= max_age and 0 <= now - stamp <= max_age
+            and abs(now - stamp - age) <= 5
+            and isinstance(invocation, str)
+            and len(invocation) == 32
+            and all(char in "0123456789abcdef" for char in invocation)
+            and isinstance(snapshot, str)
+            and 8 <= len(snapshot) <= 64
+            and all(char in "0123456789abcdef" for char in snapshot)
+        )
+        return {**unavailable, **row, "valid": valid}
+    except Exception:
+        # A broken native proof never falls back to a legacy text marker.
+        return unavailable
+
 def evaluate_gate(
     expected_head: str,
     source_repository: str | None = None,
@@ -779,7 +843,7 @@ def evaluate_gate(
     """
     audit = base._verify_audit_log(base.AUDIT_LOG)
     kill_switch = base._kill_switch_state()
-    local_backup = recovery._fresh_text_marker(recovery.BACKUP_SUCCESS)
+    local_backup = _local_backup_evidence_for_repair()
     broker = privileged.grabowski_privileged_broker_status()
     integrity = _integrity_evidence()
 
@@ -820,9 +884,8 @@ def evaluate_gate(
         "audit_writable": bool(audit.get("audit_writable", audit.get("valid"))),
         "kill_switch_clear": not bool(kill_switch.get("engaged")),
         "no_blocking_operator_blockade": bool(blockade["allows_mutation"]),
-        # Named for what is actually checked: a freshness marker, not a proven
-        # restore.  Restore provability lives in the separate server-recovery
-        # gate, which this lane deliberately does not require.
+        # Backup freshness only: the root-owned restore/canonical recovery
+        # proof remains a separate security gate, never implicitly waived.
         "local_backup_marker_fresh": bool(local_backup.get("valid")),
         "privileged_broker_ready": bool(broker.get("ready")),
         # Revision binding of the repair target.
@@ -861,8 +924,18 @@ def evaluate_gate(
         "kill_switch": {"engaged": bool(kill_switch.get("engaged"))},
         "local_backup_marker": {
             "fresh": bool(local_backup.get("valid")),
+            "source": local_backup.get("source", "legacy-backup-text-marker"),
+            "path": str(local_backup.get("path", recovery.BACKUP_SUCCESS)),
+            "timestamp_unix": local_backup.get("timestamp_unix"),
             "age_seconds": local_backup.get("age_seconds"),
-            "proves": "a recent successful backup run wrote its marker",
+            "backup_invocation_id": local_backup.get("backup_invocation_id"),
+            "snapshot_id": local_backup.get("snapshot_id"),
+            "proves": (
+                "a completed NixOS systemd backup with its bound Restic journal snapshot"
+                if getattr(recovery, "_NIXOS_OS_PRESENT", False)
+                or getattr(recovery, "_NIXOS_RESTIC_TIMER_PRESENT", False)
+                else "a recent successful backup run wrote its marker"
+            ),
             "does_not_prove": "that a restore was performed or verified",
         },
         "privileged_broker": {"ready": bool(broker.get("ready"))},
