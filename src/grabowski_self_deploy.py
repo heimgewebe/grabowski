@@ -2037,6 +2037,85 @@ def _failed_resume_job_is_settled(
         return False
 
 
+def _verified_never_started_resume(
+    entry: Path, metadata: dict[str, Any], status: dict[str, Any],
+) -> bool:
+    """Retire only a resume whose job dispatcher *proved* it never started.
+
+    The resume runner cannot issue a cutover receipt if systemd-run never
+    created its unit.  Trust neither an arbitrary launch_failed label nor a
+    later missing unit on its own: bind the stored dispatch decision to the
+    exact job/argv and its owner-private metadata, the operator's fresh
+    finalization projection and a second independent live systemd readback.
+    Ambiguous or previously started work remains reserved.
+    """
+    unit = entry.name
+    saved = metadata.get("dispatch_readback")
+    launch = metadata.get("launcher_evidence")
+    terminal = metadata.get("terminalization_evidence")
+    contract = metadata.get("finalization_contract")
+    finalization = status.get("finalization_receipt")
+    observed = status.get("terminalization_evidence")
+    if (
+        metadata.get("final_status") != "launch_failed"
+        or metadata.get("dispatch_outcome") != "not_started"
+        or not isinstance(saved, dict)
+        or set(saved) != {"query_valid", "outcome", "load_state", "active_state"}
+        or saved.get("query_valid") is not True
+        or saved.get("outcome") != "not_started"
+        or saved.get("load_state") != "not-found"
+        or saved.get("active_state") not in {"inactive", None}
+        or not isinstance(launch, dict)
+        or launch.get("source") != "systemd-run"
+        or type(launch.get("returncode")) is not int
+        or launch["returncode"] == 0
+        or any(
+            not isinstance(launch.get(key), str)
+            or _SHA256_RE.fullmatch(launch[key]) is None
+            for key in ("stdout_sha256", "stderr_sha256")
+        )
+        or any(
+            type(launch.get(key)) is not int or launch[key] < 0
+            for key in ("stdout_bytes", "stderr_bytes")
+        )
+        or not isinstance(terminal, dict)
+        or terminal.get("source") != "systemd-run-launch"
+        or terminal.get("query_valid") is not True
+        or terminal.get("systemd_visible") is not False
+        or terminal.get("final_status") != "launch_failed"
+        or not isinstance(contract, dict)
+        or contract.get("kind") != "grabowski_job_finalization"
+        or contract.get("unit") != unit
+        or contract.get("job_id") != metadata.get("job_id")
+        or contract.get("argv_sha256") != metadata.get("argv_sha256")
+        or status.get("unit") != unit
+        or status.get("metadata") != metadata
+        or status.get("final_status") != "launch_failed"
+        or status.get("systemd_visible") is not False
+        or not isinstance(finalization, dict)
+        or finalization.get("configured") is not True
+        or finalization.get("valid") is not False
+        or finalization.get("state") != "missing_receipt"
+        or not isinstance(observed, dict)
+        or observed.get("source") != "systemd-run-launch"
+        or observed.get("final_status") != "launch_failed"
+        or observed.get("query_valid") is not False
+        or observed.get("systemd_visible") is not False
+    ):
+        return False
+    try:
+        fresh = operator._unit_dispatch_readback(unit)
+    except (OSError, RuntimeError, ValueError, PermissionError):
+        return False
+    return bool(
+        isinstance(fresh, dict)
+        and fresh.get("query_valid") is True
+        and fresh.get("outcome") == "not_started"
+        and fresh.get("load_state") == "not-found"
+        and fresh.get("active_state") in {"inactive", None}
+    )
+
+
 def _verified_runtime_terminal_receipt(
     entry: Path,
     metadata: dict[str, Any],
@@ -2167,6 +2246,8 @@ def _verified_runtime_terminal_receipt(
     # denial or an unpersisted receipt. Only the authentic completed lineage
     # for its exact --cutover-id, --expected-head and --resume-binding-sha256
     # retires the reservation. load_receipts enforces private owner-only files.
+    if status.get("final_status") == "launch_failed":
+        return _verified_never_started_resume(entry, metadata, status)
     if status.get("final_status") == "failed":
         return _failed_resume_job_is_settled(entry, metadata, fields, status)
     if status.get("final_status") not in {"completed", "succeeded"}:
