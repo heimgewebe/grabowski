@@ -119,6 +119,10 @@ _CLAUDE_QUOTA_RESULT_RE = re.compile(
 _CLAUDE_QUOTA_UUID_RE = re.compile(
     r"[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}\Z"
 )
+_CLAUDE_AUTH_REVOKED_RESULT = (
+    "Failed to authenticate: OAuth token revoked. "
+    "Please log in again or contact your administrator."
+)
 _CLAUDE_QUOTA_ENVELOPE_FIELDS = frozenset({
     "type", "is_error", "terminal_reason", "api_error_status", "duration_api_ms",
     "modelUsage", "structured_output", "result", "usage", "subagent_stats",
@@ -1417,13 +1421,13 @@ def _claude_no_external_activity(usage: Any, subagents: Any) -> bool:
     return True
 
 
-def _proven_claude_quota_failure_before_review(
-    receipt: dict[str, Any], provenance: dict[str, Any]
+def _proven_claude_pre_result_failure_before_review(
+    receipt: dict[str, Any], provenance: dict[str, Any], *, auth_401: bool = False,
 ) -> bool:
-    """Accept only an exact, bound 429 transport envelope with zero model work.
+    """Verify a narrow, authenticated Claude 429 or revoked-OAuth 401 with zero review work.
 
-    This never grants a review PASS: a later independent PASS from the same
-    registered provider slot is still mandatory before settlement.
+    This never grants a review PASS, forgives ambiguous output, or erases a REJECT.
+    The sole 401 shape is the observed first-party authentication refusal.
     """
     if (
         provenance.get("schema_version") != 2
@@ -1466,7 +1470,10 @@ def _proven_claude_quota_failure_before_review(
         envelope = json.loads(tail, object_pairs_hook=unique_json_object)
     except ValueError:
         return False
-    if not isinstance(envelope, dict) or set(envelope) - _CLAUDE_QUOTA_ENVELOPE_FIELDS:
+    permitted_fields = _CLAUDE_QUOTA_ENVELOPE_FIELDS | (
+        frozenset({"api_error_origin"}) if auth_401 else frozenset()
+    )
+    if not isinstance(envelope, dict) or set(envelope) - permitted_fields:
         return False
     # The actual 429 result has one CLI wrapper turn, not one model turn.
     # An unexpected count, tool trace or provider state is not pre-result proof.
@@ -1503,14 +1510,22 @@ def _proven_claude_quota_failure_before_review(
         and envelope.get("is_error") is True
         and envelope.get("terminal_reason") == "api_error"
         and type(envelope.get("api_error_status")) is int
-        and envelope["api_error_status"] == 429
+        and envelope["api_error_status"] == (401 if auth_401 else 429)
         and type(envelope.get("duration_api_ms")) is int
         and envelope["duration_api_ms"] == 0
         and envelope.get("modelUsage") == {}
         and envelope.get("structured_output") is None
         and isinstance(envelope.get("result"), str)
         and len(envelope["result"]) <= 256
-        and _CLAUDE_QUOTA_RESULT_RE.fullmatch(envelope["result"]) is not None
+        and (
+            (
+                envelope.get("api_error_origin") == "first_party"
+                and envelope["result"] == _CLAUDE_AUTH_REVOKED_RESULT
+            )
+            if auth_401 else (
+                _CLAUDE_QUOTA_RESULT_RE.fullmatch(envelope["result"]) is not None
+            )
+        )
         and isinstance(usage, dict) and usage.get("iterations") == []
         and envelope.get("permission_denials") == []
         and type(envelope.get("total_cost_usd")) in {int, float}
@@ -1524,6 +1539,20 @@ def _proven_claude_quota_failure_before_review(
             )
         )
         and _claude_no_external_activity(usage, subagents)
+    )
+
+
+def _proven_claude_quota_failure_before_review(
+    receipt: dict[str, Any], provenance: dict[str, Any],
+) -> bool:
+    return _proven_claude_pre_result_failure_before_review(receipt, provenance)
+
+
+def _proven_claude_auth_failure_before_review(
+    receipt: dict[str, Any], provenance: dict[str, Any],
+) -> bool:
+    return _proven_claude_pre_result_failure_before_review(
+        receipt, provenance, auth_401=True,
     )
 
 
@@ -1753,6 +1782,10 @@ def _validated_review_role_evidence(
                 or _proven_grok_quota_failure_before_review(receipt, provenance)
             )
         ),
+        "pre_result_auth_failure_verified": (
+            result is None
+            and _proven_claude_auth_failure_before_review(receipt, provenance)
+        ),
     }
 
 
@@ -1882,6 +1915,7 @@ def _iter_pinned_review_job_directories(
             errors.append("decision_review_jobs_root_invalid")
             return
         names: list[tuple[str, int, int]] = []
+        original_root_entries: dict[str, tuple[int, int]] = {}
         # Child writes do not advance the jobs root mtime. Revalidate each
         # processed child's pinned directory identity after the whole scan.
         inspected_children: list[tuple[str, tuple[int, ...], tuple[Any, ...]]] = []
@@ -1889,6 +1923,14 @@ def _iter_pinned_review_job_directories(
         with os.scandir(root_fd) as entries:
             for entry in entries:
                 seen += 1
+                try:
+                    initial_entry_stat = entry.stat(follow_symlinks=False)
+                except OSError:
+                    errors.append("decision_review_job_inventory_unverifiable")
+                    return
+                original_root_entries[entry.name] = (
+                    initial_entry_stat.st_dev, initial_entry_stat.st_ino,
+                )
                 if seen > MAX_JOB_DIRECTORIES:
                     errors.append("decision_review_job_inventory_truncated")
                     return
@@ -2126,12 +2168,63 @@ def _iter_pinned_review_job_directories(
         ) != (
             after.st_dev, after.st_ino, after.st_mtime_ns, after.st_ctime_ns,
         ):
-            errors.append("decision_review_jobs_root_changed")
+            # New jobs can legitimately register during the long read-only scan.
+            # Retry the ENTIRE reconciliation only for a proven monotonic
+            # addition; removals, replacement inodes and permissions changes
+            # remain contradictory evidence and must stay blocking.
+            try:
+                # os.scandir(fd) duplicates a descriptor sharing the kernel
+                # directory offset. The initial scan exhausted root_fd; a
+                # second scandir(root_fd) would see an empty directory.
+                fresh_fd = os.open(root, dir_flags)
+                try:
+                    fresh_root = os.fstat(fresh_fd)
+                    if (
+                        fresh_root.st_dev != root_stat.st_dev
+                        or fresh_root.st_ino != root_stat.st_ino
+                    ):
+                        errors.append("decision_review_jobs_root_changed")
+                        return
+                    with os.scandir(fresh_fd) as entries:
+                        current_entries = {
+                            entry.name: entry.stat(follow_symlinks=False)
+                            for entry in entries
+                        }
+                finally:
+                    os.close(fresh_fd)
+            except OSError:
+                errors.append("decision_review_jobs_root_changed")
+                return
+            added_names = set(current_entries) - set(original_root_entries)
+            unchanged = all(
+                name in current_entries and (
+                    current_entries[name].st_dev, current_entries[name].st_ino,
+                ) == identity
+                for name, identity in original_root_entries.items()
+            )
+            additions_are_new_private_jobs = bool(added_names) and all(
+                _UNIT_RE.fullmatch(name) is not None
+                and stat.S_ISDIR(current_entries[name].st_mode)
+                and current_entries[name].st_uid == os.geteuid()
+                and not (stat.S_IMODE(current_entries[name].st_mode) & 0o077)
+                for name in added_names
+            )
+            if (
+                root_stat.st_dev == after.st_dev
+                and root_stat.st_ino == after.st_ino
+                and root_stat.st_uid == after.st_uid
+                and root_stat.st_mode == after.st_mode
+                and unchanged
+                and additions_are_new_private_jobs
+            ):
+                errors.append("decision_review_jobs_root_addition_race")
+            else:
+                errors.append("decision_review_jobs_root_changed")
     finally:
         os.close(root_fd)
 
 
-def reconcile(
+def _reconcile_once(
     *,
     repo: str,
     pr: int,
@@ -2292,6 +2385,7 @@ def reconcile(
                 "independence_verified": False,
                 "review_role_receipt_sha256": None,
                 "pre_result_quota_failure_verified": False,
+                "pre_result_auth_failure_verified": False,
                 "diff_identity_deferred": False,
             }
             if binding["base_sha"] != expected["base_sha"]:
@@ -2428,12 +2522,20 @@ def reconcile(
                 if provenance is not None and provenance.get("schema_version") == 2:
                     if (
                         role_evidence is not None
-                        and role_evidence.get("pre_result_quota_failure_verified") is True
+                        and (
+                            role_evidence.get("pre_result_quota_failure_verified") is True
+                            or role_evidence.get("pre_result_auth_failure_verified") is True
+                        )
                         and attempt["terminal_status"] in _PRE_RESULT_INFRASTRUCTURE_STATUSES
                         and attempt["terminal_status"] == "failed"
                     ):
                         attempt["classification"] = "infrastructure_error"
-                        attempt["pre_result_quota_failure_verified"] = True
+                        attempt["pre_result_quota_failure_verified"] = (
+                            role_evidence.get("pre_result_quota_failure_verified") is True
+                        )
+                        attempt["pre_result_auth_failure_verified"] = (
+                            role_evidence.get("pre_result_auth_failure_verified") is True
+                        )
                     else:
                         attempt["classification"] = "invalid_result"
                         errors.append(f"decision_review_result_invalid:{directory.name}:InvalidReviewDocument")
@@ -2478,10 +2580,13 @@ def reconcile(
         unsuperseded_infrastructure = []
         for infrastructure_attempt in infrastructure:
             eligible_passes = passes
-            if infrastructure_attempt.get("pre_result_quota_failure_verified") is True:
-                # A legacy generic PASS cannot replace authenticated Claude
-                # quota evidence. The later PASS itself must be independent
-                # and from the same provider family, not merely an old PASS.
+            if (
+                infrastructure_attempt.get("pre_result_quota_failure_verified") is True
+                or infrastructure_attempt.get("pre_result_auth_failure_verified") is True
+            ):
+                # A legacy generic PASS cannot replace authenticated provider
+                # failure evidence. The later PASS must be independently
+                # verified for this provider when settling the same slot.
                 family = infrastructure_attempt.get("review_provider_family")
                 eligible_passes = [
                     item for item in independent_passes
@@ -2547,6 +2652,7 @@ def reconcile(
                 "independence_verified",
                 "review_role_receipt_sha256",
                 "pre_result_quota_failure_verified",
+                "pre_result_auth_failure_verified",
                 "diff_identity_deferred",
             )
         }
@@ -2579,3 +2685,44 @@ def reconcile(
             "absence_of_same_uid_out_of_band_file_tampering",
         ],
     }
+
+def reconcile(
+    *,
+    repo: str,
+    pr: int,
+    head_sha: str,
+    base_sha: str,
+    diff_sha256: str,
+    equivalent_diff_sha256s: list[str] | tuple[str, ...] | None = None,
+    defer_diff_identity: bool = False,
+    jobs_root: Path | None = None,
+) -> dict[str, Any]:
+    """Bounded fresh full rescans for monotonic concurrent job registrations.
+
+    Only missing slots and documented pre-result infrastructure debt may be
+    superseded by a complete new snapshot. Never discard a material REJECT,
+    malformed provenance or changed/remapped prior directory. Three racing
+    scans without stability remain a hard block, never a presumed PASS.
+    """
+    result: dict[str, Any] = {}
+    for _ in range(3):
+        result = _reconcile_once(
+            repo=repo, pr=pr, head_sha=head_sha, base_sha=base_sha,
+            diff_sha256=diff_sha256,
+            equivalent_diff_sha256s=equivalent_diff_sha256s,
+            defer_diff_identity=defer_diff_identity, jobs_root=jobs_root,
+        )
+        errors = result.get("errors", [])
+        if "decision_review_jobs_root_addition_race" not in errors:
+            return result
+        if any(
+            error != "decision_review_jobs_root_addition_race"
+            and not error.startswith((
+                "decision_review_slot_without_pass:",
+                "decision_review_named_provider_slot_without_independent_pass:",
+                "decision_review_infrastructure_not_superseded:",
+            ))
+            for error in errors
+        ):
+            return result
+    return result
