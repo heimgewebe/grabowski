@@ -190,11 +190,30 @@ technical task PASS output do not enter this authority path. A present but
 incomplete or rejected first-party session is authoritative and cannot fall
 through to a model-provider PASS. When no first-party session exists, the
 existing authentic V2 catalog-role path remains byte-for-byte the semantic
-fallback. Both paths still require the separate isolated technical task
-receipts before the producer signs a private audit. This source change does
-not itself prove deployment of the new tools and does not authorize merge,
-Captain action or R3 release; critical release source and recovery contracts
-remain unchanged until their own post-merge evidence is verified.
+fallback. The **legacy V2 model-role path** still requires its separate, origin-bound
+isolated technical task receipts. The **first-party direct path** instead
+authenticates the five actual controller review submissions and signed Git
+source-read receipts themselves: it does **not** depend on five Grabowski
+unittest jobs or an external provider. Genuine repository-specific tests and
+required CI remain independent checks; their absence is never made into an
+invented review PASS. The first-party path supports managed heimgewebe Git
+checkouts (including other repositories such as heim-pc), with a verified
+remote/common Git directory and exact base/head/source binding.
+
+Its operational sequence is `plan-firstparty --repo ... --pr ... --base ...
+--head ... --diff ...` in the installed producer, five authenticated MCP
+`session_start / source_read / axis_submit` flows, then
+`seal-firstparty --batch-id ...`. The `--diff` digest is the canonical
+GitHub PR diff identity; the separately attested local Git diff and its
+fully observed chunks have their own independent SHA-256. Captain and Gate
+reopen the same signed per-axis evidence, reject unresolved findings and
+compare the GitHub PR identity themselves. A complete signed review remains
+valid after the submission session expires.
+
+A source commit does not itself prove deployment of these tools or authorize
+Captain merge or R3 release; the serving runtime and its root-owned public
+signer allowlist must be activated and read back. Critical release source and
+recovery contracts remain unchanged pending their post-merge evidence.
 
 ## PR self-review policy v4 (2026-10-26)
 

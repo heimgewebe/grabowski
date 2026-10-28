@@ -3530,6 +3530,7 @@ def build_self_review_audit(
         **(
             {
                 "review_batch_id": self_review.get("review_batch_id"),
+                "review_origin": self_review.get("review_origin"),
                 "review_pass_receipts": self_review.get("review_pass_receipts"),
             }
             if complexity.get("review_tier") == "high_critical"
@@ -4319,6 +4320,7 @@ def evaluate_review_gate(
                 "head_sha": pr.get("headRefOid"),
                 "diff_sha256": _normalize_sha256(state.get("pr_diff_sha256")),
                 "review_batch_id": self_review.get("review_batch_id"),
+                "review_origin": self_review.get("review_origin"),
                 "review_iterations": self_review.get("review_iterations"),
                 "review_pass_receipts": self_review.get("review_pass_receipts"),
             }

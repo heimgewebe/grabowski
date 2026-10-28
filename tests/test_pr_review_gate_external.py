@@ -164,6 +164,36 @@ class SelfReviewDepthPolicyTests(unittest.TestCase):
             result["failures"],
         )
 
+    def test_gate_and_captain_audit_preserve_first_party_proof_origin(self) -> None:
+        state = _state("tools/pr_review_gate.py", additions=180)
+        self_review = _self_review("tools/pr_review_gate.py", iterations=5)
+        self_review.update({
+            "review_batch_id": "a" * 32,
+            "review_origin": "first_party_authenticated_controller_v1",
+            "review_pass_receipts": [{"signed": number} for number in range(5)],
+        })
+        with mock.patch.object(
+            gate, "review_receipt_errors", return_value=[],
+        ) as verifier:
+            result = gate.evaluate_review_gate(state, self_review=self_review)
+        projected = verifier.call_args.args[0]
+        self.assertEqual(
+            self_review["review_origin"], projected["review_origin"],
+        )
+        self.assertIs(
+            self_review["review_pass_receipts"], projected["review_pass_receipts"],
+        )
+        captain_audit = gate.build_self_review_audit(
+            state, result, self_review,
+        )
+        self.assertEqual(
+            self_review["review_origin"], captain_audit["review_origin"],
+        )
+        self.assertIs(
+            self_review["review_pass_receipts"],
+            captain_audit["review_pass_receipts"],
+        )
+
     def test_documentation_change_requires_one_self_review_iteration(self) -> None:
         result = gate.evaluate_review_gate(_state(), self_review=_self_review())
         self.assertEqual(result["verdict"], "PASS")

@@ -250,6 +250,62 @@ class ServerReviewProducerTests(unittest.TestCase):
         self.assertNotIn("plan_path", output)
         self.assertEqual(5, output["task_count"])
 
+    def test_first_party_cli_has_no_runtime_or_signer_input(self):
+        direct_plan = {
+            key: value for key, value in self.plan.items() if key != "tasks"
+        }
+        direct_plan["kind"] = "grabowski_first_party_review_plan"
+        stdout = io.StringIO()
+        arguments = [
+            "plan-firstparty", "--repo", str(self.repo), "--base", self.base,
+            "--head", self.head, "--diff", "a" * 64, "--pr", "1649",
+        ]
+        with (
+            mock.patch.object(
+                producer, "plan_first_party_review", return_value=direct_plan,
+            ) as planner,
+            mock.patch.object(producer, "_require_live_pr"),
+            mock.patch.object(
+                producer, "_store_plan", return_value=self.root / "private-plan.json",
+            ),
+            redirect_stdout(stdout),
+        ):
+            self.assertEqual(0, producer.main(arguments))
+        output = json.loads(stdout.getvalue())
+        self.assertEqual("first_party_planned_not_executed", output["status"])
+        self.assertNotIn("tasks", output)
+        self.assertNotIn("signer", stdout.getvalue())
+        self.assertEqual(str(self.repo), str(planner.call_args.kwargs["repo"]))
+
+    def test_first_party_seal_cli_emits_no_private_audit_path(self):
+        direct_plan = {
+            key: value for key, value in self.plan.items() if key != "tasks"
+        }
+        direct_plan["kind"] = "grabowski_first_party_review_plan"
+        marker = "FIRST_PARTY_PRIVATE_AUDIT_CANARY"
+        sealed = {
+            "review_pass_count": 5,
+            "review_audit_sha256": "e" * 64,
+            "source_head": self.head,
+            "audit_path": "/private/" + marker,
+        }
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(producer, "_load_plan", return_value=direct_plan),
+            mock.patch.object(producer, "_require_live_pr"),
+            mock.patch.object(
+                producer, "seal_first_party_review", return_value=sealed,
+            ),
+            redirect_stdout(stdout),
+        ):
+            self.assertEqual(0, producer.main([
+                "seal-firstparty", "--batch-id", self.binding["review_batch_id"],
+            ]))
+        output = json.loads(stdout.getvalue())
+        self.assertEqual("sealed_and_verified", output["status"])
+        self.assertNotIn(marker, stdout.getvalue())
+        self.assertNotIn("audit_path", output)
+
     def test_seal_cli_does_not_log_private_reports_or_receipt_paths(self):
         marker = "SYNTHETIC_SECRET_REPORT_CANARY_NEVER_LOG"
         stdout = io.StringIO()

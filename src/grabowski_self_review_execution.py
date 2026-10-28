@@ -67,6 +67,7 @@ FIRST_PARTY_SESSION_KIND = "grabowski_first_party_semantic_review_session_v1"
 FIRST_PARTY_READ_KIND = "grabowski_first_party_semantic_source_read_v1"
 FIRST_PARTY_AXIS_KIND = "grabowski_first_party_semantic_axis_review_v1"
 FIRST_PARTY_ISSUER_KIND = "grabowski_authenticated_mcp_controller_v1"
+FIRST_PARTY_AUDIT_ORIGIN = "first_party_authenticated_controller_v1"
 FIRST_PARTY_TOOL_START = "grabowski_self_review_session_start"
 FIRST_PARTY_TOOL_READ = "grabowski_self_review_source_read"
 FIRST_PARTY_TOOL_SUBMIT = "grabowski_self_review_axis_submit"
@@ -941,7 +942,8 @@ def _first_party_binding(value: Any) -> dict[str, Any]:
         expected.add("release_binding")
     if (
         set(value) != expected
-        or value.get("repo") != "heimgewebe/grabowski"
+        or not isinstance(value.get("repo"), str)
+        or re.fullmatch(r"heimgewebe/[A-Za-z0-9_.-]+", value["repo"]) is None
         or type(value.get("pr")) is not int or value["pr"] <= 0
         or any(
             not isinstance(value.get(name), str)
@@ -975,11 +977,16 @@ def _first_party_binding(value: Any) -> dict[str, Any]:
 def _git_read(
     repository: Path, arguments: list[str], *, maximum: int, timeout: int = 30,
 ) -> bytes:
+    environment = {
+        key: value for key, value in os.environ.items()
+        if not key.startswith("GIT_")
+    }
+    environment.update({"GIT_OPTIONAL_LOCKS": "0", "LC_ALL": "C"})
     try:
         result = subprocess.run(
             ["git", "--no-replace-objects", "-C", str(repository), *arguments],
             capture_output=True, timeout=timeout, check=False,
-            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
+            env=environment,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise ReviewExecutionRejected("first-party review Git read unavailable") from exc
@@ -1034,13 +1041,16 @@ def _first_party_changed_paths(
 
 
 def _assert_plan_source(plan: dict[str, Any]) -> tuple[dict[str, Any], Path, str]:
-    if (
-        not isinstance(plan, dict)
-        or plan.get("schema_version") != 1
-        or plan.get("kind") != "grabowski_self_review_execution_plan"
-        or not isinstance(plan.get("tasks"), dict)
-        or set(plan["tasks"]) != set(REQUIRED_AXES)
-    ):
+    if not isinstance(plan, dict) or plan.get("schema_version") != 1:
+        raise ReviewExecutionRejected("first-party review plan invalid")
+    kind = plan.get("kind")
+    if kind == "grabowski_self_review_execution_plan":
+        if not isinstance(plan.get("tasks"), dict) or set(plan["tasks"]) != set(REQUIRED_AXES):
+            raise ReviewExecutionRejected("first-party review plan invalid")
+    elif kind == "grabowski_first_party_review_plan":
+        if "tasks" in plan:
+            raise ReviewExecutionRejected("first-party direct plan contains technical tasks")
+    else:
         raise ReviewExecutionRejected("first-party review plan invalid")
     binding = _first_party_binding(plan.get("binding"))
     worktree_raw = plan.get("worktree")
@@ -1073,6 +1083,7 @@ def start_first_party_review_session(
     signers = _allowed_signers(signers, root_owned=root_owned_signers)
     binding, worktree, source_raw = _assert_plan_source(plan)
     diff = _first_party_diff(worktree, binding)
+    canonical_diff_sha256 = hashlib.sha256(diff).hexdigest()
     changed_paths = _first_party_changed_paths(worktree, binding)
     observed_at = int(time.time()) if now_unix is None else now_unix
     if type(observed_at) is not int or observed_at < 0:
@@ -1088,7 +1099,7 @@ def start_first_party_review_session(
         "binding_sha256": _digest(binding),
         "worktree": str(worktree),
         "source_raw_diff_sha256": source_raw,
-        "canonical_diff_sha256": hashlib.sha256(diff).hexdigest(),
+        "canonical_diff_sha256": canonical_diff_sha256,
         "changed_paths": changed_paths,
         "issuer_principal": _first_party_principal(authenticated),
         "start_issuer": authenticated,
@@ -1664,7 +1675,7 @@ def submit_first_party_axis_review(
 
 
 def verified_first_party_semantic_review_passes(
-    binding: dict[str, Any], *, repository: Path,
+    binding: dict[str, Any], *, repository: Path | None,
     root: Path = FIRST_PARTY_REVIEW_ROOT,
     signers: Path = TRUSTED_SIGNERS,
     root_owned_signers: bool = True,
@@ -1727,6 +1738,9 @@ def verified_first_party_semantic_review_passes(
         or SHA256.fullmatch(session["source_raw_diff_sha256"]) is None
         or not isinstance(session.get("canonical_diff_sha256"), str)
         or SHA256.fullmatch(session["canonical_diff_sha256"]) is None
+        or not isinstance(session.get("worktree"), str)
+        or not session["worktree"].startswith("/")
+        or ".." in Path(session["worktree"]).parts
         or session.get("issuer_principal") != _first_party_principal(start_issuer)
         or type(session.get("created_at_unix")) is not int
         or type(session.get("expires_at_unix")) is not int
@@ -1734,6 +1748,21 @@ def verified_first_party_semantic_review_passes(
         != FIRST_PARTY_SESSION_TTL_SECONDS
     ):
         raise ReviewExecutionRejected("first-party session crossed review binding")
+    from grabowski_self_review_producer import (
+        _current_source, _managed_repository_identity,
+    )
+    session_repository, _session_slug = _managed_repository_identity(
+        Path(session["worktree"]), expected_repo=expected["repo"],
+    )
+    if repository is not None:
+        supplied_repository, _supplied_slug = _managed_repository_identity(
+            repository, expected_repo=expected["repo"],
+        )
+        if supplied_repository != session_repository:
+            raise ReviewExecutionRejected("first-party repository crossed review session")
+    repository = session_repository
+    if _current_source(repository, expected) != session["source_raw_diff_sha256"]:
+        raise ReviewExecutionRejected("first-party verified source identity changed")
     material = _canonical(session)
     parent_fd = _private_dir(session_path.parent)
     try:
@@ -2133,11 +2162,12 @@ def _verify(
     receipts: Path,
     outcomes: Path,
     signers: Path,
-    repository: Path,
+    repository: Path | None,
     now_unix: int,
     root_owned_signers: bool,
     read_source: Callable[[str, str], bytes] | None = None,
     capture_root: Path = CAPTURE_ROOT,
+    first_party_root: Path = FIRST_PARTY_REVIEW_ROOT,
 ) -> None:
     if not isinstance(audit, dict):
         raise ReviewExecutionRejected("self-review audit is absent")
@@ -2196,6 +2226,44 @@ def _verify(
         "review_purpose": purpose,
         **({"release_binding": release_binding} if purpose == "post_merge_release" else {}),
     }
+    review_origin = audit.get("review_origin")
+    if review_origin is not None and review_origin != FIRST_PARTY_AUDIT_ORIGIN:
+        raise ReviewExecutionRejected("self-review origin invalid")
+    if review_origin == FIRST_PARTY_AUDIT_ORIGIN:
+        semantic_reviews = verified_first_party_semantic_review_passes(
+            semantic_binding, repository=repository, root=first_party_root,
+            signers=signers, root_owned_signers=root_owned_signers,
+            now_unix=now_unix, axes_to_review=tuple(axes),
+        )
+        for phase, ref in zip(phases, refs, strict=True):
+            axis = phase.get("axis") if isinstance(phase, dict) else None
+            semantic = semantic_reviews.get(axis)
+            if (
+                not isinstance(semantic, dict)
+                or semantic.get("provenance_kind")
+                != "first_party_authenticated_controller"
+                or phase != semantic.get("phase")
+            ):
+                raise ReviewExecutionRejected(
+                    "direct first-party audit phase differs from signed axis output"
+                )
+            expected_ref = {
+                "kind": FIRST_PARTY_AUDIT_ORIGIN,
+                "axis": axis,
+                "repo": repo,
+                "base_sha": base,
+                "head_sha": head,
+                "diff_sha256": diff,
+                "binding_sha256": _digest(semantic_binding),
+                **semantic["provenance"],
+            }
+            if ref != expected_ref:
+                raise ReviewExecutionRejected(
+                    "direct first-party audit proof differs from signed records"
+                )
+        return
+    if repository is None:
+        raise ReviewExecutionRejected("legacy self-review repository absent")
     semantic_reviews = verified_semantic_review_passes(
         semantic_binding, repository=repository, axes_to_review=tuple(axes),
     )
@@ -2323,15 +2391,38 @@ def _verify(
         os.close(root_fd)
 
 
-def review_receipt_errors(audit: Any) -> list[str]:
-    """Production gate: only server-owned trust roots, never caller paths."""
+def review_receipt_errors(
+    audit: Any, *,
+    _receipts: Path = RECEIPT_ROOT,
+    _signers: Path = TRUSTED_SIGNERS,
+    _first_party_root: Path = FIRST_PARTY_REVIEW_ROOT,
+    _repository: Path | None = None,
+    _root_owned_signers: bool = True,
+    _now_unix: int | None = None,
+) -> list[str]:
+    """Verify Captain/Gate evidence; production callers use pinned defaults.
+
+    Underscored overrides exist only for real offline cryptographic fixtures;
+    no serialized audit field can select a signer, state root, or checkout.
+    """
     try:
-        _verify(
-            audit, receipts=RECEIPT_ROOT, outcomes=OUTCOME_ROOT,
-            signers=TRUSTED_SIGNERS,
-            repository=Path.home() / "repos/grabowski",
-            now_unix=int(time.time()), root_owned_signers=True,
+        direct = (
+            isinstance(audit, dict)
+            and audit.get("review_origin") == FIRST_PARTY_AUDIT_ORIGIN
         )
-    except (ReviewExecutionRejected, FileNotFoundError, PermissionError, OSError) as exc:
+        repository = _repository
+        if repository is None and not direct:
+            repository = Path.home() / "repos/grabowski"
+        _verify(
+            audit, receipts=_receipts, outcomes=OUTCOME_ROOT,
+            signers=_signers, repository=repository,
+            now_unix=int(time.time()) if _now_unix is None else _now_unix,
+            root_owned_signers=_root_owned_signers,
+            first_party_root=_first_party_root,
+        )
+    except (
+        ReviewExecutionRejected, FileNotFoundError, PermissionError, OSError,
+        TypeError, ValueError,
+    ) as exc:
         return ["high_critical_server_review_provenance_invalid:" + type(exc).__name__]
     return []

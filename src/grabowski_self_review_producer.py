@@ -33,19 +33,26 @@ RECEIPTS = provenance.RECEIPT_ROOT
 SIGNERS = provenance.TRUSTED_SIGNERS
 SIGNING_KEY = provenance.SIGNING_KEY
 R3_ROOT = Path.home() / ".local/state/grabowski/release-self-review-audits"
+MANAGED_REPOS_ROOT = Path.home() / "repos"
 CANONICAL_REPO = Path.home() / "repos/grabowski"
 SHA = re.compile(r"[a-f0-9]{40}\Z")
 HEX64 = re.compile(r"[a-f0-9]{64}\Z")
 TASK = re.compile(r"[a-f0-9]{24}\Z")
+SUPPORTED_REPO = re.compile(r"heimgewebe/(?P<name>[A-Za-z0-9_.-]+)\Z")
 METHODS = provenance.REQUIRED_AXES
 
 
 def _read_command(repo: Path, arguments: list[str], *, timeout: int = 30) -> bytes:
+    environment = {
+        key: value for key, value in os.environ.items()
+        if not key.startswith("GIT_")
+    }
+    environment.update({"GIT_OPTIONAL_LOCKS": "0", "LC_ALL": "C"})
     try:
         completed = subprocess.run(
             ["git", "--no-replace-objects", "-C", str(repo), *arguments],
             capture_output=True, timeout=timeout, check=False,
-            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
+            env=environment,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise provenance.ReviewExecutionRejected("trusted source Git probe unavailable") from exc
@@ -54,14 +61,62 @@ def _read_command(repo: Path, arguments: list[str], *, timeout: int = 30) -> byt
     return completed.stdout
 
 
-def _current_source(repo: Path, binding: dict[str, Any]) -> str:
+def _managed_repository_identity(
+    repo: Path, *, expected_repo: str | None = None,
+) -> tuple[Path, str]:
+    """Resolve one supported checkout from Git common-dir and origin identity."""
     real = repo.resolve(strict=True)
-    canonical = CANONICAL_REPO.resolve(strict=True)
-    if not (
-        real == canonical
-        or real.is_relative_to(canonical.parent / ".grabowski-worktrees")
+    root = MANAGED_REPOS_ROOT.resolve(strict=True)
+    try:
+        top = Path(
+            _read_command(real, ["rev-parse", "--show-toplevel"]).decode().strip()
+        ).resolve(strict=True)
+        common_raw = _read_command(real, ["rev-parse", "--git-common-dir"]).decode().strip()
+        common = Path(common_raw)
+        if not common.is_absolute():
+            common = real / common
+        common = common.resolve(strict=True)
+    except (UnicodeError, OSError) as exc:
+        raise provenance.ReviewExecutionRejected(
+            "review source Git checkout identity invalid"
+        ) from exc
+    if top != real or common.name != ".git" or common.parent.parent != root:
+        raise provenance.ReviewExecutionRejected("review source not a managed checkout")
+    repository_name = common.parent.name
+    canonical = root / repository_name
+    # Grabowski owns one common worktree pool for all heimgewebe repos.
+    # Keep repository-specific pools as an existing compatible layout.
+    worktrees = {
+        root / ".grabowski-worktrees",
+        root / ("." + repository_name + "-worktrees"),
+    }
+    if real != canonical and real.parent not in worktrees:
+        raise provenance.ReviewExecutionRejected("review source not a managed checkout")
+    if common != (canonical / ".git").resolve(strict=True):
+        raise provenance.ReviewExecutionRejected("review source Git common-dir mismatch")
+    remote = _read_command(
+        real, ["config", "--local", "--get", "remote.origin.url"],
+    ).decode().strip()
+    match = re.fullmatch(
+        r"(?:git@github\.com:|ssh://git@github\.com/|https://github\.com/)"
+        r"(?P<slug>heimgewebe/[A-Za-z0-9_.-]+)\.git",
+        remote,
+    )
+    slug = match["slug"] if match is not None else None
+    supported = SUPPORTED_REPO.fullmatch(slug or "")
+    if (
+        supported is None
+        or supported["name"] != repository_name
+        or (expected_repo is not None and slug != expected_repo)
     ):
-        raise provenance.ReviewExecutionRejected("review source not a Grabowski managed checkout")
+        raise provenance.ReviewExecutionRejected("review source repository origin invalid")
+    return real, slug
+
+
+def _current_source(repo: Path, binding: dict[str, Any]) -> str:
+    real, _slug = _managed_repository_identity(
+        repo, expected_repo=binding.get("repo") if isinstance(binding, dict) else None,
+    )
     head = _read_command(real, ["rev-parse", "HEAD"]).decode().strip()
     if head != binding["head_sha"]:
         raise provenance.ReviewExecutionRejected("review checkout head changed")
@@ -69,12 +124,6 @@ def _current_source(repo: Path, binding: dict[str, Any]) -> str:
         raise provenance.ReviewExecutionRejected("review checkout not clean")
     if _read_command(real, ["cat-file", "-t", binding["base_sha"]]).strip() != b"commit":
         raise provenance.ReviewExecutionRejected("review base commit absent")
-    remote = _read_command(real, ["remote", "get-url", "origin"]).decode().strip()
-    if remote not in {
-        "git@github.com:heimgewebe/grabowski.git",
-        "ssh://git@github.com/heimgewebe/grabowski.git",
-    }:
-        raise provenance.ReviewExecutionRejected("review source repository origin invalid")
     raw = _read_command(
         real,
         [
@@ -94,7 +143,9 @@ def _binding(value: Any) -> dict[str, Any]:
     if value.get("review_purpose") == "post_merge_release":
         expected.add("release_binding")
     if (
-        set(value) != expected or value.get("repo") != "heimgewebe/grabowski"
+        set(value) != expected
+        or not isinstance(value.get("repo"), str)
+        or SUPPORTED_REPO.fullmatch(value["repo"]) is None
         or type(value.get("pr")) is not int or value["pr"] <= 0
         or any(not isinstance(value.get(k), str) or SHA.fullmatch(value[k]) is None for k in ("base_sha", "head_sha"))
         or not isinstance(value.get("diff_sha256"), str)
@@ -141,8 +192,13 @@ def plan_review(
     release_binding: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Create unique, frozen task plan. Does not dispatch or grant PASS."""
+    real, repo_slug = _managed_repository_identity(repo)
+    if repo_slug != "heimgewebe/grabowski":
+        raise provenance.ReviewExecutionRejected(
+            "isolated technical review tasks are Grabowski-specific"
+        )
     candidate = {
-        "repo": "heimgewebe/grabowski", "pr": pr, "base_sha": base_sha,
+        "repo": repo_slug, "pr": pr, "base_sha": base_sha,
         "head_sha": head_sha, "diff_sha256": diff_sha256,
         "review_batch_id": secrets.token_hex(16), "review_purpose": purpose,
         **({"release_binding": release_binding} if purpose == "post_merge_release" else {}),
@@ -150,7 +206,6 @@ def plan_review(
     binding = _binding(candidate)
     if release_binding is not None and purpose != "post_merge_release":
         raise provenance.ReviewExecutionRejected("release fields given for PR audit")
-    real = repo.resolve(strict=True)
     raw_identity = _current_source(real, binding)
     if purpose == "post_merge_release" and binding["diff_sha256"] != raw_identity:
         raise provenance.ReviewExecutionRejected("full serving-to-target raw diff binding invalid")
@@ -166,6 +221,37 @@ def plan_review(
         "does_not_establish": [
             "executed_phases", "task_completion", "semantic_review",
             "signed_attestations", "Captain_authorization",
+        ],
+    }
+
+
+def plan_first_party_review(
+    *, repo: Path, pr: int, base_sha: str, head_sha: str,
+    diff_sha256: str, purpose: str = "pull_request",
+    release_binding: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Freeze a source-only plan for the authenticated first-party reviewer."""
+    if purpose != "pull_request" or release_binding is not None:
+        raise provenance.ReviewExecutionRejected(
+            "first-party direct plan supports pull requests only"
+        )
+    real, repo_slug = _managed_repository_identity(repo)
+    candidate = {
+        "repo": repo_slug, "pr": pr, "base_sha": base_sha,
+        "head_sha": head_sha, "diff_sha256": diff_sha256,
+        "review_batch_id": secrets.token_hex(16), "review_purpose": purpose,
+    }
+    binding = _binding(candidate)
+    raw_identity = _current_source(real, binding)
+    return {
+        "schema_version": 1,
+        "kind": "grabowski_first_party_review_plan",
+        "binding": binding,
+        "worktree": str(real),
+        "source_raw_diff_sha256": raw_identity,
+        "does_not_establish": [
+            "source_inspection", "semantic_review", "review_pass",
+            "technical_tests", "Captain_authorization",
         ],
     }
 
@@ -560,6 +646,146 @@ def seal_review(
         repository=CANONICAL_REPO, root_owned_signers=True,
     )
 
+
+def _seal_first_party_review(
+    plan: dict[str, Any], *, signers: Path, receipts: Path,
+    first_party_root: Path, repository: Path,
+    root_owned_signers: bool, now_unix: int | None = None,
+) -> dict[str, Any]:
+    """Seal only the already-signed controller session/read/axis records."""
+    if (
+        not isinstance(plan, dict)
+        or plan.get("schema_version") != 1
+        or plan.get("kind") != "grabowski_first_party_review_plan"
+        or "tasks" in plan
+    ):
+        raise provenance.ReviewExecutionRejected("first-party direct plan invalid")
+    signer = provenance._allowed_signers(
+        signers, root_owned=root_owned_signers,
+    )
+    binding = _binding(plan.get("binding"))
+    worktree_raw = plan.get("worktree")
+    if not isinstance(worktree_raw, str) or not worktree_raw.startswith("/"):
+        raise provenance.ReviewExecutionRejected("first-party direct worktree invalid")
+    worktree, _slug = _managed_repository_identity(
+        Path(worktree_raw), expected_repo=binding["repo"],
+    )
+    supplied, _supplied_slug = _managed_repository_identity(
+        repository, expected_repo=binding["repo"],
+    )
+    if supplied != worktree:
+        raise provenance.ReviewExecutionRejected(
+            "first-party direct repository crossed plan"
+        )
+    source_raw = plan.get("source_raw_diff_sha256")
+    if (
+        not isinstance(source_raw, str)
+        or HEX64.fullmatch(source_raw) is None
+        or _current_source(worktree, binding) != source_raw
+    ):
+        raise provenance.ReviewExecutionRejected("first-party direct source drift")
+    observed_at = int(__import__("time").time()) if now_unix is None else now_unix
+    semantic_reviews = provenance.verified_first_party_semantic_review_passes(
+        binding, repository=worktree, root=first_party_root, signers=signer,
+        root_owned_signers=root_owned_signers, now_unix=observed_at,
+    )
+    phases: list[dict[str, Any]] = []
+    refs: list[dict[str, Any]] = []
+    summaries: set[str] = set()
+    for axis in METHODS:
+        semantic = semantic_reviews[axis]
+        phase = semantic["phase"]
+        if phase["summary"] in summaries:
+            raise provenance.ReviewExecutionRejected(
+                "first-party direct phase summaries duplicated"
+            )
+        summaries.add(phase["summary"])
+        phases.append(phase)
+        refs.append({
+            "kind": provenance.FIRST_PARTY_AUDIT_ORIGIN,
+            "axis": axis,
+            "repo": binding["repo"],
+            "base_sha": binding["base_sha"],
+            "head_sha": binding["head_sha"],
+            "diff_sha256": binding["diff_sha256"],
+            "binding_sha256": provenance._digest(binding),
+            **semantic["provenance"],
+        })
+    audit = {
+        "schema_version": 1,
+        "kind": "grabowski_self_review_audit",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "repo": binding["repo"], "pr": binding["pr"],
+        "base_sha": binding["base_sha"], "head_sha": binding["head_sha"],
+        "diff_sha256": binding["diff_sha256"],
+        "review_policy_version": 5, "review_tier": "high_critical",
+        "review_origin": provenance.FIRST_PARTY_AUDIT_ORIGIN,
+        "independent_review_required": False,
+        "minimum_review_iterations": 5,
+        "actual_review_iterations": len(phases),
+        "review_pass_axes": [item["axis"] for item in phases],
+        "review_pass_evidence_sha256": hashlib.sha256(
+            provenance._canonical(phases)
+        ).hexdigest(),
+        "review_batch_id": binding["review_batch_id"],
+        "review_purpose": binding["review_purpose"],
+        **(
+            {"release_binding": binding["release_binding"]}
+            if binding["review_purpose"] == "post_merge_release" else {}
+        ),
+        "review_iterations": phases,
+        "review_pass_receipts": refs,
+        "all_findings_triaged": True,
+        "finding_count": 0,
+        "material_findings_after_first_review": 0,
+        "material_findings_remaining": 0,
+        "uncertainty": 0.5,
+        "residual_risk_accepted": False,
+        "residual_risk_reason": "",
+        "gate_verdict": "PASS",
+        "self_review_gate_valid": True,
+        "tuning_signal": "observe",
+        "source_raw_diff_sha256": source_raw,
+    }
+    provenance._verify(
+        audit, receipts=receipts, outcomes=OUTCOMES, signers=signer,
+        repository=worktree, now_unix=observed_at,
+        root_owned_signers=root_owned_signers,
+        first_party_root=first_party_root,
+    )
+    destination = receipts / "batches"
+    descriptor = _ensure_private_root(destination)
+    try:
+        name = binding["review_batch_id"] + ".json"
+        _create_only(descriptor, name, provenance._canonical(audit))
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    return {
+        "status": "sealed_and_verified",
+        "review_batch_id": binding["review_batch_id"],
+        "review_pass_count": len(phases),
+        "review_audit_sha256": provenance._digest(audit),
+        "audit_path": str(destination / name),
+        "source_head": binding["head_sha"],
+        "does_not_establish": [
+            "technical_tests", "Captain_merge", "runtime_deployment",
+            "human_independent_review",
+        ],
+    }
+
+
+def seal_first_party_review(plan: dict[str, Any]) -> dict[str, Any]:
+    """Production direct sealer with server-owned roots only."""
+    worktree = plan.get("worktree") if isinstance(plan, dict) else None
+    if not isinstance(worktree, str):
+        raise provenance.ReviewExecutionRejected("first-party direct worktree absent")
+    return _seal_first_party_review(
+        plan, signers=SIGNERS, receipts=RECEIPTS,
+        first_party_root=provenance.FIRST_PARTY_REVIEW_ROOT,
+        repository=Path(worktree), root_owned_signers=True,
+    )
+
 def _require_installed_runtime(bwrap: str, python: str) -> None:
     """Only root-owned immutable executable entries may enter a trusted task plan."""
     for item, pattern in (
@@ -669,9 +895,20 @@ def main(argv: list[str] | None = None) -> int:
     )
     for name in ("serving-release-id", "serving-tree", "target-tree"):
         new.add_argument("--" + name)
+    first_party = commands.add_parser(
+        "plan-firstparty",
+        help="Freeze source-only review identity for authenticated MCP review",
+    )
+    for name in ("repo", "base", "head", "diff"):
+        first_party.add_argument("--" + name, required=True)
+    first_party.add_argument("--pr", type=int, required=True)
     existing = commands.add_parser("seal", help="Sign real completed task executions only")
     existing.add_argument("--batch-id", required=True)
     existing.add_argument("--task-ids-json", required=True)
+    direct = commands.add_parser(
+        "seal-firstparty", help="Seal existing signed first-party review records",
+    )
+    direct.add_argument("--batch-id", required=True)
     args = parser.parse_args(argv)
     if args.operation == "plan":
         _require_installed_runtime(args.bwrap, args.python)
@@ -706,7 +943,23 @@ def main(argv: list[str] | None = None) -> int:
                 "signed_attestations", "Captain_authorization",
             ],
         }
-    else:
+    elif args.operation == "plan-firstparty":
+        new_plan = plan_first_party_review(
+            repo=Path(args.repo), pr=args.pr, base_sha=args.base,
+            head_sha=args.head, diff_sha256=args.diff,
+        )
+        _require_live_pr(new_plan["binding"])
+        _store_plan(new_plan)
+        public_result = {
+            "status": "first_party_planned_not_executed",
+            "review_batch_id": new_plan["binding"]["review_batch_id"],
+            "repo": new_plan["binding"]["repo"],
+            "does_not_establish": [
+                "source_inspection", "semantic_review", "review_pass",
+                "technical_tests", "Captain_authorization",
+            ],
+        }
+    elif args.operation == "seal":
         plan = _load_plan(args.batch_id)
         _require_live_pr(plan["binding"])
         try:
@@ -723,6 +976,18 @@ def main(argv: list[str] | None = None) -> int:
             "review_pass_count": sealed["review_pass_count"],
             "review_audit_sha256": sealed["review_audit_sha256"],
             "source_head": sealed["source_head"],
+        }
+    else:
+        plan = _load_plan(args.batch_id)
+        _require_live_pr(plan["binding"])
+        sealed = seal_first_party_review(plan)
+        public_result = {
+            "status": "sealed_and_verified",
+            "review_batch_id": args.batch_id,
+            "review_pass_count": sealed["review_pass_count"],
+            "review_audit_sha256": sealed["review_audit_sha256"],
+            "source_head": sealed["source_head"],
+            "does_not_establish": ["technical_tests", "Captain_merge"],
         }
     print(json.dumps(public_result, sort_keys=True, ensure_ascii=False))
     return 0

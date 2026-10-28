@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import secrets
 import json
+import copy
 from pathlib import Path
 import shutil
 import subprocess
@@ -31,13 +32,14 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        self.repo = self.root / "repository"
+        self.repo = self.root / "grabowski"
         self.repo.mkdir(mode=0o700)
         self._git("init", "-q")
         self._git("config", "user.email", "review-test@example.invalid")
         self._git("config", "user.name", "Review Test")
         self._git("remote", "add", "origin", "git@github.com:heimgewebe/grabowski.git")
         source = self.repo / "src" / "reviewed.py"
+        self.source_path = "src/reviewed.py"
         source.parent.mkdir()
         source.write_text(
             "\n".join(f"BASE_{number} = {number}" for number in range(1, 31)) + "\n",
@@ -71,6 +73,11 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
         self.canonical_patch = mock.patch.object(producer, "CANONICAL_REPO", self.repo)
         self.canonical_patch.start()
         self.addCleanup(self.canonical_patch.stop)
+        self.managed_root_patch = mock.patch.object(
+            producer, "MANAGED_REPOS_ROOT", self.root,
+        )
+        self.managed_root_patch.start()
+        self.addCleanup(self.managed_root_patch.stop)
 
         self.transport_patches = [
             mock.patch.object(assertion, "STATE_ROOT", self.transport_state),
@@ -94,6 +101,17 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
             diff_sha256="c" * 64,
             bwrap="/nix/store/" + "a" * 32 + "-bubblewrap-0.12.0/bin/bwrap",
             python="/nix/store/" + "b" * 32 + "-grabowski-operator-test/bin/python3",
+        )
+
+    def _first_party_plan(self) -> dict:
+        diff_sha256 = hashlib.sha256(
+            review._first_party_diff(
+                self.repo, {"base_sha": self.base, "head_sha": self.head},
+            )
+        ).hexdigest()
+        return producer.plan_first_party_review(
+            repo=self.repo, pr=1649, base_sha=self.base, head_sha=self.head,
+            diff_sha256=diff_sha256,
         )
 
     def _issuer(self, tool_name: str, arguments: dict) -> dict:
@@ -130,6 +148,9 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
 
     def _start(self) -> tuple[dict, dict]:
         plan = self._plan()
+        return plan, self._start_plan(plan)
+
+    def _start_plan(self, plan: dict) -> dict:
         arguments = {
             "review_batch_id": plan["binding"]["review_batch_id"],
             "reason": "Start exact-revision semantic review.",
@@ -140,7 +161,26 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
             root=self.state, key=self.key, signers=self.signers,
             root_owned_signers=False, now_unix=self.now,
         )
-        return plan, started
+        return started
+
+    def _seal_direct(self, plan: dict) -> tuple[dict, Path]:
+        receipts = self.root / ("audits-" + plan["binding"]["review_batch_id"])
+        sealed = producer._seal_first_party_review(
+            plan, signers=self.signers, receipts=receipts,
+            first_party_root=self.state, repository=self.repo,
+            root_owned_signers=False, now_unix=self.now,
+        )
+        audit = json.loads(
+            Path(sealed["audit_path"]).read_text(encoding="utf-8")
+        )
+        return audit, receipts
+
+    def _receipt_errors(self, audit: dict, receipts: Path) -> list[str]:
+        return review.review_receipt_errors(
+            audit, _receipts=receipts, _signers=self.signers,
+            _first_party_root=self.state, _repository=self.repo,
+            _root_owned_signers=False, _now_unix=self.now,
+        )
 
     def _read(self, started: dict, axis: str, read_kind: str, path: str,
               revision: str, first: int, last: int,
@@ -206,8 +246,8 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
             started, axis, "diff", "", "head", 1,
             len(lines) if full_diff else 1,
         )
-        first = self._read(started, axis, "source", "src/reviewed.py", "head", 1, 8)
-        second = self._read(started, axis, "source", "src/reviewed.py", "head", 9, 16)
+        first = self._read(started, axis, "source", self.source_path, "head", 1, 8)
+        second = self._read(started, axis, "source", self.source_path, "head", 9, 16)
         report = self._report(axis, number, [first["source_ref"], second["source_ref"]], reject=reject)
         arguments = {
             "review_session_id": started["review_session_id"],
@@ -236,6 +276,125 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
             item["provenance_kind"] == "first_party_authenticated_controller"
             for item in accepted.values()
         ))
+
+    def test_first_party_direct_audit_passes_public_receipt_verifier(self) -> None:
+        plan = self._first_party_plan()
+        started = self._start_plan(plan)
+        for number, axis in enumerate(review.REQUIRED_AXES, start=1):
+            self._submit_axis(started, axis, number)
+        audit, receipts = self._seal_direct(plan)
+        self.assertEqual([], self._receipt_errors(audit, receipts))
+
+        for field, replacement in (
+            ("repo", "heimgewebe/heim-pc"),
+            ("base_sha", "1" * 40),
+            ("head_sha", "2" * 40),
+            ("diff_sha256", "3" * 64),
+        ):
+            replay = copy.deepcopy(audit)
+            replay[field] = replacement
+            self.assertTrue(self._receipt_errors(replay, receipts), field)
+        altered_proof = copy.deepcopy(audit)
+        altered_proof["review_pass_receipts"][0]["axis_report_sha256"] = "4" * 64
+        self.assertTrue(self._receipt_errors(altered_proof, receipts))
+
+        persisted_read = next((
+            self.state / "sessions" / audit["review_pass_receipts"][0]["session_id"] / "reads"
+        ).glob("*.data"))
+        persisted_read.write_bytes(b"tampered source bytes")
+        self.assertTrue(self._receipt_errors(audit, receipts))
+
+    def test_heim_pc_nix_review_seals_without_grabowski_test_tasks(self) -> None:
+        self.repo = self.root / "heim-pc"
+        self.repo.mkdir(mode=0o700)
+        self.source_path = "flake.nix"
+        self._git("init", "-q")
+        self._git("config", "user.email", "review-test@example.invalid")
+        self._git("config", "user.name", "Review Test")
+        self._git("remote", "add", "origin", "git@github.com:heimgewebe/heim-pc.git")
+        source = self.repo / self.source_path
+        source.write_text(
+            "{\n" + "".join(f"  # base nix policy line {n}\n" for n in range(1, 25))
+            + "  outputs = { self }: {};\n}\n",
+            encoding="utf-8",
+        )
+        self._git("add", self.source_path)
+        self._git("commit", "-qm", "base")
+        self.base = self._git("rev-parse", "HEAD").strip()
+        source.write_text(
+            "{\n" + "".join(f"  # reviewed nix authority line {n}\n" for n in range(1, 25))
+            + "  outputs = { self }: {};\n}\n",
+            encoding="utf-8",
+        )
+        self._git("add", self.source_path)
+        self._git("commit", "-qm", "head")
+        self.head = self._git("rev-parse", "HEAD").strip()
+        # Grabowski shares one managed worktree root across repositories.
+        shared = self.root / ".grabowski-worktrees"
+        shared.mkdir()
+        candidate = shared / "heim-pc-high-critical"
+        self._git("worktree", "add", "--detach", str(candidate), self.head)
+        self.repo = candidate
+
+        plan = self._first_party_plan()
+        self.assertEqual("heimgewebe/heim-pc", plan["binding"]["repo"])
+        self.assertNotIn("tasks", plan)
+        started = self._start_plan(plan)
+        for number, axis in enumerate(review.REQUIRED_AXES, start=1):
+            self._submit_axis(started, axis, number)
+        audit, receipts = self._seal_direct(plan)
+        self.assertEqual([], self._receipt_errors(audit, receipts))
+
+    def test_wrong_remote_and_missing_axis_block_direct_audit(self) -> None:
+        self._git(
+            "remote", "set-url", "origin", "git@github.com:heimgewebe/heim-pc.git",
+        )
+        with self.assertRaisesRegex(review.ReviewExecutionRejected, "origin"):
+            self._first_party_plan()
+        self._git(
+            "remote", "set-url", "origin", "git@github.com:heimgewebe/grabowski.git",
+        )
+        unmanaged = self.root / "unmanaged" / "grabowski"
+        unmanaged.mkdir(parents=True)
+        subprocess.run(
+            ["git", "-C", str(unmanaged), "init", "-q"], check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(unmanaged), "remote", "add", "origin",
+             "git@github.com:heimgewebe/grabowski.git"], check=True,
+        )
+        with self.assertRaisesRegex(review.ReviewExecutionRejected, "managed checkout"):
+            producer._managed_repository_identity(unmanaged)
+        plan = self._first_party_plan()
+        started = self._start_plan(plan)
+        for number, axis in enumerate(review.REQUIRED_AXES[:-1], start=1):
+            self._submit_axis(started, axis, number)
+        with self.assertRaisesRegex(review.ReviewExecutionRejected, "axis coverage"):
+            self._seal_direct(plan)
+
+    def test_github_pr_diff_identity_is_distinct_from_local_source_diff(self) -> None:
+        # GitHub's canonical PR patch is not byte-identical to git --no-renames
+        # for real PRs. The Gate binds it independently from the local diff.
+        plan = self._first_party_plan()
+        local_sha = hashlib.sha256(
+            review._first_party_diff(self.repo, plan["binding"]),
+        ).hexdigest()
+        self.assertNotEqual("e" * 64, local_sha)
+        plan["binding"]["diff_sha256"] = "e" * 64
+        started = self._start_plan(plan)
+        for number, axis in enumerate(review.REQUIRED_AXES, start=1):
+            self._submit_axis(started, axis, number)
+        audit, receipts = self._seal_direct(plan)
+        self.assertEqual("e" * 64, audit["diff_sha256"])
+        self.assertEqual([], self._receipt_errors(audit, receipts))
+
+    def test_https_origin_is_admitted_as_the_same_github_repository(self) -> None:
+        self._git("remote", "set-url", "origin",
+                  "https://github.com/heimgewebe/grabowski.git")
+        _worktree, slug = producer._managed_repository_identity(
+            self.repo, expected_repo="heimgewebe/grabowski",
+        )
+        self.assertEqual("heimgewebe/grabowski", slug)
 
     def test_completed_review_remains_valid_after_session_write_deadline(self) -> None:
         # The deadline limits NEW source reads and report submissions. A fully
@@ -391,7 +550,8 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
             )
 
     def test_material_finding_blocks_complete_session(self) -> None:
-        plan, started = self._start()
+        plan = self._first_party_plan()
+        started = self._start_plan(plan)
         for number, axis in enumerate(review.REQUIRED_AXES, start=1):
             self._submit_axis(started, axis, number, reject=number == 1)
         with self.assertRaisesRegex(
@@ -401,6 +561,10 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
                 plan["binding"], repository=self.repo, root=self.state,
                 signers=self.signers, root_owned_signers=False, now_unix=self.now,
             )
+        with self.assertRaisesRegex(
+            review.ReviewExecutionRejected, "material finding unresolved",
+        ):
+            self._seal_direct(plan)
 
     def test_expired_session_rejects_fresh_authenticated_read(self) -> None:
         _plan, started = self._start()
