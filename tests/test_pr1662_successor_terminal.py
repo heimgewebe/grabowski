@@ -214,6 +214,81 @@ class CompletedSuccessorTerminalTests(unittest.TestCase):
             ):
                 self.assertFalse(self.result([self.a, sibling, self.b])[0])
 
+    def _recovering_successor(self):
+        # Choose a predecessor whose GREEN is exactly the canonical fixture
+        # B's BLUE, so the independently complete real resume fixture can be
+        # used without weakening any of its numerous source/phase bindings.
+        predecessor = completed(
+            "bgc-earlier-a",
+            fixture.HEAD_BLUE,
+            "999999999999-srcset001122334455-lock556677889900-contractaabbccddeeff",
+            fixture.BLUE_RELEASE,
+        )
+        b = fixture.cutover_receipt(outcome="outcome_unknown")
+        resume = fixture.resume_receipt(
+            resumed_cutover_id=b["cutover_id"],
+            resumed_receipt_sha256=b["receipt_sha256"],
+            expected_head=b["expected_head"],
+            green_release_id=b["green_release_id"],
+        )
+        self.assertIsNotNone(SD.midcutover._completed_lineage_binding(resume))
+        self.assertTrue(SD.midcutover._lineage_resolved([b, resume], b))
+        fields = {
+            **self.fields,
+            "expected_head": fixture.HEAD_BLUE,
+        }
+        return predecessor, b, resume, fields
+
+    def test_authentic_completed_resume_can_settle_predecessor_a(self):
+        original = (self.a, self.fields)
+        self.a, b, receipt, self.fields = self._recovering_successor()
+        try:
+            terminal, checked = self.result(
+                [self.a, b, receipt],
+                release=fixture.GREEN_RELEASE,
+                head=fixture.HEAD_GREEN,
+            )
+            self.assertTrue(terminal)
+            self.assertEqual(
+                checked[-1].args[0]["expected_head"],
+                fixture.HEAD_GREEN,
+            )
+        finally:
+            self.a, self.fields = original
+
+    def test_missing_or_wrong_completed_resume_never_retires_a(self):
+        predecessor, b, receipt, fields = self._recovering_successor()
+        original = (self.a, self.fields)
+        self.a, self.fields = predecessor, fields
+        try:
+            wrong_hash = {
+                **receipt,
+                "resumed_receipt_sha256": "f" * 64,
+            }
+            forged_resume = {
+                **receipt,
+                "final_routing": {
+                    **receipt["final_routing"],
+                    "release_id": fixture.BLUE_RELEASE,
+                },
+            }
+            for evidence in (
+                [predecessor, b],
+                [predecessor, b, wrong_hash],
+                [predecessor, b, forged_resume],
+                [predecessor, b, receipt, receipt],
+            ):
+                with self.subTest(extra_receipts=len(evidence)):
+                    self.assertFalse(
+                        self.result(
+                            evidence,
+                            release=fixture.GREEN_RELEASE,
+                            head=fixture.HEAD_GREEN,
+                        )[0]
+                    )
+        finally:
+            self.a, self.fields = original
+
     def test_unfinished_tampered_or_ambiguous_successor_stays_blocked(self):
         unknown = {**self.b, "outcome": "outcome_unknown", "phase": "outcome_unknown"}
         tampered = {**self.b, "green_release_id": RELEASE_D}

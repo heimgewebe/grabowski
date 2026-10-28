@@ -1949,6 +1949,93 @@ def _completed_cutover_routing_is_authentic(
         return False
 
 
+def _completed_resumed_successor_routing_is_authentic(
+    cutover: dict[str, Any],
+    receipts: list[dict[str, Any]],
+    command_fields: dict[str, Any],
+) -> bool:
+    """A post-switch outcome_unknown is terminal only by its exact completed resume.
+
+    The original persisted cutover is NOT rewritten as completed. Its matching
+    owner-private resume receipt must pass the existing full completed-lineage
+    validator: original receipt SHA, generation, activation, snapshot rebind,
+    release/head, final routing and independent authoritative readback.
+    Multiple or conflicting completed claims remain ambiguity, not success.
+    """
+    if (
+        cutover.get("outcome") != "outcome_unknown"
+        or cutover.get("phase") != "outcome_unknown"
+        or cutover.get("expected_head") != command_fields.get("expected_head")
+        or cutover.get("source_identity_sha256")
+        != command_fields.get("source_identity_sha256")
+    ):
+        return False
+    try:
+        original = midcutover.validate_cutover_receipt(cutover)
+        if (
+            not midcutover.release_id_binds_head(
+                original.get("green_release_id"), original.get("expected_head")
+            )
+            or not midcutover._lineage_resolved(receipts, original)
+            or midcutover.unresolved_post_switch_receipts(receipts)
+        ):
+            return False
+        completed: list[dict[str, Any]] = []
+        for attempt in receipts:
+            if (
+                not isinstance(attempt, dict)
+                or attempt.get("kind") != midcutover.RESUME_RECEIPT_KIND
+                or attempt.get("resumed_cutover_id") != original.get("cutover_id")
+                or attempt.get("outcome") != "completed"
+            ):
+                continue
+            binding = midcutover._completed_lineage_binding(attempt)
+            if (
+                binding is None
+                or (
+                    binding.get("cutover_id"),
+                    binding.get("resumed_receipt_sha256"),
+                    binding.get("target_head"),
+                    binding.get("expected_release_id"),
+                    binding.get("source_identity_sha256"),
+                ) != (
+                    original.get("cutover_id"),
+                    original.get("receipt_sha256"),
+                    original.get("expected_head"),
+                    original.get("green_release_id"),
+                    original.get("source_identity_sha256"),
+                )
+            ):
+                return False
+            completed.append(attempt)
+        if len(completed) != 1:
+            return False
+        # _completed_lineage_binding already verified these readback bytes
+        # against the signed receipt, final selector and snapshot. Require
+        # explicit agreement with the cutover being retired here as well.
+        routing = completed[0].get("final_routing")
+        readback = completed[0].get("authoritative_readback")
+        return bool(
+            isinstance(routing, dict)
+            and isinstance(readback, dict)
+            and routing.get("selected_slot") == "canonical"
+            and routing.get("repo_head") == original.get("expected_head")
+            and routing.get("release_id") == original.get("green_release_id")
+            and readback.get("authoritative") is True
+            and readback.get("selector") == routing
+            and isinstance(readback.get("ingress"), dict)
+            and readback["ingress"].get("repo_head")
+                == original.get("expected_head")
+            and readback["ingress"].get("release_id")
+                == original.get("green_release_id")
+        )
+    except (
+        OSError, RuntimeError, ValueError, PermissionError,
+        midcutover.MidCutoverEvidenceError,
+    ):
+        return False
+
+
 def _completed_cutover_has_live_successor(
     original: dict[str, Any],
     receipts: list[dict[str, Any]],
@@ -2034,8 +2121,13 @@ def _completed_cutover_has_live_successor(
             "expected_head": head,
             "source_identity_sha256": source_identity,
         }
-        if not _completed_cutover_routing_is_authentic(
-            successor, receipts, successor_fields
+        if not (
+            _completed_cutover_routing_is_authentic(
+                successor, receipts, successor_fields
+            )
+            or _completed_resumed_successor_routing_is_authentic(
+                successor, receipts, successor_fields
+            )
         ):
             return False
         if (
