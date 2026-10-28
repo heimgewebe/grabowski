@@ -36,7 +36,9 @@ MAX_STDOUT_TAIL_BYTES = 256 * 1024
 # Non-review origins must not conceal review results retained in their job logs.
 # This is a separate, bounded verification budget, not a limit increase for
 # admitted review evidence.
-MAX_UNBOUND_STDOUT_BYTES = 128 * 1024 * 1024  # Complete streaming scan, never materialize in memory
+# Scan the entire historical ordinary-job output up to the finite budget
+# rather than treating an unrelated 24-MiB log as fatal review evidence.
+MAX_UNBOUND_STDOUT_BYTES = 128 * 1024 * 1024
 MAX_UNBOUND_MARKER_BYTES = 256 * 1024
 MAX_ROLE_RECEIPT_BYTES = 4 * 1024 * 1024
 MAX_REVIEW_ROLE_MODULE_BYTES = 1024 * 1024
@@ -845,10 +847,10 @@ def _validated_origin_binding(
     if raw_binding is None:
         return metadata, None, None
     binding = normalize_binding(raw_binding)
-    # First validate the signed origin and its exact metadata binding.
-    # Historical reviews of other PRs/heads must not then depend on today's
-    # semantic runner or provider provenance. Surviving current-head evidence
-    # is independently scanned by reconcile(), including retained REJECTs.
+    # Validate the signed Origin and exact metadata binding first.
+    # Foreign reviews cannot grant a PASS or require today's model binaries;
+    # surviving current-head receipts and material REJECTs are still scanned
+    # across every historical job after a runtime or release rotation.
     if expected is not None and not _binding_matches_pr_head(binding, expected):
         return metadata, binding, None
     origin_cwd = scope.get("cwd")

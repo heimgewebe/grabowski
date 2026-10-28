@@ -3163,6 +3163,102 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
                     checked["errors"],
                 )
 
+    def test_signed_foreign_review_with_unavailable_historical_provenance_is_unrelated(self) -> None:
+        # A genuine old reviewer from another repo cannot veto every other
+        # repository solely because its old executable has rotated away.
+        # An exact-bound result or role receipt must still be discovered.
+        with tempfile.TemporaryDirectory() as temp:
+            jobs = Path(temp) / "jobs"
+            jobs.mkdir(mode=0o700)
+            make_job(
+                jobs, suffix="aaaaaaaaa291", slot="A",
+                terminal_status="succeeded",
+                review_result=result("A", "PASS_THIS_REVISION", 0),
+            )
+            with mock.patch.dict(
+                make_job.__globals__,
+                {"REPO": "heimgewebe/other", "PR": PR + 1,
+                 "HEAD": "d" * 40, "BASE": "e" * 40},
+            ):
+                foreign = make_job(
+                    jobs, suffix="bbbbbbbbb292", slot="independent-reviewer",
+                    terminal_status="succeeded", review_result=None,
+                    review_role=True, attempt_bound=True, attempt_epoch=2,
+                )
+            metadata_path = foreign / "metadata.json"
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            scope = dict(metadata["scope"])
+            provenance = dict(scope["decision_review_provenance"])
+            provenance["runner_module_sha256"] = "f" * 64
+            provenance["provenance_sha256"] = reviews.sha256_json({
+                key: value for key, value in provenance.items()
+                if key != "provenance_sha256"
+            })
+            scope["decision_review_provenance"] = provenance
+            metadata["scope"] = scope
+            metadata["origin"]["scope"] = scope
+            metadata["origin_sha256"] = reviews.sha256_json(metadata["origin"])
+            write_private(metadata_path, json.dumps(metadata))
+            checked = self.reconcile(jobs)
+        self.assertEqual("settled", checked["status"])
+        self.assertEqual([], checked["errors"])
+        self.assertEqual(1, checked["attempt_count"])
+
+    def test_signed_unbound_24m_log_is_scanned_for_retained_reject(self) -> None:
+        # A real ordinary job emitted >22MiB on the productive operator.
+        # We must inspect the entire bounded output, including a late REJECT.
+        for retained_reject in (False, True):
+            with self.subTest(retained_reject=retained_reject):
+                with tempfile.TemporaryDirectory() as temp:
+                    jobs = Path(temp) / "jobs"
+                    jobs.mkdir(mode=0o700)
+                    make_job(
+                        jobs, suffix="aaaaaaaaa293", slot="A",
+                        terminal_status="succeeded",
+                        review_result=result("A", "PASS_THIS_REVISION", 0),
+                    )
+                    ordinary = jobs / "grabowski-job-bbbbbbbbb294"
+                    ordinary.mkdir(mode=0o700)
+                    scope = {
+                        "cwd": "/tmp", "argv_sha256": "e" * 64,
+                        "runtime_seconds": 60,
+                    }
+                    origin, digest = job_origin.build_origin(
+                        unit=ordinary.name, owner=f"uid:{os.getuid()}",
+                        argv_sha256="e" * 64, scope=scope,
+                        notify_on_done={"requested": False, "channels": []},
+                        created_at_unix=1_787_000_000,
+                        started_at="2026-08-18T12:00:00Z",
+                        invoker_tool="grabowski_job_start",
+                    )
+                    write_private(ordinary / "metadata.json", json.dumps({
+                        "unit": ordinary.name, "job_id": origin["job_id"],
+                        "owner": origin["owner"], "argv_sha256": origin["argv_sha256"],
+                        "scope": scope, "origin": origin, "origin_sha256": digest,
+                    }))
+                    stdout = ordinary / "stdout.log"
+                    with stdout.open("wb") as stream:
+                        stream.truncate(24 * 1024 * 1024)
+                        if retained_reject:
+                            stream.seek(24 * 1024 * 1024 - 2048)
+                            marker = (
+                                "\n" + reviews.RESULT_PREFIX +
+                                json.dumps(result("A", "REJECT_THIS_REVISION", 1))
+                                + "\n"
+                            )
+                            stream.write(marker.encode("utf-8"))
+                    os.chmod(stdout, 0o600)
+                    checked = self.reconcile(jobs)
+                if retained_reject:
+                    self.assertEqual("blocked", checked["status"])
+                    self.assertIn(
+                        f"decision_review_unbound_result:{ordinary.name}",
+                        checked["errors"],
+                    )
+                else:
+                    self.assertEqual("settled", checked["status"])
+                    self.assertEqual([], checked["errors"])
+
     def test_legitimate_unbound_job_with_stdout_does_not_block_review(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             jobs = Path(temp) / "jobs"
