@@ -2232,7 +2232,13 @@ def _completed_predecessor_can_yield_to_recovery(
                 if isinstance(item, dict)
                 and item.get("kind") == BLUE_GREEN_RECEIPT_KIND
                 and item.get("green_release_id") == previous_green
-                and item.get("outcome") == "completed"
+                and (
+                    item.get("outcome") == "completed"
+                    or (
+                        item.get("outcome") == "outcome_unknown"
+                        and midcutover._lineage_resolved(receipts, item)
+                    )
+                )
             ]
             if len(green_owners) != 1:
                 return False

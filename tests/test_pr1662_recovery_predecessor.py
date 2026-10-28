@@ -77,6 +77,60 @@ class RecoveredSuccessorPredecessorTests(unittest.TestCase):
             "a missing canonical intermediate completion cannot bypass recovery",
         )
 
+    def test_resumed_intermediate_b_is_a_completed_release_owner_of_unresolved_c(self):
+        # A completed canonical release; B's original receipt stays unknown
+        # but a separately signed completed resume proves its new live release.
+        # Later C is the sole genuine unresolved post-switch attempt.
+        c = fixture.cutover_receipt(
+            cutover_id="bgc-future-successor-c",
+            expected_head=cases.HEAD_C,
+            blue_release_id=fixture.GREEN_RELEASE,
+            green_release_id=cases.RELEASE_C,
+            outcome="outcome_unknown", phase="outcome_unknown",
+        )
+        c_resume = fixture.resume_receipt(
+            resumed_cutover_id=c["cutover_id"],
+            resumed_receipt_sha256=c["receipt_sha256"],
+            expected_head=cases.HEAD_C,
+            green_release_id=cases.RELEASE_C,
+            resume_id="bgcr-future-successor-c",
+        )
+        binding = dict(c_resume["resume_binding"])
+        binding.update(
+            blue_release_id=fixture.GREEN_RELEASE,
+            blue_repo_head=fixture.HEAD_GREEN,
+            green_readiness={
+                **binding["green_readiness"],
+                "release_id": cases.RELEASE_C,
+                "repo_head": cases.HEAD_C,
+            },
+        )
+        binding["binding_sha256"] = SD._sha256_json({
+            k: v for k, v in binding.items() if k != "binding_sha256"
+        })
+        self.assertIsNotNone(SD.midcutover._validated_resume_binding(binding))
+        receipts = [self.a, self.b, self.resumed, c]
+        self.assertTrue(SD.midcutover._lineage_resolved(receipts, self.b))
+        self.assertEqual(
+            [c["cutover_id"]],
+            [r["cutover_id"] for r in
+             SD.midcutover.unresolved_post_switch_receipts(receipts)],
+        )
+        self.assertTrue(
+            SD._completed_predecessor_can_yield_to_recovery(
+                self.a, receipts, self.fields, binding
+            ),
+            "a fully authenticated resumed B is an owner of its canonical green release",
+        )
+        bad_resume = {**self.resumed, "receipt_sha256": "0" * 64}
+        self.assertFalse(
+            SD._completed_predecessor_can_yield_to_recovery(
+                self.a, [self.a, self.b, bad_resume, c],
+                self.fields, binding,
+            ),
+            "tampered B completion cannot retire its predecessor A",
+        )
+
     def test_duplicate_producers_for_one_completed_release_are_ambiguous(self):
         conflicting = cases.completed(
             "bgc-competing-original-blue-producer", fixture.HEAD_BLUE,
