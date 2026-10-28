@@ -2163,6 +2163,155 @@ def _completed_cutover_has_live_successor(
     return False
 
 
+def _completed_predecessor_can_yield_to_recovery(
+    predecessor: dict[str, Any],
+    receipts: list[dict[str, Any]],
+    command_fields: dict[str, Any],
+    resume_binding: dict[str, Any],
+) -> bool:
+    """Allow a signed completed ancestor of unknown B to yield to B's resume.
+
+    An A→A1→...→B history stays terminal independently of B's current
+    incomplete runtime. Prove every canonical completed hop and uniquely
+    bound unfinished B. This is never evidence for an ordinary deployment.
+    """
+    if (
+        not isinstance(resume_binding, dict)
+        or midcutover._validated_resume_binding(resume_binding) is None
+        or not isinstance(receipts, list)
+        or len(receipts) > midcutover.MAX_RECEIPT_ENTRIES
+        or not _completed_cutover_routing_is_authentic(
+            predecessor, receipts, command_fields
+        )
+    ):
+        return False
+    try:
+        original = midcutover.validate_cutover_receipt(predecessor)
+        if sum(
+            1 for item in receipts
+            if isinstance(item, dict)
+            and item.get("kind") == BLUE_GREEN_RECEIPT_KIND
+            and item.get("cutover_id") == original.get("cutover_id")
+            and item.get("receipt_sha256") == original.get("receipt_sha256")
+        ) != 1:
+            return False
+        unresolved = midcutover.unresolved_post_switch_receipts(receipts)
+        if len(unresolved) != 1:
+            return False
+        target = midcutover.validate_cutover_receipt(unresolved[0])
+        if (
+            not midcutover.is_post_switch_outcome_unknown(target)
+            or resume_binding.get("cutover_id") != target.get("cutover_id")
+            or resume_binding.get("resumed_receipt_sha256") != target.get("receipt_sha256")
+            or resume_binding.get("expected_head") != target.get("expected_head")
+            or resume_binding.get("target_head") != target.get("expected_head")
+            or resume_binding.get("expected_release_id") != target.get("green_release_id")
+            or resume_binding.get("blue_release_id") != target.get("blue_release_id")
+            or resume_binding.get("source_identity_sha256")
+                != target.get("source_identity_sha256")
+            or resume_binding.get("cutover_generation")
+                != target.get("cutover_generation")
+        ):
+            return False
+        visited_ids = {original.get("cutover_id")}
+        visited_releases = {
+            original.get("blue_release_id"), original.get("green_release_id")
+        }
+        previous = original
+        for _ in range(len(receipts)):
+            previous_head = previous.get("expected_head")
+            previous_green = previous.get("green_release_id")
+            if not midcutover.release_id_binds_head(
+                previous_green, previous_head
+            ):
+                return False
+            # A release identity cannot be produced by two completed cutovers
+            # and still unambiguously identify B's blue predecessor.
+            green_owners = [
+                item for item in receipts
+                if isinstance(item, dict)
+                and item.get("kind") == BLUE_GREEN_RECEIPT_KIND
+                and item.get("green_release_id") == previous_green
+                and item.get("outcome") == "completed"
+            ]
+            if len(green_owners) != 1:
+                return False
+            validated_owner = midcutover.validate_cutover_receipt(green_owners[0])
+            if validated_owner.get("cutover_id") != previous.get("cutover_id"):
+                return False
+            successors: list[dict[str, Any]] = []
+            for candidate in receipts:
+                if (
+                    not isinstance(candidate, dict)
+                    or candidate.get("kind") != BLUE_GREEN_RECEIPT_KIND
+                    or candidate.get("blue_release_id") != previous_green
+                ):
+                    continue
+                signed = midcutover.validate_cutover_receipt(candidate)
+                readback = signed.get("authoritative_readback")
+                if (
+                    signed.get("outcome") == "rolled_back"
+                    and _signed_clean_blue_rollback_is_terminal(signed, receipts)
+                    and isinstance(readback, dict)
+                    and isinstance(readback.get("selector"), dict)
+                    and isinstance(readback.get("ingress"), dict)
+                    and readback["selector"].get("repo_head") == previous_head
+                    and readback["ingress"].get("repo_head") == previous_head
+                ):
+                    continue
+                successors.append(signed)
+            # Missing successor, a fork, or an unproven rollback is blocking.
+            if len(successors) != 1:
+                return False
+            successor = successors[0]
+            next_id = successor.get("cutover_id")
+            next_head = successor.get("expected_head")
+            next_release = successor.get("green_release_id")
+            next_source = successor.get("source_identity_sha256")
+            if (
+                next_id in visited_ids
+                or next_release in visited_releases
+                or not isinstance(next_head, str)
+                or OBJECT_ID_RE.fullmatch(next_head) is None
+                or not midcutover.release_id_binds_head(
+                    successor.get("blue_release_id"), previous_head
+                )
+                or not midcutover.release_id_binds_head(next_release, next_head)
+                or not isinstance(next_source, str)
+                or _SHA256_RE.fullmatch(next_source) is None
+            ):
+                return False
+            if next_id == target.get("cutover_id"):
+                return bool(
+                    successor.get("receipt_sha256") == target.get("receipt_sha256")
+                    and successor.get("blue_release_id") == previous_green
+                    and resume_binding.get("blue_repo_head") == previous_head
+                )
+            successor_fields = {
+                **command_fields,
+                "expected_head": next_head,
+                "source_identity_sha256": next_source,
+            }
+            if not (
+                _completed_cutover_routing_is_authentic(
+                    successor, receipts, successor_fields
+                )
+                or _completed_resumed_successor_routing_is_authentic(
+                    successor, receipts, successor_fields
+                )
+            ):
+                return False
+            visited_ids.add(next_id)
+            visited_releases.add(next_release)
+            previous = successor
+    except (
+        OSError, RuntimeError, ValueError, KeyError, TypeError,
+        midcutover.MidCutoverEvidenceError,
+    ):
+        return False
+    return False
+
+
 def _repaired_completed_sidecars_are_terminal(
     cutover: dict[str, Any],
     receipts: list[dict[str, Any]],
@@ -2879,6 +3028,52 @@ def _indexed_failed_deploy_is_cutover_handoff(
     except (OSError, RuntimeError, ValueError, PermissionError,
             IndexedRuntimeJobConflict, midcutover.MidCutoverEvidenceError):
         return False
+
+
+def _indexed_completed_predecessor_is_recovery_handoff(
+    unit: str, resume_binding: dict[str, Any],
+) -> bool:
+    """Yield only one authenticated old completed deployment to B's resume.
+
+    No terminal status is persisted here. Both ordinary scheduling and a
+    missing/foreign B continue seeing the indexed reservation.
+    """
+    if (
+        not _durable_job_unit(unit)
+        or not isinstance(resume_binding, dict)
+        or midcutover._validated_resume_binding(resume_binding) is None
+    ):
+        return False
+    try:
+        root = operator._jobs_root()
+        index = _deploy_index(root, read_only=True)
+        if index.get("pending_unit") is not None or unit not in index.get("units", []):
+            return False
+        entry = root / unit
+        if entry.is_symlink() or not entry.is_dir():
+            return False
+        classified = _classify_indexed_job(entry)
+        if classified.get("kind") != "deploy" or classified.get("terminal"):
+            return False
+        fields = classified.get("fields")
+        if not isinstance(fields, dict):
+            return False
+        for reason in ("SidecarInstallOutstanding", "RuntimeError"):
+            proven = _authenticated_persisted_incomplete_cutover(
+                entry, classified["metadata"], fields, classified["status"],
+                failure_type=reason,
+                allowed_outcomes=frozenset({"completed"}),
+            )
+            if proven is not None:
+                return _completed_predecessor_can_yield_to_recovery(
+                    proven[0], proven[1], fields, resume_binding
+                )
+    except (
+        OSError, RuntimeError, ValueError, PermissionError, TypeError,
+        IndexedRuntimeJobConflict, midcutover.MidCutoverEvidenceError,
+    ):
+        return False
+    return False
 
 
 def _private_scheduled_resume_events(entry: Path) -> list[dict[str, Any]] | None:

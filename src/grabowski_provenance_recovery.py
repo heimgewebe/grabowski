@@ -414,6 +414,7 @@ def _competing_deployment_evidence(
     ):
         authenticated: list[str] = []
         original_deploy_count = 0
+        predecessor_count = 0
         for unit in blocking:
             try:
                 if self_deploy._indexed_failed_deploy_is_cutover_handoff(
@@ -430,6 +431,13 @@ def _competing_deployment_evidence(
                             unit, resume_binding
                         )
                     )
+                    if not verified and self_deploy._indexed_completed_predecessor_is_recovery_handoff(
+                        unit, resume_binding
+                    ):
+                        predecessor_count += 1
+                        # Several distinct signed ancestors may be on the
+                        # same unique completed chain leading to this B.
+                        verified = predecessor_count < 32
             except (
                 OSError, RuntimeError, ValueError, PermissionError, AttributeError
             ):
@@ -437,7 +445,12 @@ def _competing_deployment_evidence(
             if not verified:
                 break
             authenticated.append(unit)
-        if len(authenticated) == len(blocking):
+        # A settled predecessor cannot itself grant resume: the exact still-
+        # unresolved B must also have an independently authenticated job.
+        if (
+            len(authenticated) == len(blocking)
+            and (predecessor_count == 0 or original_deploy_count == 1)
+        ):
             evidence["inflight_deploy_jobs"] = []
             evidence["recovery_handoff_units"] = authenticated
     return evidence
