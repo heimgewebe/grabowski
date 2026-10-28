@@ -250,7 +250,8 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
         }
 
     def _submit_axis(self, started: dict, axis: str, number: int,
-                     *, reject: bool = False, full_diff: bool = True) -> dict:
+                     *, reject: bool = False, full_diff: bool = True,
+                     resolve_ids: tuple[str, ...] = ()) -> dict:
         lines = review._first_party_diff(
             self.repo, {"base_sha": self.base, "head_sha": self.head},
         ).decode("utf-8").splitlines(keepends=True)
@@ -261,6 +262,19 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
         first = self._read(started, axis, "source", self.source_path, "head", 1, 8)
         second = self._read(started, axis, "source", self.source_path, "head", 9, 16)
         report = self._report(axis, number, [first["source_ref"], second["source_ref"]], reject=reject)
+        for finding_id in resolve_ids:
+            report["findings"].append({
+                "id": finding_id, "severity": "high", "verdict": "RESOLVED",
+                "summary": (
+                    "This later authenticated revision-bound controller review "
+                    "reexamines the original material claim against the exact "
+                    "same frozen Git source. The earlier concern is explicitly "
+                    "resolved as a mistaken reading of this source branch, "
+                    "with the inspected source reference below, rather than "
+                    "merely being ignored through a new review batch."
+                ),
+                "evidence_refs": [first["source_ref"]],
+            })
         arguments = {
             "review_session_id": started["review_session_id"],
             "session_nonce": started["session_nonce"], "report": report,
@@ -272,6 +286,88 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
             self._issuer(review.FIRST_PARTY_TOOL_SUBMIT, arguments),
             root=self.state, key=self.key, signers=self.signers,
             root_owned_signers=False, now_unix=self.now,
+        )
+
+    def test_prior_signed_material_reject_remains_blocking_across_batches(self) -> None:
+        # No change to Git source, PR or canonical diff between batches.
+        plan_a = self._first_party_plan()
+        session_a = self._start_plan(plan_a)
+        for number, axis in enumerate(review.REQUIRED_AXES, 1):
+            self._submit_axis(session_a, axis, number, reject=number == 1)
+        with self.assertRaisesRegex(review.ReviewExecutionRejected, "material finding"):
+            self._seal_direct(plan_a)
+
+        plan_b = self._first_party_plan()
+        session_b = self._start_plan(plan_b)
+        for number, axis in enumerate(review.REQUIRED_AXES, 1):
+            self._submit_axis(session_b, axis, number)
+        self.assertNotEqual(plan_a["binding"]["review_batch_id"], plan_b["binding"]["review_batch_id"])
+        with self.assertRaisesRegex(review.ReviewExecutionRejected, "previous.*material"):
+            self._seal_direct(plan_b)
+
+    def test_later_explicit_signed_resolution_allows_same_revision(self) -> None:
+        plan_a = self._first_party_plan()
+        started_a = self._start_plan(plan_a)
+        for number, axis in enumerate(review.REQUIRED_AXES, 1):
+            self._submit_axis(started_a, axis, number, reject=number == 1)
+
+        plan_b = self._first_party_plan()
+        started_b = self._start_plan(plan_b)
+        for number, axis in enumerate(review.REQUIRED_AXES, 1):
+            self._submit_axis(
+                started_b, axis, number,
+                resolve_ids=("material-1",) if number == 1 else (),
+            )
+        audit_b, receipts_b = self._seal_direct(plan_b)
+        self.assertEqual([], self._receipt_errors(audit_b, receipts_b))
+
+    def test_previous_signed_reject_is_scoped_to_original_revision(self) -> None:
+        plan_a = self._first_party_plan()
+        started_a = self._start_plan(plan_a)
+        for number, axis in enumerate(review.REQUIRED_AXES, 1):
+            self._submit_axis(started_a, axis, number, reject=number == 1)
+        source = self.repo / self.source_path
+        source.write_text(source.read_text(encoding="utf-8") + "REVISION = True\\n")
+        self._git("add", self.source_path)
+        self._git("commit", "-qm", "resolve material concern in a new revision")
+        self.head = self._git("rev-parse", "HEAD").strip()
+        plan_b = self._first_party_plan()
+        started_b = self._start_plan(plan_b)
+        for number, axis in enumerate(review.REQUIRED_AXES, 1):
+            self._submit_axis(started_b, axis, number)
+        audit_b, receipts_b = self._seal_direct(plan_b)
+        self.assertEqual([], self._receipt_errors(audit_b, receipts_b))
+
+    def test_legacy_v2_review_cannot_hide_first_party_reject(self) -> None:
+        plan_a = self._first_party_plan()
+        started_a = self._start_plan(plan_a)
+        for number, axis in enumerate(review.REQUIRED_AXES, 1):
+            self._submit_axis(started_a, axis, number, reject=number == 1)
+        another_batch = self._first_party_plan()
+        with self.assertRaisesRegex(
+            review.ReviewExecutionRejected, "previous signed material",
+        ):
+            review._assert_no_first_party_reject_for_legacy_review(
+                another_batch["binding"], repository=self.repo,
+                root=self.state, signers=self.signers,
+                root_owned_signers=False,
+            )
+
+    def test_later_signed_reject_invalidates_previous_sealed_pass(self) -> None:
+        plan_a = self._first_party_plan()
+        session_a = self._start_plan(plan_a)
+        for number, axis in enumerate(review.REQUIRED_AXES, 1):
+            self._submit_axis(session_a, axis, number)
+        audit_a, receipts_a = self._seal_direct(plan_a)
+        self.assertEqual([], self._receipt_errors(audit_a, receipts_a))
+
+        plan_b = self._first_party_plan()
+        session_b = self._start_plan(plan_b)
+        for number, axis in enumerate(review.REQUIRED_AXES, 1):
+            self._submit_axis(session_b, axis, number, reject=number == 1)
+        self.assertTrue(
+            self._receipt_errors(audit_a, receipts_a),
+            "later authentic material REJECT must invalidate an old PASS audit",
         )
 
     def test_five_real_authenticated_source_read_reports_are_accepted(self) -> None:

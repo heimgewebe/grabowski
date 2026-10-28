@@ -1601,6 +1601,117 @@ def _load_first_party_axes(
     return accepted
 
 
+
+def _assert_prior_first_party_material_findings_resolved(
+    session: dict[str, Any], current_axes: dict[str, dict[str, Any]], *,
+    root: Path, repository: Path, signers: Path, root_owned_signers: bool,
+) -> None:
+    """An unchanged revision cannot discard a signed REJECT by rotating batches.
+
+    A later signed review of the same axis must explicitly resolve each old
+    finding by ID and severity, with source-attested evidence and a newer
+    submission. Other revisions remain independent. All historical signed
+    axes are read, including partial sessions whose REJECT was submitted.
+    """
+    sessions = root / "sessions"
+    lock = _first_party_lock(root)
+    try:
+        fd = _private_dir(sessions)
+        try:
+            with os.scandir(fd) as entries:
+                names = sorted(entry.name for entry in entries)
+        finally:
+            os.close(fd)
+        if len(names) > 2048:
+            raise ReviewExecutionRejected("first-party session registry over bounded limit")
+        decisive = session["binding"]
+        for name in names:
+            if ID.fullmatch(name) is None:
+                raise ReviewExecutionRejected("first-party session registry name invalid")
+            if name == session["session_id"]:
+                continue
+            historical_root = sessions / name
+            old = _read_signed_record(
+                historical_root / "session.json", signers=signers,
+                root_owned_signers=root_owned_signers,
+            )
+            if old.get("session_id") != name or old.get("kind") != FIRST_PARTY_SESSION_KIND:
+                raise ReviewExecutionRejected("previous signed session identity invalid")
+            candidate = old.get("binding")
+            if not isinstance(candidate, dict):
+                raise ReviewExecutionRejected("previous signed session binding absent")
+            revision_fields = (
+                "repo", "pr", "base_sha", "head_sha", "diff_sha256",
+                "review_purpose", "release_binding",
+            )
+            if not all(candidate.get(k) == decisive.get(k) for k in revision_fields):
+                continue
+            old_binding = _first_party_binding(candidate)
+            if (
+                old.get("schema_version") != 1
+                or old.get("binding_sha256") != _digest(old_binding)
+                or old.get("canonical_diff_sha256") != session["canonical_diff_sha256"]
+                or old.get("source_raw_diff_sha256") != session["source_raw_diff_sha256"]
+                or old.get("changed_paths") != session["changed_paths"]
+                or old.get("issuer_principal") != _first_party_principal(
+                    _validate_first_party_issuer(
+                        old.get("start_issuer"), expected_tool=FIRST_PARTY_TOOL_START,
+                    )
+                )
+            ):
+                raise ReviewExecutionRejected("previous same-revision session origin invalid")
+            old_reads = _load_first_party_reads(
+                old, historical_root, signers=signers,
+                root_owned_signers=root_owned_signers, repository=repository,
+            )
+            old_axes = _load_first_party_axes(
+                old, historical_root, reads=old_reads, signers=signers,
+                root_owned_signers=root_owned_signers,
+            )
+            for axis, old_axis in old_axes.items():
+                if old_axis["report"]["verdict"] != "REJECT":
+                    continue
+                latest = current_axes.get(axis)
+                acknowledged = latest["report"]["findings"] if latest else []
+                for finding in old_axis["report"]["findings"]:
+                    if finding["verdict"] != "UNRESOLVED":
+                        continue
+                    if not any(
+                        observed["id"] == finding["id"]
+                        and observed["severity"] == finding["severity"]
+                        and observed["verdict"] == "RESOLVED"
+                        and latest["submitted_at_unix"] >= old_axis["submitted_at_unix"]
+                        for observed in acknowledged
+                    ):
+                        raise ReviewExecutionRejected(
+                            "previous signed material finding unresolved for same revision"
+                        )
+    finally:
+        _release_first_party_lock(lock)
+
+
+def _assert_no_first_party_reject_for_legacy_review(
+    binding: dict[str, Any], *, repository: Path, root: Path,
+    signers: Path, root_owned_signers: bool,
+) -> None:
+    """V2-origin reviews may not sidestep an old signed first-party REJECT."""
+    if not (root / "sessions").exists():
+        return
+    from grabowski_self_review_producer import _current_source
+    context = {
+        "session_id": "",  # No current first-party batch to exempt.
+        "binding": _first_party_binding(binding),
+        "source_raw_diff_sha256": _current_source(repository, binding),
+        "canonical_diff_sha256": hashlib.sha256(
+            _first_party_diff(repository, binding)
+        ).hexdigest(),
+        "changed_paths": _first_party_changed_paths(repository, binding),
+    }
+    _assert_prior_first_party_material_findings_resolved(
+        context, {}, root=root, repository=repository, signers=signers,
+        root_owned_signers=root_owned_signers,
+    )
+
 def submit_first_party_axis_review(
     session_id: str, nonce: str, report: dict[str, Any],
     issuer: dict[str, Any], *,
@@ -1814,6 +1925,10 @@ def verified_first_party_semantic_review_passes(
     )
     if set(axes) != set(axes_to_review):
         raise ReviewExecutionRejected("first-party semantic axis coverage incomplete")
+    _assert_prior_first_party_material_findings_resolved(
+        session, axes, root=root, repository=repository,
+        signers=signers, root_owned_signers=root_owned_signers,
+    )
     accepted: dict[str, dict[str, Any]] = {}
     for sequence, axis in enumerate(axes_to_review, start=1):
         record = axes[axis]
@@ -2264,6 +2379,10 @@ def _verify(
         return
     if repository is None:
         raise ReviewExecutionRejected("legacy self-review repository absent")
+    _assert_no_first_party_reject_for_legacy_review(
+        semantic_binding, repository=repository, root=first_party_root,
+        signers=signers, root_owned_signers=root_owned_signers,
+    )
     semantic_reviews = verified_semantic_review_passes(
         semantic_binding, repository=repository, axes_to_review=tuple(axes),
     )
