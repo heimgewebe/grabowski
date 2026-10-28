@@ -422,8 +422,13 @@ def _competing_deployment_evidence(
                     original_deploy_count += 1
                     verified = original_deploy_count == 1
                 else:
-                    verified = self_deploy._indexed_failed_resume_is_noeffect_handoff(
-                        unit, resume_binding
+                    verified = (
+                        self_deploy._indexed_failed_resume_is_noeffect_handoff(
+                            unit, resume_binding
+                        )
+                        or self_deploy._indexed_failed_scheduled_resume_is_handoff(
+                            unit, resume_binding
+                        )
                     )
             except (
                 OSError, RuntimeError, ValueError, PermissionError, AttributeError
