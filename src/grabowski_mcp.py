@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from fnmatch import fnmatch
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 import asyncio
 import ast
 import base64
@@ -7227,24 +7228,76 @@ def grabowski_status(
     return _project_status_fields(base_payload, fields)
 
 
+_FIRST_PARTY_CONSUMED_SIGNED_EVIDENCE: ContextVar[dict[str, Any] | None] = ContextVar(
+    "grabowski_first_party_consumed_signed_evidence", default=None,
+)
+
+
+@contextmanager
+def _first_party_preconsumed_transport(evidence: dict[str, Any]) -> Iterator[None]:
+    """Carry one server-consumed ingress receipt into this exact tool execution.
+
+    FastMCP dispatch admits and consumes the signed request before invoking a
+    synchronous handler in a worker thread. The handler must authenticate the
+    same already-consumed receipt, never consume the MAC a second time. Caller
+    arguments cannot set this private, execution-scoped transport context.
+    """
+    if (
+        _FIRST_PARTY_CONSUMED_SIGNED_EVIDENCE.get() is not None
+        or not isinstance(evidence, dict)
+        or evidence.get("state") != "consumed"
+        or evidence.get("transport_mode") != "signed-one-call-v1"
+    ):
+        raise RuntimeError("first-party signed transport handoff invalid")
+    token = _FIRST_PARTY_CONSUMED_SIGNED_EVIDENCE.set(dict(evidence))
+    try:
+        yield
+    finally:
+        _FIRST_PARTY_CONSUMED_SIGNED_EVIDENCE.reset(token)
+
+
 def _authenticated_self_review_issuer(
     ctx: Context | None, *, tool_name: str, arguments: dict[str, Any],
 ) -> dict[str, Any]:
-    """Consume the real signed transport principal for one review mutation."""
+    """Use the same real signed request consumed by the outer MCP dispatcher."""
     authorization = _transport_authorize_connector_tool(ctx, tool_name, arguments)
     if not isinstance(authorization, dict):
         raise RuntimeError(
             "first-party semantic review requires an enrolled authenticated connector"
         )
     runtime_binding = _transport_roundtrip_runtime_binding()
-    evidence = _transport_signed_one_call_evidence(
-        ctx,
-        tool_name=tool_name,
-        arguments_sha256=(
-            grabowski_transport_assertion.canonical_arguments_sha256(arguments)
-        ),
-        runtime_binding=runtime_binding,
+    arguments_sha256 = grabowski_transport_assertion.canonical_arguments_sha256(
+        arguments
     )
+    evidence = _FIRST_PARTY_CONSUMED_SIGNED_EVIDENCE.get()
+    if evidence is None:
+        # Direct, non-wrapped test or transport entrypoints still require a
+        # genuine one-call MAC and exactly one durable replay-filter consume.
+        evidence = _transport_signed_one_call_evidence(
+            ctx,
+            tool_name=tool_name,
+            arguments_sha256=arguments_sha256,
+            runtime_binding=runtime_binding,
+        )
+    else:
+        # The transport proof was already consumed by this *same* server-owned
+        # dispatch. Rebind it to the handler's exact tool, domain arguments,
+        # primary connector scope, request identity and immutable release.
+        scope = _transport_connector_capability_scope(ctx)
+        if (
+            not isinstance(scope, dict)
+            or evidence.get("tool_name") != tool_name
+            or evidence.get("arguments_sha256") != arguments_sha256
+            or evidence.get("request_id")
+               != _transport_context_header(ctx, _TRANSPORT_REQUEST_ID_HEADER)
+            or evidence.get("runtime_binding_sha256")
+               != grabowski_transport_assertion.runtime_binding_sha256(
+                   runtime_binding
+               )
+            or evidence.get("client_scope_sha256")
+               != grabowski_transport_roundtrip.client_scope_sha256(scope)
+        ):
+            raise RuntimeError("first-party signed transport handoff mismatch")
     if not isinstance(evidence, dict):
         raise RuntimeError(
             "first-party semantic review requires fresh signed one-call ingress"
