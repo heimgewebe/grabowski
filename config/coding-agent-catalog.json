@@ -833,6 +833,7 @@
         "codex-terra-high",
         "claude-sonnet-5-high",
         "grok-4.6-review-high",
+        "grok-4.7-review-high",
         "antigravity-gemini-pro-review-high"
       ],
       "paid_contrast_routes": [
@@ -858,7 +859,8 @@
           "claude-opus-5.5",
           "gpt-5.6-terra",
           "claude-sonnet-5",
-          "grok-4.6"
+          "grok-4.6",
+          "grok-4.7"
         ]
       },
       "B": {
