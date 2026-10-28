@@ -176,6 +176,9 @@ SYNCHRONOUS_INDIRECT_EXECUTABLES = SYNCHRONOUS_SHELL_WRAPPERS
 MAX_NOTIFY_ON_DONE_CHANNELS = 5
 MAX_NOTIFY_ON_DONE_TEXT = 200
 MAX_FINALIZATION_RECEIPT_BYTES = 64 * 1024
+# Keep this bound identical on durable job publication and readback.
+# A genuine ordinary job may exceed the old 64-KiB read-only ceiling.
+MAX_JOB_METADATA_BYTES = 256 * 1024
 JOB_NOTIFICATION_RECEIPT_NAME = "notification.json"
 JOB_NOTIFICATION_ACK_NAME = "notification-ack.json"
 DYNAMIC_SECRET_GLOBAL_MIN_LENGTH = 8
@@ -6960,9 +6963,16 @@ def _job_directory(unit: str, *, create: bool = False) -> Path:
     return resolved
 
 
+def _bounded_job_metadata_bytes(payload: dict[str, Any]) -> bytes:
+    data = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    if len(data) > MAX_JOB_METADATA_BYTES:
+        raise ValueError("Job metadata exceeds bounded size limit")
+    return data
+
+
 def _write_job_metadata(directory: Path, payload: dict[str, Any]) -> Path:
     path = directory / "metadata.json"
-    data = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    data = _bounded_job_metadata_bytes(payload)
     descriptor = os.open(
         path,
         os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
@@ -7180,7 +7190,7 @@ def _read_job_metadata(unit: str) -> dict[str, Any]:
     path = directory / "metadata.json"
     if path.is_symlink() or not path.is_file():
         raise ValueError(f"Job metadata is missing: {unit}")
-    if path.stat().st_size > 64 * 1024:
+    if path.stat().st_size > MAX_JOB_METADATA_BYTES:
         raise ValueError(f"Job metadata is too large: {unit}")
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict) or payload.get("unit") != unit:
@@ -8418,6 +8428,9 @@ def _start_job(
             terminalization,
         ),
     }
+    # Reject an unreadable future job before publishing even its directory.
+    # Producer/reader agreement matters to the global deployment census.
+    _bounded_job_metadata_bytes(metadata)
     # All origin and metadata preparation has completed. Reserve and verify the
     # canonical destination only at the final pre-dispatch publication point.
     created_directory = _job_directory(unit, create=True)
