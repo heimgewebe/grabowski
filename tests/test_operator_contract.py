@@ -2948,6 +2948,7 @@ class OperatorContractTests(unittest.TestCase):
             self.assertEqual(invoked[separator + 1 :], operator.command_identity.systemd_escape_argv(command))
             self.assertNotIn("--expand-environment=no", invoked[:separator])
             self.assertIn("systemd-run", invoked)
+            self.assertEqual(invoked[:separator].count("--collect"), 1)
             self.assertEqual(invoked.count("--property=LimitCORE=0"), 1)
             self.assertNotIn("--property=LimitNOFILE=65536", invoked)
             self.assertNotIn("--property=UMask=0077", invoked)

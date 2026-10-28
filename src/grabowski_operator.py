@@ -8435,6 +8435,8 @@ def _start_job(
     systemd_argv = [
         "systemd-run",
         "--user",
+        # The finalizer persists the outcome before systemd collects terminal jobs.
+        "--collect",
         f"--description={_systemd_safe_description('job', unit, metadata['argv_sha256'])}",
         "--unit",
         unit,
