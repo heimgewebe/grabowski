@@ -383,6 +383,34 @@ class CheckoutIdentityTests(unittest.TestCase):
             "checkout_key": self._checkout_key(),
         }
 
+    def test_identity_rebind_cannot_exempt_existing_checkout_when_other_slot_full(self) -> None:
+        """Rebinding an already-leased row may not exceed the live writer limit."""
+        prior = self._seed_prior(owner="owner-new", branch="new-topic", head=NEW_HEAD)
+        competing_path = self.worktrees / "competing-writer"
+        self._seed_prior(
+            path=competing_path, owner="owner-other", branch="competing-topic",
+        )
+        self._live_checkout_path_lease(competing_path, "owner-other")
+        self._live_checkout_path_lease(self.checkout, "owner-new")
+        with (
+            patch.object(checkouts, "MAX_ACTIVE_CHECKOUTS_PER_REPO", 1),
+            checkouts._database() as connection,
+        ):
+            lifecycle = connection.execute(
+                "SELECT * FROM lifecycle_bindings WHERE checkout_key=?",
+                (prior["checkout_key"],),
+            ).fetchone()
+            self.assertIsNotNone(lifecycle)
+            with self.assertRaisesRegex(
+                identity.CheckoutIdentityConflict, "active checkout capacity",
+            ):
+                identity._active_slot_available(
+                    connection,
+                    inputs=self._active_slot_probe_inputs(),
+                    lifecycle=dict(lifecycle),
+                    now=self.now,
+                )
+
     def test_identity_rebind_admits_when_other_active_binding_is_retained_only(self) -> None:
         # The legacy limit counted long-term retention as active execution.
         old_checkout = self.worktrees / "retained-only"

@@ -115,6 +115,86 @@ class CheckoutLifecycleTests(unittest.TestCase):
             text=True,
         )
 
+    def test_live_lease_snapshot_retries_one_transient_wal_change(self) -> None:
+        from contextlib import closing, contextmanager
+
+        with closing(checkouts.resources._database()) as connection:
+            connection.execute("SELECT 1 FROM leases").fetchone()
+        original = checkouts.resources._resource_readonly_snapshot
+        attempts: list[int] = []
+
+        @contextmanager
+        def checkpointed_once():
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise checkouts.resources.ResourceSchemaInventoryChanged(
+                    "Store changed while schema inventory was read; retry inventory"
+                )
+            with original() as connection:
+                yield connection
+
+        with patch.object(checkouts.resources, "_resource_readonly_snapshot", checkpointed_once):
+            self.assertEqual(checkouts._live_checkout_lease_keys(now=int(time.time())), {})
+        self.assertEqual(len(attempts), 2)
+
+        attempts.clear()
+
+        @contextmanager
+        def persistently_changed():
+            attempts.append(1)
+            raise checkouts.resources.ResourceSchemaInventoryChanged(
+                "Store changed while schema inventory was read; retry inventory"
+            )
+            yield  # generator contract, unreachable
+
+        with patch.object(checkouts.resources, "_resource_readonly_snapshot", persistently_changed):
+            with self.assertRaises(checkouts.resources.ResourceSchemaInventoryChanged):
+                checkouts._live_checkout_lease_keys(now=int(time.time()))
+        self.assertEqual(len(attempts), 2)
+
+    def test_rereserving_stale_checkout_cannot_exceed_live_capacity(self) -> None:
+        """Reacquiring a lease for a retained row must not create a 17th writer."""
+        common_dir = self._common_dir()
+        until = int(time.time()) + 3600
+        live_leases: dict[str, str] = {}
+
+        def reserve(name: str) -> dict[str, object]:
+            return checkouts._reserve_checkout_lifecycle(
+                repo_common_dir=common_dir,
+                repo_path=self.repo,
+                checkout_path=self.root / "worktrees" / f"returning-{name}",
+                owner_id=f"owner-{name}",
+                purpose=f"returning checkout {name}",
+                source_kind="work_lane",
+                source_id=f"returning-{name}",
+                artifact_class="implementation-worktree",
+                retention_until_unix=until,
+                expected_head=self.head,
+                expected_branch=f"returning-{name}",
+            )
+
+        with (
+            patch.object(checkouts, "MAX_ACTIVE_CHECKOUTS_PER_REPO", 1),
+            patch.object(
+                checkouts, "_live_checkout_lease_keys",
+                side_effect=lambda *, now: dict(live_leases),
+            ),
+        ):
+            stale = reserve("stale")
+            competitor = reserve("competitor")
+            live_leases[f"path:{competitor['checkout_path']}"] = "owner-competitor"
+            # The retained checkout only begins consuming capacity now.
+            live_leases[f"path:{stale['checkout_path']}"] = "owner-stale"
+            with checkouts._database() as connection:
+                observed_count = checkouts._active_creation_count(
+                    connection, repo_common_dir=common_dir,
+                    exclude_checkout_key=stale["checkout_key"],
+                    now=int(time.time()), live_leases=live_leases,
+                )
+            self.assertEqual(observed_count, 1, f"lease rows: {live_leases!r}")
+            with self.assertRaisesRegex(RuntimeError, "active checkout limit reached"):
+                reserve("stale")
+
     def test_parallel_checkout_reservations_never_admit_seventeenth_live_lease(self) -> None:
         """Force the 15/16 stale-lease schedule without timing-dependent sleeps.
 
