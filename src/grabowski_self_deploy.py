@@ -1868,16 +1868,16 @@ def _signed_clean_blue_rollback_is_terminal(
         return False
 
 
-def _repaired_completed_sidecars_are_terminal(
+def _completed_cutover_routing_is_authentic(
     cutover: dict[str, Any],
     receipts: list[dict[str, Any]],
     command_fields: dict[str, Any],
 ) -> bool:
-    """Prove late sidecar repair against the exact completed deployed release.
+    """Require complete hash-bound canonical routing before evaluating terminality.
 
-    The signed failed job and owner-private persisted cutover are authenticated
-    by the caller. The current runtime and installed sidecars must also match,
-    independently and read-only: historic success alone never suffices.
+    The calling job's private finalization authenticates the original cutover.
+    Historical successors come only from the owner-private validated receipt
+    inventory; no generic process success or caller-supplied PASS is accepted.
     """
     try:
         readiness = cutover.get("green_readiness")
@@ -1910,9 +1910,105 @@ def _repaired_completed_sidecars_are_terminal(
                 or channel.get("repo_head") != cutover.get("expected_head")
             ):
                 return False
+        return (
+            routing.get("selector_sha256") == readback["selector"].get("selector_sha256")
+            and routing.get("selector_sha256") == readback["ingress"].get("selector_sha256")
+        )
+    except (OSError, RuntimeError, ValueError, PermissionError,
+            midcutover.MidCutoverEvidenceError):
+        return False
+
+
+def _completed_cutover_has_live_successor(
+    original: dict[str, Any],
+    receipts: list[dict[str, Any]],
+    current_runtime: dict[str, Any],
+    command_fields: dict[str, Any],
+) -> bool:
+    """Prove a unique, uninterrupted canonical A→B→...→live release chain.
+
+    A completed cutover with later repaired sidecars is already authenticated
+    by its failed deploy job and private receipt. Once a subsequent deployment
+    B becomes live, comparing A to *current* runtime alone would resurrect its
+    old failure. Each successor must itself be an owner-private, hash-verified,
+    completed canonical blue-green receipt whose blue release is exactly the
+    preceding green release. Ambiguous forks, broken links and unresolved
+    post-switch receipts block the historical reservation.
+    """
+    if len(receipts) > midcutover.MAX_RECEIPT_ENTRIES:
+        return False
+    by_blue: dict[str, list[dict[str, Any]]] = {}
+    for item in receipts:
+        if isinstance(item, dict) and item.get("kind") == BLUE_GREEN_RECEIPT_KIND:
+            blue = item.get("blue_release_id")
+            if isinstance(blue, str):
+                by_blue.setdefault(blue, []).append(item)
+
+    previous = original
+    visited_releases = {original.get("blue_release_id"), original.get("green_release_id")}
+    visited_ids = {original.get("cutover_id")}
+    for _ in range(len(receipts)):
+        new = by_blue.get(previous.get("green_release_id"), [])
+        # A fork is ambiguous even if one successor happens to match runtime.
+        if len(new) != 1:
+            return False
+        successor = new[0]
+        try:
+            successor = midcutover.validate_cutover_receipt(successor)
+        except (ValueError, RuntimeError, midcutover.MidCutoverEvidenceError):
+            return False
+        head = successor.get("expected_head")
+        release = successor.get("green_release_id")
+        cutover_id = successor.get("cutover_id")
+        source_identity = successor.get("source_identity_sha256")
         if (
-            routing.get("selector_sha256") != readback["selector"].get("selector_sha256")
-            or routing.get("selector_sha256") != readback["ingress"].get("selector_sha256")
+            not isinstance(head, str)
+            or OBJECT_ID_RE.fullmatch(head) is None
+            or not isinstance(release, str)
+            or not midcutover.release_id_binds_head(release, head)
+            or not midcutover.release_id_binds_head(
+                successor.get("blue_release_id"), previous.get("expected_head")
+            )
+            or cutover_id in visited_ids
+            or release in visited_releases
+            or not isinstance(source_identity, str)
+            or _SHA256_RE.fullmatch(source_identity) is None
+        ):
+            return False
+        successor_fields = {
+            **command_fields,
+            "expected_head": head,
+            "source_identity_sha256": source_identity,
+        }
+        if not _completed_cutover_routing_is_authentic(
+            successor, receipts, successor_fields
+        ):
+            return False
+        if (
+            current_runtime.get("repo_head") == head
+            and current_runtime.get("release_id") == release
+        ):
+            return _sidecars_match_deploy_head(successor_fields)
+        visited_releases.add(release)
+        visited_ids.add(cutover_id)
+        previous = successor
+    return False
+
+
+def _repaired_completed_sidecars_are_terminal(
+    cutover: dict[str, Any],
+    receipts: list[dict[str, Any]],
+    command_fields: dict[str, Any],
+) -> bool:
+    """Retire an authenticated completed cutover after direct or successor repair.
+
+    A direct repaired release needs exact live sidecars. A later deployment
+    needs a verified owner-private successor chain reaching the current
+    healthy runtime; neither an index prune nor an unbound PASS suffices.
+    """
+    try:
+        if not _completed_cutover_routing_is_authentic(
+            cutover, receipts, command_fields
         ):
             return False
         runtime = base._deployment_metadata()
@@ -1924,13 +2020,19 @@ def _repaired_completed_sidecars_are_terminal(
             "runtime_binding_valid", "environment_compatibility_valid",
             "provenance_valid",
         )
-        return bool(
-            isinstance(runtime, dict)
-            and runtime.get("completion_status") == "complete"
-            and runtime.get("repo_head") == cutover.get("expected_head")
+        if (
+            not isinstance(runtime, dict)
+            or runtime.get("completion_status") != "complete"
+            or not all(runtime.get(k) is True for k in required)
+        ):
+            return False
+        if (
+            runtime.get("repo_head") == cutover.get("expected_head")
             and runtime.get("release_id") == cutover.get("green_release_id")
-            and all(runtime.get(k) is True for k in required)
-            and _sidecars_match_deploy_head(command_fields)
+        ):
+            return _sidecars_match_deploy_head(command_fields)
+        return _completed_cutover_has_live_successor(
+            cutover, receipts, runtime, command_fields
         )
     except (OSError, RuntimeError, ValueError, PermissionError,
             subprocess.SubprocessError, midcutover.MidCutoverEvidenceError):
