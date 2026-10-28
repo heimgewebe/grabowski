@@ -264,11 +264,17 @@ class FakeGit:
             return {"returncode": 0, "stdout": self.branch, "stderr": ""}
         if argv == ["rev-parse", "HEAD"]:
             return {"returncode": 0, "stdout": self.head, "stderr": ""}
-        if argv == ["config", "--get", f"branch.{self.branch}.remote"]:
+        if argv in (
+            ["config", "--get", f"branch.{self.branch}.remote"],
+            ["config", "--get-all", f"branch.{self.branch}.remote"],
+        ):
             if self.configured_upstream_remote is None:
                 return {"returncode": 1, "stdout": "", "stderr": ""}
             return {"returncode": 0, "stdout": self.configured_upstream_remote, "stderr": ""}
-        if argv == ["config", "--get", f"branch.{self.branch}.merge"]:
+        if argv in (
+            ["config", "--get", f"branch.{self.branch}.merge"],
+            ["config", "--get-all", f"branch.{self.branch}.merge"],
+        ):
             if self.configured_upstream_merge is None:
                 return {"returncode": 1, "stdout": "", "stderr": ""}
             return {"returncode": 0, "stdout": self.configured_upstream_merge, "stderr": ""}
@@ -9784,6 +9790,17 @@ class GripFoundationTests(unittest.TestCase):
         self.assertFalse(any("fetch" in call for call in fake.calls))
         operator.grabowski_git.assert_not_called()
 
+    def test_branch_publish_uses_shared_hardened_ssh(self) -> None:
+        hardened = "/trusted/ssh -F /dev/null -oBatchMode=yes -i /trusted/key"
+        with (
+            patch.object(grips.grabowski_git_ssh, "hardened_git_ssh_command", return_value=hardened) as command,
+            patch.object(grips.subprocess, "run", return_value=types.SimpleNamespace(returncode=0, stdout="", stderr="")) as run,
+        ):
+            grips._default_command_runner(Path("/does-not-need-to-exist"), ["push", "origin", "HEAD:refs/heads/feature"])
+        command.assert_called_once_with()
+        self.assertEqual(hardened, run.call_args.kwargs["env"]["GIT_SSH_COMMAND"])
+        self.assertEqual("ssh", run.call_args.kwargs["env"]["GIT_ALLOW_PROTOCOL"])
+
     def test_branch_publish_requires_allow_mutation(self) -> None:
         result = grips.run_grip(
             "branch-publish",
@@ -9825,6 +9842,84 @@ class GripFoundationTests(unittest.TestCase):
         self.assertIn("--set-upstream", push)
         checks = {item["id"]: item["status"] for item in result["receipt"]["checks"]}
         self.assertEqual("pass", checks["upstream"])
+
+    def test_branch_publish_accepts_configured_upstream_when_remote_tracking_ref_is_absent(self) -> None:
+        class MissingLocalTrackingRef(FakeGit):
+            def __call__(self, repo: Path, argv: list[str]) -> dict[str, object]:
+                if argv == ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]:
+                    self.calls.append(tuple(argv))
+                    return {"returncode": 128, "stdout": "", "stderr": "upstream remote-tracking ref not fetched"}
+                return super().__call__(repo, argv)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = MissingLocalTrackingRef(
+                upstream=None,
+                configured_upstream_remote="origin",
+                configured_upstream_merge="refs/heads/feat/work",
+            )
+            result = grips.run_grip(
+                "branch-publish",
+                {"repo": tmp, "branch": "feat/work", "expected_head": "a" * 40},
+                allow_mutation=True,
+                command_runner=fake,
+            )
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertEqual("origin/feat/work", result["output"]["upstream"])
+        self.assertEqual("pass", {c["id"]: c["status"] for c in result["receipt"]["checks"]}["upstream"])
+
+    def test_branch_publish_rejects_configured_upstream_mismatch_after_remote_readback(self) -> None:
+        class MissingLocalTrackingRef(FakeGit):
+            def __call__(self, repo: Path, argv: list[str]) -> dict[str, object]:
+                if argv == ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]:
+                    self.calls.append(tuple(argv))
+                    return {"returncode": 128, "stdout": "", "stderr": "upstream not fetched"}
+                return super().__call__(repo, argv)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = MissingLocalTrackingRef(
+                upstream=None,
+                configured_upstream_remote="origin",
+                configured_upstream_merge="refs/heads/unrelated",
+            )
+            result = grips.run_grip(
+                "branch-publish",
+                {"repo": tmp, "branch": "feat/work", "expected_head": "a" * 40},
+                allow_mutation=True,
+                command_runner=fake,
+            )
+        self.assertEqual("failed", result["receipt"]["status"])
+        self.assertEqual("fail", {c["id"]: c["status"] for c in result["receipt"]["checks"]}["upstream"])
+
+    def test_branch_publish_rejects_duplicate_upstream_config_values(self) -> None:
+        class MissingLocalTrackingRef(FakeGit):
+            def __call__(self, repo: Path, argv: list[str]) -> dict[str, object]:
+                if argv == ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]:
+                    self.calls.append(tuple(argv))
+                    return {"returncode": 128, "stdout": "", "stderr": "upstream not fetched"}
+                return super().__call__(repo, argv)
+
+        for label, configured_remote, configured_merge in (
+            ("merge", "origin", "refs/heads/unrelated\nrefs/heads/feat/work"),
+            ("remote", "wrong-remote\norigin", "refs/heads/feat/work"),
+        ):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                fake = MissingLocalTrackingRef(
+                    upstream=None,
+                    configured_upstream_remote=configured_remote,
+                    configured_upstream_merge=configured_merge,
+                )
+                result = grips.run_grip(
+                    "branch-publish",
+                    {"repo": tmp, "branch": "feat/work", "expected_head": "a" * 40},
+                    allow_mutation=True,
+                    command_runner=fake,
+                )
+                self.assertEqual("failed", result["receipt"]["status"])
+                checks = {c["id"]: c["status"] for c in result["receipt"]["checks"]}
+                self.assertEqual("pass", checks["remote_head"])
+                self.assertEqual("fail", checks["upstream"])
+                self.assertIn(("config", "--get-all", "branch.feat/work.merge"), fake.calls)
+                self.assertIn(("config", "--get-all", "branch.feat/work.remote"), fake.calls)
 
     def test_branch_publish_rejects_remote_option_injection_before_git(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -10896,7 +10991,7 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual("protocol.ext.allow", env["GIT_CONFIG_KEY_2"])
         self.assertEqual("never", env["GIT_CONFIG_VALUE_2"])
         self.assertEqual("ssh", env["GIT_ALLOW_PROTOCOL"])
-        self.assertEqual("/usr/bin/ssh -F /dev/null -oBatchMode=yes -oProxyCommand=none -oPermitLocalCommand=no -oClearAllForwardings=yes", env["GIT_SSH_COMMAND"])
+        self.assertEqual("/__grabowski_ssh_transport_disabled__/ssh", env["GIT_SSH_COMMAND"])
         self.assertEqual("/bin/false", env["GIT_ASKPASS"])
         self.assertEqual("cat", env["GIT_PAGER"])
         self.assertEqual("cat", env["PAGER"])

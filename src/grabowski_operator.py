@@ -54,6 +54,7 @@ import grabowski_transport_assertion
 import grabowski_transport_roundtrip
 import grabowski_serving_process
 import grabowski_physical_checkout
+import grabowski_git_ssh
 
 
 HOME = Path.home().resolve()
@@ -4257,12 +4258,46 @@ def _trusted_root_owned_executable_path(path: Path, label: str) -> str:
     return str(path)
 
 
+def _trusted_nixos_cli_path(command: str, label: str) -> str:
+    if command not in {"git", "gh"}:
+        raise ValueError("unsupported NixOS CLI executable")
+    path = Path("/run/current-system/sw/bin") / command
+    try:
+        resolved = grabowski_git_ssh._root_managed_resolution(path)
+    except PermissionError:
+        # An untrusted intermediate symlink is a security violation, not
+        # an unavailable system executable. Keep the fail-closed signal.
+        raise
+    except OSError as exc:
+        raise RuntimeError(f"trusted {label} path is unavailable") from exc
+    if not resolved.is_relative_to(Path("/nix/store")):
+        raise PermissionError(f"trusted {label} must resolve into the Nix store")
+    grabowski_git_ssh._root_managed_chain(path)
+    grabowski_git_ssh._root_managed_chain(resolved)
+    info = resolved.stat()
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != 0
+        or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        or not info.st_mode & stat.S_IXUSR
+        or not os.access(resolved, os.X_OK)
+    ):
+        raise PermissionError(f"trusted {label} is not a root-owned executable")
+    return str(resolved)
+
+
 def _trusted_github_cli_path() -> str:
-    return _trusted_root_owned_executable_path(TRUSTED_GITHUB_CLI_PATH, "GitHub CLI")
+    if os.path.lexists(TRUSTED_GITHUB_CLI_PATH):
+        return _trusted_root_owned_executable_path(TRUSTED_GITHUB_CLI_PATH, "GitHub CLI")
+    return _trusted_nixos_cli_path("gh", "GitHub CLI")
 
 
 def _trusted_git_cli_path() -> str:
-    return _trusted_root_owned_executable_path(TRUSTED_GIT_CLI_PATH, "Git CLI")
+    if os.path.lexists(TRUSTED_GIT_CLI_PATH):
+        if stat.S_ISLNK(TRUSTED_GIT_CLI_PATH.lstat().st_mode):
+            return grabowski_git_ssh.trusted_git_cli_path()
+        return _trusted_root_owned_executable_path(TRUSTED_GIT_CLI_PATH, "Git CLI")
+    return _trusted_nixos_cli_path("git", "Git CLI")
 
 
 def _safe_environment() -> dict[str, str]:
@@ -4560,7 +4595,7 @@ def _github_pr_default_remote(working_directory: Path) -> str | None:
     try:
         completed = subprocess.run(
             [
-                "/usr/bin/git", "-C", str(working_directory), "config", "--local",
+                _trusted_git_cli_path(), "-C", str(working_directory), "config", "--local",
                 "--get-regexp", r"^remote\..*\.gh-resolved$",
             ],
             stdout=subprocess.PIPE,
@@ -4596,7 +4631,7 @@ def _github_pr_default_remote(working_directory: Path) -> str | None:
 def _github_pr_remote_names(working_directory: Path) -> list[str]:
     try:
         completed = subprocess.run(
-            ["/usr/bin/git", "-C", str(working_directory), "remote"],
+            [_trusted_git_cli_path(), "-C", str(working_directory), "remote"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
@@ -4660,7 +4695,7 @@ def _github_pr_remote_host(working_directory: Path, remote: str) -> str | None:
     try:
         completed = subprocess.run(
             [
-                "/usr/bin/git", "-C", str(working_directory), "remote", "get-url",
+                _trusted_git_cli_path(), "-C", str(working_directory), "remote", "get-url",
                 "--all", remote,
             ],
             stdout=subprocess.PIPE,
@@ -4811,7 +4846,7 @@ def _github_pr_view_auth_lookup_environment(
     # selection knobs; the network-capable PR-view child never receives this
     # HOME/config environment.
     environment["GH_HOST"] = host
-    environment["PATH"] = str(TRUSTED_GITHUB_CLI_PATH.parent)
+    environment["PATH"] = str(Path(_trusted_github_cli_path()).parent)
     environment["GH_PAGER"] = "cat"
     environment["PAGER"] = "cat"
     environment["GIT_PAGER"] = "cat"
@@ -4978,7 +5013,8 @@ def _github_pr_view_isolated_config_path() -> str:
 
 
 def _github_pr_view_environment(
-    *, host: str, token: str, repository: str | None = None
+    *, host: str, token: str, repository: str | None = None,
+    cli_executable_path: str | None = None,
 ) -> dict[str, str]:
     isolated = _github_pr_view_isolated_config_path()
     credential = _validated_github_pr_view_token(token)
@@ -4987,7 +5023,7 @@ def _github_pr_view_environment(
         "XDG_CONFIG_HOME": isolated,
         "GH_CONFIG_DIR": isolated,
         "GH_HOST": host,
-        "PATH": str(TRUSTED_GITHUB_CLI_PATH.parent),
+        "PATH": str(Path(cli_executable_path or _trusted_github_cli_path()).parent),
         "GH_PAGER": "cat",
         "PAGER": "cat",
         "GIT_PAGER": "cat",
@@ -5017,7 +5053,7 @@ def _github_pr_help_environment() -> dict[str, str]:
         "HOME": isolated,
         "XDG_CONFIG_HOME": isolated,
         "GH_CONFIG_DIR": isolated,
-        "PATH": str(TRUSTED_GITHUB_CLI_PATH.parent),
+        "PATH": str(Path(_trusted_github_cli_path()).parent),
         "GH_PAGER": "cat",
         "PAGER": "cat",
         "GIT_PAGER": "cat",
@@ -7213,7 +7249,7 @@ def _git_push_environment() -> dict[str, str]:
     environment.update(
         {
             "GIT_ALLOW_PROTOCOL": "ssh",
-            "GIT_SSH_COMMAND": "/usr/bin/ssh -F /dev/null -oBatchMode=yes -oProxyCommand=none -oPermitLocalCommand=no -oClearAllForwardings=yes",
+            "GIT_SSH_COMMAND": grabowski_git_ssh.hardened_git_ssh_command(),
             "GIT_SSH_VARIANT": "ssh",
             "GIT_ASKPASS": "/bin/false",
             "SSH_ASKPASS": "/bin/false",
@@ -8234,16 +8270,11 @@ def _start_job(
                     "provider_thread_request_sent": False,
                     "historical_review_receipts_modified": False,
                 })
-    directory = _job_directory(unit, create=True)
+    # Complete origin allocation before publishing a canonical job footprint:
+    # an unsuccessful bootstrap cannot leave missing-metadata review stubs.
+    directory = _jobs_root() / unit
     stdout_path = directory / "stdout.log"
     stderr_path = directory / "stderr.log"
-    for path in (stdout_path, stderr_path):
-        descriptor = os.open(
-            path,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
-            0o600,
-        )
-        os.close(descriptor)
 
     now_unix, now_iso, started_at_unix_ns = _job_start_timestamp()
     metadata_path = directory / "metadata.json"
@@ -8387,6 +8418,18 @@ def _start_job(
             terminalization,
         ),
     }
+    # All origin and metadata preparation has completed. Reserve and verify the
+    # canonical destination only at the final pre-dispatch publication point.
+    created_directory = _job_directory(unit, create=True)
+    if created_directory != directory:
+        raise PermissionError("job directory identity drifted during preparation")
+    for path in (stdout_path, stderr_path):
+        descriptor = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+            0o600,
+        )
+        os.close(descriptor)
     metadata_path = _write_job_metadata(directory, metadata)
 
     systemd_argv = [
@@ -8952,7 +8995,7 @@ def grabowski_git(
     elif subcommand == "push":
         remote, _source, _destination = _parse_safe_push_arguments(_command_arguments)
         command_prefix = [
-            "git",
+            _trusted_git_cli_path(),
             "-c",
             "core.hooksPath=/dev/null",
             "-c",
@@ -8976,7 +9019,7 @@ def grabowski_git(
         ]
         environment = _git_push_environment()
     else:
-        command_prefix = ["git", "-C", str(path)]
+        command_prefix = [_trusted_git_cli_path(), "-C", str(path)]
         environment = _git_environment()
     if read_shape is None:
         command = _validate_argv([*command_prefix, *arguments], cwd=path)
@@ -9262,7 +9305,8 @@ def grabowski_github(
                 if gh_repo:
                     environment_repository = gh_repo
             environment = _github_pr_view_environment(
-                host=github_host, token=github_token, repository=environment_repository
+                host=github_host, token=github_token, repository=environment_repository,
+                cli_executable_path=trusted_github_cli,
             )
     else:
         environment = None
