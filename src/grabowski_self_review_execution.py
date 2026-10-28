@@ -1744,80 +1744,80 @@ def _assert_prior_first_party_material_findings_resolved(
     sessions = root / "sessions"
     lock = _first_party_lock(root, read_only=True)
     try:
+        decisive = session["binding"]
         fd = _private_dir(sessions)
         try:
+            # Stream the registry under the shared lock. Every session signature
+            # is verified before revision filtering, without a global size cap.
             with os.scandir(fd) as entries:
-                names = sorted(entry.name for entry in entries)
+                for entry in entries:
+                    name = entry.name
+                    if ID.fullmatch(name) is None:
+                        raise ReviewExecutionRejected("first-party session registry name invalid")
+                    if name == session["session_id"]:
+                        continue
+                    historical_root = sessions / name
+                    old = _read_signed_record(
+                        historical_root / "session.json", signers=signers,
+                        root_owned_signers=root_owned_signers,
+                    )
+                    if old.get("session_id") != name or old.get("kind") != FIRST_PARTY_SESSION_KIND:
+                        raise ReviewExecutionRejected("previous signed session identity invalid")
+                    candidate = old.get("binding")
+                    if not isinstance(candidate, dict):
+                        raise ReviewExecutionRejected("previous signed session binding absent")
+                    revision_fields = (
+                        "repo", "pr", "base_sha", "head_sha", "diff_sha256",
+                        "review_purpose", "release_binding",
+                    )
+                    if not all(candidate.get(k) == decisive.get(k) for k in revision_fields):
+                        continue
+                    old_binding = _first_party_binding(candidate)
+                    if (
+                        old.get("schema_version") != 1
+                        or old.get("binding_sha256") != _digest(old_binding)
+                        or old.get("canonical_diff_sha256") != session["canonical_diff_sha256"]
+                        or old.get("source_raw_diff_sha256") != (
+                            _digest(old_binding["candidate_binding"])
+                            if old_binding["review_purpose"] == "frozen_candidate"
+                            else session["source_raw_diff_sha256"]
+                        )
+                        or old.get("changed_paths") != session["changed_paths"]
+                        or old.get("issuer_principal") != _first_party_principal(
+                            _validate_first_party_issuer(
+                                old.get("start_issuer"), expected_tool=FIRST_PARTY_TOOL_START,
+                            )
+                        )
+                    ):
+                        raise ReviewExecutionRejected("previous same-revision session origin invalid")
+                    old_reads = _load_first_party_reads(
+                        old, historical_root, signers=signers,
+                        root_owned_signers=root_owned_signers, repository=repository,
+                    )
+                    old_axes = _load_first_party_axes(
+                        old, historical_root, reads=old_reads, signers=signers,
+                        root_owned_signers=root_owned_signers,
+                    )
+                    for axis, old_axis in old_axes.items():
+                        if old_axis["report"]["verdict"] != "REJECT":
+                            continue
+                        latest = current_axes.get(axis)
+                        acknowledged = latest["report"]["findings"] if latest else []
+                        for finding in old_axis["report"]["findings"]:
+                            if finding["verdict"] != "UNRESOLVED":
+                                continue
+                            if not any(
+                                observed["id"] == finding["id"]
+                                and observed["severity"] == finding["severity"]
+                                and observed["verdict"] == "RESOLVED"
+                                and latest["submitted_at_unix"] >= old_axis["submitted_at_unix"]
+                                for observed in acknowledged
+                            ):
+                                raise ReviewExecutionRejected(
+                                    "previous signed material finding unresolved for same revision"
+                                )
         finally:
             os.close(fd)
-        if len(names) > 2048:
-            raise ReviewExecutionRejected("first-party session registry over bounded limit")
-        decisive = session["binding"]
-        for name in names:
-            if ID.fullmatch(name) is None:
-                raise ReviewExecutionRejected("first-party session registry name invalid")
-            if name == session["session_id"]:
-                continue
-            historical_root = sessions / name
-            old = _read_signed_record(
-                historical_root / "session.json", signers=signers,
-                root_owned_signers=root_owned_signers,
-            )
-            if old.get("session_id") != name or old.get("kind") != FIRST_PARTY_SESSION_KIND:
-                raise ReviewExecutionRejected("previous signed session identity invalid")
-            candidate = old.get("binding")
-            if not isinstance(candidate, dict):
-                raise ReviewExecutionRejected("previous signed session binding absent")
-            revision_fields = (
-                "repo", "pr", "base_sha", "head_sha", "diff_sha256",
-                "review_purpose", "release_binding",
-            )
-            if not all(candidate.get(k) == decisive.get(k) for k in revision_fields):
-                continue
-            old_binding = _first_party_binding(candidate)
-            if (
-                old.get("schema_version") != 1
-                or old.get("binding_sha256") != _digest(old_binding)
-                or old.get("canonical_diff_sha256") != session["canonical_diff_sha256"]
-                or old.get("source_raw_diff_sha256") != (
-                    _digest(old_binding["candidate_binding"])
-                    if old_binding["review_purpose"] == "frozen_candidate"
-                    else session["source_raw_diff_sha256"]
-                )
-                or old.get("changed_paths") != session["changed_paths"]
-                or old.get("issuer_principal") != _first_party_principal(
-                    _validate_first_party_issuer(
-                        old.get("start_issuer"), expected_tool=FIRST_PARTY_TOOL_START,
-                    )
-                )
-            ):
-                raise ReviewExecutionRejected("previous same-revision session origin invalid")
-            old_reads = _load_first_party_reads(
-                old, historical_root, signers=signers,
-                root_owned_signers=root_owned_signers, repository=repository,
-            )
-            old_axes = _load_first_party_axes(
-                old, historical_root, reads=old_reads, signers=signers,
-                root_owned_signers=root_owned_signers,
-            )
-            for axis, old_axis in old_axes.items():
-                if old_axis["report"]["verdict"] != "REJECT":
-                    continue
-                latest = current_axes.get(axis)
-                acknowledged = latest["report"]["findings"] if latest else []
-                for finding in old_axis["report"]["findings"]:
-                    if finding["verdict"] != "UNRESOLVED":
-                        continue
-                    if not any(
-                        observed["id"] == finding["id"]
-                        and observed["severity"] == finding["severity"]
-                        and observed["verdict"] == "RESOLVED"
-                        and latest["submitted_at_unix"] >= old_axis["submitted_at_unix"]
-                        for observed in acknowledged
-                    ):
-                        raise ReviewExecutionRejected(
-                            "previous signed material finding unresolved for same revision"
-                        )
     finally:
         _release_first_party_lock(lock)
 
@@ -1864,37 +1864,37 @@ def submit_first_party_axis_review(
         issuer, session, expected_tool=FIRST_PARTY_TOOL_SUBMIT,
     )
     signers = _allowed_signers(signers, root_owned=root_owned_signers)
-    worktree = _assert_first_party_source_current(session)
-    reads = _load_first_party_reads(
-        session, session_root, signers=signers,
-        root_owned_signers=root_owned_signers, repository=worktree,
-    )
-    existing = _load_first_party_axes(
-        session, session_root, reads=reads, signers=signers,
-        root_owned_signers=root_owned_signers,
-    )
-    axis = report.get("axis") if isinstance(report, dict) else None
-    if axis not in REQUIRED_AXES:
-        raise ReviewExecutionRejected("first-party submitted axis invalid")
-    if axis in existing:
-        raise ReviewExecutionRejected("first-party axis review duplicated")
-    prior_observations = {
-        observation
-        for item in existing.values()
-        for observation in item["report"]["axis_observations"]
-    }
-    normalized = _validate_first_party_report(
-        report, axis=axis, reads=reads, binding=session["binding"],
-        prior_observations=prior_observations,
-    )
-    record = {
-        "schema_version": 1, "kind": FIRST_PARTY_AXIS_KIND,
-        "session_id": session_id, "binding_sha256": session["binding_sha256"],
-        "axis": axis, "report": normalized, "report_sha256": _digest(normalized),
-        "issuer": authenticated, "submitted_at_unix": observed_at,
-    }
     lock = _first_party_lock(root)
     try:
+        worktree = _assert_first_party_source_current(session)
+        reads = _load_first_party_reads(
+            session, session_root, signers=signers,
+            root_owned_signers=root_owned_signers, repository=worktree,
+        )
+        existing = _load_first_party_axes(
+            session, session_root, reads=reads, signers=signers,
+            root_owned_signers=root_owned_signers,
+        )
+        axis = report.get("axis") if isinstance(report, dict) else None
+        if axis not in REQUIRED_AXES:
+            raise ReviewExecutionRejected("first-party submitted axis invalid")
+        if axis in existing:
+            raise ReviewExecutionRejected("first-party axis review duplicated")
+        prior_observations = {
+            observation
+            for item in existing.values()
+            for observation in item["report"]["axis_observations"]
+        }
+        normalized = _validate_first_party_report(
+            report, axis=axis, reads=reads, binding=session["binding"],
+            prior_observations=prior_observations,
+        )
+        record = {
+            "schema_version": 1, "kind": FIRST_PARTY_AXIS_KIND,
+            "session_id": session_id, "binding_sha256": session["binding_sha256"],
+            "axis": axis, "report": normalized, "report_sha256": _digest(normalized),
+            "issuer": authenticated, "submitted_at_unix": observed_at,
+        }
         axis_path = session_root / "axes" / (axis + ".json")
         if axis_path.exists():
             raise ReviewExecutionRejected("first-party axis review duplicated")

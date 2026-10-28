@@ -13,6 +13,8 @@ import sys
 import tempfile
 import time
 import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -619,6 +621,103 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
             root=self.state, key=self.key, signers=self.signers,
             root_owned_signers=False, now_unix=self.now,
         )
+
+    def test_concurrent_axes_validate_before_signing(self) -> None:
+        self._concurrent_axes(duplicate=True)
+
+    def test_concurrent_distinct_axes_remain_verifiable(self) -> None:
+        self._concurrent_axes(duplicate=False)
+
+    def _concurrent_axes(self, *, duplicate: bool) -> None:
+        plan = self._first_party_plan()
+        started = self._start_plan(plan)
+        reports = []
+        issuers = []
+        for number, axis in enumerate(review.REQUIRED_AXES[:2], 1):
+            lines = review._first_party_diff(self.repo, plan["binding"]).splitlines()
+            self._read(started, axis, "diff", "", "head", 1, len(lines))
+            first = self._read(started, axis, "source", self.source_path, "head", 1, 8)
+            second = self._read(started, axis, "source", self.source_path, "head", 9, 16)
+            report = self._report(axis, number, [first["source_ref"], second["source_ref"]])
+            if reports and duplicate:
+                report["axis_observations"] = reports[0]["axis_observations"][:]
+            reports.append(report)
+            issuers.append(self._issuer(review.FIRST_PARTY_TOOL_SUBMIT, {"report": report}))
+
+        # Both requests reach the exclusive-lock boundary before either enters.
+        # Validation outside that boundary therefore deterministically sees stale axes.
+        barrier = threading.Barrier(2)
+        original_lock = review._first_party_lock
+
+        def synchronized_lock(root, *, read_only=False):
+            if not read_only:
+                barrier.wait(timeout=20)
+            return original_lock(root, read_only=read_only)
+
+        def submit(number):
+            try:
+                return review.submit_first_party_axis_review(
+                    started["review_session_id"], started["session_nonce"],
+                    reports[number], issuers[number], root=self.state,
+                    key=self.key, signers=self.signers, root_owned_signers=False,
+                    now_unix=self.now,
+                )
+            except review.ReviewExecutionRejected as exc:
+                return exc
+
+        with mock.patch.object(review, "_first_party_lock", side_effect=synchronized_lock), \
+                mock.patch.object(review, "_write_signed_record", wraps=review._write_signed_record) as signed:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                results = list(pool.map(submit, range(2)))
+            self.assertEqual(1 if duplicate else 2, signed.call_count, results)
+        self.assertEqual(1 if duplicate else 2, sum(isinstance(item, dict) for item in results))
+        if duplicate:
+            loser = next(i for i, item in enumerate(results) if isinstance(item, Exception))
+            self.assertIn("observation", str(results[loser]))
+            # Reuse the already authenticated reads, with a fresh report and
+            # invocation. Repeating identical read arguments would be a replay.
+            reports[loser] = self._report(
+                review.REQUIRED_AXES[loser], 11, reports[loser]["evidence_refs"],
+            )
+            issuers[loser] = self._issuer(review.FIRST_PARTY_TOOL_SUBMIT, {"report": reports[loser]})
+            self.assertEqual("axis_accepted", submit(loser)["status"])
+        else:
+            self.assertEqual([1, 2], sorted(item["accepted_axis_count"] for item in results))
+        # The surviving signed axis is verifiable; fresh, distinct observations
+        # can complete every other axis in the same session.
+        for number, axis in enumerate(review.REQUIRED_AXES[2:], 3):
+            self._submit_axis(started, axis, number)
+        audit, receipts = self._seal_direct(plan)
+        self.assertEqual([], self._receipt_errors(audit, receipts))
+
+    def test_history_over_2048_authentic_unrelated_sessions(self) -> None:
+        plan = self._first_party_plan()
+        started = self._start_plan(plan)
+        session_root = self.state / "sessions" / started["review_session_id"]
+        original = review._read_signed_record(
+            session_root / "session.json", signers=self.signers, root_owned_signers=False,
+        )
+        for number in range(2049):
+            old = copy.deepcopy(original)
+            old["session_id"] = f"{number:032x}"
+            old["binding"]["pr"] += number + 1
+            old["binding_sha256"] = review._digest(old["binding"])
+            directory = self.state / "sessions" / old["session_id"]
+            directory.mkdir(mode=0o700)
+            review._write_signed_record(
+                directory / "session.json", old, key=self.key, signers=self.signers,
+            )
+        for number, axis in enumerate(review.REQUIRED_AXES, 1):
+            self._submit_axis(started, axis, number)
+        audit, receipts = self._seal_direct(plan)
+        self.assertEqual([], self._receipt_errors(audit, receipts))
+
+        # A partial historical same-revision session still blocks after that
+        # unrelated history; there is no unsigned index or count-based bypass.
+        rejected = self._start_plan(self._first_party_plan())
+        self._submit_axis(rejected, review.REQUIRED_AXES[0], 1, reject=True)
+        with self.assertRaisesRegex(review.ReviewExecutionRejected, "previous signed material"):
+            self._seal_direct(plan)
 
     def test_prior_signed_material_reject_remains_blocking_across_batches(self) -> None:
         # No change to Git source, PR or canonical diff between batches.
