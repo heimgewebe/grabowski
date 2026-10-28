@@ -7265,7 +7265,9 @@ def grabowski_self_review_session_start(
     workspace_id: str | None = None,
 ) -> dict[str, Any]:
     """Start a stored-plan review, or derive a frozen Candidate with workspace_id and an empty batch ID."""
-    _require_capability("file_write")
+    _require_mutations_enabled(
+        "file_write", path=str(self_review_execution.FIRST_PARTY_REVIEW_ROOT),
+    )
     arguments = {
         "review_batch_id": review_batch_id,
         "reason": reason,
@@ -7305,7 +7307,9 @@ def grabowski_self_review_source_read(
     ctx: Context | None = None,
 ) -> dict[str, Any]:
     """Read and persist exact immutable Git bytes for one semantic axis."""
-    _require_capability("file_write")
+    _require_mutations_enabled(
+        "file_write", path=str(self_review_execution.FIRST_PARTY_REVIEW_ROOT),
+    )
     arguments = {
         "review_session_id": review_session_id,
         "session_nonce": session_nonce,
@@ -7340,7 +7344,9 @@ def grabowski_self_review_axis_submit(
     ctx: Context | None = None,
 ) -> dict[str, Any]:
     """Persist a substantive axis verdict; report={"finalize": true} seals a five-axis Candidate handoff."""
-    _require_capability("file_write")
+    _require_mutations_enabled(
+        "file_write", path=str(self_review_execution.FIRST_PARTY_REVIEW_ROOT),
+    )
     arguments = {
         "review_session_id": review_session_id,
         "session_nonce": session_nonce,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 import asyncio
+from contextlib import contextmanager
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 
@@ -13926,6 +13927,52 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertEqual(["merge", "squash", "rebase"], execution["merge_policy"]["allowed_methods"])
         self.assertEqual([], execution["automatic_platform_effects"])
         self.assertEqual("not_evaluated", execution["effect_scope_decision"]["decision"])
+
+    def test_captain_merge_dispatch_remains_inside_first_party_signer_guard(self) -> None:
+        parameters = captain_parameters(
+            trusted_owner_mode=True,
+            autonomy_policy=grips.CAPTAIN_TRUSTED_OWNER_AUTONOMY_POLICY,
+            allow_execution=True,
+        )
+        parameters.pop("human_authorization")
+        parameters.pop("execution_authority")
+        parameters["execution_intent"] = captain_execution_intent(parameters)
+        observations = {"entered": False, "during_dispatch": False, "left": False}
+
+        @contextmanager
+        def witness(review_evidence):
+            self.assertIs(review_evidence, parameters["review_evidence"])
+            observations["entered"] = True
+            try:
+                yield
+            finally:
+                observations["left"] = True
+
+        class ProbeGh(FakeGh):
+            def __call__(self, repo, args):
+                if args[:2] == ["pr", "merge"]:
+                    observations["during_dispatch"] = (
+                        observations["entered"] and not observations["left"]
+                    )
+                return super().__call__(repo, args)
+
+        gh = ProbeGh(view={
+            "number": 96, "state": "OPEN", "baseRefName": "main",
+            "headRefName": "feat/captain", "headRefOid": CAPTAIN_HEAD,
+            "isDraft": False, "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
+        })
+        with patch.object(
+            merge_guard, "_first_party_merge_signer_snapshot_guard",
+            side_effect=witness,
+        ):
+            result = grips.grip_run(
+                "captain-run", parameters, profile="captain",
+                allow_mutation=True, command_runner=FakeGit(), github_runner=gh,
+            )
+        self.assertEqual(result["status"], "passed")
+        self.assertTrue(observations["entered"])
+        self.assertTrue(observations["during_dispatch"])
+        self.assertTrue(observations["left"])
 
     def test_captain_run_treats_exact_merge_queue_entry_as_scheduled_after_dispatch(self) -> None:
         parameters = authorized_captain_run_parameters()

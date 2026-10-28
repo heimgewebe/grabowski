@@ -5589,6 +5589,35 @@ def _role_retry_state(
     return {**raw, "count": count, "attempts": list(attempts)}, None
 
 
+def _role_recovery_attempts_used(
+    manifest: dict[str, Any], role: str, retry_state: dict[str, Any],
+) -> int:
+    """Count actual retries; the first frozen-Candidate handoff is attempt one.
+
+    Keep the complete attempt ledger for exact command/receipt provenance.
+    Only the authenticated initial pending-controller handoff is exempt from
+    the recovery budget; subsequent environmental retries remain counted.
+    """
+    count = retry_state["count"]
+    if (
+        role != "review"
+        or manifest.get("commands", {}).get("review")
+        != list(CONTROLLER_SELF_REVIEW_PENDING_ARGV)
+        or not retry_state["attempts"]
+    ):
+        return count
+    first = retry_state["attempts"][0]
+    if (
+        first.get("attempt") == 1
+        and first.get("selected_final_attempt") == 1
+        and first.get("previous_task_id") is None
+        and first.get("previous_failure_classification") == "controller_self_review_pending"
+        and first.get("retry_reason") == "controller_self_review_optional_role_handoff"
+    ):
+        return count - 1
+    return count
+
+
 def _status_role_retry(manifest: dict[str, Any], *, read_only: bool = False) -> dict[str, Any]:
     frozen = manifest.get("frozen_writer")
     result: dict[str, Any] = {}
@@ -5610,7 +5639,7 @@ def _status_role_retry(manifest: dict[str, Any], *, read_only: bool = False) -> 
                 **detail,
             }
             continue
-        retries_used = role_retry_state["count"]
+        retries_used = _role_recovery_attempts_used(manifest, role_name, role_retry_state)
         eligible = classification == "eligible" and retries_used < MAX_ROLE_RETRIES
         effective_classification = classification
         if classification == "eligible" and not eligible:
@@ -10002,7 +10031,6 @@ def grabowski_agent_workspace_role_retry(
             role_name == "review"
             and manifest.get("commands", {}).get("review")
             == list(CONTROLLER_SELF_REVIEW_PENDING_ARGV)
-            and manifest.get("tasks", {}).get("review") is None
         ):
             # Optional explicit recovery via an actual pinned review-only
             # catalogue model. Never let a caller's Python one-liner claim
@@ -10075,7 +10103,7 @@ def grabowski_agent_workspace_role_retry(
                 "retry_status": "blocked",
             }
         retries = dict(manifest.get("role_retries", {}))
-        if role_retry_state["count"] >= MAX_ROLE_RETRIES:
+        if _role_recovery_attempts_used(manifest, role_name, role_retry_state) >= MAX_ROLE_RETRIES:
             return {
                 "workspace_id": identifier,
                 "role": role_name,
@@ -10234,6 +10262,8 @@ def grabowski_agent_workspace_role_retry(
             "new_task_id": public["task_id"],
             "selected_final_attempt": attempt_number,
         }
+        # Every concrete attempt retains its exact replacement-command hash,
+        # even when the initial pending handoff costs no recovery allowance.
         role_retry_state["count"] += 1
         role_retry_state["attempts"] = [*role_retry_state["attempts"], attempt_record]
         retries[role_name] = role_retry_state

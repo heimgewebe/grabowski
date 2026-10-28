@@ -8,6 +8,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor
 import types
 import unittest
 from unittest import mock
@@ -43,6 +45,66 @@ if "mcp" not in sys.modules:
 
 import grabowski_merge_guard as merge_guard  # noqa: E402
 import grabowski_resources as resources  # noqa: E402
+
+
+class FirstPartyMergeLockTests(unittest.TestCase):
+    def test_final_merge_evidence_window_blocks_late_signed_reject(self) -> None:
+        # A signed review writer needs the exclusive receipt lock. Captain's
+        # final source check and external merge dispatch must pin a shared
+        # lock over the entire decision window, not just the readback.
+        import grabowski_self_review_execution as source
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder) / "first-party-state"
+            fd = source._first_party_lock(root)
+            source._release_first_party_lock(fd)
+            with mock.patch.object(source, "FIRST_PARTY_REVIEW_ROOT", root):
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    with merge_guard._first_party_merge_signer_snapshot_guard({
+                        "review_origin": source.FIRST_PARTY_AUDIT_ORIGIN,
+                    }):
+                        started = threading.Event()
+                        def signer():
+                            started.set()
+                            signed = source._first_party_lock(root)
+                            try:
+                                return "exclusive-signer-admitted"
+                            finally:
+                                source._release_first_party_lock(signed)
+                        future = pool.submit(signer)
+                        self.assertTrue(started.wait(2))
+                        self.assertFalse(future.done(), "a material REJECT could be signed during merge dispatch")
+                    self.assertEqual(future.result(timeout=3), "exclusive-signer-admitted")
+
+    def test_legacy_high_critical_merge_cannot_skip_new_signed_reject(self) -> None:
+        # Legacy V2 audits ALSO check first-party historical REJECTs, so their
+        # final merge dispatch must serialize with authentic receipt writers.
+        import grabowski_self_review_execution as source
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder) / "first-party-not-yet-initialized"
+            with mock.patch.object(source, "FIRST_PARTY_REVIEW_ROOT", root):
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    with merge_guard._first_party_merge_signer_snapshot_guard({
+                        "review_tier": "high_critical",
+                    }):
+                        self.assertTrue((root / ".lock").is_file())
+                        started = threading.Event()
+                        def submit_material_reject():
+                            started.set()
+                            fd = source._first_party_lock(root)
+                            try:
+                                return "late-signed-reject-serialized"
+                            finally:
+                                source._release_first_party_lock(fd)
+                        future = pool.submit(submit_material_reject)
+                        self.assertTrue(started.wait(2))
+                        from concurrent.futures import TimeoutError as FutureTimeout
+                        with self.assertRaises(FutureTimeout):
+                            future.result(timeout=0.15)
+                    self.assertEqual(future.result(timeout=3), "late-signed-reject-serialized")
+
+    def test_non_first_party_merge_review_does_not_require_private_signer_root(self) -> None:
+        with merge_guard._first_party_merge_signer_snapshot_guard({}):
+            pass
 
 
 class _PagedFilesGh:
