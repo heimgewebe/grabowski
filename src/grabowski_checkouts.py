@@ -1182,13 +1182,9 @@ def _reserve_checkout_lifecycle(
             live_leases=live_leases,
         )
         limit = _phase_limit("active")
-        existing_consumes_capacity = (
-            existing is not None
-            and _active_lifecycle_consumes_capacity(
-                existing, now=now, live_leases=live_leases,
-            )
-        )
-        if count >= limit and not existing_consumes_capacity:
+        # The count excludes the candidate checkout. A returning lease cannot
+        # exempt a separate 17th active writer when every other slot is full.
+        if count >= limit:
             raise RuntimeError(
                 f"Per-repository active checkout limit reached: active={count} limit={limit}"
             )

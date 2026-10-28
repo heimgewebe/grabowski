@@ -597,14 +597,8 @@ def _active_slot_available(
         requested_checkout, now=now, live_leases=live_leases,
     ):
         return
-    if (
-        lifecycle is not None
-        and lifecycle.get("phase") == "active"
-        and checkouts._active_lifecycle_consumes_capacity(
-            lifecycle, now=now, live_leases=live_leases,
-        )
-    ):
-        return
+    # The candidate is excluded from the count below. Even an existing active
+    # lifecycle cannot bypass the capacity of all *other* live checkouts.
     count = checkouts._active_creation_count(
         connection,
         repo_common_dir=Path(inputs["repo_common_dir"]),
