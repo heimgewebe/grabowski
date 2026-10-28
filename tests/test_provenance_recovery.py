@@ -2693,6 +2693,58 @@ class PersistedCutoverRecoveryHandoffTests(unittest.TestCase):
         self.assertEqual(resume["inflight_deploy_jobs"], [])
         self.assertEqual(resume["recovery_handoff_units"], units)
 
+
+    def test_completed_set_of_original_noeffect_and_progressed_jobs_only_handoffs_to_recovery(self):
+        """Three authentic old jobs may yield together, never individually.
+
+        A no-effect S0 job and a later progressed retry remain indexed until
+        completion. Ordinary deployments see them all, but fresh S1–S4 resume
+        must be able to proceed when every historical blocker authenticates.
+        """
+        old_noeffect = "grabowski-job-555555555555"
+        progressed = "grabowski-job-666666666666"
+        units = [self.UNIT, old_noeffect, progressed]
+        for progressed_authentic in (True, False):
+            with (
+                self.subTest(progressed_authentic=progressed_authentic),
+                patch.object(
+                    provenance_recovery.self_deploy,
+                    "inflight_runtime_job_evidence",
+                    return_value=self._projection(units), create=True,
+                ),
+                patch.object(
+                    provenance_recovery.self_deploy,
+                    "_indexed_failed_deploy_is_cutover_handoff",
+                    side_effect=lambda unit, _: unit == self.UNIT,
+                    create=True,
+                ),
+                patch.object(
+                    provenance_recovery.self_deploy,
+                    "_indexed_failed_resume_is_noeffect_handoff",
+                    side_effect=lambda unit, _: unit == old_noeffect,
+                    create=True,
+                ),
+                patch.object(
+                    provenance_recovery.self_deploy,
+                    "_indexed_failed_scheduled_resume_is_handoff",
+                    side_effect=lambda unit, _: (
+                        unit == progressed and progressed_authentic
+                    ), create=True,
+                ),
+            ):
+                ordinary = provenance_recovery._competing_deployment_evidence()
+                resume = provenance_recovery._competing_deployment_evidence(
+                    resume_binding=self.BINDING
+                )
+            self.assertEqual(ordinary["inflight_deploy_jobs"], units)
+            self.assertEqual(ordinary["recovery_handoff_units"], [])
+            if progressed_authentic:
+                self.assertEqual(resume["inflight_deploy_jobs"], [])
+                self.assertEqual(resume["recovery_handoff_units"], units)
+            else:
+                self.assertEqual(resume["inflight_deploy_jobs"], units)
+                self.assertEqual(resume["recovery_handoff_units"], [])
+
     def test_one_invalid_resume_in_a_two_job_handoff_blocks_everything(self):
         resumed_unit = "grabowski-job-555555555555"
         units = [self.UNIT, resumed_unit]

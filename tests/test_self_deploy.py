@@ -12011,6 +12011,51 @@ class PersistedUnknownCutoverHandoffSecurityTests(unittest.TestCase):
                     "old signed failed S0 resume should retire once real lineage completed",
                 )
                 completed_path.unlink()
+                # Genuine second attempt has reached S0 and produced a
+                # nonterminal effectful receipt. The old effect-free S0 job
+                # must yield to a fresh later-phase classification.
+                progressed = fixture.resume_receipt(
+                    resume_id="bgcr-progressed-after-old-noeffect",
+                    resume_phase=SELF_DEPLOY.midcutover.PHASE_REBIND_SNAPSHOT,
+                )
+                progressed.update({
+                    "outcome": "outcome_unknown",
+                    "phase": "outcome_unknown",
+                    "snapshot_rebind": {
+                        "rebound": True, "receipt_sha256": "a1" * 32,
+                    },
+                    "recovery": {
+                        "action": "readback_active_runtime_and_recover",
+                        "automatic_rollback_forbidden": True,
+                        "blue_rollback_forbidden": True,
+                        "snapshot_rebind_applied": True,
+                        "fresh_classification_required": True,
+                        "blind_retry_allowed": False,
+                    },
+                })
+                progressed["receipt_sha256"] = SELF_DEPLOY._sha256_json({
+                    k: v for k, v in progressed.items() if k != "receipt_sha256"
+                })
+                progressed_path = cutovers / (progressed["resume_id"] + ".json")
+                progressed_path.write_text(json.dumps(progressed), encoding="utf-8")
+                progressed_path.chmod(0o600)
+                self.assertFalse(
+                    SELF_DEPLOY._verified_runtime_terminal_receipt(
+                        entry, metadata, command, status
+                    ),
+                    "later progressed attempt is not completed lineage",
+                )
+                for new_phase in SELF_DEPLOY.midcutover.RESUME_PHASES[1:]:
+                    with self.subTest(fresh_phase=new_phase):
+                        later_binding = fixture.resume_receipt(
+                            resume_phase=new_phase
+                        )["resume_binding"]
+                        self.assertTrue(
+                            SELF_DEPLOY._indexed_failed_resume_is_noeffect_handoff(
+                                unit, later_binding
+                            ),
+                            "an old effect-free S0 job must allow fresh S1-S4",
+                        )
                 for drift in (
                     {"source_identity_sha256": "1" * 64},
                     {"resume_phase": SELF_DEPLOY.midcutover.PHASE_PROMOTE_POINTER},

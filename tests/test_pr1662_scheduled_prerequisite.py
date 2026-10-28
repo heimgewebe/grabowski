@@ -16,7 +16,10 @@ RUNNER = source.RUNNER
 class ScheduledPrerequisiteResumeFailure(unittest.TestCase):
     def test_persisted_failed_prerequisite_resume_is_recovery_only(self):
         phases = SD.midcutover.RESUME_PHASES
-        cases = ((False, phases[0], phases[0]),) + tuple(
+        # A no-effect S0 job remains indexed even after another authentic
+        # retry advances S0. Every later freshly classified phase must still
+        # be eligible for recovery, never for ordinary deployment.
+        cases = tuple((False, phases[0], phase) for phase in phases) + tuple(
             (True, phases[index], phases[index + 1])
             for index in range(len(phases) - 1)
         )
@@ -62,7 +65,9 @@ class ScheduledPrerequisiteResumeFailure(unittest.TestCase):
                         "effect_terminalization",
                     ):
                         attempt[key] = None
-                    current = old
+                    current = fixture.resume_receipt(
+                        resume_phase=next_phase
+                    )["resume_binding"]
                     failure = "MidCutoverResumeFailedPreResume"
                 attempt["receipt_sha256"] = SD._sha256_json({
                     k: v for k, v in attempt.items() if k != "receipt_sha256"
@@ -79,8 +84,42 @@ class ScheduledPrerequisiteResumeFailure(unittest.TestCase):
                     path = receipts_dir / (value[key] + ".json")
                     path.write_text(json.dumps(value), encoding="utf-8")
                     path.chmod(0o600)
+                if not progressed and next_phase != phases[0]:
+                    # Real persisted later progressed attempt for the *same*
+                    # original cutover; this is not a fabricated completed
+                    # lineage and cannot itself terminalize the old S0 job.
+                    progressed_attempt = fixture.resume_receipt(
+                        resume_id="bgcr-followup-progressed-after-noeffect-s0",
+                        resume_phase=phases[0],
+                    )
+                    progressed_attempt.update({
+                        "outcome": "outcome_unknown",
+                        "phase": "outcome_unknown",
+                        "snapshot_rebind": {
+                            "rebound": True, "receipt_sha256": "a1" * 32,
+                        },
+                        "recovery": {
+                            "action": "readback_active_runtime_and_recover",
+                            "automatic_rollback_forbidden": True,
+                            "blue_rollback_forbidden": True,
+                            "snapshot_rebind_applied": True,
+                            "fresh_classification_required": True,
+                            "blind_retry_allowed": False,
+                        },
+                    })
+                    progressed_attempt["receipt_sha256"] = SD._sha256_json({
+                        k: v for k, v in progressed_attempt.items()
+                        if k != "receipt_sha256"
+                    })
+                    progressed_path = receipts_dir / (
+                        progressed_attempt["resume_id"] + ".json"
+                    )
+                    progressed_path.write_text(
+                        json.dumps(progressed_attempt), encoding="utf-8"
+                    )
+                    progressed_path.chmod(0o600)
                 attempt_path = receipts_dir / (attempt["resume_id"] + ".json")
-                repo = Path("/home/alex/repos/grabowski")
+                repo = SD.CANONICAL_REPOSITORY
                 command = SD._deploy_command(
                     repo, repo / SD.RUNNER_RELATIVE_PATH, fixture.HEAD_GREEN, 8,
                     source_identity_sha256=fixture.SOURCE_IDENTITY_SHA256,

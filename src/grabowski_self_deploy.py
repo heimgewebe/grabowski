@@ -2571,7 +2571,10 @@ def _indexed_failed_scheduled_resume_is_handoff(
         past_phase = prior.get("resume_phase")
         current_phase = resume_binding.get("resume_phase")
         if prior.get("outcome") == "failed_pre_resume":
-            return current_phase == midcutover.PHASE_REBIND_SNAPSHOT
+            # The old attempt was authentically effect-free at S0. Its
+            # retirement awaits completed lineage, but it must yield to a
+            # FRESHLY classified S1-S4 after a different retry progressed.
+            return current_phase in midcutover.RESUME_PHASES
         return bool(
             past_phase in midcutover.RESUME_PHASES
             and current_phase in midcutover.RESUME_PHASES[1:]
@@ -2678,7 +2681,7 @@ def _private_failed_resume_summary(entry: Path) -> dict[str, Any] | None:
 def _indexed_failed_resume_is_noeffect_handoff(
     unit: str, resume_binding: dict[str, Any],
 ) -> bool:
-    """Exclude only a proven no-effect attempt for this exact current S0 resume.
+    """Exclude only a proven no-effect S0 attempt from its exact recovery.
 
     The original post-switch cutover remains unresolved, so normal deployment
     remains blocked. A current durable reclassification is compulsory; the
@@ -2750,6 +2753,9 @@ def _indexed_failed_resume_is_noeffect_handoff(
             or cutover.get("receipt_sha256") != resume_binding.get("resumed_receipt_sha256")
             or cutover.get("expected_head") != resume_binding.get("expected_head")
             or cutover.get("source_identity_sha256") != resume_binding.get("source_identity_sha256")
+            or cutover.get("cutover_generation") != resume_binding.get("cutover_generation")
+            or cutover.get("blue_release_id") != resume_binding.get("blue_release_id")
+            or cutover.get("green_release_id") != resume_binding.get("expected_release_id")
         ):
             return False
         matches = [
@@ -2785,7 +2791,7 @@ def _indexed_failed_resume_is_noeffect_handoff(
         recovery = receipt.get("recovery")
         if receipt.get("outcome") == "failed_pre_resume":
             return bool(
-                resume_binding.get("resume_phase") == midcutover.PHASE_REBIND_SNAPSHOT
+                resume_binding.get("resume_phase") in midcutover.RESUME_PHASES
                 and receipt.get("phase") == "failed_pre_resume"
                 and receipt.get("resume_phase") == midcutover.PHASE_REBIND_SNAPSHOT
                 and isinstance(recovery, dict)
