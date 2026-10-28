@@ -1599,6 +1599,24 @@ def _authenticated_failed_runtime_reason(
     return reason if isinstance(reason, str) and 0 < len(reason) <= 200 else None
 
 
+def _same_cutover_has_unresolved_post_switch(
+    receipts: list[dict[str, Any]], cutover: dict[str, Any],
+) -> bool:
+    """Check an old job's own conflict; another cutover stays its own blocker.
+
+    Every caller authenticates its old private receipt independently. A later
+    unknown B is still indexed and recoverable, not a reason to resurrect A.
+    Missing identity is ambiguous and deliberately remains nonterminal.
+    """
+    cutover_id = cutover.get("cutover_id") if isinstance(cutover, dict) else None
+    if not isinstance(cutover_id, str) or not cutover_id:
+        return True
+    return any(
+        item.get("cutover_id") == cutover_id
+        for item in midcutover.unresolved_post_switch_receipts(receipts)
+    )
+
+
 def _authentic_completed_cutover_remains_settled(
     failure_type: str, execution_head: str
 ) -> bool:
@@ -1620,7 +1638,7 @@ def _authentic_completed_cutover_remains_settled(
         if loaded.get("unreadable") or not loaded.get("present"):
             return False
         receipts = loaded.get("receipts")
-        if not isinstance(receipts, list) or midcutover.unresolved_post_switch_receipts(receipts):
+        if not isinstance(receipts, list):
             return False
         for original in receipts:
             if not isinstance(original, dict) or original.get("kind") != BLUE_GREEN_RECEIPT_KIND:
@@ -1642,7 +1660,9 @@ def _authentic_completed_cutover_remains_settled(
                     if failure_type == (
                         "MidCutoverPrerequisiteRecovered:" + _sha256_json(material)
                     ):
-                        return True
+                        return not _same_cutover_has_unresolved_post_switch(
+                            receipts, original
+                        )
     except (OSError, RuntimeError, ValueError, midcutover.MidCutoverEvidenceError):
         return False
     return False
@@ -1813,10 +1833,7 @@ def _signed_failed_pre_cutover_is_terminal(
             and isinstance(recovery.get("error"), dict)
             and bool(recovery["error"])
             # A later independent unknown B cannot undo proven no-effect A.
-            and not any(
-                item.get("cutover_id") == cutover.get("cutover_id")
-                for item in midcutover.unresolved_post_switch_receipts(receipts)
-            )
+            and not _same_cutover_has_unresolved_post_switch(receipts, cutover)
         )
     except (OSError, RuntimeError, ValueError, midcutover.MidCutoverEvidenceError):
         return False
@@ -1897,10 +1914,7 @@ def _signed_clean_blue_rollback_is_terminal(
             and ingress.get("release_id") == cutover.get("blue_release_id")
             and selector.get("repo_head") == ingress.get("repo_head")
             # Historical rollback A cannot depend on unrelated cutover B.
-            and not any(
-                receipt.get("cutover_id") == cutover.get("cutover_id")
-                for receipt in midcutover.unresolved_post_switch_receipts(receipts)
-            )
+            and not _same_cutover_has_unresolved_post_switch(receipts, cutover)
         )
     except (OSError, RuntimeError, ValueError, midcutover.MidCutoverEvidenceError):
         return False
@@ -1937,7 +1951,7 @@ def _completed_cutover_routing_is_authentic(
             or readback.get("readback_sha256") != _sha256_json({
                 k: v for k, v in readback.items() if k != "readback_sha256"
             })
-            or midcutover.unresolved_post_switch_receipts(receipts)
+            or _same_cutover_has_unresolved_post_switch(receipts, cutover)
         ):
             return False
         for channel in (routing, readback.get("selector"), readback.get("ingress")):
@@ -1985,7 +1999,7 @@ def _completed_resumed_successor_routing_is_authentic(
                 original.get("green_release_id"), original.get("expected_head")
             )
             or not midcutover._lineage_resolved(receipts, original)
-            or midcutover.unresolved_post_switch_receipts(receipts)
+            or _same_cutover_has_unresolved_post_switch(receipts, original)
         ):
             return False
         completed: list[dict[str, Any]] = []
@@ -2493,7 +2507,7 @@ def _failed_resume_job_is_settled(
                     )
                 )
             )
-            or midcutover.unresolved_post_switch_receipts(receipts)
+            or _same_cutover_has_unresolved_post_switch(receipts, original)
         ):
             return False
         return midcutover._lineage_resolved(receipts, original)
@@ -2712,7 +2726,7 @@ def _verified_runtime_terminal_receipt(
             if proven_resume is not None:
                 original, _old_attempt, receipts = proven_resume
                 return bool(
-                    not midcutover.unresolved_post_switch_receipts(receipts)
+                    not _same_cutover_has_unresolved_post_switch(receipts, original)
                     and midcutover._lineage_resolved(receipts, original)
                 )
         # A persisted failed_pre_cutover receipt proves the switch was never
@@ -2748,7 +2762,7 @@ def _verified_runtime_terminal_receipt(
             return _signed_clean_blue_rollback_is_terminal(cutover, receipts)
         return (
             cutover.get("outcome") == "outcome_unknown"
-            and not midcutover.unresolved_post_switch_receipts(receipts)
+            and not _same_cutover_has_unresolved_post_switch(receipts, cutover)
             and midcutover._lineage_resolved(receipts, cutover)
         )
 

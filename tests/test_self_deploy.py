@@ -11516,6 +11516,40 @@ class P1ActualRuntimeReceiptLineageTests(unittest.TestCase):
             self.assertTrue(SELF_DEPLOY._verified_runtime_terminal_receipt(
                 entry, metadata, argv, status
             ))
+        # The later unrelated unknown B stays open but must not revoke the
+        # independently completed and SHA-bound prerequisite recovery A.
+        foreign = fixture.cutover_receipt(
+            cutover_id="bgc-later-foreign-after-prerequisite",
+            outcome="outcome_unknown", phase="outcome_unknown",
+        )
+        receipts_with_foreign = [cutover, resumed, foreign]
+        self.assertTrue(SELF_DEPLOY.midcutover._lineage_resolved(
+            receipts_with_foreign, cutover
+        ))
+        self.assertEqual(
+            [foreign["cutover_id"]],
+            [item["cutover_id"] for item in
+             SELF_DEPLOY.midcutover.unresolved_post_switch_receipts(
+                 receipts_with_foreign
+             )],
+            "B is still a real unresolved cutover",
+        )
+        with mock.patch.object(
+            SELF_DEPLOY, "_authenticated_failed_runtime_reason",
+            return_value=exact_failure_type,
+        ), mock.patch.object(
+            SELF_DEPLOY.midcutover, "load_receipts",
+            return_value={
+                "receipts": receipts_with_foreign,
+                "present": True, "unreadable": [],
+            },
+        ):
+            self.assertTrue(
+                SELF_DEPLOY._verified_runtime_terminal_receipt(
+                    entry, metadata, argv, status
+                ),
+                "completed prerequisite A must stay terminal during unrelated B",
+            )
         for evidence in (
             {"receipts": [cutover], "present": True, "unreadable": []},
             {
@@ -11794,11 +11828,19 @@ class PersistedUnknownCutoverHandoffSecurityTests(unittest.TestCase):
                 foreign_path = cutovers / (foreign["cutover_id"] + ".json")
                 foreign_path.write_text(json.dumps(foreign), encoding="utf-8")
                 foreign_path.chmod(0o600)
-                self.assertFalse(
+                self.assertEqual(
+                    [foreign["cutover_id"]],
+                    [r["cutover_id"] for r in
+                     SELF_DEPLOY.midcutover.unresolved_post_switch_receipts(
+                         current_receipts()["receipts"]
+                     )],
+                    "foreign B must remain unresolved",
+                )
+                self.assertTrue(
                     SELF_DEPLOY._verified_runtime_terminal_receipt(
                         entry, metadata, command, status
                     ),
-                    "one resolved lineage must not hide another unresolved cutover",
+                    "authenticated resolved A must remain terminal while B is unresolved",
                 )
                 foreign_path.unlink()
                 # RED regression for a fully rolled-back, receipt-persisted
