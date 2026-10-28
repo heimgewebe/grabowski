@@ -387,5 +387,330 @@ class FailedPreCutoverDeployTerminalityTests(unittest.TestCase):
         self.assertFalse(self._check(status, raw))
 
 
+class AmbiguousS0RecoveryHandoffTests(unittest.TestCase):
+    """An unreadable cold snapshot is not an effect or permission to deploy."""
+
+    def test_cold_unreadable_s0_can_only_yield_to_same_cutover_fresh_recovery(self) -> None:
+        import json
+        import sys
+        import test_midcutover_resume as fixture
+        tool_dir = Path(__file__).resolve().parents[1] / "tools"
+        if str(tool_dir) not in sys.path:
+            sys.path.insert(0, str(tool_dir))
+        import run_midcutover_resume as resume_runner
+
+        original = fixture.cutover_receipt()
+        attempt = fixture.resume_receipt(
+            resume_phase=DEPLOY.midcutover.PHASE_REBIND_SNAPSHOT
+        )
+        binding = attempt["resume_binding"]
+        attempt.update({
+            "outcome": "outcome_unknown", "phase": "outcome_unknown",
+            "snapshot_rebind": None, "pointer_promotion": None,
+            "selector_switch": None, "canonical_operator": None,
+            "retirement": None, "effect_terminalization": None,
+            "final_routing": None,
+            "admission_state": None, "final_state": None,
+            "authoritative_readback": None,
+            "recovery": {
+                "action": "readback_active_runtime_and_recover",
+                "automatic_rollback_forbidden": True,
+                "blue_rollback_forbidden": True,
+                "snapshot_binding_state": DEPLOY.midcutover.SNAPSHOT_BINDING_UNREADABLE,
+                "snapshot_rebind_applied": False,
+                "pointer_promoted": False, "canonical_selected": False,
+                "snapshot_rollback_forbidden": False,
+                "blind_retry_allowed": False,
+                "fresh_classification_required": True,
+                "error": {"type": "ColdSnapshotReadbackError"},
+            },
+        })
+        attempt["receipt_sha256"] = DEPLOY._sha256_json({
+            k: v for k, v in attempt.items() if k != "receipt_sha256"
+        })
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            jobs = root / "jobs"
+            receipts_dir = root / "receipts"
+            jobs.mkdir(mode=0o700)
+            receipts_dir.mkdir(mode=0o700)
+            unit = "grabowski-job-123a456b789c"
+            entry = jobs / unit
+            entry.mkdir(mode=0o700)
+            for receipt in (original, attempt):
+                name = receipt.get("cutover_id") or receipt["resume_id"]
+                path = receipts_dir / (name + ".json")
+                path.write_text(json.dumps(receipt), encoding="utf-8")
+                path.chmod(0o600)
+            summary = resume_runner._resume_summary({
+                "receipt": attempt,
+                "receipt_path": str(receipts_dir / (attempt["resume_id"] + ".json")),
+                "receipt_persisted": True,
+            })
+            fields = {
+                "cutover_id": original["cutover_id"],
+                "expected_head": original["expected_head"],
+                "repository": "/home/alex/repos/grabowski",
+                "resume_binding_sha256": binding["binding_sha256"],
+            }
+            metadata = {"final_status": "failed"}
+            status = {"final_status": "failed"}
+            scheduled = {
+                "repo": fields["repository"],
+                "expected_head": fields["expected_head"],
+                "cutover_id": fields["cutover_id"],
+                "resume_binding_sha256": fields["resume_binding_sha256"],
+            }
+            loader = DEPLOY.midcutover.load_receipts
+            with (
+                mock.patch.object(DEPLOY.operator, "_jobs_root", return_value=jobs),
+                mock.patch.object(DEPLOY, "_deploy_index",
+                                  return_value={"units": [unit], "pending_unit": None}),
+                mock.patch.object(DEPLOY, "_classify_indexed_job",
+                                  return_value={"kind": "midcutover_resume",
+                                                "terminal": False, "status": status,
+                                                "metadata": metadata, "fields": fields}),
+                mock.patch.object(DEPLOY, "_private_failed_resume_summary",
+                                  return_value={"scheduled": scheduled, "summary": summary}),
+                mock.patch.object(DEPLOY.midcutover, "load_receipts",
+                                  side_effect=lambda: loader(receipts_dir)),
+            ):
+                self.assertTrue(
+                    DEPLOY._indexed_failed_resume_is_noeffect_handoff(unit, binding),
+                    "fresh S0 after unreadable cold readback must be recoverable",
+                )
+                self.assertFalse(
+                    DEPLOY._indexed_failed_resume_is_noeffect_handoff(
+                        unit, {**binding, "source_identity_sha256": "1" * 64}
+                    )
+                )
+                with (
+                    mock.patch.object(DEPLOY, "_classify_indexed_job",
+                                      return_value={"kind": "deploy",
+                                                    "terminal": False, "status": status,
+                                                    "metadata": metadata, "fields": fields}),
+                    mock.patch.object(DEPLOY, "_authenticated_scheduled_prerequisite_failure",
+                                      return_value=(original, attempt, [original, attempt])),
+                ):
+                    self.assertTrue(
+                        DEPLOY._indexed_failed_scheduled_resume_is_handoff(unit, binding),
+                        "scheduled old S0 must yield to fresh exact recovery",
+                    )
+                with mock.patch.object(
+                    DEPLOY, "_deploy_index",
+                    return_value={"units": [unit], "pending_unit": unit},
+                ):
+                    self.assertFalse(
+                        DEPLOY._indexed_failed_resume_is_noeffect_handoff(unit, binding)
+                    )
+
+
+
+class UnreadableS0RecoveryHandoffTests(unittest.TestCase):
+    """A signed but effect-unconfirmed S0 attempt needs fresh recovery, not a deadlock."""
+
+    REPO = Path("/home/alex/repos/grabowski")
+    UNIT = "grabowski-job-aabbccdd0011"
+
+    def setUp(self) -> None:
+        import json
+        import test_midcutover_resume as fixture
+        import run_midcutover_resume as resume_runner
+
+        self.fixture = fixture
+        self.resume_runner = resume_runner
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.jobs = self.root / "jobs"
+        self.cutovers = self.root / "cutovers"
+        self.jobs.mkdir(mode=0o700)
+        self.cutovers.mkdir(mode=0o700)
+        self.entry = self.jobs / self.UNIT
+        self.entry.mkdir(mode=0o700)
+
+        # Exercise the real producer's S0 exception and unreadable cold
+        # snapshot path rather than inventing an "outcome_unknown" receipt.
+        runtime = fixture._FakeResumeRuntime(
+            phase=DEPLOY.midcutover.PHASE_REBIND_SNAPSHOT,
+            fail_phase="rebind_snapshot_before_write",
+        )
+        runtime.cold_snapshot_observation = lambda: {
+            "state": DEPLOY.midcutover.SNAPSHOT_BINDING_UNREADABLE,
+            "error": "temporary readback failure",
+        }
+        # A real S0 starts with the prior post-switch selector still on green.
+        # The generic fake defaults to canonical for later-phase tests.
+        runtime.current_selector.update({
+            "selected_slot": "green",
+            "upstream_port": DEPLOY.midcutover.GREEN_UPSTREAM_PORT,
+            "selector_sha256": fixture.SELECTOR_SHA256,
+            "generation": fixture.GENERATION,
+        })
+        produced = fixture.ResumeEffectSemanticsTests()._run(
+            runtime, self.cutovers
+        )
+        self.assertEqual(produced["outcome"], "outcome_unknown")
+        self.attempt = produced["receipt"]
+        self.assertIsNone(self.attempt["snapshot_rebind"])
+        self.assertEqual(self.attempt["resume_phase"], DEPLOY.midcutover.PHASE_REBIND_SNAPSHOT)
+        recovery = self.attempt["recovery"]
+        for key in ("snapshot_rebind_applied", "pointer_promoted", "canonical_selected"):
+            self.assertIs(recovery[key], False)
+        self.assertEqual(
+            recovery["snapshot_binding_state"],
+            DEPLOY.midcutover.SNAPSHOT_BINDING_UNREADABLE,
+        )
+        self.old_binding = self.attempt["resume_binding"]
+        self.command = DEPLOY._midcutover_resume_command(
+            self.REPO,
+            self.REPO / DEPLOY.MIDCUTOVER_RESUME_RUNNER_RELATIVE_PATH,
+            fixture.HEAD_GREEN,
+            fixture.CUTOVER_ID,
+            self.old_binding["binding_sha256"],
+        )
+        self.meta = {
+            "unit": self.UNIT,
+            "job_id": self.UNIT.removeprefix("grabowski-job-"),
+            "argv": self.command,
+            "argv_sha256": DEPLOY._deploy_command_sha256(self.command),
+            "cwd": str(self.REPO),
+            "final_status": "failed",
+        }
+        self.status = {"final_status": "failed"}
+        self._install_attempt(self.attempt)
+
+    def _install_attempt(self, receipt) -> None:
+        import json
+
+        path = self.cutovers / (receipt["resume_id"] + ".json")
+        path.write_text(json.dumps(receipt), encoding="utf-8")
+        path.chmod(0o600)
+        summary = self.resume_runner._resume_summary({
+            "receipt": receipt,
+            "receipt_persisted": True,
+            "receipt_path": str(path),
+        })
+        events = [
+            {
+                "timestamp_unix": 1001,
+                "phase": "midcutover-resume-scheduled",
+                "repo": str(self.REPO),
+                "expected_head": self.fixture.HEAD_GREEN,
+                "cutover_id": self.fixture.CUTOVER_ID,
+                "resume_binding_sha256": self.old_binding["binding_sha256"],
+            },
+            {"timestamp_unix": 1002, "phase": "midcutover-resume-receipt", **summary},
+            {
+                "timestamp_unix": 1003,
+                "phase": "midcutover-resume-incomplete",
+                "outcome": receipt["outcome"],
+            },
+        ]
+        stdout = self.entry / "stdout.log"
+        stdout.write_text(
+            "".join(json.dumps(event, sort_keys=True) + "\n" for event in events),
+            encoding="utf-8",
+        )
+        stdout.chmod(0o600)
+
+    def _with_evidence(self, fresh_binding, *, pending=False) -> bool:
+        real_loader = DEPLOY.midcutover.load_receipts
+        with (
+            mock.patch.object(DEPLOY.operator, "_jobs_root", return_value=self.jobs),
+            mock.patch.object(DEPLOY.operator, "_read_job_metadata", return_value=self.meta),
+            mock.patch.object(DEPLOY.operator, "grabowski_job_status", return_value=self.status),
+            mock.patch.object(
+                DEPLOY, "_deploy_index",
+                return_value={
+                    "units": [self.UNIT],
+                    "pending_unit": self.UNIT if pending else None,
+                },
+            ),
+            mock.patch.object(
+                DEPLOY.midcutover, "load_receipts",
+                side_effect=lambda: real_loader(self.cutovers),
+            ),
+        ):
+            return DEPLOY._indexed_failed_resume_is_noeffect_handoff(
+                self.UNIT, fresh_binding
+            )
+
+    def _terminal_with_evidence(self) -> bool:
+        real_loader = DEPLOY.midcutover.load_receipts
+        with mock.patch.object(
+            DEPLOY.midcutover, "load_receipts",
+            side_effect=lambda: real_loader(self.cutovers),
+        ):
+            return DEPLOY._verified_runtime_terminal_receipt(
+                self.entry, self.meta, self.command, self.status
+            )
+
+    def _rewrite_proven_attempt(self, *, key, value, recovery=False) -> None:
+        mutated = deepcopy(self.attempt)
+        if recovery:
+            mutated["recovery"][key] = value
+        else:
+            mutated[key] = value
+        mutated["receipt_sha256"] = DEPLOY._sha256_json({
+            k: v for k, v in mutated.items() if k != "receipt_sha256"
+        })
+        self._install_attempt(mutated)
+
+    def test_unreadable_s0_requires_fresh_same_cutover_s0_or_s1_handoff(self):
+        self.assertFalse(self._terminal_with_evidence(), "a failed S0 is not completed deployment")
+        fresh_s0 = self.old_binding
+        fresh_s1 = self.fixture.resume_receipt(
+            resume_phase=DEPLOY.midcutover.PHASE_PROMOTE_POINTER
+        )["resume_binding"]
+        fresh_s2 = self.fixture.resume_receipt(
+            resume_phase=DEPLOY.midcutover.PHASE_SELECT_CANONICAL
+        )["resume_binding"]
+        self.assertTrue(self._with_evidence(fresh_s0))
+        self.assertTrue(self._with_evidence(fresh_s1))
+        self.assertTrue(self._with_evidence(fresh_s2))
+        self.assertFalse(self._with_evidence(fresh_s0, pending=True))
+        self.assertFalse(self._with_evidence({**fresh_s0, "source_identity_sha256": "f" * 64}))
+        # Ordinary deployment can retire the failed attempt only AFTER an
+        # independently authentic completed resume resolves its original cutover.
+        final = self.fixture.resume_receipt(resume_id="bgcr-pr1662-recovery-terminal")
+        path = self.cutovers / (final["resume_id"] + ".json")
+        import json
+        path.write_text(json.dumps(final), encoding="utf-8")
+        path.chmod(0o600)
+        self.assertTrue(self._terminal_with_evidence())
+
+    def test_s0_unknown_without_exact_no_effect_proof_does_not_handoff(self):
+        self.assertFalse(DEPLOY._progressed_resume_has_authentic_recovery_evidence(
+            self.attempt, self.resume_runner._resume_summary({
+                "receipt": self.attempt,
+                "receipt_persisted": True,
+                "receipt_path": str(self.cutovers / (self.attempt["resume_id"] + ".json")),
+            })
+        ))
+        for key, value, recovery in (
+            ("snapshot_rebind", {"rebound": True}, False),
+            ("pointer_promotion", {"promoted": True}, False),
+            ("selector_switch", {"switched": True}, False),
+            ("effect_terminalization", {"blocking_tool_calls": 0}, False),
+            ("authoritative_readback", {
+                "authoritative": True,
+                "selector": {"selected_slot": "canonical"},
+                "ingress": {"selected_slot": "canonical"},
+            }, False),
+            ("snapshot_binding_state", DEPLOY.midcutover.SNAPSHOT_BINDING_FOREIGN, True),
+            ("action", "reclassify_and_retry_resume", True),
+            ("fresh_classification_required", False, True),
+            ("next_resume_phase", DEPLOY.midcutover.PHASE_PROMOTE_POINTER, True),
+        ):
+            with self.subTest(key=key):
+                self._rewrite_proven_attempt(key=key, value=value, recovery=recovery)
+                self.assertFalse(self._with_evidence(self.old_binding))
+                self._install_attempt(self.attempt)
+        stdout = self.entry / "stdout.log"
+        stdout.write_text('{"phase":"midcutover-resume-scheduled"}\n', encoding="utf-8")
+        self.assertFalse(self._with_evidence(self.old_binding))
+
+
 if __name__ == "__main__":
     unittest.main()
