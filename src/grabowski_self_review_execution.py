@@ -20,6 +20,7 @@ import re
 import secrets
 import stat
 import subprocess
+import tempfile
 import time
 from typing import Any, Callable
 
@@ -1172,13 +1173,23 @@ def start_first_party_review_session(
         if index_path.exists():
             raise ReviewExecutionRejected("first-party review batch already has a session")
         session_root = sessions / session_id
-        session_root.mkdir(mode=0o700)
-        _ensure_private_state_directory(session_root)
-        _ensure_private_state_directory(session_root / "reads")
-        _ensure_private_state_directory(session_root / "axes")
-        receipt_sha256, signature_sha256 = _write_signed_record(
-            session_root / "session.json", session, key=key, signers=signers,
-        )
+        # Incomplete starts (including crash leftovers) must stay outside the
+        # authenticated history scanned under sessions/.
+        with tempfile.TemporaryDirectory(prefix=".session-stage-", dir=root) as stage:
+            staged_root = Path(stage) / session_id
+            _ensure_private_state_directory(staged_root)
+            _ensure_private_state_directory(staged_root / "reads")
+            _ensure_private_state_directory(staged_root / "axes")
+            receipt_sha256, signature_sha256 = _write_signed_record(
+                staged_root / "session.json", session, key=key, signers=signers,
+            )
+            _read_signed_record(
+                staged_root / "session.json", signers=signers,
+                root_owned_signers=root_owned_signers,
+            )
+            if session_root.exists() or session_root.is_symlink():
+                raise ReviewExecutionRejected("first-party review session already exists")
+            staged_root.rename(session_root)
         index = {
             "schema_version": 1,
             "kind": "grabowski_first_party_review_batch_index_v1",
