@@ -21,6 +21,7 @@ import secrets
 import sqlite3
 import stat
 import subprocess
+import sys
 from typing import Any, Callable
 
 import grabowski_self_review_execution as provenance
@@ -117,6 +118,13 @@ def _current_source(repo: Path, binding: dict[str, Any]) -> str:
     real, _slug = _managed_repository_identity(
         repo, expected_repo=binding.get("repo") if isinstance(binding, dict) else None,
     )
+    if binding.get("review_purpose") == "frozen_candidate":
+        context, observed_repo = _frozen_candidate_context(
+            binding["candidate_binding"]["workspace_id"],
+        )
+        if observed_repo != real or context != binding["candidate_binding"]:
+            raise provenance.ReviewExecutionRejected("frozen Candidate source drift")
+        return provenance._digest(context)
     head = _read_command(real, ["rev-parse", "HEAD"]).decode().strip()
     if head != binding["head_sha"]:
         raise provenance.ReviewExecutionRejected("review checkout head changed")
@@ -134,6 +142,234 @@ def _current_source(repo: Path, binding: dict[str, Any]) -> str:
         timeout=60,
     )
     return hashlib.sha256(raw).hexdigest()
+
+
+def _candidate_task_evidence(
+    task_id: str, expected_argv_sha256: str, worktree: Path,
+) -> dict[str, Any]:
+    """Read server-owned completion evidence without refreshing task state."""
+    row = _task_row(TASK_DB, task_id)
+    outcome = provenance._read_private_json(OUTCOMES / (task_id + ".json"))
+    if (
+        row["host"] != "heim-pc" or row["cwd"] != str(worktree)
+        or row["state"] != "completed" or row["attempt"] != 1
+        or row["argv_sha256"] != expected_argv_sha256
+        or hashlib.sha256(row["argv_json"].encode("utf-8")).hexdigest() != expected_argv_sha256
+        or row["unit"] != f"grabowski-task-{task_id}-a1.service"
+        or row["execution_backend"] != "systemd-user" or row["systemd_scope"] != "user"
+        or outcome.get("receipt_sha256") != row["lifecycle_receipt_sha256"]
+        or outcome.get("receipt_sha256") != provenance._digest({
+            k: v for k, v in outcome.items() if k != "receipt_sha256"
+        })
+        or any(outcome.get(k) != row[k] for k in (
+            "task_id", "state", "unit", "argv_sha256", "attempt",
+            "execution_backend", "systemd_scope",
+        ))
+        or outcome.get("observation", {}).get("state") != "completed"
+        or outcome.get("observation", {}).get("properties", {}).get("Result") != "success"
+        or outcome.get("observation", {}).get("properties", {}).get("ExecMainStatus") != "0"
+    ):
+        raise provenance.ReviewExecutionRejected("Candidate task origin invalid")
+    return {"task": row, "outcome": outcome}
+
+
+def _frozen_candidate_context(workspace_id: str) -> tuple[dict[str, Any], Path]:
+    """Reconstruct the frozen identity from owning private receipts and Git.
+
+    This read never calls status/recovery, acquires a lease or rewrites a patch.
+    The authenticated session signs this entire context, including the original
+    writer/test task and receipt material, and every subsequent read checks it.
+    """
+    import grabowski_agent_workspace as workspace
+    import grabowski_agent_role as role
+    manifest = workspace._manifest(workspace_id)
+    frozen = manifest.get("frozen_writer")
+    if not isinstance(frozen, dict) or manifest.get("close_receipt") is not None:
+        raise provenance.ReviewExecutionRejected("frozen Candidate unavailable")
+    worktree, slug = _managed_repository_identity(Path(manifest["writer_worktree"]))
+    base = manifest["expected_base_head"]
+    head, diff, dirty = role.current_binding(worktree, base)
+    if (head, diff, dirty) != (
+        frozen.get("writer_head"), frozen.get("diff_sha256"), frozen.get("dirty"),
+    ):
+        raise provenance.ReviewExecutionRejected("frozen Candidate Git drift")
+    artifact = frozen.get("writer_result")
+    if (not isinstance(artifact, dict) or artifact.get("type") != "patch"
+            or artifact.get("applies_to") != base or not workspace._verify_patch_artifact(
+        artifact, expected_path=workspace._writer_patch_path(manifest),
+    )):
+        raise provenance.ReviewExecutionRejected("frozen Candidate patch tamper")
+    patch = role.read_bound_review_input_artifact(
+        str(workspace._ensure_root(create=False)), artifact["path"], artifact["sha256"],
+    )
+    writer_attempt = workspace._effective_writer_attempt(manifest)
+    writer = workspace._role_receipt(manifest, "writer", attempt=writer_attempt["attempt"])
+    tests = workspace._role_receipt(manifest, "tests")
+    if any(not isinstance(r, dict) or not workspace._receipt_integrity(r)
+           or type(r.get("returncode")) is not int or r["returncode"] != 0 for r in (writer, tests)):
+        raise provenance.ReviewExecutionRejected("Candidate writer/test receipt missing or corrupt")
+    if (
+        writer.get("role") != "writer"
+        or writer.get("expected_base_head") != base
+        or writer.get("expected_branch") != manifest["writer_branch"]
+        or writer.get("command_sha256") != writer_attempt["command_sha256"]
+        or writer.get("sandbox") != "bubblewrap-minimal-root-bounded-writable-paths-v1"
+        or writer.get("git_common_dir_mode") != "read_only"
+        or writer.get("allowed_paths") != manifest["scope"]["allowed_paths"]
+        or writer.get("allowed_paths_sha256") != workspace._sha256_json(manifest["scope"]["allowed_paths"])
+        or writer.get("head_before") != base
+        or writer.get("head_after") != base
+        or writer.get("branch_before") != manifest["writer_branch"]
+        or writer.get("branch_after") != manifest["writer_branch"]
+        or (writer_attempt["attempt"] > 1 and writer.get("launch_nonce") != writer_attempt.get("launch_nonce"))
+        or writer.get("expected_dirty_preimage_sha256") != writer_attempt.get("revision_preimage_sha256")
+        or writer.get("observed_dirty_preimage_sha256") != writer_attempt.get("revision_preimage_sha256")
+    ):
+        raise provenance.ReviewExecutionRejected("Candidate writer receipt binding invalid")
+    expected_tests = {
+        "role": "tests", "expected_head": head, "expected_base_head": base,
+        "expected_diff_sha256": diff, "expected_dirty": dirty,
+        "head_before": head, "head_after": head, "diff_after": diff,
+        "worktree_dirty_after": dirty, "sandbox": role.SANDBOX_LABEL,
+        "argv_sha256": workspace._expected_role_argv_sha256(manifest, "tests"),
+    }
+    if any(tests.get(k) != v for k, v in expected_tests.items()):
+        raise provenance.ReviewExecutionRejected("Candidate test receipt binding invalid")
+    snapshot = workspace._git_snapshot(manifest, workspace._run)
+    if (snapshot.get("scope_passed") is not True or snapshot.get("base_drift")
+            or (snapshot.get("writer_head"), snapshot.get("diff_sha256"), snapshot.get("dirty")) != (head, diff, dirty)):
+        raise provenance.ReviewExecutionRejected("Candidate scope/base drift")
+    # Compare the freezer's exact byte format, including untracked additions.
+    # Never normalize or rewrite the retained patch to make it match.
+    current_patch = provenance._git_read(worktree, [
+        "diff", "--binary", "--no-ext-diff", "--no-textconv", base, "--",
+    ], maximum=workspace.MAX_PATCH_BYTES)
+    for item in snapshot["untracked_artifacts"]:
+        addition = workspace._run_bytes(worktree, [
+            "git", "diff", "--no-index", "--binary", "--no-ext-diff", "--no-textconv",
+            "--src-prefix=a/", "--dst-prefix=b/", "--", "/dev/null", item["path"],
+        ])
+        if addition.get("returncode") not in {0, 1}:
+            raise provenance.ReviewExecutionRejected("Candidate untracked patch read failed")
+        current_patch += bytes(addition["stdout"])
+        if len(current_patch) > workspace.MAX_PATCH_BYTES:
+            raise provenance.ReviewExecutionRejected("Candidate source patch over budget")
+    if current_patch != patch or role.current_binding(worktree, base) != (head, diff, dirty):
+        raise provenance.ReviewExecutionRejected("frozen Candidate patch/source drift")
+    candidate = workspace._candidate_manifest_from_frozen_writer(
+        manifest, snapshot, artifact, writer, round_number=workspace._candidate_round(manifest),
+    )
+    paths = workspace._candidate_receipt_paths(manifest, round_number=candidate["round"])
+    if provenance._read_private_json(paths["candidate"]) != candidate:
+        raise provenance.ReviewExecutionRejected("Candidate immutable receipt drift")
+    writer_task = _candidate_task_evidence(
+        writer_attempt["task_id"], writer_attempt["task_argv_sha256"], worktree,
+    )
+    tests_prefix = workspace._role_task_argv(
+        manifest, "tests", head, diff, dirty,
+        command=[],
+        output_path=workspace._role_receipt_path(
+            manifest, "tests", attempt=workspace._role_final_attempt(manifest, "tests"),
+        ),
+    )
+    tests_row = _task_row(TASK_DB, manifest["tasks"]["tests"])
+    try:
+        tests_argv = json.loads(tests_row["argv_json"])
+    except (TypeError, ValueError) as exc:
+        raise provenance.ReviewExecutionRejected("Candidate test task argv invalid") from exc
+    if (not isinstance(tests_argv, list) or tests_argv[:len(tests_prefix)] != tests_prefix
+            or workspace._sha256_json(tests_argv[len(tests_prefix):]) != tests["argv_sha256"]):
+        raise provenance.ReviewExecutionRejected("Candidate test task wrapper/command drift")
+    test_task = _candidate_task_evidence(
+        manifest["tasks"]["tests"], workspace._task_argv_sha256(tests_argv), worktree,
+    )
+    return {
+        "workspace_id": workspace_id, "candidate": candidate, "repo": slug,
+        "base_sha": base, "head_sha": head, "diff_sha256": diff, "dirty": dirty,
+        "patch": artifact, "changed_paths": snapshot["changed_paths"],
+        "writer_receipt": writer, "test_receipt": tests,
+        "writer_task": writer_task, "test_task": test_task,
+        "patch_bytes_sha256": hashlib.sha256(patch).hexdigest(),
+    }, worktree
+
+
+def plan_frozen_candidate_review(workspace_id: str) -> dict[str, Any]:
+    context, worktree = _frozen_candidate_context(workspace_id)
+    binding = provenance._first_party_binding({
+        "repo": context["repo"], "pr": 0,
+        "base_sha": context["base_sha"], "head_sha": context["head_sha"],
+        "diff_sha256": context["diff_sha256"], "review_batch_id": secrets.token_hex(16),
+        "review_purpose": "frozen_candidate", "candidate_binding": context,
+    })
+    return {
+        "schema_version": 1, "kind": "grabowski_first_party_review_plan",
+        "binding": binding, "worktree": str(worktree),
+        "source_raw_diff_sha256": _current_source(worktree, binding),
+    }
+
+
+def candidate_review_command(batch: str) -> list[str]:
+    if not isinstance(batch, str) or provenance.ID.fullmatch(batch) is None:
+        raise provenance.ReviewExecutionRejected("Candidate review batch invalid")
+    return [sys.executable, "-m", "grabowski_self_review_producer", "verify-candidate", batch]
+
+
+def candidate_review_batch(command: list[str]) -> str | None:
+    if (len(command) == 5 and isinstance(command[-1], str)
+            and provenance.ID.fullmatch(command[-1]) is not None
+            and command == candidate_review_command(command[-1])):
+        return command[-1]
+    return None
+
+
+def verify_candidate_review_command(command: list[str], *, repository: Path) -> dict[str, Any]:
+    batch = candidate_review_batch(command)
+    if batch is None:
+        raise provenance.ReviewExecutionRejected("Candidate verifier command invalid")
+    plan = _load_plan(batch)
+    if Path(plan["worktree"]).resolve(strict=True) != repository.resolve(strict=True):
+        raise provenance.ReviewExecutionRejected("Candidate verifier repository mismatch")
+    return provenance.verified_first_party_candidate_handoff(plan)
+
+
+def assert_candidate_review_history(workspace_id: str) -> None:
+    sessions = provenance.FIRST_PARTY_REVIEW_ROOT / "sessions"
+    if not sessions.exists():
+        return
+    paths = sorted(sessions.iterdir())
+    if len(paths) > 2048:
+        raise provenance.ReviewExecutionRejected("Candidate session registry over budget")
+    matching = False
+    for path in paths:
+        session = provenance._read_signed_record(
+            path / "session.json", signers=provenance.TRUSTED_SIGNERS, root_owned_signers=True,
+        )
+        if session.get("binding", {}).get("candidate_binding", {}).get("workspace_id") == workspace_id:
+            matching = True
+    if not matching:
+        return
+    plan = plan_frozen_candidate_review(workspace_id)
+    provenance._assert_no_first_party_reject_for_legacy_review(
+        plan["binding"], repository=Path(plan["worktree"]),
+        root=provenance.FIRST_PARTY_REVIEW_ROOT, signers=provenance.TRUSTED_SIGNERS,
+        root_owned_signers=True,
+    )
+
+
+def verify_workspace_candidate_review(manifest: dict[str, Any]) -> None:
+    import grabowski_agent_workspace as workspace
+    batch = manifest.get("first_party_candidate_review_batch")
+    if batch is None:
+        if manifest.get("commands", {}).get("review") == list(workspace.CONTROLLER_SELF_REVIEW_PENDING_ARGV):
+            assert_candidate_review_history(manifest["workspace_id"])
+        return
+    command = candidate_review_command(batch)
+    if workspace._expected_role_argv_sha256(manifest, "review") != workspace._sha256_json(command):
+        raise provenance.ReviewExecutionRejected("Candidate review role command drift")
+    plan = _load_plan(batch)
+    if plan["binding"]["candidate_binding"]["workspace_id"] != manifest["workspace_id"]:
+        raise provenance.ReviewExecutionRejected("Candidate review workspace replay")
+    verify_candidate_review_command(command, repository=Path(manifest["writer_worktree"]))
 
 
 def _binding(value: Any) -> dict[str, Any]:
@@ -909,6 +1145,8 @@ def main(argv: list[str] | None = None) -> int:
         "seal-firstparty", help="Seal existing signed first-party review records",
     )
     direct.add_argument("--batch-id", required=True)
+    candidate_verifier = commands.add_parser("verify-candidate", help="Verify an existing signed Candidate handoff read-only")
+    candidate_verifier.add_argument("batch")
     args = parser.parse_args(argv)
     if args.operation == "plan":
         _require_installed_runtime(args.bwrap, args.python)
@@ -977,6 +1215,8 @@ def main(argv: list[str] | None = None) -> int:
             "review_audit_sha256": sealed["review_audit_sha256"],
             "source_head": sealed["source_head"],
         }
+    elif args.operation == "verify-candidate":
+        public_result = provenance.verified_first_party_candidate_handoff(_load_plan(args.batch))
     else:
         plan = _load_plan(args.batch_id)
         _require_live_pr(plan["binding"])

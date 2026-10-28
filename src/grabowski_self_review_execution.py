@@ -835,12 +835,16 @@ def _create_private_bytes(path: Path, data: bytes) -> None:
         os.close(descriptor)
 
 
-def _first_party_lock(root: Path) -> int:
-    _ensure_private_state_directory(root)
+def _first_party_lock(root: Path, *, read_only: bool = False) -> int:
+    if read_only:
+        fd = _private_dir(root)
+        os.close(fd)
+    else:
+        _ensure_private_state_directory(root)
     path = root / ".lock"
     descriptor = os.open(
         path,
-        os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
+        (os.O_RDONLY if read_only else os.O_RDWR | os.O_CREAT) | os.O_NOFOLLOW | os.O_CLOEXEC,
         0o600,
     )
     metadata = os.fstat(descriptor)
@@ -852,7 +856,7 @@ def _first_party_lock(root: Path) -> int:
     ):
         os.close(descriptor)
         raise ReviewExecutionRejected("first-party review state lock unsafe")
-    fcntl.flock(descriptor, fcntl.LOCK_EX)
+    fcntl.flock(descriptor, fcntl.LOCK_SH if read_only else fcntl.LOCK_EX)
     return descriptor
 
 
@@ -940,11 +944,14 @@ def _first_party_binding(value: Any) -> dict[str, Any]:
     }
     if value.get("review_purpose") == "post_merge_release":
         expected.add("release_binding")
+    frozen = value.get("review_purpose") == "frozen_candidate"
+    if frozen:
+        expected.add("candidate_binding")
     if (
         set(value) != expected
         or not isinstance(value.get("repo"), str)
         or re.fullmatch(r"heimgewebe/[A-Za-z0-9_.-]+", value["repo"]) is None
-        or type(value.get("pr")) is not int or value["pr"] <= 0
+        or type(value.get("pr")) is not int or (value["pr"] != 0 if frozen else value["pr"] <= 0)
         or any(
             not isinstance(value.get(name), str)
             or SHA40.fullmatch(value[name]) is None
@@ -954,9 +961,22 @@ def _first_party_binding(value: Any) -> dict[str, Any]:
         or SHA256.fullmatch(value["diff_sha256"]) is None
         or not isinstance(value.get("review_batch_id"), str)
         or ID.fullmatch(value["review_batch_id"]) is None
-        or value.get("review_purpose") not in {"pull_request", "post_merge_release"}
+        or value.get("review_purpose") not in {"pull_request", "post_merge_release", "frozen_candidate"}
     ):
         raise ReviewExecutionRejected("first-party review binding invalid")
+    if frozen:
+        candidate = value["candidate_binding"]
+        if (
+            not isinstance(candidate, dict)
+            or not isinstance(candidate.get("workspace_id"), str)
+            or any(candidate.get(k) != value[k] for k in (
+                "repo", "base_sha", "head_sha", "diff_sha256",
+            ))
+            or type(candidate.get("dirty")) is not bool
+            or not isinstance(candidate.get("candidate"), dict)
+            or candidate["candidate"].get("workspace_id") != candidate["workspace_id"]
+        ):
+            raise ReviewExecutionRejected("first-party frozen Candidate binding invalid")
     if value["review_purpose"] == "post_merge_release":
         release = value.get("release_binding")
         if (
@@ -996,6 +1016,13 @@ def _git_read(
 
 
 def _first_party_diff(repository: Path, binding: dict[str, Any]) -> bytes:
+    if binding.get("review_purpose") == "frozen_candidate":
+        from grabowski_agent_role import read_bound_review_input_artifact
+        from grabowski_agent_workspace import _ensure_root
+        artifact = binding["candidate_binding"]["patch"]
+        return read_bound_review_input_artifact(
+            str(_ensure_root(create=False)), artifact["path"], artifact["sha256"],
+        )
     return _git_read(
         repository,
         [
@@ -1011,6 +1038,8 @@ def _first_party_diff(repository: Path, binding: dict[str, Any]) -> bytes:
 def _first_party_changed_paths(
     repository: Path, binding: dict[str, Any],
 ) -> list[str]:
+    if binding.get("review_purpose") == "frozen_candidate":
+        return list(binding["candidate_binding"]["changed_paths"])
     raw = _git_read(
         repository,
         [
@@ -1038,6 +1067,33 @@ def _first_party_changed_paths(
     ):
         raise ReviewExecutionRejected("first-party changed path set invalid")
     return paths
+
+
+def _read_private_json(path: Path) -> dict[str, Any]:
+    fd = _private_dir(path.parent)
+    try:
+        raw = _private_read(fd, path.name, limit=MAX_RECEIPT)
+    finally:
+        os.close(fd)
+    try:
+        value = json.loads(raw, object_pairs_hook=_unique_semantic_json_object)
+    except (ValueError, UnicodeError) as exc:
+        raise ReviewExecutionRejected("private workspace JSON invalid") from exc
+    if not isinstance(value, dict):
+        raise ReviewExecutionRejected("private workspace JSON must be an object")
+    return value
+
+
+def _first_party_source_blob(repository: Path, binding: dict[str, Any], path: str, revision: str) -> bytes:
+    if binding.get("review_purpose") == "frozen_candidate" and revision == "head":
+        from grabowski_agent_role import safe_untracked_file
+        from pathlib import PurePosixPath
+        target = safe_untracked_file(repository, PurePosixPath(path))
+        if target.stat().st_size > MAX_SOURCE_BLOB:
+            raise ReviewExecutionRejected("first-party Candidate source over budget")
+        return target.read_bytes()
+    chosen = binding["base_sha"] if revision == "base" else binding["head_sha"]
+    return _git_read(repository, ["show", chosen + ":" + path], maximum=MAX_SOURCE_BLOB)
 
 
 def _assert_plan_source(plan: dict[str, Any]) -> tuple[dict[str, Any], Path, str]:
@@ -1271,9 +1327,7 @@ def record_first_party_source_read(
         ):
             raise ReviewExecutionRejected("first-party source read range invalid")
         chosen = binding["base_sha"] if revision == "base" else binding["head_sha"]
-        blob = _git_read(
-            worktree, ["show", chosen + ":" + path], maximum=MAX_SOURCE_BLOB,
-        )
+        blob = _first_party_source_blob(worktree, binding, path, revision)
         if b"\x00" in blob:
             raise ReviewExecutionRejected("first-party source read is not text")
         try:
@@ -1302,6 +1356,7 @@ def record_first_party_source_read(
     }
     lock = _first_party_lock(root)
     try:
+        _assert_first_party_source_current(session)
         reads = session_root / "reads"
         _create_private_bytes(reads / (read_id + ".data"), data)
         _write_signed_record(
@@ -1407,9 +1462,8 @@ def _load_first_party_reads(
                 or record["path"] not in session["changed_paths"]
             ):
                 raise ReviewExecutionRejected("first-party source read binding invalid")
-            blob = _git_read(
-                repository, ["show", chosen + ":" + record["path"]],
-                maximum=MAX_SOURCE_BLOB,
+            blob = _first_party_source_blob(
+                repository, session["binding"], record["path"], record["revision"],
             )
             try:
                 lines = blob.decode("utf-8").splitlines(keepends=True)
@@ -1440,6 +1494,10 @@ def _read_covers_reference(
         item["axis"] == axis
         and item["read_kind"] == "source"
         and item["path"] == match["path"]
+        and (
+            binding.get("review_purpose") != "frozen_candidate"
+            or item["revision"] == ("base" if match["source_revision"] else "head")
+        )
         and (
             binding["base_sha"] if item["revision"] == "base"
             else binding["head_sha"]
@@ -1601,6 +1659,76 @@ def _load_first_party_axes(
     return accepted
 
 
+def finalize_first_party_candidate(
+    session_id: str, nonce: str, issuer: dict[str, Any], *,
+    root: Path = FIRST_PARTY_REVIEW_ROOT, key: Path = SIGNING_KEY,
+    signers: Path = TRUSTED_SIGNERS, root_owned_signers: bool = True,
+    now_unix: int | None = None,
+) -> dict[str, Any]:
+    """Seal an authenticated handoff, only after the ordinary five-axis verifier."""
+    now = int(time.time()) if now_unix is None else now_unix
+    session, session_root = _load_first_party_session(
+        session_id, nonce, root=root, signers=signers,
+        root_owned_signers=root_owned_signers, now_unix=now, require_fresh=True,
+    )
+    authenticated = _issuer_matches_session(issuer, session, expected_tool=FIRST_PARTY_TOOL_SUBMIT)
+    binding = session["binding"]
+    if binding["review_purpose"] != "frozen_candidate":
+        raise ReviewExecutionRejected("Candidate finalization requires frozen Candidate")
+    axes = verified_first_party_semantic_review_passes(
+        binding, repository=Path(session["worktree"]), root=root, signers=signers,
+        root_owned_signers=root_owned_signers, now_unix=now,
+    )
+    record = {
+        "schema_version": 1, "kind": "grabowski_first_party_candidate_handoff_v1",
+        "binding": binding, "session_id": session_id, "axes": axes,
+        "issuer": authenticated, "finalized_at_unix": now,
+    }
+    lock = _first_party_lock(root)
+    try:
+        _assert_first_party_source_current(session)
+        _write_signed_record(session_root / "finalized.json", record, key=key, signers=signers)
+    finally:
+        _release_first_party_lock(lock)
+    return record
+
+
+def verified_first_party_candidate_handoff(
+    plan: dict[str, Any], *, root: Path = FIRST_PARTY_REVIEW_ROOT,
+    signers: Path = TRUSTED_SIGNERS, root_owned_signers: bool = True,
+    now_unix: int | None = None,
+) -> dict[str, Any]:
+    binding, repository, _raw = _assert_plan_source(plan)
+    if binding["review_purpose"] != "frozen_candidate":
+        raise ReviewExecutionRejected("frozen Candidate handoff required")
+    axes = verified_first_party_semantic_review_passes(
+        binding, repository=repository, root=root, signers=signers,
+        root_owned_signers=root_owned_signers, now_unix=now_unix,
+    )
+    session_id = next(iter(axes.values()))["provenance"]["session_id"]
+    record = _read_signed_record(
+        root / "sessions" / session_id / "finalized.json", signers=signers,
+        root_owned_signers=root_owned_signers,
+    )
+    session = _read_signed_record(
+        root / "sessions" / session_id / "session.json", signers=signers,
+        root_owned_signers=root_owned_signers,
+    )
+    if (
+        set(record) != {"schema_version", "kind", "binding", "session_id", "axes", "issuer", "finalized_at_unix"}
+        or record.get("schema_version") != 1
+        or record.get("kind") != "grabowski_first_party_candidate_handoff_v1"
+        or record.get("binding") != binding or record.get("session_id") != session_id
+        or record.get("axes") != axes
+        or type(record.get("finalized_at_unix")) is not int
+        or not session["created_at_unix"] <= record["finalized_at_unix"] <= session["expires_at_unix"]
+    ):
+        raise ReviewExecutionRejected("Candidate signed handoff mismatch")
+    _issuer_matches_session(record["issuer"], session, expected_tool=FIRST_PARTY_TOOL_SUBMIT)
+    _assert_first_party_source_current(session)
+    return {"verdict": "PASS", "findings": []}
+
+
 
 def _assert_prior_first_party_material_findings_resolved(
     session: dict[str, Any], current_axes: dict[str, dict[str, Any]], *,
@@ -1614,7 +1742,7 @@ def _assert_prior_first_party_material_findings_resolved(
     axes are read, including partial sessions whose REJECT was submitted.
     """
     sessions = root / "sessions"
-    lock = _first_party_lock(root)
+    lock = _first_party_lock(root, read_only=True)
     try:
         fd = _private_dir(sessions)
         try:
@@ -1651,7 +1779,11 @@ def _assert_prior_first_party_material_findings_resolved(
                 old.get("schema_version") != 1
                 or old.get("binding_sha256") != _digest(old_binding)
                 or old.get("canonical_diff_sha256") != session["canonical_diff_sha256"]
-                or old.get("source_raw_diff_sha256") != session["source_raw_diff_sha256"]
+                or old.get("source_raw_diff_sha256") != (
+                    _digest(old_binding["candidate_binding"])
+                    if old_binding["review_purpose"] == "frozen_candidate"
+                    else session["source_raw_diff_sha256"]
+                )
                 or old.get("changed_paths") != session["changed_paths"]
                 or old.get("issuer_principal") != _first_party_principal(
                     _validate_first_party_issuer(
@@ -1958,6 +2090,7 @@ def verified_first_party_semantic_review_passes(
                 "canonical_diff_sha256": session["canonical_diff_sha256"],
             },
         }
+    _assert_first_party_source_current(session)
     return accepted
 
 

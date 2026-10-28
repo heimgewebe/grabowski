@@ -7262,20 +7262,29 @@ def grabowski_self_review_session_start(
     reason: str,
     user_intent: str,
     ctx: Context | None = None,
+    workspace_id: str | None = None,
 ) -> dict[str, Any]:
-    """Start one exact-revision semantic review session for a stored plan."""
+    """Start a stored-plan review, or derive a frozen Candidate with workspace_id and an empty batch ID."""
     _require_capability("file_write")
     arguments = {
         "review_batch_id": review_batch_id,
         "reason": reason,
         "user_intent": user_intent,
     }
+    if workspace_id is not None:
+        arguments["workspace_id"] = workspace_id
     issuer = _authenticated_self_review_issuer(
         ctx, tool_name=self_review_execution.FIRST_PARTY_TOOL_START,
         arguments=arguments,
     )
-    from grabowski_self_review_producer import _load_plan
-    plan = _load_plan(review_batch_id)
+    from grabowski_self_review_producer import _load_plan, _store_plan, plan_frozen_candidate_review
+    if workspace_id is not None:
+        if review_batch_id != "":
+            raise ValueError("Candidate session derives its batch; review_batch_id must be empty")
+        plan = plan_frozen_candidate_review(workspace_id)
+        _store_plan(plan)
+    else:
+        plan = _load_plan(review_batch_id)
     return self_review_execution.start_first_party_review_session(plan, issuer)
 
 
@@ -7330,7 +7339,7 @@ def grabowski_self_review_axis_submit(
     user_intent: str,
     ctx: Context | None = None,
 ) -> dict[str, Any]:
-    """Persist one immutable substantive controller-written axis verdict."""
+    """Persist a substantive axis verdict; report={"finalize": true} seals a five-axis Candidate handoff."""
     _require_capability("file_write")
     arguments = {
         "review_session_id": review_session_id,
@@ -7343,6 +7352,19 @@ def grabowski_self_review_axis_submit(
         ctx, tool_name=self_review_execution.FIRST_PARTY_TOOL_SUBMIT,
         arguments=arguments,
     )
+    if set(report) == {"finalize"} and report["finalize"] is True:
+        sealed = self_review_execution.finalize_first_party_candidate(
+            review_session_id, session_nonce, issuer,
+        )
+        from grabowski_self_review_producer import candidate_review_command
+        return {
+            "status": "candidate_review_finalized",
+            "workspace_id": sealed["binding"]["candidate_binding"]["workspace_id"],
+            "candidate_id": sealed["binding"]["candidate_binding"]["candidate"]["candidate_id"],
+            "replacement_argv": candidate_review_command(sealed["binding"]["review_batch_id"]),
+            "next_action": "grabowski_agent_workspace_role_retry",
+            "role": "review", "review_task_started": False,
+        }
     return self_review_execution.submit_first_party_axis_review(
         review_session_id, session_nonce, report, issuer,
     )

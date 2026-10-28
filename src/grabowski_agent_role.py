@@ -1103,6 +1103,15 @@ def _review_sandbox_argv(
     review_diff: bytes,
     review_input_source: str = "committed_diff",
 ) -> tuple[list[str], str | None, bytes | None]:
+    from grabowski_self_review_producer import candidate_review_batch, verify_candidate_review_command
+    if candidate_review_batch(command) is not None:
+        document = verify_candidate_review_command(command, repository=repo)
+        # The trusted role verifies signed material; the ordinary read-only
+        # sandbox transports that exact verdict through its normal capture and
+        # role receipt path. No caller-provided document can select this path.
+        copier = [sys.executable, "-I", "-S", "-c",
+                  "import sys; sys.stdout.buffer.write(sys.stdin.buffer.read())"]
+        return sandbox_argv(repo, copier), None, canonical(document).encode("utf-8")
     executable_name = Path(command[0]).name
     if executable_name == "codex":
         normalized = _codex_review_command_for_headless_execution(command)

@@ -8509,6 +8509,12 @@ def grabowski_agent_workspace_collect(workspace_id: str) -> dict[str, Any]:
                 "snapshot": snapshot,
                 "receipt_status": "passed",
             }
+        from grabowski_self_review_producer import verify_workspace_candidate_review
+        try:
+            verify_workspace_candidate_review(manifest)
+        except (ValueError, OSError, RuntimeError) as exc:
+            return {"workspace_id": identifier, "state": "candidate_review_provenance_invalid",
+                    "error": _error_summary(exc), "receipt_status": "blocked"}
         test_receipt = _role_receipt(manifest, "tests")
         review_receipt = _role_receipt(manifest, "review")
         if test_receipt is None or review_receipt is None:
@@ -10003,7 +10009,15 @@ def grabowski_agent_workspace_role_retry(
             # controller self-review PASS. A native first-party Candidate
             # proof still needs its own authenticated signed handoff.
             from grabowski_decision_reviews import _review_route_evidence
-            if _review_route_evidence(command) is None:
+            from grabowski_self_review_producer import candidate_review_batch, verify_candidate_review_command
+            first_party_batch = candidate_review_batch(command)
+            if first_party_batch is not None:
+                verify_candidate_review_command(command, repository=worktree)
+                from grabowski_self_review_producer import _load_plan
+                if _load_plan(first_party_batch)["binding"]["candidate_binding"]["workspace_id"] != identifier:
+                    raise AgentWorkspaceError("Candidate review workspace replay")
+                manifest["first_party_candidate_review_batch"] = first_party_batch
+            elif _review_route_evidence(command) is None:
                 return {
                     "workspace_id": identifier,
                     "role": role_name,
@@ -10011,6 +10025,9 @@ def grabowski_agent_workspace_role_retry(
                     "retry_status": "blocked",
                     "review_task_started": False,
                 }
+            else:
+                from grabowski_self_review_producer import assert_candidate_review_history
+                assert_candidate_review_history(identifier)
         start_intent = _role_start_intent_classification(manifest, role_name)
         if start_intent is not None:
             classification, detail = start_intent
@@ -10373,6 +10390,8 @@ def grabowski_agent_workspace_close(
         collection_integrity = _collection_integrity_status(manifest, collection)
         if not collection_integrity["valid"]:
             raise AgentWorkspaceError("collection receipt integrity is invalid")
+        from grabowski_self_review_producer import verify_workspace_candidate_review
+        verify_workspace_candidate_review(manifest)
         if collection.get("writer_head") != head or collection.get("diff_sha256") != diff_sha or collection.get("result_sha256") != result_sha:
             raise AgentWorkspaceError("close bindings do not match collection receipt")
         route_evidence, route_gate_passed, legacy_route = _route_gate(manifest)

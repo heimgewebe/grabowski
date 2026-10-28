@@ -12,6 +12,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import sqlite3
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -114,6 +116,336 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
             repo=self.repo, pr=1649, base_sha=self.base, head_sha=self.head,
             diff_sha256=diff_sha256,
         )
+
+    def _candidate_plan(self, *, dirty: bool = True, retried_tests: bool = False) -> dict:
+        from test_agent_workspace import AgentWorkspaceTests, signed_role_receipt, workspace
+        canonical = self.repo
+        written_source = (canonical / self.source_path).read_bytes()
+        pool = self.root / ".grabowski-worktrees"
+        pool.mkdir()
+        candidate = pool / "candidate"
+        self._git("worktree", "add", "--detach", str(candidate), self.base if dirty else self.head)
+        self._git("reset", "--hard", self.base)
+        self.repo = candidate
+        self._git("checkout", "-b", "candidate-review")
+        if dirty:
+            self.head = self.base
+            (candidate / self.source_path).write_bytes(written_source + b"DIRTY_CANDIDATE = 73\n")
+        state = self.root / "workspaces"
+        state.mkdir(mode=0o700)
+        patcher = mock.patch.object(workspace, "WORKSPACE_ROOT", state)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        fixture = SimpleNamespace(
+            git=SimpleNamespace(repo=canonical, writer=candidate, base=self.base), state=state,
+        )
+        manifest = AgentWorkspaceTests.manifest(fixture)
+        manifest["writer_branch"] = "candidate-review"
+        manifest["commands"]["review"] = list(workspace.CONTROLLER_SELF_REVIEW_PENDING_ARGV)
+        manifest["tasks"] = {"writer": "a" * 24, "tests": "b" * 24, "review": None}
+        writer = workspace._role_receipt(manifest, "writer")
+        writer.update({"expected_branch": "candidate-review", "branch_before": "candidate-review", "branch_after": "candidate-review"})
+        writer["receipt_sha256"] = workspace._sha256_json({k: v for k, v in writer.items() if k != "receipt_sha256"})
+        workspace._atomic_json(workspace._role_receipt_path(manifest, "writer"), writer)
+        snapshot = workspace._git_snapshot(manifest, workspace._run)
+        if dirty:
+            patch = workspace._materialize_writer_patch(manifest, snapshot, workspace._run)
+        else:
+            # A clean frozen patch already has immutable committed source.
+            # Keep the existing dirty-workspace freezer's contract unchanged.
+            payload = review._first_party_diff(candidate, {"base_sha": self.base, "head_sha": self.head})
+            path = workspace._writer_patch_path(manifest)
+            size, sha = workspace._atomic_bounded_chunks(path, [payload], max_bytes=workspace.MAX_PATCH_BYTES)
+            patch = {"type": "patch", "path": str(path), "sha256": sha, "bytes": size, "applies_to": self.base}
+        manifest["frozen_writer"] = {
+            "writer_head": snapshot["writer_head"], "diff_sha256": snapshot["diff_sha256"],
+            "dirty": snapshot["dirty"], "writer_result": patch,
+        }
+        workspace._persist_candidate_evidence(manifest, snapshot, patch, writer)
+        selected_tests = manifest["commands"]["tests"]
+        if retried_tests:
+            selected_tests = ["python3", "-m", "unittest", "discover"]
+            manifest["role_final_attempt"] = {"tests": 2}
+            manifest["role_retries"] = {"tests": {"count": 1, "attempts": [
+                {"attempt": 2, "new_command_sha256": workspace._sha256_json(selected_tests)},
+            ]}}
+        tests_output = workspace._role_receipt_path(manifest, "tests", attempt=2 if retried_tests else 1)
+        workspace._atomic_json(tests_output, signed_role_receipt(
+            "tests", manifest, snapshot, argv_sha256=workspace._sha256_json(selected_tests),
+        ))
+        workspace._write_manifest(manifest)
+        self.candidate_manifest = manifest
+        self.workspace = workspace
+        db = self.root / "tasks.sqlite3"
+        outcomes = self.root / "outcomes"
+        outcomes.mkdir(mode=0o700)
+        columns = ["task_id", "host", "cwd", "argv_json", "argv_sha256", "unit", "state", "attempt",
+                   "lifecycle_receipt_sha256", "execution_backend", "systemd_scope"]
+        connection = sqlite3.connect(db)
+        connection.execute("CREATE TABLE tasks (" + ",".join(
+            name + (" INTEGER" if name == "attempt" else " TEXT") for name in columns
+        ) + ")")
+        for name in ("writer", "tests"):
+            task = manifest["tasks"][name]
+            argv = (workspace._writer_task_argv(manifest) if name == "writer" else
+                    workspace._role_task_argv(manifest, "tests", snapshot["writer_head"], snapshot["diff_sha256"], dirty,
+                                              command=selected_tests, output_path=tests_output))
+            row = dict(zip(columns, [task, "heim-pc", str(candidate), json.dumps(argv, ensure_ascii=False, separators=(",", ":")),
+                       workspace._task_argv_sha256(argv), f"grabowski-task-{task}-a1.service", "completed", 1,
+                       None, "systemd-user", "user"]))
+            outcome = {k: row[k] for k in ("task_id", "unit", "state", "attempt", "argv_sha256", "execution_backend", "systemd_scope")}
+            outcome["observation"] = {"state": "completed", "properties": {"Result": "success", "ExecMainStatus": "0"}}
+            outcome["receipt_sha256"] = review._digest(outcome)
+            row["lifecycle_receipt_sha256"] = outcome["receipt_sha256"]
+            (outcomes / (task + ".json")).write_bytes(review._canonical(outcome))
+            (outcomes / (task + ".json")).chmod(0o600)
+            connection.execute("INSERT INTO tasks VALUES (" + ",".join("?" for _ in columns) + ")", [row[k] for k in columns])
+        connection.commit()
+        connection.close()
+        db.chmod(0o600)
+        for patcher in (mock.patch.object(producer, "TASK_DB", db), mock.patch.object(producer, "OUTCOMES", outcomes)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return producer.plan_frozen_candidate_review(manifest["workspace_id"])
+
+    def _finalize_candidate(self, plan: dict, started: dict) -> dict:
+        return review.finalize_first_party_candidate(
+            started["review_session_id"], started["session_nonce"],
+            self._issuer(review.FIRST_PARTY_TOOL_SUBMIT, {
+                "review_session_id": started["review_session_id"], "session_nonce": started["session_nonce"],
+                "report": {"finalize": True},
+            }),
+            root=self.state, key=self.key, signers=self.signers,
+            root_owned_signers=False, now_unix=self.now,
+        )
+
+    def _verify_candidate(self, plan: dict) -> dict:
+        return review.verified_first_party_candidate_handoff(
+            plan, root=self.state, signers=self.signers, root_owned_signers=False, now_unix=self.now,
+        )
+
+    def _complete_candidate(self, plan: dict, started: dict, *, reject: bool = False) -> None:
+        for number, axis in enumerate(review.REQUIRED_AXES, 1):
+            count = len(review._first_party_diff(self.repo, plan["binding"]).decode().splitlines())
+            self._read(started, axis, "diff", "", "head", 1, count)
+            self._read(started, axis, "source", self.source_path, "head", 1, 4)
+            self._read(started, axis, "source", self.source_path, "base", 1, 4)
+            refs = [f"{self.source_path}:L1-L4", f"{self.source_path}:{self.base}:L1-L4"]
+            self._submit(started, self._report(axis, number, refs, reject=reject and number == 1))
+
+    def _submit(self, started: dict, report: dict) -> dict:
+        return review.submit_first_party_axis_review(
+            started["review_session_id"], started["session_nonce"], report,
+            self._issuer(review.FIRST_PARTY_TOOL_SUBMIT, {
+                "review_session_id": started["review_session_id"], "session_nonce": started["session_nonce"],
+                "report": report,
+            }),
+            root=self.state, key=self.key, signers=self.signers,
+            root_owned_signers=False, now_unix=self.now,
+        )
+
+    def test_dirty_frozen_candidate_signed_five_axis_handoff(self) -> None:
+        plan = self._candidate_plan()
+        self.assertTrue(plan["binding"]["candidate_binding"]["dirty"])
+        started = self._start_plan(plan)
+        dirty_read = self._read(started, review.REQUIRED_AXES[0], "source", self.source_path, "head", 31, 31)
+        self.assertEqual("DIRTY_CANDIDATE = 73\n", dirty_read["content"])
+        self._complete_candidate(plan, started)
+        finalized = self._finalize_candidate(plan, started)
+        self.assertEqual(5, len(finalized["axes"]))
+        self.assertEqual({"verdict": "PASS", "findings": []}, self._verify_candidate(plan))
+        with self.assertRaises((review.ReviewExecutionRejected, FileExistsError, assertion.TransportAssertionReplay)):
+            self._finalize_candidate(plan, started)
+
+    def test_clean_frozen_candidate_signed_five_axis_handoff(self) -> None:
+        plan = self._candidate_plan(dirty=False)
+        self.assertFalse(plan["binding"]["candidate_binding"]["dirty"])
+        started = self._start_plan(plan)
+        self._complete_candidate(plan, started)
+        self._finalize_candidate(plan, started)
+        self.assertEqual("PASS", self._verify_candidate(plan)["verdict"])
+
+    def test_candidate_handoff_accepts_bound_completed_retried_tests(self) -> None:
+        plan = self._candidate_plan(retried_tests=True)
+        started = self._start_plan(plan)
+        self._complete_candidate(plan, started)
+        self._finalize_candidate(plan, started)
+        self.assertEqual("PASS", self._verify_candidate(plan)["verdict"])
+
+    def test_candidate_handoff_runs_role_capture_collect_and_close(self) -> None:
+        from test_agent_workspace import passing_toolchain_preflight, friction, role
+        plan = self._candidate_plan()
+        started = self._start_plan(plan)
+        self._complete_candidate(plan, started)
+        self._finalize_candidate(plan, started)
+        workspace = self.workspace
+        command = producer.candidate_review_command(plan["binding"]["review_batch_id"])
+        real_verify = review.verified_first_party_candidate_handoff
+        public_review = {}
+        launched = []
+
+        def start_task(**kwargs):
+            launched.append(kwargs["argv"])
+            public_review.update({"task_id": "c" * 24, "host": kwargs["host"], "attempt": 1,
+                                  "resume_policy": "never", "cwd": kwargs["cwd"],
+                                  "argv_sha256": workspace._task_argv_sha256(kwargs["argv"]),
+                                  "state": "completed", "terminal": True})
+            return {"task": public_review}
+
+        def task_public(task_id, **kwargs):
+            if task_id == "c" * 24:
+                return public_review
+            return {**producer._task_row(producer.TASK_DB, task_id), "terminal": True}
+
+        with (
+            mock.patch.object(producer, "RECEIPTS", self.root / "plans-state"),
+            mock.patch.object(review, "verified_first_party_candidate_handoff", side_effect=lambda p: real_verify(
+                p, root=self.state, signers=self.signers, root_owned_signers=False, now_unix=self.now,
+            )),
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(workspace, "_role_toolchain_preflight", side_effect=passing_toolchain_preflight),
+            mock.patch.object(workspace.tasks, "grabowski_task_start", side_effect=start_task),
+            mock.patch.object(workspace, "_task_public", side_effect=task_public),
+            mock.patch.object(workspace.base, "_append_audit"),
+            mock.patch.object(friction, "EXECUTION_OUTCOME_LOG", self.root / "execution-outcomes.jsonl"),
+        ):
+            producer._store_plan(plan)
+            retried = workspace.grabowski_agent_workspace_role_retry(
+                self.candidate_manifest["workspace_id"], "review", command,
+            )
+            self.assertEqual("retry_started", retried["state"])
+            # Exercise the actual signed verifier, subprocess stdin/output,
+            # parser and create-only role receipt. Only OS sandbox launching
+            # is substituted here; this fixture is not isolation proof.
+            with (
+                mock.patch.object(role, "sandbox_argv", side_effect=lambda repo, argv, **kw: argv),
+                mock.patch.object(role, "runtime_sandbox_argv", side_effect=lambda argv: argv),
+            ):
+                self.assertEqual(0, role.main(launched[0][3:]))
+            collected = workspace.grabowski_agent_workspace_collect(self.candidate_manifest["workspace_id"])
+            self.assertEqual("complete", collected["state"], collected)
+            self.assertEqual("PASS", collected["result"]["verification_summary"]["outcome"])
+            result = collected["result"]
+            with (
+                mock.patch.object(workspace, "_tmux_has_session", return_value=False),
+                mock.patch.object(workspace.resources, "release_resources", return_value={
+                    "released": [{"resource_key": k} for k in self.candidate_manifest["resources"]["lease_keys"]],
+                }),
+                mock.patch.object(workspace.resources, "list_resources", return_value=[]),
+            ):
+                closed = workspace.grabowski_agent_workspace_close(
+                    self.candidate_manifest["workspace_id"], result["writer_head"],
+                    result["diff_sha256"], result["result_sha256"],
+                )
+            self.assertEqual("complete", closed["close_receipt"]["state"])
+
+    def test_candidate_missing_axis_and_fake_pass_cannot_finalize(self) -> None:
+        plan = self._candidate_plan()
+        started = self._start_plan(plan)
+        with self.assertRaises(review.ReviewExecutionRejected):
+            self._submit(started, {"axis": review.REQUIRED_AXES[0], "verdict": "PASS"})
+        with self.assertRaisesRegex(review.ReviewExecutionRejected, "coverage"):
+            self._finalize_candidate(plan, started)
+
+    def test_candidate_source_drift_and_patch_tamper_reject(self) -> None:
+        plan = self._candidate_plan()
+        started = self._start_plan(plan)
+        self._complete_candidate(plan, started)
+        self._finalize_candidate(plan, started)
+        source = self.repo / self.source_path
+        original = source.read_bytes()
+        source.write_bytes(original + b"DRIFT = True\n")
+        with self.assertRaisesRegex(review.ReviewExecutionRejected, "drift"):
+            self._verify_candidate(plan)
+        source.write_bytes(original)
+        patch = Path(plan["binding"]["candidate_binding"]["patch"]["path"])
+        patch.write_bytes(patch.read_bytes() + b"edited patch\n")
+        with self.assertRaisesRegex(review.ReviewExecutionRejected, "patch"):
+            self._verify_candidate(plan)
+
+    def test_candidate_historical_reject_survives_batch_rotation(self) -> None:
+        plan = self._candidate_plan()
+        started = self._start_plan(plan)
+        self._complete_candidate(plan, started, reject=True)
+        with self.assertRaises(review.ReviewExecutionRejected):
+            self._finalize_candidate(plan, started)
+        # A fresh test receipt cannot erase an earlier semantic REJECT for
+        # this unchanged Candidate by changing the full session source hash.
+        tests_path = self.workspace._role_receipt_path(self.candidate_manifest, "tests")
+        tests = json.loads(tests_path.read_bytes())
+        tests["fixture_execution_note"] = "fresh completed test readback"
+        tests["receipt_sha256"] = self.workspace._sha256_json({k: v for k, v in tests.items() if k != "receipt_sha256"})
+        self.workspace._atomic_json(tests_path, tests)
+        later = producer.plan_frozen_candidate_review(self.candidate_manifest["workspace_id"])
+        later_session = self._start_plan(later)
+        self._complete_candidate(later, later_session)
+        with self.assertRaisesRegex(review.ReviewExecutionRejected, "previous signed material finding"):
+            self._finalize_candidate(later, later_session)
+        with self.assertRaisesRegex(review.ReviewExecutionRejected, "previous signed material finding"):
+            review._assert_no_first_party_reject_for_legacy_review(
+                later["binding"], repository=self.repo, root=self.state, signers=self.signers, root_owned_signers=False,
+            )
+
+    def test_candidate_source_read_checks_drift_before_signing_readback(self) -> None:
+        plan = self._candidate_plan()
+        started = self._start_plan(plan)
+        original_reader = review._first_party_source_blob
+
+        def drifting_read(*args):
+            data = original_reader(*args)
+            source = self.repo / self.source_path
+            source.write_bytes(source.read_bytes() + b"DRIFT_DURING_READ = True\n")
+            return data
+
+        with mock.patch.object(review, "_first_party_source_blob", side_effect=drifting_read):
+            with self.assertRaisesRegex(review.ReviewExecutionRejected, "drift"):
+                self._read(started, review.REQUIRED_AXES[0], "source", self.source_path, "head", 1, 4)
+        reads = self.state / "sessions" / started["review_session_id"] / "reads"
+        self.assertEqual([], list(reads.iterdir()))
+
+    def test_candidate_writer_and_test_receipts_are_required(self) -> None:
+        plan = self._candidate_plan()
+        for role in ("writer", "tests"):
+            path = self.workspace._role_receipt_path(self.candidate_manifest, role)
+            original = path.read_bytes()
+            path.unlink()
+            with self.assertRaisesRegex(review.ReviewExecutionRejected, "receipt"):
+                producer._current_source(self.repo, plan["binding"])
+            path.write_bytes(original)
+            path.chmod(0o600)
+            changed = json.loads(original)
+            changed["returncode"] = 37
+            path.write_text(json.dumps(changed))
+            with self.assertRaisesRegex(review.ReviewExecutionRejected, "receipt"):
+                producer._current_source(self.repo, plan["binding"])
+            path.write_bytes(original)
+
+    def test_candidate_signed_axis_cannot_replay_into_another_session(self) -> None:
+        plan = self._candidate_plan()
+        started = self._start_plan(plan)
+        self._complete_candidate(plan, started)
+        later = producer.plan_frozen_candidate_review(self.candidate_manifest["workspace_id"])
+        new = self._start_plan(later)
+        axis = review.REQUIRED_AXES[0]
+        count = len(review._first_party_diff(self.repo, later["binding"]).decode().splitlines())
+        self._read(new, axis, "diff", "", "head", 1, count)
+        old_axes = self.state / "sessions" / started["review_session_id"] / "axes"
+        new_axes = self.state / "sessions" / new["review_session_id"] / "axes"
+        for path in old_axes.iterdir():
+            shutil.copyfile(path, new_axes / path.name)
+            (new_axes / path.name).chmod(0o600)
+        with self.assertRaisesRegex(review.ReviewExecutionRejected, "axis.*binding|crossed|axis.*invalid"):
+            self._finalize_candidate(later, new)
+
+    def test_candidate_missing_signed_axis_receipt_blocks_handoff_readback(self) -> None:
+        plan = self._candidate_plan()
+        started = self._start_plan(plan)
+        self._complete_candidate(plan, started)
+        self._finalize_candidate(plan, started)
+        axes = self.state / "sessions" / started["review_session_id"] / "axes"
+        next(axes.glob("*.sig")).unlink()
+        with self.assertRaises((review.ReviewExecutionRejected, FileNotFoundError)):
+            self._verify_candidate(plan)
 
     def _issuer(self, tool_name: str, arguments: dict) -> dict:
         """Consume a real HMAC assertion; this origin is intentionally not mocked."""
