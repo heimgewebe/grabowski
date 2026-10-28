@@ -3522,6 +3522,36 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertTrue(workspace._verify_patch_artifact(frozen["writer_result"]))
         self.assertTrue(self.git.writer.exists())
 
+    def test_controller_self_review_waits_without_launching_negative_role(self) -> None:
+        manifest = self.manifest()
+        manifest["commands"]["review"] = list(
+            workspace.CONTROLLER_SELF_REVIEW_PENDING_ARGV
+        )
+        workspace._write_manifest(manifest)
+        (self.git.writer / "src" / "app.py").write_text(
+            "dirty = True\\n", encoding="utf-8"
+        )
+        role_starts = []
+        def start_role(_manifest, role, _snapshot):
+            role_starts.append(role)
+            return {"task_id": f"{role}-task"}
+        with (
+            mock.patch.object(
+                workspace, "_task_public",
+                return_value={"task_id": "writer-task", "state": "completed", "terminal": True},
+            ),
+            mock.patch.object(workspace, "_start_role_task", side_effect=start_role),
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+        ):
+            result = workspace.grabowski_agent_workspace_collect(manifest["workspace_id"])
+        self.assertEqual(result["state"], "controller_self_review_pending")
+        self.assertEqual(result["receipt_status"], "passed")
+        self.assertRegex(result["candidate_id"], r"^[a-f0-9]{64}$")
+        self.assertEqual(role_starts, ["tests"])
+        saved = workspace._manifest(manifest["workspace_id"])
+        self.assertIsNone(saved["tasks"]["review"])
+        self.assertTrue(saved["frozen_writer"]["dirty"])
+
     def test_dirty_grok_role_argv_binds_exact_frozen_patch_with_untracked_files(self) -> None:
         manifest = self.manifest()
         (self.git.writer / "src" / "app.py").write_text("dirty = True\n", encoding="utf-8")
@@ -7400,6 +7430,111 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertEqual(result["state"], "semantic_test_failure")
         self.assertEqual(result["returncode"], 1)
         start.assert_not_called()
+
+    def test_pending_controller_review_refuses_synthetic_retry_pass(self) -> None:
+        manifest = self.manifest()
+        (self.git.writer / "src" / "app.py").write_text(
+            "review_pending = True\\n", encoding="utf-8",
+        )
+        snapshot = workspace._git_snapshot(manifest, workspace._run)
+        writer_result = workspace._materialize_writer_patch(
+            manifest, snapshot, workspace._run,
+        )
+        manifest["frozen_writer"] = {
+            "writer_head": snapshot["writer_head"],
+            "diff_sha256": snapshot["diff_sha256"],
+            "dirty": snapshot["dirty"],
+            "writer_result": writer_result,
+        }
+        manifest["commands"]["review"] = list(
+            workspace.CONTROLLER_SELF_REVIEW_PENDING_ARGV
+        )
+        workspace._write_manifest(manifest)
+        classification, detail = workspace._role_retry_classification(
+            manifest, "review", manifest["frozen_writer"],
+        )
+        self.assertEqual(classification, "eligible")
+        self.assertEqual(detail["prior_failure_classification"], "controller_self_review_pending")
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(workspace.tasks, "grabowski_task_start") as started,
+        ):
+            blocked = workspace.grabowski_agent_workspace_role_retry(
+                manifest["workspace_id"], "review",
+                ["python3", "-c", "print('PASS')"],
+            )
+        self.assertEqual(blocked["state"], "authentic_review_route_required")
+        self.assertEqual(blocked["retry_status"], "blocked")
+        self.assertFalse(blocked["review_task_started"])
+        started.assert_not_called()
+        self.assertIsNone(workspace._manifest(manifest["workspace_id"])["tasks"]["review"])
+
+    def test_pending_controller_review_can_start_real_optional_catalogue_reviewer(self) -> None:
+        manifest = self.manifest()
+        (self.git.writer / "src" / "app.py").write_text(
+            "review_pending = True\\n", encoding="utf-8",
+        )
+        snapshot = workspace._git_snapshot(manifest, workspace._run)
+        writer_result = workspace._materialize_writer_patch(
+            manifest, snapshot, workspace._run,
+        )
+        manifest["frozen_writer"] = {
+            "writer_head": snapshot["writer_head"],
+            "diff_sha256": snapshot["diff_sha256"],
+            "dirty": snapshot["dirty"],
+            "writer_result": writer_result,
+        }
+        manifest["commands"]["review"] = list(
+            workspace.CONTROLLER_SELF_REVIEW_PENDING_ARGV
+        )
+        workspace._write_manifest(manifest)
+        replacement = [
+            "claude", "--model", "claude-opus-5-5",
+            "--effort", "high", "--permission-mode", "plan",
+            "Review the exact bound frozen Candidate; give only real findings.",
+        ]
+        from grabowski_decision_reviews import _review_route_evidence
+        self.assertIsNotNone(_review_route_evidence(replacement))
+
+        def fake_task_start(**kwargs):
+            self.assertIn("--review-input-sha256", kwargs["argv"])
+            return {"task": {
+                "task_id": "authentic-readonly-review-task",
+                "host": kwargs["host"], "attempt": 1,
+                "resume_policy": "never",
+                "argv_sha256": workspace._sha256_json(kwargs["argv"]),
+                "cwd": kwargs["cwd"],
+            }}
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(workspace, "_role_toolchain_preflight", return_value={
+                "passed": True,
+                "command_sha256": workspace._sha256_json(replacement),
+                "environment": {"environment_sha256": "a" * 64},
+            }),
+            mock.patch.object(
+                workspace.tasks, "grabowski_task_start",
+                side_effect=fake_task_start,
+            ) as started,
+        ):
+            retried = workspace.grabowski_agent_workspace_role_retry(
+                manifest["workspace_id"], "review", replacement,
+            )
+        self.assertEqual(retried["state"], "retry_started")
+        self.assertEqual(retried["attempt"], 1)
+        self.assertEqual(
+            retried["attempt_record"]["retry_reason"],
+            "controller_self_review_optional_role_handoff",
+        )
+        self.assertEqual(
+            retried["attempt_record"]["previous_failure_classification"],
+            "controller_self_review_pending",
+        )
+        self.assertEqual(started.call_count, 1)
+        self.assertEqual(
+            workspace._manifest(manifest["workspace_id"])["tasks"]["review"],
+            "authentic-readonly-review-task",
+        )
 
     def test_role_retry_blocks_on_review_needs_change(self) -> None:
         manifest = self.manifest()

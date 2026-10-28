@@ -8250,6 +8250,55 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual(writer_command, create_kwargs["writer_argv"])
         continuation.assert_called_once()
 
+    def test_agent_execution_controller_review_pending_does_not_schedule_retry_loop(self) -> None:
+        workspace_id = "gaw-controller-review-handoff"
+        workspace = types.SimpleNamespace()
+        coordinator = types.SimpleNamespace(
+            run_workspace_candidate_coordinator=Mock(return_value={
+                "workspace_id": workspace_id,
+                "state": "pending",
+                "reason": "controller_self_review_pending",
+                "status": {
+                    "tasks": {"review": {"task_id": None, "terminal": False}},
+                    "frozen_writer": {"diff_sha256": "a" * 64},
+                },
+            })
+        )
+        continuation = Mock()
+        with (
+            patch.object(
+                grips, "_agent_execution_happy_path_modules",
+                return_value=(coordinator, workspace),
+            ),
+            patch.object(
+                grips, "_agent_execution_bound_writer_command",
+                return_value=["python3", "-c", "pass"],
+            ),
+            patch.object(
+                grips, "_agent_execution_bound_effect_profile",
+                return_value="candidate",
+            ),
+            patch.object(grips, "_agent_execution_start_continuation", continuation),
+        ):
+            result = grips.run_grip(
+                "agent-execution-happy-path",
+                {
+                    "workspace_id": workspace_id,
+                    "base": "main",
+                    "title": "Persist candidate pending genuine controller review",
+                },
+                allow_mutation=True,
+                command_runner=FakeGit(),
+                github_runner=FakeGh(),
+            )
+        self.assertEqual(result["receipt"]["status"], "passed")
+        self.assertEqual(result["output"]["state"], "controller_self_review_pending")
+        self.assertEqual(result["output"]["next_action"], "controller_self_review_bound_candidate")
+        self.assertFalse(result["output"]["integration_ready"])
+        self.assertFalse(result["output"]["reconcile_required"])
+        self.assertIsNone(result["output"]["continuation"])
+        continuation.assert_not_called()
+
     def test_agent_execution_self_review_frontdoor_stays_pending_after_green_tests(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp).resolve()
@@ -8336,7 +8385,11 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual(test_argv, create_kwargs["test_argv"])
         self.assertNotEqual(test_argv, create_kwargs["review_argv"])
         review_command = " ".join(create_kwargs["review_argv"])
-        self.assertIn("BLOCK", review_command)
+        self.assertEqual(
+            create_kwargs["review_argv"],
+            list(__import__("grabowski_agent_workspace").CONTROLLER_SELF_REVIEW_PENDING_ARGV),
+        )
+        self.assertNotIn("'BLOCK'", review_command)
         self.assertNotIn("'PASS'", review_command)
 
     def test_agent_execution_happy_path_source_mode_binds_direct_controller_lane_without_workspace(self) -> None:

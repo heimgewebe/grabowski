@@ -1,5 +1,14 @@
 from __future__ import annotations
 
+# This *never* produces a semantic verdict. A workspace using the self-review
+# policy must hand its frozen Candidate to the authenticated controller instead
+# of executing a fake BLOCK and irreversibly poisoning role-retry.
+CONTROLLER_SELF_REVIEW_PENDING_ARGV = (
+    "python3",
+    "-c",
+    "raise SystemExit('controller_self_review_pending: substantive review not submitted')",
+)
+
 import hashlib
 import json
 import re

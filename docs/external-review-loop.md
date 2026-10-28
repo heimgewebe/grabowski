@@ -28,18 +28,31 @@ For `high_critical`, the self-review audit carries `independent_review_required=
 
 This contract governs only reviews launched as decision-bound through the typed Grabowski job surface. Generic decision-bound jobs may still create blocking finding debt, but only the server-derived read-only reviewer-role provenance described above can satisfy an explicitly requested independent-review requirement. It does not turn arbitrary external LLM output into merge authority, prove review quality, prove a different provider family, prevent a non-cooperating external GitHub actor from merging, or claim complete detection of deliberately indirect same-UID execution.
 
-## Current implementation gap (PR #1649, source-only)
+## Current source/runtime boundary (PR #1649)
 
-The existing V2 semantic proof verifier currently accepts only successfully
-executed, origin-bound read-only catalog reviewer jobs, so its present runtime
-cannot yet establish the promised provider-independent first-party path.
-Five successful isolated unit-test/source-inspection jobs are **not** five
-semantic reviews. A caller-authored report, matching SHA-256, or technically
-green task is not a valid substitute for the authenticated content-producing
-review role and its protected full output. Until a legitimate first-party
-semantic execution route and signer/trust-root are implemented and verified,
-this remains a hard admission BLOCK; do not waive the Codex/finding gates,
-undraft PR #1649, or claim Captain merge authority.
+The source implementation includes the new signed primary-connector first-party
+review session, source-read, axis-submit, and exact five-axis verification path.
+Until the Nix-installed runtime actually registers those three MCP tools and
+deploys an independently protected signer trust anchor, their source existence
+cannot authorize Captain or seal the pending original PR review plan. Five
+technical PASS jobs still do not constitute five semantic reviews. Missing,
+stale, or spoofed signed controller evidence remains BLOCK. Do not undraft or
+merge PR #1649 based only on green tests.
+
+For a lane-backed Agent Execution Fabric Candidate under self_review policy, an
+as-yet unperformed controller review is a **pending source-bound handoff**, not
+the negative semantic verdict BLOCK. Collection freezes the Candidate and may
+start deterministic tests, but must not start a fake negative review task. The
+coordinator returns controller_self_review_pending, does not enqueue a pointless
+polling loop, and retains the exact Candidate/diff/patch identity. An explicitly
+selected catalogue-bound read-only reviewer can later resume through
+grabowski_agent_workspace_role_retry, with a real reviewer outcome bound to the
+immutable frozen Candidate. An arbitrary Python one-liner returning PASS is
+refused as a reviewer replacement. This optional reviewer recovery does NOT
+replace the separately missing provider-independent signed first-party Candidate
+completion endpoint; until that endpoint is implemented and deployed, the
+automatic provider-free Candidate workflow is not end-to-end complete. Neither
+green tests nor pending implies approval.
 
 ## Depth policy
 

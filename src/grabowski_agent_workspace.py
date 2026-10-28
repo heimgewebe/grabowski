@@ -71,6 +71,8 @@ TERMINAL_TASK_STATES = frozenset(
     {"completed", "failed", "cancelled", "timed_out", "signalled"}
 )
 READ_ONLY_ROLES = ("tests", "review")
+CONTROLLER_SELF_REVIEW_PENDING_ARGV = execution_plan.CONTROLLER_SELF_REVIEW_PENDING_ARGV
+
 ALL_ROLES = ("captain", "writer", "tests", "review")
 PLAN_FIELDS = (
     "schema_version",
@@ -5427,6 +5429,18 @@ def _role_retry_classification(
         return start_intent
     task_id = manifest.get("tasks", {}).get(role)
     if task_id is None:
+        if (
+            role == "review"
+            and manifest.get("commands", {}).get("review")
+            == list(CONTROLLER_SELF_REVIEW_PENDING_ARGV)
+            and isinstance(manifest.get("frozen_writer"), dict)
+        ):
+            # No previous reviewer executed. This is a genuine controller
+            # handoff, not a failed semantic review verdict or quota event.
+            return "eligible", {
+                "prior_failure_classification": "controller_self_review_pending",
+                "prior_attempt_consumed": False,
+            }
         blocks = manifest.get("role_preflight_blocks", {})
         role_blocks = blocks.get(role) if isinstance(blocks, dict) else None
         if isinstance(role_blocks, list) and role_blocks:
@@ -8354,6 +8368,29 @@ def grabowski_agent_workspace_collect(workspace_id: str) -> dict[str, Any]:
             }
 
         for role in READ_ONLY_ROLES:
+            if (
+                role == "review"
+                and tasks_map.get("review") is None
+                and manifest.get("commands", {}).get("review")
+                == list(CONTROLLER_SELF_REVIEW_PENDING_ARGV)
+            ):
+                # Freeze the full Candidate first; start real tests normally.
+                # No synthetic BLOCK/PASS is run as a review role, so the
+                # existing retry/NEEDS_CHANGE contracts remain meaningful.
+                return {
+                    "workspace_id": identifier,
+                    "state": "controller_self_review_pending",
+                    "candidate_id": candidate_manifest["candidate_id"],
+                    "writer_head": snapshot["writer_head"],
+                    "diff_sha256": snapshot["diff_sha256"],
+                    "dirty": snapshot["dirty"],
+                    "patch_sha256": writer_result["sha256"],
+                    "test_task_id": tasks_map.get("tests"),
+                    "review_task_started": False,
+                    "next_action": "controller_self_review_bound_candidate",
+                    "worktree_preserved": True,
+                    "receipt_status": "passed",
+                }
             if tasks_map.get(role) is None:
                 # Do not preflight a sibling if reconciliation is already required.
                 reconciliation_block = _existing_role_reconciliation_block()
@@ -9955,6 +9992,25 @@ def grabowski_agent_workspace_role_retry(
             }
         worktree = Path(str(manifest["writer_worktree"]))
         command = _role_argv(replacement_argv, "replacement_argv", cwd=worktree)
+        if (
+            role_name == "review"
+            and manifest.get("commands", {}).get("review")
+            == list(CONTROLLER_SELF_REVIEW_PENDING_ARGV)
+            and manifest.get("tasks", {}).get("review") is None
+        ):
+            # Optional explicit recovery via an actual pinned review-only
+            # catalogue model. Never let a caller's Python one-liner claim
+            # controller self-review PASS. A native first-party Candidate
+            # proof still needs its own authenticated signed handoff.
+            from grabowski_decision_reviews import _review_route_evidence
+            if _review_route_evidence(command) is None:
+                return {
+                    "workspace_id": identifier,
+                    "role": role_name,
+                    "state": "authentic_review_route_required",
+                    "retry_status": "blocked",
+                    "review_task_started": False,
+                }
         start_intent = _role_start_intent_classification(manifest, role_name)
         if start_intent is not None:
             classification, detail = start_intent
@@ -10145,6 +10201,8 @@ def grabowski_agent_workspace_role_retry(
         retry_reason = (
             "toolchain_preflight_blocked"
             if previous_failure_classification == "toolchain_preflight_blocked"
+            else "controller_self_review_optional_role_handoff"
+            if previous_failure_classification == "controller_self_review_pending"
             else "terminal_environment_toolchain_failure"
         )
         attempt_record = {

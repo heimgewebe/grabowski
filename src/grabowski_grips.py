@@ -9327,17 +9327,10 @@ def _agent_execution_source_request(
             role="review",
         )
     elif verification_policy == "self_review":
-        review_argv = [
-            sys.executable,
-            "-I",
-            "-c",
-            (
-                "import json; print(json.dumps({'verdict':'BLOCK','findings':["
-                "{'code':'controller_self_review_pending','message':"
-                "'Substantive controller self-review is still pending; deterministic "
-                "test success is not a review verdict.'}]}))"
-            ),
-        ]
+        # The controller owns the semantic verdict. This is a non-executable
+        # placeholder in the Workspace plan, NOT an executed role verdict.
+        # collect() must return a frozen-Candidate handoff without starting it.
+        review_argv = list(execution_plan.CONTROLLER_SELF_REVIEW_PENDING_ARGV)
     else:
         review_argv = [
             "python3",
@@ -10014,6 +10007,20 @@ def _run_agent_execution_happy_path(
     _check(receipt, "workspace-coordinator-bound", "pass", str(coordinated.get("state")))
     coordinator_state = coordinated.get("state")
     if coordinator_state == "pending":
+        if coordinated.get("reason") == "controller_self_review_pending":
+            # A controller review must be a real later source-bound action.
+            # Do not launch a background continuation that would re-run the
+            # same sentinel forever or claim technical tests are reviewer PASS.
+            return with_frontdoor({
+                "state": "controller_self_review_pending",
+                "integration_ready": False,
+                "workspace_id": workspace_id,
+                "coordinator": coordinated,
+                "continuation": None,
+                "reconcile_required": False,
+                "next_action": "controller_self_review_bound_candidate",
+                "receipt_status": "passed",
+            })
         continuation = _agent_execution_start_continuation(
             workspace,
             workspace_id=workspace_id,
