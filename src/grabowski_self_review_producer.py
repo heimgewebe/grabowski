@@ -431,6 +431,18 @@ def _seal_review(
             seen.add(phase["summary"])
             argv_sha = task["argv_sha256"]
             nonce = secrets.token_hex(16)
+            semantic_kind = semantic.get("provenance_kind", "v2_model_role")
+            if semantic_kind not in {
+                "v2_model_role", "first_party_authenticated_controller",
+            }:
+                raise provenance.ReviewExecutionRejected(
+                    "review semantic provenance kind invalid"
+                )
+            semantic_field = (
+                "semantic_first_party"
+                if semantic_kind == "first_party_authenticated_controller"
+                else "semantic_v2"
+            )
             record = {
                 "schema_version": 1, "kind": provenance.KIND,
                 "producer": provenance.PRODUCER,
@@ -440,7 +452,7 @@ def _seal_review(
                 "stdout_sha256": hashlib.sha256(output).hexdigest(),
                 "source_raw_diff_sha256": plan["source_raw_diff_sha256"],
                 "source_inspection_report_sha256": provenance._digest(observed_report),
-                "semantic_v2": semantic["provenance"],
+                semantic_field: semantic["provenance"],
                 "sandbox": "isolated-read-only",
                 "sandbox_argv": command, "worktree_path": str(worktree),
                 "isolation_sha256": provenance._digest({

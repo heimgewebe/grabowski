@@ -11,11 +11,13 @@ the PR under review.  Missing deployment of that trust root is a hard BLOCK.
 from __future__ import annotations
 
 import hashlib
+import fcntl
 import json
 import os
 import pwd
 from pathlib import Path
 import re
+import secrets
 import stat
 import subprocess
 import time
@@ -54,6 +56,22 @@ MAX_OUTPUT = 1024 * 1024
 MAX_SOURCE_BLOB = 2 * 1024 * 1024
 MAX_REFERENCES = 64
 PHASE_OBSERVATION_PREFIX = b"grabowski-phase-source-inspection-v1:"
+FIRST_PARTY_REVIEW_ROOT = (
+    Path.home() / ".local/state/grabowski/first-party-self-reviews"
+)
+FIRST_PARTY_SESSION_TTL_SECONDS = 24 * 60 * 60
+FIRST_PARTY_MAX_DIFF_BYTES = 1024 * 1024
+FIRST_PARTY_MAX_READ_BYTES = 256 * 1024
+FIRST_PARTY_MAX_READ_LINES = 1000
+FIRST_PARTY_SESSION_KIND = "grabowski_first_party_semantic_review_session_v1"
+FIRST_PARTY_READ_KIND = "grabowski_first_party_semantic_source_read_v1"
+FIRST_PARTY_AXIS_KIND = "grabowski_first_party_semantic_axis_review_v1"
+FIRST_PARTY_ISSUER_KIND = "grabowski_authenticated_mcp_controller_v1"
+FIRST_PARTY_TOOL_START = "grabowski_self_review_session_start"
+FIRST_PARTY_TOOL_READ = "grabowski_self_review_source_read"
+FIRST_PARTY_TOOL_SUBMIT = "grabowski_self_review_axis_submit"
+FIRST_PARTY_CONNECTOR_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
+FIRST_PARTY_READ_ID_RE = re.compile(r"[a-f0-9]{32}\Z")
 
 
 class ReviewExecutionRejected(ValueError):
@@ -698,6 +716,1107 @@ def _source_reference(
         raise ReviewExecutionRejected("self-review evidence range not present")
 
 
+class FirstPartyReviewAbsent(ReviewExecutionRejected):
+    """No first-party session is bound to this review batch."""
+
+
+def authenticated_first_party_issuer(
+    connector_id: Any, evidence: Any, *, expected_tool: str,
+) -> dict[str, Any]:
+    """Project consumed signed-ingress evidence into a storable issuer receipt.
+
+    This function accepts only the result of the server's one-call assertion
+    consumer.  MCP tool schemas never expose an ``issuer`` argument, so caller
+    JSON cannot select or replace this value.
+    """
+    if (
+        not isinstance(connector_id, str)
+        or FIRST_PARTY_CONNECTOR_RE.fullmatch(connector_id) is None
+        # Other enrolled read/write connectors are not the primary operator.
+        or connector_id != "primary"
+        or expected_tool not in {
+            FIRST_PARTY_TOOL_START, FIRST_PARTY_TOOL_READ,
+            FIRST_PARTY_TOOL_SUBMIT,
+        }
+        or not isinstance(evidence, dict)
+        or evidence.get("state") != "consumed"
+        or evidence.get("single_use") is not True
+        or evidence.get("transport_mode") != "signed-one-call-v1"
+        or evidence.get("client_scope_kind") != "connector_capability"
+        or evidence.get("tool_name") != expected_tool
+    ):
+        raise ReviewExecutionRejected("authenticated controller issuer absent")
+    required_hashes = (
+        "client_scope_sha256", "runtime_binding_sha256", "arguments_sha256",
+        "consumption_receipt_sha256",
+    )
+    if any(
+        not isinstance(evidence.get(name), str)
+        or SHA256.fullmatch(evidence[name]) is None
+        for name in required_hashes
+    ):
+        raise ReviewExecutionRejected("authenticated controller issuer malformed")
+    request_id = evidence.get("request_id")
+    if not isinstance(request_id, str) or ID.fullmatch(request_id) is None:
+        raise ReviewExecutionRejected("authenticated controller request identity invalid")
+    return {
+        "schema_version": 1,
+        "kind": FIRST_PARTY_ISSUER_KIND,
+        "connector_id": connector_id,
+        "client_scope_sha256": evidence["client_scope_sha256"],
+        "runtime_binding_sha256": evidence["runtime_binding_sha256"],
+        "request_id": request_id,
+        "tool_name": expected_tool,
+        "arguments_sha256": evidence["arguments_sha256"],
+        "consumption_receipt_sha256": evidence["consumption_receipt_sha256"],
+    }
+
+
+def _validate_first_party_issuer(
+    value: Any, *, expected_tool: str,
+) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != {
+        "schema_version", "kind", "connector_id", "client_scope_sha256",
+        "runtime_binding_sha256", "request_id", "tool_name",
+        "arguments_sha256", "consumption_receipt_sha256",
+    }:
+        raise ReviewExecutionRejected("first-party issuer receipt shape invalid")
+    if value.get("schema_version") != 1 or value.get("kind") != FIRST_PARTY_ISSUER_KIND:
+        raise ReviewExecutionRejected("first-party issuer receipt identity invalid")
+    return authenticated_first_party_issuer(
+        value["connector_id"],
+        {
+            "state": "consumed", "single_use": True,
+            "transport_mode": "signed-one-call-v1",
+            "client_scope_kind": "connector_capability",
+            **{key: value[key] for key in (
+                "client_scope_sha256", "runtime_binding_sha256", "request_id",
+                "tool_name", "arguments_sha256", "consumption_receipt_sha256",
+            )},
+        },
+        expected_tool=expected_tool,
+    )
+
+
+def _first_party_principal(issuer: dict[str, Any]) -> dict[str, str]:
+    return {
+        "connector_id": issuer["connector_id"],
+        "client_scope_sha256": issuer["client_scope_sha256"],
+    }
+
+
+def _ensure_private_state_directory(path: Path) -> None:
+    path.mkdir(parents=True, mode=0o700, exist_ok=True)
+    metadata = path.lstat()
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or stat.S_IMODE(metadata.st_mode) & 0o077
+    ):
+        raise ReviewExecutionRejected("first-party review state directory unsafe")
+
+
+def _create_private_bytes(path: Path, data: bytes) -> None:
+    if not isinstance(data, bytes):
+        raise ReviewExecutionRejected("first-party review record bytes invalid")
+    descriptor = os.open(
+        path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+        0o600,
+    )
+    try:
+        with os.fdopen(descriptor, "wb", closefd=False) as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+    finally:
+        os.close(descriptor)
+
+
+def _first_party_lock(root: Path) -> int:
+    _ensure_private_state_directory(root)
+    path = root / ".lock"
+    descriptor = os.open(
+        path,
+        os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
+        0o600,
+    )
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or metadata.st_nlink != 1
+    ):
+        os.close(descriptor)
+        raise ReviewExecutionRejected("first-party review state lock unsafe")
+    fcntl.flock(descriptor, fcntl.LOCK_EX)
+    return descriptor
+
+
+def _release_first_party_lock(descriptor: int) -> None:
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
+
+
+def _private_signing_key(path: Path) -> None:
+    metadata = path.lstat()
+    parent = path.parent.lstat()
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or not stat.S_ISDIR(parent.st_mode)
+        or parent.st_uid != os.getuid()
+        or stat.S_IMODE(parent.st_mode) & 0o077
+    ):
+        raise ReviewExecutionRejected("first-party review signing key unsafe")
+
+
+def _sign_server_record(material: bytes, *, key: Path, signers: Path) -> bytes:
+    _private_signing_key(key)
+    try:
+        result = subprocess.run(
+            [
+                _trusted_ssh_keygen(), "-Y", "sign", "-f", str(key),
+                "-n", NAMESPACE,
+            ],
+            input=material, capture_output=True, timeout=15, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ReviewExecutionRejected("first-party review signer unavailable") from exc
+    if result.returncode != 0:
+        raise ReviewExecutionRejected("first-party review signature failed")
+    _check_signature(material, result.stdout, signers)
+    return result.stdout
+
+
+def _write_signed_record(
+    path: Path, record: dict[str, Any], *, key: Path, signers: Path,
+) -> tuple[str, str]:
+    material = _canonical(record)
+    if len(material) > MAX_RECEIPT:
+        raise ReviewExecutionRejected("first-party review receipt over budget")
+    signature = _sign_server_record(material, key=key, signers=signers)
+    _create_private_bytes(path, material)
+    try:
+        _create_private_bytes(path.with_suffix(".sig"), signature)
+    except Exception:
+        # The unsigned JSON is fail-closed and cannot be accepted.  Do not
+        # overwrite or silently reuse it on a later request.
+        raise
+    return hashlib.sha256(material).hexdigest(), hashlib.sha256(signature).hexdigest()
+
+
+def _read_signed_record(
+    path: Path, *, signers: Path, root_owned_signers: bool,
+) -> dict[str, Any]:
+    parent_fd = _private_dir(path.parent)
+    try:
+        material = _private_read(parent_fd, path.name, limit=MAX_RECEIPT)
+        signature = _private_read(
+            parent_fd, path.with_suffix(".sig").name, limit=16384,
+        )
+    finally:
+        os.close(parent_fd)
+    _check_signature(
+        material, signature,
+        _allowed_signers(signers, root_owned=root_owned_signers),
+    )
+    return _json_record(material)
+
+
+def _first_party_binding(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ReviewExecutionRejected("first-party review binding absent")
+    expected = {
+        "repo", "pr", "base_sha", "head_sha", "diff_sha256",
+        "review_batch_id", "review_purpose",
+    }
+    if value.get("review_purpose") == "post_merge_release":
+        expected.add("release_binding")
+    if (
+        set(value) != expected
+        or value.get("repo") != "heimgewebe/grabowski"
+        or type(value.get("pr")) is not int or value["pr"] <= 0
+        or any(
+            not isinstance(value.get(name), str)
+            or SHA40.fullmatch(value[name]) is None
+            for name in ("base_sha", "head_sha")
+        )
+        or not isinstance(value.get("diff_sha256"), str)
+        or SHA256.fullmatch(value["diff_sha256"]) is None
+        or not isinstance(value.get("review_batch_id"), str)
+        or ID.fullmatch(value["review_batch_id"]) is None
+        or value.get("review_purpose") not in {"pull_request", "post_merge_release"}
+    ):
+        raise ReviewExecutionRejected("first-party review binding invalid")
+    if value["review_purpose"] == "post_merge_release":
+        release = value.get("release_binding")
+        if (
+            not isinstance(release, dict)
+            or set(release) != {"serving_release_id", "serving_tree", "target_tree"}
+            or not isinstance(release.get("serving_release_id"), str)
+            or not release["serving_release_id"]
+            or any(
+                not isinstance(release.get(name), str)
+                or SHA40.fullmatch(release[name]) is None
+                for name in ("serving_tree", "target_tree")
+            )
+        ):
+            raise ReviewExecutionRejected("first-party release binding invalid")
+    return dict(value)
+
+
+def _git_read(
+    repository: Path, arguments: list[str], *, maximum: int, timeout: int = 30,
+) -> bytes:
+    try:
+        result = subprocess.run(
+            ["git", "--no-replace-objects", "-C", str(repository), *arguments],
+            capture_output=True, timeout=timeout, check=False,
+            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ReviewExecutionRejected("first-party review Git read unavailable") from exc
+    if result.returncode != 0 or len(result.stdout) > maximum:
+        raise ReviewExecutionRejected("first-party review Git read failed or over budget")
+    return result.stdout
+
+
+def _first_party_diff(repository: Path, binding: dict[str, Any]) -> bytes:
+    return _git_read(
+        repository,
+        [
+            "diff", "--no-ext-diff", "--no-textconv", "--no-renames",
+            "--ignore-submodules=none", "--unified=3",
+            binding["base_sha"], binding["head_sha"], "--",
+        ],
+        maximum=FIRST_PARTY_MAX_DIFF_BYTES,
+        timeout=60,
+    )
+
+
+def _first_party_changed_paths(
+    repository: Path, binding: dict[str, Any],
+) -> list[str]:
+    raw = _git_read(
+        repository,
+        [
+            "diff", "--no-ext-diff", "--no-textconv", "--no-renames",
+            "--ignore-submodules=none", "--name-only", "-z",
+            binding["base_sha"], binding["head_sha"], "--",
+        ],
+        maximum=FIRST_PARTY_MAX_DIFF_BYTES,
+        timeout=60,
+    )
+    if not raw or not raw.endswith(b"\x00"):
+        raise ReviewExecutionRejected("first-party review changed paths absent")
+    try:
+        paths = [item.decode("utf-8") for item in raw[:-1].split(b"\x00")]
+    except UnicodeError as exc:
+        raise ReviewExecutionRejected("first-party changed path encoding invalid") from exc
+    if (
+        not 1 <= len(paths) <= 256
+        or len(paths) != len(set(paths))
+        or any(
+            not path or len(path) > 512 or ".." in Path(path).parts
+            or re.fullmatch(r"[A-Za-z0-9_.@+/-]+", path) is None
+            for path in paths
+        )
+    ):
+        raise ReviewExecutionRejected("first-party changed path set invalid")
+    return paths
+
+
+def _assert_plan_source(plan: dict[str, Any]) -> tuple[dict[str, Any], Path, str]:
+    if (
+        not isinstance(plan, dict)
+        or plan.get("schema_version") != 1
+        or plan.get("kind") != "grabowski_self_review_execution_plan"
+        or not isinstance(plan.get("tasks"), dict)
+        or set(plan["tasks"]) != set(REQUIRED_AXES)
+    ):
+        raise ReviewExecutionRejected("first-party review plan invalid")
+    binding = _first_party_binding(plan.get("binding"))
+    worktree_raw = plan.get("worktree")
+    source_raw = plan.get("source_raw_diff_sha256")
+    if (
+        not isinstance(worktree_raw, str) or not worktree_raw.startswith("/")
+        or ".." in Path(worktree_raw).parts
+        or not isinstance(source_raw, str) or SHA256.fullmatch(source_raw) is None
+    ):
+        raise ReviewExecutionRejected("first-party review plan source invalid")
+    from grabowski_self_review_producer import _current_source
+    worktree = Path(worktree_raw).resolve(strict=True)
+    if _current_source(worktree, binding) != source_raw:
+        raise ReviewExecutionRejected("first-party review plan source drift")
+    return binding, worktree, source_raw
+
+
+def start_first_party_review_session(
+    plan: dict[str, Any], issuer: dict[str, Any], *,
+    root: Path = FIRST_PARTY_REVIEW_ROOT,
+    key: Path = SIGNING_KEY,
+    signers: Path = TRUSTED_SIGNERS,
+    root_owned_signers: bool = True,
+    now_unix: int | None = None,
+) -> dict[str, Any]:
+    """Create the only authenticated controller session for one review batch."""
+    authenticated = _validate_first_party_issuer(
+        issuer, expected_tool=FIRST_PARTY_TOOL_START,
+    )
+    signers = _allowed_signers(signers, root_owned=root_owned_signers)
+    binding, worktree, source_raw = _assert_plan_source(plan)
+    diff = _first_party_diff(worktree, binding)
+    changed_paths = _first_party_changed_paths(worktree, binding)
+    observed_at = int(time.time()) if now_unix is None else now_unix
+    if type(observed_at) is not int or observed_at < 0:
+        raise ReviewExecutionRejected("first-party session observation time invalid")
+    session_id = secrets.token_hex(16)
+    nonce = secrets.token_hex(16)
+    session = {
+        "schema_version": 1,
+        "kind": FIRST_PARTY_SESSION_KIND,
+        "session_id": session_id,
+        "session_nonce_sha256": hashlib.sha256(nonce.encode("ascii")).hexdigest(),
+        "binding": binding,
+        "binding_sha256": _digest(binding),
+        "worktree": str(worktree),
+        "source_raw_diff_sha256": source_raw,
+        "canonical_diff_sha256": hashlib.sha256(diff).hexdigest(),
+        "changed_paths": changed_paths,
+        "issuer_principal": _first_party_principal(authenticated),
+        "start_issuer": authenticated,
+        "created_at_unix": observed_at,
+        "expires_at_unix": observed_at + FIRST_PARTY_SESSION_TTL_SECONDS,
+    }
+    lock = _first_party_lock(root)
+    try:
+        batches = root / "batches"
+        sessions = root / "sessions"
+        _ensure_private_state_directory(batches)
+        _ensure_private_state_directory(sessions)
+        index_path = batches / (binding["review_batch_id"] + ".json")
+        if index_path.exists():
+            raise ReviewExecutionRejected("first-party review batch already has a session")
+        session_root = sessions / session_id
+        session_root.mkdir(mode=0o700)
+        _ensure_private_state_directory(session_root)
+        _ensure_private_state_directory(session_root / "reads")
+        _ensure_private_state_directory(session_root / "axes")
+        receipt_sha256, signature_sha256 = _write_signed_record(
+            session_root / "session.json", session, key=key, signers=signers,
+        )
+        index = {
+            "schema_version": 1,
+            "kind": "grabowski_first_party_review_batch_index_v1",
+            "review_batch_id": binding["review_batch_id"],
+            "session_id": session_id,
+            "binding_sha256": session["binding_sha256"],
+            "session_receipt_sha256": receipt_sha256,
+            "session_signature_sha256": signature_sha256,
+        }
+        _create_private_bytes(index_path, _canonical(index))
+    finally:
+        _release_first_party_lock(lock)
+    return {
+        "status": "review_session_started",
+        "review_session_id": session_id,
+        "session_nonce": nonce,
+        "review_batch_id": binding["review_batch_id"],
+        "head_sha": binding["head_sha"],
+        "canonical_diff_sha256": session["canonical_diff_sha256"],
+        "required_axes": list(REQUIRED_AXES),
+        "expires_at_unix": session["expires_at_unix"],
+        "does_not_establish": ["source_inspection", "semantic_review", "review_pass"],
+    }
+
+
+def _load_first_party_session(
+    session_id: str, nonce: str, *, root: Path, signers: Path,
+    root_owned_signers: bool, now_unix: int, require_fresh: bool,
+) -> tuple[dict[str, Any], Path]:
+    if (
+        not isinstance(session_id, str) or ID.fullmatch(session_id) is None
+        or not isinstance(nonce, str) or ID.fullmatch(nonce) is None
+    ):
+        raise ReviewExecutionRejected("first-party session identity invalid")
+    session_root = root / "sessions" / session_id
+    record = _read_signed_record(
+        session_root / "session.json", signers=signers,
+        root_owned_signers=root_owned_signers,
+    )
+    if (
+        set(record) != {
+            "schema_version", "kind", "session_id", "session_nonce_sha256",
+            "binding", "binding_sha256", "worktree", "source_raw_diff_sha256",
+            "canonical_diff_sha256", "changed_paths", "issuer_principal",
+            "start_issuer", "created_at_unix", "expires_at_unix",
+        }
+        or record.get("schema_version") != 1
+        or record.get("kind") != FIRST_PARTY_SESSION_KIND
+        or record.get("session_id") != session_id
+        or record.get("session_nonce_sha256")
+        != hashlib.sha256(nonce.encode("ascii")).hexdigest()
+        or record.get("binding_sha256") != _digest(_first_party_binding(record.get("binding")))
+        or not isinstance(record.get("changed_paths"), list)
+        or not isinstance(record.get("issuer_principal"), dict)
+        or _validate_first_party_issuer(
+            record.get("start_issuer"), expected_tool=FIRST_PARTY_TOOL_START,
+        ) != record.get("start_issuer")
+    ):
+        raise ReviewExecutionRejected("first-party session receipt invalid")
+    if record["issuer_principal"] != _first_party_principal(record["start_issuer"]):
+        raise ReviewExecutionRejected("first-party session principal mismatch")
+    if (
+        type(record.get("created_at_unix")) is not int
+        or type(record.get("expires_at_unix")) is not int
+        or record["expires_at_unix"] - record["created_at_unix"]
+        != FIRST_PARTY_SESSION_TTL_SECONDS
+        or (require_fresh and now_unix > record["expires_at_unix"])
+    ):
+        raise ReviewExecutionRejected("first-party review session expired")
+    return record, session_root
+
+
+def _assert_first_party_source_current(session: dict[str, Any]) -> Path:
+    binding = session["binding"]
+    worktree = Path(session["worktree"])
+    from grabowski_self_review_producer import _current_source
+    if _current_source(worktree, binding) != session["source_raw_diff_sha256"]:
+        raise ReviewExecutionRejected("first-party review source revision drift")
+    diff = _first_party_diff(worktree, binding)
+    if hashlib.sha256(diff).hexdigest() != session["canonical_diff_sha256"]:
+        raise ReviewExecutionRejected("first-party canonical diff drift")
+    return worktree
+
+
+def _issuer_matches_session(
+    issuer: dict[str, Any], session: dict[str, Any], *, expected_tool: str,
+) -> dict[str, Any]:
+    authenticated = _validate_first_party_issuer(issuer, expected_tool=expected_tool)
+    if _first_party_principal(authenticated) != session["issuer_principal"]:
+        raise ReviewExecutionRejected("first-party issuer crossed controller session")
+    return authenticated
+
+
+def record_first_party_source_read(
+    session_id: str, nonce: str, axis: str, read_kind: str,
+    path: str, revision: str, start_line: int, end_line: int,
+    issuer: dict[str, Any], *,
+    root: Path = FIRST_PARTY_REVIEW_ROOT,
+    key: Path = SIGNING_KEY,
+    signers: Path = TRUSTED_SIGNERS,
+    root_owned_signers: bool = True,
+    now_unix: int | None = None,
+) -> dict[str, Any]:
+    """Read immutable Git bytes and persist exactly what the controller received."""
+    observed_at = int(time.time()) if now_unix is None else now_unix
+    session, session_root = _load_first_party_session(
+        session_id, nonce, root=root, signers=signers,
+        root_owned_signers=root_owned_signers, now_unix=observed_at,
+        require_fresh=True,
+    )
+    authenticated = _issuer_matches_session(
+        issuer, session, expected_tool=FIRST_PARTY_TOOL_READ,
+    )
+    signers = _allowed_signers(signers, root_owned=root_owned_signers)
+    if axis not in REQUIRED_AXES:
+        raise ReviewExecutionRejected("first-party source read axis invalid")
+    worktree = _assert_first_party_source_current(session)
+    binding = session["binding"]
+    source_ref: str | None = None
+    diff_total_lines: int | None = None
+    if read_kind == "diff":
+        if (
+            path != "" or revision != "head"
+            or type(start_line) is not int or type(end_line) is not int
+            or start_line < 1 or end_line < start_line
+            or end_line - start_line + 1 > FIRST_PARTY_MAX_READ_LINES
+        ):
+            raise ReviewExecutionRejected("first-party canonical diff read shape invalid")
+        try:
+            lines = _first_party_diff(worktree, binding).decode("utf-8").splitlines(keepends=True)
+        except UnicodeError as exc:
+            raise ReviewExecutionRejected("first-party canonical diff is not reviewable text") from exc
+        diff_total_lines = len(lines)
+        if end_line > diff_total_lines:
+            raise ReviewExecutionRejected("first-party canonical diff range invalid")
+        data = "".join(lines[start_line - 1:end_line]).encode("utf-8")
+        if not data or len(data) > FIRST_PARTY_MAX_READ_BYTES:
+            raise ReviewExecutionRejected("first-party canonical diff chunk over budget")
+    elif read_kind == "source":
+        if (
+            not isinstance(path, str) or path not in session["changed_paths"]
+            or revision not in {"base", "head"}
+            or type(start_line) is not int or type(end_line) is not int
+            or start_line < 1 or end_line < start_line
+            or end_line - start_line + 1 > FIRST_PARTY_MAX_READ_LINES
+        ):
+            raise ReviewExecutionRejected("first-party source read range invalid")
+        chosen = binding["base_sha"] if revision == "base" else binding["head_sha"]
+        blob = _git_read(
+            worktree, ["show", chosen + ":" + path], maximum=MAX_SOURCE_BLOB,
+        )
+        if b"\x00" in blob:
+            raise ReviewExecutionRejected("first-party source read is not text")
+        try:
+            lines = blob.decode("utf-8").splitlines(keepends=True)
+        except UnicodeError as exc:
+            raise ReviewExecutionRejected("first-party source read encoding invalid") from exc
+        if end_line > len(lines) or not any(line.strip() for line in lines[start_line - 1:end_line]):
+            raise ReviewExecutionRejected("first-party source read range absent")
+        data = "".join(lines[start_line - 1:end_line]).encode("utf-8")
+        if len(data) > FIRST_PARTY_MAX_READ_BYTES:
+            raise ReviewExecutionRejected("first-party source read over budget")
+        suffix = "" if revision == "head" else ":" + binding["base_sha"]
+        source_ref = f"{path}{suffix}:L{start_line}-L{end_line}"
+    else:
+        raise ReviewExecutionRejected("first-party read kind invalid")
+    read_id = secrets.token_hex(16)
+    record = {
+        "schema_version": 1, "kind": FIRST_PARTY_READ_KIND,
+        "read_id": read_id, "session_id": session_id,
+        "binding_sha256": session["binding_sha256"], "axis": axis,
+        "read_kind": read_kind, "path": path, "revision": revision,
+        "start_line": start_line, "end_line": end_line,
+        "source_ref": source_ref, "data_sha256": hashlib.sha256(data).hexdigest(),
+        "data_bytes": len(data), "issuer": authenticated,
+        "observed_at_unix": observed_at,
+    }
+    lock = _first_party_lock(root)
+    try:
+        reads = session_root / "reads"
+        _create_private_bytes(reads / (read_id + ".data"), data)
+        _write_signed_record(
+            reads / (read_id + ".json"), record, key=key, signers=signers,
+        )
+    finally:
+        _release_first_party_lock(lock)
+    return {
+        "status": "source_read_recorded", "review_session_id": session_id,
+        "axis": axis, "read_id": read_id, "read_kind": read_kind,
+        "source_ref": source_ref, "content": data.decode("utf-8"),
+        "content_sha256": record["data_sha256"],
+        **(
+            {"diff_total_lines": diff_total_lines,
+             "canonical_diff_sha256": session["canonical_diff_sha256"]}
+            if read_kind == "diff" else {}
+        ),
+        "does_not_establish": ["semantic_review", "axis_verdict", "review_pass"],
+    }
+
+
+def _load_first_party_reads(
+    session: dict[str, Any], session_root: Path, *,
+    signers: Path, root_owned_signers: bool, repository: Path,
+) -> list[dict[str, Any]]:
+    reads_root = session_root / "reads"
+    validation_fd = _private_dir(reads_root)
+    os.close(validation_fd)  # Validation only; per-record reads reopen safely.
+    records: list[dict[str, Any]] = []
+    request_ids: set[str] = {session["start_issuer"]["request_id"]}
+    for path in sorted(reads_root.glob("*.json")):
+        if FIRST_PARTY_READ_ID_RE.fullmatch(path.stem) is None:
+            raise ReviewExecutionRejected("first-party read record name invalid")
+        record = _read_signed_record(
+            path, signers=signers, root_owned_signers=root_owned_signers,
+        )
+        issuer = _validate_first_party_issuer(
+            record.get("issuer"), expected_tool=FIRST_PARTY_TOOL_READ,
+        )
+        if (
+            set(record) != {
+                "schema_version", "kind", "read_id", "session_id",
+                "binding_sha256", "axis", "read_kind", "path", "revision",
+                "start_line", "end_line", "source_ref", "data_sha256",
+                "data_bytes", "issuer", "observed_at_unix",
+            }
+            or record.get("schema_version") != 1
+            or record.get("kind") != FIRST_PARTY_READ_KIND
+            or record.get("read_id") != path.stem
+            or record.get("session_id") != session["session_id"]
+            or record.get("binding_sha256") != session["binding_sha256"]
+            or record.get("axis") not in REQUIRED_AXES
+            or _first_party_principal(issuer) != session["issuer_principal"]
+            or issuer["request_id"] in request_ids
+            or type(record.get("observed_at_unix")) is not int
+            or not session["created_at_unix"] <= record["observed_at_unix"] <= session["expires_at_unix"]
+        ):
+            raise ReviewExecutionRejected("first-party read receipt invalid or replayed")
+        request_ids.add(issuer["request_id"])
+        parent_fd = _private_dir(reads_root)
+        try:
+            data = _private_read(
+                parent_fd, path.stem + ".data", limit=FIRST_PARTY_MAX_DIFF_BYTES,
+                allow_empty=True,
+            )
+        finally:
+            os.close(parent_fd)
+        if (
+            record.get("data_bytes") != len(data)
+            or record.get("data_sha256") != hashlib.sha256(data).hexdigest()
+        ):
+            raise ReviewExecutionRejected("first-party persisted source read changed")
+        if record["read_kind"] == "diff":
+            try:
+                complete_diff = _first_party_diff(repository, session["binding"])
+                lines = complete_diff.decode("utf-8").splitlines(keepends=True)
+            except UnicodeError as exc:
+                raise ReviewExecutionRejected("first-party canonical diff not text") from exc
+            first, last = record["start_line"], record["end_line"]
+            if (
+                record["path"] != "" or record["revision"] != "head"
+                or type(first) is not int or type(last) is not int
+                or first < 1 or last < first or last > len(lines)
+                or last - first + 1 > FIRST_PARTY_MAX_READ_LINES
+                or record["source_ref"] is not None
+                or hashlib.sha256(complete_diff).hexdigest() != session["canonical_diff_sha256"]
+                or data != "".join(lines[first - 1:last]).encode("utf-8")
+                or len(data) > FIRST_PARTY_MAX_READ_BYTES
+            ):
+                raise ReviewExecutionRejected("first-party canonical diff chunk invalid")
+        elif record["read_kind"] == "source":
+            match = REF.fullmatch(record.get("source_ref", ""))
+            chosen = (
+                session["binding"]["base_sha"]
+                if record["revision"] == "base"
+                else session["binding"]["head_sha"]
+            )
+            if (
+                match is None or match["path"] != record["path"]
+                or int(match["start"]) != record["start_line"]
+                or int(match["end"] or match["start"]) != record["end_line"]
+                or chosen != (match["source_revision"] or session["binding"]["head_sha"])
+                or record["path"] not in session["changed_paths"]
+            ):
+                raise ReviewExecutionRejected("first-party source read binding invalid")
+            blob = _git_read(
+                repository, ["show", chosen + ":" + record["path"]],
+                maximum=MAX_SOURCE_BLOB,
+            )
+            try:
+                lines = blob.decode("utf-8").splitlines(keepends=True)
+            except UnicodeError as exc:
+                raise ReviewExecutionRejected("first-party source blob invalid") from exc
+            expected = "".join(
+                lines[record["start_line"] - 1:record["end_line"]]
+            ).encode("utf-8")
+            if data != expected:
+                raise ReviewExecutionRejected("first-party source read bytes mismatch")
+        else:
+            raise ReviewExecutionRejected("first-party persisted read kind invalid")
+        records.append({**record, "_data": data})
+    return records
+
+
+def _read_covers_reference(
+    reference: Any, *, axis: str, reads: list[dict[str, Any]],
+    binding: dict[str, Any],
+) -> bool:
+    match = REF.fullmatch(reference) if isinstance(reference, str) else None
+    if match is None:
+        return False
+    revision = match["source_revision"] or binding["head_sha"]
+    first = int(match["start"])
+    last = int(match["end"] or match["start"])
+    return any(
+        item["axis"] == axis
+        and item["read_kind"] == "source"
+        and item["path"] == match["path"]
+        and (
+            binding["base_sha"] if item["revision"] == "base"
+            else binding["head_sha"]
+        ) == revision
+        and item["start_line"] <= first <= last <= item["end_line"]
+        for item in reads
+    )
+
+
+def _substantive_text(value: Any, minimum: int, maximum: int) -> bool:
+    return (
+        isinstance(value, str)
+        and value == value.strip()
+        and minimum <= len(" ".join(value.split())) <= maximum
+    )
+
+
+def _validate_first_party_report(
+    report: Any, *, axis: str, reads: list[dict[str, Any]],
+    binding: dict[str, Any], prior_observations: set[str],
+) -> dict[str, Any]:
+    if not isinstance(report, dict) or set(report) != {
+        "axis", "verdict", "summary", "axis_observations", "evidence_refs",
+        "reviewed_risks", "findings",
+    }:
+        raise ReviewExecutionRejected("first-party axis report shape invalid")
+    if report.get("axis") != axis or report.get("verdict") not in {"PASS", "REJECT"}:
+        raise ReviewExecutionRejected("first-party axis report verdict invalid")
+    if not _substantive_text(report.get("summary"), 160, 8000):
+        raise ReviewExecutionRejected("first-party semantic summary inadequate")
+    observations = report.get("axis_observations")
+    if (
+        not isinstance(observations, list) or not 2 <= len(observations) <= 8
+        or any(not _substantive_text(item, 80, 2000) for item in observations)
+        or len(observations) != len(set(observations))
+        or any(item in prior_observations for item in observations)
+    ):
+        raise ReviewExecutionRejected("first-party axis observations not distinct")
+    refs = report.get("evidence_refs")
+    if (
+        not isinstance(refs, list) or not 2 <= len(refs) <= MAX_REFERENCES
+        or len(refs) != len(set(refs))
+        or any(not _read_covers_reference(
+            item, axis=axis, reads=reads, binding=binding,
+        ) for item in refs)
+    ):
+        raise ReviewExecutionRejected("first-party report lacks observed source references")
+    if not any(item["axis"] == axis and item["read_kind"] == "diff" for item in reads):
+        raise ReviewExecutionRejected("first-party axis canonical diff was not read")
+    risks = report.get("reviewed_risks")
+    if not isinstance(risks, list) or not 2 <= len(risks) <= 16:
+        raise ReviewExecutionRejected("first-party report requires two reviewed risks")
+    risk_names: set[str] = set()
+    assessments: set[str] = set()
+    material_risk = False
+    for risk in risks:
+        if (
+            not isinstance(risk, dict)
+            or set(risk) != {"risk", "assessment", "verdict", "evidence_refs"}
+            or not _substantive_text(risk.get("risk"), 20, 500)
+            or risk["risk"] in risk_names
+            or not _substantive_text(risk.get("assessment"), 80, 3000)
+            or risk["assessment"] in assessments
+            or risk.get("verdict") not in {"NON_MATERIAL", "MATERIAL"}
+            or not isinstance(risk.get("evidence_refs"), list)
+            or not 1 <= len(risk["evidence_refs"]) <= MAX_REFERENCES
+            or any(not _read_covers_reference(
+                item, axis=axis, reads=reads, binding=binding,
+            ) for item in risk["evidence_refs"])
+        ):
+            raise ReviewExecutionRejected("first-party reviewed risk inadequate")
+        risk_names.add(risk["risk"])
+        assessments.add(risk["assessment"])
+        material_risk = material_risk or risk["verdict"] == "MATERIAL"
+    findings = report.get("findings")
+    if not isinstance(findings, list) or len(findings) > 32:
+        raise ReviewExecutionRejected("first-party findings list invalid")
+    finding_ids: set[str] = set()
+    unresolved = 0
+    for finding in findings:
+        if (
+            not isinstance(finding, dict)
+            or set(finding) != {
+                "id", "severity", "verdict", "summary", "evidence_refs",
+            }
+            or not isinstance(finding.get("id"), str)
+            or re.fullmatch(r"[a-z0-9][a-z0-9_.-]{2,63}", finding["id"]) is None
+            or finding["id"] in finding_ids
+            or finding.get("severity") not in {"low", "medium", "high", "critical"}
+            or finding.get("verdict") not in {"RESOLVED", "UNRESOLVED"}
+            or not _substantive_text(finding.get("summary"), 80, 3000)
+            or not isinstance(finding.get("evidence_refs"), list)
+            or not 1 <= len(finding["evidence_refs"]) <= MAX_REFERENCES
+            or any(not _read_covers_reference(
+                item, axis=axis, reads=reads, binding=binding,
+            ) for item in finding["evidence_refs"])
+        ):
+            raise ReviewExecutionRejected("first-party finding invalid")
+        finding_ids.add(finding["id"])
+        unresolved += finding["verdict"] == "UNRESOLVED"
+    if (
+        (report["verdict"] == "PASS" and (material_risk or unresolved))
+        or (report["verdict"] == "REJECT" and not (material_risk and unresolved))
+    ):
+        raise ReviewExecutionRejected("first-party verdict contradicts material findings")
+    return json.loads(_canonical(report))
+
+
+def _load_first_party_axes(
+    session: dict[str, Any], session_root: Path, *,
+    reads: list[dict[str, Any]], signers: Path, root_owned_signers: bool,
+) -> dict[str, dict[str, Any]]:
+    axes_root = session_root / "axes"
+    validation_fd = _private_dir(axes_root)
+    os.close(validation_fd)
+    accepted: dict[str, dict[str, Any]] = {}
+    observations: set[str] = set()
+    summaries: set[str] = set()
+    request_ids = {
+        session["start_issuer"]["request_id"],
+        *(item["issuer"]["request_id"] for item in reads),
+    }
+    for path in sorted(axes_root.glob("*.json")):
+        axis = path.stem
+        if axis not in REQUIRED_AXES:
+            raise ReviewExecutionRejected("first-party axis receipt name invalid")
+        record = _read_signed_record(
+            path, signers=signers, root_owned_signers=root_owned_signers,
+        )
+        issuer = _validate_first_party_issuer(
+            record.get("issuer"), expected_tool=FIRST_PARTY_TOOL_SUBMIT,
+        )
+        if (
+            set(record) != {
+                "schema_version", "kind", "session_id", "binding_sha256",
+                "axis", "report", "report_sha256", "issuer", "submitted_at_unix",
+            }
+            or record.get("schema_version") != 1
+            or record.get("kind") != FIRST_PARTY_AXIS_KIND
+            or record.get("session_id") != session["session_id"]
+            or record.get("binding_sha256") != session["binding_sha256"]
+            or record.get("axis") != axis
+            or _first_party_principal(issuer) != session["issuer_principal"]
+            or issuer["request_id"] in request_ids
+            or record.get("report_sha256") != _digest(record.get("report"))
+            or record.get("report", {}).get("summary") in summaries
+            or type(record.get("submitted_at_unix")) is not int
+            or not session["created_at_unix"] <= record["submitted_at_unix"] <= session["expires_at_unix"]
+        ):
+            raise ReviewExecutionRejected("first-party axis receipt invalid or replayed")
+        request_ids.add(issuer["request_id"])
+        report = _validate_first_party_report(
+            record["report"], axis=axis, reads=reads,
+            binding=session["binding"], prior_observations=observations,
+        )
+        observations.update(report["axis_observations"])
+        summaries.add(report["summary"])
+        accepted[axis] = record
+    return accepted
+
+
+def submit_first_party_axis_review(
+    session_id: str, nonce: str, report: dict[str, Any],
+    issuer: dict[str, Any], *,
+    root: Path = FIRST_PARTY_REVIEW_ROOT,
+    key: Path = SIGNING_KEY,
+    signers: Path = TRUSTED_SIGNERS,
+    root_owned_signers: bool = True,
+    now_unix: int | None = None,
+) -> dict[str, Any]:
+    """Persist one immutable model/human-written axis report after real reads."""
+    observed_at = int(time.time()) if now_unix is None else now_unix
+    session, session_root = _load_first_party_session(
+        session_id, nonce, root=root, signers=signers,
+        root_owned_signers=root_owned_signers, now_unix=observed_at,
+        require_fresh=True,
+    )
+    authenticated = _issuer_matches_session(
+        issuer, session, expected_tool=FIRST_PARTY_TOOL_SUBMIT,
+    )
+    signers = _allowed_signers(signers, root_owned=root_owned_signers)
+    worktree = _assert_first_party_source_current(session)
+    reads = _load_first_party_reads(
+        session, session_root, signers=signers,
+        root_owned_signers=root_owned_signers, repository=worktree,
+    )
+    existing = _load_first_party_axes(
+        session, session_root, reads=reads, signers=signers,
+        root_owned_signers=root_owned_signers,
+    )
+    axis = report.get("axis") if isinstance(report, dict) else None
+    if axis not in REQUIRED_AXES:
+        raise ReviewExecutionRejected("first-party submitted axis invalid")
+    if axis in existing:
+        raise ReviewExecutionRejected("first-party axis review duplicated")
+    prior_observations = {
+        observation
+        for item in existing.values()
+        for observation in item["report"]["axis_observations"]
+    }
+    normalized = _validate_first_party_report(
+        report, axis=axis, reads=reads, binding=session["binding"],
+        prior_observations=prior_observations,
+    )
+    record = {
+        "schema_version": 1, "kind": FIRST_PARTY_AXIS_KIND,
+        "session_id": session_id, "binding_sha256": session["binding_sha256"],
+        "axis": axis, "report": normalized, "report_sha256": _digest(normalized),
+        "issuer": authenticated, "submitted_at_unix": observed_at,
+    }
+    lock = _first_party_lock(root)
+    try:
+        axis_path = session_root / "axes" / (axis + ".json")
+        if axis_path.exists():
+            raise ReviewExecutionRejected("first-party axis review duplicated")
+        receipt_sha256, _signature_sha256 = _write_signed_record(
+            axis_path, record, key=key, signers=signers,
+        )
+    finally:
+        _release_first_party_lock(lock)
+    completed = len(existing) + 1
+    return {
+        "status": "axis_rejected" if normalized["verdict"] == "REJECT" else "axis_accepted",
+        "review_session_id": session_id, "axis": axis,
+        "axis_receipt_sha256": receipt_sha256,
+        "accepted_axis_count": completed,
+        "session_complete": completed == len(REQUIRED_AXES),
+        "material_findings": sum(
+            item["verdict"] == "UNRESOLVED" for item in normalized["findings"]
+        ),
+        "does_not_establish": ["technical_task_pass", "Captain_merge", "deployment"],
+    }
+
+
+def verified_first_party_semantic_review_passes(
+    binding: dict[str, Any], *, repository: Path,
+    root: Path = FIRST_PARTY_REVIEW_ROOT,
+    signers: Path = TRUSTED_SIGNERS,
+    root_owned_signers: bool = True,
+    now_unix: int | None = None,
+    axes_to_review: tuple[str, ...] = REQUIRED_AXES,
+) -> dict[str, dict[str, Any]]:
+    """Verify five signed controller reports and every persisted source read."""
+    expected = _first_party_binding(binding)
+    if axes_to_review != REQUIRED_AXES:
+        raise ReviewExecutionRejected("first-party semantic method scope invalid")
+    index_path = root / "batches" / (expected["review_batch_id"] + ".json")
+    try:
+        parent_fd = _private_dir(index_path.parent)
+        try:
+            index = _json_record(_private_read(parent_fd, index_path.name, limit=4096))
+        finally:
+            os.close(parent_fd)
+    except FileNotFoundError as exc:
+        raise FirstPartyReviewAbsent("first-party semantic review session absent") from exc
+    if (
+        set(index) != {
+            "schema_version", "kind", "review_batch_id", "session_id",
+            "binding_sha256", "session_receipt_sha256", "session_signature_sha256",
+        }
+        or index.get("schema_version") != 1
+        or index.get("kind") != "grabowski_first_party_review_batch_index_v1"
+        or index.get("review_batch_id") != expected["review_batch_id"]
+        or index.get("binding_sha256") != _digest(expected)
+        or not isinstance(index.get("session_id"), str)
+        or ID.fullmatch(index["session_id"]) is None
+        or not isinstance(index.get("session_receipt_sha256"), str)
+        or SHA256.fullmatch(index["session_receipt_sha256"]) is None
+        or not isinstance(index.get("session_signature_sha256"), str)
+        or SHA256.fullmatch(index["session_signature_sha256"]) is None
+    ):
+        raise ReviewExecutionRejected("first-party batch index invalid")
+    session_id = index["session_id"]
+    session_path = root / "sessions" / session_id / "session.json"
+    session = _read_signed_record(
+        session_path, signers=signers, root_owned_signers=root_owned_signers,
+    )
+    start_issuer = _validate_first_party_issuer(
+        session.get("start_issuer"), expected_tool=FIRST_PARTY_TOOL_START,
+    )
+    if (
+        set(session) != {
+            "schema_version", "kind", "session_id", "session_nonce_sha256",
+            "binding", "binding_sha256", "worktree", "source_raw_diff_sha256",
+            "canonical_diff_sha256", "changed_paths", "issuer_principal",
+            "start_issuer", "created_at_unix", "expires_at_unix",
+        }
+        or session.get("schema_version") != 1
+        or session.get("kind") != FIRST_PARTY_SESSION_KIND
+        or session.get("binding") != expected
+        or session.get("binding_sha256") != _digest(expected)
+        or session.get("session_id") != session_id
+        or not isinstance(session.get("session_nonce_sha256"), str)
+        or SHA256.fullmatch(session["session_nonce_sha256"]) is None
+        or not isinstance(session.get("source_raw_diff_sha256"), str)
+        or SHA256.fullmatch(session["source_raw_diff_sha256"]) is None
+        or not isinstance(session.get("canonical_diff_sha256"), str)
+        or SHA256.fullmatch(session["canonical_diff_sha256"]) is None
+        or session.get("issuer_principal") != _first_party_principal(start_issuer)
+        or type(session.get("created_at_unix")) is not int
+        or type(session.get("expires_at_unix")) is not int
+        or session["expires_at_unix"] - session["created_at_unix"]
+        != FIRST_PARTY_SESSION_TTL_SECONDS
+    ):
+        raise ReviewExecutionRejected("first-party session crossed review binding")
+    material = _canonical(session)
+    parent_fd = _private_dir(session_path.parent)
+    try:
+        signature = _private_read(parent_fd, "session.sig", limit=16384)
+    finally:
+        os.close(parent_fd)
+    if (
+        hashlib.sha256(material).hexdigest() != index["session_receipt_sha256"]
+        or hashlib.sha256(signature).hexdigest() != index["session_signature_sha256"]
+    ):
+        raise ReviewExecutionRejected("first-party indexed session bytes changed")
+    diff = _first_party_diff(repository, expected)
+    if hashlib.sha256(diff).hexdigest() != session.get("canonical_diff_sha256"):
+        raise ReviewExecutionRejected("first-party verified Git diff changed")
+    observed_at = int(time.time()) if now_unix is None else now_unix
+    # Session expiry prevents new source reads/submissions, not the later
+    # verification of completed signed reviews. Signed timestamps of all
+    # source reads and axis reports remain bounded by that original window.
+    if type(observed_at) is not int or observed_at < session["created_at_unix"]:
+        raise ReviewExecutionRejected("first-party review verification time invalid")
+    session_root = session_path.parent
+    reads = _load_first_party_reads(
+        session, session_root, signers=signers,
+        root_owned_signers=root_owned_signers, repository=repository,
+    )
+    # No review PASS from a single authentic but incomplete diff excerpt.
+    # Every line of the immutable base/head delta must have been returned to
+    # the enrolled controller across the signed source-read receipts.
+    try:
+        diff_line_count = len(diff.decode("utf-8").splitlines(keepends=True))
+    except UnicodeError as exc:
+        raise ReviewExecutionRejected("first-party canonical diff not text") from exc
+    next_unseen = 1
+    ranges = sorted(
+        (item["start_line"], item["end_line"])
+        for item in reads if item["read_kind"] == "diff"
+    )
+    for first, last in ranges:
+        if first > next_unseen:
+            break
+        next_unseen = max(next_unseen, last + 1)
+        if next_unseen > diff_line_count:
+            break
+    if next_unseen <= diff_line_count:
+        raise ReviewExecutionRejected("first-party canonical diff coverage incomplete")
+    axes = _load_first_party_axes(
+        session, session_root, reads=reads, signers=signers,
+        root_owned_signers=root_owned_signers,
+    )
+    if set(axes) != set(axes_to_review):
+        raise ReviewExecutionRejected("first-party semantic axis coverage incomplete")
+    accepted: dict[str, dict[str, Any]] = {}
+    for sequence, axis in enumerate(axes_to_review, start=1):
+        record = axes[axis]
+        report = record["report"]
+        if (
+            report["verdict"] != "PASS"
+            or any(item["verdict"] == "MATERIAL" for item in report["reviewed_risks"])
+            or any(item["verdict"] == "UNRESOLVED" for item in report["findings"])
+        ):
+            raise ReviewExecutionRejected("first-party semantic material finding unresolved")
+        phase = {
+            "n": sequence, "axis": axis, "summary": report["summary"],
+            "evidence_refs": report["evidence_refs"], "material_findings": 0,
+        }
+        accepted[axis] = {
+            "phase": phase,
+            "provenance_kind": "first_party_authenticated_controller",
+            "provenance": {
+                "session_id": session_id,
+                "session_receipt_sha256": index["session_receipt_sha256"],
+                "issuer_principal_sha256": _digest(session["issuer_principal"]),
+                "axis_receipt_sha256": hashlib.sha256(_canonical(record)).hexdigest(),
+                "axis_report_sha256": record["report_sha256"],
+                "source_reads_sha256": _digest(sorted(
+                    item["data_sha256"] for item in reads if item["axis"] == axis
+                )),
+                "canonical_diff_sha256": session["canonical_diff_sha256"],
+            },
+        }
+    return accepted
+
+
 
 
 def _verified_provider_semantic_bytes(
@@ -766,7 +1885,7 @@ def _unique_semantic_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]
     return result
 
 
-def verified_semantic_review_passes(
+def _verified_v2_semantic_review_passes(
     binding: dict[str, Any], *, repository: Path,
     axes_to_review: tuple[str, ...] = REQUIRED_AXES,
 ) -> dict[str, dict[str, Any]]:
@@ -982,6 +2101,21 @@ def verified_semantic_review_passes(
     return accepted
 
 
+def verified_semantic_review_passes(
+    binding: dict[str, Any], *, repository: Path,
+    axes_to_review: tuple[str, ...] = REQUIRED_AXES,
+) -> dict[str, dict[str, Any]]:
+    """Use signed first-party model tool interactions, or genuine V2 role results."""
+    try:
+        return verified_first_party_semantic_review_passes(
+            binding, repository=repository, axes_to_review=axes_to_review,
+        )
+    except FirstPartyReviewAbsent:
+        return _verified_v2_semantic_review_passes(
+            binding, repository=repository, axes_to_review=axes_to_review,
+        )
+
+
 def _verify(
     audit: dict[str, Any],
     *,
@@ -1100,12 +2234,34 @@ def _verify(
             if record.get("binding") != expected_binding:
                 raise ReviewExecutionRejected("self-review signed binding mismatch")
             expected_semantic = semantic_reviews.get(phase.get("axis"))
+            semantic_kind = (
+                expected_semantic.get("provenance_kind", "v2_model_role")
+                if isinstance(expected_semantic, dict) else None
+            )
+            semantic_field = (
+                "semantic_first_party"
+                if semantic_kind == "first_party_authenticated_controller"
+                else "semantic_v2"
+            )
             if (
                 not isinstance(expected_semantic, dict)
+                or semantic_kind not in {
+                    "v2_model_role", "first_party_authenticated_controller",
+                }
                 or phase != expected_semantic.get("phase")
-                or record.get("semantic_v2") != expected_semantic.get("provenance")
+                or record.get(semantic_field) != expected_semantic.get("provenance")
+                or (
+                    semantic_field == "semantic_first_party"
+                    and record.get("semantic_v2") is not None
+                )
+                or (
+                    semantic_field == "semantic_v2"
+                    and record.get("semantic_first_party") is not None
+                )
             ):
-                raise ReviewExecutionRejected("signed self-review not based on authentic V2 semantic review")
+                raise ReviewExecutionRejected(
+                    "signed self-review not based on authentic semantic review"
+                )
             if (
                 record.get("schema_version") != 1
                 or record.get("kind") != KIND

@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "ed2614ea2680d0e7bb87ebd7b5de69295fc66a0f8152a350b9121993b456c39f",
+  "capability_source_sha256": "e894771c674ecb89d8261217bf5350beaf370fad28b150e053a11ac5221c4811",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "911675b539cf5eb53b0cc295fee58ebfbf1bf8f5cfdc138ff0326d7e81a02213",
+  "contract_sha256": "762697e6fc372f4800054251c24e9cb991aab252ef92f1a5a105cd7cc61e2970",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -270,6 +270,45 @@
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_verify_audit"
+    },
+    {
+      "category": "audit",
+      "description": "Start one exact-revision semantic review session for a stored plan.",
+      "effects": [
+        "private-review-session-create"
+      ],
+      "id": "grabowski_self_review_session_start",
+      "purpose": "Start one signed-ingress-bound semantic review session for an immutable stored review plan.",
+      "read_only": false,
+      "reversibility": "new-review-batch",
+      "risk_class": "medium",
+      "tool": "grabowski_self_review_session_start"
+    },
+    {
+      "category": "audit",
+      "description": "Read and persist exact immutable Git bytes for one semantic axis.",
+      "effects": [
+        "private-source-read-receipt-create"
+      ],
+      "id": "grabowski_self_review_source_read",
+      "purpose": "Return and immutably persist exact Git diff or source bytes inspected for one semantic review axis.",
+      "read_only": false,
+      "reversibility": "new-review-batch",
+      "risk_class": "medium",
+      "tool": "grabowski_self_review_source_read"
+    },
+    {
+      "category": "audit",
+      "description": "Persist one immutable substantive controller-written axis verdict.",
+      "effects": [
+        "private-semantic-review-receipt-create"
+      ],
+      "id": "grabowski_self_review_axis_submit",
+      "purpose": "Persist one substantive source-read-bound semantic axis verdict from the authenticated controller.",
+      "read_only": false,
+      "reversibility": "new-review-batch",
+      "risk_class": "medium",
+      "tool": "grabowski_self_review_axis_submit"
     },
     {
       "category": "audit",

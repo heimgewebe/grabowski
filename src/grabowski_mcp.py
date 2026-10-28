@@ -51,6 +51,7 @@ import grabowski_transport_assertion
 import grabowski_serving_process
 import grabowski_connector_contract
 import grabowski_connector_policy
+import grabowski_self_review_execution as self_review_execution
 import grabowski_lifecycle_read_surface as lifecycle_read_surface
 import grabowski_system_map
 import grabowski_blockades as blockade_policy
@@ -585,6 +586,9 @@ TOOL_CAPABILITY_REQUIREMENTS = {
     "grabowski_destroy_path": ("file_destroy",),
     "grabowski_rollback_text": ("rollback_text",),
     "grabowski_verify_audit": ("audit_verify",),
+    "grabowski_self_review_session_start": ("file_write",),
+    "grabowski_self_review_source_read": ("file_write",),
+    "grabowski_self_review_axis_submit": ("file_write",),
     "grabowski_audit_query": ("audit_read",),
     "grabowski_audit_trace": ("audit_read",),
     "grabowski_audit_analyze": ("audit_read",),
@@ -7221,6 +7225,127 @@ def grabowski_status(
             }
         )
     return _project_status_fields(base_payload, fields)
+
+
+def _authenticated_self_review_issuer(
+    ctx: Context | None, *, tool_name: str, arguments: dict[str, Any],
+) -> dict[str, Any]:
+    """Consume the real signed transport principal for one review mutation."""
+    authorization = _transport_authorize_connector_tool(ctx, tool_name, arguments)
+    if not isinstance(authorization, dict):
+        raise RuntimeError(
+            "first-party semantic review requires an enrolled authenticated connector"
+        )
+    runtime_binding = _transport_roundtrip_runtime_binding()
+    evidence = _transport_signed_one_call_evidence(
+        ctx,
+        tool_name=tool_name,
+        arguments_sha256=(
+            grabowski_transport_assertion.canonical_arguments_sha256(arguments)
+        ),
+        runtime_binding=runtime_binding,
+    )
+    if not isinstance(evidence, dict):
+        raise RuntimeError(
+            "first-party semantic review requires fresh signed one-call ingress"
+        )
+    return self_review_execution.authenticated_first_party_issuer(
+        authorization["connector_id"], evidence, expected_tool=tool_name,
+    )
+
+
+@mcp.tool(
+    name="grabowski_self_review_session_start", annotations=CREATE_ANNOTATIONS,
+)
+def grabowski_self_review_session_start(
+    review_batch_id: str,
+    reason: str,
+    user_intent: str,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    """Start one exact-revision semantic review session for a stored plan."""
+    _require_capability("file_write")
+    arguments = {
+        "review_batch_id": review_batch_id,
+        "reason": reason,
+        "user_intent": user_intent,
+    }
+    issuer = _authenticated_self_review_issuer(
+        ctx, tool_name=self_review_execution.FIRST_PARTY_TOOL_START,
+        arguments=arguments,
+    )
+    from grabowski_self_review_producer import _load_plan
+    plan = _load_plan(review_batch_id)
+    return self_review_execution.start_first_party_review_session(plan, issuer)
+
+
+@mcp.tool(
+    name="grabowski_self_review_source_read", annotations=CREATE_ANNOTATIONS,
+)
+def grabowski_self_review_source_read(
+    review_session_id: str,
+    session_nonce: str,
+    axis: str,
+    read_kind: str,
+    path: str,
+    revision: str,
+    start_line: int,
+    end_line: int,
+    reason: str,
+    user_intent: str,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    """Read and persist exact immutable Git bytes for one semantic axis."""
+    _require_capability("file_write")
+    arguments = {
+        "review_session_id": review_session_id,
+        "session_nonce": session_nonce,
+        "axis": axis,
+        "read_kind": read_kind,
+        "path": path,
+        "revision": revision,
+        "start_line": start_line,
+        "end_line": end_line,
+        "reason": reason,
+        "user_intent": user_intent,
+    }
+    issuer = _authenticated_self_review_issuer(
+        ctx, tool_name=self_review_execution.FIRST_PARTY_TOOL_READ,
+        arguments=arguments,
+    )
+    return self_review_execution.record_first_party_source_read(
+        review_session_id, session_nonce, axis, read_kind,
+        path, revision, start_line, end_line, issuer,
+    )
+
+
+@mcp.tool(
+    name="grabowski_self_review_axis_submit", annotations=CREATE_ANNOTATIONS,
+)
+def grabowski_self_review_axis_submit(
+    review_session_id: str,
+    session_nonce: str,
+    report: dict[str, Any],
+    reason: str,
+    user_intent: str,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    """Persist one immutable substantive controller-written axis verdict."""
+    _require_capability("file_write")
+    arguments = {
+        "review_session_id": review_session_id,
+        "session_nonce": session_nonce,
+        "report": report,
+        "reason": reason,
+        "user_intent": user_intent,
+    }
+    issuer = _authenticated_self_review_issuer(
+        ctx, tool_name=self_review_execution.FIRST_PARTY_TOOL_SUBMIT,
+        arguments=arguments,
+    )
+    return self_review_execution.submit_first_party_axis_review(
+        review_session_id, session_nonce, report, issuer,
+    )
 
 
 @mcp.tool(name="grabowski_list_directory", annotations=READ_ANNOTATIONS)

@@ -1,16 +1,16 @@
 {
   "canonical_contract": {
     "path": "config/runtime-entrypoint.json",
-    "sha256": "911675b539cf5eb53b0cc295fee58ebfbf1bf8f5cfdc138ff0326d7e81a02213"
+    "sha256": "762697e6fc372f4800054251c24e9cb991aab252ef92f1a5a105cd7cc61e2970"
   },
   "capability_catalog": {
     "path": "contracts/capability-catalog.v1.json",
-    "sha256": "47b9c6c1c325015fe44eb24271610453d36918dea195a91d15a40751a937f96a"
+    "sha256": "4cbedc8ebd1ef485da9b530575e0762caaa1e72913d8a24f171ff7ef08f382df"
   },
   "counts": {
     "core": 25,
-    "full": 203,
-    "operator": 187
+    "full": 206,
+    "operator": 190
   },
   "profiles": {
     "core": [
@@ -61,6 +61,9 @@
       "grabowski_destroy_path",
       "grabowski_rollback_text",
       "grabowski_verify_audit",
+      "grabowski_self_review_session_start",
+      "grabowski_self_review_source_read",
+      "grabowski_self_review_axis_submit",
       "grabowski_audit_query",
       "grabowski_audit_trace",
       "grabowski_audit_analyze",
@@ -265,6 +268,9 @@
       "grabowski_restore_removed_path",
       "grabowski_destroy_path",
       "grabowski_rollback_text",
+      "grabowski_self_review_session_start",
+      "grabowski_self_review_source_read",
+      "grabowski_self_review_axis_submit",
       "grabowski_audit_query",
       "grabowski_audit_trace",
       "grabowski_audit_analyze",

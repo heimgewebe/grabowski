@@ -166,14 +166,35 @@ An independent external-provider review is **optional** unless explicitly
 required for the PR. A real, unresolved material finding or trusted review
 thread remains blocking regardless of whether the reviewer was optional.
 Authenticated pre-result provider unavailability never produces a PASS and
-cannot excuse one of the five mandatory substantive phases. The currently
-implemented V2 semantic-review path still only accepts catalog model-review
-role output, so genuinely provider-independent first-party review authority
-is **not yet proven** for PR #1649. Do not mark the PR ready, merge via Captain,
-or infer R3 deployment authority from its technical tests or current source
-changes. The separate critical release source and recovery contracts remain
-unchanged until their own authentic post-merge review and admission evidence
-is verified.
+cannot excuse one of the five mandatory substantive phases. The source now
+also defines a provider-independent first-party controller path:
+
+1. `grabowski_self_review_session_start` consumes the existing enrolled
+   connector's fresh signed-one-call assertion and binds one unrepeatable
+   session/nonce to the private stored plan and exact Git revision.
+2. `grabowski_self_review_source_read` reads immutable Git diff or source
+   ranges in bounded chunks (at most 1,000 lines and 256 KiB per call), returning
+   their actual bytes and recording signed server-observed read receipts. The
+   five-axis audit cannot PASS unless the union of observed chunks covers every
+   line of the canonical base/head diff, including changed-file headers.
+3. `grabowski_self_review_axis_submit` accepts no caller-selected issuer or
+   provider; only the authenticated primary Grabowski connector can initiate
+   this first-party route. Each axis must actually read the canonical diff and
+   source ranges supporting at least two distinct risk assessments. Material
+   or unresolved findings make the session fail closed. New inspections and
+   submissions expire with the session; fully signed completed review evidence
+   remains verifiable afterward.
+
+`Context.client_id`, request `_meta`, free-form CLI output, report hashes and
+technical task PASS output do not enter this authority path. A present but
+incomplete or rejected first-party session is authoritative and cannot fall
+through to a model-provider PASS. When no first-party session exists, the
+existing authentic V2 catalog-role path remains byte-for-byte the semantic
+fallback. Both paths still require the separate isolated technical task
+receipts before the producer signs a private audit. This source change does
+not itself prove deployment of the new tools and does not authorize merge,
+Captain action or R3 release; critical release source and recovery contracts
+remain unchanged until their own post-merge evidence is verified.
 
 ## PR self-review policy v4 (2026-10-26)
 
