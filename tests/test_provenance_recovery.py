@@ -13,6 +13,7 @@ import json
 from pathlib import Path
 import stat
 import sys
+import time
 import tempfile
 import types
 import unittest
@@ -83,6 +84,9 @@ def _load_provenance_recovery():
     privileged.grabowski_privileged_broker_status = lambda: {}
     recovery = types.ModuleType("grabowski_recovery")
     recovery.BACKUP_SUCCESS = Path("/nonexistent-backup-marker")
+    recovery.MAX_AGE_SECONDS = 24 * 60 * 60
+    recovery._NIXOS_OS_PRESENT = False
+    recovery._NIXOS_RESTIC_TIMER_PRESENT = False
     recovery._fresh_text_marker = lambda path: {}
     sys.modules.setdefault("grabowski_runtime_contract", __import__("grabowski_runtime_contract"))
     self_deploy = types.ModuleType("grabowski_self_deploy")
@@ -271,6 +275,134 @@ class ProvenanceRecoveryGateTests(unittest.TestCase):
         self.assertTrue(gate["allowed"], gate["reasons"])
         self.assertEqual(gate["reasons"], [])
         self.assertTrue(gate["runtime_integrity"]["repair_warranted"])
+
+    def _native_gate(self, local_evidence, *, legacy=None):
+        row = dict(local_evidence)
+        stamp = row.get("timestamp_unix")
+        if type(stamp) is int:
+            row.setdefault("service_start_unix", stamp - 30)
+            row.setdefault("service_exit_unix", stamp)
+            row.setdefault("snapshot_saved_at_unix", stamp - 1)
+        with (
+            patch.object(provenance_recovery.recovery,
+                         "_NIXOS_OS_PRESENT", True, create=True),
+            patch.object(provenance_recovery.recovery,
+                         "_NIXOS_RESTIC_TIMER_PRESENT", True, create=True),
+            patch.object(provenance_recovery.recovery, "_nixos_native_backup_service_fresh",
+                         return_value=row, create=True),
+            patch.object(provenance_recovery.recovery, "_local_backup_freshness",
+                         side_effect=AssertionError("restore-dependent helper"), create=True),
+            patch.object(provenance_recovery.recovery, "_server_source_marker",
+                         side_effect=AssertionError("restore source read"), create=True),
+        ):
+            return self._gate(backup=legacy or {"valid": True, "age_seconds": 30})
+
+    def test_native_root_snapshot_evidence_replaces_missing_legacy_marker(self):
+        stamp = int(time.time()) - 55
+        row = {"valid": True, "exists": True,
+               "source": "nixos-system-restic-backup-completion",
+               "path": "systemd:restic-backups-heim-pc.service",
+               "timestamp_unix": stamp, "age_seconds": 55,
+               "backup_invocation_id": "a" * 32, "snapshot_id": "b" * 8}
+        gate = self._native_gate(row, legacy={"valid": False, "age_seconds": None})
+        self.assertTrue(gate["allowed"], gate["reasons"])
+        self.assertEqual(gate["local_backup_marker"]["source"], row["source"])
+
+    def test_native_completed_systemd_backup_replaces_missing_pop_marker(self):
+        stamp = int(time.time()) - 40
+        row = {"valid": True, "exists": True,
+               "source": "nixos-system-restic-backup-completion",
+               "path": "systemd:restic-backups-heim-pc.service",
+               "timestamp_unix": stamp, "age_seconds": 40,
+               "backup_invocation_id": "a" * 32, "snapshot_id": "b" * 8}
+        gate = self._native_gate(row, legacy={"valid": False})
+        self.assertTrue(gate["checks"]["local_backup_marker_fresh"], gate["reasons"])
+
+    def test_native_backup_save_before_final_maintenance_execstart_is_valid(self):
+        stamp = int(time.time()) - 30
+        row = {"valid": True, "exists": True,
+               "source": "nixos-system-restic-backup-completion",
+               "path": "systemd:restic-backups-heim-pc.service",
+               "timestamp_unix": stamp, "age_seconds": 30,
+               "service_start_unix": stamp - 10,  # final prune/check ExecStart
+               "service_exit_unix": stamp,
+               "snapshot_saved_at_unix": stamp - 45,  # earlier backup ExecStart
+               "backup_invocation_id": "a" * 32, "snapshot_id": "b" * 8}
+        gate = self._native_gate(row, legacy={"valid": False})
+        self.assertTrue(gate["checks"]["local_backup_marker_fresh"], gate["reasons"])
+
+    def test_native_stale_evidence_cannot_be_bypassed_by_legacy_success(self):
+        row = {"valid": False, "source": "nixos-system-restic-backup-completion",
+               "timestamp_unix": None, "age_seconds": None}
+        gate = self._native_gate(row)
+        self.assertFalse(gate["allowed"])
+        self.assertIn("local_backup_marker_fresh", gate["reasons"])
+
+    def test_native_source_age_and_timestamp_are_all_required(self):
+        stamp = int(time.time()) - 50
+        valid = {"valid": True, "exists": True,
+                 "source": "nixos-system-restic-backup-completion",
+                 "path": "systemd:restic-backups-heim-pc.service",
+                 "timestamp_unix": stamp, "age_seconds": 50,
+                 "backup_invocation_id": "a" * 32, "snapshot_id": "b" * 8}
+        for label, bad in (
+            ("wrong_source", {**valid, "source": "legacy-marker"}),
+            ("missing_age", {**valid, "age_seconds": None}),
+            ("boolean_age", {**valid, "age_seconds": True}),
+            ("stale_age", {**valid, "age_seconds": 90000}),
+            ("stale_timestamp", {**valid, "timestamp_unix": stamp - 90000}),
+            ("future_timestamp", {**valid, "timestamp_unix": stamp + 120}),
+            ("missing_invocation", {**valid, "backup_invocation_id": None}),
+            ("malformed_invocation", {**valid, "backup_invocation_id": "f" * 31}),
+            ("missing_snapshot", {**valid, "snapshot_id": None}),
+            ("malformed_snapshot", {**valid, "snapshot_id": "not-a-restic-id"}),
+            ("missing_service_evidence", {**valid, "exists": False}),
+            ("malformed", {}),
+        ):
+            with self.subTest(label=label):
+                gate = self._native_gate(bad)
+                self.assertFalse(gate["allowed"])
+                self.assertIn("local_backup_marker_fresh", gate["reasons"])
+
+    def test_native_recovery_status_exception_fails_closed(self):
+        with (
+            patch.object(provenance_recovery.recovery,
+                         "_NIXOS_OS_PRESENT", True, create=True),
+            patch.object(provenance_recovery.recovery,
+                         "_NIXOS_RESTIC_TIMER_PRESENT", True, create=True),
+            patch.object(provenance_recovery.recovery, "_nixos_native_backup_service_fresh",
+                         side_effect=RuntimeError("root evidence unreadable"), create=True),
+        ):
+            gate = self._gate(backup={"valid": True, "age_seconds": 10})
+        self.assertFalse(gate["allowed"])
+        self.assertIn("local_backup_marker_fresh", gate["reasons"])
+
+    def test_nixos_missing_native_timer_does_not_accept_legacy_success(self):
+        with (
+            patch.object(provenance_recovery.recovery, "_NIXOS_OS_PRESENT",
+                         True, create=True),
+            patch.object(provenance_recovery.recovery,
+                         "_NIXOS_RESTIC_TIMER_PRESENT", False, create=True),
+            patch.object(provenance_recovery.recovery, "_nixos_native_backup_service_fresh",
+                         return_value={"valid": False, "exists": False,
+                                       "source": "nixos-system-restic-backup-completion"},
+                         create=True),
+        ):
+            gate = self._gate(backup={"valid": True, "age_seconds": 10})
+        self.assertFalse(gate["allowed"])
+        self.assertIn("local_backup_marker_fresh", gate["reasons"])
+
+    def test_non_native_legacy_text_marker_remains_authoritative(self):
+        with (
+            patch.object(provenance_recovery.recovery,
+                         "_NIXOS_OS_PRESENT", False, create=True),
+            patch.object(provenance_recovery.recovery,
+                         "_NIXOS_RESTIC_TIMER_PRESENT", False, create=True),
+            patch.object(provenance_recovery.recovery, "_nixos_native_backup_service_fresh",
+                         side_effect=RuntimeError("must not call on Pop!"), create=True),
+        ):
+            gate = self._gate(backup={"valid": True, "age_seconds": 45})
+        self.assertTrue(gate["allowed"], gate["reasons"])
 
     def test_lane_is_closed_when_the_runtime_is_healthy(self) -> None:
         """The lane must never be a way around gates that currently apply."""

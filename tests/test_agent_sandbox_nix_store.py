@@ -202,6 +202,103 @@ class NixStoreSandboxTests(unittest.TestCase):
                             **kwargs,
                         )
 
+    def test_nixos_vendor_elf_runtime_rejects_user_owned_loader_and_libs(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            untrusted = Path(raw) / "lib"
+            untrusted.mkdir()
+            (untrusted / "ld.so").write_bytes(b"fake loader")
+            with mock.patch.object(sandbox, "_NIX_LD_LIBRARY_DIR", untrusted):
+                with self.assertRaisesRegex(sandbox.AgentSandboxError, "NixOS ELF runtime"):
+                    sandbox._trusted_nix_vendor_elf_runtime(Path("/nix/store"))
+
+    def test_nixos_vendor_elf_runtime_requires_real_immutable_store(self) -> None:
+        if not Path("/nix/store").is_dir():
+            self.skipTest("not running on NixOS")
+        loader, libraries = sandbox._trusted_nix_vendor_elf_runtime(Path("/nix/store"))
+        self.assertTrue(loader.is_relative_to(Path("/nix/store")))
+        self.assertTrue(libraries.is_relative_to(Path("/nix/store")))
+        self.assertEqual(loader.stat().st_uid, 0)
+        self.assertEqual(libraries.stat().st_uid, 0)
+
+    def test_nixos_vendor_elf_is_readonly_and_only_explicit_for_vendors(self) -> None:
+        if not Path("/nix/store").is_dir() or Path("/usr/lib64").exists():
+            self.skipTest("NixOS vendor ELF loader scenario not present")
+        with tempfile.TemporaryDirectory() as raw:
+            worktree = Path(raw) / "worktree"
+            worktree.mkdir()
+            vendor_fixture = worktree / "vendor-binary"
+            vendor_fixture.write_bytes(b"vendor fixture")
+            loader, libraries = sandbox._trusted_nix_vendor_elf_runtime(Path("/nix/store"))
+            plain = sandbox.minimal_sandbox_argv(
+                workspace=worktree, command=["/usr/bin/true"],
+                workspace_writable=False,
+            )
+            self.assertNotIn("LD_LIBRARY_PATH", plain)
+            self.assertNotIn("/lib64/ld-linux-x86-64.so.2", plain)
+            binds = ((vendor_fixture, sandbox.CLAUDE_SANDBOX_EXECUTABLE),)
+            argv = sandbox.minimal_sandbox_argv(
+                workspace=worktree,
+                command=[str(sandbox.CLAUDE_SANDBOX_EXECUTABLE), "--version"],
+                workspace_writable=False,
+                extra_read_only=binds,
+                extra_directories=(Path("/opt"), Path("/opt/grabowski-external")),
+            )
+            self.assertIn(
+                ["--ro-bind", str(loader), "/lib64/ld-linux-x86-64.so.2"],
+                [argv[i:i+3] for i in range(len(argv)-2)],
+            )
+            self.assertIn(
+                ["--setenv", "LD_LIBRARY_PATH", str(libraries)],
+                [argv[i:i+3] for i in range(len(argv)-2)],
+            )
+            self.assertNotIn(str(sandbox._NIX_LD_LIBRARY_DIR), argv)
+            self.assertNotIn(["--bind", str(libraries), str(libraries)],
+                             [argv[i:i+3] for i in range(len(argv)-2)])
+            for forbidden in (
+                {"extra_directories": (Path("/lib64"),)},
+                {"extra_read_only": (*binds, (vendor_fixture, Path("/lib64/ld-linux-x86-64.so.2")))},
+                {"extra_read_only": (*binds, (vendor_fixture, Path("/lib64/libc.so.6")))},
+            ):
+                with self.subTest(forbidden=forbidden), self.assertRaises(sandbox.AgentSandboxError):
+                    sandbox.minimal_sandbox_argv(
+                        workspace=worktree,
+                        command=[str(sandbox.CLAUDE_SANDBOX_EXECUTABLE), "--version"],
+                        workspace_writable=False,
+                        extra_read_only=forbidden.get("extra_read_only", binds),
+                        extra_directories=forbidden.get(
+                            "extra_directories", (Path("/opt"), Path("/opt/grabowski-external"))
+                        ),
+                    )
+
+    def test_real_nixos_vendor_elf_version_without_credentials(self) -> None:
+        # Enabled explicitly for the installed NixOS native Claude ELF CLI.
+        binary_value = os.environ.get("GRABOWSKI_NIXOS_VENDOR_ELF_PROBE_BIN")
+        if not binary_value or not Path("/nix/store").is_dir():
+            self.skipTest("NixOS vendor ELF probe binary not provided")
+        source = Path(binary_value).resolve(strict=True)
+        bwrap = os.environ.get("GRABOWSKI_BWRAP_BIN") or next(
+            (str(p) for p in Path("/nix/store").glob("*-bubblewrap-*/bin/bwrap")), None
+        )
+        if bwrap is None:
+            self.fail("NixOS native vendor ELF requires bubblewrap")
+        with tempfile.TemporaryDirectory() as raw:
+            workspace = Path(raw) / "worktree"
+            workspace.mkdir()
+            argv = sandbox.minimal_sandbox_argv(
+                workspace=workspace,
+                command=[str(sandbox.CLAUDE_SANDBOX_EXECUTABLE), "--version"],
+                workspace_writable=False,
+                extra_read_only=((source, sandbox.CLAUDE_SANDBOX_EXECUTABLE),),
+                extra_directories=(Path("/opt"), Path("/opt/grabowski-external")),
+            )
+            self.assertNotIn(".credentials.json", " ".join(argv))
+            result = subprocess.run(
+                [str(Path(bwrap).resolve(strict=True)), *argv[1:]],
+                check=False, capture_output=True, timeout=15,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
+            self.assertTrue(result.stdout.strip())
+
     def test_real_nixos_bwrap_executes_from_immutable_store(self) -> None:
         if not Path("/nix/store").is_dir():
             self.skipTest("not running on NixOS")
