@@ -504,6 +504,31 @@ class TaskTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "could not be staged"):
                 tasks._stage_task_output_capture_script("heimserver", transport="ssh")
 
+    def test_legacy_local_status_survives_missing_fleet_registry(self) -> None:
+        started = self._start()
+        probe = _launcher()
+        probe["stdout"] = (
+            "LoadState=loaded\nActiveState=active\nSubState=running\n"
+            "Result=success\nExecMainCode=0\nExecMainStatus=0\n"
+        )
+        with patch.object(
+            tasks.fleet, "fleet_host",
+            side_effect=RuntimeError("Fleet registry missing: /ci/fleet.json"),
+        ), patch.object(tasks, "_dispatch", return_value=probe):
+            status = tasks.grabowski_task_status(started["task"]["task_id"])
+        self.assertEqual(status["state"], "running")
+
+    def test_ssh_status_missing_fleet_registry_stays_blocked(self) -> None:
+        started = self._start(host="heimserver")
+        record = tasks._row_raw(str(started["task"]["task_id"]))
+        with patch.object(
+            tasks.fleet, "fleet_host",
+            side_effect=RuntimeError("Fleet registry missing: /ci/fleet.json"),
+        ), patch.object(tasks, "_dispatch") as dispatch:
+            with self.assertRaisesRegex(RuntimeError, "remote target authority unavailable"):
+                tasks._observe(record)
+            dispatch.assert_not_called()
+
     def test_ssh_without_task_home_binds_target_and_denies_drift(self) -> None:
         with patch.dict(REMOTE_HOST, {"target": "remote"}), patch.object(
             tasks.fleet, "fleet_host", return_value=REMOTE_HOST

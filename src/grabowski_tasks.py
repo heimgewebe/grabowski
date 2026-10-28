@@ -5952,8 +5952,19 @@ def _task_output_remote_target(record: dict[str, Any]) -> str | None:
         previous_target = launcher.get(TASK_OUTPUT_REMOTE_TARGET_BINDING_KEY)
     try:
         target = fleet.fleet_host(host_name)
-    except ValueError as exc:
-        if host_name == "local" and previous_target is None and home is None:
+    except (ValueError, RuntimeError) as exc:
+        legacy_local = host_name == "local" and previous_target is None and home is None
+        unknown_local_alias = (
+            isinstance(exc, ValueError)
+            and str(exc) == "Unknown fleet host: local"
+        )
+        missing_registry = (
+            isinstance(exc, RuntimeError)
+            and str(exc).startswith("Fleet registry missing: ")
+        )
+        if legacy_local and (unknown_local_alias or missing_registry):
+            # Read-only legacy local observations do not require Fleet config.
+            # A bound SSH task never passes this narrow exception.
             return None
         raise RuntimeError("task remote target authority unavailable") from exc
     if target["transport"] != "ssh":
