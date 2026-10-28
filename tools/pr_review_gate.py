@@ -248,6 +248,9 @@ RISK_PATH_PREFIXES = (
     "src/grabowski_merge_guard.py",
     "src/grabowski_decision_reviews.py",
     "src/grabowski_release_admission.py",
+    "src/grabowski_self_review_execution.py",
+    "src/grabowski_self_review_producer.py",
+    "config/self-review-allowed-signers",
     "tools/pr_review_gate.py",
 )
 DOCUMENTATION_PATH_PREFIXES = ("docs/", "documentation/")

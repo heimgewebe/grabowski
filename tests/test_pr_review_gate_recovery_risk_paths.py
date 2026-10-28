@@ -196,5 +196,19 @@ class RecoveryEvidenceAuthorityRiskTests(unittest.TestCase):
                 self.assertTrue(failures)
 
 
+    def test_self_review_execution_authority_paths_are_high_critical(self) -> None:
+        for path in (
+            "src/grabowski_self_review_execution.py",
+            "src/grabowski_self_review_producer.py",
+            "config/self-review-allowed-signers",
+        ):
+            with self.subTest(path=path):
+                result = complexity([path], repo="heimgewebe/grabowski")
+                self.assertEqual(result["review_tier"], "high_critical", result)
+                self.assertTrue(result["high_critical"], result)
+                self.assertGreaterEqual(result["minimum_self_review_iterations"], 5)
+                self.assertFalse(result["independent_review_required"], result)
+
+
 if __name__ == "__main__":
     unittest.main()
