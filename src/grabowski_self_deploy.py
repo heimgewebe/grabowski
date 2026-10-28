@@ -2010,6 +2010,89 @@ def _unreadable_s0_attempt_is_recovery_only(
     )
 
 
+def _pre_effect_resume_binding_drift_is_authenticated(
+    attempt: dict[str, Any], summary: dict[str, Any], authorized_sha256: str,
+) -> bool:
+    """Recognize only the runner's explicitly refused old authorized binding.
+
+    The private, hashed resume receipt and exact job stdout are authenticated
+    by the callers. This predicate binds the queued original SHA to the
+    producer's MidCutoverResumeDenied, the two freshly validated bindings and
+    the same cutover lineage. It grants recovery handoff only, never deployment.
+    """
+    recovery = attempt.get("recovery")
+    error = recovery.get("error") if isinstance(recovery, dict) else None
+    denied = error.get("initial_classification") if isinstance(error, dict) else None
+    fresh = recovery.get("classification") if isinstance(recovery, dict) else None
+    receipt_binding = midcutover._validated_resume_binding(attempt.get("resume_binding"))
+    denied_binding = (
+        midcutover._validated_resume_binding(denied.get("resume_binding"))
+        if isinstance(denied, dict) else None
+    )
+    if (
+        not isinstance(authorized_sha256, str)
+        or _SHA256_RE.fullmatch(authorized_sha256) is None
+        or not isinstance(recovery, dict)
+        or not isinstance(error, dict)
+        or not isinstance(denied, dict)
+        or not isinstance(fresh, dict)
+        or receipt_binding is None
+        or denied_binding is None
+    ):
+        return False
+    outcome = attempt.get("outcome")
+    if (
+        outcome not in {"failed_pre_resume", "outcome_unknown"}
+        or attempt.get("phase") != outcome
+        or summary.get("outcome") != outcome
+        or summary.get("resume_receipt_phase") != outcome
+        or summary.get("effect_applied") is not (outcome == "outcome_unknown")
+        or error.get("type") != "MidCutoverResumeDenied"
+        or denied.get("lane") != midcutover.LANE_FAIL_CLOSED
+        or not isinstance(denied.get("reasons"), list)
+        or "resume_binding_drifted" not in denied["reasons"]
+        or denied.get("authorized_resume_binding_sha256") != authorized_sha256
+        or denied_binding.get("binding_sha256") == authorized_sha256
+        or receipt_binding.get("binding_sha256") == authorized_sha256
+        or attempt.get("resume_binding_sha256") != receipt_binding["binding_sha256"]
+        or fresh.get("lane") != midcutover.LANE_MID_CUTOVER_RESUME
+        or fresh.get("resume_binding") != receipt_binding
+        or recovery.get("fresh_classification_required") is not True
+        or recovery.get("blind_retry_allowed") is not False
+        or recovery.get("automatic_rollback_forbidden") is not True
+        or recovery.get("snapshot_binding_state")
+        != receipt_binding.get("snapshot_binding_state")
+        or any(attempt.get(key) is not None for key in (
+            "green_serving", "snapshot_rebind", "pointer_promotion",
+            "selector_switch", "canonical_operator", "retirement",
+            "final_routing", "effect_terminalization", "admission_state",
+            "final_state", "authoritative_readback",
+        ))
+    ):
+        return False
+    for key in (
+        "cutover_id", "resumed_receipt_sha256", "target_head",
+        "expected_head", "source_identity_sha256", "expected_release_id",
+        "blue_release_id", "cutover_generation",
+    ):
+        if denied_binding.get(key) != receipt_binding.get(key):
+            return False
+    if outcome == "failed_pre_resume":
+        return bool(
+            receipt_binding.get("resume_phase") == midcutover.PHASE_REBIND_SNAPSHOT
+            and recovery.get("action") == "repair_preflight_evidence_and_retry"
+            and recovery.get("blue_green_state_unchanged") is True
+            and recovery.get("snapshot_binding_state") == midcutover.SNAPSHOT_BINDING_PENDING
+        )
+    return bool(
+        receipt_binding.get("resume_phase") in midcutover.RESUME_PHASES[1:]
+        and recovery.get("action") == "readback_active_runtime_and_recover"
+        and recovery.get("blue_rollback_forbidden") is True
+        and recovery.get("snapshot_rebind_applied") is True
+        and recovery.get("snapshot_binding_state") == midcutover.SNAPSHOT_BINDING_DONE
+    )
+
+
 def _progressed_resume_has_authentic_recovery_evidence(
     receipt: dict[str, Any], summary: dict[str, Any],
 ) -> bool:
@@ -2108,8 +2191,15 @@ def _failed_resume_job_is_settled(
             or attempt.get("phase") != attempt.get("outcome")
             or attempt.get("resume_phase") not in midcutover.RESUME_PHASES
             or previous is None
-            or previous.get("binding_sha256") != fields["resume_binding_sha256"]
-            or attempt.get("resume_binding_sha256") != fields["resume_binding_sha256"]
+            or (
+                (
+                    previous.get("binding_sha256") != fields["resume_binding_sha256"]
+                    or attempt.get("resume_binding_sha256") != fields["resume_binding_sha256"]
+                )
+                and not _pre_effect_resume_binding_drift_is_authenticated(
+                    attempt, summary, fields["resume_binding_sha256"]
+                )
+            )
             or attempt.get("resumed_cutover_id") != original["cutover_id"]
             or attempt.get("resumed_receipt_sha256") != original["receipt_sha256"]
             or summary.get("resumed_receipt_sha256") != original["receipt_sha256"]
@@ -2123,6 +2213,9 @@ def _failed_resume_job_is_settled(
                     attempt, summary
                 )
                 and not _unreadable_s0_attempt_is_recovery_only(attempt, summary)
+                and not _pre_effect_resume_binding_drift_is_authenticated(
+                    attempt, summary, fields["resume_binding_sha256"]
+                )
                 and not (
                     attempt.get("outcome") == "failed_pre_resume"
                     and attempt.get("resume_phase") == midcutover.PHASE_REBIND_SNAPSHOT
@@ -2627,7 +2720,6 @@ def _authenticated_scheduled_prerequisite_failure(
         or summary.get("execution_head") != fields["expected_head"]
         or summary.get("resume_target_head") != decision.get("resume_target_head")
         or summary.get("resumed_cutover_id") != decision.get("cutover_id")
-        or summary.get("resume_phase") != decision.get("resume_phase")
         or _SHA256_RE.fullmatch(str(summary.get("receipt_sha256"))) is None
         or summary.get("summary_sha256") != _sha256_json({
             k: v for k, v in summary.items()
@@ -2679,8 +2771,20 @@ def _authenticated_scheduled_prerequisite_failure(
             or attempt.get("resume_phase") != summary.get("resume_phase")
             or attempt.get("resumed_cutover_id") != original.get("cutover_id")
             or attempt.get("resumed_receipt_sha256") != original.get("receipt_sha256")
-            or attempt.get("resume_binding_sha256") != decision.get("resume_binding_sha256")
-            or previous.get("binding_sha256") != decision.get("resume_binding_sha256")
+            or (
+                (
+                    attempt.get("resume_binding_sha256") != decision.get("resume_binding_sha256")
+                    or previous.get("binding_sha256") != decision.get("resume_binding_sha256")
+                    or summary.get("resume_phase") != decision.get("resume_phase")
+                )
+                and not _pre_effect_resume_binding_drift_is_authenticated(
+                    attempt, {
+                        "outcome": expected_outcome,
+                        "resume_receipt_phase": expected_outcome,
+                        "effect_applied": expected_outcome == "outcome_unknown",
+                    }, decision.get("resume_binding_sha256")
+                )
+            )
             or previous.get("cutover_id") != original.get("cutover_id")
             or previous.get("resumed_receipt_sha256") != original.get("receipt_sha256")
             or previous.get("target_head") != original.get("expected_head")
@@ -2728,6 +2832,13 @@ def _authenticated_scheduled_prerequisite_failure(
                     "resume_receipt_phase": expected_outcome,
                     "effect_applied": True,
                 }
+            )
+            or _pre_effect_resume_binding_drift_is_authenticated(
+                attempt, {
+                    "outcome": expected_outcome,
+                    "resume_receipt_phase": expected_outcome,
+                    "effect_applied": expected_outcome == "outcome_unknown",
+                }, decision.get("resume_binding_sha256")
             )
         ):
             return None
@@ -2999,8 +3110,15 @@ def _indexed_failed_resume_is_noeffect_handoff(
             or receipt.get("phase") != receipt.get("outcome")
             or receipt.get("resume_phase") not in midcutover.RESUME_PHASES
             or previous is None
-            or receipt.get("resume_binding_sha256") != fields["resume_binding_sha256"]
-            or previous.get("binding_sha256") != fields["resume_binding_sha256"]
+            or (
+                (
+                    receipt.get("resume_binding_sha256") != fields["resume_binding_sha256"]
+                    or previous.get("binding_sha256") != fields["resume_binding_sha256"]
+                )
+                and not _pre_effect_resume_binding_drift_is_authenticated(
+                    receipt, summary, fields["resume_binding_sha256"]
+                )
+            )
             or receipt.get("resumed_cutover_id") != cutover["cutover_id"]
             or receipt.get("resumed_receipt_sha256") != cutover["receipt_sha256"]
             or receipt.get("expected_head") != cutover["expected_head"]
@@ -3034,6 +3152,17 @@ def _indexed_failed_resume_is_noeffect_handoff(
                         "effect_terminalization",
                     )
                 )
+            )
+        if _pre_effect_resume_binding_drift_is_authenticated(
+            receipt, summary, fields["resume_binding_sha256"]
+        ):
+            old_phase = receipt.get("resume_phase")
+            current_phase = resume_binding.get("resume_phase")
+            return bool(
+                old_phase in midcutover.RESUME_PHASES
+                and current_phase in midcutover.RESUME_PHASES
+                and midcutover.RESUME_PHASES.index(current_phase)
+                >= midcutover.RESUME_PHASES.index(old_phase)
             )
         if _unreadable_s0_attempt_is_recovery_only(receipt, summary):
             return resume_binding.get("resume_phase") in midcutover.RESUME_PHASES
