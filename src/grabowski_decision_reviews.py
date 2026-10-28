@@ -227,6 +227,105 @@ def _historical_review_role_module_matches(
     return hmac.compare_digest(hashlib.sha256(payload).hexdigest(), expected_sha256)
 
 
+_NIX_REVIEW_STORE_ROOT = Path("/nix/store")
+_NIX_REVIEW_OWNER_UID = 0
+_NIX_REVIEW_OPERATOR_RELEASE_RE = re.compile(
+    r"[0123456789abcdfghijklmnpqrsvwxyz]{32}-grabowski-operator-[0-9a-f]{8,40}\Z"
+)
+
+
+def _historical_nix_review_role_origin_matches(
+    runner_python: Any, runner_module_path: Any, runner_module_sha256: Any,
+) -> bool:
+    """Preserve exact V2 role provenance across immutable NixOS release rotations.
+
+    One source package MUST own both the canonical Python entrypoint and role
+    module. The Nix store may be group-writable for its daemon; every package
+    component is root-owned, non-writable and module bytes are SHA-pinned.
+    No arbitrary Python path, symlinked role module or caller-selected digest
+    grants review authority without the independently validated job origin.
+    """
+    if (
+        not isinstance(runner_python, str)
+        or not isinstance(runner_module_path, str)
+        or not isinstance(runner_module_sha256, str)
+        or _SHA256_RE.fullmatch(runner_module_sha256) is None
+    ):
+        return False
+    interpreter = Path(runner_python)
+    module = Path(runner_module_path)
+    release = interpreter.parent.parent
+    relative = None
+    try:
+        relative = module.relative_to(release).parts
+        if (
+            release.parent != _NIX_REVIEW_STORE_ROOT
+            or _NIX_REVIEW_OPERATOR_RELEASE_RE.fullmatch(release.name) is None
+            or interpreter != release / "bin" / "python3"
+            or len(relative) != 4
+            or relative[0] != "lib"
+            or _REVIEW_ROLE_PYTHON_DIR_RE.fullmatch(relative[1]) is None
+            or relative[2:] != ("site-packages", f"{REVIEW_ROLE_MODULE}.py")
+        ):
+            return False
+        store = _NIX_REVIEW_STORE_ROOT.lstat()
+        store_mode = stat.S_IMODE(store.st_mode)
+        if (
+            not stat.S_ISDIR(store.st_mode)
+            or store.st_uid != _NIX_REVIEW_OWNER_UID
+            or store_mode & 0o002
+            or (store_mode & 0o020 and not store_mode & stat.S_ISVTX)
+        ):
+            return False
+        for directory in (
+            release, release / "bin", release / "lib",
+            release / "lib" / relative[1],
+            release / "lib" / relative[1] / "site-packages",
+        ):
+            info = directory.lstat()
+            if (
+                not stat.S_ISDIR(info.st_mode)
+                or info.st_uid != _NIX_REVIEW_OWNER_UID
+                or stat.S_IMODE(info.st_mode) & 0o222
+            ):
+                return False
+        module_info = module.lstat()
+        if (
+            not stat.S_ISREG(module_info.st_mode)
+            or module_info.st_uid != _NIX_REVIEW_OWNER_UID
+            or module_info.st_nlink != 1
+            or not 0 < module_info.st_size <= MAX_REVIEW_ROLE_MODULE_BYTES
+            or stat.S_IMODE(module_info.st_mode) & 0o222
+            or module.resolve(strict=True) != module
+        ):
+            return False
+        python_info = interpreter.lstat()
+        if (
+            python_info.st_uid != _NIX_REVIEW_OWNER_UID
+            or not (
+                stat.S_ISLNK(python_info.st_mode)
+                or stat.S_ISREG(python_info.st_mode)
+            )
+        ):
+            return False
+        python_target = interpreter.resolve(strict=True)
+        target_info = python_target.stat()
+        if (
+            _NIX_REVIEW_STORE_ROOT not in python_target.parents
+            or not stat.S_ISREG(target_info.st_mode)
+            or target_info.st_uid != _NIX_REVIEW_OWNER_UID
+            or stat.S_IMODE(target_info.st_mode) & 0o222
+            or not stat.S_IMODE(target_info.st_mode) & 0o111
+        ):
+            return False
+        return hmac.compare_digest(
+            hashlib.sha256(module.read_bytes()).hexdigest(),
+            runner_module_sha256,
+        )
+    except (OSError, ValueError, RuntimeError):
+        return False
+
+
 def _historical_review_role_python_matches(value: Any) -> bool:
     """Accept only canonical historical runner paths to the current interpreter."""
 
@@ -1277,12 +1376,19 @@ def _normalize_review_role_provenance(
     runner_module_path, runner_module_sha256 = module_identity
     recorded_runner_python = value.get("runner_python")
     stable_python = str(REVIEW_ROLE_STABLE_PYTHON.expanduser())
-    runner_python_matches = (
-        recorded_runner_python == REVIEW_ROLE_PYTHON
-        and recorded_runner_python != stable_python
-    ) or _historical_review_role_python_matches(recorded_runner_python)
     recorded_module_path = value.get("runner_module_path")
     recorded_module_sha256 = value.get("runner_module_sha256")
+    nix_origin_matches = _historical_nix_review_role_origin_matches(
+        recorded_runner_python, recorded_module_path, recorded_module_sha256,
+    )
+    runner_python_matches = (
+        (
+            recorded_runner_python == REVIEW_ROLE_PYTHON
+            and recorded_runner_python != stable_python
+        )
+        or _historical_review_role_python_matches(recorded_runner_python)
+        or nix_origin_matches
+    )
     # Historical attempts bind the module bytes installed when the review ran.
     # A later source upgrade must not erase that evidence. Never trust an
     # arbitrary caller-selected digest: require the exact byte-matching module
@@ -1296,6 +1402,7 @@ def _normalize_review_role_provenance(
             recorded_module_path,
             expected_sha256=recorded_module_sha256,
         )
+        or nix_origin_matches
     )
     if (
         schema not in {1, 2}
@@ -1471,7 +1578,7 @@ def _proven_claude_pre_result_failure_before_review(
     except ValueError:
         return False
     permitted_fields = _CLAUDE_QUOTA_ENVELOPE_FIELDS | (
-        frozenset({"api_error_origin"}) if auth_401 else frozenset()
+        frozenset({"api_error_origin", "safety_stops"}) if auth_401 else frozenset()
     )
     if not isinstance(envelope, dict) or set(envelope) - permitted_fields:
         return False
@@ -1528,6 +1635,11 @@ def _proven_claude_pre_result_failure_before_review(
         )
         and isinstance(usage, dict) and usage.get("iterations") == []
         and envelope.get("permission_denials") == []
+        and (
+            type(envelope.get("safety_stops")) is int
+            and envelope["safety_stops"] == 0
+            if auth_401 else True
+        )
         and type(envelope.get("total_cost_usd")) in {int, float}
         and envelope["total_cost_usd"] == 0
         and isinstance(usage, dict)

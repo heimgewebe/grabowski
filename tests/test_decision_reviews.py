@@ -394,6 +394,7 @@ def stamp_claude_oauth_401(directory: Path, *, envelope_updates: dict | None = N
     envelope.update({
         "api_error_status": 401,
         "api_error_origin": "first_party",
+        "safety_stops": 0,
         "result": (
             "Failed to authenticate: OAuth token revoked. "
             "Please log in again or contact your administrator."
@@ -978,6 +979,8 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
             ("other_message", {"result": "REJECT_THIS_REVISION: material findings"}, {}),
             ("result_nonstring", {"result": {"verdict": "REJECT_THIS_REVISION"}}, {}),
             ("response_work", {"duration_api_ms": 2}, {}),
+            ("safety_stop", {"safety_stops": 1}, {}),
+            ("safety_stop_bool", {"safety_stops": True}, {}),
             ("document", {}, {"review_document_bytes": 14}),
             ("hash_tamper", {}, {"review_provider_envelope_sha256": "f" * 64}),
         ]
