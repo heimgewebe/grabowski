@@ -777,6 +777,11 @@
     },
     {
       "kind": "python_module",
+      "launcher_module": "grabowski_self_review_producer",
+      "spawned_module": "grabowski_self_review_producer"
+    },
+    {
+      "kind": "python_module",
       "launcher_module": "grabowski_self_deploy",
       "spawned_module": "grabowski_coding_agent_router_cli"
     },

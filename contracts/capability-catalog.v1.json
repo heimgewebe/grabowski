@@ -2,7 +2,7 @@
   "capability_source": "src/grabowski_capabilities.py",
   "capability_source_sha256": "e894771c674ecb89d8261217bf5350beaf370fad28b150e053a11ac5221c4811",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "762697e6fc372f4800054251c24e9cb991aab252ef92f1a5a105cd7cc61e2970",
+  "contract_sha256": "23851f3e6deab58099ba689712a5f85d688077427a45c6dde9da9466ababac75",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -273,7 +273,7 @@
     },
     {
       "category": "audit",
-      "description": "Start one exact-revision semantic review session for a stored plan.",
+      "description": "Start a stored-plan review, or derive a frozen Candidate with workspace_id and an empty batch ID.",
       "effects": [
         "private-review-session-create"
       ],
@@ -299,7 +299,7 @@
     },
     {
       "category": "audit",
-      "description": "Persist one immutable substantive controller-written axis verdict.",
+      "description": "Persist a substantive axis verdict; report={\"finalize\": true} seals a five-axis Candidate handoff.",
       "effects": [
         "private-semantic-review-receipt-create"
       ],
