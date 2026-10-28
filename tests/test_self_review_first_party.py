@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import secrets
 import json
 import copy
@@ -176,7 +177,18 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
         return audit, receipts
 
     def _receipt_errors(self, audit: dict, receipts: Path) -> list[str]:
-        return review.review_receipt_errors(
+        # Other suites explicitly mock the module-level public verifier for
+        # unrelated routing tests. A security-negative test must execute the
+        # actual source verifier even after a leaked test mock.
+        spec = importlib.util.spec_from_file_location(
+            "isolated_first_party_signed_receipt_verifier",
+            Path(review.__file__).resolve(strict=True),
+        )
+        if spec is None or spec.loader is None:
+            raise AssertionError("real source verifier could not be loaded")
+        actual = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(actual)
+        return actual.review_receipt_errors(
             audit, _receipts=receipts, _signers=self.signers,
             _first_party_root=self.state, _repository=self.repo,
             _root_owned_signers=False, _now_unix=self.now,
@@ -303,6 +315,21 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
         ).glob("*.data"))
         persisted_read.write_bytes(b"tampered source bytes")
         self.assertTrue(self._receipt_errors(audit, receipts))
+
+    def test_forged_repo_is_rejected_even_when_another_test_mocks_public_verifier(self) -> None:
+        """Exercise the real cryptographic verifier despite prior gate fixture mocks."""
+        plan = self._first_party_plan()
+        started = self._start_plan(plan)
+        for number, axis in enumerate(review.REQUIRED_AXES, start=1):
+            self._submit_axis(started, axis, number)
+        audit, receipts = self._seal_direct(plan)
+        forged = copy.deepcopy(audit)
+        forged["repo"] = "heimgewebe/heim-pc"
+        with mock.patch.object(review, "review_receipt_errors", return_value=[]):
+            self.assertTrue(
+                self._receipt_errors(forged, receipts),
+                "a mock from an unrelated gate test must not falsify the signed verifier",
+            )
 
     def test_heim_pc_nix_review_seals_without_grabowski_test_tasks(self) -> None:
         self.repo = self.root / "heim-pc"
