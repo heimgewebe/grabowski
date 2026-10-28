@@ -35,7 +35,9 @@ MAX_STDOUT_TAIL_BYTES = 256 * 1024
 # Non-review origins must not conceal review results retained in their job logs.
 # This is a separate, bounded verification budget, not a limit increase for
 # admitted review evidence.
-MAX_UNBOUND_STDOUT_BYTES = 8 * 1024 * 1024
+# A valid non-review Bureau status projection can exceed 24 MiB.
+# Read and check the whole output for an exactly bound material review marker.
+MAX_UNBOUND_STDOUT_BYTES = 32 * 1024 * 1024
 MAX_ROLE_RECEIPT_BYTES = 4 * 1024 * 1024
 MAX_REVIEW_ROLE_MODULE_BYTES = 1024 * 1024
 REVIEW_ROLE_MODULE = "grabowski_agent_role"
@@ -666,10 +668,11 @@ def _exact_empty_prelaunch_stub(directory_fd: int) -> bool:
             descriptors.append(fd)
             before = os.fstat(fd)
             snapshot = observed[name]
-            identity = lambda s: (
-                s.st_dev, s.st_ino, s.st_mode, s.st_uid, s.st_nlink,
-                s.st_size, s.st_mtime_ns, s.st_ctime_ns,
-            )
+            def identity(s: os.stat_result) -> tuple[int, ...]:
+                return (
+                    s.st_dev, s.st_ino, s.st_mode, s.st_uid, s.st_nlink,
+                    s.st_size, s.st_mtime_ns, s.st_ctime_ns,
+                )
             if (
                 not stat.S_ISREG(before.st_mode)
                 or before.st_uid != os.geteuid()
@@ -738,6 +741,7 @@ def _proven_not_started(metadata: dict[str, Any]) -> bool:
 def _validated_origin_binding(
     directory: Path, *, raw_metadata: dict[str, Any] | None = None,
     parent_fd: int | None = None,
+    expected: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any] | None, dict[str, Any] | None]:
     unit = directory.name
     if _UNIT_RE.fullmatch(unit) is None:
@@ -772,6 +776,12 @@ def _validated_origin_binding(
     attempt_epoch = scope.get("decision_review_attempt_epoch")
     if attempt_epoch is not None and attempt_epoch != 2:
         raise ValueError("decision review attempt epoch is invalid")
+    # The immutable job origin and its review binding have been validated.
+    # Historical reviewer-role provenance from another repo/PR/head is not
+    # admissible evidence for this PR and must not block unrelated merges.
+    # Still inspect its role receipt and stdout for surviving target evidence.
+    if expected is not None and not _binding_matches_pr_head(binding, expected):
+        return metadata, binding, None
     provenance = _normalize_review_role_provenance(
         scope.get("decision_review_provenance"), binding, cwd=origin_cwd,
         attempt_directory=directory,
@@ -2117,7 +2127,6 @@ def reconcile(
     review_attempt_count = 0
     with closing(iterator):
         for directory, directory_fd in iterator:
-            raw_targets_pr_head = False
             try:
                 try:
                     raw_metadata = _read_private_json(
@@ -2144,10 +2153,6 @@ def reconcile(
                     raw_origin_scope.get("decision_bound_review")
                     if isinstance(raw_origin_scope, dict) else None
                 )
-                raw_targets_pr_head = (
-                    _raw_binding_targets_pr_head(raw_review_binding, expected)
-                    or _raw_binding_targets_pr_head(raw_origin_binding, expected)
-                )
                 if raw_review_binding is not None or raw_origin_binding is not None:
                     review_attempt_count += 1
                     if review_attempt_count > MAX_BOUND_REVIEW_JOBS:
@@ -2155,7 +2160,8 @@ def reconcile(
                         attempts = []
                         break
                 metadata, binding, provenance = _validated_origin_binding(
-                    directory, raw_metadata=raw_metadata, parent_fd=directory_fd
+                    directory, raw_metadata=raw_metadata, parent_fd=directory_fd,
+                    expected=expected,
                 )
             except ReviewMetadataBudgetExceeded:
                 errors.append("decision_review_metadata_aggregate_budget_exceeded")
