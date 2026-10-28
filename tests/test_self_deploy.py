@@ -11880,6 +11880,30 @@ class PersistedUnknownCutoverHandoffSecurityTests(unittest.TestCase):
                         ),
                         "authentic persisted rolled_back must retire the old job",
                     )
+                    # Later unrelated B remains genuinely unresolved, but cannot
+                    # resurrect an already verified clean-blue rollback A.
+                    foreign = fixture.cutover_receipt(
+                        cutover_id="bgc-later-foreign-outcome-unknown",
+                        outcome="outcome_unknown", phase="outcome_unknown",
+                    )
+                    foreign_path = cutovers / (foreign["cutover_id"] + ".json")
+                    foreign_path.write_text(json.dumps(foreign), encoding="utf-8")
+                    foreign_path.chmod(0o600)
+                    unresolved = SELF_DEPLOY.midcutover.unresolved_post_switch_receipts(
+                        current_receipts()["receipts"]
+                    )
+                    self.assertEqual(
+                        [foreign["cutover_id"]],
+                        [receipt["cutover_id"] for receipt in unresolved],
+                        "later B must remain explicitly unresolved",
+                    )
+                    self.assertTrue(
+                        SELF_DEPLOY._verified_runtime_terminal_receipt(
+                            entry, metadata, command, rb_status
+                        ),
+                        "authenticated rolled-back A must stay terminal during B recovery",
+                    )
+                    foreign_path.unlink()
                     self.assertFalse(
                         SELF_DEPLOY._indexed_failed_deploy_is_cutover_handoff(
                             self.UNIT, binding

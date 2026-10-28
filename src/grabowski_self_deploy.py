@@ -1892,7 +1892,11 @@ def _signed_clean_blue_rollback_is_terminal(
             and selector.get("release_id") == cutover.get("blue_release_id")
             and ingress.get("release_id") == cutover.get("blue_release_id")
             and selector.get("repo_head") == ingress.get("repo_head")
-            and not midcutover.unresolved_post_switch_receipts(receipts)
+            # Historical rollback A cannot depend on unrelated cutover B.
+            and not any(
+                receipt.get("cutover_id") == cutover.get("cutover_id")
+                for receipt in midcutover.unresolved_post_switch_receipts(receipts)
+            )
         )
     except (OSError, RuntimeError, ValueError, midcutover.MidCutoverEvidenceError):
         return False
