@@ -2437,18 +2437,21 @@ def _verified_runtime_terminal_receipt(
         )
         if preflight is not None:
             return _signed_failed_pre_cutover_is_terminal(preflight[0], preflight[1])
-        # Sidecar failures carry a blue-green summary, so the no-effect
-        # authenticator deliberately cannot read their failure type. The
-        # dedicated cutover proof checks the exact private finalization itself.
-        completed = _authenticated_persisted_incomplete_cutover(
-            entry, metadata, deploy, status,
-            failure_type="SidecarInstallOutstanding",
-            allowed_outcomes=frozenset({"completed"}),
-        )
-        if completed is not None:
-            return _repaired_completed_sidecars_are_terminal(
-                completed[0], completed[1], deploy
+        # A signed completed cutover can be followed by a sidecar failure or
+        # a repository/runtime verification RuntimeError (e.g. origin/main
+        # advanced during cutover). Both require the exact persisted cutover,
+        # current deployed release integrity and repaired sidecars. An
+        # incomplete or unknown cutover is never retired through this path.
+        for completed_failure in ("SidecarInstallOutstanding", "RuntimeError"):
+            completed = _authenticated_persisted_incomplete_cutover(
+                entry, metadata, deploy, status,
+                failure_type=completed_failure,
+                allowed_outcomes=frozenset({"completed"}),
             )
+            if completed is not None:
+                return _repaired_completed_sidecars_are_terminal(
+                    completed[0], completed[1], deploy
+                )
         persisted = _authenticated_persisted_incomplete_cutover(
             entry, metadata, deploy, status
         )

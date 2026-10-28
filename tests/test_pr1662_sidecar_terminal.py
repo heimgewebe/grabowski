@@ -15,6 +15,17 @@ RUNNER = source.RUNNER
 
 class CompletedCutoverSidecarRetirement(unittest.TestCase):
     def test_completed_cutover_requires_current_release_and_repaired_sidecars(self):
+        for failure_type in (
+            "SidecarInstallOutstanding", "RuntimeError",
+            "BlueGreenDeploymentIncomplete",
+        ):
+            with self.subTest(failure_type=failure_type):
+                self._assert_completed_cutover(
+                    failure_type,
+                    expected_terminal=failure_type != "BlueGreenDeploymentIncomplete",
+                )
+
+    def _assert_completed_cutover(self, failure_type, *, expected_terminal):
         original = fixture.cutover_receipt(outcome="completed", phase="completed")
         final_routing = {
             "selected_slot": "canonical",
@@ -75,7 +86,7 @@ class CompletedCutoverSidecarRetirement(unittest.TestCase):
                 "receipt_paths": paths, "final_status": "failed",
                 "completion_status": "failed",
                 "repo_head": None, "release_id": None,
-                "failure_type": "SidecarInstallOutstanding",
+                "failure_type": failure_type,
                 "blue_green": summary,
                 "blue_green_receipt_sha256": original["receipt_sha256"],
                 "blind_retry_allowed": None, "timestamp_unix": 1000,
@@ -118,11 +129,16 @@ class CompletedCutoverSidecarRetirement(unittest.TestCase):
                 mock.patch.object(SD, "_sidecars_match_deploy_head",
                                   return_value=True) as checked,
             ):
-                self.assertTrue(
+                self.assertEqual(
                     SD._verified_runtime_terminal_receipt(job, metadata, command, status),
-                    "completed blue-green with real verified repaired sidecars should retire",
+                    expected_terminal,
+                    "only an authenticated completed-cutover verification failure "
+                    "with matching live release and repaired sidecars may retire",
                 )
-                checked.assert_called()
+                if expected_terminal:
+                    checked.assert_called()
+                else:
+                    checked.assert_not_called()
                 with mock.patch.object(SD, "_sidecars_match_deploy_head", return_value=False):
                     self.assertFalse(SD._verified_runtime_terminal_receipt(
                         job, metadata, command, status
