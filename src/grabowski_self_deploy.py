@@ -1937,6 +1937,79 @@ def _repaired_completed_sidecars_are_terminal(
         return False
 
 
+def _unreadable_s0_attempt_is_recovery_only(
+    receipt: dict[str, Any], summary: dict[str, Any],
+) -> bool:
+    """A cold unreadable S0 readback is ambiguous, not confirmed progress.
+
+    Only a fresh, validated same-cutover resume binding may hand off this
+    exhausted job. This proof never retires the job for ordinary deployment,
+    never reuses the old S0 decision, and cannot grant blind retry authority.
+    """
+    recovery = receipt.get("recovery")
+    routing = receipt.get("final_routing")
+    readback = receipt.get("authoritative_readback")
+    # The S0 exception path may still observe the old green route. An
+    # authoritative canonical readback contradicts a no-progress claim and
+    # cannot be retired as an effect-unconfirmed S0 attempt.
+    readback_consistent = (
+        readback is None
+        or (
+            isinstance(readback, dict)
+            and (
+                (
+                    readback.get("authoritative") is False
+                    and readback.get("selector") is None
+                    and readback.get("ingress") is None
+                )
+                or (
+                    readback.get("authoritative") is True
+                    and isinstance(readback.get("selector"), dict)
+                    and readback["selector"].get("selected_slot") == "green"
+                    and isinstance(readback.get("ingress"), dict)
+                    and readback["ingress"].get("selected_slot") == "green"
+                    and readback.get("readback_sha256") == _sha256_json({
+                        k: v for k, v in readback.items()
+                        if k != "readback_sha256"
+                    })
+                )
+            )
+        )
+    )
+    return bool(
+        readback_consistent
+        and receipt.get("outcome") == "outcome_unknown"
+        and receipt.get("phase") == "outcome_unknown"
+        and receipt.get("resume_phase") == midcutover.PHASE_REBIND_SNAPSHOT
+        and summary.get("outcome") == "outcome_unknown"
+        and summary.get("resume_receipt_phase") == "outcome_unknown"
+        and summary.get("effect_applied") is True
+        and isinstance(recovery, dict)
+        and recovery.get("action") == "readback_active_runtime_and_recover"
+        and recovery.get("automatic_rollback_forbidden") is True
+        and recovery.get("blue_rollback_forbidden") is True
+        and recovery.get("snapshot_binding_state") == midcutover.SNAPSHOT_BINDING_UNREADABLE
+        and recovery.get("snapshot_rebind_applied") is False
+        and recovery.get("pointer_promoted") is False
+        and recovery.get("canonical_selected") is False
+        and recovery.get("snapshot_rollback_forbidden") is False
+        and recovery.get("blind_retry_allowed") is False
+        and recovery.get("fresh_classification_required") is True
+        and recovery.get("next_resume_phase") is None
+        and isinstance(recovery.get("error"), dict)
+        and bool(recovery["error"])
+        and (routing is None or (
+            isinstance(routing, dict)
+            and routing.get("selected_slot") == "green"
+        ))
+        and all(receipt.get(key) is None for key in (
+            "snapshot_rebind", "pointer_promotion", "selector_switch",
+            "canonical_operator", "retirement", "effect_terminalization",
+            "admission_state", "final_state",
+        ))
+    )
+
+
 def _progressed_resume_has_authentic_recovery_evidence(
     receipt: dict[str, Any], summary: dict[str, Any],
 ) -> bool:
@@ -2049,6 +2122,7 @@ def _failed_resume_job_is_settled(
                 not _progressed_resume_has_authentic_recovery_evidence(
                     attempt, summary
                 )
+                and not _unreadable_s0_attempt_is_recovery_only(attempt, summary)
                 and not (
                     attempt.get("outcome") == "failed_pre_resume"
                     and attempt.get("resume_phase") == midcutover.PHASE_REBIND_SNAPSHOT
@@ -2640,12 +2714,21 @@ def _authenticated_scheduled_prerequisite_failure(
                 ))
             ):
                 return None
-        elif not _progressed_resume_has_authentic_recovery_evidence(
-            attempt, {
-                "outcome": expected_outcome,
-                "resume_receipt_phase": expected_outcome,
-                "effect_applied": True,
-            }
+        elif not (
+            _progressed_resume_has_authentic_recovery_evidence(
+                attempt, {
+                    "outcome": expected_outcome,
+                    "resume_receipt_phase": expected_outcome,
+                    "effect_applied": True,
+                }
+            )
+            or _unreadable_s0_attempt_is_recovery_only(
+                attempt, {
+                    "outcome": expected_outcome,
+                    "resume_receipt_phase": expected_outcome,
+                    "effect_applied": True,
+                }
+            )
         ):
             return None
         return original, attempt, receipts
@@ -2703,7 +2786,16 @@ def _indexed_failed_scheduled_resume_is_handoff(
             return False
         past_phase = prior.get("resume_phase")
         current_phase = resume_binding.get("resume_phase")
-        if prior.get("outcome") == "failed_pre_resume":
+        if (
+            prior.get("outcome") == "failed_pre_resume"
+            or _unreadable_s0_attempt_is_recovery_only(
+                prior, {
+                    "outcome": prior.get("outcome"),
+                    "resume_receipt_phase": prior.get("phase"),
+                    "effect_applied": True,
+                },
+            )
+        ):
             # The old attempt was authentically effect-free at S0. Its
             # retirement awaits completed lineage, but it must yield to a
             # FRESHLY classified S1-S4 after a different retry progressed.
@@ -2943,6 +3035,8 @@ def _indexed_failed_resume_is_noeffect_handoff(
                     )
                 )
             )
+        if _unreadable_s0_attempt_is_recovery_only(receipt, summary):
+            return resume_binding.get("resume_phase") in midcutover.RESUME_PHASES
         if not _progressed_resume_has_authentic_recovery_evidence(receipt, summary):
             return False
         # An old failed attempt cannot prescribe the next phase. It may yield
