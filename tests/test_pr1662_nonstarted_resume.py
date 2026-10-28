@@ -712,5 +712,124 @@ class UnreadableS0RecoveryHandoffTests(unittest.TestCase):
         self.assertFalse(self._with_evidence(self.old_binding))
 
 
+class PreparedResumeBindingDriftTests(unittest.TestCase):
+    """A queued old binding can be refused before effects while the same cutover advances."""
+
+    def test_authentic_binding_drift_refusal_yields_only_to_recovery_and_later_terminal(self):
+        import json
+        import test_midcutover_resume as fixture
+        from contextlib import nullcontext
+
+        dual = fixture.dual
+        for phase in (
+            DEPLOY.midcutover.PHASE_REBIND_SNAPSHOT,
+            DEPLOY.midcutover.PHASE_PROMOTE_POINTER,
+        ):
+            with self.subTest(phase=phase):
+                # Reuse the real job-dir/stdout receipt fixture, not a fabricated
+                # private-failure status or a mocked classifier gate.
+                job = UnreadableS0RecoveryHandoffTests()
+                job.setUp()
+                self.addCleanup(job.temp.cleanup)
+                (job.cutovers / (job.attempt["resume_id"] + ".json")).unlink()
+                original_authorized = fixture.resume_receipt(
+                    resume_phase=DEPLOY.midcutover.PHASE_REBIND_SNAPSHOT
+                )["resume_binding"]
+                if phase == DEPLOY.midcutover.PHASE_REBIND_SNAPSHOT:
+                    newly_classified = deepcopy(original_authorized)
+                    newly_classified["source_evidence_time"] += 1
+                    newly_classified["binding_sha256"] = DEPLOY._sha256_json({
+                        k: v for k, v in newly_classified.items()
+                        if k != "binding_sha256"
+                    })
+                else:
+                    newly_classified = fixture.resume_receipt(
+                        resume_phase=phase
+                    )["resume_binding"]
+                self.assertIsNotNone(
+                    DEPLOY.midcutover._validated_resume_binding(newly_classified)
+                )
+                fresh = {
+                    "schema_version": DEPLOY.midcutover.SCHEMA_VERSION,
+                    "kind": DEPLOY.midcutover.KIND,
+                    "lane": DEPLOY.midcutover.LANE_MID_CUTOVER_RESUME,
+                    "resume_binding": newly_classified,
+                    "evidence": {
+                        "snapshot_binding_state": newly_classified["snapshot_binding_state"],
+                    },
+                    "classification_sha256": "d" * 64,
+                }
+                refused = {
+                    **fresh,
+                    "lane": DEPLOY.midcutover.LANE_FAIL_CLOSED,
+                    "reasons": ["resume_binding_drifted"],
+                    "authorized_resume_binding_sha256": original_authorized["binding_sha256"],
+                }
+                with (
+                    mock.patch.object(dual.core, "deployment_lock", return_value=nullcontext()),
+                    mock.patch.object(
+                        dual, "prepare_midcutover_resume_runtime",
+                        side_effect=dual.MidCutoverResumeDenied(refused),
+                    ),
+                    mock.patch.object(
+                        dual, "classify_midcutover_resume", return_value=fresh,
+                    ),
+                    mock.patch.object(dual, "BLUE_GREEN_RECEIPT_ROOT", job.cutovers),
+                ):
+                    result = dual.resume_production_blue_green_cutover(
+                        repo=job.REPO, expected_head=fixture.HEAD_GREEN,
+                        resume_id=(
+                            "bgcr-pr1662-binding-drift-s0"
+                            if phase == DEPLOY.midcutover.PHASE_REBIND_SNAPSHOT
+                            else "bgcr-pr1662-binding-drift-s1"
+                        ),
+                        require_resume_binding_sha256=original_authorized["binding_sha256"],
+                    )
+                self.assertNotEqual(
+                    result["receipt"]["resume_binding_sha256"],
+                    original_authorized["binding_sha256"],
+                )
+                job.old_binding = original_authorized
+                job.command = DEPLOY._midcutover_resume_command(
+                    job.REPO,
+                    job.REPO / DEPLOY.MIDCUTOVER_RESUME_RUNNER_RELATIVE_PATH,
+                    fixture.HEAD_GREEN,
+                    fixture.CUTOVER_ID,
+                    original_authorized["binding_sha256"],
+                )
+                job.meta["argv"] = job.command
+                job.meta["argv_sha256"] = DEPLOY._deploy_command_sha256(job.command)
+                job.attempt = result["receipt"]
+                job._install_attempt(job.attempt)
+                self.assertFalse(job._terminal_with_evidence())
+                self.assertTrue(job._with_evidence(newly_classified))
+                self.assertFalse(job._with_evidence({
+                    **newly_classified,
+                    "source_identity_sha256": "f" * 64,
+                }))
+                tampered = deepcopy(job.attempt)
+                tampered["recovery"]["error"]["initial_classification"][
+                    "authorized_resume_binding_sha256"
+                ] = "f" * 64
+                tampered["receipt_sha256"] = DEPLOY._sha256_json({
+                    k: v for k, v in tampered.items() if k != "receipt_sha256"
+                })
+                job._install_attempt(tampered)
+                self.assertFalse(job._with_evidence(newly_classified))
+                job._install_attempt(job.attempt)
+                # Never terminal before completed lineage, even on verified no-effect refusal.
+                final = fixture.resume_receipt(
+                    resume_id=(
+                        "bgcr-pr1662-drift-s0-final"
+                        if phase == DEPLOY.midcutover.PHASE_REBIND_SNAPSHOT
+                        else "bgcr-pr1662-drift-s1-final"
+                    )
+                )
+                final_path = job.cutovers / (final["resume_id"] + ".json")
+                final_path.write_text(json.dumps(final), encoding="utf-8")
+                final_path.chmod(0o600)
+                self.assertTrue(job._terminal_with_evidence())
+
+
 if __name__ == "__main__":
     unittest.main()
