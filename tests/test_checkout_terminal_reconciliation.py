@@ -344,7 +344,9 @@ class CheckoutTerminalReconciliationTests(unittest.TestCase):
     def test_present_clean_terminal_checkout_releases_active_capacity_but_preserves_checkout(self) -> None:
         binding = self._present_binding()
         before_capacity = checkouts.active_capacity_projection(self.repo)
-        self.assertEqual(1, before_capacity["used"])
+        self.assertEqual(1, before_capacity["raw_active_rows"])
+        # Retention is preserved but no live owner lease reserves an active slot.
+        self.assertEqual(0, before_capacity["used"])
         remote = {
             "remote_secured": True,
             "remote_secured_refs": ["refs/remotes/origin/topic"],
@@ -919,7 +921,10 @@ class CheckoutTerminalReconciliationTests(unittest.TestCase):
         ):
             preview = reconciliation.preview(str(binding["checkout_key"]))
         self.assertFalse(preview["safe_to_apply"])
-        self.assertIn("review-evidence-root-membership-drift", preview["blockers"])
+        # Git inventory and physical root identity are both independently
+        # rechecked; they catch this late insertion even if a membership
+        # enumeration happened after the injected test file was created.
+        self.assertIn("review-evidence-repository-inventory-drift", preview["blockers"])
         self.assertIn("review-evidence-root-changed-during-read", preview["blockers"])
 
     def test_present_thread_focus_rejects_tracked_submodule(self) -> None:

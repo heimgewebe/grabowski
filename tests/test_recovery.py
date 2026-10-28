@@ -418,7 +418,9 @@ class RecoveryToolTests(unittest.TestCase):
             descriptor = os.open(state, os.O_RDONLY)
             try:
                 fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                with patch.object(recovery, "LOCAL_RECOVERY_OPERATION_STATE", state):
+                with patch.object(recovery, "_NIXOS_RESTIC_TIMER_PRESENT", False), patch.object(
+                    recovery, "LOCAL_RECOVERY_OPERATION_STATE", state
+                ):
                     with self.assertRaisesRegex(
                         RuntimeError, "local recovery repository operation is busy"
                     ):
@@ -440,6 +442,10 @@ class RecoveryToolTests(unittest.TestCase):
             "_local_recovery_repository_operation_lock",
             return_value=nullcontext(),
         ) as lock, patch.object(
+            recovery, "_NIXOS_OS_PRESENT", False
+        ), patch.object(
+            recovery, "_NIXOS_RESTIC_TIMER_PRESENT", False
+        ), patch.object(
             recovery, "_local_recovery_probe_locked", return_value=expected
         ) as probe:
             result = recovery._local_recovery_probe(target_info)
@@ -727,11 +733,14 @@ class RecoveryToolTests(unittest.TestCase):
 
     def test_recovery_status_allows_custom_target_with_matching_fresh_evidence(self) -> None:
         target = "wg-prod-1:rest-server/grabowski-recovery-probe"
-        result = _run_ready_recovery_status(
-            _fresh_server_marker(target),
-            host="wg-prod-1",
-            target=target,
-        )
+        with patch.object(recovery, "_NIXOS_OS_PRESENT", False), patch.object(
+            recovery, "_NIXOS_RESTIC_TIMER_PRESENT", False
+        ):
+            result = _run_ready_recovery_status(
+                _fresh_server_marker(target),
+                host="wg-prod-1",
+                target=target,
+            )
 
         self.assertTrue(result["checks"]["server_recovery_fresh"])
         self.assertTrue(result["ready_for_user_power_worker"])
@@ -741,6 +750,24 @@ class RecoveryToolTests(unittest.TestCase):
         self.assertTrue(boundary["target_matches_configured"])
         self.assertFalse(boundary["high_impact_actions_remain_blocked_until_fresh_server_evidence"])
 
+
+    def test_nixos_missing_native_timer_rejects_even_fresh_legacy_marker(self) -> None:
+        target = "wg-prod-1:rest-server/grabowski-recovery-probe"
+        with patch.object(recovery, "_NIXOS_OS_PRESENT", True), patch.object(
+            recovery, "_NIXOS_RESTIC_TIMER_PRESENT", False
+        ):
+            # All unrelated gates and the old text marker are deliberately green.
+            state = _run_ready_recovery_status(
+                _fresh_server_marker(target),
+                host="wg-prod-1",
+                target=target,
+            )
+        self.assertFalse(state["checks"]["local_backup_fresh"])
+        self.assertFalse(state["ready_for_user_power_worker"])
+        self.assertFalse(state["ready_for_privileged_actions"])
+        self.assertEqual(state["local_backup"]["source"], "nixos-system-restic-backup-completion")
+        self.assertFalse(state["local_backup"]["exists"])
+        self.assertIn("missing", state["local_backup"]["error"])
 
     def test_server_source_marker_reports_hash_of_exact_raw_record(self) -> None:
         target = "wg-prod-1:rest-server/grabowski-recovery-probe"

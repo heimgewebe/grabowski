@@ -582,23 +582,37 @@ def _active_slot_available(
     lifecycle: dict[str, Any] | None,
     now: int,
 ) -> None:
-    was_active = bool(
-        lifecycle
-        and lifecycle.get("phase") == "active"
-        and int(lifecycle.get("retention_until_unix") or 0) > now
-    )
-    if was_active:
+    checkouts = _checkouts()
+    live_leases = checkouts._live_checkout_lease_keys(now=now)
+    requested_checkout = {
+        "owner_id": inputs["lease_owner_id"],
+        "repo_path": inputs["repo"],
+        "checkout_path": inputs["target_path"],
+        "expected_branch": inputs["branch"],
+    }
+    # Identity supersession must use exactly the creation-admission rule.
+    # Historical retention without the checkout's own live path/branch lease
+    # never reserves an execution slot, even across a CAS identity rebind.
+    if not checkouts._active_lifecycle_consumes_capacity(
+        requested_checkout, now=now, live_leases=live_leases,
+    ):
         return
-    row = connection.execute(
-        """
-        SELECT count(*) AS total FROM lifecycle_bindings
-        WHERE repo_common_dir=? AND checkout_key<>?
-          AND phase='active' AND retention_until_unix>?
-        """,
-        (inputs["repo_common_dir"], inputs["checkout_key"], now),
-    ).fetchone()
-    count = int(row["total"] if row is not None else 0)
-    limit = _checkouts()._phase_limit("active")
+    if (
+        lifecycle is not None
+        and lifecycle.get("phase") == "active"
+        and checkouts._active_lifecycle_consumes_capacity(
+            lifecycle, now=now, live_leases=live_leases,
+        )
+    ):
+        return
+    count = checkouts._active_creation_count(
+        connection,
+        repo_common_dir=Path(inputs["repo_common_dir"]),
+        exclude_checkout_key=inputs["checkout_key"],
+        now=now,
+        live_leases=live_leases,
+    )
+    limit = checkouts._phase_limit("active")
     if count >= limit:
         raise CheckoutIdentityConflict(
             f"identity supersession would exceed active checkout capacity: active={count} limit={limit}"

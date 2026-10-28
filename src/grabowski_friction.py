@@ -834,27 +834,48 @@ def _run_diagnostic_command(
 
 def _service_status_probe(unit: str) -> dict[str, Any]:
     name = operator._validate_unit(unit)
-    result = _run_diagnostic_command(
-        [
-            "systemctl",
-            "--user",
-            "show",
-            name,
-            "--no-pager",
-            "--property=LoadState",
-            "--property=ActiveState",
-            "--property=SubState",
-            "--property=UnitFileState",
-            "--property=Result",
-            "--property=ExecMainCode",
-            "--property=ExecMainStatus",
-            "--property=NRestarts",
-        ],
-        timeout_seconds=30,
-        max_output_bytes=32_768,
-    )
+
+    def read_scope(scope: str) -> dict[str, Any]:
+        return _run_diagnostic_command(
+            [
+                "systemctl",
+                "--system" if scope == "system" else "--user",
+                "show",
+                name,
+                "--no-pager",
+                "--property=LoadState",
+                "--property=ActiveState",
+                "--property=SubState",
+                "--property=UnitFileState",
+                "--property=Result",
+                "--property=ExecMainCode",
+                "--property=ExecMainStatus",
+                "--property=NRestarts",
+            ],
+            timeout_seconds=30,
+            max_output_bytes=32_768,
+        )
+
+    scope = "user"
+    if name == "grabowski-operator.service":
+        system_result = read_scope("system")
+        system_properties = operator._parse_show(system_result.get("stdout", ""))
+        if (
+            system_result["returncode"] == 0
+            and not system_result["timed_out"]
+            and not system_result["stdout_truncated"]
+            and system_properties.get("LoadState") == "loaded"
+        ):
+            scope = "system"
+            result = system_result
+        else:
+            result = read_scope("user")
+    else:
+        result = read_scope("user")
+
     return {
         "unit": name,
+        "scope": scope,
         "returncode": result["returncode"],
         "timed_out": result["timed_out"],
         "stdout_truncated": result["stdout_truncated"],
@@ -910,6 +931,7 @@ def _explicit_http_statuses(payload: dict[str, Any]) -> list[int]:
             r"(?<![\w])(?:status(?:_?code)?|http_?status(?:_?code)?|response_?(?:status|code)|code)\s*[=:]\s*(\d{3})(?![\w])",
             r"\bHTTP(?:/\d+(?:\.\d+)?)?(?:\s+status)?\s*[:=]?\s*(\d{3})(?![\w])",
             r"received exception from stream\s*:\s*([45]\d{2})(?=\s+(?:upstream|external|http|bad gateway|service error))",
+            r"\bMCP SSE probe returned\s+([45]\d{2})(?![\w.])",
             r"(?:upstream(?: or|/)external service|external service error)[^0-9]{0,32}([45]\d{2})(?!\d)",
         )
         for pattern in explicit_patterns:
@@ -943,6 +965,7 @@ def _stop_invocation_context(
     records: list[dict[str, Any]],
     *,
     unit: str,
+    scope: str = "user",
 ) -> tuple[set[str], dict[str, int]]:
     completed: set[str] = set()
     completed_at: dict[str, int] = {}
@@ -966,16 +989,20 @@ def _stop_invocation_context(
             )
         if (
             record.get("MESSAGE_ID") != SYSTEMD_STOP_COMPLETED_MESSAGE_ID
-            or record.get("USER_UNIT") != unit
+            or (
+                record.get("UNIT") if scope == "system" else record.get("USER_UNIT")
+            ) != unit
             or record.get("JOB_TYPE") != "stop"
             or record.get("JOB_RESULT") != "done"
         ):
             continue
-        user_invocation = record.get("USER_INVOCATION_ID")
-        if isinstance(user_invocation, str) and re.fullmatch(r"[0-9a-f]{32}", user_invocation):
-            completed.add(user_invocation)
+        stop_invocation = record.get(
+            "INVOCATION_ID" if scope == "system" else "USER_INVOCATION_ID"
+        )
+        if isinstance(stop_invocation, str) and re.fullmatch(r"[0-9a-f]{32}", stop_invocation):
+            completed.add(stop_invocation)
             if realtime is not None:
-                completed_at[user_invocation] = realtime
+                completed_at[stop_invocation] = realtime
     qualified = {
         invocation: completion_time
         for invocation, completion_time in completed_at.items()
@@ -1119,13 +1146,15 @@ def _journal_transport_event(
 
 
 
-def _journal_response_lifecycle_lookback_probe(unit: str) -> dict[str, Any]:
+def _journal_response_lifecycle_lookback_probe(unit: str, *, scope: str = "user") -> dict[str, Any]:
     """Read only lifecycle signals over a time window so high traffic cannot evict them."""
     name = operator._validate_unit(unit)
+    if scope not in {"user", "system"}:
+        raise ValueError("unknown systemd scope")
     result = _run_diagnostic_command(
         [
             "journalctl",
-            "--user",
+            "--system" if scope == "system" else "--user",
             "--unit",
             name,
             "--no-pager",
@@ -1247,12 +1276,14 @@ def _journal_response_lifecycle_lookback_probe(unit: str) -> dict[str, Any]:
         "stderr_preview": _bounded_summary_text(result.get("stderr"), max_chars=240),
     }
 
-def _journal_transport_probe(unit: str, max_lines: int) -> dict[str, Any]:
+def _journal_transport_probe(unit: str, max_lines: int, *, scope: str = "user") -> dict[str, Any]:
     name = operator._validate_unit(unit)
+    if scope not in {"user", "system"}:
+        raise ValueError("unknown systemd scope")
     result = _run_diagnostic_command(
         [
             "journalctl",
-            "--user",
+            "--system" if scope == "system" else "--user",
             "--unit",
             name,
             "--no-pager",
@@ -1279,6 +1310,7 @@ def _journal_transport_probe(unit: str, max_lines: int) -> dict[str, Any]:
     completed_stop_invocations, qualified_stop_invocations = _stop_invocation_context(
         parsed,
         unit=name,
+        scope=scope,
     )
     error_domains: Counter[str] = Counter()
     http_statuses: Counter[str] = Counter()
@@ -1613,13 +1645,35 @@ def connector_transport_live_diagnostics(
         for unit in CONNECTOR_DIAGNOSTIC_UNITS
     }
     journal_probes = {
-        unit: _journal_transport_probe(unit, max_log_lines)
+        unit: _journal_transport_probe(
+            unit, max_log_lines, scope=service_statuses[unit]["scope"]
+        )
         for unit in CONNECTOR_DIAGNOSTIC_UNITS
     }
     response_lifecycle_lookbacks = {
-        unit: _journal_response_lifecycle_lookback_probe(unit)
+        unit: _journal_response_lifecycle_lookback_probe(
+            unit, scope=service_statuses[unit]["scope"]
+        )
         for unit in CONNECTOR_DIAGNOSTIC_UNITS
     }
+    for unit, probe in journal_probes.items():
+        service = service_statuses[unit]
+        properties = service.get("properties", {})
+        service_available = (
+            service["returncode"] == 0
+            and not service["timed_out"]
+            and not service["stdout_truncated"]
+            and properties.get("LoadState") == "loaded"
+            and properties.get("ActiveState") in {"active", "reloading"}
+        )
+        if not service_available or probe["parsed_records"] == 0:
+            if probe["transport_health_state"] == "healthy":
+                probe["transport_health_state"] = "indeterminate"
+            if probe["window_state"] == "no_errors":
+                probe["window_state"] = (
+                    "indeterminate_no_recent_activity"
+                    if service_available else "indeterminate_service_unavailable"
+                )
     transport_error_count = sum(
         probe["transport_error_count"] for probe in journal_probes.values()
     )
@@ -1641,14 +1695,14 @@ def connector_transport_live_diagnostics(
         if lookback["signal_count"] > 0:
             if transport_health_states[unit] in {"healthy", "indeterminate"}:
                 transport_health_states[unit] = "degraded"
-            if window_states[unit] == "no_errors":
+            if window_states[unit] in {"no_errors", "indeterminate_no_recent_activity"}:
                 window_states[unit] = "lifecycle_errors_outside_tail_window"
             continue
         if lookback["journal_window_complete"]:
             continue
         if transport_health_states[unit] == "healthy":
             transport_health_states[unit] = "indeterminate"
-        if window_states[unit] == "no_errors":
+        if window_states[unit] in {"no_errors", "indeterminate_no_recent_activity"}:
             window_states[unit] = (
                 "indeterminate_truncated"
                 if lookback["stdout_truncated"]
@@ -1713,6 +1767,10 @@ def connector_transport_live_diagnostics(
         transport_window_state = "errors_followed_by_activity"
     elif "lifecycle_errors_outside_tail_window" in window_states.values():
         transport_window_state = "lifecycle_errors_outside_tail_window"
+    elif "indeterminate_service_unavailable" in window_states.values():
+        transport_window_state = "indeterminate_service_unavailable"
+    elif "indeterminate_no_recent_activity" in window_states.values():
+        transport_window_state = "indeterminate_no_recent_activity"
     elif "indeterminate_truncated" in window_states.values():
         transport_window_state = "indeterminate_truncated"
     elif "indeterminate_incomplete" in window_states.values():
@@ -1733,7 +1791,7 @@ def connector_transport_live_diagnostics(
     return {
         "schema_version": 3,
         "authority": "read_only_transport_diagnostic_receipt",
-        "source": "friction-log-and-local-user-systemd",
+        "source": "friction-log-and-local-systemd",
         "limit": limit,
         "max_log_lines": max_log_lines,
         "friction_log": {

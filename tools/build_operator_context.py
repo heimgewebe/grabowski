@@ -106,7 +106,14 @@ def _canonical_json_sha256(value: Any) -> str:
 def _ast_contract(node: ast.AST | None) -> str | None:
     if node is None:
         return None
-    dumped = ast.dump(node, annotate_fields=True, include_attributes=False)
+    # Python 3.13 omits empty AST list fields unless show_empty=True, unlike
+    # Python 3.10/3.12. Preserve the existing v1 digest representation.
+    if sys.version_info >= (3, 13):
+        dumped = ast.dump(
+            node, annotate_fields=True, include_attributes=False, show_empty=True
+        )
+    else:
+        dumped = ast.dump(node, annotate_fields=True, include_attributes=False)
     # Python 3.12 added ``type_params`` to FunctionDef/AsyncFunctionDef/ClassDef.
     # An empty field is parser-version metadata, not a source-contract change.
     # Non-empty type parameters remain in the dump and therefore stay digest-bound.
