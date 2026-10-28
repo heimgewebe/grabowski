@@ -32,12 +32,33 @@ RECOVERY_SOURCE_KEYS = frozenset({
     "schema_version", "completed_at_unix", "snapshot_id",
     "restore_probe_valid", "repository_check_valid", "target",
 })
+RECOVERY_SOURCE_OPTIONAL_KEYS = frozenset({"snapshot_time_unix"})
 RECOVERY_RECORD_KEYS = frozenset({
     "schema_version", "kind", "generated_at_unix", "max_age_seconds",
     "snapshot_id", "restore_probe_valid", "repository_check_valid",
     "target", "configured_target", "configured_target_valid",
     "target_matches_configured", "source_record_sha256", "source_owner_uid",
 })
+RECOVERY_RECORD_OPTIONAL_KEYS = frozenset({"snapshot_time_unix", "root_proof_sha256"})
+NIXOS_RESTIC_TARGET = "local-backup-disk:UUID=9b626294-7913-4be0-88fa-96b314e96ee5/restic/heim-pc"
+NIXOS_RESTIC_ROOT_UNIT_ACTION = "nixos_restic_root_unit"
+NIXOS_RESTIC_ROOT_UNIT = "heim-pc-restic-recovery-probe.service"
+NIXOS_RESTIC_ROOT_UNIT_ARGV = [
+    "/run/current-system/sw/bin/systemctl", "--system", "--no-block", "start", NIXOS_RESTIC_ROOT_UNIT,
+]
+NIXOS_RESTIC_ROOT_PROOF = Path("/var/lib/heim-pc-restic-recovery-probe/proof.json")
+NIXOS_RESTIC_REPO_ID = "85ee278eeb58f42c26745796cb7b23239d4c7c01f5f4d00f2c10e216cefa4972"
+NIXOS_RESTIC_UUID = "9b626294-7913-4be0-88fa-96b314e96ee5"
+
+
+def _native_nixos_root_proof_required(target: Any) -> bool:
+    """Distinguish root-controlled NixOS from legacy Pop sharing the disk target.
+
+    A missing NixOS timer cannot silently downgrade the native recovery
+    requirement to legacy because the trusted OS marker is independent.
+    """
+    return target == NIXOS_RESTIC_TARGET and Path("/etc/NIXOS").is_file()
+
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 REQUEST_ID = re.compile(r"[0-9a-f]{32}\Z")
 SHELL_EXECUTABLES = {
@@ -394,6 +415,28 @@ def _resolve_template_action(
     legacy_kill_switch_value = candidate.get("legacy_kill_switch_path")
     peer_uid = candidate.get("allowed_peer_uid")
     peer_unit = candidate.get("allowed_peer_unit")
+    if reference.get("action") == NIXOS_RESTIC_ROOT_UNIT_ACTION:
+        # A recovery verification must not use the scoped allowance that
+        # authorizes only explicit blockade-management actions.
+        if os.path.lexists(str(kill_switch_value)) or os.path.lexists(str(legacy_kill_switch_value)):
+            raise PermissionError("NixOS Restic root service is disabled by kill-switch")
+        # A private root policy cannot accidentally convert this fixed service
+        # launcher into a general privileged argv or foreign unit launcher.
+        if (
+            reference["target"] != NIXOS_RESTIC_ROOT_UNIT
+            or argv != NIXOS_RESTIC_ROOT_UNIT_ARGV
+            or type(timeout) is not int or timeout != 60
+            or type(peer_uid) is not int or peer_uid != 1000
+            or peer_unit != "grabowski-operator.service"
+            or kill_switch_value != "/var/lib/grabowski/operator-blockade/operator-kill-switch"
+            or legacy_kill_switch_value != "/home/alex/.local/state/grabowski/operator-kill-switch"
+            or set(candidate) != {
+                "enabled", "mode", "target_pattern", "argv", "timeout_seconds",
+                "allowed_peer_uid", "allowed_peer_unit", "kill_switch_path",
+                "legacy_kill_switch_path",
+            }
+        ):
+            raise PermissionError("fixed NixOS Restic Rootbroker unit contract is unauthorized")
     if reference.get("action") == ROOTBROKER_CUTOVER_ACTION and (
         kill_switch_value is None
         or legacy_kill_switch_value is None
@@ -605,7 +648,7 @@ def _canonical_recovery_payload(
     max_age_seconds: int,
     configured_target: str,
 ) -> dict[str, Any]:
-    return {
+    record = {
         "schema_version": RECOVERY_RECORD_SCHEMA_VERSION,
         "kind": RECOVERY_RECORD_KIND,
         "generated_at_unix": source["completed_at_unix"],
@@ -620,6 +663,9 @@ def _canonical_recovery_payload(
         "source_record_sha256": source_record_sha256,
         "source_owner_uid": source_owner_uid,
     }
+    if "snapshot_time_unix" in source:
+        record["snapshot_time_unix"] = source["snapshot_time_unix"]
+    return record
 
 
 def _validate_recovery_source_record(
@@ -631,7 +677,8 @@ def _validate_recovery_source_record(
     now: int,
 ) -> dict[str, Any]:
     value = _decode_json_object(raw, label="recovery source record")
-    if set(value) != RECOVERY_SOURCE_KEYS or value.get("schema_version") != RECOVERY_SOURCE_SCHEMA_VERSION:
+    if (set(value) not in (RECOVERY_SOURCE_KEYS, RECOVERY_SOURCE_KEYS | RECOVERY_SOURCE_OPTIONAL_KEYS)
+            or value.get("schema_version") != RECOVERY_SOURCE_SCHEMA_VERSION):
         raise ValueError("recovery source record contract is invalid")
     generated_at = value.get("completed_at_unix")
     if isinstance(generated_at, bool) or not isinstance(generated_at, int):
@@ -640,6 +687,11 @@ def _validate_recovery_source_record(
         raise PermissionError("recovery source record is future-dated")
     if now - generated_at > max_age_seconds:
         raise PermissionError("recovery source record is stale")
+    if "snapshot_time_unix" in value:
+        snapshot_time = value["snapshot_time_unix"]
+        if (type(snapshot_time) is not int or snapshot_time > generated_at
+                or now - snapshot_time > max_age_seconds):
+            raise PermissionError("recovery source record snapshot is stale or invalid")
     snapshot_id = value.get("snapshot_id")
     if not isinstance(snapshot_id, str) or not snapshot_id:
         raise PermissionError("recovery source record snapshot is invalid")
@@ -679,6 +731,8 @@ def inspect_canonical_recovery_record(
         "generated_at_unix": None,
         "age_seconds": None,
         "max_age_seconds": None,
+        "snapshot_time_unix": None,
+        "snapshot_age_seconds": None,
         "record_sha256": None,
         "source_record_sha256": None,
         "snapshot_id": None,
@@ -705,7 +759,15 @@ def inspect_canonical_recovery_record(
     except ValueError as exc:
         result.update({"freshness_reason": "malformed", "error": str(exc)})
         return result
-    if set(value) != RECOVERY_RECORD_KEYS:
+    if _native_nixos_root_proof_required(value.get("target")):
+        if (
+            set(value) != RECOVERY_RECORD_KEYS | RECOVERY_RECORD_OPTIONAL_KEYS
+            or not isinstance(value.get("root_proof_sha256"), str)
+            or SHA256_RE.fullmatch(value["root_proof_sha256"]) is None
+        ):
+            result.update({"freshness_reason": "contract-mismatch", "error": "NixOS canonical root proof binding is missing"})
+            return result
+    elif set(value) not in (RECOVERY_RECORD_KEYS, RECOVERY_RECORD_KEYS | {"snapshot_time_unix"}):
         result.update({"freshness_reason": "contract-mismatch", "error": "canonical recovery record keys are invalid"})
         return result
     if value.get("schema_version") != RECOVERY_RECORD_SCHEMA_VERSION or value.get("kind") != RECOVERY_RECORD_KIND:
@@ -738,6 +800,17 @@ def inspect_canonical_recovery_record(
     if age > max_age:
         result.update({"freshness_reason": "stale", "error": "canonical recovery record is stale"})
         return result
+    if "snapshot_time_unix" in value:
+        snapshot_time = value["snapshot_time_unix"]
+        if type(snapshot_time) is not int or snapshot_time > generated_at:
+            result.update({"freshness_reason": "malformed", "error": "canonical snapshot timestamp is invalid"})
+            return result
+        snapshot_age = current - snapshot_time
+        result["snapshot_time_unix"] = snapshot_time
+        result["snapshot_age_seconds"] = snapshot_age
+        if snapshot_age > max_age:
+            result.update({"freshness_reason": "stale", "error": "canonical backup snapshot is stale"})
+            return result
     if value.get("restore_probe_valid") is not True or value.get("repository_check_valid") is not True:
         result.update({"freshness_reason": "incomplete", "error": "canonical recovery evidence is incomplete"})
         return result
@@ -764,6 +837,28 @@ def inspect_canonical_recovery_record(
     if not isinstance(snapshot_id, str) or not snapshot_id:
         result.update({"freshness_reason": "malformed", "error": "canonical recovery snapshot is invalid"})
         return result
+    if _native_nixos_root_proof_required(target):
+        # The NixOS oneshot unlinks its previous proof before attempting a new
+        # restore. A failure must revoke the old canonical gate immediately;
+        # a syntactically valid stored proof SHA alone is not current authority.
+        source_identity = {
+            "completed_at_unix": generated_at,
+            "snapshot_id": snapshot_id,
+            "snapshot_time_unix": value["snapshot_time_unix"],
+            "target": target,
+        }
+        try:
+            proof_sha = _validated_nixos_root_oneshot_proof(
+                source_identity, now=current,
+                expected_digest=value["root_proof_sha256"],
+            )
+        except (OSError, PermissionError, RuntimeError, ValueError) as exc:
+            result.update({
+                "freshness_reason": "root-proof-invalid",
+                "error": str(exc),
+            })
+            return result
+        result["root_proof_sha256"] = proof_sha
     result.update({"valid": True, "freshness_reason": "ready", "error": None, "record": value})
     return result
 
@@ -904,6 +999,74 @@ def _require_recovery_publication_kill_switch_binding(path: Path, *, expected: d
         raise PermissionError("recovery publication kill-switch identity changed after authorization")
 
 
+
+def _validated_nixos_root_oneshot_proof(
+    source: dict[str, Any], *, now: int, expected_digest: str | None = None
+) -> str:
+    """Require real root-owned Heim-PC #263 restore evidence before gate publication."""
+    parent = NIXOS_RESTIC_ROOT_PROOF.parent
+    parent_meta = parent.lstat()
+    if (
+        stat.S_ISLNK(parent_meta.st_mode) or not stat.S_ISDIR(parent_meta.st_mode)
+        or parent_meta.st_uid != 0 or parent_meta.st_mode & 0o022
+    ):
+        raise PermissionError("native root proof directory is not trusted")
+    raw, _metadata = _read_safe_regular_file(
+        NIXOS_RESTIC_ROOT_PROOF, label="native Restic root proof",
+        require_root_owned=True,
+    )
+    if not 0 < len(raw) <= 8192:
+        raise PermissionError("native root proof length is outside the contract")
+    digest = hashlib.sha256(raw).hexdigest()
+    if expected_digest is not None and digest != expected_digest:
+        raise PermissionError("native root proof changed during canonical publication")
+    proof = _decode_json_object(raw, label="native Restic root proof")
+    required = {
+        "schema_version", "kind", "started_at_unix", "completed_at_unix",
+        "snapshot_id", "snapshot_time_unix", "repository_id", "backup_uuid",
+        "backup_source", "restore_sha256", "restore_probe_valid",
+        "repository_check_valid",
+    }
+    if (
+        set(proof) != required
+        or proof.get("schema_version") != 1
+        or proof.get("kind") != "heim_pc.nixos_restic_recovery_root_proof"
+        or proof.get("repository_id") != NIXOS_RESTIC_REPO_ID
+        or proof.get("backup_uuid") != NIXOS_RESTIC_UUID
+        or proof.get("restore_probe_valid") is not True
+        or proof.get("repository_check_valid") is not True
+    ):
+        raise PermissionError("native Restic root proof identity is invalid")
+    start, completed, snapshot_time = (
+        proof.get("started_at_unix"),
+        proof.get("completed_at_unix"),
+        proof.get("snapshot_time_unix"),
+    )
+    source_completed = source.get("completed_at_unix")
+    if (
+        any(type(item) is not int for item in (start, completed, snapshot_time, source_completed))
+        or not start <= completed <= source_completed <= now
+        or not 0 <= source_completed - completed <= 120
+        or now - snapshot_time > 86400
+        or snapshot_time > completed
+    ):
+        raise PermissionError("native Restic root proof freshness is invalid")
+    snapshot_id = proof.get("snapshot_id")
+    restored_sha = proof.get("restore_sha256")
+    source_id = source.get("snapshot_id")
+    if (
+        not isinstance(snapshot_id, str) or SHA256_RE.fullmatch(snapshot_id) is None
+        or not isinstance(restored_sha, str) or SHA256_RE.fullmatch(restored_sha) is None
+        or not isinstance(proof.get("backup_source"), str)
+        or re.fullmatch(r"/dev/[A-Za-z0-9_./+-]{1,255}", proof["backup_source"]) is None
+        or source_id != snapshot_id[:8]
+        or source.get("snapshot_time_unix") != snapshot_time
+        or source.get("target") != NIXOS_RESTIC_TARGET
+    ):
+        raise PermissionError("native Restic source does not match root restore proof")
+    return digest
+
+
 def _resolve_recovery_marker_publish_action(
     candidate: dict[str, Any],
     reference: dict[str, Any],
@@ -979,6 +1142,11 @@ def _resolve_recovery_marker_publish_action(
     )
     if validated["source_record_sha256"] != expected_sha:
         raise PermissionError("recovery source digest changed before publication")
+    native_nixos_proof_required = _native_nixos_root_proof_required(configured_target)
+    proof_digest = (
+        _validated_nixos_root_oneshot_proof(validated["source"], now=current)
+        if native_nixos_proof_required else None
+    )
     if validated["source"]["completed_at_unix"] != expected_generated:
         raise PermissionError("recovery source generation changed before publication")
     return {
@@ -995,6 +1163,8 @@ def _resolve_recovery_marker_publish_action(
         "kill_switch_binding": kill_switch_binding,
         "legacy_kill_switch_path": (str(legacy_switch) if legacy_switch is not None else None),
         "require_root_owned_destination": require_root_destination,
+        "nixos_root_proof_sha256": proof_digest,
+        "native_nixos_proof_required": native_nixos_proof_required,
     }
 
 
@@ -1075,6 +1245,15 @@ def _validated_recovery_source_for_execution(
         or generated_at != execution["expected_generated_at_unix"]
     ):
         raise PermissionError("recovery source changed after reference validation")
+    require_native = _native_nixos_root_proof_required(execution["configured_target"])
+    if execution.get("native_nixos_proof_required", False) is not require_native:
+        raise PermissionError("root recovery mode changed after authorization")
+    if require_native:
+        digest = _validated_nixos_root_oneshot_proof(
+            validated["source"], now=now,
+            expected_digest=execution.get("nixos_root_proof_sha256"),
+        )
+        validated["canonical_record"]["root_proof_sha256"] = digest
     return validated
 
 
