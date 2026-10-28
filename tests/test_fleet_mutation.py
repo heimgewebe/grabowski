@@ -201,6 +201,86 @@ class FleetRegistryMutationTests(unittest.TestCase):
                 )
             self.assertEqual(config.read_bytes(), concurrent)
 
+    def test_task_home_can_be_added_and_updated_by_typed_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config, state = root / "fleet.json", root / "state"
+            host = {
+                **_host(target="alex@heim-pc"),
+                "remote_command_mode": "posix",
+                "task_home": "/home/alex",
+            }
+            before = _write_registry(config, {})
+            with patch.object(fleet, "FLEET_CONFIG", config):
+                plan = mutation.plan_registry_mutation({
+                    "operation": "add",
+                    "host": "remote",
+                    "expected_registry_sha256": _sha256(before),
+                    "host_spec_json": json.dumps(host),
+                })
+            self.assertEqual(plan["public"]["host_spec_sha256"], mutation._canonical_sha256(host))
+            add = mutation.mutate_registry(
+                _request("add", "remote", _sha256(before), host),
+                path=config, state_root=state,
+            )
+            self.assertEqual(add["result"], "success")
+            self.assertEqual(
+                fleet.validate_fleet(json.loads(config.read_text()))["hosts"]["remote"],
+                host,
+            )
+            updated = {**host, "roles": ["windows", "workstation"]}
+            before_update = config.read_bytes()
+            update = mutation.mutate_registry(
+                _request("update", "remote", _sha256(before_update), updated),
+                path=config, state_root=state,
+            )
+            self.assertEqual(update["result"], "success")
+            self.assertEqual(json.loads(config.read_text())["hosts"]["remote"], updated)
+
+    def test_typed_update_cannot_implicitly_drop_task_home(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config, state = root / "fleet.json", root / "state"
+            host = {
+                **_host(target="alex@heim-pc"),
+                "remote_command_mode": "posix",
+                "task_home": "/home/alex",
+            }
+            before = _write_registry(config, {"remote": host})
+            changed = {key: value for key, value in host.items() if key != "task_home"}
+            changed["roles"] = ["windows"]
+            with patch.object(fleet, "FLEET_CONFIG", config):
+                with self.assertRaisesRegex(mutation.FleetRegistryMutationError, "task_home"):
+                    mutation.plan_registry_mutation({
+                        "operation": "update",
+                        "host": "remote",
+                        "expected_registry_sha256": _sha256(before),
+                        "host_spec_json": json.dumps(changed),
+                    })
+            with self.assertRaisesRegex(mutation.FleetRegistryMutationError, "task_home"):
+                mutation.mutate_registry(
+                    _request("update", "remote", _sha256(before), changed),
+                    path=config, state_root=state,
+                )
+            self.assertEqual(config.read_bytes(), before)
+
+    def test_typed_task_home_validation_rejects_mismatch_and_unknown_keys(self) -> None:
+        host = {
+            **_host(target="alex@heim-pc"),
+            "remote_command_mode": "posix",
+            "task_home": "/home/alex",
+        }
+        for candidate in (
+            {**host, "task_home": "/home/bob"},
+            {**host, "target": "alex@heim-pc@other.example"},
+            {**host, "remote_command_mode": "windows-powershell"},
+        ):
+            with self.subTest(candidate=candidate):
+                with self.assertRaises(ValueError):
+                    mutation._validate_host_spec("remote", candidate)
+        with self.assertRaisesRegex(ValueError, "complete v1 host contract"):
+            mutation._validate_host_spec("remote", {**host, "unknown": "field"})
+
     def test_invalid_ssh_target_and_incomplete_host_spec_are_rejected(self) -> None:
         complete = _host()
         incomplete = dict(complete)
