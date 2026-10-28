@@ -1,11 +1,11 @@
 {
   "canonical_contract": {
     "path": "config/runtime-entrypoint.json",
-    "sha256": "762697e6fc372f4800054251c24e9cb991aab252ef92f1a5a105cd7cc61e2970"
+    "sha256": "23851f3e6deab58099ba689712a5f85d688077427a45c6dde9da9466ababac75"
   },
   "capability_catalog": {
     "path": "contracts/capability-catalog.v1.json",
-    "sha256": "4cbedc8ebd1ef485da9b530575e0762caaa1e72913d8a24f171ff7ef08f382df"
+    "sha256": "e2c425f49eb9523ccff3c78ac69e3c9bb23e35d2c77da0d6326ce5227eed1807"
   },
   "counts": {
     "core": 25,
