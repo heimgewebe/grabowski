@@ -595,6 +595,51 @@ class CodingAgentRouterCliTests(unittest.TestCase):
             rejected_rotation["providers"]["grok"]["entitlement_verified"]
         )
 
+    def test_probe_verifies_entitlement_with_only_grok_47_available(self) -> None:
+        # Regression: a valid SuperGrok account with only the current model
+        # must not lose its quota pool/account binding during a fresh probe.
+        catalog, _ = router._load_catalog()
+        auth = {
+            "authenticated": True,
+            "entitlement_verified": True,
+            "status": "valid",
+            "subscription_tier": "SuperGrok",
+            "account_binding_sha256": "a" * 64,
+            "auth_file_identity_sha256": "c" * 64,
+        }
+
+        def metadata(_harnesses, harness, arguments, _catalog):
+            if harness == "grok" and arguments == ["models"]:
+                return {
+                    "ok": True,
+                    "stdout": "You are logged in with grok.com.\nDefault model: grok-4.7\n\nAvailable models:\n  * grok-4.7 (default)\n",
+                    "stderr": "",
+                }
+            return {"ok": False, "stdout": "", "stderr": ""}
+
+        with (
+            mock.patch.object(
+                cli, "_binary_versions",
+                return_value={"grok": {"available": True, "binary": "/grok"}},
+            ),
+            mock.patch.object(cli, "_run_harness_metadata", side_effect=metadata),
+            mock.patch.object(
+                cli, "_grok_subscription_auth_status",
+                side_effect=[dict(auth), dict(auth)],
+            ),
+            mock.patch.object(
+                cli, "_openhands_subscription_auth_status",
+                return_value={"authenticated": False},
+            ),
+            mock.patch.object(cli, "_resolve_executable", return_value=None),
+        ):
+            verified = cli._probe(catalog)
+        self.assertEqual(verified["providers"]["grok"]["models"], ["grok-4.7"])
+        self.assertTrue(verified["providers"]["grok"]["entitlement_verified"])
+        self.assertEqual(verified["providers"]["grok"]["subscription_tier"], "SuperGrok")
+        self.assertEqual(verified["providers"]["grok"]["account_binding_sha256"], "a" * 64)
+        self.assertIn("grok-com", verified["verified_quota_pools"])
+
     def test_probe_digest_safety_guard_rejects_sensitive_fields(self) -> None:
         with self.assertRaisesRegex(
             cli.CodingAgentRouterCliError,

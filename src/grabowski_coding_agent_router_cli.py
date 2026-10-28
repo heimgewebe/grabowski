@@ -877,7 +877,7 @@ def _probe(catalog: dict[str, Any]) -> dict[str, Any]:
         grok_logged_in
         and grok_auth_before.get("entitlement_verified") is True
         and grok_auth_after.get("entitlement_verified") is True
-        and "grok-4.6" in grok_models
+        and any(model in grok_models for model in ("grok-4.6", "grok-4.7"))
     )
     providers["grok"] = {
         "available": harnesses.get("grok", {}).get("available") is True,
