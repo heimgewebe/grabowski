@@ -3382,6 +3382,113 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
             checked["errors"],
         )
 
+    def test_foreign_historical_origin_is_not_current_review(self) -> None:
+        # A hash-valid foreign job may contain stale, currently unverifiable
+        # semantic role provenance. It is not a review of this PR/head.
+        # A surviving exact-bound REJECT must nevertheless remain visible.
+        for retained_reject in (False, True):
+            with self.subTest(retained_reject=retained_reject):
+                with tempfile.TemporaryDirectory() as tmp:
+                    jobs = Path(tmp) / "jobs"
+                    jobs.mkdir(mode=0o700)
+                    make_job(
+                        jobs, suffix="aaaaaaaaa401", slot="A",
+                        terminal_status="succeeded",
+                        review_result=result("A", "PASS_THIS_REVISION", 0),
+                    )
+                    foreign = make_job(
+                        jobs, suffix="bbbbbbbbb402", slot="A",
+                        terminal_status="succeeded", review_result=None,
+                    )
+                    metadata_path = foreign / "metadata.json"
+                    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                    scope = dict(metadata["scope"])
+                    bound = dict(scope["decision_bound_review"])
+                    bound.update({
+                        "repo": "heimgewebe/repoground",
+                        "pr": 1357,
+                        "head_sha": "f" * 40,
+                        "base_sha": "e" * 40,
+                    })
+                    scope["decision_bound_review"] = bound
+                    scope["decision_review_attempt_epoch"] = 2
+                    scope["decision_review_provenance"] = {
+                        "schema_version": 2, "obsolete_runner": "old-release",
+                    }
+                    metadata["scope"] = scope
+                    metadata["origin"]["scope"] = scope
+                    metadata["origin_sha256"] = reviews.sha256_json(metadata["origin"])
+                    write_private(metadata_path, json.dumps(metadata))
+                    if retained_reject:
+                        write_private(
+                            foreign / "stdout.log",
+                            reviews.RESULT_PREFIX +
+                            json.dumps(result("A", "REJECT_THIS_REVISION", 1)) + "\n",
+                        )
+                    outcome = self.reconcile(jobs)
+                if retained_reject:
+                    self.assertEqual(outcome["status"], "blocked")
+                    self.assertIn(
+                        f"decision_review_unbound_result:{foreign.name}", outcome["errors"],
+                    )
+                else:
+                    self.assertEqual(outcome["status"], "settled")
+                    self.assertEqual(outcome["errors"], [])
+
+    def test_ordinary_24mb_stdout_stream_preserves_late_reject(self) -> None:
+        # Exercise the actual 24,092,538-byte failure size with no giant
+        # in-memory test string; the marker may be the very last line.
+        for retained_reject in (False, True):
+            with self.subTest(retained_reject=retained_reject):
+                with tempfile.TemporaryDirectory() as tmp:
+                    jobs = Path(tmp) / "jobs"
+                    jobs.mkdir(mode=0o700)
+                    make_job(
+                        jobs, suffix="aaaaaaaaa411", slot="A",
+                        terminal_status="succeeded",
+                        review_result=result("A", "PASS_THIS_REVISION", 0),
+                    )
+                    ordinary = jobs / "grabowski-job-bbbbbbbbb412"
+                    ordinary.mkdir(mode=0o700)
+                    scope = {
+                        "cwd": "/tmp", "argv_sha256": "e" * 64,
+                        "runtime_seconds": 60,
+                    }
+                    origin, digest = job_origin.build_origin(
+                        unit=ordinary.name, owner=f"uid:{os.getuid()}",
+                        argv_sha256="e" * 64, scope=scope,
+                        notify_on_done={"requested": False, "channels": []},
+                        created_at_unix=1_787_000_000,
+                        started_at="2026-08-18T12:00:00Z",
+                        invoker_tool="grabowski_job_start",
+                    )
+                    write_private(ordinary / "metadata.json", json.dumps({
+                        "unit": ordinary.name, "job_id": origin["job_id"],
+                        "owner": origin["owner"], "argv_sha256": origin["argv_sha256"],
+                        "scope": scope, "origin": origin, "origin_sha256": digest,
+                    }))
+                    marker = (
+                        b"\n" + reviews.RESULT_PREFIX.encode("ascii") +
+                        json.dumps(result("A", "REJECT_THIS_REVISION", 1)).encode("ascii") +
+                        b"\n"
+                    ) if retained_reject else b""
+                    with (ordinary / "stdout.log").open("wb") as stream:
+                        stream.write(b"ordinary job output\n")
+                        stream.seek(24_092_538 - len(marker))
+                        stream.write(marker)
+                        stream.truncate(24_092_538)
+                    os.chmod(ordinary / "stdout.log", 0o600)
+                    outcome = self.reconcile(jobs)
+                if retained_reject:
+                    self.assertEqual(outcome["status"], "blocked")
+                    self.assertIn(
+                        f"decision_review_unbound_result:{ordinary.name}",
+                        outcome["errors"],
+                    )
+                else:
+                    self.assertEqual(outcome["status"], "settled")
+                    self.assertEqual(outcome["errors"], [])
+
     def test_malformed_targeted_registration_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             jobs = Path(tmp)

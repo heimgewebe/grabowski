@@ -36,7 +36,8 @@ MAX_STDOUT_TAIL_BYTES = 256 * 1024
 # Non-review origins must not conceal review results retained in their job logs.
 # This is a separate, bounded verification budget, not a limit increase for
 # admitted review evidence.
-MAX_UNBOUND_STDOUT_BYTES = 8 * 1024 * 1024
+MAX_UNBOUND_STDOUT_BYTES = 128 * 1024 * 1024  # Complete streaming scan, never materialize in memory
+MAX_UNBOUND_MARKER_BYTES = 256 * 1024
 MAX_ROLE_RECEIPT_BYTES = 4 * 1024 * 1024
 MAX_REVIEW_ROLE_MODULE_BYTES = 1024 * 1024
 REVIEW_ROLE_MODULE = "grabowski_agent_role"
@@ -583,6 +584,99 @@ def _read_stdout_tail(
     return payload.decode("utf-8", errors="replace"), hashlib.sha256(payload).hexdigest()
 
 
+def _unbound_stdout_has_target_result(
+    directory: Path, *, parent_fd: int, aggregate_bytes: list[int],
+    expected: dict[str, Any], allow_legacy_readable: bool,
+) -> bool:
+    """Scan complete owner-pinned ordinary stdout, not an arbitrary 8-MiB prefix.
+
+    Memory use is bounded by one chunk and a candidate review marker. A giant
+    unrelated line is skipped rather than buffered. An oversized candidate,
+    unreadable evidence or a changed inode fails closed.
+    """
+    parent = os.fstat(parent_fd)
+    if (
+        not stat.S_ISDIR(parent.st_mode)
+        or parent.st_uid != os.getuid()
+        or stat.S_IMODE(parent.st_mode) & 0o077
+    ):
+        raise ValueError("unbound review evidence parent is not owner-private")
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+    fd = os.open("stdout.log", flags, dir_fd=parent_fd)
+    try:
+        before = os.fstat(fd)
+        mode = stat.S_IMODE(before.st_mode)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.getuid()
+            or before.st_nlink != 1
+            or (mode & 0o077 and not (allow_legacy_readable and mode == 0o644))
+        ):
+            raise ValueError("unbound stdout is not one owner-private regular file")
+        if before.st_size > MAX_UNBOUND_STDOUT_BYTES:
+            raise ValueError("unbound stdout exceeds bounded inspection budget")
+        total_budget = aggregate_bytes[0] + before.st_size
+        if total_budget > MAX_TOTAL_METADATA_BYTES:
+            raise ReviewMetadataBudgetExceeded(
+                "decision review unbound stdout aggregate budget exceeded"
+            )
+        aggregate_bytes[0] = total_budget
+
+        prefix = RESULT_PREFIX.encode("ascii")
+        line = bytearray()
+        maybe_marker = True
+        found = False
+        read_size = 0
+
+        def exact_target_marker(candidate: bytearray) -> bool:
+            if not candidate.startswith(prefix):
+                return False
+            try:
+                result = json.loads(
+                    candidate[len(prefix):].decode("utf-8", errors="replace")
+                )
+            except json.JSONDecodeError:
+                return False  # A malformed marker is not a decision.
+            return isinstance(result, dict) and _raw_binding_targets_pr_head(
+                result, expected
+            )
+
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            read_size += len(chunk)
+            if read_size > before.st_size:
+                raise ValueError("unbound stdout grew during inspection")
+            fragments = chunk.split(b"\n")
+            for index, fragment in enumerate(fragments):
+                if maybe_marker:
+                    line.extend(fragment)
+                    if not (prefix.startswith(line) or line.startswith(prefix)):
+                        maybe_marker = False
+                        line.clear()
+                    elif len(line) > MAX_UNBOUND_MARKER_BYTES:
+                        raise ValueError("unbound decision marker exceeds bounded size")
+                if index < len(fragments) - 1:
+                    if maybe_marker and exact_target_marker(line):
+                        found = True
+                    line.clear()
+                    maybe_marker = True
+        if maybe_marker and exact_target_marker(line):
+            found = True
+        after = os.fstat(fd)
+        linked = os.stat("stdout.log", dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            read_size != before.st_size
+            or _review_stat_file_identity(after) != _review_stat_file_identity(before)
+            or _review_stat_file_identity(linked) != _review_stat_file_identity(before)
+        ):
+            raise ValueError("unbound stdout changed during inspection")
+        return found
+    finally:
+        os.close(fd)
+
+
 def _unbound_review_result_visible(
     directory: Path, *, parent_fd: int, aggregate_bytes: list[int],
     expected: dict[str, Any], allow_legacy_readable_stdout: bool = False,
@@ -616,26 +710,10 @@ def _unbound_review_result_visible(
             # Still scan any surviving stdout for an exact-bound REJECT.
             if base_head == expected["base_sha"]:
                 return True
-    # An oversized unbound stdout can retain a material REJECT even after
-    # its origin metadata has been rebound to an ordinary job. Without an
-    # independent, authenticated origin record, it cannot be classified as
-    # harmless. Keep the FD-pinned bounded read fail-closed on oversize.
-    stdout = _read_private_bytes(
-        directory / "stdout.log", MAX_UNBOUND_STDOUT_BYTES,
-        parent_fd=parent_fd, aggregate_metadata_bytes=aggregate_bytes,
-        allow_legacy_readable=allow_legacy_readable_stdout,
+    return _unbound_stdout_has_target_result(
+        directory, parent_fd=parent_fd, aggregate_bytes=aggregate_bytes,
+        expected=expected, allow_legacy_readable=allow_legacy_readable_stdout,
     )
-    for line in stdout.decode("utf-8", errors="replace").splitlines():
-        if not line.startswith(RESULT_PREFIX):
-            continue
-        try:
-            marker = json.loads(line[len(RESULT_PREFIX):])
-        except json.JSONDecodeError:
-            # A quoted marker name is not an authenticated review decision.
-            continue
-        if isinstance(marker, dict) and _raw_binding_targets_pr_head(marker, expected):
-            return True
-    return False
 
 
 def _exact_empty_prelaunch_stub(directory_fd: int) -> bool:
@@ -738,7 +816,7 @@ def _proven_not_started(metadata: dict[str, Any]) -> bool:
 
 def _validated_origin_binding(
     directory: Path, *, raw_metadata: dict[str, Any] | None = None,
-    parent_fd: int | None = None,
+    parent_fd: int | None = None, expected: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any] | None, dict[str, Any] | None]:
     unit = directory.name
     if _UNIT_RE.fullmatch(unit) is None:
@@ -767,6 +845,12 @@ def _validated_origin_binding(
     if raw_binding is None:
         return metadata, None, None
     binding = normalize_binding(raw_binding)
+    # First validate the signed origin and its exact metadata binding.
+    # Historical reviews of other PRs/heads must not then depend on today's
+    # semantic runner or provider provenance. Surviving current-head evidence
+    # is independently scanned by reconcile(), including retained REJECTs.
+    if expected is not None and not _binding_matches_pr_head(binding, expected):
+        return metadata, binding, None
     origin_cwd = scope.get("cwd")
     if not isinstance(origin_cwd, str) or not origin_cwd:
         raise ValueError("job origin cwd is invalid")
@@ -2153,7 +2237,8 @@ def reconcile(
                 # metadata budget already guarantee a finite authenticated
                 # full scan, including a later same-revision REJECT.
                 metadata, binding, provenance = _validated_origin_binding(
-                    directory, raw_metadata=raw_metadata, parent_fd=directory_fd
+                    directory, raw_metadata=raw_metadata, parent_fd=directory_fd,
+                    expected=expected,
                 )
             except ReviewMetadataBudgetExceeded:
                 errors.append("decision_review_metadata_aggregate_budget_exceeded")
