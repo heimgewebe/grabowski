@@ -115,6 +115,105 @@ class CompletedSuccessorTerminalTests(unittest.TestCase):
         self.assertFalse(self.result([self.a, unrelated])[0])
         self.assertFalse(self.result([self.a])[0])
 
+    def _clean_rolled_back_sibling(self):
+        rollback = fixture.cutover_receipt(
+            cutover_id="bgc-rolledback-b1",
+            expected_head=HEAD_D,
+            blue_release_id=fixture.GREEN_RELEASE,
+            green_release_id=RELEASE_D,
+            outcome="rolled_back",
+            phase="rolled_back",
+            switched=False,
+        )
+        selector = {
+            "selected_slot": "canonical",
+            "release_id": fixture.GREEN_RELEASE,
+            "repo_head": fixture.HEAD_GREEN,
+        }
+        readback = {
+            "authoritative": True, "selector": dict(selector),
+            "ingress": dict(selector),
+        }
+        readback["readback_sha256"] = SD._sha256_json(readback)
+        rollback.update(
+            selector_switch=None,
+            snapshot_rebind=None,
+            retirement=None,
+            final_routing=None,
+            authoritative_readback=readback,
+            recovery={
+                "action": "retry_from_clean_blue",
+                "blue_preserved": True,
+                "rollback": {"blue_preserved": True},
+                "platform_publication_rollback": {
+                    "state": "no_prepared_request_effect",
+                },
+            },
+        )
+        rollback["receipt_sha256"] = SD._sha256_json({
+            key: value for key, value in rollback.items()
+            if key != "receipt_sha256"
+        })
+        self.assertTrue(
+            SD._signed_clean_blue_rollback_is_terminal(
+                rollback, [self.a, rollback, self.b]
+            )
+        )
+        return rollback
+
+    def test_cleanly_rolled_back_sibling_does_not_fork_completed_successor(self):
+        rollback = self._clean_rolled_back_sibling()
+        terminal, checks = self.result([self.a, rollback, self.b])
+        self.assertTrue(terminal, "a fully proven rollback B1 is not a competing deployment B2")
+        self.assertEqual(checks[-1].args[0]["expected_head"], HEAD_C)
+
+    def test_unproved_or_tampered_rollback_sibling_still_blocks_successor(self):
+        rollback = self._clean_rolled_back_sibling()
+        failed = {**rollback, "recovery": {
+            **rollback["recovery"],
+            "platform_publication_rollback": {
+                "state": "failed", "error": "rollback was not confirmed",
+            },
+        }}
+        mismatched_hash = {**rollback, "receipt_sha256": "0" * 64}
+        wrong_blue_head = {
+            **rollback,
+            "authoritative_readback": {
+                **rollback["authoritative_readback"],
+                "selector": {
+                    **rollback["authoritative_readback"]["selector"],
+                    "repo_head": "f" * 40,
+                },
+                "ingress": {
+                    **rollback["authoritative_readback"]["ingress"],
+                    "repo_head": "f" * 40,
+                },
+            },
+        }
+        wrong_blue_head["authoritative_readback"]["readback_sha256"] = SD._sha256_json({
+            k: v for k, v in wrong_blue_head["authoritative_readback"].items()
+            if k != "readback_sha256"
+        })
+        wrong_blue_head["receipt_sha256"] = SD._sha256_json({
+            k: v for k, v in wrong_blue_head.items() if k != "receipt_sha256"
+        })
+        self.assertTrue(
+            SD._signed_clean_blue_rollback_is_terminal(
+                wrong_blue_head, [self.a, wrong_blue_head, self.b]
+            ),
+            "generic clean blue predicate alone does not prove the predecessor head",
+        )
+        for sibling in (failed, mismatched_hash, wrong_blue_head):
+            with self.subTest(
+                state=sibling.get("recovery", {}).get(
+                    "platform_publication_rollback", {}
+                ).get("state"),
+                blue_head=sibling.get("authoritative_readback", {}).get(
+                    "selector", {}
+                ).get("repo_head"),
+            ):
+                self.assertFalse(self.result([self.a, sibling, self.b])[0])
+
     def test_unfinished_tampered_or_ambiguous_successor_stays_blocked(self):
         unknown = {**self.b, "outcome": "outcome_unknown", "phase": "outcome_unknown"}
         tampered = {**self.b, "green_release_id": RELEASE_D}

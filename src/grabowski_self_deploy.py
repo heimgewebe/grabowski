@@ -1978,15 +1978,39 @@ def _completed_cutover_has_live_successor(
     visited_releases = {original.get("blue_release_id"), original.get("green_release_id")}
     visited_ids = {original.get("cutover_id")}
     for _ in range(len(receipts)):
-        new = by_blue.get(previous.get("green_release_id"), [])
-        # A fork is ambiguous even if one successor happens to match runtime.
-        if len(new) != 1:
+        candidates = by_blue.get(previous.get("green_release_id"), [])
+        successors: list[dict[str, Any]] = []
+        for candidate in candidates:
+            try:
+                validated = midcutover.validate_cutover_receipt(candidate)
+            except (ValueError, RuntimeError, midcutover.MidCutoverEvidenceError):
+                return False
+            rollback_readback = validated.get("authoritative_readback")
+            if (
+                validated.get("outcome") == "rolled_back"
+                and _signed_clean_blue_rollback_is_terminal(validated, receipts)
+                and midcutover.release_id_binds_head(
+                    validated.get("blue_release_id"), previous.get("expected_head")
+                )
+                and isinstance(rollback_readback, dict)
+                and isinstance(rollback_readback.get("selector"), dict)
+                and isinstance(rollback_readback.get("ingress"), dict)
+                and rollback_readback["selector"].get("repo_head")
+                    == previous.get("expected_head")
+                and rollback_readback["ingress"].get("repo_head")
+                    == previous.get("expected_head")
+            ):
+                # A fully authenticated no-effect/clean-blue rollback preserves
+                # the predecessor. It is an abandoned attempt, not another
+                # successful successor branch. Failed, incomplete, ambiguous,
+                # tampered or unproved rollbacks remain blocking candidates.
+                continue
+            successors.append(validated)
+        # Two actual successor candidates remain a fork even if one matches
+        # the current runtime. No proof of B2 may hide an unfinished B1.
+        if len(successors) != 1:
             return False
-        successor = new[0]
-        try:
-            successor = midcutover.validate_cutover_receipt(successor)
-        except (ValueError, RuntimeError, midcutover.MidCutoverEvidenceError):
-            return False
+        successor = successors[0]
         head = successor.get("expected_head")
         release = successor.get("green_release_id")
         cutover_id = successor.get("cutover_id")
