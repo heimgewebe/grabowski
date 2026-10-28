@@ -336,16 +336,27 @@ def assert_candidate_review_history(workspace_id: str) -> None:
     sessions = provenance.FIRST_PARTY_REVIEW_ROOT / "sessions"
     if not sessions.exists():
         return
-    paths = sorted(sessions.iterdir())
-    if len(paths) > 2048:
-        raise provenance.ReviewExecutionRejected("Candidate session registry over budget")
     matching = False
-    for path in paths:
-        session = provenance._read_signed_record(
-            path / "session.json", signers=provenance.TRUSTED_SIGNERS, root_owned_signers=True,
-        )
-        if session.get("binding", {}).get("candidate_binding", {}).get("workspace_id") == workspace_id:
-            matching = True
+    # Stream every signed session without a global count limit. A signed
+    # historical material REJECT must remain visible as the registry grows.
+    with os.scandir(sessions) as entries:
+        for entry in entries:
+            name = entry.name
+            if provenance.ID.fullmatch(name) is None or not entry.is_dir(follow_symlinks=False):
+                raise provenance.ReviewExecutionRejected("Candidate session registry entry invalid")
+            session = provenance._read_signed_record(
+                sessions / name / "session.json",
+                signers=provenance.TRUSTED_SIGNERS, root_owned_signers=True,
+            )
+            if (
+                session.get("session_id") != name
+                or session.get("kind") != provenance.FIRST_PARTY_SESSION_KIND
+                or not isinstance(session.get("binding"), dict)
+            ):
+                raise provenance.ReviewExecutionRejected("Candidate signed session identity invalid")
+            candidate = session["binding"].get("candidate_binding")
+            if isinstance(candidate, dict) and candidate.get("workspace_id") == workspace_id:
+                matching = True
     if not matching:
         return
     plan = plan_frozen_candidate_review(workspace_id)

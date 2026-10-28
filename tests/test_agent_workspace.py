@@ -7469,6 +7469,73 @@ class AgentWorkspaceTests(unittest.TestCase):
         started.assert_not_called()
         self.assertIsNone(workspace._manifest(manifest["workspace_id"])["tasks"]["review"])
 
+    def test_pending_controller_second_review_retry_still_refuses_synthetic_pass(self) -> None:
+        # A genuine reviewer may fail for environmental reasons. An additional
+        # retry must not turn that failure into a caller-selected Python PASS.
+        manifest = self.manifest()
+        (self.git.writer / "src" / "app.py").write_text(
+            "review_pending = True\n", encoding="utf-8",
+        )
+        snapshot = workspace._git_snapshot(manifest, workspace._run)
+        manifest["frozen_writer"] = {
+            "writer_head": snapshot["writer_head"],
+            "diff_sha256": snapshot["diff_sha256"],
+            "dirty": snapshot["dirty"],
+            "writer_result": workspace._materialize_writer_patch(
+                manifest, snapshot, workspace._run,
+            ),
+        }
+        manifest["commands"]["review"] = list(
+            workspace.CONTROLLER_SELF_REVIEW_PENDING_ARGV
+        )
+        manifest["tasks"]["review"] = "authentic-review-toolchain-failure"
+        workspace._write_manifest(manifest)
+        receipt = signed_role_receipt(
+            "review", manifest, snapshot, returncode=127,
+            verdict="INVALID",
+            failure_classification="environment_toolchain_failure",
+        )
+        workspace._atomic_json(
+            workspace._role_receipt_path(manifest, "review"), receipt,
+        )
+        replacement = ["python3", "-c", "print('PASS')"]
+
+        def fake_task_start(**kwargs):
+            return {"task": {
+                "task_id": "synthetic-review-task-2",
+                "host": kwargs["host"], "attempt": 1,
+                "resume_policy": "never",
+                "argv_sha256": workspace._sha256_json(kwargs["argv"]),
+                "cwd": kwargs["cwd"],
+            }}
+
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(
+                workspace, "_task_public",
+                return_value={
+                    "task_id": manifest["tasks"]["review"],
+                    "state": "failed", "terminal": True,
+                },
+            ),
+            mock.patch.object(
+                workspace, "_role_toolchain_preflight",
+                return_value=passing_toolchain_preflight(
+                    manifest, "review", replacement,
+                ),
+            ),
+            mock.patch.object(
+                workspace.tasks, "grabowski_task_start",
+                side_effect=fake_task_start,
+            ) as started,
+        ):
+            blocked = workspace.grabowski_agent_workspace_role_retry(
+                manifest["workspace_id"], "review", replacement,
+            )
+        self.assertEqual(blocked["state"], "authentic_review_route_required")
+        self.assertEqual(blocked["retry_status"], "blocked")
+        started.assert_not_called()
+
     def test_pending_controller_review_can_start_real_optional_catalogue_reviewer(self) -> None:
         manifest = self.manifest()
         (self.git.writer / "src" / "app.py").write_text(
@@ -7534,6 +7601,81 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertEqual(
             workspace._manifest(manifest["workspace_id"])["tasks"]["review"],
             "authentic-readonly-review-task",
+        )
+        # Attempt one retains the authentic replacement-command hash,
+        # but consumes no environment-recovery retry allowance.
+        persisted = workspace._manifest(manifest["workspace_id"])
+        retry_state = persisted["role_retries"]["review"]
+        self.assertEqual(retry_state["count"], 1)
+        self.assertEqual(
+            workspace._role_recovery_attempts_used(persisted, "review", retry_state),
+            0,
+        )
+        self.assertEqual(
+            workspace._expected_role_argv_sha256(persisted, "review"),
+            workspace._sha256_json(replacement),
+        )
+
+        # The genuine model route may report an environment failure before
+        # producing a semantic verdict. One ordinary recovery retry remains.
+        environment_failure = signed_role_receipt(
+            "review", persisted, snapshot,
+            argv_sha256=workspace._sha256_json(replacement),
+            returncode=127, verdict="INVALID",
+            failure_classification="environment_toolchain_failure",
+        )
+        workspace._atomic_json(
+            workspace._role_receipt_path(persisted, "review", attempt=1),
+            environment_failure,
+        )
+
+        def restart_task(**kwargs):
+            return {"task": {
+                "task_id": "authentic-review-task-2",
+                "host": kwargs["host"], "attempt": 1,
+                "resume_policy": "never",
+                "argv_sha256": workspace._sha256_json(kwargs["argv"]),
+                "cwd": kwargs["cwd"],
+            }}
+
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(
+                workspace, "_task_public",
+                return_value={
+                    "task_id": "authentic-readonly-review-task",
+                    "state": "failed", "terminal": True,
+                },
+            ),
+            mock.patch.object(
+                workspace, "_role_toolchain_preflight",
+                return_value=passing_toolchain_preflight(
+                    persisted, "review", replacement,
+                ),
+            ),
+            mock.patch.object(
+                workspace.tasks, "grabowski_task_start",
+                side_effect=restart_task,
+            ) as restarted,
+        ):
+            recovered = workspace.grabowski_agent_workspace_role_retry(
+                manifest["workspace_id"], "review", replacement,
+            )
+        self.assertEqual(recovered["state"], "retry_started")
+        self.assertEqual(recovered["attempt"], 2)
+        self.assertEqual(restarted.call_count, 1)
+        after_recovery = workspace._manifest(manifest["workspace_id"])
+        retry_state = after_recovery["role_retries"]["review"]
+        self.assertEqual(retry_state["count"], 2)
+        self.assertEqual(
+            workspace._role_recovery_attempts_used(
+                after_recovery, "review", retry_state,
+            ),
+            1,
+        )
+        self.assertEqual(
+            workspace._expected_role_argv_sha256(after_recovery, "review"),
+            workspace._sha256_json(replacement),
         )
 
     def test_role_retry_blocks_on_review_needs_change(self) -> None:

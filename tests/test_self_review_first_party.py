@@ -707,6 +707,19 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
             review._write_signed_record(
                 directory / "session.json", old, key=self.key, signers=self.signers,
             )
+        # The actual Frozen-Candidate role retry must also survive 2049
+        # unrelated *authentically signed* historical sessions. The fixture
+        # signer is non-root but verification still checks real SSH signatures.
+        real_read = review._read_signed_record
+
+        def fixture_signed_read(path, *, signers, root_owned_signers):
+            return real_read(path, signers=signers, root_owned_signers=False)
+
+        with mock.patch.object(review, "FIRST_PARTY_REVIEW_ROOT", self.state), \
+                mock.patch.object(review, "TRUSTED_SIGNERS", self.signers), \
+                mock.patch.object(review, "_read_signed_record", side_effect=fixture_signed_read):
+            producer.assert_candidate_review_history("unrelated-frozen-candidate")
+
         for number, axis in enumerate(review.REQUIRED_AXES, 1):
             self._submit_axis(started, axis, number)
         audit, receipts = self._seal_direct(plan)
@@ -1022,6 +1035,41 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
             signers=self.signers, root_owned_signers=False, now_unix=self.now,
         )
         self.assertEqual(set(review.REQUIRED_AXES), set(verified))
+
+    def test_authenticated_self_review_mcp_mutations_require_operator_gate(self) -> None:
+        # Even an enrolled connector cannot persist a signed review while
+        # the operator mutation blockade or audit-integrity gate is denying.
+        import grabowski_mcp as mcp
+
+        requests = [
+            ("session_start", mcp.grabowski_self_review_session_start,
+             ("pending-batch", "source inspection", "real review")),
+            ("source_read", mcp.grabowski_self_review_source_read,
+             ("session-id", "nonce", review.REQUIRED_AXES[0],
+              "diff", "", "head", 1, 2, "read source", "real review")),
+            ("axis_submit", mcp.grabowski_self_review_axis_submit,
+             ("session-id", "nonce", {"axis": review.REQUIRED_AXES[0]},
+              "submit verdict", "real review")),
+        ]
+        for name, endpoint, arguments in requests:
+            with self.subTest(endpoint=name):
+                with (
+                    mock.patch.object(mcp, "_require_capability"),
+                    mock.patch.object(
+                        mcp, "_require_mutations_enabled",
+                        side_effect=PermissionError("operator blockade active"),
+                    ) as gate,
+                    mock.patch.object(
+                        mcp, "_authenticated_self_review_issuer",
+                        side_effect=RuntimeError("reached authentication before mutation gate"),
+                    ) as issuer,
+                ):
+                    with self.assertRaisesRegex(PermissionError, "operator blockade active"):
+                        endpoint(*arguments)
+                    gate.assert_called_once_with(
+                        "file_write", path=str(review.FIRST_PARTY_REVIEW_ROOT),
+                    )
+                    issuer.assert_not_called()
 
     def test_secondary_enrolled_connector_cannot_issue_controller_reviews(self) -> None:
         # A valid transport identity for a different enrolled connector is

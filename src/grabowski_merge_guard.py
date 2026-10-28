@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import datetime, timezone
+import fcntl
 import hashlib
 import hmac
 import json
@@ -26,6 +28,45 @@ from grabowski_pr_diff import (
     bound_local_pr_git_diff,
     BoundLocalDiffError,
 )
+
+
+@contextmanager
+def _first_party_merge_signer_snapshot_guard(review_evidence: Any):
+    """Hold historical signed REJECTs fixed through Captain merge dispatch.
+
+    Both direct first-party and legacy high-critical audits validate signed
+    first-party REJECT history. The established receipt lock is shared during
+    final revalidation and the actual merge effect. An authenticated REJECT
+    submission requires the same lock exclusively and must wait.
+    """
+    if (
+        not isinstance(review_evidence, dict)
+        or (
+            review_evidence.get("review_tier") != "high_critical"
+            and review_evidence.get("review_origin")
+            != "first_party_authenticated_controller_v1"
+        )
+    ):
+        yield
+        return
+    import grabowski_self_review_execution as source
+    root = source.FIRST_PARTY_REVIEW_ROOT
+    if (root / ".lock").exists():
+        descriptor = source._first_party_lock(root, read_only=True)
+    else:
+        # Pin the lock before a concurrent first-ever session can create it.
+        # Downgrade EX -> SH atomically so nested signed-history readers
+        # may take their ordinary shared lock without a self-deadlock.
+        descriptor = source._first_party_lock(root)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_SH)
+        except BaseException:
+            source._release_first_party_lock(descriptor)
+            raise
+    try:
+        yield
+    finally:
+        source._release_first_party_lock(descriptor)
 
 
 class MergeGuardResourceAuthority(Protocol):
@@ -6121,7 +6162,10 @@ class CaptainMergeGuardRunner:
         # live revalidation and GitHub merge dispatch closes the registration
         # TOCTOU: a reviewer cannot become decision-bound between reconciliation
         # and the merge call and then be omitted from this decision.
-        with decision_reviews.decision_review_lock(decision_binding):
+        with decision_reviews.decision_review_lock(decision_binding), \
+                _first_party_merge_signer_snapshot_guard(
+                    self.parameters.get("review_evidence"),
+                ):
             equivalent_review_diff_sha256s = _verified_decision_review_diff_aliases(
                 bindings, self.receipt.get("live_diff")
             )
