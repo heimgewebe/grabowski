@@ -7963,7 +7963,12 @@ class GripFoundationTests(unittest.TestCase):
                 case["coordinator"].run_workspace_candidate_coordinator.assert_not_called()
                 case["nested"].assert_not_called()
 
-    def _source_route_decision(self, *, executor: str = "scoped_writer") -> dict[str, object]:
+    def _source_route_decision(
+        self,
+        *,
+        executor: str = "scoped_writer",
+        verification_policy: str = "independent_review",
+    ) -> dict[str, object]:
         writer_route = "claude-sonnet-5-high" if executor == "scoped_writer" else "grabowski-primary"
         writer = (
             {
@@ -8000,7 +8005,7 @@ class GripFoundationTests(unittest.TestCase):
             "executor": executor,
             "writer_route": writer_route,
             "effect_profile": "candidate",
-            "verification_policy": "independent_review",
+            "verification_policy": verification_policy,
             "task_class": "bounded-patch",
             "direct_work_required": executor == "controller",
             "direct_review_required": False,
@@ -8244,6 +8249,95 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual(lane_receipt, create_kwargs["expected_lane_receipt_sha256"])
         self.assertEqual(writer_command, create_kwargs["writer_argv"])
         continuation.assert_called_once()
+
+    def test_agent_execution_self_review_frontdoor_stays_pending_after_green_tests(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp).resolve()
+            head = "a" * 40
+            route = self._source_route_decision(verification_policy="self_review")
+            execution_plan = __import__("grabowski_execution_plan")
+            lane_id = "b" * 32
+            lane_receipt = "c" * 64
+            workspace_id = "gaw-p5-self-review"
+
+            def acquire(parameters: dict[str, object], **kwargs: object) -> dict[str, object]:
+                del kwargs
+                return {
+                    "state": "ready",
+                    "lane_id": lane_id,
+                    "receipt_sha256": lane_receipt,
+                    "inputs": {
+                        "execution_plan": deepcopy(parameters["execution_plan"]),
+                        "source": {"kind": "direct-user", "id": "self-review-source"},
+                        "scoped_writer": {
+                            "actor": "scoped-writer:claude-sonnet-5-high",
+                            "role": "scoped_writer",
+                        },
+                    },
+                }
+
+            work_acquire = types.SimpleNamespace(
+                acquire_work=Mock(side_effect=acquire),
+                operator=types.SimpleNamespace(
+                    _require_operator_mutation=Mock(),
+                    _require_operator_capability=Mock(),
+                    base=types.SimpleNamespace(_append_audit=Mock()),
+                ),
+            )
+            workspace = types.SimpleNamespace(
+                _lane_workspace_identity=Mock(return_value=(workspace_id, workspace_id)),
+                grabowski_agent_workspace_create=Mock(return_value={
+                    "workspace": {
+                        "workspace_id": workspace_id,
+                        "resources": {
+                            "lane_binding": {
+                                "lane_id": lane_id,
+                                "receipt_sha256": lane_receipt,
+                            }
+                        },
+                    }
+                }),
+            )
+            router = types.SimpleNamespace(
+                canonical_execution_route=Mock(return_value=route)
+            )
+            test_argv = ["python3", "-m", "unittest", "-q"]
+            parameters = {
+                "source_kind": "direct-user",
+                "source_id": "self-review-source",
+                "repo": str(repo),
+                "source_revision": head,
+                "write_paths": ["src/grabowski_grips.py"],
+                "objective": "Implement the bounded source request",
+                "test_argv": test_argv,
+                "verification_policy": "self_review",
+                "retention_until_unix": int(time.time()) + 9000,
+                "_server_runtime_actor_identity": (
+                    grips.grabowski_merge_guard.issue_server_runtime_actor_identity(
+                        object(), profile="operator"
+                    )
+                ),
+            }
+            with patch.object(
+                grips,
+                "_agent_execution_frontdoor_modules",
+                return_value=(router, execution_plan, work_acquire, workspace),
+            ):
+                result = grips._agent_execution_source_request(
+                    parameters,
+                    {"checks": []},
+                    FakeGit(head=head),
+                )
+
+        self.assertEqual("workspace_ready", result["state"])
+        self.assertEqual("self_review", result["verification_policy"])
+        self.assertEqual(1, result["execution_plan"]["completion_policy"]["verifier_quorum"])
+        create_kwargs = workspace.grabowski_agent_workspace_create.call_args.kwargs
+        self.assertEqual(test_argv, create_kwargs["test_argv"])
+        self.assertNotEqual(test_argv, create_kwargs["review_argv"])
+        review_command = " ".join(create_kwargs["review_argv"])
+        self.assertIn("BLOCK", review_command)
+        self.assertNotIn("'PASS'", review_command)
 
     def test_agent_execution_happy_path_source_mode_binds_direct_controller_lane_without_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

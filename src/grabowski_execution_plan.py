@@ -12,7 +12,7 @@ REVISION_REQUEST_KIND = "RevisionRequest.v1"
 ROUTING_CONTRACT_VERSION = "agent-execution-fabric-routing-v1"
 TOPOLOGIES = frozenset({"direct", "writer_verify_reduce", "fork_compare"})
 VERIFICATION_POLICIES = frozenset(
-    {"deterministic", "independent_review", "competition"}
+    {"deterministic", "self_review", "independent_review", "competition"}
 )
 NODE_KINDS = frozenset(
     {
@@ -150,9 +150,12 @@ def route_binding_from_decision(value: Any) -> dict[str, Any]:
     )
     if verification_policy not in VERIFICATION_POLICIES:
         raise ExecutionPlanError("route verification policy is unsupported")
-    if effect_profile == "delivery" and verification_policy != "independent_review":
+    if effect_profile == "delivery" and verification_policy not in {
+        "self_review", "independent_review",
+    }:
         raise ExecutionPlanError(
-            "delivery effect profile requires verification_policy=independent_review"
+            "delivery effect profile requires verification_policy=self_review "
+            "or independent_review"
         )
     return {
         "routing_contract_version": ROUTING_CONTRACT_VERSION,
@@ -411,8 +414,9 @@ def _completion_policy(
         "completion_policy.verifier_quorum",
         maximum=verifier_count,
     )
-    if verification_policy == "independent_review" and quorum < 1:
-        raise ExecutionPlanError("independent review requires verifier quorum")
+    if verification_policy in {"self_review", "independent_review"} and quorum < 1:
+        label = verification_policy.replace("_", " ")
+        raise ExecutionPlanError(f"{label} requires verifier quorum")
     return {
         "required_nodes": required,
         "require_all_critical": require_all_critical,

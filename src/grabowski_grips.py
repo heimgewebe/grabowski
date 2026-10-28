@@ -9084,9 +9084,12 @@ def _agent_execution_source_request(
         raise GripPreflightError("novelty must be low, medium or high")
     risk_flags = _string_list_parameter(parameters, "risk_flags")
     verification_policy = parameters.get("verification_policy", "independent_review")
-    if verification_policy not in {"deterministic", "independent_review"}:
+    if verification_policy not in {
+        "deterministic", "self_review", "independent_review",
+    }:
         raise GripPreflightError(
-            "P5 one-shot verification_policy must be deterministic or independent_review"
+            "P5 one-shot verification_policy must be deterministic, self_review "
+            "or independent_review"
         )
     effect_profile = parameters.get("effect_profile", "candidate")
     if effect_profile not in {"candidate", "delivery"}:
@@ -9323,6 +9326,18 @@ def _agent_execution_source_request(
             prompt=str(review_prompt).strip(),
             role="review",
         )
+    elif verification_policy == "self_review":
+        review_argv = [
+            sys.executable,
+            "-I",
+            "-c",
+            (
+                "import json; print(json.dumps({'verdict':'BLOCK','findings':["
+                "{'code':'controller_self_review_pending','message':"
+                "'Substantive controller self-review is still pending; deterministic "
+                "test success is not a review verdict.'}]}))"
+            ),
+        ]
     else:
         review_argv = [
             "python3",

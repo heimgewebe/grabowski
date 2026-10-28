@@ -596,6 +596,8 @@ class SemanticV2RoleContractTests(unittest.TestCase):
                 "slot": f"selfrev.{self.binding['review_batch_id'][:16]}.{axis}",
                 "unit": unit, "classification": "pass", "terminal": True,
                 "terminal_status": "succeeded",
+                "created_at_unix": 200 + number,
+                "started_at_unix_ns": (200 + number) * 1_000_000_000,
                 "review_role_verified": True, "review_route_verified": True,
                 "independence_verified": True, "verdict": "PASS_THIS_REVISION",
                 "material_findings": 0,
@@ -627,6 +629,78 @@ class SemanticV2RoleContractTests(unittest.TestCase):
         self.assertEqual(
             len({item["provenance"]["unit"] for item in result.values()}), 5,
         )
+
+    def test_earlier_superseded_infrastructure_allows_one_final_axis_pass(self):
+        final_pass = self.attempts[0]
+        self.attempts.insert(0, {
+            "slot": final_pass["slot"],
+            "unit": "grabowski-job-0000000000f0",
+            "classification": "infrastructure_error",
+            "terminal": True,
+            "terminal_status": "failed",
+            "created_at_unix": final_pass["created_at_unix"] - 1,
+            "started_at_unix_ns": (
+                final_pass["created_at_unix"] - 1
+            ) * 1_000_000_000,
+        })
+        result = self.verify_fixture()
+        self.assertEqual(
+            "grabowski-job-000000000001",
+            result[execution.REQUIRED_AXES[0]]["provenance"]["unit"],
+        )
+
+    def test_same_slot_nonfinal_evidence_cannot_hide_behind_settled_status(self):
+        final_pass = self.attempts[0]
+        cases = {
+            "duplicate_pass": {
+                **final_pass,
+                "unit": "grabowski-job-0000000000f1",
+            },
+            "material_reject": {
+                "slot": final_pass["slot"],
+                "unit": "grabowski-job-0000000000f2",
+                "classification": "material_reject",
+                "terminal": True,
+                "terminal_status": "succeeded",
+                "created_at_unix": final_pass["created_at_unix"] - 1,
+                "started_at_unix_ns": (
+                    final_pass["created_at_unix"] - 1
+                ) * 1_000_000_000,
+            },
+            "non_terminal": {
+                "slot": final_pass["slot"],
+                "unit": "grabowski-job-0000000000f3",
+                "classification": "not_terminal",
+                "terminal": False,
+                "terminal_status": None,
+                "created_at_unix": final_pass["created_at_unix"] - 1,
+                "started_at_unix_ns": (
+                    final_pass["created_at_unix"] - 1
+                ) * 1_000_000_000,
+            },
+            "unsuperseded_infrastructure": {
+                "slot": final_pass["slot"],
+                "unit": "grabowski-job-0000000000f4",
+                "classification": "infrastructure_error",
+                "terminal": True,
+                "terminal_status": "failed",
+                "created_at_unix": final_pass["created_at_unix"] + 1,
+                "started_at_unix_ns": (
+                    final_pass["created_at_unix"] + 1
+                ) * 1_000_000_000,
+            },
+        }
+        for name, extra in cases.items():
+            with self.subTest(name=name):
+                self.attempts.insert(0, extra)
+                try:
+                    with self.assertRaisesRegex(
+                        execution.ReviewExecutionRejected,
+                        "axis absent or ambiguous",
+                    ):
+                        self.verify_fixture()
+                finally:
+                    self.attempts.pop(0)
 
     def test_real_v2_semantic_role_does_not_require_external_independence(self):
         """Optional independent review eligibility is NOT five-phase provenance.

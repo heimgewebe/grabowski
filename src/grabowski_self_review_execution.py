@@ -1944,9 +1944,20 @@ def _verified_v2_semantic_review_passes(
     for sequence, axis in enumerate(axes_to_review, start=1):
         slot = f"selfrev.{expected['review_batch_id'][:16]}.{axis}"
         matches = [item for item in attempts if item.get("slot") == slot]
-        if len(matches) != 1:
+        passes = [item for item in matches if item.get("classification") == "pass"]
+        if len(passes) != 1:
             raise ReviewExecutionRejected("substantive V2 reviewer axis absent or ambiguous")
-        item = matches[0]
+        item = passes[0]
+        if any(
+            prior is not item
+            and (
+                prior.get("classification") != "infrastructure_error"
+                or prior.get("terminal") is not True
+                or not decisions._attempt_started_after(item, prior)
+            )
+            for prior in matches
+        ):
+            raise ReviewExecutionRejected("substantive V2 reviewer axis absent or ambiguous")
         if (
             item.get("classification") != "pass"
             or item.get("terminal") is not True
