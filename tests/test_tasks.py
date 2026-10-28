@@ -504,6 +504,38 @@ class TaskTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "could not be staged"):
                 tasks._stage_task_output_capture_script("heimserver", transport="ssh")
 
+    def test_ssh_without_task_home_binds_target_and_denies_drift(self) -> None:
+        with patch.dict(REMOTE_HOST, {"target": "remote"}), patch.object(
+            tasks.fleet, "fleet_host", return_value=REMOTE_HOST
+        ):
+            started = self._start(host="heimserver")
+            record = tasks._row_raw(str(started["task"]["task_id"]))
+            binding = json.loads(record["launcher_json"])
+            self.assertEqual(binding["task_output_remote_target"], "remote")
+            self.assertNotIn("task_output_remote_home", binding)
+            self.assertIsNone(tasks._task_output_remote_home(record))
+            REMOTE_HOST["target"] = "remote-other-host"
+            with self.assertRaisesRegex(RuntimeError, "remote task.*(identity|target)|target binding"):
+                tasks._require_reused_task_target_identity(record)
+            with patch.object(tasks, "_dispatch") as dispatch:
+                with self.assertRaisesRegex(RuntimeError, "remote task.*(identity|target)|target binding"):
+                    tasks._observe(record)
+                dispatch.assert_not_called()
+
+    def test_ssh_effect_time_target_swap_denied_inside_fleet_dispatch(self) -> None:
+        good = {**REMOTE_HOST, "target": "remote"}
+        changed = {**REMOTE_HOST, "target": "remote-other-host"}
+        with (
+            patch.object(tasks.fleet, "fleet_host", side_effect=[good, changed]),
+            patch.object(tasks.fleet.operator, "_run") as runner,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "target.*changed|target.*mismatch"):
+                tasks._dispatch(
+                    "heimserver", ["systemctl", "--user", "show", "example.service"],
+                    expected_target="remote",
+                )
+            runner.assert_not_called()
+
     def test_ssh_task_home_is_bound_across_stage_capture_read_and_cleanup(self) -> None:
         with patch.dict(REMOTE_HOST, {"task_home": "/home/remote"}), patch.object(
             tasks.fleet, "fleet_host", return_value=REMOTE_HOST
@@ -710,6 +742,7 @@ class TaskTests(unittest.TestCase):
             "attempt": 1,
             "argv_json": json.dumps(["/bin/echo", "hello"]),
             "backend": "user-systemd",
+            "launcher_json": json.dumps({tasks.TASK_OUTPUT_REMOTE_TARGET_BINDING_KEY: "remote"}),
         }
         with patch.object(
             tasks.fleet, "fleet_host", return_value=REMOTE_HOST
@@ -3052,7 +3085,9 @@ class TaskTests(unittest.TestCase):
         task_id = started["task"]["task_id"]
         missing = _launcher(returncode=1)
         missing["stderr"] = "unit not found"
-        with patch.object(tasks, "_dispatch", return_value=missing), patch.object(
+        with patch.object(
+            tasks.fleet, "fleet_host", return_value=REMOTE_HOST
+        ), patch.object(tasks, "_dispatch", return_value=missing), patch.object(
             tasks.base, "_append_audit"
         ), patch.object(
             tasks, "_require_recovery_gate", return_value={"checked_at_unix": 124}
@@ -3167,6 +3202,8 @@ class TaskTests(unittest.TestCase):
             "result": probe,
         }
         with patch.object(
+            tasks.fleet, "fleet_host", return_value={**REMOTE_HOST, "target": "remote"}
+        ), patch.object(
             tasks,
             "_dispatch",
             side_effect=tasks.fleet.FleetCommandDenied("Executable is not allowed for fleet host wg-prod-1: systemctl"),
@@ -3176,6 +3213,7 @@ class TaskTests(unittest.TestCase):
             result = tasks._observe({
                 "host": "wg-prod-1",
                 "unit": "grabowski-task-0123456789abcdef01234567-a1.service",
+                "launcher_json": json.dumps({tasks.TASK_OUTPUT_REMOTE_TARGET_BINDING_KEY: "remote"}),
             })
         self.assertEqual(result["state"], "completed")
         self.assertEqual(result["observer"]["kind"], tasks.fleet.TASK_UNIT_SHOW_OBSERVER)
@@ -3189,10 +3227,13 @@ class TaskTests(unittest.TestCase):
             tasks.fleet.TASK_UNIT_SHOW_PROPERTIES,
             timeout_seconds=30,
             max_output_bytes=8192,
+            expected_target="remote",
         )
 
     def test_reconcile_observer_propagates_narrow_probe_failure(self) -> None:
         with patch.object(
+            tasks.fleet, "fleet_host", return_value={**REMOTE_HOST, "target": "remote"}
+        ), patch.object(
             tasks,
             "_dispatch",
             side_effect=tasks.fleet.FleetCommandDenied("Executable is not allowed for fleet host wg-prod-1: systemctl"),
@@ -3203,6 +3244,7 @@ class TaskTests(unittest.TestCase):
                 tasks._observe({
                     "host": "wg-prod-1",
                     "unit": "grabowski-task-0123456789abcdef01234567-a1.service",
+                    "launcher_json": json.dumps({tasks.TASK_OUTPUT_REMOTE_TARGET_BINDING_KEY: "remote"}),
                 })
 
     def test_task_start_resume_policy_schema_matches_runtime_contract(self) -> None:

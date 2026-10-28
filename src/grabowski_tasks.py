@@ -5861,12 +5861,15 @@ def _dispatch(
     *,
     timeout_seconds: int = 60,
     allow_legacy_local_alias: bool = False,
+    expected_target: str | None = None,
 ) -> dict[str, Any]:
     if allow_legacy_local_alias:
         resolved_host, target, legacy_local_alias = _resolve_task_dispatch_host(host)
     else:
         resolved_host, target, legacy_local_alias = host, fleet.fleet_host(host), False
     if target["transport"] == "local":
+        if expected_target is not None:
+            raise RuntimeError("task SSH target changed before dispatch")
         result = operator._run(
             argv,
             cwd=operator.HOME,
@@ -5879,6 +5882,7 @@ def _dispatch(
             argv,
             timeout_seconds=timeout_seconds,
             max_output_bytes=operator.DEFAULT_OUTPUT_BYTES,
+            **({"expected_target": expected_target} if expected_target is not None else {}),
         )
         result = remote["result"]
     if legacy_local_alias:
@@ -5911,6 +5915,7 @@ def _task_output_managed_from_attempt(record: dict[str, Any]) -> int | None:
 
 
 def _task_output_remote_home(record: dict[str, Any]) -> str | None:
+    """Derive output path; retain existing home-binding validation when set."""
     raw = record.get("launcher_json")
     if not isinstance(raw, str):
         return None
@@ -5922,8 +5927,8 @@ def _task_output_remote_home(record: dict[str, Any]) -> str | None:
         raise RuntimeError("task remote home binding is invalid")
     home = launcher.get(TASK_OUTPUT_REMOTE_HOME_BINDING_KEY)
     if home is None:
-        if TASK_OUTPUT_REMOTE_TARGET_BINDING_KEY in launcher:
-            raise RuntimeError("task remote target exists without home binding")
+        # Legacy path derivation is pure: effective SSH identity is enforced
+        # separately before every remote effect, not while constructing paths.
         return None
     target = fleet.fleet_host(str(record["host"]))
     if (
@@ -5934,6 +5939,32 @@ def _task_output_remote_home(record: dict[str, Any]) -> str | None:
     ):
         raise RuntimeError("task remote home binding differs from fleet authority")
     return home
+
+
+def _task_output_remote_target(record: dict[str, Any]) -> str | None:
+    """Require the saved remote endpoint before any task effect or reuse."""
+    home = _task_output_remote_home(record)
+    raw = record.get("launcher_json")
+    host_name = str(record.get("host", ""))
+    previous_target = None
+    if isinstance(raw, str):
+        launcher = json.loads(raw)
+        previous_target = launcher.get(TASK_OUTPUT_REMOTE_TARGET_BINDING_KEY)
+    try:
+        target = fleet.fleet_host(host_name)
+    except ValueError as exc:
+        if host_name == "local" and previous_target is None and home is None:
+            return None
+        raise RuntimeError("task remote target authority unavailable") from exc
+    if target["transport"] != "ssh":
+        if previous_target is not None or home is not None:
+            raise RuntimeError("task remote target binding differs from fleet authority")
+        return None
+    if not isinstance(previous_target, str) or previous_target != target["target"]:
+        raise RuntimeError("task remote target binding missing or stale")
+    if home != target.get("task_home"):
+        raise RuntimeError("task remote home binding differs from fleet authority")
+    return previous_target
 
 
 def _require_reused_task_target_identity(record: dict[str, Any]) -> None:
@@ -5951,6 +5982,7 @@ def _require_reused_task_target_identity(record: dict[str, Any]) -> None:
         raise RuntimeError("remote task identity unavailable before reuse") from exc
     try:
         previous_home = _task_output_remote_home(record)
+        _task_output_remote_target(record)
     except (KeyError, TypeError, ValueError, RuntimeError, PermissionError) as exc:
         raise RuntimeError("remote task identity unavailable before reuse") from exc
     if target["transport"] == "ssh" and target.get("task_home") != previous_home:
@@ -6162,6 +6194,7 @@ def _stage_task_output_capture_script(
         _task_output_capture_script()
         return {"host": host, "transport": transport, "path": str(path), "status": "local"}
     payload = base64.b64encode(TASK_OUTPUT_CAPTURE_CODE.encode("utf-8")).decode("ascii")
+    expected_target = _task_output_remote_target(record) if record is not None else None
     staged = fleet.run_fleet_task_capture_stage(
         host,
         [
@@ -6173,6 +6206,7 @@ def _stage_task_output_capture_script(
         ],
         timeout_seconds=60,
         max_output_bytes=operator.DEFAULT_OUTPUT_BYTES,
+        **({"expected_target": expected_target} if expected_target is not None else {}),
     )
     result = staged["result"]
     if result.get("returncode") != 0 or str(result.get("stdout", "")).strip() not in {
@@ -6507,6 +6541,7 @@ def _read_remote_task_output_stream(
     if stream not in {"stdout", "stderr"}:
         raise ValueError("task output stream is invalid")
     paths = _task_output_paths(record)
+    expected_target = _task_output_remote_target(record)
     envelope = fleet.run_fleet_task_output_read(
         str(record["host"]),
         [
@@ -6520,6 +6555,7 @@ def _read_remote_task_output_stream(
         ],
         timeout_seconds=30,
         max_output_bytes=int(operator.DEFAULT_OUTPUT_BYTES),
+        **({"expected_target": expected_target} if expected_target is not None else {}),
     )
     result = envelope["result"]
     returncode = int(result.get("returncode", 1))
@@ -6645,11 +6681,13 @@ def _task_output_cleanup_run(
     command = _task_output_cleanup_argv(
         record, mode=mode, token=token, inventory=inventory
     )
+    expected_target = _task_output_remote_target(record)
     envelope = fleet.run_fleet_task_output_cleanup(
         str(record["host"]),
         command,
         timeout_seconds=30,
         max_output_bytes=int(operator.DEFAULT_OUTPUT_BYTES),
+        **({"expected_target": expected_target} if expected_target is not None else {}),
     )
     result = envelope.get("result")
     if not isinstance(result, dict):
@@ -6837,13 +6875,20 @@ def _launch(record: dict[str, Any]) -> dict[str, Any]:
             }
     target = fleet.fleet_host(record["host"])
     try:
-        if (
-            target["transport"] == "ssh"
-            and target.get("task_home") != _task_output_remote_home(record)
-        ):
-            raise RuntimeError("task remote home binding is missing or stale")
+        expected_remote_target = _task_output_remote_target(record)
+        if target["transport"] == "ssh" and expected_remote_target != target["target"]:
+            raise RuntimeError("task SSH target changed before launch")
         _stage_task_output_capture_script(
             record["host"], transport=target["transport"], record=record
+        )
+        return _dispatch(
+            record["host"],
+            _launch_argv(
+                record,
+                include_managed_runtime=target["transport"] == "local",
+            ),
+            timeout_seconds=60,
+            expected_target=expected_remote_target,
         )
     except (OSError, PermissionError, RuntimeError, ValueError) as exc:
         # The row is already committed as launching and its leases are held.
@@ -6861,14 +6906,7 @@ def _launch(record: dict[str, Any]) -> dict[str, Any]:
             "launch_not_dispatched": True,
             "privileged_broker": None,
         }
-    return _dispatch(
-        record["host"],
-        _launch_argv(
-            record,
-            include_managed_runtime=target["transport"] == "local",
-        ),
-        timeout_seconds=60,
-    )
+
 
 
 def _launch_state(result: dict[str, Any]) -> str:
@@ -8608,11 +8646,13 @@ def _observe(
         observer["transport"] = "local"
     else:
         try:
+            expected_remote_target = _task_output_remote_target(record)
             result = _dispatch(
                 record["host"],
                 command,
                 timeout_seconds=30,
                 allow_legacy_local_alias=True,
+                expected_target=expected_remote_target,
             )
         except fleet.FleetCommandDenied:
             # Production hosts intentionally do not expose generic systemctl through
@@ -8624,6 +8664,7 @@ def _observe(
                 fleet.TASK_UNIT_SHOW_PROPERTIES,
                 timeout_seconds=30,
                 max_output_bytes=8192,
+                **({"expected_target": expected_remote_target} if expected_remote_target is not None else {}),
             )
             result = observed["result"]
             observer = {
@@ -9670,6 +9711,11 @@ def grabowski_task_start(
         if target["transport"] == "ssh" and execution_backend == "systemd-user"
         else None
     )
+    task_output_remote_target = (
+        target["target"]
+        if target["transport"] == "ssh" and execution_backend == "systemd-user"
+        else None
+    )
     executor_lease_binding_plan: dict[str, Any] | None = None
     executor_lease_binding_journal: dict[str, Any] | None = None
     executor_lease_binding: dict[str, Any] | None = None
@@ -9703,11 +9749,13 @@ def grabowski_task_start(
                 ),
                 **(
                     {
-                        TASK_OUTPUT_REMOTE_HOME_BINDING_KEY: task_output_remote_home,
-                        TASK_OUTPUT_REMOTE_TARGET_BINDING_KEY: target["target"],
+                        TASK_OUTPUT_REMOTE_TARGET_BINDING_KEY: task_output_remote_target,
+                        **(
+                            {TASK_OUTPUT_REMOTE_HOME_BINDING_KEY: task_output_remote_home}
+                            if task_output_remote_home is not None else {}
+                        ),
                     }
-                    if task_output_remote_home is not None
-                    else {}
+                    if task_output_remote_target is not None else {}
                 ),
                 "task_effect_classification": dict(
                     task_effect_classification
@@ -10004,11 +10052,13 @@ def grabowski_task_start(
         **_launch(record),
         **(
             {
-                        TASK_OUTPUT_REMOTE_HOME_BINDING_KEY: task_output_remote_home,
-                        TASK_OUTPUT_REMOTE_TARGET_BINDING_KEY: target["target"],
-                    }
-            if task_output_remote_home is not None
-            else {}
+                TASK_OUTPUT_REMOTE_TARGET_BINDING_KEY: task_output_remote_target,
+                **(
+                    {TASK_OUTPUT_REMOTE_HOME_BINDING_KEY: task_output_remote_home}
+                    if task_output_remote_home is not None else {}
+                ),
+            }
+            if task_output_remote_target is not None else {}
         ),
         "task_effect_classification": dict(task_effect_classification),
         **(
@@ -10328,6 +10378,7 @@ def grabowski_task_logs(task_id: str, max_lines: int = 200) -> dict[str, Any]:
                     str(max_lines),
                 ],
                 timeout_seconds=30,
+                expected_target=_task_output_remote_target(record),
             )
         else:
             output_source = "private-task-files-v1"
@@ -10361,6 +10412,7 @@ def grabowski_task_cancel(task_id: str) -> dict[str, Any]:
             timeout_seconds=60,
         )
     else:
+        expected_remote_target = _task_output_remote_target(record)
         resolved_host, target, _legacy_local_alias = _resolve_task_dispatch_host(
             str(record["host"])
         )
@@ -10376,6 +10428,7 @@ def grabowski_task_cancel(task_id: str) -> dict[str, Any]:
                 resolved_host,
                 ["systemctl", "--user", "stop", _authoritative_unit(record)],
                 timeout_seconds=60,
+                expected_target=expected_remote_target,
             )
     if result.get("outcome_unknown"):
         state = "outcome_unknown"
@@ -10511,23 +10564,34 @@ def grabowski_task_resume(
             coding_agent_pre_dispatch_admission = candidate_admission
     attempt = int(record["attempt"]) + 1
     task_output_managed_from_attempt = _task_output_managed_from_attempt(record)
+    if task_output_managed_from_attempt is not None and not _is_root_systemd_backend(record):
+        # Preserve the more specific existing rejection for a local task whose
+        # Fleet transport changed; no attempt or remote effect may start.
+        _resolved_host, current_transport, _alias = _resolve_task_dispatch_host(str(record["host"]))
+        if current_transport["transport"] != "local":
+            raise RuntimeError(
+                "Task with managed local output cannot resume on non-local transport; "
+                "restore the fleet host to local transport or start a new task"
+            )
     task_output_remote_home = _task_output_remote_home(record)
+    task_output_remote_target = _task_output_remote_target(record)
+    if task_output_remote_target is not None:
+        recovery_launcher_bindings[TASK_OUTPUT_REMOTE_TARGET_BINDING_KEY] = (
+            task_output_remote_target
+        )
     if task_output_remote_home is not None:
         recovery_launcher_bindings[TASK_OUTPUT_REMOTE_HOME_BINDING_KEY] = (
             task_output_remote_home
-        )
-        recovery_launcher_bindings[TASK_OUTPUT_REMOTE_TARGET_BINDING_KEY] = (
-            fleet.fleet_host(str(record["host"]))["target"]
         )
     if not _is_root_systemd_backend(record):
         _resolved_host, resume_target, _legacy_local_alias = (
             _resolve_task_dispatch_host(str(record["host"]))
         )
-        if (
-            resume_target["transport"] == "ssh"
-            and resume_target.get("task_home") != task_output_remote_home
+        if resume_target["transport"] == "ssh" and (
+            resume_target.get("task_home") != task_output_remote_home
+            or resume_target["target"] != task_output_remote_target
         ):
-            raise RuntimeError("task remote home binding is missing or stale on resume")
+            raise RuntimeError("task remote SSH target/home binding is missing or stale on resume")
         if task_output_managed_from_attempt is None:
             if resume_target["transport"] == "local":
                 record = _bind_task_output_managed_from_attempt(
@@ -10625,11 +10689,14 @@ def grabowski_task_resume(
                 "reconciled" if lease_result.get("preserved") else "reacquired"
             )
     launcher = _launch(candidate)
-    if task_output_remote_home is not None:
+    if task_output_remote_target is not None:
         launcher = {
             **launcher,
-            TASK_OUTPUT_REMOTE_HOME_BINDING_KEY: task_output_remote_home,
-            TASK_OUTPUT_REMOTE_TARGET_BINDING_KEY: fleet.fleet_host(str(record["host"]))["target"],
+            TASK_OUTPUT_REMOTE_TARGET_BINDING_KEY: task_output_remote_target,
+            **(
+                {TASK_OUTPUT_REMOTE_HOME_BINDING_KEY: task_output_remote_home}
+                if task_output_remote_home is not None else {}
+            ),
         }
     if coding_agent_pre_dispatch_admission is not None:
         launcher = {

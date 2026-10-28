@@ -235,6 +235,30 @@ class FleetTransportGateTests(unittest.TestCase):
                 self.assertEqual(module.main(), 2)
         fake._run.assert_not_called()
 
+    def test_record_bound_fleet_effects_refuse_mismatched_actual_ssh_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            module, fake = _load_fleet_module(Path(tmp))
+            config = json.loads(module.FLEET_CONFIG.read_text(encoding="utf-8"))
+            config["hosts"]["ssh"] = {
+                "transport": "ssh", "target": "remote-other-host",
+                "enabled": True, "roles": ["worker"],
+                "command_allowlist": ["*"],
+            }
+            module.FLEET_CONFIG.write_text(json.dumps(config), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "target.*changed|target.*mismatch"):
+                module.run_fleet_host(
+                    "ssh", ["systemctl", "--user", "show", "example.service"],
+                    timeout_seconds=30, max_output_bytes=4096,
+                    expected_target="remote",
+                )
+            with self.assertRaisesRegex(RuntimeError, "target.*changed|target.*mismatch"):
+                module.run_fleet_task_unit_show(
+                    "ssh", "grabowski-task-" + "a"*24 + "-a1.service",
+                    ["ActiveState"], timeout_seconds=30, max_output_bytes=4096,
+                    expected_target="remote",
+                )
+            fake._run.assert_not_called()
+
     def test_windows_powershell_remote_mode_uses_encoded_argv(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             module, fake = _load_fleet_module(Path(tmp))

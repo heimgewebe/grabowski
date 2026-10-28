@@ -260,9 +260,21 @@ def _ensure_command_allowed(name: str, host: dict[str, Any], command: list[str])
         raise FleetCommandDenied(f"Executable is not allowed for fleet host {name}: {command[0]}")
 
 
-def run_fleet_host(name: str, argv: list[str], *, timeout_seconds: int,
-                   max_output_bytes: int) -> dict[str, Any]:
+def _bound_task_destination(name: str, expected_target: str | None) -> dict[str, Any]:
+    """Bind the actual SSH argv destination in the same host snapshot used for execution."""
     host = fleet_host(name)
+    if expected_target is not None and (
+        not isinstance(expected_target, str)
+        or host["transport"] != "ssh"
+        or host["target"] != expected_target
+    ):
+        raise RuntimeError("task SSH target changed before dispatch")
+    return host
+
+
+def run_fleet_host(name: str, argv: list[str], *, timeout_seconds: int,
+                   max_output_bytes: int, expected_target: str | None = None) -> dict[str, Any]:
+    host = _bound_task_destination(name, expected_target)
     command = _safe_argv(argv)
     timeout = operator._timeout(timeout_seconds)
     output_limit = operator._output_limit(max_output_bytes)
@@ -294,6 +306,7 @@ def run_fleet_task_output_read(
     *,
     timeout_seconds: int,
     max_output_bytes: int,
+    expected_target: str | None = None,
 ) -> dict[str, Any]:
     """Run the narrow descriptor-bound task-output reader.
 
@@ -302,7 +315,7 @@ def run_fleet_task_output_read(
     every remaining argument against the task-output path grammar. It therefore
     does not authorize arbitrary Python execution through ``grabowski_fleet_run``.
     """
-    host = fleet_host(name)
+    host = _bound_task_destination(name, expected_target)
     command = operator._validate_argv(argv, cwd=HOME)
     if len(command) != 7:
         raise ValueError("Invalid task-output reader argv length")
@@ -387,6 +400,7 @@ def run_fleet_task_capture_stage(
     *,
     timeout_seconds: int,
     max_output_bytes: int,
+    expected_target: str | None = None,
 ) -> dict[str, Any]:
     """Run the narrow digest-bound task-output capture stager.
 
@@ -397,7 +411,7 @@ def run_fleet_task_capture_stage(
     authorize arbitrary Python execution through ``grabowski_fleet_run``, and a
     host whose allowlist omits an interpreter can still launch tasks.
     """
-    host = fleet_host(name)
+    host = _bound_task_destination(name, expected_target)
     command = operator._validate_argv(argv, cwd=HOME)
     if len(command) != 5:
         raise ValueError("Invalid capture stager argv length")
@@ -482,6 +496,7 @@ def run_fleet_task_output_cleanup(
     *,
     timeout_seconds: int,
     max_output_bytes: int,
+    expected_target: str | None = None,
 ) -> dict[str, Any]:
     """Run the fixed task-output inventory/delete contract on one fleet host.
 
@@ -489,7 +504,7 @@ def run_fleet_task_output_cleanup(
     the hash-bound embedded program and exact task-output arguments. No caller-
     supplied Python program, executable, path family or deletion target is allowed.
     """
-    host = fleet_host(name)
+    host = _bound_task_destination(name, expected_target)
     command = operator._validate_argv(argv, cwd=HOME)
     if len(command) != 10:
         raise ValueError("Invalid task-output cleanup argv length")
@@ -591,6 +606,7 @@ def run_fleet_task_unit_show(
     *,
     timeout_seconds: int,
     max_output_bytes: int,
+    expected_target: str | None = None,
 ) -> dict[str, Any]:
     """Run the narrow read-only task-unit observer used by task reconcile.
 
@@ -598,7 +614,7 @@ def run_fleet_task_unit_show(
     command allowlist.  The only accepted command shape is
     ``systemctl --user show <grabowski-task-unit>`` with bounded property names.
     """
-    host = fleet_host(name)
+    host = _bound_task_destination(name, expected_target)
     if not isinstance(unit, str) or _TASK_UNIT.fullmatch(unit) is None:
         raise ValueError("Invalid Grabowski task unit")
     if not (
