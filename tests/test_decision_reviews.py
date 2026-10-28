@@ -3690,7 +3690,7 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
 
             target = Path(temporary) / "jobs" / "grabowski-job-a11111111111"
             normalized = reviews.normalize_binding({
-                **binding("independent-gemini"), "head_sha": head, "base_sha": base,
+                **binding("independent-claude"), "head_sha": head, "base_sha": base,
                 "diff_sha256": "f" * 64,
             })
             argv = [
@@ -3699,7 +3699,7 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
                 "--expected-head", head, "--expected-base-head", base,
                 "--expected-diff-sha256", raw_sha,
                 "--expected-dirty", "false", "--output", "/tmp/preflight-placeholder.json",
-                "--", "agy", "--model", "gemini-3.1-pro-high", "Review exact diff",
+                "--", "claude", "--model", "claude-opus-5-5", "--effort", "high", "--permission-mode", "plan", "Review exact diff",
             ]
             with self.assertRaisesRegex(ValueError, "prelaunch.*identity"):
                 reviews.bind_job_review_role_argv(
@@ -3735,14 +3735,14 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
                 )
 
     def test_v2_role_prelaunch_unknown_readback_fails_closed(self) -> None:
-        normalized = reviews.normalize_binding(binding("independent-gemini"))
+        normalized = reviews.normalize_binding(binding("independent-claude"))
         argv = [
             reviews.REVIEW_ROLE_PYTHON, "-I", "-m", reviews.REVIEW_ROLE_MODULE,
             "--role", "review", "--repository", "/tmp/review",
             "--expected-head", HEAD, "--expected-base-head", BASE,
             "--expected-diff-sha256", "e" * 64,
             "--expected-dirty", "false", "--output", "/tmp/preflight-placeholder.json",
-            "--", "agy", "--model", "gemini-3.1-pro-high", "Review exact diff",
+            "--", "claude", "--model", "claude-opus-5-5", "--effort", "high", "--permission-mode", "plan", "Review exact diff",
         ]
         with mock.patch.object(agent_role, "current_binding", side_effect=RuntimeError("git unavailable")):
             with self.assertRaisesRegex(ValueError, "prelaunch.*unavailable"):
