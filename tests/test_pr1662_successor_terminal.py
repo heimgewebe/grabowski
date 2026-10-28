@@ -243,5 +243,155 @@ class CompletedSuccessorTerminalTests(unittest.TestCase):
 
 
 
+class NeverStartedDeployContractTests(unittest.TestCase):
+    def _original_nonstart(self):
+        from test_pr1662_nonstarted_resume import NeverStartedResumeReservationTests
+        case = NeverStartedResumeReservationTests(
+            "test_launch_failed_after_verified_nonstart_can_retire_promoted_reservation"
+        )
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        repo = case.REPOSITORY
+        command = SD._deploy_command(
+            repo, repo / SD.RUNNER_RELATIVE_PATH, case.HEAD, 8,
+            source_identity_sha256=fixture.SOURCE_IDENTITY_SHA256,
+        )
+        sha = SD._deploy_command_sha256(command)
+        case.meta["argv"] = command
+        case.meta["argv_sha256"] = sha
+        case.meta["finalization_contract"] = {
+            "kind": "grabowski_runtime_deploy_finalization",
+            "unit": case.UNIT,
+            "job_id": case.meta["job_id"],
+            "argv_sha256": sha,
+            "expected_head": case.HEAD,
+            "receipt_paths": {
+                key: str(case.entry / filename) for key, filename in (
+                    ("metadata", "metadata.json"), ("stdout", "stdout.log"),
+                    ("stderr", "stderr.log"), ("finalization", "finalization.json"),
+                )
+            },
+        }
+        case.status["metadata"] = case.meta
+        return case
+
+    def test_real_scheduled_deploy_nonstart_is_terminal(self):
+        case = self._original_nonstart()
+        self.assertTrue(
+            case._classify(),
+            "genuine never-started scheduled deploy has the runtime finalization "
+            "contract, not the generic job finalization contract",
+        )
+        with (
+            mock.patch.object(SD.operator, "_read_job_metadata", return_value=case.meta),
+            mock.patch.object(SD.operator, "grabowski_job_status", return_value=case.status),
+            mock.patch.object(SD.operator, "_unit_dispatch_readback",
+                              return_value=case.dispatch),
+        ):
+            result = SD._bootstrap_deploy_index(case.root, read_only=True)
+        self.assertEqual(result["units"], [])
+
+    def test_mismatched_contract_kind_head_or_dispatch_proof_blocks(self):
+        from copy import deepcopy
+        case = self._original_nonstart()
+        self.assertFalse(case._classify(metadata={
+            **case.meta, "finalization_contract": {
+                **case.meta["finalization_contract"],
+                "kind": "grabowski_job_finalization",
+            }
+        }, status={
+            **case.status,
+            "metadata": {
+                **case.meta, "finalization_contract": {
+                    **case.meta["finalization_contract"],
+                    "kind": "grabowski_job_finalization",
+                },
+            },
+        }))
+        for key, malformed in (
+            ("expected_head", "f" * 40),
+            ("unit", "grabowski-job-000000000000"),
+            ("argv_sha256", "0" * 64),
+        ):
+            changed = deepcopy(case.meta)
+            changed["finalization_contract"][key] = malformed
+            with self.subTest(field=key):
+                self.assertFalse(case._classify(
+                    metadata=changed, status={**case.status, "metadata": changed}
+                ))
+        self.assertFalse(case._classify(
+            status={**case.status, "systemd_visible": True}
+        ))
+
+
+class PublicationRollbackTerminalProofTests(unittest.TestCase):
+    def setUp(self):
+        self.original = fixture.cutover_receipt(
+            outcome="rolled_back", phase="rolled_back", switched=False,
+        )
+        selector = {
+            "selected_slot": "canonical",
+            "release_id": fixture.BLUE_RELEASE,
+            "repo_head": fixture.HEAD_BLUE,
+        }
+        readback = {
+            "authoritative": True,
+            "selector": dict(selector), "ingress": dict(selector),
+        }
+        readback["readback_sha256"] = SD._sha256_json(readback)
+        self.original.update(
+            selector_switch=None,
+            snapshot_rebind=None,
+            retirement=None,
+            final_routing=None,
+            authoritative_readback=readback,
+            recovery={
+                "action": "retry_from_clean_blue",
+                "blue_preserved": True,
+                "rollback": {"blue_preserved": True},
+                "platform_publication_rollback": {
+                    "state": "no_prepared_request_effect",
+                },
+            },
+        )
+        self._rehash()
+
+    def _rehash(self):
+        self.original["receipt_sha256"] = SD._sha256_json({
+            k: v for k, v in self.original.items() if k != "receipt_sha256"
+        })
+
+    def _check(self, publication):
+        self.original["recovery"]["platform_publication_rollback"] = publication
+        self._rehash()
+        return SD._signed_clean_blue_rollback_is_terminal(
+            self.original, [self.original]
+        )
+
+    def test_actual_effect_free_and_verified_rollback_are_terminal(self):
+        self.assertTrue(self._check({"state": "no_prepared_request_effect"}))
+        self.assertTrue(self._check({
+            "state": "rolled_back", "request_id": "gpp-rolledback-123",
+            "restored_request_id": None,
+            "resolution_sha256": "a" * 64,
+        }))
+
+    def test_failed_unknown_empty_or_unproved_publication_rollback_is_not_terminal(self):
+        bad = (
+            {},
+            {"state": "failed", "error": "publication rollback unconfirmed"},
+            {"state": "publication_pending", "request_id": "gpp-pending"},
+            {"state": "not_current", "request_id": "gpp-new", "idempotent": True},
+            {"state": "rolled_back"},
+            {"state": "rolled_back", "request_id": "gpp-rolledback-123"},
+            {"state": "no_prepared_request_effect", "error": "conflict"},
+        )
+        for state in bad:
+            with self.subTest(state=state.get("state")):
+                self.assertFalse(self._check(state))
+
+
+
+
 if __name__ == "__main__":
     unittest.main()

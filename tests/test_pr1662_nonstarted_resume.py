@@ -180,7 +180,24 @@ class NeverStartedResumeReservationTests(unittest.TestCase):
         metadata = deepcopy(self.meta)
         metadata["argv"] = command
         metadata["argv_sha256"] = DEPLOY._deploy_command_sha256(command)
-        metadata["finalization_contract"]["argv_sha256"] = metadata["argv_sha256"]
+        # The reserved scheduled deploy uses the runtime-specific contract.
+        # A generic job contract must never authorize this effect-bearing runner.
+        metadata["finalization_contract"] = {
+            "kind": "grabowski_runtime_deploy_finalization",
+            "unit": self.UNIT,
+            "job_id": metadata["job_id"],
+            "argv_sha256": metadata["argv_sha256"],
+            "expected_head": self.HEAD,
+            "receipt_paths": {
+                key: str(self.entry / filename)
+                for key, filename in (
+                    ("metadata", "metadata.json"),
+                    ("stdout", "stdout.log"),
+                    ("stderr", "stderr.log"),
+                    ("finalization", "finalization.json"),
+                )
+            },
+        }
         status = deepcopy(self.status)
         status["metadata"] = metadata
         self.assertTrue(self._classify(metadata=metadata, status=status))

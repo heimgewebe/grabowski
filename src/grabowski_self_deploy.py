@@ -1818,6 +1818,36 @@ def _signed_failed_pre_cutover_is_terminal(
         return False
 
 
+def _platform_publication_rollback_is_terminal(result: Any) -> bool:
+    """Accept only producer-confirmed no-effect or durable publication rollback.
+
+    An authoritative blue-runtime readback cannot establish that platform
+    publication was also reverted. In particular, publication_pending,
+    not_current, failed, empty and error-bearing responses are not terminal.
+    """
+    if not isinstance(result, dict):
+        return False
+    state = result.get("state")
+    if state == "no_prepared_request_effect":
+        return set(result) == {"state"}
+    if state != "rolled_back" or set(result) != {
+        "state", "request_id", "restored_request_id", "resolution_sha256",
+    }:
+        return False
+    request_id = result.get("request_id")
+    restored = result.get("restored_request_id")
+    return bool(
+        isinstance(request_id, str)
+        and re.fullmatch(r"[A-Za-z0-9._:@-]{1,128}", request_id) is not None
+        and (restored is None or (
+            isinstance(restored, str)
+            and re.fullmatch(r"[A-Za-z0-9._:@-]{1,128}", restored) is not None
+        ))
+        and isinstance(result.get("resolution_sha256"), str)
+        and _SHA256_RE.fullmatch(result["resolution_sha256"]) is not None
+    )
+
+
 def _signed_clean_blue_rollback_is_terminal(
     cutover: dict[str, Any],
     receipts: list[dict[str, Any]],
@@ -1852,7 +1882,7 @@ def _signed_clean_blue_rollback_is_terminal(
             and recovery.get("blue_preserved") is True
             and isinstance(rollback, dict)
             and rollback.get("blue_preserved") is True
-            and isinstance(publication_rollback, dict)
+            and _platform_publication_rollback_is_terminal(publication_rollback)
             and readback.get("authoritative") is True
             and readback.get("readback_sha256") == expected_readback
             and isinstance(selector, dict)
@@ -2349,6 +2379,9 @@ def _failed_resume_job_is_settled(
 
 def _verified_never_started_resume(
     entry: Path, metadata: dict[str, Any], status: dict[str, Any],
+    *,
+    deploy_fields: dict[str, str] | None = None,
+    resume_fields: dict[str, str] | None = None,
 ) -> bool:
     """Retire only a resume whose job dispatcher *proved* it never started.
 
@@ -2366,6 +2399,31 @@ def _verified_never_started_resume(
     contract = metadata.get("finalization_contract")
     finalization = status.get("finalization_receipt")
     observed = status.get("terminalization_evidence")
+    # The typed scheduler creates a runtime-deploy finalization contract,
+    # whereas a dedicated midcutover resume uses the generic job contract.
+    # Do not accept either contract kind on the wrong effect-bearing runner.
+    expected_kind = (
+        "grabowski_runtime_deploy_finalization" if deploy_fields is not None
+        else "grabowski_job_finalization" if resume_fields is not None
+        else None
+    )
+    expected_head = (
+        deploy_fields.get("expected_head")
+        if isinstance(deploy_fields, dict)
+        else None
+    )
+    if (
+        expected_kind is None
+        or not isinstance(contract, dict)
+        or contract.get("kind") != expected_kind
+        or (deploy_fields is not None and (
+            contract.get("expected_head") != expected_head
+            or not isinstance(contract.get("receipt_paths"), dict)
+            or contract["receipt_paths"].get("finalization")
+            != str(entry / "finalization.json")
+        ))
+    ):
+        return False
     if (
         metadata.get("final_status") != "launch_failed"
         or metadata.get("dispatch_outcome") != "not_started"
@@ -2394,7 +2452,7 @@ def _verified_never_started_resume(
         or terminal.get("systemd_visible") is not False
         or terminal.get("final_status") != "launch_failed"
         or not isinstance(contract, dict)
-        or contract.get("kind") != "grabowski_job_finalization"
+        or contract.get("kind") != expected_kind
         or contract.get("unit") != unit
         or contract.get("job_id") != metadata.get("job_id")
         or contract.get("argv_sha256") != metadata.get("argv_sha256")
@@ -2469,7 +2527,9 @@ def _verified_runtime_terminal_receipt(
     # A proven systemd-run non-start has no runner-specific receipt for either
     # scheduled deploy or mid-cutover resume. Bind it to the same strict proof.
     if status.get("final_status") == "launch_failed":
-        return _verified_never_started_resume(entry, metadata, status)
+        return _verified_never_started_resume(
+            entry, metadata, status, deploy_fields=deploy, resume_fields=resume
+        )
 
     if deploy is not None:
         contract = metadata.get("finalization_contract")
