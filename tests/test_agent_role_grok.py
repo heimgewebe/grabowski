@@ -588,7 +588,8 @@ class GrokReviewRoleTests(unittest.TestCase):
         self.assertNotIn("--deny", actual)
         self.assertNotIn("-p", actual)
         self.assertIn("--verbatim", actual)
-        self.assertEqual(actual[actual.index("--sandbox") + 1], "read-only")
+        self.assertEqual(actual[actual.index("--sandbox") + 1], "off")
+        # The actual role executor still encloses this command in read-only bubblewrap.
         self.assertEqual(actual[actual.index("--prompt-file") + 1], "/dev/stdin")
         prompt = prompt_bytes.decode("utf-8")
         self.assertIn(base, prompt)
