@@ -598,6 +598,24 @@ def _configure_installer_paths(
     return source, template, gateway_path, unit_path, token_path
 
 
+def test_initial_probe_systemctl_timeout_allows_full_service_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[tuple[list[str], int]] = []
+
+    def fake_run(argv, **kwargs):
+        observed.append((argv, kwargs["timeout"]))
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(installer.subprocess, "run", fake_run)
+    installer._systemctl("start", installer.PROBE_SERVICE_NAME)
+    installer._systemctl("restart", installer.SERVICE_NAME)
+    assert observed == [
+        (["systemctl", "--user", "start", installer.PROBE_SERVICE_NAME], 100),
+        (["systemctl", "--user", "restart", installer.SERVICE_NAME], 30),
+    ]
+
+
 def test_installer_restarts_after_replacing_active_revision(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

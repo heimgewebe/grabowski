@@ -250,7 +250,7 @@ def _systemctl(*arguments: str) -> subprocess.CompletedProcess[str]:
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        timeout=30,
+        timeout=100 if arguments == ("start", PROBE_SERVICE_NAME) else 30,
     )
 
 
