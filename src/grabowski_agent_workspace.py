@@ -1322,6 +1322,31 @@ def _preflight_cache_record_valid(record: Any, cache_key: str, now: int) -> bool
     )
 
 
+def _creation_role_preflight(
+    manifest: dict[str, Any], role: str, command: list[str],
+) -> dict[str, Any]:
+    """Defer only the exact never-executed First-Party controller placeholder.
+
+    Its argv is a handoff sentinel, not a read-only reviewer or a callable
+    toolchain. Running or probing it can create an artificial NixOS block,
+    while claiming a fake successful toolchain check would misstate evidence.
+    Writer/tests and every real reviewer command keep their normal probes.
+    """
+    if role == "review" and command == list(CONTROLLER_SELF_REVIEW_PENDING_ARGV):
+        return {
+            "role": "review",
+            "command_sha256": _sha256_json(command),
+            "checked_at": _utc(),
+            "sandbox": agent_role.SANDBOX_LABEL,
+            "passed": False,
+            "deferred": True,
+            "executed": False,
+            "failure_classification": "controller_self_review_pending",
+            "external_agent_profile": None,
+        }
+    return _role_toolchain_preflight(manifest, role, command)
+
+
 def _role_toolchain_preflight(manifest: dict[str, Any], role: str, command: list[str]) -> dict[str, Any]:
     """Validate exact role prerequisites with a short, snapshot-bound cross-workspace cache."""
     worktree = Path(str(manifest["writer_worktree"]))
@@ -7825,7 +7850,7 @@ def grabowski_agent_workspace_create(
             worktree_created = True
         initial_preflights: dict[str, Any] = {}
         for preflight_role in ("writer", "tests", "review"):
-            role_preflight = _role_toolchain_preflight(
+            role_preflight = _creation_role_preflight(
                 manifest, preflight_role, list(plan["commands"][preflight_role])
             )
             initial_preflights[preflight_role] = role_preflight
@@ -7836,7 +7861,11 @@ def grabowski_agent_workspace_create(
                 manifest,
                 "role_preflight",
                 role=preflight_role,
-                outcome="passed" if role_preflight.get("passed") is True else "blocked",
+                outcome=(
+                    "deferred" if role_preflight.get("deferred") is True
+                    else "passed" if role_preflight.get("passed") is True
+                    else "blocked"
+                ),
                 evidence={
                     "phase": "workspace_creation",
                     "command_sha256": role_preflight.get("command_sha256"),
@@ -7855,7 +7884,15 @@ def grabowski_agent_workspace_create(
                 },
             )
             _write_manifest(manifest)
-            if role_preflight.get("passed") is not True:
+            pending_controller_handoff = (
+                preflight_role == "review"
+                and list(plan["commands"]["review"]) == list(CONTROLLER_SELF_REVIEW_PENDING_ARGV)
+                and role_preflight.get("deferred") is True
+                and role_preflight.get("passed") is False
+                and role_preflight.get("failure_classification") == "controller_self_review_pending"
+                and role_preflight.get("executed") is False
+            )
+            if role_preflight.get("passed") is not True and not pending_controller_handoff:
                 classification = role_preflight.get("failure_classification") or "toolchain_probe_error"
                 raise AgentWorkspaceActionError(
                     f"{preflight_role} toolchain preflight failed: {classification}"

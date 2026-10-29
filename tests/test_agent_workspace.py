@@ -4986,6 +4986,31 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertTrue(observed["add"])
         self.assertFalse(state["held"])
 
+    def test_controller_pending_review_has_deferred_not_fake_passed_toolchain_preflight(self) -> None:
+        # The controller-review sentinel is never run. An executable probe for
+        # its python3 -c placeholder is an artificial NixOS bootstrap blocker.
+        command = list(workspace.CONTROLLER_SELF_REVIEW_PENDING_ARGV)
+        manifest = {"commands": {"review": command}}
+        with mock.patch.object(
+            workspace, "_role_toolchain_preflight",
+            side_effect=AssertionError("non-executed controller sentinel was probed"),
+        ) as probe:
+            result = workspace._creation_role_preflight(manifest, "review", command)
+        probe.assert_not_called()
+        self.assertEqual(result["command_sha256"], workspace._sha256_json(command))
+        self.assertEqual(result["failure_classification"], "controller_self_review_pending")
+        self.assertIs(result["passed"], False)
+        self.assertIs(result["deferred"], True)
+        self.assertIs(result["executed"], False)
+
+        with mock.patch.object(
+            workspace, "_role_toolchain_preflight",
+            return_value={"passed": False, "failure_classification": "environment_toolchain_failure"},
+        ) as probe:
+            ordinary = workspace._creation_role_preflight(manifest, "review", ["true"])
+        probe.assert_called_once_with(manifest, "review", ["true"])
+        self.assertIs(ordinary["passed"], False)
+
     def test_create_blocks_before_writer_when_read_only_role_preflight_fails(self) -> None:
         calls: list[str] = []
 
