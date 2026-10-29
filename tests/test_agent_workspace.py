@@ -8826,6 +8826,27 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertEqual(len(manifest["outcome_receipts"]["collection"]["history"]), 2)
 
 
+    def test_native_nix_store_virtualenv_needs_no_second_sandbox_mount(self) -> None:
+        # A native Nix package already lives under the sandbox's immutable
+        # /nix/store bind. Rebinding it as a generic venv adds a forbidden
+        # /nix directory even though no additional access is necessary.
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary) / "repo"
+            repo.mkdir()
+            package = Path("/nix/store/" + "a" * 32 + "-grabowski-operator-test")
+            with (
+                mock.patch.object(Path, "resolve", autospec=True,
+                                  side_effect=lambda path, strict=False: path),
+                mock.patch.object(Path, "is_file", autospec=True,
+                                  side_effect=lambda path: path == package / "pyvenv.cfg"),
+            ):
+                bindings, directories = role._declared_virtualenv_binding(
+                    repo, [str(package / "bin/python3"), "-m", "grabowski_self_review_producer"]
+                )
+        self.assertEqual(bindings, [])
+        self.assertEqual(directories, [])
+
+
     def test_declared_external_virtualenv_is_bound_read_only_without_home_tree(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)

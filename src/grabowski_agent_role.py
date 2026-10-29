@@ -508,6 +508,9 @@ def _declared_virtualenv_binding(repo: Path, command: list[str]) -> tuple[list[t
     target_root = declared_root.absolute()
     if source_root == repo_root or source_root.is_relative_to(repo_root):
         return [], []
+    # Nix store virtualenvs are already mounted read-only by the sandbox.
+    if source_root.is_relative_to(Path("/nix/store")) and target_root.is_relative_to(Path("/nix/store")):
+        return [], []
     if source_root == Path("/") or source_root.is_relative_to(Path("/usr")):
         return [], []
     directories = [
