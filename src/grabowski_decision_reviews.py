@@ -1169,6 +1169,85 @@ _NIX_REVIEW_PACKAGE = re.compile(
 )
 
 
+
+_NIX_REVIEW_PROFILES_ROOT = Path("/nix/var/nix/profiles")
+_NIX_REVIEW_NIX_STORE_BIN = Path("/run/current-system/sw/bin/nix-store")
+_NIX_SYSTEM_PROFILE_NAME = re.compile(r"system-[1-9][0-9]*-link\Z")
+_NIX_SYSTEM_PACKAGE_NAME = re.compile(
+    r"[0-9a-df-np-sv-z]{32}-nixos-system-[A-Za-z0-9._-]+\Z"
+)
+
+
+def _historical_nix_deployed_generation_contains(package: Path) -> bool:
+    """Require root-authorized system-generation closure, not merely a store name.
+
+    On multi-user Nix, any allowed builder can produce a root-owned store
+    output. Only a generation installed under the root-controlled system
+    profiles is evidence that the output was authorized for this host.
+    The query is read-only; it never creates or changes GC roots.
+    """
+    profiles = _NIX_REVIEW_PROFILES_ROOT
+    store = _NIX_REVIEW_STORE_ROOT
+    program = _NIX_REVIEW_NIX_STORE_BIN
+    try:
+        profile_stat = profiles.lstat()
+        if (
+            not stat.S_ISDIR(profile_stat.st_mode)
+            or profile_stat.st_uid != _NIX_REVIEW_OWNER_UID
+            or stat.S_IMODE(profile_stat.st_mode) & 0o022
+        ):
+            return False
+        entries = list(profiles.iterdir())
+        if len(entries) > 512:
+            return False
+        generations: list[Path] = []
+        for link in entries:
+            if not _NIX_SYSTEM_PROFILE_NAME.fullmatch(link.name):
+                continue
+            link_stat = link.lstat()
+            if not stat.S_ISLNK(link_stat.st_mode) or link_stat.st_uid != _NIX_REVIEW_OWNER_UID:
+                return False
+            target = link.resolve(strict=True)
+            target_stat = target.stat()
+            if (
+                target.parent != store
+                or not _NIX_SYSTEM_PACKAGE_NAME.fullmatch(target.name)
+                or not stat.S_ISDIR(target_stat.st_mode)
+                or target_stat.st_uid != _NIX_REVIEW_OWNER_UID
+                or stat.S_IMODE(target_stat.st_mode) & 0o022
+            ):
+                return False
+            generations.append(link)
+        if not generations or len(generations) > 128:
+            return False
+        runner_lstat = program.lstat()
+        runner = program.resolve(strict=True)
+        runner_stat = runner.stat()
+        if (
+            not (stat.S_ISLNK(runner_lstat.st_mode) or stat.S_ISREG(runner_lstat.st_mode))
+            or runner_lstat.st_uid != _NIX_REVIEW_OWNER_UID
+            or not runner.is_relative_to(store)
+            or not stat.S_ISREG(runner_stat.st_mode)
+            or runner_stat.st_uid != _NIX_REVIEW_OWNER_UID
+            or stat.S_IMODE(runner_stat.st_mode) & 0o022
+            or not os.access(runner, os.X_OK)
+        ):
+            return False
+        # Nix accepts multiple closure roots in one invocation; a root-owned
+        # installed generation, not an arbitrary GC root, is the trust anchor.
+        query = subprocess.run(
+            [str(program), "--query", "--requisites", *map(str, sorted(generations))],
+            capture_output=True, text=True, timeout=15, check=False,
+            env={"PATH": "/run/current-system/sw/bin:/usr/bin:/bin",
+                 "NIX_REMOTE": "daemon", "NIX_CONFIG": ""},
+        )
+        if query.returncode != 0 or len(query.stdout) > 8 * 1024 * 1024:
+            return False
+        return str(package) in query.stdout.splitlines()
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+        return False
+
+
 def _historical_nix_review_role_matches(
     runner_python: Any, module_path: Any, module_sha256: Any,
 ) -> bool:
@@ -1237,7 +1316,7 @@ def _historical_nix_review_role_matches(
                 return False
         return hmac.compare_digest(
             hashlib.sha256(module.read_bytes()).hexdigest(), module_sha256,
-        )
+        ) and _historical_nix_deployed_generation_contains(package)
     except (FileNotFoundError, IndexError, OSError, RuntimeError, ValueError):
         return False
 
@@ -1675,6 +1754,101 @@ def _proven_grok_quota_failure_before_review(
     )
 
 
+
+def _proven_grok_historical_cli_pre_result(
+    receipt: dict[str, Any], provenance: dict[str, Any]
+) -> bool:
+    """Two observed exact pre-review CLI failures, never review verdicts."""
+    route = provenance.get("review_route")
+    if provenance.get("schema_version") != 2 or not isinstance(route, dict):
+        return False
+    if route.get("provider_family") != "xai":
+        return False
+    quota = (
+        "You’ve reached your free Grok Build usage limit for now. "
+        "Get SuperGrok for much higher limits, or try again later: "
+        "https://grok.com/supergrok?referrer=grok-build"
+    )
+    bad_model = (
+        "Couldn't set model 'grok-4.6': Invalid params: "
+        '"unknown model id". Run \'grok models\' to see available models.'
+    )
+    model, route_id = route.get("model"), route.get("route_id")
+    if (model, route_id) == ("grok-4.7", "grok-4.7-review-high"):
+        error = quota
+        commands = ["compact", "always-approve", "context",
+                    "session-info", "feedback", "goal"]
+        available = {"type": "available_commands", "tools": [], "commands": commands}
+        events = [available, available]
+    elif (model, route_id) == ("grok-4.6", "grok-4.6-review-high"):
+        error = bad_model
+        events = []
+    else:
+        return False
+    events.append({"type": "error", "message": error, "cwd": provenance["repository"]})
+    expected_stdout = "".join(
+        json.dumps(event, separators=(",", ":"), ensure_ascii=False) + "\n"
+        for event in events
+    )
+    expected_stderr = "Error: " + error + "\n"
+    provider_keys = {
+        "review_provider_available_commands_events",
+        "review_provider_available_tools", "review_provider_completed_commands",
+        "review_provider_completed_tool_calls", "review_provider_completed_tools",
+        "review_provider_stream_bytes", "review_provider_stream_contract",
+        "review_provider_stream_events", "review_provider_stream_sha256",
+    }
+    probe = receipt.get("post_failure_toolchain_probe")
+    return (
+        receipt.get("verdict") == "INVALID"
+        and receipt.get("findings") == []
+        and receipt.get("failure_classification") == "invalid_review_output"
+        and type(receipt.get("returncode")) is int
+        and receipt["returncode"] == 126
+        and receipt.get("error") == "Grok review stream used unsupported event type: error"
+        and type(receipt.get("review_document_bytes")) is int
+        and receipt["review_document_bytes"] == 0
+        and receipt.get("review_document_sha256") is None
+        and receipt.get("review_document_normalizations") == []
+        and receipt.get("review_findings_normalized") is False
+        and receipt.get("review_input_source") == "committed_diff"
+        and type(receipt.get("review_input_bytes")) is int
+        and 0 < receipt["review_input_bytes"] <= 1024 * 1024
+        and isinstance(receipt.get("review_input_sha256"), str)
+        and _SHA256_RE.fullmatch(receipt["review_input_sha256"]) is not None
+        and isinstance(probe, dict)
+        and probe.get("passed") is True
+        and probe.get("failure_classification") == "passed"
+        and probe.get("missing_executable") is False
+        and probe.get("missing_python_module") is False
+        and {k for k in receipt if k.startswith("review_provider_")} == provider_keys
+        and receipt.get("review_provider_stream_contract")
+            == "grok-streaming-json-bound-diff-review-v2"
+        and receipt.get("review_provider_available_tools") == []
+        and receipt.get("review_provider_completed_tools") == []
+        and receipt.get("review_provider_completed_commands") == []
+        and type(receipt.get("review_provider_completed_tool_calls")) is int
+        and receipt["review_provider_completed_tool_calls"] == 0
+        and type(receipt.get("review_provider_available_commands_events")) is int
+        and receipt["review_provider_available_commands_events"] == 0
+        and type(receipt.get("review_provider_stream_events")) is int
+        and receipt["review_provider_stream_events"] == len(events)
+        and receipt.get("stdout_tail") == expected_stdout
+        and receipt.get("stderr_tail") == expected_stderr
+        and type(receipt.get("stdout_bytes")) is int
+        and receipt["stdout_bytes"] == len(expected_stdout.encode("utf-8"))
+        and receipt.get("stdout_sha256") ==
+            hashlib.sha256(expected_stdout.encode("utf-8")).hexdigest()
+        and type(receipt.get("review_provider_stream_bytes")) is int
+        and receipt["review_provider_stream_bytes"] == receipt["stdout_bytes"]
+        and receipt.get("review_provider_stream_sha256") == receipt["stdout_sha256"]
+        and type(receipt.get("stderr_bytes")) is int
+        and receipt["stderr_bytes"] == len(expected_stderr.encode("utf-8"))
+        and receipt.get("stderr_sha256") ==
+            hashlib.sha256(expected_stderr.encode("utf-8")).hexdigest()
+    )
+
+
 def _validated_review_role_evidence(
     metadata: dict[str, Any], binding: dict[str, Any], provenance: dict[str, Any] | None,
     *, directory: Path | None = None, parent_fd: int | None = None,
@@ -1757,6 +1931,10 @@ def _validated_review_role_evidence(
                 _proven_claude_quota_failure_before_review(receipt, provenance)
                 or _proven_grok_quota_failure_before_review(receipt, provenance)
             )
+        ),
+        "pre_result_cli_failure_verified": (
+            result is None
+            and _proven_grok_historical_cli_pre_result(receipt, provenance)
         ),
     }
 
@@ -2435,12 +2613,20 @@ def reconcile(
                 if provenance is not None and provenance.get("schema_version") == 2:
                     if (
                         role_evidence is not None
-                        and role_evidence.get("pre_result_quota_failure_verified") is True
+                        and (
+                            role_evidence.get("pre_result_quota_failure_verified") is True
+                            or role_evidence.get("pre_result_cli_failure_verified") is True
+                        )
                         and attempt["terminal_status"] in _PRE_RESULT_INFRASTRUCTURE_STATUSES
                         and attempt["terminal_status"] == "failed"
                     ):
                         attempt["classification"] = "infrastructure_error"
-                        attempt["pre_result_quota_failure_verified"] = True
+                        attempt["pre_result_quota_failure_verified"] = (
+                            role_evidence.get("pre_result_quota_failure_verified") is True
+                        )
+                        attempt["pre_result_cli_failure_verified"] = (
+                            role_evidence.get("pre_result_cli_failure_verified") is True
+                        )
                     else:
                         attempt["classification"] = "invalid_result"
                         errors.append(f"decision_review_result_invalid:{directory.name}:InvalidReviewDocument")
@@ -2461,6 +2647,15 @@ def reconcile(
     if not _external_v1_role_receipts_unchanged(external_v1_snapshots):
         errors.append("decision_review_external_role_receipt_changed")
 
+    # A verified pre-review CLI failure is not a reviewer decision. A later
+    # real independent PASS in the same provider family may supersede it even
+    # when the operator used a newer, separately named reviewer slot. Every
+    # material REJECT and any ambiguous/unknown result remains blocking.
+    global_independent_passes = [
+        item for item in attempts
+        if item["classification"] == "pass"
+        and item.get("independence_verified") is True
+    ]
     slots: list[dict[str, Any]] = []
     for slot in sorted({str(item["slot"]) for item in attempts}):
         slot_attempts = [item for item in attempts if item["slot"] == slot]
@@ -2485,13 +2680,15 @@ def reconcile(
         unsuperseded_infrastructure = []
         for infrastructure_attempt in infrastructure:
             eligible_passes = passes
-            if infrastructure_attempt.get("pre_result_quota_failure_verified") is True:
-                # A legacy generic PASS cannot replace authenticated Claude
-                # quota evidence. The later PASS itself must be independent
-                # and from the same provider family, not merely an old PASS.
+            if (
+                infrastructure_attempt.get("pre_result_quota_failure_verified") is True
+                or infrastructure_attempt.get("pre_result_cli_failure_verified") is True
+            ):
+                # Only authenticated, pre-semantic infrastructure failures can
+                # use this same-family cross-slot replacement, never rejections.
                 family = infrastructure_attempt.get("review_provider_family")
                 eligible_passes = [
-                    item for item in independent_passes
+                    item for item in global_independent_passes
                     if item.get("review_provider_family") == family
                 ]
             if not any(
@@ -2499,7 +2696,17 @@ def reconcile(
                 for pass_attempt in eligible_passes
             ):
                 unsuperseded_infrastructure.append(infrastructure_attempt)
-        if not passes and not rejects:
+        pre_result_replaced = (
+            not passes and not rejects and bool(infrastructure)
+            and len(infrastructure) == len(slot_attempts)
+            and not unsuperseded_infrastructure
+            and all(
+                item.get("pre_result_quota_failure_verified") is True
+                or item.get("pre_result_cli_failure_verified") is True
+                for item in infrastructure
+            )
+        )
+        if not passes and not rejects and not pre_result_replaced:
             errors.append(f"decision_review_slot_without_pass:{slot}")
         named_family = _named_slot_provider_family(slot)
         if named_family is not None and not any(
@@ -2507,6 +2714,15 @@ def reconcile(
             and attempt.get("independence_verified") is True
             and attempt.get("review_provider_family") == named_family
             for attempt in slot_attempts
+        ) and not (
+            pre_result_replaced
+            and any(
+                item.get("review_provider_family") == named_family
+                and all(
+                    _attempt_started_after(item, old) for old in infrastructure
+                )
+                for item in global_independent_passes
+            )
         ):
             errors.append(
                 f"decision_review_named_provider_slot_without_independent_pass:{slot}"

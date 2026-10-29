@@ -42,15 +42,26 @@ class NixReviewerHistoryTests(unittest.TestCase):
         self.sha = hashlib.sha256(self.module.read_bytes()).hexdigest()
         p1 = mock.patch.object(reviews, "_NIX_REVIEW_STORE_ROOT", self.store)
         p2 = mock.patch.object(reviews, "_NIX_REVIEW_OWNER_UID", os.getuid())
+        p3 = mock.patch.object(
+            reviews, "_historical_nix_deployed_generation_contains", return_value=True
+        )
         p1.start()
         p2.start()
+        p3.start()
         self.addCleanup(p1.stop)
         self.addCleanup(p2.stop)
+        self.addCleanup(p3.stop)
 
     def accepted(self, runner: Path | None = None, module: Path | None = None) -> bool:
         return reviews._historical_nix_review_role_matches(
             str(runner or self.runner), str(module or self.module), self.sha
         )
+
+    def test_store_name_without_installed_system_generation_is_rejected(self) -> None:
+        with mock.patch.object(
+            reviews, "_historical_nix_deployed_generation_contains", return_value=False
+        ):
+            self.assertFalse(self.accepted())
 
     def test_same_store_output_with_recorded_module_sha_is_accepted(self) -> None:
         self.assertTrue(self.accepted())
@@ -136,6 +147,71 @@ class NixReviewerHistoryTests(unittest.TestCase):
         self.runner.unlink()
         self.runner.symlink_to(external_python)
         self.assertFalse(self.accepted())
+
+
+
+class NixInstalledSystemGenerationTests(unittest.TestCase):
+    """Root-installed system profile closure is the trust anchor, not Nix hash shape."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        root = Path(self.temp.name)
+        self.store = root / "nix" / "store"
+        self.store.mkdir(parents=True)
+        self.profiles = root / "nix" / "var" / "nix" / "profiles"
+        self.profiles.mkdir(parents=True)
+        self.system = self.store / ("a" * 32 + "-nixos-system-heim-pc-26.05.test")
+        self.system.mkdir()
+        self.link = self.profiles / "system-25-link"
+        self.link.symlink_to(self.system)
+        self.package = self.store / ("b" * 32 + "-grabowski-operator-374d7471")
+        self.package.mkdir()
+        nix = self.store / ("c" * 32 + "-nix-2.34.9") / "bin" / "nix-store"
+        nix.parent.mkdir(parents=True)
+        nix.write_text("#!/bin/sh\n", encoding="utf-8")
+        nix.chmod(0o555)
+        self.bin = root / "bin" / "nix-store"
+        self.bin.parent.mkdir()
+        self.bin.symlink_to(nix)
+        for name, value in (
+            ("_NIX_REVIEW_STORE_ROOT", self.store),
+            ("_NIX_REVIEW_PROFILES_ROOT", self.profiles),
+            ("_NIX_REVIEW_NIX_STORE_BIN", self.bin),
+            ("_NIX_REVIEW_OWNER_UID", os.getuid()),
+        ):
+            patch = mock.patch.object(reviews, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def test_only_root_installed_generation_closure_is_accepted(self):
+        response = mock.Mock(returncode=0, stdout=f"{self.package}\n", stderr="")
+        with mock.patch.object(reviews.subprocess, "run", return_value=response) as runner:
+            self.assertTrue(reviews._historical_nix_deployed_generation_contains(self.package))
+            self.assertIn(str(self.link), runner.call_args.args[0])
+            self.assertFalse(reviews._historical_nix_deployed_generation_contains(
+                self.store / ("d" * 32 + "-grabowski-operator-deadbeef")
+            ))
+
+    def test_noninstalled_nix_store_output_cannot_attest_review_origin(self):
+        response = mock.Mock(returncode=0, stdout=f"{self.system}\n", stderr="")
+        with mock.patch.object(reviews.subprocess, "run", return_value=response):
+            self.assertFalse(reviews._historical_nix_deployed_generation_contains(self.package))
+
+    def test_untrusted_profile_and_binary_links_rejected_before_nix_query(self):
+        with mock.patch.object(reviews.subprocess, "run") as runner:
+            outside = Path(self.temp.name) / "untrusted-system"
+            outside.mkdir()
+            self.link.unlink()
+            self.link.symlink_to(outside)
+            self.assertFalse(reviews._historical_nix_deployed_generation_contains(self.package))
+            runner.assert_not_called()
+            self.link.unlink()
+            self.link.symlink_to(self.system)
+            self.bin.unlink()
+            self.bin.symlink_to(outside)
+            self.assertFalse(reviews._historical_nix_deployed_generation_contains(self.package))
+            runner.assert_not_called()
 
 
 if __name__ == "__main__":
