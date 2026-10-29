@@ -42,7 +42,10 @@ def _first_party_merge_signer_snapshot_guard(review_evidence: Any):
     if (
         not isinstance(review_evidence, dict)
         or (
-            review_evidence.get("review_tier") not in {"standard", "high_critical"}
+            review_evidence.get("review_tier") not in {
+                "very_small", "documentation", "standard", "important_repo",
+                "high_critical",
+            }
             and review_evidence.get("review_origin")
             != "first_party_authenticated_controller_v1"
         )
