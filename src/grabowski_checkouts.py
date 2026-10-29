@@ -829,12 +829,21 @@ def _live_checkout_lease_keys(*, now: int) -> dict[str, str]:
     """
     if not resources.RESOURCE_DB.exists():
         return {}
-    with resources._resource_readonly_snapshot() as resource_connection:
-        rows = resource_connection.execute(
-            "SELECT resource_key, owner_id FROM leases WHERE expires_at_unix>?",
-            (now,),
-        ).fetchall()
-    return {str(row["resource_key"]): str(row["owner_id"]) for row in rows}
+
+    def read_once() -> dict[str, str]:
+        with resources._resource_readonly_snapshot() as resource_connection:
+            rows = resource_connection.execute(
+                "SELECT resource_key, owner_id FROM leases WHERE expires_at_unix>?",
+                (now,),
+            ).fetchall()
+        return {str(row["resource_key"]): str(row["owner_id"]) for row in rows}
+
+    try:
+        return read_once()
+    except resources.ResourceSchemaInventoryChanged:
+        # SQLite can remove a checkpointed WAL between the sidecar check and
+        # its first stat; one fresh read recovers a quiescent snapshot.
+        return read_once()
 
 
 def _active_lifecycle_consumes_capacity(
@@ -1182,13 +1191,9 @@ def _reserve_checkout_lifecycle(
             live_leases=live_leases,
         )
         limit = _phase_limit("active")
-        existing_consumes_capacity = (
-            existing is not None
-            and _active_lifecycle_consumes_capacity(
-                existing, now=now, live_leases=live_leases,
-            )
-        )
-        if count >= limit and not existing_consumes_capacity:
+        # The count excludes the candidate checkout. A returning lease cannot
+        # exempt a separate 17th active writer when every other slot is full.
+        if count >= limit:
             raise RuntimeError(
                 f"Per-repository active checkout limit reached: active={count} limit={limit}"
             )

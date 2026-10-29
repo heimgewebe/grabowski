@@ -3613,7 +3613,7 @@ print(json.dumps({
                     return_value={
                         "outcome": "completed",
                         "receipt_persisted": True,
-                        "receipt": {"receipt_sha256": "ab" * 32},
+                        "receipt": {"receipt_sha256": "ab" * 32, "resumed_cutover_id": CUTOVER_ID},
                     },
                 ) as resume,
                 mock.patch.object(runner, "run_productive_blue_green") as deploy,
@@ -3968,7 +3968,7 @@ class DeployedFinalizationCompatibilityTests(unittest.TestCase):
                 return_value={
                     "outcome": "completed",
                     "receipt_persisted": True,
-                    "receipt": {"receipt_sha256": "ab" * 32},
+                    "receipt": {"receipt_sha256": "ab" * 32, "resumed_cutover_id": CUTOVER_ID},
                 },
             ),
             mock.patch.object(runner, "write_finalization_receipt", side_effect=capture),
@@ -3979,7 +3979,17 @@ class DeployedFinalizationCompatibilityTests(unittest.TestCase):
             )
         deploy.assert_not_called()
         self.assertEqual(written["final_status"], "failed")
-        self.assertEqual(written["failure_type"], "MidCutoverPrerequisiteRecovered")
+        bound = {
+            "schema_version": 1,
+            "kind": "grabowski_resolved_midcutover_prerequisite",
+            "resumed_cutover_id": CUTOVER_ID,
+            "resume_receipt_sha256": "ab" * 32,
+            "execution_head": "e" * 40,
+        }
+        self.assertEqual(
+            written["failure_type"],
+            "MidCutoverPrerequisiteRecovered:" + runner.canonical_json_sha256(bound),
+        )
         # Neither head may be presented as the deployed one.
         self.assertIsNone(written["repo_head"])
         self.assertIsNone(written["release_id"])

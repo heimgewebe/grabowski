@@ -50,7 +50,8 @@ class CodingAgentRouterCliTests(unittest.TestCase):
     def _grok_auth_home(
         self,
         *,
-        tier: int = 1,
+        tier: int | None = 1,
+        explicit_null_tier: bool = False,
         issued_at: int = 1_000,
         expires_at: int = 2_000,
         file_mode: int = 0o600,
@@ -72,10 +73,11 @@ class CodingAgentRouterCliTests(unittest.TestCase):
             "principal_id": principal_id,
             "principal_type": "User",
             "team_id": team_id,
-            "tier": tier,
             "iat": issued_at,
             "exp": expires_at,
         }
+        if tier is not None or explicit_null_tier:
+            claims["tier"] = tier
         encoded_claims = base64.urlsafe_b64encode(
             json.dumps(claims, separators=(",", ":"), sort_keys=True).encode()
         ).decode().rstrip("=")
@@ -425,6 +427,76 @@ class CodingAgentRouterCliTests(unittest.TestCase):
         )
         self.assertEqual(ambiguous["status"], "ambiguous-account")
 
+    def test_tierless_grok_oidc_login_never_claims_paid_entitlement(self) -> None:
+        catalog, _ = router._load_catalog()
+        home = self._grok_auth_home(tier=None)
+        verified_login = cli._grok_subscription_auth_status(
+            catalog, home=home, now_unix=1_100,
+        )
+        self.assertEqual(verified_login["status"], "tier-unverified")
+        self.assertTrue(verified_login["authenticated"])
+        self.assertFalse(verified_login["entitlement_verified"])
+        self.assertIsNone(verified_login["subscription_tier"])
+        self.assertRegex(
+            verified_login["account_binding_sha256"], r"^[0-9a-f]{64}$",
+        )
+        self.assertEqual(
+            verified_login["auth_file_identity_sha256"],
+            router._grok_auth_file_identity(home=home),
+        )
+
+        def metadata(_harnesses, harness, arguments, _catalog):
+            if harness == "grok" and arguments == ["models"]:
+                return {
+                    "ok": True,
+                    "stdout": (
+                        "You are logged in with grok.com.\\n"
+                        "Default model: grok-4.7\\n"
+                        "Available models:\\n  * grok-4.7 (default)\\n"
+                    ),
+                    "stderr": "",
+                }
+            return {"ok": False, "stdout": "", "stderr": ""}
+
+        with (
+            mock.patch.object(
+                cli, "_binary_versions",
+                return_value={"grok": {"available": True, "binary": "/grok"}},
+            ),
+            mock.patch.object(cli, "_run_harness_metadata", side_effect=metadata),
+            mock.patch.object(
+                cli, "_grok_subscription_auth_status",
+                side_effect=[dict(verified_login), dict(verified_login)],
+            ),
+            mock.patch.object(
+                cli, "_openhands_subscription_auth_status",
+                return_value={"authenticated": False},
+            ),
+            mock.patch.object(cli, "_resolve_executable", return_value=None),
+        ):
+            probe = cli._probe(catalog)
+        grok = probe["providers"]["grok"]
+        self.assertTrue(grok["logged_in"])
+        self.assertFalse(grok["entitlement_verified"])
+        self.assertIsNone(grok["subscription_tier"])
+        self.assertEqual(grok["models"], ["grok-4.7"])
+        self.assertNotIn("grok-com", probe["verified_quota_pools"])
+        route47 = next(
+            r for r in catalog["routes"] if r["id"] == "grok-4.7-review-high"
+        )
+        route46 = next(
+            r for r in catalog["routes"] if r["id"] == "grok-4.6-review-high"
+        )
+        self.assertTrue(router._route_available(route47, catalog, {"catalog": probe})[0])
+        self.assertFalse(router._route_available(route46, catalog, {"catalog": probe})[0])
+
+        # An explicitly null tier is not the same as an absent tier claim.
+        null_tier = cli._grok_subscription_auth_status(
+            catalog, home=self._grok_auth_home(tier=None, explicit_null_tier=True), now_unix=1_100,
+        )
+        self.assertEqual(null_tier["status"], "entitlement-mismatch")
+        self.assertFalse(null_tier["authenticated"])
+
     def test_configured_models_fail_closed_without_routes(self) -> None:
         with self.assertRaisesRegex(
             ValueError, "catalog routes are missing or invalid"
@@ -594,6 +666,51 @@ class CodingAgentRouterCliTests(unittest.TestCase):
         self.assertFalse(
             rejected_rotation["providers"]["grok"]["entitlement_verified"]
         )
+
+    def test_probe_verifies_entitlement_with_only_grok_47_available(self) -> None:
+        # Regression: a valid SuperGrok account with only the current model
+        # must not lose its quota pool/account binding during a fresh probe.
+        catalog, _ = router._load_catalog()
+        auth = {
+            "authenticated": True,
+            "entitlement_verified": True,
+            "status": "valid",
+            "subscription_tier": "SuperGrok",
+            "account_binding_sha256": "a" * 64,
+            "auth_file_identity_sha256": "c" * 64,
+        }
+
+        def metadata(_harnesses, harness, arguments, _catalog):
+            if harness == "grok" and arguments == ["models"]:
+                return {
+                    "ok": True,
+                    "stdout": "You are logged in with grok.com.\nDefault model: grok-4.7\n\nAvailable models:\n  * grok-4.7 (default)\n",
+                    "stderr": "",
+                }
+            return {"ok": False, "stdout": "", "stderr": ""}
+
+        with (
+            mock.patch.object(
+                cli, "_binary_versions",
+                return_value={"grok": {"available": True, "binary": "/grok"}},
+            ),
+            mock.patch.object(cli, "_run_harness_metadata", side_effect=metadata),
+            mock.patch.object(
+                cli, "_grok_subscription_auth_status",
+                side_effect=[dict(auth), dict(auth)],
+            ),
+            mock.patch.object(
+                cli, "_openhands_subscription_auth_status",
+                return_value={"authenticated": False},
+            ),
+            mock.patch.object(cli, "_resolve_executable", return_value=None),
+        ):
+            verified = cli._probe(catalog)
+        self.assertEqual(verified["providers"]["grok"]["models"], ["grok-4.7"])
+        self.assertTrue(verified["providers"]["grok"]["entitlement_verified"])
+        self.assertEqual(verified["providers"]["grok"]["subscription_tier"], "SuperGrok")
+        self.assertEqual(verified["providers"]["grok"]["account_binding_sha256"], "a" * 64)
+        self.assertIn("grok-com", verified["verified_quota_pools"])
 
     def test_probe_digest_safety_guard_rejects_sensitive_fields(self) -> None:
         with self.assertRaisesRegex(

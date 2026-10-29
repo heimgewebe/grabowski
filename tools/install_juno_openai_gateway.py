@@ -12,9 +12,12 @@ import subprocess
 import time
 from typing import Any
 import urllib.error
+import urllib.parse
 import urllib.request
 
 SERVICE_NAME = "grabowski-juno-openai-gateway.service"
+PROBE_SERVICE_NAME = "grabowski-coding-agent-router-probe.service"
+PROBE_TIMER_NAME = "grabowski-coding-agent-router-probe.timer"
 MODEL_ID = "grabowski-juno"
 LOCAL_BASE_URL = "http://127.0.0.1:18195"
 INSTALL_SMOKE_REPLY = "JUNO_INSTALL_SMOKE_OK"
@@ -24,6 +27,12 @@ USER_UNIT_DIR = Path.home() / ".config" / "systemd" / "user"
 UNIT_PATH = USER_UNIT_DIR / SERVICE_NAME
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TEMPLATE_PATH = REPO_ROOT / "systemd" / f"{SERVICE_NAME}.example"
+PROBE_SERVICE_TEMPLATE_PATH = REPO_ROOT / "systemd" / f"{PROBE_SERVICE_NAME}.example"
+PROBE_TIMER_TEMPLATE_PATH = REPO_ROOT / "systemd" / f"{PROBE_TIMER_NAME}.example"
+PROBE_SERVICE_PATH = USER_UNIT_DIR / PROBE_SERVICE_NAME
+PROBE_TIMER_PATH = USER_UNIT_DIR / PROBE_TIMER_NAME
+LAUNCHER_SOURCE_PATH = REPO_ROOT / "tools/grabowski_juno_runtime_launcher.py"
+LAUNCHER_EXEC_PATH = Path.home() / ".local/libexec/grabowski/grabowski_juno_runtime_launcher.py"
 GATEWAY_SOURCE_PATH = REPO_ROOT / "src" / "grabowski_juno_openai_gateway.py"
 GATEWAY_EXEC_PATH = (
     Path.home()
@@ -33,6 +42,12 @@ GATEWAY_EXEC_PATH = (
     / "grabowski_juno_openai_gateway.py"
 )
 MAX_INSTALL_ARTIFACT_BYTES = 2 * 1024 * 1024
+KNOWN_GATEWAY_FAILURE_CODES = frozenset({
+    "router_unavailable", "no_safe_route", "unsafe_route",
+    "route_revalidation_failed", "backend_feature_probe_failed",
+    "backend_failed", "backend_unavailable", "backend_timeout",
+    "backend_output_missing", "backend_output_invalid",
+})
 
 
 def _fsync_directory(path: Path) -> None:
@@ -235,7 +250,7 @@ def _systemctl(*arguments: str) -> subprocess.CompletedProcess[str]:
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        timeout=30,
+        timeout=100 if arguments == ("start", PROBE_SERVICE_NAME) else 30,
     )
 
 
@@ -250,10 +265,10 @@ def _systemctl_probe(*arguments: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def _service_state() -> dict[str, bool]:
+def _unit_state(name: str) -> dict[str, bool]:
     observation = _systemctl_probe(
         "show",
-        SERVICE_NAME,
+        name,
         "--no-pager",
         "--property=LoadState",
         "--property=ActiveState",
@@ -261,7 +276,7 @@ def _service_state() -> dict[str, bool]:
     )
     if observation.returncode != 0:
         raise RuntimeError(
-            f"cannot observe prior gateway service state: exit {observation.returncode}"
+            f"cannot observe prior {name} state: exit {observation.returncode}"
         )
     properties: dict[str, str] = {}
     for line in observation.stdout.splitlines():
@@ -269,12 +284,20 @@ def _service_state() -> dict[str, bool]:
             key, value = line.split("=", 1)
             properties[key] = value
     if not {"LoadState", "ActiveState", "UnitFileState"} <= properties.keys():
-        raise RuntimeError("prior gateway service state readback is incomplete")
+        raise RuntimeError(f"prior {name} state readback is incomplete")
     enabled_states = {"enabled", "enabled-runtime", "linked", "linked-runtime"}
     return {
         "active": properties["ActiveState"] == "active",
         "enabled": properties["UnitFileState"] in enabled_states,
     }
+
+
+def _service_state() -> dict[str, bool]:
+    return _unit_state(SERVICE_NAME)
+
+
+def _probe_timer_state() -> dict[str, bool]:
+    return _unit_state(PROBE_TIMER_NAME)
 
 
 def _read_token_for_smoke(path: Path) -> str:
@@ -294,18 +317,55 @@ def _read_json_response(response: Any, *, label: str) -> dict[str, Any]:
     return value
 
 
-def _wait_for_ready(token_path: Path, timeout_seconds: int = 20) -> str:
+def _verified_https_smoke_url(value: str) -> str:
+    """Send the local credential only to the existing Tailscale Serve backend."""
+    parsed = urllib.parse.urlsplit(value)
+    if (
+        parsed.scheme != "https"
+        or parsed.username is not None
+        or parsed.password is not None
+        or not parsed.hostname
+        or not parsed.hostname.endswith(".ts.net")
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise RuntimeError("smoke URL must be a bare HTTPS Tailscale Serve origin")
+    try:
+        port = parsed.port or 443
+    except ValueError as exc:
+        raise RuntimeError("smoke URL port is invalid") from exc
+    key = parsed.hostname + (f":{port}" if port != 443 else ":443")
+    try:
+        result = subprocess.run(
+            ["tailscale", "serve", "status", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            check=True,
+        )
+        serve = json.loads(result.stdout)
+        handler = serve["Web"][key]["Handlers"]["/"]
+    except (OSError, subprocess.SubprocessError, KeyError, TypeError,
+            ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError("cannot attest Tailscale Serve smoke target") from exc
+    if handler.get("Proxy") != LOCAL_BASE_URL or serve.get("AllowFunnel", {}).get(key):
+        raise RuntimeError("smoke target is not private Serve for the Juno backend")
+    return f"https://{parsed.hostname}:{port}"
+
+
+def _wait_for_ready(token_path: Path, timeout_seconds: int = 20, *, base_url: str = LOCAL_BASE_URL) -> str:
     deadline = time.monotonic() + timeout_seconds
     last_error = "service did not become ready"
     token = _read_token_for_smoke(token_path)
     while time.monotonic() < deadline:
         try:
             with urllib.request.urlopen(
-                LOCAL_BASE_URL + "/healthz", timeout=2
+                base_url + "/healthz", timeout=2
             ) as response:
                 _read_json_response(response, label="health endpoint")
             request = urllib.request.Request(
-                LOCAL_BASE_URL + "/v1/models",
+                base_url + "/v1/models",
                 headers={"Authorization": "Bearer " + token},
             )
             with urllib.request.urlopen(request, timeout=2) as response:
@@ -322,7 +382,7 @@ def _wait_for_ready(token_path: Path, timeout_seconds: int = 20) -> str:
     raise RuntimeError(f"gateway readiness smoke failed: {last_error}")
 
 
-def _completion_smoke(token: str, timeout_seconds: int = 130) -> None:
+def _completion_smoke(token: str, timeout_seconds: int = 130, *, base_url: str = LOCAL_BASE_URL) -> None:
     body = json.dumps(
         {
             "model": MODEL_ID,
@@ -336,7 +396,7 @@ def _completion_smoke(token: str, timeout_seconds: int = 130) -> None:
         separators=(",", ":"),
     ).encode("utf-8")
     request = urllib.request.Request(
-        LOCAL_BASE_URL + "/v1/chat/completions",
+        base_url + "/v1/chat/completions",
         data=body,
         headers={
             "Authorization": "Bearer " + token,
@@ -347,6 +407,18 @@ def _completion_smoke(token: str, timeout_seconds: int = 130) -> None:
     try:
         with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
             payload = _read_json_response(response, label="completion endpoint")
+    except urllib.error.HTTPError as exc:
+        code = "unknown"
+        try:
+            body = json.loads(exc.read(4096).decode("utf-8"))
+            candidate = body["error"]["code"]
+            if candidate in KNOWN_GATEWAY_FAILURE_CODES:
+                code = candidate
+        except (ValueError, KeyError, TypeError, UnicodeError):
+            pass
+        raise RuntimeError(
+            f"gateway completion smoke failed: HTTP {exc.code}, code={code}"
+        ) from exc
     except (OSError, ValueError, RuntimeError, urllib.error.URLError) as exc:
         raise RuntimeError(
             f"gateway completion smoke failed: {type(exc).__name__}: {exc}"
@@ -359,32 +431,30 @@ def _completion_smoke(token: str, timeout_seconds: int = 130) -> None:
         raise RuntimeError("completion smoke returned unexpected assistant content")
 
 
-def _wait_for_smoke(token_path: Path) -> None:
-    token = _wait_for_ready(token_path)
-    _completion_smoke(token)
+def _wait_for_smoke(token_path: Path, *, base_url: str = LOCAL_BASE_URL) -> None:
+    token = _wait_for_ready(token_path, base_url=base_url)
+    _completion_smoke(token, base_url=base_url)
 
 
 def _rollback_install(
     *,
-    gateway_snapshot: tuple[bytes, int] | None,
-    unit_snapshot: tuple[bytes, int] | None,
+    artifacts: list[tuple[Path, tuple[bytes, int] | None, str]],
     service_state: dict[str, bool],
+    timer_state: dict[str, bool],
     restore_service_state: bool,
 ) -> None:
     errors: list[str] = []
     if restore_service_state:
-        for action in ("stop", "disable"):
-            try:
-                result = _systemctl_probe(action, SERVICE_NAME)
-            except BaseException as exc:
-                errors.append(f"{action}: {type(exc).__name__}: {exc}")
-            else:
-                if result.returncode not in {0, 1, 5}:
-                    errors.append(f"{action}: exit {result.returncode}")
-    for destination, snapshot, label in (
-        (GATEWAY_EXEC_PATH, gateway_snapshot, "gateway executable"),
-        (UNIT_PATH, unit_snapshot, "systemd unit"),
-    ):
+        for name in (SERVICE_NAME, PROBE_TIMER_NAME):
+            for action in ("stop", "disable"):
+                try:
+                    result = _systemctl_probe(action, name)
+                except BaseException as exc:
+                    errors.append(f"{action} {name}: {type(exc).__name__}: {exc}")
+                else:
+                    if result.returncode not in {0, 1, 5}:
+                        errors.append(f"{action} {name}: exit {result.returncode}")
+    for destination, snapshot, label in reversed(artifacts):
         try:
             _restore_file(destination, snapshot, label=label)
         except BaseException as exc:
@@ -393,22 +463,34 @@ def _rollback_install(
         _systemctl("daemon-reload")
     except BaseException as exc:
         errors.append(f"daemon-reload: {type(exc).__name__}: {exc}")
-    if restore_service_state and unit_snapshot is not None:
-        try:
-            if service_state["enabled"]:
-                _systemctl("enable", SERVICE_NAME)
-            else:
-                result = _systemctl_probe("disable", SERVICE_NAME)
-                if result.returncode not in {0, 1, 5}:
-                    raise RuntimeError(f"disable exited {result.returncode}")
-            if service_state["active"]:
-                _systemctl("restart", SERVICE_NAME)
-            else:
-                result = _systemctl_probe("stop", SERVICE_NAME)
-                if result.returncode not in {0, 1, 5}:
-                    raise RuntimeError(f"stop exited {result.returncode}")
-        except BaseException as exc:
-            errors.append(f"restore service state: {type(exc).__name__}: {exc}")
+    if restore_service_state:
+        for name, old_state, exists in (
+            (SERVICE_NAME, service_state, any(
+                destination == UNIT_PATH and snapshot is not None
+                for destination, snapshot, _ in artifacts
+            )),
+            (PROBE_TIMER_NAME, timer_state, any(
+                destination == PROBE_TIMER_PATH and snapshot is not None
+                for destination, snapshot, _ in artifacts
+            )),
+        ):
+            if not exists:
+                continue
+            try:
+                if old_state["enabled"]:
+                    _systemctl("enable", name)
+                else:
+                    result = _systemctl_probe("disable", name)
+                    if result.returncode not in {0, 1, 5}:
+                        raise RuntimeError(f"disable exited {result.returncode}")
+                if old_state["active"]:
+                    _systemctl("restart", name)
+                else:
+                    result = _systemctl_probe("stop", name)
+                    if result.returncode not in {0, 1, 5}:
+                        raise RuntimeError(f"stop exited {result.returncode}")
+            except BaseException as exc:
+                errors.append(f"restore service state {name}: {type(exc).__name__}: {exc}")
     if errors:
         raise RuntimeError("installer rollback failed: " + "; ".join(errors))
 
@@ -416,6 +498,14 @@ def _rollback_install(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Install the controlled Juno OpenAI-compatible gateway"
+    )
+    parser.add_argument(
+        "--smoke-only", action="store_true",
+        help="test existing live service including a real authenticated Codex reply without installation",
+    )
+    parser.add_argument(
+        "--smoke-https-origin", metavar="URL",
+        help="optional private Tailscale Serve HTTPS origin, verified against live Serve status",
     )
     parser.add_argument(
         "--no-start",
@@ -427,25 +517,66 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    gateway_snapshot = _snapshot_file(
-        GATEWAY_EXEC_PATH, label="existing gateway executable"
-    )
-    unit_snapshot = _snapshot_file(UNIT_PATH, label="existing systemd unit")
+    if args.smoke_https_origin and not args.smoke_only:
+        raise RuntimeError("--smoke-https-origin requires --smoke-only")
+    if args.smoke_only:
+        if args.no_start:
+            raise RuntimeError("--smoke-only cannot be combined with --no-start")
+        base_url = (
+            _verified_https_smoke_url(args.smoke_https_origin)
+            if args.smoke_https_origin else LOCAL_BASE_URL
+        )
+        _wait_for_smoke(TOKEN_PATH, base_url=base_url)
+        print(json.dumps({
+            "status": "passed", "model": MODEL_ID,
+            "base_url": base_url, "completion_smoke": True,
+            "tailscale_serve_changed": False,
+        }, sort_keys=True, separators=(",", ":")))
+        return 0
+    artifacts = [
+        (GATEWAY_EXEC_PATH, _snapshot_file(
+            GATEWAY_EXEC_PATH, label="existing gateway executable"
+        ), "gateway executable"),
+        (LAUNCHER_EXEC_PATH, _snapshot_file(
+            LAUNCHER_EXEC_PATH, label="existing runtime launcher"
+        ), "runtime launcher"),
+        (UNIT_PATH, _snapshot_file(
+            UNIT_PATH, label="existing systemd unit"
+        ), "systemd unit"),
+        (PROBE_SERVICE_PATH, _snapshot_file(
+            PROBE_SERVICE_PATH, label="existing probe service"
+        ), "probe service"),
+        (PROBE_TIMER_PATH, _snapshot_file(
+            PROBE_TIMER_PATH, label="existing probe timer"
+        ), "probe timer"),
+    ]
     previous_service_state = _service_state()
+    previous_timer_state = _probe_timer_state()
     token_created = False
-    gateway_sha256 = ""
-    unit_sha256 = ""
+    hashes: dict[str, str] = {}
     service_mutation_started = False
     try:
         token_created = _ensure_token(TOKEN_PATH)
-        gateway_sha256 = _install_file(
+        hashes["gateway_sha256"] = _install_file(
             GATEWAY_SOURCE_PATH, GATEWAY_EXEC_PATH, mode=0o700
         )
-        unit_sha256 = _install_unit(TEMPLATE_PATH, UNIT_PATH)
+        hashes["launcher_sha256"] = _install_file(
+            LAUNCHER_SOURCE_PATH, LAUNCHER_EXEC_PATH, mode=0o700
+        )
+        hashes["unit_sha256"] = _install_unit(TEMPLATE_PATH, UNIT_PATH)
+        hashes["probe_service_sha256"] = _install_unit(
+            PROBE_SERVICE_TEMPLATE_PATH, PROBE_SERVICE_PATH
+        )
+        hashes["probe_timer_sha256"] = _install_unit(
+            PROBE_TIMER_TEMPLATE_PATH, PROBE_TIMER_PATH
+        )
         _systemctl("daemon-reload")
         state = "installed"
         if not args.no_start:
             service_mutation_started = True
+            # A stale catalog must not block an otherwise valid initial install.
+            _systemctl("start", PROBE_SERVICE_NAME)
+            _systemctl("enable", "--now", PROBE_TIMER_NAME)
             _systemctl("enable", SERVICE_NAME)
             _systemctl("restart", SERVICE_NAME)
             _wait_for_smoke(TOKEN_PATH)
@@ -455,9 +586,9 @@ def main(argv: list[str] | None = None) -> int:
     except BaseException as install_error:
         try:
             _rollback_install(
-                gateway_snapshot=gateway_snapshot,
-                unit_snapshot=unit_snapshot,
+                artifacts=artifacts,
                 service_state=previous_service_state,
+                timer_state=previous_timer_state,
                 restore_service_state=service_mutation_started,
             )
         except BaseException as rollback_error:
@@ -472,12 +603,12 @@ def main(argv: list[str] | None = None) -> int:
                 "state": state,
                 "token_created": token_created,
                 "gateway_path": str(GATEWAY_EXEC_PATH),
-                "gateway_sha256": gateway_sha256,
-                "unit_sha256": unit_sha256,
+                "launcher_path": str(LAUNCHER_EXEC_PATH),
                 "local_base_url": LOCAL_BASE_URL,
                 "model": MODEL_ID,
                 "completion_smoke": not args.no_start,
                 "tailscale_serve_changed": False,
+                **hashes,
             },
             sort_keys=True,
             separators=(",", ":"),

@@ -56,12 +56,12 @@ def _sha256_json(value: Any) -> str:
 def _github_token() -> str:
     """Resolve the existing trusted operator GitHub credential; never fall back to anonymous."""
     try:
-        import grabowski_operator as operator
+        import grabowski_operator_core as operator
 
         # Reuse the operator's isolated, bounded gh-auth/keyring lookup. The
         # token remains process-local and never enters a receipt or URL.
         return operator._github_pr_view_auth_token(
-            str(operator.TRUSTED_GITHUB_CLI_PATH), dict(os.environ), "github.com"
+            operator._trusted_github_cli_path(), dict(os.environ), "github.com"
         )
     except Exception:
         # A credential helper may raise an exception carrying a token or its

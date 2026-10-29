@@ -187,6 +187,39 @@ class CodingAgentRouterTests(unittest.TestCase):
             json.dumps(self.state, sort_keys=True, indent=2) + "\n", encoding="utf-8"
         )
 
+    def test_codex_only_juno_does_not_require_unrelated_grok_auth(self) -> None:
+        self.grok_auth_identity_mock.return_value = None
+        self.assertFalse(router._state_catalog_fresh(self.state))
+        self.assertTrue(router._state_catalog_fresh(
+            self.state, require_grok_auth_identity=False
+        ))
+        codex = router.select_contrast_routes(
+            "triage", changed_files=0, duration_minutes=3,
+            novelty="low", risk_flags=["private-context", "user_data"],
+            latency_priority=True, max_candidates=2, allow_paid=False,
+            allowed_harnesses={"codex"},
+        )
+        self.assertEqual(codex["status"], "recommended")
+        self.assertTrue(codex["routes"])
+        contract = router.advisory_route_execution_contract(
+            codex["routes"][0]["route"], paid_execution_authorized=False
+        )
+        self.assertEqual(contract["harness"], "codex")
+        self.assertFalse(contract["paid_only"])
+        for allowed in (None, {"grok"}, {"codex", "grok"}):
+            broad = router.select_contrast_routes(
+                "triage", allowed_harnesses=allowed
+            )
+            self.assertEqual(broad["status"], "router-state-stale")
+        self.state["catalog"]["observed_at"] = (
+            datetime.now(timezone.utc) - timedelta(hours=2)
+        ).isoformat()
+        self._write_state()
+        stale = router.select_contrast_routes(
+            "triage", allowed_harnesses={"codex"}
+        )
+        self.assertEqual(stale["status"], "router-state-stale")
+
     def test_catalog_freshness_invalidates_on_grok_auth_file_change(self) -> None:
         self.assertTrue(router._state_catalog_fresh(self.state))
         self.grok_auth_identity_mock.return_value = "b" * 64
@@ -2014,6 +2047,14 @@ class CodingAgentRouterTests(unittest.TestCase):
         }
         self.assertNotIn("claude-fable-5-contrast-high", all_review_routes)
         self.assertNotIn("claude-fable-5-writer-high", all_review_routes)
+
+    def test_grok_47_quality_and_review_policy_indexes_remain_consistent(self) -> None:
+        policy = self.catalog["policy"]
+        self.assertEqual(self.catalog["models"]["grok-4.7"]["quality_prior_class"], "A")
+        self.assertIn("grok-4.7", policy["quality_classes"]["A"]["models"])
+        self.assertIn("grok-4.6", policy["quality_classes"]["A"]["models"])
+        self.assertIn("grok-4.7-review-high", policy["frontier_model_policy"]["upper_review_or_contrast_routes"])
+        self.assertIn("grok-4.6-review-high", policy["frontier_model_policy"]["upper_review_or_contrast_routes"])
 
     def test_jules_is_a_managed_harness_not_a_ranked_model_claim(self) -> None:
         model = self.catalog["models"]["jules-managed-latest"]

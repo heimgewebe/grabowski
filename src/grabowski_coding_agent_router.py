@@ -1206,7 +1206,9 @@ def _grok_auth_file_identity(*, home: Path | None = None) -> str | None:
             os.close(descriptor)
 
 
-def _state_catalog_fresh(state: dict[str, Any]) -> bool:
+def _state_catalog_fresh(
+    state: dict[str, Any], *, require_grok_auth_identity: bool = True,
+) -> bool:
     catalog_state = state.get("catalog", {})
     observed = _parse_time(catalog_state.get("observed_at"))
     if observed is None:
@@ -1214,6 +1216,11 @@ def _state_catalog_fresh(state: dict[str, Any]) -> bool:
     age = (_utc_now() - observed).total_seconds()
     if not 0 <= age <= CATALOG_FRESHNESS_SECONDS:
         return False
+    if not require_grok_auth_identity:
+        # A Codex-only sandbox has no reason to read Grok's private auth
+        # directory. Preserve timestamp and catalog identity checks while
+        # letting route-specific callers ignore that unrelated credential.
+        return True
     providers = catalog_state.get("providers")
     # Freshness is not a structural validator. Preserve malformed-state
     # classification for the normal router validation path, and permit bounded
@@ -2140,7 +2147,8 @@ def _validate_request(
 
 
 def _current_contrast_state(
-    catalog: dict[str, Any], validation: dict[str, Any]
+    catalog: dict[str, Any], validation: dict[str, Any],
+    *, require_grok_auth_identity: bool = True,
 ) -> tuple[dict[str, Any] | None, str, str | None]:
     state, error_type = _load_optional_advisory_state()
     if error_type is not None:
@@ -2149,7 +2157,9 @@ def _current_contrast_state(
         return None, "router-state-unavailable", None
     if state.get("catalog_sha256") != validation["catalog_sha256"]:
         return None, "router-state-catalog-mismatch", None
-    if not _state_catalog_fresh(state):
+    if not _state_catalog_fresh(
+        state, require_grok_auth_identity=require_grok_auth_identity
+    ):
         return None, "router-state-stale", None
     return state, "current", None
 
@@ -2190,7 +2200,12 @@ def select_contrast_routes(
         raise CodingAgentRouterError("max_candidates must be 1 or 2")
     if type(allow_paid) is not bool:
         raise CodingAgentRouterError("allow_paid must be boolean")
-    state, status, error_type = _current_contrast_state(catalog, validation)
+    state, status, error_type = _current_contrast_state(
+        catalog, validation,
+        require_grok_auth_identity=(
+            allowed_harnesses is None or "grok" in allowed_harnesses
+        ),
+    )
     if state is None:
         return {
             "status": status,
@@ -2391,7 +2406,10 @@ def coding_agent_pre_dispatch_admission(argv: list[str]) -> dict[str, Any]:
         )
 
     capacity_contract = next(iter(capacity_contracts.values()))
-    state, state_status, state_error_type = _current_contrast_state(catalog, validation)
+    state, state_status, state_error_type = _current_contrast_state(
+        catalog, validation,
+        require_grok_auth_identity=capacity_contract["harness"] == "grok",
+    )
     if state is None:
         return _pre_dispatch_admission_receipt(
             {
@@ -2517,7 +2535,9 @@ def _advisory_route_execution_contract(
         raise CodingAgentRouterError(
             "paid-only route requires explicit paid execution authorization"
         )
-    state, status, error_type = _current_contrast_state(catalog, validation)
+    state, status, error_type = _current_contrast_state(
+        catalog, validation, require_grok_auth_identity=route["harness"] == "grok"
+    )
     if state is None:
         suffix = f" ({error_type})" if error_type else ""
         raise CodingAgentRouterError(
