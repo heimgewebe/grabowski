@@ -10584,17 +10584,21 @@ def grabowski_task_resume(
                 "Task with managed local output cannot resume on non-local transport; "
                 "restore the fleet host to local transport or start a new task"
             )
-    task_output_remote_home = _task_output_remote_home(record)
-    task_output_remote_target = _task_output_remote_target(record)
-    if task_output_remote_target is not None:
-        recovery_launcher_bindings[TASK_OUTPUT_REMOTE_TARGET_BINDING_KEY] = (
-            task_output_remote_target
-        )
-    if task_output_remote_home is not None:
-        recovery_launcher_bindings[TASK_OUTPUT_REMOTE_HOME_BINDING_KEY] = (
-            task_output_remote_home
-        )
+    task_output_remote_home: str | None = None
+    task_output_remote_target: str | None = None
     if not _is_root_systemd_backend(record):
+        # Rootbroker resumes run locally through the privileged broker and
+        # must not depend on a renamed or absent user Fleet registry.
+        task_output_remote_home = _task_output_remote_home(record)
+        task_output_remote_target = _task_output_remote_target(record)
+        if task_output_remote_target is not None:
+            recovery_launcher_bindings[TASK_OUTPUT_REMOTE_TARGET_BINDING_KEY] = (
+                task_output_remote_target
+            )
+        if task_output_remote_home is not None:
+            recovery_launcher_bindings[TASK_OUTPUT_REMOTE_HOME_BINDING_KEY] = (
+                task_output_remote_home
+            )
         _resolved_host, resume_target, _legacy_local_alias = (
             _resolve_task_dispatch_host(str(record["host"]))
         )

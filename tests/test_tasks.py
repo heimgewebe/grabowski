@@ -3431,6 +3431,39 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(payload["runtime_seconds"], 300)
         self.assertEqual(result["audit"]["execution_backend"], "systemd-root-broker")
 
+    def test_root_broker_resume_survives_missing_fleet_registry(self) -> None:
+        started = self._start()
+        task_id = str(started["task"]["task_id"])
+        with tasks._database_connection() as connection:
+            connection.execute(
+                "UPDATE tasks SET execution_backend='systemd-root-broker', "
+                "systemd_scope='system' WHERE task_id=?",
+                (task_id,),
+            )
+        observation = {
+            "state": "failed",
+            "properties": {"Result": "exit-code"},
+            "probe": _launcher(returncode=1),
+            "observer": {"kind": "test"},
+            "observed_at_unix": int(time.time()),
+        }
+        with (
+            patch.object(tasks, "_observe", return_value=observation),
+            patch.object(tasks, "_launch", return_value=_launcher()) as launch,
+            patch.object(
+                tasks.fleet,
+                "fleet_host",
+                side_effect=RuntimeError("Fleet registry missing: /ci/fleet.json"),
+            ) as fleet,
+            patch.object(tasks, "_require_recovery_gate", return_value={"checked_at_unix": 207}),
+            patch.object(tasks.base, "_append_audit"),
+        ):
+            resumed = tasks.grabowski_task_resume(task_id)
+        fleet.assert_not_called()
+        launch.assert_called_once()
+        self.assertEqual(resumed["task"]["attempt"], 2)
+        self.assertEqual(resumed["task"]["execution_backend"], "systemd-root-broker")
+
     def test_root_task_status_logs_and_cancel_route_by_stored_scope(self) -> None:
         running = _launcher()
         running["stdout"] = (
