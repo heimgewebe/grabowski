@@ -117,6 +117,31 @@ class CodingAgentCatalogDataTests(unittest.TestCase):
         self.assertEqual(routes["openhands-always-approve"]["harness"], "openhands")
         self.assertIn("--always-approve", routes["openhands-always-approve"]["argv_prefix"])
 
+    def test_grok_review_routes_match_role_prompt_contract(self) -> None:
+        from grabowski_agent_role import _grok_streaming_review_command
+        from grabowski_decision_reviews import _review_route_evidence
+
+        catalog, _ = router._load_catalog()
+        routes = {route["id"]: route for route in catalog["routes"]}
+        for model in ("grok-4.6", "grok-4.7"):
+            with self.subTest(model=model):
+                prefix = routes[f"{model}-review-high"]["argv_prefix"]
+                # The role requires -p immediately before the final prompt.
+                self.assertEqual(prefix[-1], "-p")
+                command = [*prefix, "Review this exact frozen diff"]
+                evidence = _review_route_evidence(command)
+                self.assertIsNotNone(evidence)
+                self.assertEqual(evidence["model"], model)
+                argv, prompt = _grok_streaming_review_command(
+                    tuple(command),
+                    expected_head="a" * 40,
+                    expected_base_head="b" * 40,
+                    review_diff=b"diff --git a/x b/x\\n",
+                )
+                self.assertIn("--sandbox", argv)
+                self.assertIn("off", argv)
+                self.assertIn(b"--- BEGIN GRABOWSKI BOUND DIFF ---", prompt)
+
     def test_ox_alpha_openrouter_preview_is_retired_fail_closed(self) -> None:
         catalog, _ = router._load_catalog()
         routes = {item["id"]: item for item in catalog["routes"]}
