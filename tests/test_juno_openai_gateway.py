@@ -163,9 +163,55 @@ def test_route_selection_is_codex_nonpaid_and_revalidated(
         advisory_route_execution_contract=contract,
     )
     monkeypatch.setattr(gateway, "_router_module", lambda: router)
+    monkeypatch.setattr(gateway, "_codex_advertised_model_ids", lambda: {"gpt-5.3-codex-spark"})
     result = gateway.select_advisory_contract()
     assert result["route_id"] == "codex-spark-low"
     assert seen == {"route_id": "codex-spark-low", "paid": False}
+
+
+
+def test_codex_model_cache_reports_account_supported_models(tmp_path: Path) -> None:
+    cache = tmp_path / "models_cache.json"
+    cache.write_text(json.dumps({
+        "models": [{"slug": "gpt-5.6-luna"}, {"slug": "gpt-5.6-sol"}]
+    }), encoding="utf-8")
+    assert gateway._codex_advertised_model_ids(cache_path=cache) == {
+        "gpt-5.6-luna", "gpt-5.6-sol"
+    }
+    cache.write_text("{not json", encoding="utf-8")
+    assert gateway._codex_advertised_model_ids(cache_path=cache) is None
+
+
+def test_unsupported_codex_spark_falls_back_to_authorized_luna(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, bool]] = []
+
+    def contract(route_id: str, *, paid_execution_authorized: bool) -> dict[str, object]:
+        calls.append((route_id, paid_execution_authorized))
+        return {
+            **_contract(),
+            "route_id": route_id,
+            "argv_prefix": ["codex", "--model", "gpt-5.6-luna"],
+        }
+
+    router = SimpleNamespace(
+        select_contrast_routes=lambda *args, **kwargs: {
+            "status": "recommended",
+            "routes": [{
+                "route": "codex-spark-low",
+                "harness": "codex",
+                "provider_family": "openai",
+                "paid_only": False,
+            }],
+        },
+        advisory_route_execution_contract=contract,
+    )
+    monkeypatch.setattr(gateway, "_router_module", lambda: router)
+    monkeypatch.setattr(gateway, "_codex_advertised_model_ids", lambda: {"gpt-5.6-luna"})
+    selected = gateway.select_advisory_contract()
+    assert selected["route_id"] == "codex-luna-low"
+    assert calls == [("codex-luna-low", False)]
 
 
 def test_route_selection_rejects_paid_openrouter_or_wrong_harness(

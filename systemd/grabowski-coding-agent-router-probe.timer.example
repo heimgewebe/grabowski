@@ -3,7 +3,7 @@ Description=Keep Grabowski coding-agent routing metadata fresh
 
 [Timer]
 OnBootSec=3min
-OnUnitInactiveSec=30min
+OnCalendar=*:0/30
 AccuracySec=1min
 Persistent=true
 Unit=grabowski-coding-agent-router-probe.service
