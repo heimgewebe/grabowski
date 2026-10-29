@@ -8568,7 +8568,10 @@ def _start_job(
                     "source": "validated-finalization-receipt",
                     "receipt_sha256": receipt["receipt_sha256"],
                 }
-            elif result.get("timed_out"):
+            else:
+                # --collect unloads both failed and successful short-lived jobs.
+                # Even a prompt nonzero launcher reply with a not-found unit
+                # cannot prove that no action ran. Avoid duplicate execution.
                 dispatch_readback = {
                     **dispatch_readback,
                     "outcome": "outcome_unknown",

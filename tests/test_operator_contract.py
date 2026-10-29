@@ -3512,7 +3512,7 @@ class OperatorContractTests(unittest.TestCase):
             "terminated_unclear",
         )
 
-    def test_launch_failure_persists_failed_evidence_not_started(self) -> None:
+    def test_collected_fast_launch_failure_preserves_unknown_without_receipt(self) -> None:
         operator = _load_operator_module()
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -3545,18 +3545,20 @@ class OperatorContractTests(unittest.TestCase):
             ), patch.object(operator.uuid, "uuid4", return_value=fake_uuid), patch.object(
                 operator, "_run", side_effect=[launcher, launch_readback]
             ):
-                with self.assertRaisesRegex(RuntimeError, "systemd refused launch"):
+                with self.assertRaises(operator.JobDispatchUnknown) as caught:
                     operator.grabowski_job_start(["python3", "-c", "print(1)"], cwd=str(cwd))
+            self.assertEqual(caught.exception.dispatch_outcome, "outcome_unknown")
 
             metadata_path = jobs / "grabowski-job-bad1a0c00000" / "metadata.json"
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-            self.assertEqual(metadata["final_status"], "launch_failed")
-            self.assertEqual(metadata["terminalization_evidence"]["source"], "systemd-run-launch")
-            self.assertEqual(metadata["terminalization_evidence"]["final_status"], "launch_failed")
+            self.assertEqual(metadata["final_status"], "launch_outcome_unknown")
+            self.assertEqual(metadata["terminalization_evidence"]["source"], "systemd-run-launch-readback")
+            self.assertEqual(metadata["terminalization_evidence"]["final_status"], "launch_outcome_unknown")
             self.assertFalse(metadata["terminalization_evidence"]["systemd_visible"])
             self.assertEqual(metadata["launcher_evidence"]["returncode"], 1)
-            self.assertEqual(metadata["dispatch_outcome"], "not_started")
-            self.assertEqual(metadata["dispatch_readback"]["outcome"], "not_started")
+            self.assertEqual(metadata["dispatch_outcome"], "outcome_unknown")
+            self.assertEqual(metadata["dispatch_readback"]["outcome"], "outcome_unknown")
+            self.assertEqual(metadata["dispatch_readback"]["source"], "collect-mode-unloaded-or-never-started")
             self.assertNotEqual(metadata["final_status"], "started")
 
             systemctl = {
@@ -3578,9 +3580,8 @@ class OperatorContractTests(unittest.TestCase):
                 status = operator.grabowski_job_status("grabowski-job-bad1a0c00000")
 
             self.assertFalse(status["systemd_visible"])
-            self.assertEqual(status["final_status"], "launch_failed")
-            self.assertEqual(status["terminalization_evidence"]["source"], "systemd-run-launch")
-            self.assertEqual(status["notification_evidence"]["final_status_preserved"], "launch_failed")
+            self.assertNotEqual(status["final_status"], "launch_failed")
+            self.assertNotEqual(status["terminalization_evidence"]["source"], "systemd-run-launch")
 
     def test_launcher_error_with_started_readback_is_a_started_job(self) -> None:
         operator = _load_operator_module()
@@ -3623,15 +3624,16 @@ class OperatorContractTests(unittest.TestCase):
 
     def test_collected_launcher_timeout_uses_receipt_or_preserves_unknown(self) -> None:
         operator = _load_operator_module()
-        for receipt_valid in (True, False):
-            with self.subTest(receipt_valid=receipt_valid), tempfile.TemporaryDirectory() as tmp:
+        for receipt_valid, timed_out in ((True, True), (True, False), (False, True), (False, False)):
+            with self.subTest(receipt_valid=receipt_valid, timed_out=timed_out), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 state, jobs, cwd = root / "state", root / "state/jobs", root / "cwd"
                 cwd.mkdir()
                 launcher = {
                     "returncode": 1, "stdout": "", "stderr": "lost launcher reply",
                     "argv": [], "argv_sha256": "0" * 64, "command": "systemd-run",
-                    "cwd": str(root), "timed_out": True, "duration_seconds": 60.0,
+                    "cwd": str(root), "timed_out": timed_out,
+                    "duration_seconds": 60.0 if timed_out else 0.01,
                     "stdout_truncated": False, "stderr_truncated": False,
                 }
                 readback = {
