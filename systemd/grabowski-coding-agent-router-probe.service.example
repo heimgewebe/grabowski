@@ -1,0 +1,15 @@
+[Unit]
+Description=Refresh Grabowski coding-agent routing metadata
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h
+Environment=HOME=%h
+Environment=PATH=%h/.nix-profile/bin:%h/.local/bin:/run/current-system/sw/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.local/libexec/grabowski/grabowski_juno_runtime_launcher.py probe
+TimeoutStartSec=90
+StandardOutput=null
+StandardError=journal
+LimitCORE=0
