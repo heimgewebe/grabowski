@@ -1192,10 +1192,19 @@ def _nix_installed_generation_requisites(
     """
     query = subprocess.run(
         [executable, "--query", "--requisites",
-         *(link for link, _target in system_generations)],
+         *(target for _link, target in system_generations)],
+        # Preserve nix-store as argv[0] for the Nix multicall dispatcher,
+        # but execute the already verified immutable store binary, not the
+        # mutable current-system symlink.
+        executable=resolved_binary,
         capture_output=True, text=True, timeout=15, check=False,
+        # NIX_USER_CONF_FILES overrides ambient per-user nix.conf paths.
+        # Never load same-UID plugin-files while verifying review authority.
         env={"PATH": "/run/current-system/sw/bin:/usr/bin:/bin",
-             "NIX_REMOTE": "daemon", "NIX_CONFIG": ""},
+             "NIX_REMOTE": "daemon", "NIX_CONFIG": "",
+             "NIX_USER_CONF_FILES": "/dev/null",
+             "HOME": "/var/empty", "XDG_CONFIG_HOME": "/var/empty",
+             "NIX_CONFIG_HOME": "/var/empty"},
     )
     if query.returncode != 0 or len(query.stdout) > 8 * 1024 * 1024:
         raise ValueError("root-installed NixOS generation closure unavailable")
@@ -1316,6 +1325,22 @@ def _historical_nix_review_role_matches(
         ):
             return False
         package_stat = package.lstat()
+        # A module's immutable inode is meaningful only while every
+        # intermediate directory is root-owned and non-writable.  lstat
+        # excludes aliasing via symlinked bin/lib/site-packages parents.
+        for directory in (
+            package / "bin",
+            package / "lib",
+            package / "lib" / relative_module[1],
+            package / "lib" / relative_module[1] / "site-packages",
+        ):
+            directory_stat = directory.lstat()
+            if (
+                not stat.S_ISDIR(directory_stat.st_mode)
+                or directory_stat.st_uid != _NIX_REVIEW_OWNER_UID
+                or stat.S_IMODE(directory_stat.st_mode) & 0o022
+            ):
+                return False
         module_stat = module.lstat()
         runner_stat = runner.lstat()
         resolved_runner = runner.resolve(strict=True)

@@ -118,6 +118,21 @@ class NixReviewerHistoryTests(unittest.TestCase):
         self.package.chmod(0o755)
         self.assertTrue(self.accepted())
 
+    def test_all_intermediate_package_directories_are_root_owned_and_nonwritable(self) -> None:
+        folders = [
+            self.package / "bin",
+            self.package / "lib",
+            self.package / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}",
+            self.module.parent,
+        ]
+        self.assertTrue(self.accepted())
+        for folder in folders:
+            with self.subTest(folder=folder):
+                folder.chmod(0o775)
+                self.assertFalse(self.accepted())
+                folder.chmod(0o755)
+                self.assertTrue(self.accepted())
+
     def test_real_nix_store_group_writable_sticky_directory(self) -> None:
         self.store.chmod(0o775)
         self.assertFalse(self.accepted())
@@ -188,7 +203,15 @@ class NixInstalledSystemGenerationTests(unittest.TestCase):
         response = mock.Mock(returncode=0, stdout=f"{self.package}\n", stderr="")
         with mock.patch.object(reviews.subprocess, "run", return_value=response) as runner:
             self.assertTrue(reviews._historical_nix_deployed_generation_contains(self.package))
-            self.assertIn(str(self.link), runner.call_args.args[0])
+            invoked = runner.call_args.args[0]
+            options = runner.call_args.kwargs
+            self.assertIn(str(self.system), invoked)
+            self.assertNotIn(str(self.link), invoked)
+            self.assertEqual(str(self.bin), invoked[0])  # multicall argv[0]
+            self.assertEqual(str(self.bin.resolve(strict=True)), options["executable"])
+            self.assertEqual("/dev/null", options["env"]["NIX_USER_CONF_FILES"])
+            self.assertEqual("/var/empty", options["env"]["HOME"])
+            self.assertEqual("/var/empty", options["env"]["XDG_CONFIG_HOME"])
             self.assertFalse(reviews._historical_nix_deployed_generation_contains(
                 self.store / ("d" * 32 + "-grabowski-operator-deadbeef")
             ))
@@ -213,6 +236,23 @@ class NixInstalledSystemGenerationTests(unittest.TestCase):
             self.link.symlink_to(updated_system)
             self.assertFalse(reviews._historical_nix_deployed_generation_contains(self.package))
             self.assertEqual(runner.call_count, 2)
+
+    def test_nix_executable_and_generation_targets_remain_pinned_if_links_change(self):
+        prior_binary = self.bin.resolve(strict=True)
+        alternate = self.store / ("d" * 32 + "-nix-2.34.9") / "bin" / "nix-store"
+        alternate.parent.mkdir(parents=True)
+        alternate.write_text("#!/bin/sh\n", encoding="utf-8")
+        alternate.chmod(0o555)
+        def retarget_after_validation(argv, **kwargs):
+            self.assertEqual(str(prior_binary), kwargs["executable"])
+            self.assertIn(str(self.system), argv)
+            self.assertNotIn(str(self.link), argv)
+            self.bin.unlink()
+            self.bin.symlink_to(alternate)
+            self.assertNotEqual(str(self.bin.resolve(strict=True)), kwargs["executable"])
+            return mock.Mock(returncode=0, stdout=f"{self.package}\n", stderr="")
+        with mock.patch.object(reviews.subprocess, "run", side_effect=retarget_after_validation):
+            self.assertTrue(reviews._historical_nix_deployed_generation_contains(self.package))
 
     def test_untrusted_profile_and_binary_links_rejected_before_nix_query(self):
         with mock.patch.object(reviews.subprocess, "run") as runner:
