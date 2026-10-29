@@ -119,10 +119,14 @@ def _current_source(repo: Path, binding: dict[str, Any]) -> str:
         repo, expected_repo=binding.get("repo") if isinstance(binding, dict) else None,
     )
     if binding.get("review_purpose") == "frozen_candidate":
+        requested = binding["candidate_binding"]
         context, observed_repo = _frozen_candidate_context(
-            binding["candidate_binding"]["workspace_id"],
+            requested["workspace_id"],
+            # Existing signed batches keep their full-payload origin. New
+            # batches bind only already-verified role and task digests.
+            legacy_extended="writer_receipt" in requested,
         )
-        if observed_repo != real or context != binding["candidate_binding"]:
+        if observed_repo != real or context != requested:
             raise provenance.ReviewExecutionRejected("frozen Candidate source drift")
         return provenance._digest(context)
     head = _read_command(real, ["rev-parse", "HEAD"]).decode().strip()
@@ -199,12 +203,15 @@ def _candidate_recorded_task_argv(task_id: str, *, module: str) -> list[str]:
     return argv
 
 
-def _frozen_candidate_context(workspace_id: str) -> tuple[dict[str, Any], Path]:
-    """Reconstruct the frozen identity from owning private receipts and Git.
+def _frozen_candidate_context(
+    workspace_id: str, *, legacy_extended: bool = False,
+) -> tuple[dict[str, Any], Path]:
+    """Verify frozen role/task provenance and bind its immutable SHA-256 values.
 
-    This read never calls status/recovery, acquires a lease or rewrites a patch.
-    The authenticated session signs this entire context, including the original
-    writer/test task and receipt material, and every subsequent read checks it.
+    The authenticated new session signs compact digests after independently
+    verifying the original Writer/Test receipts and server task outcomes.
+    Historical full-payload sessions retain exact source checks and signatures.
+    This read never mutates a workspace, task or artifact.
     """
     import grabowski_agent_workspace as workspace
     import grabowski_agent_role as role
@@ -325,12 +332,27 @@ def _frozen_candidate_context(workspace_id: str) -> tuple[dict[str, Any], Path]:
     test_task = _candidate_task_evidence(
         manifest["tasks"]["tests"], workspace._task_argv_sha256(tests_argv), worktree,
     )
+    role_task_origin = (
+        {
+            "writer_receipt": writer, "test_receipt": tests,
+            "writer_task": writer_task, "test_task": test_task,
+        }
+        if legacy_extended else {
+            # Keep the signed session independent of arbitrarily long stdout
+            # and stderr captures while retaining every verified origin byte
+            # through a stable digest. The current source observer recomputes
+            # all four digests from private records before admitting each read.
+            "writer_receipt_sha256": writer["receipt_sha256"],
+            "test_receipt_sha256": tests["receipt_sha256"],
+            "writer_task_sha256": provenance._digest(writer_task),
+            "test_task_sha256": provenance._digest(test_task),
+        }
+    )
     return {
         "workspace_id": workspace_id, "candidate": candidate, "repo": slug,
         "base_sha": base, "head_sha": head, "diff_sha256": diff, "dirty": dirty,
         "patch": artifact, "changed_paths": snapshot["changed_paths"],
-        "writer_receipt": writer, "test_receipt": tests,
-        "writer_task": writer_task, "test_task": test_task,
+        **role_task_origin,
         "patch_bytes_sha256": hashlib.sha256(patch).hexdigest(),
     }, worktree
 

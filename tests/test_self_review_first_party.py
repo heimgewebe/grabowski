@@ -119,7 +119,8 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
             diff_sha256=diff_sha256,
         )
 
-    def _candidate_plan(self, *, dirty: bool = True, retried_tests: bool = False) -> dict:
+    def _candidate_plan(self, *, dirty: bool = True, retried_tests: bool = False,
+                        capture_tail_bytes: int = 0) -> dict:
         from test_agent_workspace import AgentWorkspaceTests, signed_role_receipt, workspace
         canonical = self.repo
         written_source = (canonical / self.source_path).read_bytes()
@@ -147,6 +148,13 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
         manifest["tasks"] = {"writer": "a" * 24, "tests": "b" * 24, "review": None}
         writer = workspace._role_receipt(manifest, "writer")
         writer.update({"expected_branch": "candidate-review", "branch_before": "candidate-review", "branch_after": "candidate-review"})
+        if capture_tail_bytes:
+            writer_capture = b"W" * capture_tail_bytes
+            writer.update({
+                "stdout_tail": writer_capture.decode("ascii"),
+                "stdout_bytes": len(writer_capture),
+                "stdout_sha256": hashlib.sha256(writer_capture).hexdigest(),
+            })
         writer["receipt_sha256"] = workspace._sha256_json({k: v for k, v in writer.items() if k != "receipt_sha256"})
         workspace._atomic_json(workspace._role_receipt_path(manifest, "writer"), writer)
         snapshot = workspace._git_snapshot(manifest, workspace._run)
@@ -172,9 +180,20 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
                 {"attempt": 2, "new_command_sha256": workspace._sha256_json(selected_tests)},
             ]}}
         tests_output = workspace._role_receipt_path(manifest, "tests", attempt=2 if retried_tests else 1)
-        workspace._atomic_json(tests_output, signed_role_receipt(
+        tests_receipt = signed_role_receipt(
             "tests", manifest, snapshot, argv_sha256=workspace._sha256_json(selected_tests),
-        ))
+        )
+        if capture_tail_bytes:
+            tests_capture = b"T" * capture_tail_bytes
+            tests_receipt.update({
+                "stdout_tail": tests_capture.decode("ascii"),
+                "stdout_bytes": len(tests_capture),
+                "stdout_sha256": hashlib.sha256(tests_capture).hexdigest(),
+            })
+            tests_receipt["receipt_sha256"] = workspace._sha256_json({
+                k: v for k, v in tests_receipt.items() if k != "receipt_sha256"
+            })
+        workspace._atomic_json(tests_output, tests_receipt)
         workspace._write_manifest(manifest)
         self.candidate_manifest = manifest
         self.workspace = workspace
@@ -258,6 +277,74 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
         self.assertEqual({"verdict": "PASS", "findings": []}, self._verify_candidate(plan))
         with self.assertRaises((review.ReviewExecutionRejected, FileExistsError, assertion.TransportAssertionReplay)):
             self._finalize_candidate(plan, started)
+
+    def test_full_captured_writer_test_output_allows_signed_candidate_session(self) -> None:
+        # Realistic max-size immutable role captures; hashes remain bound to
+        # the original Writer/Test receipts, not arbitrary caller-supplied PASS.
+        plan = self._candidate_plan(capture_tail_bytes=12_000)
+        binding = plan["binding"]["candidate_binding"]
+        writer = self.workspace._role_receipt(self.candidate_manifest, "writer")
+        tests = self.workspace._role_receipt(self.candidate_manifest, "tests")
+        self.assertEqual(12_000, len(writer["stdout_tail"]))
+        self.assertEqual(12_000, len(tests["stdout_tail"]))
+        self.assertEqual(writer["receipt_sha256"], binding["writer_receipt_sha256"])
+        self.assertEqual(tests["receipt_sha256"], binding["test_receipt_sha256"])
+        self.assertNotIn("writer_receipt", binding)
+        self.assertNotIn("test_receipt", binding)
+        self.assertLess(len(review._canonical(plan["binding"])), review.MAX_RECEIPT)
+        started = self._start_plan(plan)
+        session_file = self.state / "sessions" / started["review_session_id"] / "session.json"
+        self.assertLessEqual(session_file.stat().st_size, review.MAX_RECEIPT)
+        self.assertNotIn(b"W" * 100, session_file.read_bytes())
+        self.assertNotIn(b"T" * 100, session_file.read_bytes())
+        self._complete_candidate(plan, started)
+        self._finalize_candidate(plan, started)
+        self.assertEqual("PASS", self._verify_candidate(plan)["verdict"])
+
+    def test_historical_full_candidate_binding_still_verifies(self) -> None:
+        plan = self._candidate_plan()
+        legacy, _worktree = producer._frozen_candidate_context(
+            self.candidate_manifest["workspace_id"], legacy_extended=True,
+        )
+        self.assertIn("writer_receipt", legacy)
+        self.assertIn("test_receipt", legacy)
+        historical = {
+            **plan,
+            "binding": {**plan["binding"], "candidate_binding": legacy},
+            "source_raw_diff_sha256": review._digest(legacy),
+        }
+        self.assertEqual(
+            historical["source_raw_diff_sha256"],
+            producer._current_source(self.repo, historical["binding"]),
+        )
+        started = self._start_plan(historical)
+        self._complete_candidate(historical, started)
+        self._finalize_candidate(historical, started)
+        self.assertEqual("PASS", self._verify_candidate(historical)["verdict"])
+
+    def test_signed_legacy_candidate_reject_blocks_compact_review_batch(self) -> None:
+        # Rotating from the historical full receipt binding to the new
+        # digest-only format must not erase an authenticated material finding.
+        plan = self._candidate_plan()
+        old_context, _ = producer._frozen_candidate_context(
+            self.candidate_manifest["workspace_id"], legacy_extended=True,
+        )
+        legacy = {
+            **plan,
+            "binding": {**plan["binding"], "candidate_binding": old_context},
+            "source_raw_diff_sha256": review._digest(old_context),
+        }
+        started = self._start_plan(legacy)
+        self._complete_candidate(legacy, started, reject=True)
+        compact = producer.plan_frozen_candidate_review(
+            self.candidate_manifest["workspace_id"],
+        )
+        self.assertNotIn("writer_receipt", compact["binding"]["candidate_binding"])
+        with self.assertRaisesRegex(review.ReviewExecutionRejected, "previous signed material"):
+            review._assert_no_first_party_reject_for_legacy_review(
+                compact["binding"], repository=self.repo, root=self.state,
+                signers=self.signers, root_owned_signers=False,
+            )
 
     def test_dirty_candidate_finalization_accepts_substantive_signed_32k_receipt(self) -> None:
         plan = self._candidate_plan()
