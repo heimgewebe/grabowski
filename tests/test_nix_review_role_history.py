@@ -55,6 +55,15 @@ class NixReviewerHistoryTests(unittest.TestCase):
     def test_same_store_output_with_recorded_module_sha_is_accepted(self) -> None:
         self.assertTrue(self.accepted())
 
+    def test_nix_store_optimised_hardlinks_preserve_valid_module(self) -> None:
+        links = self.store / ".links"
+        links.mkdir()
+        twin = links / "identical-role-module"
+        os.link(self.module, twin)
+        self.assertEqual(self.module.stat().st_ino, twin.stat().st_ino)
+        self.assertGreater(self.module.stat().st_nlink, 1)
+        self.assertTrue(self.accepted())
+
     def test_recorded_module_bytes_must_still_match(self) -> None:
         self.assertTrue(self.accepted())
         self.module.chmod(0o644)

@@ -1228,7 +1228,6 @@ def _historical_nix_review_role_matches(
             or not (stat.S_ISREG(runner_stat.st_mode) or stat.S_ISLNK(runner_stat.st_mode))
             or not stat.S_ISREG(resolved_runner_stat.st_mode)
             or not os.access(resolved_runner, os.X_OK)
-            or module_stat.st_nlink != 1
         ):
             return False
         for info in (package_stat, module_stat, runner_stat, resolved_runner_stat):
