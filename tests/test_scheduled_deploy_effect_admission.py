@@ -225,6 +225,19 @@ class ScheduledWorkerGitFilterTests(unittest.TestCase):
             (repo / "ignored.log").write_text("ignored\n", encoding="utf-8")
             worker.verify_repository(repo, repo, "canonical-main", head)
 
+    def test_empty_untracked_directory_is_clean_but_contents_remain_dirty(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="worker-empty-dir-") as dirname:
+            repo, head = self.make_repo(Path(dirname))
+            empty = repo / "generated"
+            empty.mkdir()
+            worker.verify_repository(repo, repo, "canonical-main", head)
+            nested = empty / "nested"
+            nested.mkdir()
+            worker.verify_repository(repo, repo, "canonical-main", head)
+            (nested / "file.txt").write_text("untracked\n", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "dirty"):
+                worker.verify_repository(repo, repo, "canonical-main", head)
+
     def test_plain_repo_remains_eligible(self) -> None:
         with tempfile.TemporaryDirectory(prefix="worker-plain-filter-") as dirname:
             repo, head = self.make_repo(Path(dirname))

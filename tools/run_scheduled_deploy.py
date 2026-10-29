@@ -786,7 +786,7 @@ def _repository_dirty_without_git_filters(
         except ValueError:
             return True
     if _bounded_git_metadata(
-        repo, ["ls-files", "--others", "--exclude-standard", "--directory", "-z"],
+        repo, ["ls-files", "--others", "--exclude-standard", "--directory", "--no-empty-directory", "-z"],
         environment,
     ):
         return True
