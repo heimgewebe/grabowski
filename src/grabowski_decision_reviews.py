@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import closing, contextmanager
+from functools import lru_cache
 import fcntl
 import hashlib
 import hmac
@@ -1178,6 +1179,29 @@ _NIX_SYSTEM_PACKAGE_NAME = re.compile(
 )
 
 
+@lru_cache(maxsize=8)
+def _nix_installed_generation_requisites(
+    executable: str, resolved_binary: str,
+    system_generations: tuple[tuple[str, str], ...],
+) -> frozenset[str]:
+    """Memoize only immutable, root-controlled system generation closures.
+
+    Link path *and its resolved store target* are part of the cache identity.
+    Root changing or removing a generation forces a new validated lookup;
+    errors are never cached as a successful empty set.
+    """
+    query = subprocess.run(
+        [executable, "--query", "--requisites",
+         *(link for link, _target in system_generations)],
+        capture_output=True, text=True, timeout=15, check=False,
+        env={"PATH": "/run/current-system/sw/bin:/usr/bin:/bin",
+             "NIX_REMOTE": "daemon", "NIX_CONFIG": ""},
+    )
+    if query.returncode != 0 or len(query.stdout) > 8 * 1024 * 1024:
+        raise ValueError("root-installed NixOS generation closure unavailable")
+    return frozenset(query.stdout.splitlines())
+
+
 def _historical_nix_deployed_generation_contains(package: Path) -> bool:
     """Require root-authorized system-generation closure, not merely a store name.
 
@@ -1200,7 +1224,7 @@ def _historical_nix_deployed_generation_contains(package: Path) -> bool:
         entries = list(profiles.iterdir())
         if len(entries) > 512:
             return False
-        generations: list[Path] = []
+        generations: list[tuple[str, str]] = []
         for link in entries:
             if not _NIX_SYSTEM_PROFILE_NAME.fullmatch(link.name):
                 continue
@@ -1217,7 +1241,7 @@ def _historical_nix_deployed_generation_contains(package: Path) -> bool:
                 or stat.S_IMODE(target_stat.st_mode) & 0o022
             ):
                 return False
-            generations.append(link)
+            generations.append((str(link), str(target)))
         if not generations or len(generations) > 128:
             return False
         runner_lstat = program.lstat()
@@ -1233,18 +1257,16 @@ def _historical_nix_deployed_generation_contains(package: Path) -> bool:
             or not os.access(runner, os.X_OK)
         ):
             return False
-        # Nix accepts multiple closure roots in one invocation; a root-owned
-        # installed generation, not an arbitrary GC root, is the trust anchor.
-        query = subprocess.run(
-            [str(program), "--query", "--requisites", *map(str, sorted(generations))],
-            capture_output=True, text=True, timeout=15, check=False,
-            env={"PATH": "/run/current-system/sw/bin:/usr/bin:/bin",
-                 "NIX_REMOTE": "daemon", "NIX_CONFIG": ""},
+        # Use the exact resolved immutable Nix binary, not a mutable PATH or
+        # current-system symlink after validation. Cache only authenticated
+        # generation identity, never caller-supplied review verdicts.
+        # nix-store is a multi-call Nix wrapper. Preserve its verified argv[0]
+        # basename; executing the resolved bin/nix parses a different CLI.
+        # The resolved immutable binary remains part of the cache identity.
+        return str(package) in _nix_installed_generation_requisites(
+            str(program), str(runner), tuple(sorted(generations))
         )
-        if query.returncode != 0 or len(query.stdout) > 8 * 1024 * 1024:
-            return False
-        return str(package) in query.stdout.splitlines()
-    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+    except (OSError, ValueError, RuntimeError, UnicodeError, subprocess.SubprocessError):
         return False
 
 
@@ -1355,28 +1377,33 @@ def _normalize_review_role_provenance(
     stable_python = str(REVIEW_ROLE_STABLE_PYTHON.expanduser())
     recorded_module_path = value.get("runner_module_path")
     recorded_module_sha256 = value.get("runner_module_sha256")
-    historical_nix = _historical_nix_review_role_matches(
-        recorded_runner_python, recorded_module_path, recorded_module_sha256,
-    )
-    runner_python_matches = (
+    # Common/current runtime receipts need no historical Nix closure query.
+    # Only unresolved runner/module identity pairs enter the explicit fallback.
+    current_runner = (
         recorded_runner_python == REVIEW_ROLE_PYTHON
         and recorded_runner_python != stable_python
-    ) or _historical_review_role_python_matches(recorded_runner_python) or historical_nix
-    # Historical attempts bind the module bytes installed when the review ran.
-    # A later source upgrade must not erase that evidence. Never trust an
-    # arbitrary caller-selected digest: require the exact byte-matching module
-    # in an owner-controlled, immutable release-layout path.
-    module_identity_matches = (
-        (
-            recorded_module_sha256 == runner_module_sha256
-            and recorded_module_path == runner_module_path
-        )
-        or _historical_review_role_module_matches(
-            recorded_module_path,
-            expected_sha256=recorded_module_sha256,
-        )
-        or historical_nix
     )
+    current_module = (
+        recorded_module_sha256 == runner_module_sha256
+        and recorded_module_path == runner_module_path
+    )
+    legacy_runner = (
+        not current_runner
+        and _historical_review_role_python_matches(recorded_runner_python)
+    )
+    legacy_module = (
+        not current_module
+        and _historical_review_role_module_matches(
+            recorded_module_path, expected_sha256=recorded_module_sha256,
+        )
+    )
+    historical_nix = False
+    if not ((current_runner or legacy_runner) and (current_module or legacy_module)):
+        historical_nix = _historical_nix_review_role_matches(
+            recorded_runner_python, recorded_module_path, recorded_module_sha256,
+        )
+    runner_python_matches = current_runner or legacy_runner or historical_nix
+    module_identity_matches = current_module or legacy_module or historical_nix
     if (
         schema not in {1, 2}
         or value.get("kind") != "grabowski_decision_review_provenance"

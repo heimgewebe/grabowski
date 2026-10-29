@@ -192,11 +192,27 @@ class NixInstalledSystemGenerationTests(unittest.TestCase):
             self.assertFalse(reviews._historical_nix_deployed_generation_contains(
                 self.store / ("d" * 32 + "-grabowski-operator-deadbeef")
             ))
+            self.assertTrue(reviews._historical_nix_deployed_generation_contains(self.package))
+            runner.assert_called_once()  # one immutable installed-generation snapshot
 
     def test_noninstalled_nix_store_output_cannot_attest_review_origin(self):
         response = mock.Mock(returncode=0, stdout=f"{self.system}\n", stderr="")
         with mock.patch.object(reviews.subprocess, "run", return_value=response):
             self.assertFalse(reviews._historical_nix_deployed_generation_contains(self.package))
+
+    def test_profile_generation_rotation_invalidates_closure_cache(self):
+        response = [
+            mock.Mock(returncode=0, stdout=f"{self.package}\n", stderr=""),
+            mock.Mock(returncode=0, stdout=f"{self.system}\n", stderr=""),
+        ]
+        with mock.patch.object(reviews.subprocess, "run", side_effect=response) as runner:
+            self.assertTrue(reviews._historical_nix_deployed_generation_contains(self.package))
+            updated_system = self.store / ("d" * 32 + "-nixos-system-heim-pc-26.05.next")
+            updated_system.mkdir()
+            self.link.unlink()
+            self.link.symlink_to(updated_system)
+            self.assertFalse(reviews._historical_nix_deployed_generation_contains(self.package))
+            self.assertEqual(runner.call_count, 2)
 
     def test_untrusted_profile_and_binary_links_rejected_before_nix_query(self):
         with mock.patch.object(reviews.subprocess, "run") as runner:
@@ -212,6 +228,27 @@ class NixInstalledSystemGenerationTests(unittest.TestCase):
             self.bin.symlink_to(outside)
             self.assertFalse(reviews._historical_nix_deployed_generation_contains(self.package))
             runner.assert_not_called()
+
+
+
+class CurrentRuntimeReviewerFastPathTests(unittest.TestCase):
+    def test_valid_current_runtime_review_does_not_launch_nix_closure_query(self):
+        import test_decision_reviews as fixtures
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "jobs"
+            root.mkdir(mode=0o700)
+            job = fixtures.make_job(
+                root, suffix="a98765432101", slot="independent-current-review",
+                terminal_status="succeeded", review_result=None,
+                review_role=True, attempt_bound=True, attempt_epoch=2,
+            )
+            with mock.patch.object(
+                reviews, "_historical_nix_review_role_matches",
+                side_effect=AssertionError("current runtime must not query historical Nix"),
+            ):
+                _, binding, provenance = reviews._validated_origin_binding(job)
+            self.assertIsNotNone(binding)
+            self.assertIsNotNone(provenance)
 
 
 if __name__ == "__main__":
