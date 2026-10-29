@@ -197,11 +197,11 @@ class CompletedSuccessorTerminalTests(unittest.TestCase):
         wrong_blue_head["receipt_sha256"] = SD._sha256_json({
             k: v for k, v in wrong_blue_head.items() if k != "receipt_sha256"
         })
-        self.assertTrue(
+        self.assertFalse(
             SD._signed_clean_blue_rollback_is_terminal(
                 wrong_blue_head, [self.a, wrong_blue_head, self.b]
             ),
-            "generic clean blue predicate alone does not prove the predecessor head",
+            "even generic clean-blue retirement must bind the preserved blue revision",
         )
         for sibling in (failed, mismatched_hash, wrong_blue_head):
             with self.subTest(

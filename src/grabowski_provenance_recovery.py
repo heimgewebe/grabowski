@@ -414,6 +414,7 @@ def _competing_deployment_evidence(
     ):
         authenticated: list[str] = []
         original_deploy_count = 0
+        same_cutover_job_count = 0
         predecessor_count = 0
         for unit in blocking:
             try:
@@ -422,7 +423,13 @@ def _competing_deployment_evidence(
                 ):
                     original_deploy_count += 1
                     verified = original_deploy_count == 1
+                    if verified:
+                        same_cutover_job_count += 1
                 else:
+                    # A scheduled runner may have failed during B's recovery
+                    # without the original blue-green deploy job remaining
+                    # indexed. Its authenticated same-B receipt is still a
+                    # real owner-private target, not a predecessor claim.
                     verified = (
                         self_deploy._indexed_failed_resume_is_noeffect_handoff(
                             unit, resume_binding
@@ -431,6 +438,8 @@ def _competing_deployment_evidence(
                             unit, resume_binding
                         )
                     )
+                    if verified:
+                        same_cutover_job_count += 1
                     if not verified and self_deploy._indexed_completed_predecessor_is_recovery_handoff(
                         unit, resume_binding
                     ):
@@ -449,7 +458,7 @@ def _competing_deployment_evidence(
         # unresolved B must also have an independently authenticated job.
         if (
             len(authenticated) == len(blocking)
-            and (predecessor_count == 0 or original_deploy_count == 1)
+            and (predecessor_count == 0 or same_cutover_job_count >= 1)
         ):
             evidence["inflight_deploy_jobs"] = []
             evidence["recovery_handoff_units"] = authenticated

@@ -1643,26 +1643,40 @@ def _authentic_completed_cutover_remains_settled(
         for original in receipts:
             if not isinstance(original, dict) or original.get("kind") != BLUE_GREEN_RECEIPT_KIND:
                 continue
-            for resume in receipts:
-                if (
-                    isinstance(resume, dict)
-                    and resume.get("kind") == midcutover.RESUME_RECEIPT_KIND
-                    and resume.get("outcome") == "completed"
-                    and midcutover._lineage_resolved([resume], original)
-                ):
-                    material = {
-                        "schema_version": 1,
-                        "kind": "grabowski_resolved_midcutover_prerequisite",
-                        "resumed_cutover_id": resume.get("resumed_cutover_id"),
-                        "resume_receipt_sha256": resume.get("receipt_sha256"),
-                        "execution_head": execution_head,
-                    }
-                    if failure_type == (
-                        "MidCutoverPrerequisiteRecovered:" + _sha256_json(material)
-                    ):
-                        return not _same_cutover_has_unresolved_post_switch(
-                            receipts, original
-                        )
+            # One signed completion of this exact original is necessary, not
+            # the first plausible match in an otherwise ambiguous inventory.
+            if sum(
+                1 for item in receipts
+                if isinstance(item, dict)
+                and item.get("kind") == BLUE_GREEN_RECEIPT_KIND
+                and item.get("cutover_id") == original.get("cutover_id")
+            ) != 1:
+                continue
+            completed = [
+                item for item in receipts
+                if isinstance(item, dict)
+                and item.get("kind") == midcutover.RESUME_RECEIPT_KIND
+                and item.get("resumed_cutover_id") == original.get("cutover_id")
+                and item.get("outcome") == "completed"
+            ]
+            if (
+                len(completed) != 1
+                or not midcutover._lineage_resolved(receipts, original)
+                or _same_cutover_has_unresolved_post_switch(receipts, original)
+            ):
+                continue
+            resume = completed[0]
+            material = {
+                "schema_version": 1,
+                "kind": "grabowski_resolved_midcutover_prerequisite",
+                "resumed_cutover_id": resume.get("resumed_cutover_id"),
+                "resume_receipt_sha256": resume.get("receipt_sha256"),
+                "execution_head": execution_head,
+            }
+            if failure_type == (
+                "MidCutoverPrerequisiteRecovered:" + _sha256_json(material)
+            ):
+                return True
     except (OSError, RuntimeError, ValueError, midcutover.MidCutoverEvidenceError):
         return False
     return False
@@ -1913,6 +1927,9 @@ def _signed_clean_blue_rollback_is_terminal(
             and selector.get("release_id") == cutover.get("blue_release_id")
             and ingress.get("release_id") == cutover.get("blue_release_id")
             and selector.get("repo_head") == ingress.get("repo_head")
+            and midcutover.release_id_binds_head(
+                cutover.get("blue_release_id"), selector.get("repo_head")
+            )
             # Historical rollback A cannot depend on unrelated cutover B.
             and not _same_cutover_has_unresolved_post_switch(receipts, cutover)
         )
@@ -2946,29 +2963,31 @@ def _verified_runtime_terminal_receipt(
     if len(matching_cutovers) != 1:
         return False
     original = matching_cutovers[0]
-    for receipt in receipts:
-        if (
-            not isinstance(receipt, dict)
-            or receipt.get("kind") != midcutover.RESUME_RECEIPT_KIND
-            or receipt.get("outcome") != "completed"
-            or receipt.get("resumed_cutover_id") != fields["cutover_id"]
-        ):
-            continue
-        try:
-            receipt = midcutover.validate_resume_receipt(receipt)
-        except midcutover.MidCutoverEvidenceError:
-            return False
-        binding = midcutover._completed_lineage_binding(receipt)
-        if (
-            binding is not None
-            and receipt.get("expected_head") == fields["expected_head"]
-            and receipt.get("resume_binding_sha256") == fields["resume_binding_sha256"]
-            and binding.get("binding_sha256") == fields["resume_binding_sha256"]
-            and binding.get("expected_head") == fields["expected_head"]
-            and midcutover._lineage_resolved([receipt], original)
-        ):
-            return True
-    return False
+    completed = [
+        item for item in receipts
+        if isinstance(item, dict)
+        and item.get("kind") == midcutover.RESUME_RECEIPT_KIND
+        and item.get("outcome") == "completed"
+        and item.get("resumed_cutover_id") == fields["cutover_id"]
+    ]
+    if (
+        len(completed) != 1
+        or not midcutover._lineage_resolved(receipts, original)
+        or _same_cutover_has_unresolved_post_switch(receipts, original)
+    ):
+        return False
+    try:
+        receipt = midcutover.validate_resume_receipt(completed[0])
+    except midcutover.MidCutoverEvidenceError:
+        return False
+    binding = midcutover._completed_lineage_binding(receipt)
+    return bool(
+        binding is not None
+        and receipt.get("expected_head") == fields["expected_head"]
+        and receipt.get("resume_binding_sha256") == fields["resume_binding_sha256"]
+        and binding.get("binding_sha256") == fields["resume_binding_sha256"]
+        and binding.get("expected_head") == fields["expected_head"]
+    )
 
 
 def _indexed_failed_deploy_is_cutover_handoff(
@@ -3793,9 +3812,24 @@ def _bootstrap_deploy_index(
                     raise RuntimeError(
                         f"durable runtime job status is unreadable: {entry.name}"
                     )
-                if _verified_runtime_terminal_receipt(
-                    entry, metadata, candidate_command, status
-                ):
+                # The warm index and a missing/cold index must retire exactly
+                # the same hash-bound terminal jobs, including legacy
+                # no-finalization runtime/no-effect evidence. Unknown effect
+                # remains a blocker via the shared classifier.
+                try:
+                    classified = _classify_indexed_job(
+                        entry, _preloaded_metadata=metadata, _preloaded_status=status
+                    )
+                except IndexedRuntimeJobConflict:
+                    # A legacy or malformed job is NOT proven terminal. Keep
+                    # its reservation in the index for warm fail-closed
+                    # classification; an absent receipt is never a free pass.
+                    classified = {"terminal": False}
+                except (OSError, RuntimeError, ValueError, PermissionError) as exc:
+                    raise RuntimeError(
+                        f"durable runtime job classification failed: {entry.name}"
+                    ) from exc
+                if classified["terminal"]:
                     continue
                 if time.monotonic() - scan_started > DEPLOY_BOOTSTRAP_TIMEOUT_SECONDS:
                     raise RuntimeError("runtime deploy bootstrap census timed out")
@@ -4070,7 +4104,11 @@ class IndexedRuntimeJobConflict(RuntimeError):
     """An indexed runtime job forbids starting another one right now."""
 
 
-def _classify_indexed_job(entry: Path) -> dict[str, Any]:
+def _classify_indexed_job(
+    entry: Path, *,
+    _preloaded_metadata: dict[str, Any] | None = None,
+    _preloaded_status: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Read one indexed durable job into a decided shape.
 
     Extracted so the scheduler and the recovery lane read the deploy index
@@ -4083,7 +4121,10 @@ def _classify_indexed_job(entry: Path) -> dict[str, Any]:
             f"durable job entry is not a real directory: {entry.name}"
         )
     try:
-        metadata = operator._read_job_metadata(entry.name)
+        metadata = (
+            _preloaded_metadata if _preloaded_metadata is not None
+            else operator._read_job_metadata(entry.name)
+        )
     except (OSError, ValueError, PermissionError) as exc:
         raise IndexedRuntimeJobConflict(
             f"durable job metadata is unreadable: {entry.name}"
@@ -4136,7 +4177,10 @@ def _classify_indexed_job(entry: Path) -> dict[str, Any]:
         raise IndexedRuntimeJobConflict(
             f"self deploy job command hash mismatch: {entry.name}"
         )
-    status = operator.grabowski_job_status(entry.name)
+    status = (
+        _preloaded_status if _preloaded_status is not None
+        else operator.grabowski_job_status(entry.name)
+    )
     if not isinstance(status, dict):
         raise IndexedRuntimeJobConflict(
             f"self deploy job status is unavailable: {entry.name}"
