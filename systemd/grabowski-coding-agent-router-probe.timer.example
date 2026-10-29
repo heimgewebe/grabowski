@@ -1,0 +1,12 @@
+[Unit]
+Description=Keep Grabowski coding-agent routing metadata fresh
+
+[Timer]
+OnBootSec=3min
+OnUnitInactiveSec=30min
+AccuracySec=1min
+Persistent=true
+Unit=grabowski-coding-agent-router-probe.service
+
+[Install]
+WantedBy=timers.target

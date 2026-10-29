@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from http import HTTPStatus
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -35,6 +36,16 @@ _INSTALLER_SPEC = importlib.util.spec_from_file_location(
 assert _INSTALLER_SPEC is not None and _INSTALLER_SPEC.loader is not None
 installer = importlib.util.module_from_spec(_INSTALLER_SPEC)
 _INSTALLER_SPEC.loader.exec_module(installer)
+
+_LAUNCHER_PATH = (
+    Path(__file__).resolve().parents[1] / "tools/grabowski_juno_runtime_launcher.py"
+)
+_LAUNCHER_SPEC = importlib.util.spec_from_file_location(
+    "grabowski_juno_runtime_launcher_tested", _LAUNCHER_PATH
+)
+assert _LAUNCHER_SPEC is not None and _LAUNCHER_SPEC.loader is not None
+launcher = importlib.util.module_from_spec(_LAUNCHER_SPEC)
+_LAUNCHER_SPEC.loader.exec_module(launcher)
 
 
 def _contract() -> dict[str, object]:
@@ -489,6 +500,24 @@ def test_installer_completion_smoke_posts_authenticated_chat(
     assert observed["timeout"] == 7
 
 
+def test_installer_completion_smoke_reports_sanitized_backend_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_urlopen(request, timeout):
+        raise urllib.error.HTTPError(
+            request.full_url,
+            503,
+            "Service Unavailable",
+            {},
+            io.BytesIO(b'{"error":{"code":"backend_unavailable","message":"private details"}}'),
+        )
+
+    monkeypatch.setattr(installer.urllib.request, "urlopen", fake_urlopen)
+    with pytest.raises(RuntimeError, match=r"HTTP 503, code=backend_unavailable") as exc:
+        installer._completion_smoke("x" * 48, timeout_seconds=3)
+    assert "private details" not in str(exc.value)
+
+
 def _configure_installer_paths(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> tuple[Path, Path, Path, Path, Path]:
@@ -504,6 +533,22 @@ def _configure_installer_paths(
     monkeypatch.setattr(installer, "GATEWAY_EXEC_PATH", gateway_path)
     monkeypatch.setattr(installer, "UNIT_PATH", unit_path)
     monkeypatch.setattr(installer, "TOKEN_PATH", token_path)
+    launcher_source = tmp_path / "launcher-source.py"
+    launcher_source.write_text("print('runtime launcher')\n", encoding="utf-8")
+    probe_service_source = tmp_path / "probe.service.example"
+    probe_service_source.write_text("[Service]\nExecStart=/bin/true\n", encoding="utf-8")
+    probe_timer_source = tmp_path / "probe.timer.example"
+    probe_timer_source.write_text("[Timer]\nOnBootSec=1min\n", encoding="utf-8")
+    monkeypatch.setattr(installer, "LAUNCHER_SOURCE_PATH", launcher_source)
+    monkeypatch.setattr(installer, "LAUNCHER_EXEC_PATH", tmp_path / "installed" / "launcher.py")
+    monkeypatch.setattr(installer, "PROBE_SERVICE_TEMPLATE_PATH", probe_service_source)
+    monkeypatch.setattr(installer, "PROBE_TIMER_TEMPLATE_PATH", probe_timer_source)
+    monkeypatch.setattr(
+        installer, "PROBE_SERVICE_PATH", tmp_path / "systemd" / installer.PROBE_SERVICE_NAME
+    )
+    monkeypatch.setattr(
+        installer, "PROBE_TIMER_PATH", tmp_path / "systemd" / installer.PROBE_TIMER_NAME
+    )
     return source, template, gateway_path, unit_path, token_path
 
 
@@ -513,6 +558,9 @@ def test_installer_restarts_after_replacing_active_revision(
     _configure_installer_paths(monkeypatch, tmp_path)
     monkeypatch.setattr(
         installer, "_service_state", lambda: {"active": False, "enabled": False}
+    )
+    monkeypatch.setattr(
+        installer, "_probe_timer_state", lambda: {"active": False, "enabled": False}
     )
     calls: list[tuple[str, ...]] = []
 
@@ -547,6 +595,9 @@ def test_installer_rolls_back_artifacts_and_service_state_after_smoke_failure(
     monkeypatch.setattr(
         installer, "_service_state", lambda: {"active": True, "enabled": True}
     )
+    monkeypatch.setattr(
+        installer, "_probe_timer_state", lambda: {"active": True, "enabled": True}
+    )
     calls: list[tuple[str, ...]] = []
 
     def systemctl(*arguments: str):
@@ -571,6 +622,136 @@ def test_installer_rolls_back_artifacts_and_service_state_after_smoke_failure(
     assert ("restart", installer.SERVICE_NAME) in calls
     assert ("probe", "stop", installer.SERVICE_NAME) in calls
     assert ("probe", "disable", installer.SERVICE_NAME) in calls
+
+
+def test_https_smoke_attests_current_private_tailscale_proxy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = "https://heim-pc.tail6dbb90.ts.net:9450"
+    observed: list[list[str]] = []
+
+    def fake_run(argv, **_kwargs):
+        observed.append(argv)
+        payload = {
+            "Web": {
+                "heim-pc.tail6dbb90.ts.net:9450": {
+                    "Handlers": {"/": {"Proxy": installer.LOCAL_BASE_URL}}
+                }
+            },
+            "AllowFunnel": {},
+        }
+        return subprocess.CompletedProcess(
+            argv, 0, stdout=json.dumps(payload), stderr=""
+        )
+
+    monkeypatch.setattr(installer.subprocess, "run", fake_run)
+    assert installer._verified_https_smoke_url(target) == target
+    assert observed == [["tailscale", "serve", "status", "--json"]]
+
+
+def test_https_smoke_rejects_unrelated_proxy_or_public_funnel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = "https://heim-pc.tail6dbb90.ts.net:9450"
+    for backend, funnel in (
+        ("http://127.0.0.1:18082", False),
+        (installer.LOCAL_BASE_URL, True),
+    ):
+        def fake_run(argv, **_kwargs):
+            payload = {
+                "Web": {
+                    "heim-pc.tail6dbb90.ts.net:9450": {
+                        "Handlers": {"/": {"Proxy": backend}}
+                    }
+                },
+                "AllowFunnel": {"heim-pc.tail6dbb90.ts.net:9450": funnel},
+            }
+            return subprocess.CompletedProcess(
+                argv, 0, stdout=json.dumps(payload), stderr=""
+            )
+
+        monkeypatch.setattr(installer.subprocess, "run", fake_run)
+        with pytest.raises(RuntimeError, match="not private Serve"):
+            installer._verified_https_smoke_url(base)
+    for malformed in (
+        "http://heim-pc.tail6dbb90.ts.net:9450",
+        "https://example.com",
+        "https://heim-pc.tail6dbb90.ts.net:9450/fake",
+        "https://heim-pc.tail6dbb90.ts.net:9450?token=x",
+    ):
+        with pytest.raises(RuntimeError, match="bare HTTPS Tailscale Serve"):
+            installer._verified_https_smoke_url(malformed)
+
+
+def test_https_smoke_only_is_read_only(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    expected = "https://heim-pc.tail6dbb90.ts.net:9450"
+    calls: list[tuple[Path, str]] = []
+    monkeypatch.setattr(
+        installer, "_verified_https_smoke_url", lambda url: expected
+    )
+    monkeypatch.setattr(
+        installer, "_wait_for_smoke",
+        lambda token_path, *, base_url: calls.append((token_path, base_url)),
+    )
+    monkeypatch.setattr(
+        installer, "_service_state",
+        lambda: (_ for _ in ()).throw(AssertionError("not read-only")),
+    )
+    assert installer.main(["--smoke-only", "--smoke-https-origin", expected]) == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["status"] == "passed"
+    assert output["base_url"] == expected
+    assert calls == [(installer.TOKEN_PATH, expected)]
+
+
+
+
+class JunoRuntimeLauncherUnittest(unittest.TestCase):
+    def test_active_nixos_operator_execstart_binding(self) -> None:
+        store = "a" * 32 + "-grabowski-operator-374d7471"
+        executable = f"/nix/store/{store}/bin/grabowski-operator"
+        value = (
+            f"{{ path={executable} ; argv[]={executable} ; "
+            "ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 }}"
+        )
+        self.assertEqual(
+            launcher._parse_operator_package(value),
+            Path(f"/nix/store/{store}"),
+        )
+
+    def test_nixos_operator_binding_rejects_unrelated_binary(self) -> None:
+        with self.assertRaises(RuntimeError):
+            launcher._parse_operator_package(
+                "{ path=/usr/bin/python3 ; argv[]=/usr/bin/python3 ; status=0 }"
+            )
+
+    def test_launcher_uses_same_runtime_for_gateway_and_probe(self) -> None:
+        python = Path("/nix/store/example/bin/python3")
+        site = Path("/nix/store/example/lib/python3.12/site-packages")
+        service, environment = launcher._command(
+            "serve", python=python, site=site
+        )
+        probe, probe_environment = launcher._command(
+            "probe", python=python, site=site
+        )
+        self.assertEqual(service[0], str(python))
+        self.assertEqual(probe[:4], [
+            str(python), "-m", "grabowski_coding_agent_router_cli", "probe"
+        ])
+        self.assertEqual(environment["PYTHONPATH"], str(site))
+        self.assertEqual(probe_environment["PYTHONPATH"], str(site))
+        self.assertIn(".nix-profile/bin", environment["PATH"])
+        self.assertIn("--token-file", service)
+
+    def test_installer_template_uses_dynamic_runtime(self) -> None:
+        unit = installer.TEMPLATE_PATH.read_text(encoding="utf-8")
+        self.assertIn("grabowski_juno_runtime_launcher.py serve", unit)
+        self.assertNotIn(".venv/bin/python ", unit)
+        probe = installer.PROBE_SERVICE_TEMPLATE_PATH.read_text(encoding="utf-8")
+        self.assertIn("grabowski_juno_runtime_launcher.py probe", probe)
+
 
 
 class JunoOpenAIGatewayUnittestSmoke(unittest.TestCase):
