@@ -1161,6 +1161,88 @@ def _historical_review_role_provenance(
     return {**material, "provenance_sha256": sha256_json(material)}
 
 
+
+_NIX_REVIEW_STORE_ROOT = Path("/nix/store")
+_NIX_REVIEW_OWNER_UID = 0
+_NIX_REVIEW_PACKAGE = re.compile(
+    r"[0-9a-df-np-sv-z]{32}-grabowski-operator-[0-9a-f]{8}\Z"
+)
+
+
+def _historical_nix_review_role_matches(
+    runner_python: Any, module_path: Any, module_sha256: Any,
+) -> bool:
+    """Accept a prior NixOS reviewer only from one unchanged immutable output.
+
+    Headless NixOS reviewers use a root-owned /nix/store package, not the
+    user-owned release virtualenv. Bind the previous executable and role
+    module to the same package, with exact recorded module bytes.
+    """
+    if (
+        not all(isinstance(value, str) and value for value in (runner_python, module_path))
+        or not isinstance(module_sha256, str)
+        or _SHA256_RE.fullmatch(module_sha256) is None
+    ):
+        return False
+    runner = Path(runner_python)
+    module = Path(module_path)
+    store = _NIX_REVIEW_STORE_ROOT
+    try:
+        if store.is_symlink() or store.resolve(strict=True) != store:
+            return False
+        store_stat = store.stat()
+        if (
+            not stat.S_ISDIR(store_stat.st_mode)
+            or store_stat.st_uid != _NIX_REVIEW_OWNER_UID
+            or stat.S_IMODE(store_stat.st_mode) & 0o002
+            or (
+                stat.S_IMODE(store_stat.st_mode) & 0o020
+                and not (store_stat.st_mode & stat.S_ISVTX)
+            )
+        ):
+            return False
+        package = runner.parents[1]
+        relative_module = module.relative_to(package).parts
+        if (
+            not runner.is_absolute() or not module.is_absolute()
+            or package.parent != store
+            or _NIX_REVIEW_PACKAGE.fullmatch(package.name) is None
+            or runner != package / "bin" / "python3"
+            or len(relative_module) != 4
+            or relative_module[0] != "lib"
+            or _REVIEW_ROLE_PYTHON_DIR_RE.fullmatch(relative_module[1]) is None
+            or relative_module[2:] != ("site-packages", f"{REVIEW_ROLE_MODULE}.py")
+        ):
+            return False
+        package_stat = package.lstat()
+        module_stat = module.lstat()
+        runner_stat = runner.lstat()
+        resolved_runner = runner.resolve(strict=True)
+        resolved_module = module.resolve(strict=True)
+        resolved_runner.relative_to(store)
+        resolved_runner_stat = resolved_runner.stat()
+        if (
+            not stat.S_ISDIR(package_stat.st_mode)
+            or not stat.S_ISREG(module_stat.st_mode)
+            or resolved_module != module
+            or not (stat.S_ISREG(runner_stat.st_mode) or stat.S_ISLNK(runner_stat.st_mode))
+            or not stat.S_ISREG(resolved_runner_stat.st_mode)
+            or not os.access(resolved_runner, os.X_OK)
+            or module_stat.st_nlink != 1
+        ):
+            return False
+        for info in (package_stat, module_stat, runner_stat, resolved_runner_stat):
+            if info.st_uid != _NIX_REVIEW_OWNER_UID:
+                return False
+            if not stat.S_ISLNK(info.st_mode) and stat.S_IMODE(info.st_mode) & 0o022:
+                return False
+        return hmac.compare_digest(
+            hashlib.sha256(module.read_bytes()).hexdigest(), module_sha256,
+        )
+    except (FileNotFoundError, IndexError, OSError, RuntimeError, ValueError):
+        return False
+
+
 def _normalize_review_role_provenance(
     value: Any, binding: dict[str, Any], *, cwd: str,
     attempt_directory: Path | None = None,
@@ -1193,12 +1275,15 @@ def _normalize_review_role_provenance(
     runner_module_path, runner_module_sha256 = module_identity
     recorded_runner_python = value.get("runner_python")
     stable_python = str(REVIEW_ROLE_STABLE_PYTHON.expanduser())
+    recorded_module_path = value.get("runner_module_path")
+    recorded_module_sha256 = value.get("runner_module_sha256")
+    historical_nix = _historical_nix_review_role_matches(
+        recorded_runner_python, recorded_module_path, recorded_module_sha256,
+    )
     runner_python_matches = (
         recorded_runner_python == REVIEW_ROLE_PYTHON
         and recorded_runner_python != stable_python
-    ) or _historical_review_role_python_matches(recorded_runner_python)
-    recorded_module_path = value.get("runner_module_path")
-    recorded_module_sha256 = value.get("runner_module_sha256")
+    ) or _historical_review_role_python_matches(recorded_runner_python) or historical_nix
     # Historical attempts bind the module bytes installed when the review ran.
     # A later source upgrade must not erase that evidence. Never trust an
     # arbitrary caller-selected digest: require the exact byte-matching module
@@ -1212,6 +1297,7 @@ def _normalize_review_role_provenance(
             recorded_module_path,
             expected_sha256=recorded_module_sha256,
         )
+        or historical_nix
     )
     if (
         schema not in {1, 2}
