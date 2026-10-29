@@ -1414,6 +1414,9 @@ class DecisionBoundReleaseReviewTests(unittest.TestCase):
 
     def test_valid_review_does_not_claim_captain(self):
         with (
+            # The mock review uses invented SHAs and tests only Captain authority.
+            # Signed history is exercised against real SSH receipts elsewhere.
+            patch.object(admission, "_assert_no_signed_first_party_release_reject"),
             patch.object(admission, "validate_independent_release_review", return_value={
                 "review_pr": 1452, "independent_pass_count": 1,
             }),

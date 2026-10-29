@@ -1762,6 +1762,10 @@ def _assert_prior_first_party_material_findings_resolved(
     axes are read, including partial sessions whose REJECT was submitted.
     """
     sessions = root / "sessions"
+    # Keep only signed finding identities/timestamps, not entire old reports.
+    # This preserves unbounded registry iteration without a second archive.
+    unresolved_latest: dict[tuple[str, str, str], int] = {}
+    resolved_latest: dict[tuple[str, str, str], int] = {}
     lock = _first_party_lock(root, read_only=True)
     try:
         decisive = session["binding"]
@@ -1792,6 +1796,21 @@ def _assert_prior_first_party_material_findings_resolved(
                     )
                     if not all(candidate.get(k) == decisive.get(k) for k in revision_fields):
                         continue
+                    if "canonical_diff_sha256" not in session:
+                        # The legacy fallback has no current first-party batch.
+                        # Inspect the signed registry first: unrelated history
+                        # must not require the target revision to be checked out.
+                        from grabowski_self_review_producer import _current_source
+
+                        session["source_raw_diff_sha256"] = _current_source(
+                            repository, decisive,
+                        )
+                        session["canonical_diff_sha256"] = hashlib.sha256(
+                            _first_party_diff(repository, decisive)
+                        ).hexdigest()
+                        session["changed_paths"] = _first_party_changed_paths(
+                            repository, decisive,
+                        )
                     old_binding = _first_party_binding(candidate)
                     if (
                         old.get("schema_version") != 1
@@ -1819,23 +1838,38 @@ def _assert_prior_first_party_material_findings_resolved(
                         root_owned_signers=root_owned_signers,
                     )
                     for axis, old_axis in old_axes.items():
-                        if old_axis["report"]["verdict"] != "REJECT":
-                            continue
-                        latest = current_axes.get(axis)
-                        acknowledged = latest["report"]["findings"] if latest else []
+                        submitted = old_axis["submitted_at_unix"]
                         for finding in old_axis["report"]["findings"]:
-                            if finding["verdict"] != "UNRESOLVED":
-                                continue
-                            if not any(
-                                observed["id"] == finding["id"]
-                                and observed["severity"] == finding["severity"]
-                                and observed["verdict"] == "RESOLVED"
-                                and latest["submitted_at_unix"] >= old_axis["submitted_at_unix"]
-                                for observed in acknowledged
-                            ):
-                                raise ReviewExecutionRejected(
-                                    "previous signed material finding unresolved for same revision"
+                            identity = (axis, finding["id"], finding["severity"])
+                            if (old_axis["report"]["verdict"] == "REJECT"
+                                    and finding["verdict"] == "UNRESOLVED"):
+                                unresolved_latest[identity] = max(
+                                    submitted, unresolved_latest.get(identity, -1),
                                 )
+                            elif finding["verdict"] == "RESOLVED":
+                                resolved_latest[identity] = max(
+                                    submitted, resolved_latest.get(identity, -1),
+                                )
+            # Every historical session has now been signature/source verified.
+            # A later independently signed resolution may clear earlier debt;
+            # an earlier resolution cannot cancel a newly signed REJECT.
+            for identity, rejected_at in unresolved_latest.items():
+                axis, finding_id, severity = identity
+                current = current_axes.get(axis)
+                current_resolves = (
+                    current is not None
+                    and current["submitted_at_unix"] >= rejected_at
+                    and any(
+                        observed["id"] == finding_id
+                        and observed["severity"] == severity
+                        and observed["verdict"] == "RESOLVED"
+                        for observed in current["report"]["findings"]
+                    )
+                )
+                if not current_resolves and resolved_latest.get(identity, -1) <= rejected_at:
+                    raise ReviewExecutionRejected(
+                        "previous signed material finding unresolved for same revision"
+                    )
         finally:
             os.close(fd)
     finally:
@@ -1849,15 +1883,9 @@ def _assert_no_first_party_reject_for_legacy_review(
     """V2-origin reviews may not sidestep an old signed first-party REJECT."""
     if not (root / "sessions").exists():
         return
-    from grabowski_self_review_producer import _current_source
     context = {
         "session_id": "",  # No current first-party batch to exempt.
         "binding": _first_party_binding(binding),
-        "source_raw_diff_sha256": _current_source(repository, binding),
-        "canonical_diff_sha256": hashlib.sha256(
-            _first_party_diff(repository, binding)
-        ).hexdigest(),
-        "changed_paths": _first_party_changed_paths(repository, binding),
     }
     _assert_prior_first_party_material_findings_resolved(
         context, {}, root=root, repository=repository, signers=signers,

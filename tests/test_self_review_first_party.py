@@ -870,6 +870,196 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
         audit_b, receipts_b = self._seal_direct(plan_b)
         self.assertEqual([], self._receipt_errors(audit_b, receipts_b))
 
+    def _signed_release_plan(
+        self, *, release_id: str = "test-release-r3",
+    ) -> tuple[dict, dict, str]:
+        release = {
+            "serving_release_id": release_id,
+            "serving_tree": self._git("rev-parse", self.base + "^{tree}").strip(),
+            "target_tree": self._git("rev-parse", self.head + "^{tree}").strip(),
+        }
+        diff = producer._current_source(
+            self.repo, {"repo": "heimgewebe/grabowski",
+                        "base_sha": self.base, "head_sha": self.head},
+        )
+        plan = producer.plan_review(
+            repo=self.repo, pr=1649, base_sha=self.base, head_sha=self.head,
+            diff_sha256=diff, purpose="post_merge_release",
+            release_binding=release,
+            bwrap="/nix/store/" + "a" * 32 + "-bubblewrap-0.12.0/bin/bwrap",
+            python="/nix/store/" + "b" * 32 + "-grabowski-operator-test/bin/python3",
+        )
+        return plan, release, diff
+
+    def _check_signed_release_fallback(self, release: dict, diff: str) -> dict:
+        import grabowski_release_admission as admission
+
+        genuine = review._assert_no_first_party_reject_for_legacy_review
+
+        def signed_history(binding: dict, **_options: object) -> None:
+            genuine(
+                binding, repository=self.repo, root=self.state,
+                signers=self.signers, root_owned_signers=False,
+            )
+
+        with (
+            mock.patch.object(admission, "RELEASE_SELF_REVIEW_ROOT", self.root / "no-r3-audit"),
+            mock.patch.object(admission, "validate_independent_release_review",
+                              return_value={"review_pr": 1649, "independent_pass_count": 1,
+                                            "admissible_slots": ["independent-claude"]}),
+            mock.patch.object(review, "FIRST_PARTY_REVIEW_ROOT", self.state),
+            mock.patch.object(review, "_assert_no_first_party_reject_for_legacy_review",
+                              side_effect=signed_history),
+        ):
+            return admission.validate_release_review(
+                serving_head=self.base, target_head=self.head, diff_sha256=diff, review_pr=1649,
+                serving_release_id=release["serving_release_id"],
+                serving_tree=release["serving_tree"], target_tree=release["target_tree"],
+            )
+
+    def test_release_without_historical_session_allows_independent_pass(self) -> None:
+        _plan, release, diff = self._signed_release_plan()
+        self.assertEqual(
+            "independent", self._check_signed_release_fallback(release, diff)["review_mode"],
+        )
+
+    def test_release_partial_signed_reject_blocks_independent_pass(self) -> None:
+        import grabowski_release_admission as admission
+
+        plan, release, diff = self._signed_release_plan()
+        started = self._start_plan(plan)
+        self._submit_axis(started, review.REQUIRED_AXES[0], 1, reject=True)
+        with self.assertRaisesRegex(admission.ReleaseAdmissionDenied, "material REJECT"):
+            self._check_signed_release_fallback(release, diff)
+
+    def test_release_later_signed_resolution_allows_independent_pass(self) -> None:
+        plan, release, diff = self._signed_release_plan()
+        first = self._start_plan(plan)
+        self._submit_axis(first, review.REQUIRED_AXES[0], 1, reject=True)
+        later, _, _ = self._signed_release_plan()
+        self.now += 1  # A truly later signed submission, not an older same-second claim.
+        second = self._start_plan(later)
+        for number, axis in enumerate(review.REQUIRED_AXES, 1):
+            self._submit_axis(
+                second, axis, number,
+                resolve_ids=("material-1",) if number == 1 else (),
+            )
+        self.assertEqual(
+            "independent", self._check_signed_release_fallback(release, diff)["review_mode"],
+        )
+
+    def test_release_other_release_identity_does_not_inherit_signed_reject(self) -> None:
+        plan, _release, diff = self._signed_release_plan()
+        session = self._start_plan(plan)
+        self._submit_axis(session, review.REQUIRED_AXES[0], 1, reject=True)
+        _, different_release, _ = self._signed_release_plan(release_id="different-release")
+        self.assertEqual(
+            "independent", self._check_signed_release_fallback(different_release, diff)["review_mode"],
+        )
+
+    def test_release_tampered_signed_axis_cannot_pass_independent(self) -> None:
+        import grabowski_release_admission as admission
+
+        plan, release, diff = self._signed_release_plan()
+        session = self._start_plan(plan)
+        self._submit_axis(session, review.REQUIRED_AXES[0], 1, reject=True)
+        path = (
+            self.state / "sessions" / session["review_session_id"] /
+            "axes" / (review.REQUIRED_AXES[0] + ".json")
+        )
+        path.write_bytes(path.read_bytes() + b" ")
+        with self.assertRaisesRegex(admission.ReleaseAdmissionDenied, "authenticated"):
+            self._check_signed_release_fallback(release, diff)
+
+    def test_release_concurrent_signed_reject_rechecked_at_final_authorization(self) -> None:
+        import grabowski_release_admission as admission
+
+        plan, release, diff = self._signed_release_plan()
+        original = review._assert_no_first_party_reject_for_legacy_review
+
+        def signed_history(binding: dict, **_options: object) -> None:
+            original(binding, repository=self.repo, root=self.state,
+                     signers=self.signers, root_owned_signers=False)
+
+        def ci_with_concurrent_reject(_target: str, **_kwargs: object) -> dict:
+            session = self._start_plan(plan)
+            self._submit_axis(session, review.REQUIRED_AXES[0], 1, reject=True)
+            return {
+                "checks": [], "checks_sha256": "a" * 64,
+                "workflow": {
+                    "ci_policy_transition_required": False,
+                    "ci_policy_transition_review_binding_sha256": None,
+                },
+            }
+
+        with (
+            mock.patch.object(admission, "RELEASE_SELF_REVIEW_ROOT", self.root / "no-r3-audit"),
+            mock.patch.object(admission, "validate_independent_release_review",
+                              return_value={"review_pr": 1649, "independent_pass_count": 1,
+                                            "admissible_slots": ["independent-claude"]}),
+            mock.patch.object(admission, "_fresh_github_checks", side_effect=ci_with_concurrent_reject),
+            mock.patch.object(review, "FIRST_PARTY_REVIEW_ROOT", self.state),
+            mock.patch.object(review, "_assert_no_first_party_reject_for_legacy_review",
+                              side_effect=signed_history) as verifier,
+        ):
+            with self.assertRaisesRegex(admission.ReleaseAdmissionDenied, "material REJECT"):
+                admission.validate_release(
+                    serving_head=self.base, target_head=self.head,
+                    serving_release_id=release["serving_release_id"],
+                    serving_tree=release["serving_tree"], target_tree=release["target_tree"],
+                    diff_sha256=diff, review_pr=1649,
+                )
+        self.assertEqual(1, verifier.call_count, "new REJECT must be checked after CI")
+
+    def test_release_independent_pass_cannot_hide_signed_first_party_reject(self) -> None:
+        import grabowski_release_admission as admission
+
+        release = {
+            "serving_release_id": "test-release-r3",
+            "serving_tree": self._git("rev-parse", self.base + "^{tree}").strip(),
+            "target_tree": self._git("rev-parse", self.head + "^{tree}").strip(),
+        }
+        raw_diff = producer._current_source(
+            self.repo, {"repo": "heimgewebe/grabowski",
+                        "base_sha": self.base, "head_sha": self.head},
+        )
+        plan = producer.plan_review(
+            repo=self.repo, pr=1649, base_sha=self.base, head_sha=self.head,
+            diff_sha256=raw_diff, purpose="post_merge_release",
+            release_binding=release,
+            bwrap="/nix/store/" + "a" * 32 + "-bubblewrap-0.12.0/bin/bwrap",
+            python="/nix/store/" + "b" * 32 + "-grabowski-operator-test/bin/python3",
+        )
+        started = self._start_plan(plan)
+        for number, axis in enumerate(review.REQUIRED_AXES, 1):
+            self._submit_axis(started, axis, number, reject=number == 1)
+        signed_guard = review._assert_no_first_party_reject_for_legacy_review
+
+        def read_actual_signed_history(binding: dict, **_options: object) -> None:
+            signed_guard(
+                binding, repository=self.repo, root=self.state,
+                signers=self.signers, root_owned_signers=False,
+            )
+
+        with (
+            mock.patch.object(admission, "RELEASE_SELF_REVIEW_ROOT", self.root / "no-sealed-r3"),
+            mock.patch.object(admission, "validate_independent_release_review",
+                              return_value={"review_pr": 1649, "independent_pass_count": 1,
+                                            "admissible_slots": ["independent-claude"]}) as independent,
+            mock.patch.object(review, "FIRST_PARTY_REVIEW_ROOT", self.state),
+            mock.patch.object(review, "_assert_no_first_party_reject_for_legacy_review",
+                              side_effect=read_actual_signed_history) as history,
+        ):
+            with self.assertRaisesRegex(admission.ReleaseAdmissionDenied, "first.party|material|REJECT"):
+                admission.validate_release_review(
+                    serving_head=self.base, target_head=self.head,
+                    diff_sha256=raw_diff, review_pr=1649,
+                    serving_release_id=release["serving_release_id"],
+                    serving_tree=release["serving_tree"], target_tree=release["target_tree"],
+                )
+        self.assertTrue(history.called, "release fallback must inspect signed session receipts")
+        self.assertTrue(independent.called, "the positive independent result must be reconciled")
+
     def test_legacy_v2_review_cannot_hide_first_party_reject(self) -> None:
         plan_a = self._first_party_plan()
         started_a = self._start_plan(plan_a)

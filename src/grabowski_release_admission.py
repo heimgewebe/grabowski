@@ -776,6 +776,58 @@ def validate_authenticated_self_release_review(
     }
 
 
+def _assert_no_signed_first_party_release_reject(
+    *, serving_head: str, target_head: str, diff_sha256: str, review_pr: int,
+    serving_release_id: str | None, serving_tree: str | None,
+    target_tree: str | None,
+) -> None:
+    """Do not let independent R3 erase authenticated same-release REJECT debt.
+
+    Reuse the first-party signed-history verifier, including partial sessions
+    and its shared read lock. A missing registry is normal for legacy reviews;
+    a present but untrustworthy registry never grants PASS.
+    """
+    import grabowski_self_review_execution as first_party
+
+    sessions = first_party.FIRST_PARTY_REVIEW_ROOT / "sessions"
+    if sessions.is_symlink():
+        raise ReleaseAdmissionDenied("signed first-party release registry invalid")
+    if not sessions.exists():
+        return
+    if (
+        not isinstance(serving_release_id, str) or not serving_release_id.strip()
+        or not isinstance(serving_tree, str) or _SHA40.fullmatch(serving_tree) is None
+        or not isinstance(target_tree, str) or _SHA40.fullmatch(target_tree) is None
+    ):
+        raise ReleaseAdmissionDenied("signed first-party release identity incomplete")
+
+    from grabowski_self_review_producer import CANONICAL_REPO
+
+    # The historical predicate ignores batch rotation, but matches every
+    # actual revision and release field before authenticating signed reports.
+    binding = {
+        "repo": REPOSITORY, "pr": review_pr,
+        "base_sha": serving_head, "head_sha": target_head,
+        "diff_sha256": diff_sha256,
+        "review_batch_id": "0" * 32, "review_purpose": "post_merge_release",
+        "release_binding": {
+            "serving_release_id": serving_release_id,
+            "serving_tree": serving_tree, "target_tree": target_tree,
+        },
+    }
+    try:
+        first_party._assert_no_first_party_reject_for_legacy_review(
+            binding, repository=CANONICAL_REPO,
+            root=first_party.FIRST_PARTY_REVIEW_ROOT,
+            signers=first_party.TRUSTED_SIGNERS, root_owned_signers=True,
+        )
+    except (first_party.ReviewExecutionRejected, OSError, ValueError, KeyError, TypeError):
+        raise ReleaseAdmissionDenied(
+            "signed first-party release history contains unresolved material REJECT "
+            "or cannot be authenticated"
+        ) from None
+
+
 def validate_release_review(
     *, serving_head: str, target_head: str, diff_sha256: str, review_pr: int,
     serving_release_id: str | None = None,
@@ -806,6 +858,17 @@ def validate_release_review(
     )
     if not isinstance(independent, dict):
         raise ReleaseAdmissionDenied("authenticated full-delta R3 result is invalid")
+    # Some CI-policy probes do not yet have a serving release identity;
+    # actual release authorization always does, and checks it again below.
+    if all(isinstance(item, str) for item in (
+        serving_release_id, serving_tree, target_tree,
+    )):
+        _assert_no_signed_first_party_release_reject(
+            serving_head=serving_head, target_head=target_head,
+            diff_sha256=diff_sha256, review_pr=review_pr,
+            serving_release_id=serving_release_id,
+            serving_tree=serving_tree, target_tree=target_tree,
+        )
     return {**independent, "review_mode": "independent"}
 
 
@@ -909,6 +972,15 @@ def validate_release(
         != review.get("review_binding_sha256")
     ):
         raise ReleaseAdmissionDenied("CI transition review identity changed during admission")
+    # Recheck immediately before issuing the release authorization. A signed
+    # REJECT submitted while CI was being reconciled must not inherit a stale PASS.
+    if review.get("review_mode") == "independent":
+        _assert_no_signed_first_party_release_reject(
+            serving_head=serving_head, target_head=target_head,
+            diff_sha256=diff_sha256, review_pr=review_pr,
+            serving_release_id=serving_release_id,
+            serving_tree=serving_tree, target_tree=target_tree,
+        )
     material = {
         "schema_version": 1,
         "kind": "grabowski_post_merge_release_review",
