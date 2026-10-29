@@ -53,6 +53,9 @@ SHA256 = re.compile(r"[a-f0-9]{64}\Z")
 ID = re.compile(r"[a-f0-9]{32}\Z")
 REF = re.compile(r"(?P<path>[A-Za-z0-9_.@+/-]+)(?::(?P<source_revision>[a-f0-9]{40}))?:L(?P<start>[1-9][0-9]{0,6})(?:-L(?P<end>[1-9][0-9]{0,6}))?\Z")
 MAX_RECEIPT = 16384
+# Five substantial, independently signed axes plus a frozen Writer/Test origin
+# can exceed the ordinary single-record limit without adding untrusted data.
+MAX_CANDIDATE_FINALIZED_RECEIPT = 32768
 MAX_OUTPUT = 1024 * 1024
 MAX_SOURCE_BLOB = 2 * 1024 * 1024
 MAX_REFERENCES = 64
@@ -903,9 +906,10 @@ def _sign_server_record(material: bytes, *, key: Path, signers: Path) -> bytes:
 
 def _write_signed_record(
     path: Path, record: dict[str, Any], *, key: Path, signers: Path,
+    max_bytes: int = MAX_RECEIPT,
 ) -> tuple[str, str]:
     material = _canonical(record)
-    if len(material) > MAX_RECEIPT:
+    if len(material) > max_bytes:
         raise ReviewExecutionRejected("first-party review receipt over budget")
     signature = _sign_server_record(material, key=key, signers=signers)
     _create_private_bytes(path, material)
@@ -920,10 +924,11 @@ def _write_signed_record(
 
 def _read_signed_record(
     path: Path, *, signers: Path, root_owned_signers: bool,
+    max_bytes: int = MAX_RECEIPT,
 ) -> dict[str, Any]:
     parent_fd = _private_dir(path.parent)
     try:
-        material = _private_read(parent_fd, path.name, limit=MAX_RECEIPT)
+        material = _private_read(parent_fd, path.name, limit=max_bytes)
         signature = _private_read(
             parent_fd, path.with_suffix(".sig").name, limit=16384,
         )
@@ -1698,7 +1703,10 @@ def finalize_first_party_candidate(
     lock = _first_party_lock(root)
     try:
         _assert_first_party_source_current(session)
-        _write_signed_record(session_root / "finalized.json", record, key=key, signers=signers)
+        _write_signed_record(
+            session_root / "finalized.json", record, key=key, signers=signers,
+            max_bytes=MAX_CANDIDATE_FINALIZED_RECEIPT,
+        )
     finally:
         _release_first_party_lock(lock)
     return record
@@ -1720,6 +1728,7 @@ def verified_first_party_candidate_handoff(
     record = _read_signed_record(
         root / "sessions" / session_id / "finalized.json", signers=signers,
         root_owned_signers=root_owned_signers,
+        max_bytes=MAX_CANDIDATE_FINALIZED_RECEIPT,
     )
     session = _read_signed_record(
         root / "sessions" / session_id / "session.json", signers=signers,

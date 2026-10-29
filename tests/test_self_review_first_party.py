@@ -259,6 +259,46 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
         with self.assertRaises((review.ReviewExecutionRejected, FileExistsError, assertion.TransportAssertionReplay)):
             self._finalize_candidate(plan, started)
 
+    def test_dirty_candidate_finalization_accepts_substantive_signed_32k_receipt(self) -> None:
+        plan = self._candidate_plan()
+        started = self._start_plan(plan)
+        source_path = self.source_path
+        diff_line_count = len(
+            review._first_party_diff(self.repo, plan["binding"]).splitlines()
+        )
+        for number, axis in enumerate(review.REQUIRED_AXES, 1):
+            self._read(started, axis, "diff", "", "head", 1, diff_line_count)
+            first = self._read(started, axis, "source", source_path, "head", 1, 4)
+            second = self._read(started, axis, "source", source_path, "base", 1, 4)
+            report = self._report(
+                axis, number, [first["source_ref"], second["source_ref"]],
+            )
+            # A realistic, detailed high-critical review can carry substantial
+            # source-based reasoning. Ordinary per-axis records stay <=16 KiB.
+            report["summary"] += (
+                " Extended source-based method assessment compares each changed "
+                "line with its unchanged base, tests rejection paths and explains "
+                "the concrete effect of the preserved authority boundary."
+            ) * 18
+            self._submit(started, report)
+        finalized = self._finalize_candidate(plan, started)
+        self.assertEqual(5, len(finalized["axes"]))
+        signed_path = (
+            self.state / "sessions" / started["review_session_id"] / "finalized.json"
+        )
+        self.assertGreater(signed_path.stat().st_size, review.MAX_RECEIPT)
+        self.assertLessEqual(
+            signed_path.stat().st_size, review.MAX_CANDIDATE_FINALIZED_RECEIPT,
+        )
+        self.assertEqual({"verdict": "PASS", "findings": []}, self._verify_candidate(plan))
+        with self.assertRaisesRegex(review.ReviewExecutionRejected, "over budget"):
+            review._write_signed_record(
+                self.root / "oversized-finalized.json",
+                {"oversized": "x" * review.MAX_CANDIDATE_FINALIZED_RECEIPT},
+                key=self.key, signers=self.signers,
+                max_bytes=review.MAX_CANDIDATE_FINALIZED_RECEIPT,
+            )
+
     def test_clean_frozen_candidate_signed_five_axis_handoff(self) -> None:
         plan = self._candidate_plan(dirty=False)
         self.assertFalse(plan["binding"]["candidate_binding"]["dirty"])

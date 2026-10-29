@@ -281,6 +281,7 @@ class ReviewExecutionProvenanceTests(unittest.TestCase):
             now_unix=self.now, root_owned_signers=False,
             read_source=lambda _head, _path: b"alpha\nbeta\ngamma\n",
             capture_root=self.capture_root,
+            first_party_root=Path(self.temp.name) / "first-party-history",
             **options,
         )
 
@@ -500,6 +501,7 @@ class ReviewExecutionProvenanceTests(unittest.TestCase):
                 signers=self.signers, repository=Path(self.temp.name),
                 now_unix=self.now+86401, root_owned_signers=False,
                 read_source=lambda _head, _path: b"alpha\nbeta\n",
+                first_party_root=Path(self.temp.name) / "first-party-history",
             )
 
     def test_untrusted_signer_allowlist_rejected(self) -> None:
