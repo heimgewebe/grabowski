@@ -1540,7 +1540,13 @@ def _lane_backed(manifest: dict[str, Any]) -> bool:
     return _workspace_ownership_mode(manifest) == WORKSPACE_OWNERSHIP_WORK_LANE
 
 
-def _lane_receipt(lane_id: str, expected_receipt_sha256: str, *, read_only: bool = False) -> dict[str, Any]:
+def _lane_receipt(
+    lane_id: str,
+    expected_receipt_sha256: str,
+    *,
+    read_only: bool = False,
+    allow_continuation: bool = False,
+) -> dict[str, Any]:
     identifier = _required_string(lane_id, "lane_id", max_length=32).lower()
     expected = _required_string(
         expected_receipt_sha256,
@@ -1588,7 +1594,46 @@ def _lane_receipt(lane_id: str, expected_receipt_sha256: str, *, read_only: bool
     if receipt is None or receipt.get("lane_id") != identifier:
         raise AgentWorkspaceError("work lane receipt is missing or bound to another lane")
     if receipt.get("receipt_sha256") != expected:
-        raise AgentWorkspaceError("work lane receipt digest drifted from the expected binding")
+        continuation = receipt.get("continuation_preimage")
+        worktree = receipt.get("worktree_receipt")
+        lifecycle = worktree.get("lifecycle") if isinstance(worktree, dict) else None
+        physical = (
+            lifecycle.get("physical_checkout")
+            if isinstance(lifecycle, dict) else None
+        )
+        inputs = receipt.get("inputs")
+        # Only an existing workspace may use an exact WorkAcquire
+        # CONTINUE_EXISTING renewal. New workspace creation still requires
+        # the caller's precise current receipt SHA. Later binding validation
+        # compares every immutable source/admission/lifecycle field against
+        # the workspace's saved binding; renewed leases never create a writer.
+        if not (
+            allow_continuation
+            and receipt.get("decision") == "CONTINUE_EXISTING"
+            and type(receipt.get("attempt_count")) is int
+            and receipt["attempt_count"] >= 2
+            and isinstance(continuation, dict)
+            and continuation.get("kind") == "grabowski.work_lane_continuation_preimage"
+            and continuation.get("lane_id") == identifier
+            and continuation.get("preimage_sha256") == work_acquire._sha(
+                {key: value for key, value in continuation.items() if key != "preimage_sha256"}
+            )
+            and isinstance(inputs, dict)
+            and isinstance(worktree, dict)
+            and isinstance(lifecycle, dict)
+            and isinstance(physical, dict)
+            and SHA256_RE.fullmatch(str(worktree.get("durable_receipt_sha256", ""))) is not None
+            and continuation.get("prior_worktree_receipt_sha256") == worktree["durable_receipt_sha256"]
+            and continuation.get("checkout_key") == lifecycle.get("checkout_key")
+            and continuation.get("checkout_path") == inputs.get("target_path")
+            and continuation.get("branch") == inputs.get("branch")
+            and continuation.get("head") == inputs.get("base_head")
+            and continuation.get("ensure_head") == inputs.get("base_head")
+            and continuation.get("physical_identity_sha256") == physical.get("physical_identity_sha256")
+            and continuation.get("lifecycle_retention_until_unix") == lifecycle.get("expires_at_unix")
+            and continuation.get("lifecycle_updated_at_unix") == lifecycle.get("updated_at_unix")
+        ):
+            raise AgentWorkspaceError("work lane receipt digest drifted from the expected binding")
     if receipt.get("state") != "ready":
         raise AgentWorkspaceError("work lane is not ready")
     if receipt.get("terminal_closeout") is not None:
@@ -1632,8 +1677,12 @@ def _validate_work_lane_binding(
     runtime_deadline_unix: int,
     runner: CommandRunner,
     read_only: bool = False,
+    allow_continuation: bool = False,
 ) -> dict[str, Any]:
-    receipt = _lane_receipt(lane_id, expected_receipt_sha256, read_only=read_only)
+    receipt = _lane_receipt(
+        lane_id, expected_receipt_sha256,
+        read_only=read_only, allow_continuation=allow_continuation,
+    )
     inputs = receipt.get("inputs")
     authority = receipt.get("authority")
     if not isinstance(inputs, dict) or receipt.get("inputs_sha256") != work_acquire._sha(inputs):
@@ -1852,6 +1901,7 @@ def _lane_binding_status(
             ),
             runner=runner,
             read_only=read_only,
+            allow_continuation=True,
         )
         if observed != lane_binding:
             raise AgentWorkspaceError("live work lane binding differs from immutable workspace binding")

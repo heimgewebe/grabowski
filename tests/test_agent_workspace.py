@@ -1359,6 +1359,78 @@ class AgentWorkspaceTests(unittest.TestCase):
                 expected_lane_receipt_sha256=lane["receipt_sha256"],
             )
 
+    def test_existing_lane_workspace_accepts_exact_continuation_not_replay(self) -> None:
+        lane = self.lane_receipt(idempotency_key="workspace-existing-continuation")
+        # The real managed Checkout includes its immutable physical identity.
+        # Supply that live identity in this isolated fixture before freezing
+        # the workspace plan; the production verifier remains unchanged.
+        with workspace.work_acquire._lane_lock(lane["lane_id"]) as path_to_receipt:
+            current = workspace.work_acquire._read_state(path_to_receipt)
+            current["worktree_receipt"]["lifecycle"]["physical_checkout"] = (
+                workspace.physical_checkout.capture_physical_checkout_identity(
+                    self.git.writer
+                )
+            )
+            lane = workspace.work_acquire._write_state(path_to_receipt, current)
+        manifest = self.lane_manifest(lane)
+        original_sha = lane["receipt_sha256"]
+        lifecycle = lane["worktree_receipt"]["lifecycle"]
+        original_worktree_sha = "a" * 64
+        preimage = {
+            "schema_version": 1,
+            "kind": "grabowski.work_lane_continuation_preimage",
+            "lane_id": lane["lane_id"],
+            "checkout_key": lifecycle["checkout_key"],
+            "checkout_path": str(self.git.writer),
+            "branch": "feat/writer",
+            "head": self.git.base,
+            "ensure_head": self.git.base,
+            "physical_identity_sha256": lifecycle["physical_checkout"]["physical_identity_sha256"],
+            "lifecycle_retention_until_unix": lifecycle["expires_at_unix"],
+            "lifecycle_updated_at_unix": lifecycle["updated_at_unix"],
+            "prior_worktree_receipt_sha256": original_worktree_sha,
+        }
+        preimage["preimage_sha256"] = workspace.work_acquire._sha(preimage)
+
+        def store_continuation(*, attempt: int = 2, changed_preimage: dict | None = None) -> dict:
+            with workspace.work_acquire._lane_lock(lane["lane_id"]) as receipt_path:
+                current = workspace.work_acquire._read_state(receipt_path)
+                return workspace.work_acquire._write_state(
+                    receipt_path,
+                    {
+                        **current,
+                        "decision": "CONTINUE_EXISTING",
+                        "attempt_count": attempt,
+                        "continuation_preimage": preimage if changed_preimage is None else changed_preimage,
+                        "worktree_receipt": {
+                            **current["worktree_receipt"],
+                            "durable_receipt_sha256": original_worktree_sha,
+                        },
+                    },
+                )
+
+        renewed = store_continuation()
+        self.assertNotEqual(original_sha, renewed["receipt_sha256"])
+        # The immutable workspace still pins the original receipt SHA. The
+        # renewed WorkAcquire receipt is revalidated, not copied into it.
+        result = workspace._lane_binding_status(manifest, read_only=False)
+        self.assertTrue(result["valid"], result)
+        self.assertEqual(result["binding_sha256"], manifest["resources"]["lane_binding"]["binding_sha256"])
+        with self.assertRaisesRegex(workspace.AgentWorkspaceError, "digest drifted"):
+            workspace._lane_receipt(lane["lane_id"], original_sha)
+
+        for case, attempt, changed in (
+            ("replay", 1, preimage),
+            ("missing_preimage", 2, {}),
+            ("different_branch", 2, {**preimage, "branch": "feat/other"}),
+            ("invalid_preimage_digest", 2, {**preimage, "preimage_sha256": "0" * 64}),
+        ):
+            with self.subTest(case=case):
+                store_continuation(attempt=attempt, changed_preimage=changed)
+                denied = workspace._lane_binding_status(manifest, read_only=False)
+                self.assertFalse(denied["valid"], denied)
+                self.assertIn("digest drifted", denied["error"])
+
     def test_lane_backed_normalize_rejects_configured_scoped_writer_command(self) -> None:
         lane = self.lane_receipt(
             scoped_writer_argv=["true"],
