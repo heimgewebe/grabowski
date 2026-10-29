@@ -27,7 +27,7 @@ from typing import Any, Callable
 import grabowski_self_review_execution as provenance
 
 MAX_PLAN_BYTES = 128 * 1024  # Five pinned outer Python worker argv records exceed 32 KiB.
-TASK_DB = Path.home() / ".local/state/grabowski/tasks.sqlite3"
+TASK_DB = Path(os.environ.get("GRABOWSKI_TASK_DB", str(Path.home() / ".local/state/grabowski/tasks.sqlite3"))).expanduser()
 CAPTURE_ROOT = provenance.CAPTURE_ROOT
 OUTCOMES = provenance.OUTCOME_ROOT
 RECEIPTS = provenance.RECEIPT_ROOT

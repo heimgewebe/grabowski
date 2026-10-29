@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import secrets
 import json
+import os
 import copy
 from pathlib import Path
 import shutil
@@ -277,6 +278,31 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
         self.assertEqual({"verdict": "PASS", "findings": []}, self._verify_candidate(plan))
         with self.assertRaises((review.ReviewExecutionRejected, FileExistsError, assertion.TransportAssertionReplay)):
             self._finalize_candidate(plan, started)
+
+    def test_review_producer_follows_configured_task_database(self) -> None:
+        # The task writer and review producer are separate processes: reload
+        # both in the same fresh runtime instead of patching a test constant.
+        custom_db = self.root / "isolated-tasks.sqlite3"
+        script = (
+            "import json, pathlib, sys; "
+            "sys.path.insert(0, " + repr(str(Path(__file__).resolve().parents[1] / "src")) + "); "
+            "import grabowski_self_review_producer as producer; "
+            "import grabowski_self_review_execution as execution; "
+            "print(json.dumps({'task_db': str(producer.TASK_DB), "
+            "'producer_outcomes': str(producer.OUTCOMES), "
+            "'execution_outcomes': str(execution.OUTCOME_ROOT)}))"
+        )
+        result = subprocess.run(
+            [sys.executable, "-I", "-B", "-c", script],
+            cwd=self.repo,
+            env={**os.environ, "GRABOWSKI_TASK_DB": str(custom_db)},
+            capture_output=True, text=True, timeout=20, check=False,
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        observed = json.loads(result.stdout)
+        self.assertEqual(str(custom_db), observed["task_db"])
+        self.assertEqual(str(custom_db.with_suffix(".outcomes")), observed["producer_outcomes"])
+        self.assertEqual(observed["producer_outcomes"], observed["execution_outcomes"])
 
     def test_full_captured_writer_test_output_allows_signed_candidate_session(self) -> None:
         # Realistic max-size immutable role captures; hashes remain bound to
