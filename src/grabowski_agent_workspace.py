@@ -2980,6 +2980,7 @@ def _writer_task_argv(
     attempt: int = 1,
     launch_nonce: str | None = None,
     dirty_preimage_sha256: str | None = None,
+    python_executable: str | None = None,
 ) -> list[str]:
     allowed_arguments = [
         value
@@ -2990,7 +2991,7 @@ def _writer_task_argv(
     if dirty_preimage_sha256 is not None and SHA256_RE.fullmatch(dirty_preimage_sha256) is None:
         raise AgentWorkspaceError("writer dirty preimage binding is invalid")
     return [
-        sys.executable,
+        sys.executable if python_executable is None else python_executable,
         "-m",
         "grabowski_agent_writer",
         "--repository",
@@ -3013,7 +3014,9 @@ def _writer_task_argv(
     ]
 
 
-def _writer_attempts(manifest: dict[str, Any]) -> list[dict[str, Any]]:
+def _writer_attempts(
+    manifest: dict[str, Any], *, initial_python_executable: str | None = None,
+) -> list[dict[str, Any]]:
     command = list(manifest["commands"]["writer"])
     legacy = {
         "attempt": 1,
@@ -3021,7 +3024,9 @@ def _writer_attempts(manifest: dict[str, Any]) -> list[dict[str, Any]]:
         "task_id": manifest["tasks"]["writer"],
         "command": command,
         "command_sha256": _sha256_json(command),
-        "task_argv_sha256": _task_argv_sha256(_writer_task_argv(manifest)),
+        "task_argv_sha256": _task_argv_sha256(
+            _writer_task_argv(manifest, python_executable=initial_python_executable)
+        ),
         "receipt_path": str(_role_receipt_path(manifest, "writer")),
         "expected_base_head": manifest["expected_base_head"],
         "expected_branch": manifest["writer_branch"],
@@ -3095,8 +3100,15 @@ def _writer_attempt_refs(manifest: dict[str, Any]) -> list[dict[str, Any]]:
     return [{key: item.get(key) for key in fields if key in item} for item in _writer_attempts(manifest)]
 
 
-def _effective_writer_attempt(manifest: dict[str, Any]) -> dict[str, Any]:
-    attempts = _writer_attempts(manifest)
+def _effective_writer_attempt(
+    manifest: dict[str, Any],
+    *,
+    initial_python_executable: str | None = None,
+    final_python_executable: str | None = None,
+) -> dict[str, Any]:
+    attempts = _writer_attempts(
+        manifest, initial_python_executable=initial_python_executable,
+    )
     final = _writer_final_attempt(manifest)
     if final != len(attempts):
         raise AgentWorkspaceError("writer_final_attempt must select the last append-only attempt")
@@ -3145,6 +3157,7 @@ def _effective_writer_attempt(manifest: dict[str, Any]) -> dict[str, Any]:
         attempt=final,
         launch_nonce=launch_nonce,
         dirty_preimage_sha256=dirty_preimage_sha256,
+        python_executable=final_python_executable,
     )
     if selected.get("task_argv_sha256") != _task_argv_sha256(argv):
         raise AgentWorkspaceError("effective writer task argv hash mismatch")
@@ -3304,6 +3317,7 @@ def _role_task_argv(
     *,
     command: list[str] | None = None,
     output_path: Path | None = None,
+    python_executable: str | None = None,
 ) -> list[str]:
     selected_command = (
         list(command) if command is not None else list(manifest["commands"][role])
@@ -3336,7 +3350,7 @@ def _role_task_argv(
             str(writer_result["sha256"]),
         ]
     return [
-        sys.executable,
+        sys.executable if python_executable is None else python_executable,
         "-m",
         "grabowski_agent_role",
         "--role",

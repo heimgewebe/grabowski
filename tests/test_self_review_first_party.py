@@ -267,6 +267,54 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
         self._finalize_candidate(plan, started)
         self.assertEqual("PASS", self._verify_candidate(plan)["verdict"])
 
+    def test_frozen_candidate_origin_survives_nix_python_runtime_switch(self) -> None:
+        # The trusted Writer/Test tasks really used the original Python.
+        # A later Nix reviewer must verify their recorded argv, not rebuild it
+        # with its own new sys.executable.
+        original = self._candidate_plan()
+        next_python = "/nix/store/" + "f" * 32 + "-new-reviewer/bin/python3"
+        self.assertNotEqual(sys.executable, next_python)
+        with mock.patch.object(sys, "executable", next_python):
+            replay = producer.plan_frozen_candidate_review(
+                self.candidate_manifest["workspace_id"]
+            )
+            self.assertEqual(
+                original["binding"]["candidate_binding"],
+                replay["binding"]["candidate_binding"],
+            )
+            started = self._start_plan(replay)
+            self._complete_candidate(replay, started)
+            self._finalize_candidate(replay, started)
+            self.assertEqual("PASS", self._verify_candidate(replay)["verdict"])
+
+    def test_rewritten_server_task_argv_cannot_fake_cross_runtime_origin(self) -> None:
+        self._candidate_plan()
+        writer_id = self.candidate_manifest["tasks"]["writer"]
+        db = sqlite3.connect(producer.TASK_DB)
+        try:
+            old = db.execute(
+                "SELECT argv_json FROM tasks WHERE task_id=?", (writer_id,)
+            ).fetchone()[0]
+            argv = json.loads(old)
+            argv[0] = "/nix/store/" + "0" * 32 + "-forged-runtime/bin/python3"
+            rewritten = json.dumps(argv, ensure_ascii=False, separators=(",", ":"))
+            db.execute(
+                "UPDATE tasks SET argv_json=?, argv_sha256=? WHERE task_id=?",
+                (rewritten, hashlib.sha256(rewritten.encode()).hexdigest(), writer_id),
+            )
+            db.commit()
+        finally:
+            db.close()
+        with mock.patch.object(
+            sys, "executable", "/nix/store/" + "f" * 32 + "-new-reviewer/bin/python3"
+        ):
+            with self.assertRaisesRegex(
+                review.ReviewExecutionRejected, "Candidate task origin invalid"
+            ):
+                producer.plan_frozen_candidate_review(
+                    self.candidate_manifest["workspace_id"]
+                )
+
     def test_candidate_handoff_accepts_bound_completed_retried_tests(self) -> None:
         plan = self._candidate_plan(retried_tests=True)
         started = self._start_plan(plan)

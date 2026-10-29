@@ -7599,6 +7599,13 @@ class AgentWorkspaceTests(unittest.TestCase):
             }}
         with (
             mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            # The optional catalogue-route unit test must not depend on the
+            # host's real root-owned signer registry. Separate signed E2E
+            # fixtures test the actual provenance/verifier independently.
+            mock.patch(
+                "grabowski_self_review_producer.assert_candidate_review_history",
+                return_value=None,
+            ) as history_guard,
             mock.patch.object(workspace, "_role_toolchain_preflight", return_value={
                 "passed": True,
                 "command_sha256": workspace._sha256_json(replacement),
@@ -7612,6 +7619,7 @@ class AgentWorkspaceTests(unittest.TestCase):
             retried = workspace.grabowski_agent_workspace_role_retry(
                 manifest["workspace_id"], "review", replacement,
             )
+        history_guard.assert_called_once_with(manifest["workspace_id"])
         self.assertEqual(retried["state"], "retry_started")
         self.assertEqual(retried["attempt"], 1)
         self.assertEqual(
@@ -7665,6 +7673,10 @@ class AgentWorkspaceTests(unittest.TestCase):
 
         with (
             mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch(
+                "grabowski_self_review_producer.assert_candidate_review_history",
+                return_value=None,
+            ) as recovery_history_guard,
             mock.patch.object(
                 workspace, "_task_public",
                 return_value={
@@ -7686,6 +7698,7 @@ class AgentWorkspaceTests(unittest.TestCase):
             recovered = workspace.grabowski_agent_workspace_role_retry(
                 manifest["workspace_id"], "review", replacement,
             )
+        recovery_history_guard.assert_called_once_with(manifest["workspace_id"])
         self.assertEqual(recovered["state"], "retry_started")
         self.assertEqual(recovered["attempt"], 2)
         self.assertEqual(restarted.call_count, 1)

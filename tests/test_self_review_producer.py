@@ -28,6 +28,24 @@ class ServerReviewProducerTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
+        # V2 producer fixtures have no prior signed first-party history.
+        # Keep that private registry isolated instead of accidentally reading
+        # actual host sessions for a temporary Git repository.
+        original_history_guard = execute._assert_no_first_party_reject_for_legacy_review
+
+        def isolated_history_guard(binding, *, repository, root, signers, root_owned_signers):
+            return original_history_guard(
+                binding, repository=repository,
+                root=self.root / "first-party-history",
+                signers=signers, root_owned_signers=root_owned_signers,
+            )
+
+        history_patch = mock.patch.object(
+            execute, "_assert_no_first_party_reject_for_legacy_review",
+            side_effect=isolated_history_guard,
+        )
+        history_patch.start()
+        self.addCleanup(history_patch.stop)
         self.repo = self.root / "repo"
         self.repo.mkdir()
         def git(*args):

@@ -173,6 +173,32 @@ def _candidate_task_evidence(
     return {"task": row, "outcome": outcome}
 
 
+def _candidate_recorded_task_argv(task_id: str, *, module: str) -> list[str]:
+    """Reconstruct a historical task with its *recorded* trusted interpreter.
+
+    The server-owned task DB and signed terminal outcome bind the full argv.
+    Rebuilding just argv[0] from this later reviewer's sys.executable gives a
+    false provenance REJECT after an otherwise valid Nix release transition.
+    The final comparison still authenticates every argv byte and outcome.
+    """
+    row = _task_row(TASK_DB, task_id)
+    raw = row["argv_json"]
+    try:
+        argv = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        raise provenance.ReviewExecutionRejected("Candidate task argv invalid") from exc
+    if (
+        not isinstance(argv, list) or len(argv) < 3
+        or any(type(item) is not str or not item for item in argv)
+        or not Path(argv[0]).is_absolute() or ".." in Path(argv[0]).parts
+        or argv[1:3] != ["-m", module]
+        or raw != json.dumps(argv, ensure_ascii=False, separators=(",", ":"))
+        or hashlib.sha256(raw.encode("utf-8")).hexdigest() != row["argv_sha256"]
+    ):
+        raise provenance.ReviewExecutionRejected("Candidate task argv invalid")
+    return argv
+
+
 def _frozen_candidate_context(workspace_id: str) -> tuple[dict[str, Any], Path]:
     """Reconstruct the frozen identity from owning private receipts and Git.
 
@@ -202,7 +228,24 @@ def _frozen_candidate_context(workspace_id: str) -> tuple[dict[str, Any], Path]:
     patch = role.read_bound_review_input_artifact(
         str(workspace._ensure_root(create=False)), artifact["path"], artifact["sha256"],
     )
-    writer_attempt = workspace._effective_writer_attempt(manifest)
+    initial_argv = _candidate_recorded_task_argv(
+        manifest["tasks"]["writer"], module="grabowski_agent_writer",
+    )
+    stored_attempts = manifest.get("writer_attempts")
+    selected_writer_id = (
+        stored_attempts[-1].get("task_id")
+        if isinstance(stored_attempts, list) and stored_attempts
+        and isinstance(stored_attempts[-1], dict)
+        else manifest["tasks"]["writer"]
+    )
+    selected_argv = _candidate_recorded_task_argv(
+        selected_writer_id, module="grabowski_agent_writer",
+    )
+    writer_attempt = workspace._effective_writer_attempt(
+        manifest,
+        initial_python_executable=initial_argv[0],
+        final_python_executable=selected_argv[0],
+    )
     writer = workspace._role_receipt(manifest, "writer", attempt=writer_attempt["attempt"])
     tests = workspace._role_receipt(manifest, "tests")
     if any(not isinstance(r, dict) or not workspace._receipt_integrity(r)
@@ -265,19 +308,18 @@ def _frozen_candidate_context(workspace_id: str) -> tuple[dict[str, Any], Path]:
     writer_task = _candidate_task_evidence(
         writer_attempt["task_id"], writer_attempt["task_argv_sha256"], worktree,
     )
+    tests_argv = _candidate_recorded_task_argv(
+        manifest["tasks"]["tests"], module="grabowski_agent_role",
+    )
     tests_prefix = workspace._role_task_argv(
         manifest, "tests", head, diff, dirty,
         command=[],
         output_path=workspace._role_receipt_path(
             manifest, "tests", attempt=workspace._role_final_attempt(manifest, "tests"),
         ),
+        python_executable=tests_argv[0],
     )
-    tests_row = _task_row(TASK_DB, manifest["tasks"]["tests"])
-    try:
-        tests_argv = json.loads(tests_row["argv_json"])
-    except (TypeError, ValueError) as exc:
-        raise provenance.ReviewExecutionRejected("Candidate test task argv invalid") from exc
-    if (not isinstance(tests_argv, list) or tests_argv[:len(tests_prefix)] != tests_prefix
+    if (tests_argv[:len(tests_prefix)] != tests_prefix
             or workspace._sha256_json(tests_argv[len(tests_prefix):]) != tests["argv_sha256"]):
         raise provenance.ReviewExecutionRejected("Candidate test task wrapper/command drift")
     test_task = _candidate_task_evidence(
