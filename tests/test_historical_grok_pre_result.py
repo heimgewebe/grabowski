@@ -96,7 +96,7 @@ class HistoricalGrokPreResultTests(unittest.TestCase):
             terminal_status="failed", review_result=None,
             review_role=True, attempt_bound=True, attempt_epoch=2,
             role_command_override=[
-                "grok", "--model", "grok-4.6", "Read-only frozen revision review",
+                "grok", "--model", "grok-4.6", "-p", "Read-only frozen revision review",
             ],
         )
         stamp_grok_quota(directory)
