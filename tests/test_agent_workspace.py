@@ -7651,6 +7651,8 @@ class AgentWorkspaceTests(unittest.TestCase):
         manifest["commands"]["review"] = list(
             workspace.CONTROLLER_SELF_REVIEW_PENDING_ARGV
         )
+        # First-party preflight may have persisted an abandoned batch.
+        manifest["first_party_candidate_review_batch"] = "abandoned-preflight-batch"
         workspace._write_manifest(manifest)
         replacement = [
             "claude", "--model", "claude-opus-5-5",
@@ -7710,6 +7712,14 @@ class AgentWorkspaceTests(unittest.TestCase):
         # Attempt one retains the authentic replacement-command hash,
         # but consumes no environment-recovery retry allowance.
         persisted = workspace._manifest(manifest["workspace_id"])
+        self.assertNotIn("first_party_candidate_review_batch", persisted)
+        from grabowski_self_review_producer import verify_workspace_candidate_review
+        with mock.patch(
+            "grabowski_self_review_producer.assert_candidate_review_history",
+            return_value=None,
+        ) as fallback_history:
+            verify_workspace_candidate_review(persisted)
+        fallback_history.assert_called_once_with(manifest["workspace_id"])
         retry_state = persisted["role_retries"]["review"]
         self.assertEqual(retry_state["count"], 1)
         self.assertEqual(

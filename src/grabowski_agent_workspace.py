@@ -10128,6 +10128,7 @@ def grabowski_agent_workspace_role_retry(
             }
         worktree = Path(str(manifest["writer_worktree"]))
         command = _role_argv(replacement_argv, "replacement_argv", cwd=worktree)
+        catalogue_fallback_selected = False
         if (
             role_name == "review"
             and manifest.get("commands", {}).get("review")
@@ -10157,6 +10158,7 @@ def grabowski_agent_workspace_role_retry(
             else:
                 from grabowski_self_review_producer import assert_candidate_review_history
                 assert_candidate_review_history(identifier)
+                catalogue_fallback_selected = True
         start_intent = _role_start_intent_classification(manifest, role_name)
         if start_intent is not None:
             classification, detail = start_intent
@@ -10334,6 +10336,10 @@ def grabowski_agent_workspace_role_retry(
             expected_argv=task_argv,
             expected_cwd=cwd,
         )
+        if catalogue_fallback_selected:
+            # The accepted catalogue task replaces an abandoned first-party
+            # verifier; source-bound signed REJECT history remains enforced.
+            manifest.pop("first_party_candidate_review_batch", None)
         intents = dict(manifest.get("task_start_intents", {}))
         intents.pop(role_name, None)
         manifest["task_start_intents"] = intents
