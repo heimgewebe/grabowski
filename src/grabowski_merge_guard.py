@@ -42,7 +42,7 @@ def _first_party_merge_signer_snapshot_guard(review_evidence: Any):
     if (
         not isinstance(review_evidence, dict)
         or (
-            review_evidence.get("review_tier") != "high_critical"
+            review_evidence.get("review_tier") not in {"standard", "high_critical"}
             and review_evidence.get("review_origin")
             != "first_party_authenticated_controller_v1"
         )
@@ -67,6 +67,45 @@ def _first_party_merge_signer_snapshot_guard(review_evidence: Any):
         yield
     finally:
         source._release_first_party_lock(descriptor)
+
+
+def _signed_first_party_material_history_errors(bindings: dict[str, Any]) -> list[str]:
+    """Recheck immutable signed material debt for ordinary self-review tiers.
+
+    Only signed records of this exact repo/PR/base/head/diff can match.
+    An empty registry is legitimate; an untrustworthy present registry is not.
+    The caller holds the same signer lock until the GitHub merge effect.
+    """
+    import grabowski_self_review_execution as provenance
+
+    root = provenance.FIRST_PARTY_REVIEW_ROOT
+    registry = root / "sessions"
+    if registry.is_symlink():
+        return ["merge_guard_signed_first_party_history_invalid"]
+    if not registry.exists():
+        return []
+    repo = bindings.get("repository")
+    if not isinstance(repo, str) or re.fullmatch(r"heimgewebe/[A-Za-z0-9_.-]+", repo) is None:
+        return ["merge_guard_signed_first_party_history_binding_invalid"]
+    binding = {
+        "repo": repo,
+        "pr": bindings.get("pull_request"),
+        "base_sha": bindings.get("base_sha"),
+        "head_sha": bindings.get("head_sha"),
+        "diff_sha256": bindings.get("diff_sha256"),
+        "review_batch_id": "0" * 32,
+        "review_purpose": "pull_request",
+    }
+    try:
+        provenance._assert_no_first_party_reject_for_legacy_review(
+            binding,
+            repository=Path.home() / "repos" / repo.split("/")[-1],
+            root=root, signers=provenance.TRUSTED_SIGNERS,
+            root_owned_signers=True,
+        )
+    except (provenance.ReviewExecutionRejected, OSError, ValueError, KeyError, TypeError):
+        return ["merge_guard_signed_first_party_material_reject_or_invalid_history"]
+    return []
 
 
 class MergeGuardResourceAuthority(Protocol):
@@ -6199,6 +6238,10 @@ class CaptainMergeGuardRunner:
                 or independent_pass_count < 1
             ):
                 independent_errors.append("merge_guard_independent_review_pass_missing")
+            if independent_requirement["review_tier"] != "high_critical":
+                independent_errors.extend(
+                    _signed_first_party_material_history_errors(bindings)
+                )
             independent_errors = sorted(set(independent_errors))
             self.receipt["independent_review_revalidation"] = {
                 **independent_requirement,

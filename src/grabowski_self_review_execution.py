@@ -1764,6 +1764,7 @@ def _assert_prior_first_party_material_findings_resolved(
     sessions = root / "sessions"
     # Keep only signed finding identities/timestamps, not entire old reports.
     # This preserves unbounded registry iteration without a second archive.
+    legacy_history_only = "canonical_diff_sha256" not in session
     unresolved_latest: dict[tuple[str, str, str], int] = {}
     resolved_latest: dict[tuple[str, str, str], int] = {}
     lock = _first_party_lock(root, read_only=True)
@@ -1796,6 +1797,14 @@ def _assert_prior_first_party_material_findings_resolved(
                     )
                     if not all(candidate.get(k) == decisive.get(k) for k in revision_fields):
                         continue
+                    # A legacy/independent review may be dispatched from main.
+                    # Verify sources against the original SIGNED review worktree,
+                    # never assume that Captain\'s main checkout is the PR head.
+                    historical_repository = (
+                        Path(old.get("worktree")) if legacy_history_only else repository
+                    )
+                    if legacy_history_only and not isinstance(old.get("worktree"), str):
+                        raise ReviewExecutionRejected("previous signed review worktree invalid")
                     if "canonical_diff_sha256" not in session:
                         # The legacy fallback has no current first-party batch.
                         # Inspect the signed registry first: unrelated history
@@ -1803,13 +1812,13 @@ def _assert_prior_first_party_material_findings_resolved(
                         from grabowski_self_review_producer import _current_source
 
                         session["source_raw_diff_sha256"] = _current_source(
-                            repository, decisive,
+                            historical_repository, decisive,
                         )
                         session["canonical_diff_sha256"] = hashlib.sha256(
-                            _first_party_diff(repository, decisive)
+                            _first_party_diff(historical_repository, decisive)
                         ).hexdigest()
                         session["changed_paths"] = _first_party_changed_paths(
-                            repository, decisive,
+                            historical_repository, decisive,
                         )
                     old_binding = _first_party_binding(candidate)
                     if (
@@ -1831,7 +1840,7 @@ def _assert_prior_first_party_material_findings_resolved(
                         raise ReviewExecutionRejected("previous same-revision session origin invalid")
                     old_reads = _load_first_party_reads(
                         old, historical_root, signers=signers,
-                        root_owned_signers=root_owned_signers, repository=repository,
+                        root_owned_signers=root_owned_signers, repository=historical_repository,
                     )
                     old_axes = _load_first_party_axes(
                         old, historical_root, reads=old_reads, signers=signers,

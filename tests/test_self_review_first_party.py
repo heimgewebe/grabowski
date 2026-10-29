@@ -1060,6 +1060,106 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
         self.assertTrue(history.called, "release fallback must inspect signed session receipts")
         self.assertTrue(independent.called, "the positive independent result must be reconciled")
 
+    def test_standard_tier_gate_cannot_hide_signed_first_party_reject(self) -> None:
+        from test_pr_review_gate_self_diff import _self_review, _state, gate
+
+        plan = self._first_party_plan()
+        binding = plan["binding"]
+        state = _state(diff_sha=binding["diff_sha256"])
+        state["pr"]["number"] = 1649
+        state["pr"]["baseRefOid"] = self.base
+        state["pr"]["headRefOid"] = self.head
+        state["pr"]["files"] = [{"path": self.source_path}]
+        state["pr"]["reviews"] = [{
+            "author": {"login": "chatgpt-codex-connector"},
+            "state": "APPROVED", "commit_id": self.head,
+        }]
+        packet = _self_review(diff_sha=binding["diff_sha256"])
+        packet["pr"] = 1649
+        packet["base_sha"] = self.base
+        packet["head_sha"] = self.head
+        packet["reviewed_files"] = [self.source_path]
+        packet["review_iterations"] = [
+            {"n": n, "summary": f"independent source review pass {n}",
+             "material_findings": 0} for n in range(1, 4)
+        ]
+        self.assertNotEqual(
+            "high_critical",
+            gate.classify_complexity(state["pr"], packet,
+                                     repo_name="heimgewebe/grabowski")["review_tier"],
+        )
+        with mock.patch.object(review, "FIRST_PARTY_REVIEW_ROOT", self.state):
+            baseline = gate.evaluate_review_gate(state, self_review=packet)
+        self.assertEqual("PASS", baseline["verdict"], baseline["failures"])
+
+        signed = self._start_plan(plan)
+        self._submit_axis(signed, review.REQUIRED_AXES[0], 1, reject=True)
+        genuine = review._assert_no_first_party_reject_for_legacy_review
+
+        def verify_signed_history(candidate: dict, **_kwargs: object) -> None:
+            genuine(candidate, repository=self.repo, root=self.state,
+                    signers=self.signers, root_owned_signers=False)
+
+        with (
+            mock.patch.object(review, "FIRST_PARTY_REVIEW_ROOT", self.state),
+            mock.patch.object(review, "_assert_no_first_party_reject_for_legacy_review",
+                              side_effect=verify_signed_history),
+        ):
+            rejected = gate.evaluate_review_gate(state, self_review=packet)
+        self.assertEqual("BLOCK", rejected["verdict"], rejected["failures"])
+        self.assertTrue(
+            any("signed first-party" in item for item in rejected["failures"]),
+            rejected["failures"],
+        )
+
+    def test_captain_standard_tier_checks_signed_history_and_later_resolution(self) -> None:
+        import grabowski_merge_guard as captain
+
+        plan = self._first_party_plan()
+        started = self._start_plan(plan)
+        self._submit_axis(started, review.REQUIRED_AXES[0], 1, reject=True)
+        serving_checkout = self.root / "serving-only"
+        self._git("worktree", "add", "--detach", str(serving_checkout), self.base)
+        binding = {
+            "repository": "heimgewebe/grabowski",
+            "pull_request": 1649,
+            "base_sha": self.base, "head_sha": self.head,
+            "diff_sha256": plan["binding"]["diff_sha256"],
+        }
+        authentic = review._assert_no_first_party_reject_for_legacy_review
+
+        def inspect_original_signed_review(candidate: dict, **_options: object) -> None:
+            authentic(
+                candidate, repository=serving_checkout, root=self.state,
+                signers=self.signers, root_owned_signers=False,
+            )
+
+        with (
+            mock.patch.object(review, "FIRST_PARTY_REVIEW_ROOT", self.state),
+            mock.patch.object(review, "_assert_no_first_party_reject_for_legacy_review",
+                              side_effect=inspect_original_signed_review),
+        ):
+            self.assertEqual(
+                ["merge_guard_signed_first_party_material_reject_or_invalid_history"],
+                captain._signed_first_party_material_history_errors(binding),
+            )
+            self.assertEqual(
+                [], captain._signed_first_party_material_history_errors({
+                    **binding, "pull_request": 1650,
+                }),
+                "a signed REJECT must not bleed into another PR identity",
+            )
+
+            self.now += 1
+            resolution = self._start_plan(self._first_party_plan())
+            self._submit_axis(
+                resolution, review.REQUIRED_AXES[0], 1, resolve_ids=("material-1",),
+            )
+            self.assertEqual(
+                [], captain._signed_first_party_material_history_errors(binding),
+                "a genuinely later signed resolution must clear the exact finding",
+            )
+
     def test_legacy_v2_review_cannot_hide_first_party_reject(self) -> None:
         plan_a = self._first_party_plan()
         started_a = self._start_plan(plan_a)

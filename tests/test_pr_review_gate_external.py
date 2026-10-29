@@ -27,6 +27,19 @@ def _load_gate():
 gate = _load_gate()
 
 
+def setUpModule() -> None:
+    # Synthetic GitHub identities must not import unrelated signed state from
+    # the developer's real operator. Signed-history E2E tests use real receipts.
+    private_history = tempfile.TemporaryDirectory()
+    unittest.addModuleCleanup(private_history.cleanup)
+    patcher = mock.patch.object(
+        gate.review_provenance, "FIRST_PARTY_REVIEW_ROOT",
+        Path(private_history.name) / "no-signed-sessions",
+    )
+    patcher.start()
+    unittest.addModuleCleanup(patcher.stop)
+
+
 def _state(
     path: str = "docs/example.md",
     *,

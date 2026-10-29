@@ -102,6 +102,35 @@ class FirstPartyMergeLockTests(unittest.TestCase):
                             future.result(timeout=0.15)
                     self.assertEqual(future.result(timeout=3), "late-signed-reject-serialized")
 
+    def test_standard_tier_merge_serializes_late_signed_reject(self) -> None:
+        # A standard packet cannot replace a signed REJECT during the
+        # Captain revalidation-and-merge window either.
+        import grabowski_self_review_execution as source
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder) / "first-party-standard-tier"
+            with mock.patch.object(source, "FIRST_PARTY_REVIEW_ROOT", root):
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    with merge_guard._first_party_merge_signer_snapshot_guard({
+                        "review_tier": "standard",
+                    }):
+                        self.assertTrue((root / ".lock").is_file())
+                        started = threading.Event()
+
+                        def submit_material_reject():
+                            started.set()
+                            fd = source._first_party_lock(root)
+                            try:
+                                return "signed-reject-serialized"
+                            finally:
+                                source._release_first_party_lock(fd)
+
+                        future = pool.submit(submit_material_reject)
+                        self.assertTrue(started.wait(2))
+                        from concurrent.futures import TimeoutError as FutureTimeout
+                        with self.assertRaises(FutureTimeout):
+                            future.result(timeout=0.15)
+                    self.assertEqual(future.result(timeout=3), "signed-reject-serialized")
+
     def test_non_first_party_merge_review_does_not_require_private_signer_root(self) -> None:
         with merge_guard._first_party_merge_signer_snapshot_guard({}):
             pass

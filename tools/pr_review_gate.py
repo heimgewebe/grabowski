@@ -23,6 +23,7 @@ if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
 
 from grabowski_self_review_execution import review_receipt_errors  # noqa: E402
+import grabowski_self_review_execution as review_provenance  # noqa: E402
 
 from grabowski_pr_diff import (  # noqa: E402
     canonicalize_github_pr_diff_identity,
@@ -4326,6 +4327,38 @@ def evaluate_review_gate(
                 "review_pass_receipts": self_review.get("review_pass_receipts"),
             }
             self_review_failures.extend(review_receipt_errors(origin_audit))
+        elif repo_name is not None and all((
+            type(pr.get("number")) is int,
+            isinstance(pr.get("baseRefOid"), str),
+            isinstance(pr.get("headRefOid"), str),
+            _normalize_sha256(state.get("pr_diff_sha256")) is not None,
+        )):
+            # Standard and elevated self-reviews need no five-axis PASS audit,
+            # but they may not silently discard a signed material REJECT from
+            # the same immutable PR revision. Reuse the authenticated registry
+            # predicate; absence of a signed session remains a valid legacy case.
+            binding = {
+                "repo": repo_name,
+                "pr": pr["number"],
+                "base_sha": pr["baseRefOid"],
+                "head_sha": pr["headRefOid"],
+                "diff_sha256": _normalize_sha256(state.get("pr_diff_sha256")),
+                "review_batch_id": "0" * 32,
+                "review_purpose": "pull_request",
+            }
+            try:
+                review_provenance._assert_no_first_party_reject_for_legacy_review(
+                    binding,
+                    repository=Path.home() / "repos" / repo_name.split("/")[-1],
+                    root=review_provenance.FIRST_PARTY_REVIEW_ROOT,
+                    signers=review_provenance.TRUSTED_SIGNERS,
+                    root_owned_signers=True,
+                )
+            except (review_provenance.ReviewExecutionRejected, OSError,
+                    ValueError, KeyError, TypeError):
+                self_review_failures.append(
+                    "signed first-party material review history unresolved or invalid"
+                )
     failures.extend(self_review_failures)
 
     claude = self_review.get("claude_review") if isinstance(self_review, dict) else None
