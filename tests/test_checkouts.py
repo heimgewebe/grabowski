@@ -5604,6 +5604,67 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self.assertEqual(retained, 2)
         self.assertTrue(self.checkout.is_dir())
 
+
+    def test_retain_renews_exact_expired_lane_checkout_without_releasing_lease(self) -> None:
+        owner = "lane:" + "a" * 32
+        purpose = "frozen candidate same-lane renewal"
+        now = int(time.time())
+        initial_deadline = now + 60
+        renewed_deadline = now + 3600
+        common_dir = self._common_dir()
+        lifecycle = checkouts._reserve_checkout_lifecycle(
+            repo_common_dir=common_dir,
+            repo_path=self.repo,
+            checkout_path=self.checkout,
+            owner_id=owner,
+            purpose=purpose,
+            source_kind="thread_focus",
+            source_id="pr1649-original-candidate",
+            artifact_class="implementation-worktree",
+            retention_until_unix=initial_deadline,
+            expected_head=self.head,
+            expected_branch="topic",
+        )
+        checkouts._upsert_retention(
+            checkout_key=lifecycle["checkout_key"],
+            repo_common_dir=common_dir,
+            repo_path=self.repo,
+            checkout_path=self.checkout,
+            owner_id=owner,
+            purpose=purpose,
+            retention_until_unix=initial_deadline,
+            expected_head=self.head,
+            expected_branch="topic",
+        )
+        path_key = f"path:{self.checkout}"
+        branch_key = f"repo:{self.repo}:branch:topic"
+        checkouts.resources.acquire_resources(
+            owner, [path_key, branch_key], purpose=purpose, ttl_seconds=5400
+        )
+        old_path_lease = checkouts.resources.inspect_resource(path_key)
+        with patch.object(checkouts, "_now", return_value=now + 90):
+            result = checkouts.grabowski_checkout_retain(
+                str(self.repo), str(self.checkout), owner, purpose,
+                renewed_deadline, self.head, "topic",
+            )
+        self.assertEqual(result["retention"]["retention_until_unix"], renewed_deadline)
+        self.assertEqual(result["lifecycle"]["retention_until_unix"], renewed_deadline)
+        self.assertEqual(result["lifecycle"]["source"], lifecycle["source"])
+        self.assertEqual(result["lifecycle"]["owner_id"], owner)
+        self.assertEqual(result["lifecycle"]["checkout_key"], lifecycle["checkout_key"])
+        self.assertEqual(
+            checkouts.resources.inspect_resource(path_key),
+            old_path_lease,
+            "the active Work-Lane path lease must never be released or replaced",
+        )
+        self.assertEqual(result["lease"]["owner_id"], owner)
+        self.assertFalse(result["lease_release"]["released"])
+        with self.assertRaisesRegex(PermissionError, "another owner"):
+            checkouts.grabowski_checkout_retain(
+                str(self.repo), str(self.checkout), "owner-b", "foreign",
+                renewed_deadline + 60, self.head, "topic",
+            )
+
     def test_retention_can_protect_dirty_checkout_and_rejects_foreign_owner(self) -> None:
         (self.checkout / "untracked.txt").write_text("preserve me\n", encoding="utf-8")
         retained_until = int(time.time()) + 3600
