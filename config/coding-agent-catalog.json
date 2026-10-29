@@ -3150,7 +3150,8 @@
       "argv_prefix": [
         "grok",
         "--model",
-        "grok-4.6"
+        "grok-4.6",
+        "-p"
       ],
       "base_quality_rank": 84,
       "burn_weight": 1.4,
@@ -3186,7 +3187,8 @@
       "argv_prefix": [
         "grok",
         "--model",
-        "grok-4.7"
+        "grok-4.7",
+        "-p"
       ],
       "base_quality_rank": 84,
       "burn_weight": 1.4,
