@@ -443,7 +443,12 @@ def _git_command_environment() -> dict[str, str]:
 
 def safe_git_environment(base: dict[str, str] | None = None) -> dict[str, str]:
     """Return a non-interactive Git environment with executable helpers disabled."""
-    environment = dict(os.environ if base is None else base)
+    inherited = os.environ if base is None else base
+    # Git scope, helpers and tracing must not inherit caller authority.
+    # Reinstall only the audited Git overrides below.
+    environment = {
+        key: value for key, value in inherited.items() if not key.startswith("GIT_")
+    }
     # Flowlines exporter authentication is server-only and must never cross
     # into agent, workspace, reviewer, or writer child processes.
     for key in (
