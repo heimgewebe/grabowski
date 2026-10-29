@@ -617,7 +617,16 @@ def _trusted_git_binary() -> str:
         try:
             original = candidate.lstat()
             if candidate == candidates[0] and not stat.S_ISREG(original.st_mode):
-                raise RuntimeError("classic system Git must be a regular file")
+                # On NixOS the classic spelling may be a root-managed alias.
+                # Execute the separately authenticated canonical system Git,
+                # never an executable resolved from the mutable alias.
+                if not stat.S_ISLNK(original.st_mode) or not os.path.lexists(candidates[1]):
+                    raise RuntimeError("classic system Git must be a regular file or trusted NixOS alias")
+                legacy_target = candidate.resolve(strict=True)
+                nix_target = candidates[1].resolve(strict=True)
+                if legacy_target != nix_target or not nix_target.is_relative_to(Path("/nix/store")):
+                    raise RuntimeError("legacy Git alias does not match trusted NixOS system Git")
+                candidate = candidates[1]
             resolved = candidate.resolve(strict=True)
             if candidate == candidates[1] and not resolved.is_relative_to(Path("/nix/store")):
                 raise RuntimeError("NixOS Git must resolve inside the immutable Nix store")

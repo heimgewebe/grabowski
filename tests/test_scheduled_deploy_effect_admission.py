@@ -40,6 +40,47 @@ class ScheduledWorkerGitFilterTests(unittest.TestCase):
         ):
             worker._trusted_git_binary()
 
+    def test_root_managed_nixos_legacy_git_alias_uses_canonical_binary(self) -> None:
+        # NixOS can expose /usr/bin/git as a symlink to its immutable Git.
+        # The worker must execute the authenticated canonical system path.
+        canonical = "/run/current-system/sw/bin/git"
+        executable = Path("/nix/store/" + "a" * 32 + "-git/bin/git")
+        with (
+            patch.object(
+                worker.os.path, "lexists",
+                side_effect=lambda path: str(path) in {"/usr/bin/git", canonical},
+            ),
+            patch.object(Path, "lstat", return_value=SimpleNamespace(
+                st_uid=0, st_mode=stat.S_IFLNK | 0o755,
+            )),
+            patch.object(Path, "resolve", return_value=executable),
+            patch.object(Path, "stat", return_value=SimpleNamespace(
+                st_uid=0, st_mode=stat.S_IFREG | 0o555,
+            )),
+            patch.object(worker.os, "access", return_value=True),
+        ):
+            self.assertEqual(worker._trusted_git_binary(), canonical)
+
+    def test_legacy_git_alias_must_match_canonical_nixos_git(self) -> None:
+        canonical = "/run/current-system/sw/bin/git"
+        trusted = Path("/nix/store/" + "a" * 32 + "-git/bin/git")
+
+        def resolve(path: Path, *, strict: bool = False) -> Path:
+            return Path("/tmp/foreign-git") if str(path) == "/usr/bin/git" else trusted
+
+        with (
+            patch.object(
+                worker.os.path, "lexists",
+                side_effect=lambda path: str(path) in {"/usr/bin/git", canonical},
+            ),
+            patch.object(Path, "lstat", return_value=SimpleNamespace(
+                st_uid=0, st_mode=stat.S_IFLNK | 0o755,
+            )),
+            patch.object(Path, "resolve", autospec=True, side_effect=resolve),
+            self.assertRaisesRegex(RuntimeError, "legacy Git alias"),
+        ):
+            worker._trusted_git_binary()
+
     @staticmethod
     def git(repo: Path, *args: str) -> str:
         environment = {
