@@ -2015,6 +2015,14 @@ class CodingAgentRouterTests(unittest.TestCase):
         self.assertNotIn("claude-fable-5-contrast-high", all_review_routes)
         self.assertNotIn("claude-fable-5-writer-high", all_review_routes)
 
+    def test_grok_47_quality_and_review_policy_indexes_remain_consistent(self) -> None:
+        policy = self.catalog["policy"]
+        self.assertEqual(self.catalog["models"]["grok-4.7"]["quality_prior_class"], "A")
+        self.assertIn("grok-4.7", policy["quality_classes"]["A"]["models"])
+        self.assertIn("grok-4.6", policy["quality_classes"]["A"]["models"])
+        self.assertIn("grok-4.7-review-high", policy["frontier_model_policy"]["upper_review_or_contrast_routes"])
+        self.assertIn("grok-4.6-review-high", policy["frontier_model_policy"]["upper_review_or_contrast_routes"])
+
     def test_jules_is_a_managed_harness_not_a_ranked_model_claim(self) -> None:
         model = self.catalog["models"]["jules-managed-latest"]
         self.assertEqual(model["identity_kind"], "managed-harness-placeholder")

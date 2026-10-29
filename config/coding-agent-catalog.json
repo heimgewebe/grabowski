@@ -499,6 +499,26 @@
       },
       "quality_prior_class": "A"
     },
+    "grok-4.7": {
+      "availability": "live-verified-via-grok-com",
+      "base_quality_rank": 84,
+      "evidence": "grok-cli-1.0.70-authenticated-grok-models-and-bwrap-role-smoke-2026-10-28",
+      "family": "xai-grok-4.7",
+      "identity_kind": "model",
+      "name": "Grok 4.7",
+      "provider_family": "xai",
+      "quality": {
+        "architecture": 9,
+        "autonomy": 9,
+        "coding": 9,
+        "context": 9,
+        "debugging": 9,
+        "reliability": 8,
+        "review": 8,
+        "speed": 9
+      },
+      "quality_prior_class": "A"
+    },
     "jules-managed-latest": {
       "availability": "live-plan-unknown",
       "evidence": "managed remote harness; underlying model is not asserted",
@@ -813,6 +833,7 @@
         "codex-terra-high",
         "claude-sonnet-5-high",
         "grok-4.6-review-high",
+        "grok-4.7-review-high",
         "antigravity-gemini-pro-review-high"
       ],
       "paid_contrast_routes": [
@@ -838,7 +859,8 @@
           "claude-opus-5.5",
           "gpt-5.6-terra",
           "claude-sonnet-5",
-          "grok-4.6"
+          "grok-4.6",
+          "grok-4.7"
         ]
       },
       "B": {
@@ -2453,6 +2475,47 @@
     },
     {
       "argv_prefix": [
+        "grok",
+        "--model",
+        "grok-4.7"
+      ],
+      "base_quality_rank": 84,
+      "burn_weight": 1.4,
+      "delegation_overhead_minutes": 5,
+      "effort": "high",
+      "enabled": true,
+      "harness": "grok",
+      "harness_quality": 7,
+      "id": "grok-4.7-high",
+      "independence_group": "xai-grok-4.7",
+      "min_duration_minutes": 10,
+      "model": "grok-4.7",
+      "priority": 100,
+      "quality_class": "A",
+      "quota_pools": [
+        "grok-com"
+      ],
+      "risk_affinity": {
+        "counteranalysis": 10,
+        "frontend": 6,
+        "terminal-heavy": 6
+      },
+      "role": "independent-frontier-countervoice",
+      "task_classes": [
+        "tests",
+        "bounded-patch",
+        "frontend",
+        "refactor",
+        "complex-patch",
+        "deep-debug",
+        "architecture",
+        "long-agent"
+      ],
+      "tier": "deep",
+      "contrast_only": true
+    },
+    {
+      "argv_prefix": [
         "jules",
         "new"
       ],
@@ -3102,6 +3165,42 @@
       "min_duration_minutes": 10,
       "model": "grok-4.6",
       "priority": 104,
+      "quality_class": "A",
+      "quota_pools": [
+        "grok-com"
+      ],
+      "review_only": true,
+      "task_affinity": {
+        "critical-review": 18,
+        "independent-review": 18,
+        "security-review": 12
+      },
+      "task_classes": [
+        "independent-review",
+        "critical-review",
+        "security-review"
+      ],
+      "tier": "deep"
+    },
+    {
+      "argv_prefix": [
+        "grok",
+        "--model",
+        "grok-4.7"
+      ],
+      "base_quality_rank": 84,
+      "burn_weight": 1.4,
+      "critical_eligible": true,
+      "delegation_overhead_minutes": 5,
+      "effort": "high",
+      "enabled": true,
+      "harness": "grok",
+      "harness_quality": 8,
+      "id": "grok-4.7-review-high",
+      "independence_group": "xai-grok-4.7",
+      "min_duration_minutes": 10,
+      "model": "grok-4.7",
+      "priority": 107,
       "quality_class": "A",
       "quota_pools": [
         "grok-com"

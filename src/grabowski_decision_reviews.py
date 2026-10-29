@@ -35,7 +35,7 @@ MAX_STDOUT_TAIL_BYTES = 256 * 1024
 # Non-review origins must not conceal review results retained in their job logs.
 # This is a separate, bounded verification budget, not a limit increase for
 # admitted review evidence.
-MAX_UNBOUND_STDOUT_BYTES = 8 * 1024 * 1024
+MAX_UNBOUND_STDOUT_BYTES = 32 * 1024 * 1024
 MAX_ROLE_RECEIPT_BYTES = 4 * 1024 * 1024
 MAX_REVIEW_ROLE_MODULE_BYTES = 1024 * 1024
 REVIEW_ROLE_MODULE = "grabowski_agent_role"
@@ -737,7 +737,7 @@ def _proven_not_started(metadata: dict[str, Any]) -> bool:
 
 def _validated_origin_binding(
     directory: Path, *, raw_metadata: dict[str, Any] | None = None,
-    parent_fd: int | None = None,
+    parent_fd: int | None = None, expected: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any] | None, dict[str, Any] | None]:
     unit = directory.name
     if _UNIT_RE.fullmatch(unit) is None:
@@ -766,6 +766,13 @@ def _validated_origin_binding(
     if raw_binding is None:
         return metadata, None, None
     binding = normalize_binding(raw_binding)
+    # A foreign PR/head cannot contribute a PASS to this reconciliation.
+    # Its authenticated Origin and structured binding are still verified;
+    # the caller must scan any retained exact-head role receipt/stdout for
+    # a displaced REJECT. Do not require historical runner binaries for
+    # unrelated reviews after a runtime or release rotation.
+    if expected is not None and not _binding_matches_pr_head(binding, expected):
+        return metadata, binding, None
     origin_cwd = scope.get("cwd")
     if not isinstance(origin_cwd, str) or not origin_cwd:
         raise ValueError("job origin cwd is invalid")
@@ -2155,7 +2162,8 @@ def reconcile(
                         attempts = []
                         break
                 metadata, binding, provenance = _validated_origin_binding(
-                    directory, raw_metadata=raw_metadata, parent_fd=directory_fd
+                    directory, raw_metadata=raw_metadata, parent_fd=directory_fd,
+                    expected=expected,
                 )
             except ReviewMetadataBudgetExceeded:
                 errors.append("decision_review_metadata_aggregate_budget_exceeded")

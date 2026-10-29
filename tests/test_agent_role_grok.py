@@ -48,6 +48,17 @@ def _create_only_process_writer(
         results.put("created")
 
 
+class NixOSRoleToolchainTests(unittest.TestCase):
+    def test_failed_secondary_toolchain_probe_keeps_invalid_review_receipt(self) -> None:
+        payload = {"returncode": 126, "verdict": "INVALID"}
+        with mock.patch.object(role, "toolchain_probe", side_effect=RuntimeError("unavailable")):
+            result = role.classify_result("review", ["claude"], Path("/unused"), payload)
+        self.assertEqual(result, "invalid_review_output")
+        self.assertEqual(payload["returncode"], 126)
+        self.assertEqual(payload["post_failure_toolchain_probe"]["failure_classification"], "toolchain_probe_error")
+        self.assertEqual(payload["post_failure_toolchain_probe"]["probe_error_type"], "RuntimeError")
+
+
 class GrokReviewRoleTests(unittest.TestCase):
 
     def test_create_only_receipt_is_private_and_cannot_be_replaced(self) -> None:
@@ -577,7 +588,8 @@ class GrokReviewRoleTests(unittest.TestCase):
         self.assertNotIn("--deny", actual)
         self.assertNotIn("-p", actual)
         self.assertIn("--verbatim", actual)
-        self.assertEqual(actual[actual.index("--sandbox") + 1], "read-only")
+        self.assertEqual(actual[actual.index("--sandbox") + 1], "off")
+        # The actual role executor still encloses this command in read-only bubblewrap.
         self.assertEqual(actual[actual.index("--prompt-file") + 1], "/dev/stdin")
         prompt = prompt_bytes.decode("utf-8")
         self.assertIn(base, prompt)
@@ -586,6 +598,31 @@ class GrokReviewRoleTests(unittest.TestCase):
         self.assertIn(review_diff.decode(), prompt)
         self.assertIn("Do not use any tool", prompt)
 
+
+    def test_grok_47_review_has_outer_read_only_bubblewrap(self) -> None:
+        # The inner Grok --sandbox off is allowed only inside Grabowski's
+        # real read-only Bubblewrap command, not as an unwrapped reviewer.
+        declared = ["grok", "--model", "grok-4.7", "review this"]
+        prepared = PreparedSandboxCommand(
+            command=("/opt/grabowski-external/grok", "--model", "grok-4.7", "-p", "review this")
+        )
+        with mock.patch.object(role, "prepare_external_agent_command", return_value=prepared):
+            argv, contract, prompt = role._review_sandbox_argv(
+                ROOT, declared, expected_head="a" * 40, expected_base_head="b" * 40,
+                review_diff=b"diff --git a/a.py b/a.py\n+safe = True\n",
+            )
+        self.assertEqual(Path(argv[0]).name, "bwrap")
+        self.assertIn("--unshare-pid", argv)
+        self.assertTrue(any(
+            argv[index:index + 3] == ["--ro-bind", str(ROOT), str(ROOT)]
+            for index in range(len(argv) - 2)
+        ))
+        self.assertIn("--ro-bind-data", argv)
+        self.assertEqual(argv[argv.index("--sandbox") + 1], "off")
+        self.assertEqual(argv[argv.index("--tools") + 1], "todo_write")
+        self.assertIn("todo_write", argv[argv.index("--disallowed-tools") + 1])
+        self.assertEqual(contract, role.GROK_REVIEW_STREAM_CONTRACT)
+        self.assertIn(b"diff --git", prompt)
 
     def test_streaming_review_large_diff_stays_out_of_argv(self) -> None:
         prepared = ("/opt/grabowski-external/grok", "--model", "grok-4.6", "-p", "review this")
