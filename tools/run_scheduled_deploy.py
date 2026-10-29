@@ -2108,6 +2108,34 @@ def run_resume_only(
     )
     outcome = resume_result.get("outcome")
     failure_type = _resume_finalization_failure_type(resume_result)
+    if outcome == "completed" and resume_result.get("receipt_persisted") is True:
+        # A generic "prerequisite recovered" finalization is NOT evidence
+        # that this specific attempted resume reached completed. Bind the
+        # terminal tag to its actual persisted resume receipt and requested
+        # deploy revision. The independent canonical loader must verify it.
+        receipt = resume_result.get("receipt")
+        resumed = receipt.get("resumed_cutover_id") if isinstance(receipt, dict) else None
+        receipt_hash = receipt.get("receipt_sha256") if isinstance(receipt, dict) else None
+        execution_head = recovery_decision.get("execution_head")
+        if (
+            not isinstance(resumed, str)
+            or re.fullmatch(r"[A-Za-z0-9._:@-]{1,128}", resumed) is None
+            or not isinstance(receipt_hash, str)
+            or re.fullmatch(r"[0-9a-f]{64}", receipt_hash) is None
+            or not isinstance(execution_head, str)
+            or re.fullmatch(r"[0-9a-f]{40,64}", execution_head) is None
+        ):
+            raise RuntimeError("completed prerequisite lacks exact persisted resume binding")
+        material = {
+            "schema_version": 1,
+            "kind": "grabowski_resolved_midcutover_prerequisite",
+            "resumed_cutover_id": resumed,
+            "resume_receipt_sha256": receipt_hash,
+            "execution_head": execution_head,
+        }
+        failure_type = (
+            "MidCutoverPrerequisiteRecovered:" + canonical_json_sha256(material)
+        )
     emit(
         "midcutover-recovery-terminal",
         resume_outcome=outcome,
@@ -2166,6 +2194,9 @@ def main() -> int:
     binding: dict[str, Any] | None = None
     blue_green_result: dict[str, Any] | None = None
     live: dict[str, Any] | None = None
+    # Signed no-runtime-effect failure only until the first potentially
+    # effectful resume/cutover call has been entered.
+    runtime_effect_started = False
     retained_validation: tempfile.TemporaryDirectory[str] | None = None
     sealed_yaml_fd: int | None = None
     try:
@@ -2218,6 +2249,7 @@ def main() -> int:
             if key != "classification"
         })
         if recovery_decision["resume_required"]:
+            runtime_effect_started = True
             return run_resume_only(
                 {
                     **recovery_decision,
@@ -2231,6 +2263,7 @@ def main() -> int:
                 "recovery classification is fail-closed; no deployment may start: "
                 + ",".join(recovery_decision.get("reasons") or ["unclassified"])
             )
+        runtime_effect_started = True
         blue_green_result = run_productive_blue_green(
             repo=repo,
             expected_head=args.expected_head,
@@ -2327,7 +2360,13 @@ def main() -> int:
                         if unresolved_without_primary_receipt and isinstance(live, dict)
                         else None
                     ),
-                    failure_type=type(exc).__name__,
+                    # Typed only by this runner before either effect boundary:
+                    # a plain failed finalization is never no-effect proof.
+                    failure_type=(
+                        f"PreRuntimeEffect:{type(exc).__name__}"
+                        if not runtime_effect_started
+                        else type(exc).__name__
+                    ),
                     blue_green=(
                         blue_green_result.get("summary")
                         if isinstance(blue_green_result, dict)
