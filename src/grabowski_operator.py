@@ -8435,8 +8435,9 @@ def _start_job(
     systemd_argv = [
         "systemd-run",
         "--user",
-        # The finalizer persists the outcome before systemd collects terminal jobs.
-        "--collect",
+        # Generic jobs retain a finalization receipt before systemd collection.
+        # Reserved deployments use runner-owned finalization and must stay observable.
+        *(["--collect"] if finalization_expected_head is None else []),
         f"--description={_systemd_safe_description('job', unit, metadata['argv_sha256'])}",
         "--unit",
         unit,
