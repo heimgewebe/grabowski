@@ -165,6 +165,57 @@ class ScheduledWorkerGitFilterTests(unittest.TestCase):
                 worker.verify_repository(repo, repo, "canonical-main", head)
             self.assertFalse((root / "trace").exists())
 
+    def test_filter_registered_after_audit_cannot_execute_during_dirty_check(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="worker-filter-race-") as dirname:
+            root = Path(dirname)
+            repo, head = self.make_repo(root, attributes=True)
+            tracked = repo / "tracked.txt"
+            original = tracked.stat()
+            # Same size/mtime forces Git's otherwise hidden clean-filter path.
+            tracked.write_text("modified\n", encoding="utf-8")
+            os.utime(tracked, ns=(original.st_atime_ns, original.st_mtime_ns))
+            marker = root / "raced-filter-executed"
+            original_audit = worker._reject_repository_git_filters
+
+            def race_config(checkout: Path) -> None:
+                original_audit(checkout)
+                self.git(
+                    repo, "config", "filter.proof.clean",
+                    f"/bin/sh -c 'printf executed > {marker}; cat'",
+                )
+
+            with patch.object(worker, "_reject_repository_git_filters", side_effect=race_config):
+                with self.assertRaisesRegex(RuntimeError, "dirty"):
+                    worker.verify_repository(repo, repo, "canonical-main", head)
+            self.assertFalse(marker.exists(), "effect-time clean filter executed")
+            # Discriminating control: an ordinary Git content diff executes it.
+            self.git(repo, "diff", "--", "tracked.txt")
+            self.assertTrue(marker.exists(), "clean-filter control did not trigger")
+
+    def test_staged_and_untracked_changes_are_still_dirty(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="worker-raw-clean-") as dirname:
+            repo, head = self.make_repo(Path(dirname))
+            (repo / "untracked.txt").write_text("extra\n", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "dirty"):
+                worker.verify_repository(repo, repo, "canonical-main", head)
+            (repo / "untracked.txt").unlink()
+            (repo / "tracked.txt").write_text("staged\n", encoding="utf-8")
+            self.git(repo, "add", "tracked.txt")
+            with self.assertRaisesRegex(RuntimeError, "dirty"):
+                worker.verify_repository(repo, repo, "canonical-main", head)
+
+    def test_ignored_file_and_tracked_symlink_keep_clean_repo_eligible(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="worker-raw-symlink-") as dirname:
+            repo, _head = self.make_repo(Path(dirname))
+            (repo / ".gitignore").write_text("*.log\n", encoding="utf-8")
+            (repo / "link.txt").symlink_to("tracked.txt")
+            self.git(repo, "add", ".gitignore", "link.txt")
+            self.git(repo, "commit", "-qm", "ignore and symlink")
+            head = self.git(repo, "rev-parse", "HEAD")
+            self.git(repo, "update-ref", "refs/remotes/origin/main", head)
+            (repo / "ignored.log").write_text("ignored\n", encoding="utf-8")
+            worker.verify_repository(repo, repo, "canonical-main", head)
+
     def test_plain_repo_remains_eligible(self) -> None:
         with tempfile.TemporaryDirectory(prefix="worker-plain-filter-") as dirname:
             repo, head = self.make_repo(Path(dirname))

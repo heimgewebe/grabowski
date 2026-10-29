@@ -685,10 +685,10 @@ def _verified_git_environment() -> dict[str, str]:
 
 
 def _reject_repository_git_filters(repo: Path) -> None:
-    """Deny configured executable filter drivers before dirty-state Git commands.
+    """Reject executable filters as source policy, not as an effect-time guard.
 
-    This is an admission check, not an atomic guard against another writer
-    changing Git configuration between the check and a later Git invocation.
+    The separate worktree verifier never executes Git's content-conversion
+    machinery, even if configuration changes after this audit.
     """
     try:
         process = subprocess.Popen(
@@ -736,6 +736,133 @@ def _git_common_directory(repo: Path) -> Path:
     return resolved
 
 
+def _bounded_git_metadata(repo: Path, argv: list[str], environment: dict[str, str]) -> bytes:
+    """Read bounded Git index/tree listings without worktree content conversion."""
+    try:
+        process = subprocess.Popen(
+            [*_git_prefix(repo), *argv],
+            cwd=repo,
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        stdout, _stderr, timed_out, stdout_truncated, stderr_truncated = (
+            read_limited_process_pipes(
+                process, timeout_seconds=30, max_output_bytes=MAX_MANIFEST_BYTES
+            )
+        )
+    except OSError as exc:
+        raise RuntimeError("Git repository metadata unavailable") from exc
+    if timed_out or stdout_truncated or stderr_truncated or process.returncode != 0:
+        raise RuntimeError("Git repository metadata unavailable")
+    return stdout
+
+
+def _repository_dirty_without_git_filters(
+    repo: Path, environment: dict[str, str], expected_head: str,
+) -> bool:
+    """Check HEAD/index/worktree without asking Git to convert file contents.
+
+    Git status, diff-files and even ls-files -m can execute repo-configured
+    clean filters when index timestamps are racy. A config precheck cannot
+    make those later effects safe against concurrent writers. Instead, list
+    only Git index metadata and compare raw file blobs in Python.
+    """
+    tree = _bounded_git_metadata(
+        repo, ["ls-tree", "-r", "-z", expected_head], environment,
+    )
+    expected: dict[bytes, tuple[bytes, bytes]] = {}
+    for entry in tree.split(b"\0"):
+        if not entry:
+            continue
+        try:
+            metadata, pathname = entry.split(b"\t", 1)
+            mode, kind, oid = metadata.split()
+            if kind not in {b"blob", b"commit"} or pathname in expected:
+                return True
+            expected[pathname] = mode, oid
+        except ValueError:
+            return True
+    if _bounded_git_metadata(
+        repo, ["ls-files", "--others", "--exclude-standard", "--directory", "-z"],
+        environment,
+    ):
+        return True
+    manifest = _bounded_git_metadata(
+        repo, ["ls-files", "--stage", "-z"], environment,
+    )
+    for entry in manifest.split(b"\0"):
+        if not entry:
+            continue
+        try:
+            metadata, pathname = entry.split(b"\t", 1)
+            mode, oid, stage = metadata.split()
+            if expected.pop(pathname, None) != (mode, oid):
+                return True
+            if (
+                stage != b"0" or mode not in {b"100644", b"100755", b"120000"}
+                or len(oid) not in {40, 64}
+                or not re.fullmatch(rb"[0-9a-f]+", oid)
+            ):
+                return True
+            parts = pathname.split(b"/")
+            if not parts or any(part in {b"", b".", b".."} for part in parts):
+                return True
+            digest = hashlib.sha1() if len(oid) == 40 else hashlib.sha256()
+            # Directory-descriptor walk forbids symlinked parent directories.
+            parent_fd = os.open(repo, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+            try:
+                for part in parts[:-1]:
+                    next_fd = os.open(
+                        part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                        dir_fd=parent_fd,
+                    )
+                    os.close(parent_fd)
+                    parent_fd = next_fd
+                if mode == b"120000":
+                    link = os.readlink(parts[-1], dir_fd=parent_fd)
+                    raw = os.fsencode(link)
+                    digest.update(b"blob " + str(len(raw)).encode("ascii") + b"\0")
+                    digest.update(raw)
+                else:
+                    file_fd = os.open(
+                        parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                        dir_fd=parent_fd,
+                    )
+                    with os.fdopen(file_fd, "rb") as tracked:
+                        before = os.fstat(tracked.fileno())
+                        if (
+                            not stat.S_ISREG(before.st_mode)
+                            or bool(before.st_mode & 0o111) != (mode == b"100755")
+                        ):
+                            return True
+                        digest.update(
+                            b"blob " + str(before.st_size).encode("ascii") + b"\0"
+                        )
+                        total = 0
+                        while chunk := tracked.read(128 * 1024):
+                            total += len(chunk)
+                            digest.update(chunk)
+                        after = os.fstat(tracked.fileno())
+                        if (
+                            total != before.st_size
+                            or (before.st_dev, before.st_ino, before.st_size,
+                                before.st_mtime_ns, before.st_ctime_ns)
+                            != (after.st_dev, after.st_ino, after.st_size,
+                                after.st_mtime_ns, after.st_ctime_ns)
+                        ):
+                            return True
+            finally:
+                os.close(parent_fd)
+            if digest.hexdigest().encode("ascii") != oid:
+                return True
+        except (OSError, ValueError):
+            return True
+    return bool(expected)
+
+
 def verify_repository(
     repo: Path,
     canonical_repo: Path,
@@ -780,10 +907,6 @@ def verify_repository(
         [*git_prefix, "rev-parse", "--verify", "refs/remotes/origin/main"],
         cwd=source, environment=environment,
     )
-    status = run_capture(
-        [*git_prefix, "status", "--porcelain=v1", "--untracked-files=normal"],
-        cwd=source, environment=environment,
-    )
     if head != expected_head:
         raise RuntimeError(f"HEAD drift: expected {expected_head}, found {head}")
     expected_branch = "main" if source_kind == "canonical-main" else "HEAD"
@@ -793,7 +916,7 @@ def verify_repository(
         )
     if origin_main != expected_head:
         raise RuntimeError(f"origin/main drift: expected {expected_head}, found {origin_main}")
-    if status:
+    if _repository_dirty_without_git_filters(source, environment, expected_head):
         raise RuntimeError("source repository is dirty")
 
 
