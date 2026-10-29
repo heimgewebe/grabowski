@@ -1068,14 +1068,32 @@ class AuthoritativeCIReadTests(unittest.TestCase):
                     admission._fresh_github_checks(TARGET, serving_head=SERVING)
                 network.assert_not_called()
 
+    def test_release_credential_uses_packaged_operator_core_and_trusted_cli(self):
+        # NixOS packages grabowski_operator as a lightweight MCP facade.
+        # The token helper lives in grabowski_operator_core; the facade must
+        # neither be imported for auth nor used as a source of /usr/bin/gh.
+        facade = types.ModuleType("grabowski_operator")
+        core = types.ModuleType("grabowski_operator_core")
+        core._trusted_github_cli_path = Mock(return_value="/nix/store/trusted-gh/bin/gh")
+        core._github_pr_view_auth_token = Mock(return_value="test-opaque-token")
+        with patch.dict(sys.modules, {
+            "grabowski_operator": facade,
+            "grabowski_operator_core": core,
+        }):
+            self.assertEqual(admission._github_token(), "test-opaque-token")
+        core._trusted_github_cli_path.assert_called_once_with()
+        args = core._github_pr_view_auth_token.call_args.args
+        self.assertEqual(args[0], "/nix/store/trusted-gh/bin/gh")
+        self.assertEqual(args[2], "github.com")
+
     def test_operator_credential_failure_is_redacted(self):
         import types
-        fake = types.ModuleType("grabowski_operator")
-        fake.TRUSTED_GITHUB_CLI_PATH = Path("/usr/bin/gh")
+        fake = types.ModuleType("grabowski_operator_core")
+        fake._trusted_github_cli_path = Mock(return_value="/nix/store/trusted-gh/bin/gh")
         def reject(*_args):
             raise RuntimeError("secret must not reach a receipt: secret-fixture")
         fake._github_pr_view_auth_token = reject
-        with patch.dict(sys.modules, {"grabowski_operator": fake}):
+        with patch.dict(sys.modules, {"grabowski_operator_core": fake}):
             with self.assertRaises(admission.ReleaseAdmissionDenied) as raised:
                 admission._github_token()
         self.assertNotIn("secret-fixture", str(raised.exception))
@@ -1084,8 +1102,8 @@ class AuthoritativeCIReadTests(unittest.TestCase):
     def test_unexpected_credential_lookup_errors_hide_original_exception(self):
         import subprocess
 
-        fake = types.ModuleType("grabowski_operator")
-        fake.TRUSTED_GITHUB_CLI_PATH = Path("/usr/bin/gh")
+        fake = types.ModuleType("grabowski_operator_core")
+        fake._trusted_github_cli_path = Mock(return_value="/nix/store/trusted-gh/bin/gh")
         failures = (
             subprocess.CalledProcessError(
                 2, ["gh", "auth", "token"], output=b"secret-credential-canary"
@@ -1098,7 +1116,7 @@ class AuthoritativeCIReadTests(unittest.TestCase):
         for failure in failures:
             with self.subTest(failure=type(failure).__name__):
                 fake._github_pr_view_auth_token = Mock(side_effect=failure)
-                with patch.dict(sys.modules, {"grabowski_operator": fake}):
+                with patch.dict(sys.modules, {"grabowski_operator_core": fake}):
                     with self.assertRaises(admission.ReleaseAdmissionDenied) as raised:
                         admission._github_token()
                 self.assertEqual(
@@ -1531,7 +1549,7 @@ class RealGitDocumentationModeTests(unittest.TestCase):
                 return subprocess.run(
                     ["git", "-C", str(repo), *args],
                     capture_output=True, text=True, check=True,
-                    env={"PATH": "/usr/bin:/bin", "HOME": str(repo)},
+                    env={"PATH": "/run/current-system/sw/bin:/usr/bin:/bin", "HOME": str(repo)},
                 ).stdout.strip()
 
             git("init", "-q")

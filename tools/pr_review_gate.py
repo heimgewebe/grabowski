@@ -113,6 +113,7 @@ BOOTSTRAP_EXPECTED_CHECK_NAMES_BY_REPO = {
     "hall-of-memory/hall-of-memory": ("verify",),
     "alexdermohr/livia": ("quality",),
     "alexdermohr/mark-api": ("verify",),
+    "alexdermohr/kleinanzeiger": ("verify", "verify-py313", "installed-offline", "installed-offline-py313", "windows-installed-py3.12", "windows-installed-py3.13"),
     "heimgewebe/metarepo": ("ci (ubuntu-latest)", "ci (macos-latest)"),
     "heimgewebe/mitschreiber": ("ci / reusable-ci",),
     "heimgewebe/nixer": ("nixer-ci",),
