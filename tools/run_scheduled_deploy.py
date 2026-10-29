@@ -828,7 +828,7 @@ def _repository_dirty_without_git_filters(
                     digest.update(raw)
                 else:
                     file_fd = os.open(
-                        parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                        parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
                         dir_fd=parent_fd,
                     )
                     with os.fdopen(file_fd, "rb") as tracked:

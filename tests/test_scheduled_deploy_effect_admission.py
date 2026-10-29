@@ -204,6 +204,15 @@ class ScheduledWorkerGitFilterTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "dirty"):
                 worker.verify_repository(repo, repo, "canonical-main", head)
 
+    def test_tracked_fifo_cannot_block_raw_worktree_verification(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="worker-raw-fifo-") as dirname:
+            repo, head = self.make_repo(Path(dirname))
+            tracked = repo / "tracked.txt"
+            tracked.unlink()
+            os.mkfifo(tracked)
+            with self.assertRaisesRegex(RuntimeError, "dirty"):
+                worker.verify_repository(repo, repo, "canonical-main", head)
+
     def test_ignored_file_and_tracked_symlink_keep_clean_repo_eligible(self) -> None:
         with tempfile.TemporaryDirectory(prefix="worker-raw-symlink-") as dirname:
             repo, _head = self.make_repo(Path(dirname))
