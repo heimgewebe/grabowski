@@ -3580,8 +3580,16 @@ class OperatorContractTests(unittest.TestCase):
                 status = operator.grabowski_job_status("grabowski-job-bad1a0c00000")
 
             self.assertFalse(status["systemd_visible"])
-            self.assertNotEqual(status["final_status"], "launch_failed")
-            self.assertNotEqual(status["terminalization_evidence"]["source"], "systemd-run-launch")
+            # The unavailable unit and absent receipt never establish non-start.
+            # Keep that uncertainty when a later caller reads the job status.
+            self.assertEqual(status["final_status"], "missing_finalization_evidence")
+            self.assertEqual(status["terminalization_evidence"]["source"], "systemd-show")
+            self.assertFalse(status["terminalization_evidence"]["fallback_used"])
+            self.assertEqual(status["terminalization_evidence"]["receipt_state"], "missing_receipt")
+            self.assertEqual(
+                status["notification_evidence"]["final_status_preserved"],
+                "missing_finalization_evidence",
+            )
 
     def test_launcher_error_with_started_readback_is_a_started_job(self) -> None:
         operator = _load_operator_module()
