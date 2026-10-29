@@ -8533,6 +8533,24 @@ def _start_job(
         # launcher can fail or time out after systemd created the unit.  Ask
         # systemd before claiming a definitive non-start.
         dispatch_readback = _unit_dispatch_readback(unit)
+        if finalization_expected_head is None and dispatch_readback["outcome"] == "not_started":
+            # --collect can unload an already completed unit before a failed
+            # launcher readback. Only a validated finalization proves start.
+            receipt = _finalization_receipt_result(unit, metadata)
+            if receipt.get("valid") is True:
+                dispatch_readback = {
+                    **dispatch_readback,
+                    "outcome": "started",
+                    "source": "validated-finalization-receipt",
+                    "receipt_sha256": receipt["receipt_sha256"],
+                }
+            elif result.get("timed_out"):
+                dispatch_readback = {
+                    **dispatch_readback,
+                    "outcome": "outcome_unknown",
+                    "source": "collect-mode-unloaded-or-never-started",
+                    "receipt_state": receipt.get("state"),
+                }
         message = result["stderr"] or result["stdout"] or "job launch failed"
         if dispatch_readback["outcome"] == "not_started":
             terminalization = {
