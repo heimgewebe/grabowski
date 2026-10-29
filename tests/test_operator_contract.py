@@ -3300,7 +3300,7 @@ class OperatorContractTests(unittest.TestCase):
                 "--expected-diff-sha256", "e" * 64,
                 "--expected-dirty", "false",
                 "--output", str(root / "shared-legacy-output.json"),
-                "--", "grok", "--model", "grok-4.6", "Review frozen revision",
+                "--", "grok", "--model", "grok-4.6", "-p", "Review frozen revision",
             ]
             launched = {
                 "returncode": 0,

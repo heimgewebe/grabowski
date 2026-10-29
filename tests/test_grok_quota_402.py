@@ -12,7 +12,7 @@ import unittest
 import test_decision_reviews as fixtures
 
 
-GROK_COMMAND = ["grok", "--model", "grok-4.6", "Review the frozen revision"]
+GROK_COMMAND = ["grok", "--model", "grok-4.6", "-p", "Review the frozen revision"]
 COMMANDS = ["compact", "always-approve", "context", "session-info", "feedback", "goal"]
 COMMANDS_WITH_MEMORY = [*COMMANDS[:2], "memory", *COMMANDS[2:]]
 QUOTA_MESSAGE = "API error (status 402 Payment Required): Grok Build usage balance exhausted"
