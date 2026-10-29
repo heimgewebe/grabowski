@@ -954,7 +954,7 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
                 terminal_status="succeeded", review_result=None,
                 review_role=True, attempt_bound=True, attempt_epoch=2,
                 role_command_override=[
-                    "grok", "--model", "grok-4.6", "Read-only frozen revision review",
+                    "grok", "--model", "grok-4.6", "-p", "Read-only frozen revision review",
                 ],
                 created_at_unix=1_787_000_200,
             )
