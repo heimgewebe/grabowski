@@ -1273,6 +1273,32 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
                 "a genuinely later signed resolution must clear the exact finding",
             )
 
+    def test_signed_reject_survives_equivalent_diff_identity(self) -> None:
+        original = self._first_party_plan()
+        first = self._start_plan(original)
+        self._submit_axis(first, review.REQUIRED_AXES[0], 1, reject=True)
+        # GitHub can represent identical immutable base/head source bytes
+        # under canonical, canonical-v1, or current-provider raw SHA labels.
+        alias = producer.plan_first_party_review(
+            repo=self.repo, pr=1649, base_sha=self.base, head_sha=self.head,
+            diff_sha256="d" * 64,
+        )
+        self.assertNotEqual(original["binding"]["diff_sha256"], alias["binding"]["diff_sha256"])
+        with self.assertRaisesRegex(
+            review.ReviewExecutionRejected, "previous signed material",
+        ):
+            review._assert_no_first_party_reject_for_legacy_review(
+                alias["binding"], repository=self.repo, root=self.state,
+                signers=self.signers, root_owned_signers=False,
+            )
+        second = self._start_plan(alias)
+        for number, axis in enumerate(review.REQUIRED_AXES, 1):
+            self._submit_axis(second, axis, number)
+        with self.assertRaisesRegex(
+            review.ReviewExecutionRejected, "previous signed material",
+        ):
+            self._seal_direct(alias)
+
     def test_legacy_v2_review_cannot_hide_first_party_reject(self) -> None:
         plan_a = self._first_party_plan()
         started_a = self._start_plan(plan_a)

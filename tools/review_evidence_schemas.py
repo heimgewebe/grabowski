@@ -180,6 +180,10 @@ SELF_REVIEW_SCHEMA = EvidenceSchema(
         "head_sha": STRING,
         "base_sha": STRING,
         "diff_sha256": STRING,
+        # Authenticated fields reach the semantic verifier; shape alone confers no trust.
+        "review_batch_id": STRING,
+        "review_origin": FieldRule(("string",), const="first_party_authenticated_controller_v1"),
+        "review_pass_receipts": OBJECT_ARRAY,
         "diff_reviewed": BOOLEAN,
         "reviewed_files": NON_EMPTY_STRING_ARRAY,
         "review_focus": NON_EMPTY_STRING_ARRAY,

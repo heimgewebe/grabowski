@@ -174,6 +174,22 @@ class ReviewEvidenceSchemaTests(unittest.TestCase):
         self.assertEqual(document["properties"]["schema_version"]["const"], 1)
         self.assertIn("expected_head_sha", document["required"])
 
+    def test_authenticated_first_party_fields_pass_strict_input_schema(self) -> None:
+        payload = _self_review()
+        payload.update({
+            "review_batch_id": "b" * 32,
+            "review_origin": "first_party_authenticated_controller_v1",
+            "review_pass_receipts": [{"session_id": "a" * 32}],
+        })
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "authenticated-self-review.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            self.assertEqual(gate.load_self_review(path), payload)
+            payload["review_pass_receipts"] = "untrusted-string"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaisesRegex(gate.GateInputError, "review_pass_receipts"):
+                gate.load_self_review(path)
+
     def test_self_review_loader_uses_schema_layer(self) -> None:
         payload = _self_review()
         payload["pr"] = "42"

@@ -1791,12 +1791,31 @@ def _assert_prior_first_party_material_findings_resolved(
                     candidate = old.get("binding")
                     if not isinstance(candidate, dict):
                         raise ReviewExecutionRejected("previous signed session binding absent")
+                    # Equivalent GitHub diff encodings cannot erase signed
+                    # REJECT debt. Exact raw and canonical source digests are
+                    # independently verified below before admitting history.
                     revision_fields = (
-                        "repo", "pr", "base_sha", "head_sha", "diff_sha256",
+                        "repo", "pr", "base_sha", "head_sha",
                         "review_purpose", "release_binding",
                     )
                     if not all(candidate.get(k) == decisive.get(k) for k in revision_fields):
                         continue
+                    if decisive.get("review_purpose") == "frozen_candidate":
+                        # A new signed Test receipt changes the full Candidate
+                        # binding but NOT its immutable Writer patch identity.
+                        # Compare source identity, never ephemeral Test receipts,
+                        # so batch rotation cannot erase a signed REJECT.
+                        previous_candidate = candidate.get("candidate_binding")
+                        current_candidate = decisive.get("candidate_binding")
+                        if (
+                            not isinstance(previous_candidate, dict)
+                            or not isinstance(current_candidate, dict)
+                            or candidate.get("diff_sha256") != decisive.get("diff_sha256")
+                            or previous_candidate.get("candidate") != current_candidate.get("candidate")
+                            or previous_candidate.get("patch_bytes_sha256")
+                            != current_candidate.get("patch_bytes_sha256")
+                        ):
+                            continue
                     # A legacy/independent review may be dispatched from main.
                     # Verify sources against the original SIGNED review worktree,
                     # never assume that Captain\'s main checkout is the PR head.
