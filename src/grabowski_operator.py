@@ -8459,6 +8459,9 @@ def _start_job(
     systemd_argv = [
         "systemd-run",
         "--user",
+        # Generic jobs retain a finalization receipt before systemd collection.
+        # Reserved deployments use runner-owned finalization and must stay observable.
+        *(["--collect"] if finalization_expected_head is None else []),
         f"--description={_systemd_safe_description('job', unit, metadata['argv_sha256'])}",
         "--unit",
         unit,
@@ -8554,6 +8557,27 @@ def _start_job(
         # launcher can fail or time out after systemd created the unit.  Ask
         # systemd before claiming a definitive non-start.
         dispatch_readback = _unit_dispatch_readback(unit)
+        if finalization_expected_head is None and dispatch_readback["outcome"] == "not_started":
+            # --collect can unload an already completed unit before a failed
+            # launcher readback. Only a validated finalization proves start.
+            receipt = _finalization_receipt_result(unit, metadata)
+            if receipt.get("valid") is True:
+                dispatch_readback = {
+                    **dispatch_readback,
+                    "outcome": "started",
+                    "source": "validated-finalization-receipt",
+                    "receipt_sha256": receipt["receipt_sha256"],
+                }
+            else:
+                # --collect unloads both failed and successful short-lived jobs.
+                # Even a prompt nonzero launcher reply with a not-found unit
+                # cannot prove that no action ran. Avoid duplicate execution.
+                dispatch_readback = {
+                    **dispatch_readback,
+                    "outcome": "outcome_unknown",
+                    "source": "collect-mode-unloaded-or-never-started",
+                    "receipt_state": receipt.get("state"),
+                }
         message = result["stderr"] or result["stdout"] or "job launch failed"
         if dispatch_readback["outcome"] == "not_started":
             terminalization = {
