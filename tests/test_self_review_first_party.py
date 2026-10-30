@@ -1386,6 +1386,26 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
                 }),
                 "a signed REJECT must not bleed into another PR identity",
             )
+            self.assertEqual(
+                [], captain._signed_first_party_material_history_errors({
+                    **binding, "repository": "alexdermohr/machtverflechtungen",
+                }),
+                "a heimgewebe-only signed review cannot apply to another GitHub owner",
+            )
+            self.assertEqual(
+                ["merge_guard_signed_first_party_history_binding_invalid"],
+                captain._signed_first_party_material_history_errors({
+                    **binding, "repository": "../invalid/name",
+                }),
+                "invalid repository identities must still be rejected",
+            )
+            self.assertEqual(
+                ["merge_guard_signed_first_party_material_reject_or_invalid_history"],
+                captain._signed_first_party_material_history_errors({
+                    **binding, "repository": "Heimgewebe/grabowski",
+                }),
+                "case aliases of the signed owner must not bypass REJECT history",
+            )
 
             self.now += 1
             resolution = self._start_plan(self._first_party_plan())
