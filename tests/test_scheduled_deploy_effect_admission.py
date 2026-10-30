@@ -332,6 +332,70 @@ class ScheduledWorkerGitFilterTests(unittest.TestCase):
             self.assertIn(b"\r\n", target.read_bytes())
             worker.verify_repository(repo, repo, "canonical-main", head)
 
+    def test_committed_later_eol_override_cannot_launder_from_info(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="worker-eol-override-") as dirname:
+            repo, head = self.make_repo(Path(dirname))
+            (repo / ".gitattributes").write_text(
+                "*.txt text eol=crlf\n"
+                "tracked.txt -text eol=lf\n", encoding="utf-8"
+            )
+            self.git(repo, "add", ".gitattributes")
+            self.git(repo, "commit", "-qm", "Later rule overrides CRLF")
+            head = self.git(repo, "rev-parse", "HEAD")
+            self.git(repo, "update-ref", "refs/remotes/origin/main", head)
+            (repo / "tracked.txt").write_bytes(b"original\r\n")
+            (repo / ".git" / "info" / "attributes").write_text(
+                "tracked.txt text eol=crlf\n", encoding="utf-8"
+            )
+            self.assertNotEqual(
+                self.git(repo, "status", "--porcelain=v1", "--untracked-files=normal"), ""
+            )
+            with self.assertRaisesRegex(RuntimeError, "dirty"):
+                worker.verify_repository(repo, repo, "canonical-main", head)
+
+    def test_committed_nested_eol_override_cannot_launder_from_info(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="worker-eol-nested-override-") as dirname:
+            repo, _ = self.make_repo(Path(dirname))
+            nested = repo / "nested"
+            nested.mkdir()
+            tracked = nested / "notes.txt"
+            tracked.write_bytes(b"original\n")
+            (repo / ".gitattributes").write_text(
+                "*.txt text eol=crlf\n", encoding="utf-8"
+            )
+            (nested / ".gitattributes").write_text(
+                "notes.txt -text eol=lf\n", encoding="utf-8"
+            )
+            self.git(
+                repo, "add", ".gitattributes", "nested/.gitattributes", "nested/notes.txt"
+            )
+            self.git(repo, "commit", "-qm", "Nested committed LF override")
+            head = self.git(repo, "rev-parse", "HEAD")
+            self.git(repo, "update-ref", "refs/remotes/origin/main", head)
+            tracked.write_bytes(b"original\r\n")
+            (repo / ".git" / "info" / "attributes").write_text(
+                "nested/notes.txt text eol=crlf\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(RuntimeError, "dirty"):
+                worker.verify_repository(repo, repo, "canonical-main", head)
+
+    def test_last_matching_committed_crlf_rule_is_accepted(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="worker-eol-last-") as dirname:
+            repo, _ = self.make_repo(Path(dirname))
+            (repo / ".gitattributes").write_text(
+                "*.txt -text eol=lf\n"
+                "tracked.txt text eol=crlf\n", encoding="utf-8"
+            )
+            self.git(repo, "add", ".gitattributes")
+            self.git(repo, "commit", "-qm", "Final matching rule is CRLF")
+            head = self.git(repo, "rev-parse", "HEAD")
+            self.git(repo, "update-ref", "refs/remotes/origin/main", head)
+            tracked = repo / "tracked.txt"
+            tracked.unlink()
+            self.git(repo, "checkout", "--", "tracked.txt")
+            self.assertIn(b"\r\n", tracked.read_bytes())
+            worker.verify_repository(repo, repo, "canonical-main", head)
+
     def test_unstaged_crlf_attribute_cannot_disguise_dirty_file(self) -> None:
         with tempfile.TemporaryDirectory(prefix="worker-eol-unindexed-") as dirname:
             repo, head = self.make_repo(Path(dirname))

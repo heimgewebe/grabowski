@@ -760,25 +760,27 @@ def _bounded_git_metadata(repo: Path, argv: list[str], environment: dict[str, st
     return stdout
 
 
-def _committed_crlf_rule_matches(
+def _committed_crlf_attributes(
     repo: Path,
     environment: dict[str, str],
     pathname: bytes,
     committed_attrs: dict[bytes, tuple[bytes, bytes]],
-) -> bool:
-    """Require a matching explicit CRLF rule in a HEAD-pinned .gitattributes.
+) -> dict[bytes, bytes] | None:
+    """Resolve narrow HEAD-pinned rules in declaration/ancestor order.
 
-    Git check-attr --cached ALSO considers mutable .git/info/attributes, so it
-    alone cannot authorize a content-changing normalization. Only strict
-    literal filename/path and *.extension patterns are admitted here.
-    Unsupported Git attribute patterns fail closed.
+    The last matching assignment for each field wins, as in Git attributes.
+    Never use .git/info/attributes as evidence for content normalization.
+    Only literal, *.extension and exact relative-path patterns are supported;
+    an unknown potentially affecting pattern is a conservative denial.
     """
+    fields = {b"text", b"eol", b"filter", b"ident", b"working-tree-encoding"}
     components = pathname.split(b"/")
     attr_paths = [b".gitattributes"]
     parent = b""
     for part in components[:-1]:
         parent = (parent + b"/" if parent else b"") + part
         attr_paths.append(parent + b"/.gitattributes")
+    effective: dict[bytes, bytes] = {}
     for attr_path in attr_paths:
         item = committed_attrs.get(attr_path)
         if not item or item[0] not in {b"100644", b"100755"}:
@@ -794,22 +796,55 @@ def _committed_crlf_rule_matches(
             if not line or line.startswith(b"#"):
                 continue
             tokens = line.split()
-            if len(tokens) < 2 or b"eol=crlf" not in tokens[1:]:
+            if len(tokens) < 2:
                 continue
             pattern = tokens[0]
             if pattern.startswith(b"/"):
                 pattern = pattern[1:]
+            unsupported = False
             if b"/" in pattern:
-                matched = pattern == relative
-            elif pattern.startswith(b"*.") and pattern.count(b"*") == 1:
+                if any(ch in pattern for ch in (b"*", b"?", b"[", b"]", b"\\")):
+                    unsupported = True
+                    matched = False
+                else:
+                    matched = pattern == relative
+            elif pattern.startswith(b"*.") and pattern.count(b"*") == 1 and not any(
+                ch in pattern for ch in (b"?", b"[", b"]", b"\\")
+            ):
                 matched = basename.endswith(pattern[1:])
+            elif pattern == b"*":
+                matched = True
             elif all(ch not in pattern for ch in (b"*", b"?", b"[", b"]", b"\\")):
                 matched = pattern == basename
             else:
+                unsupported = True
                 matched = False
-            if matched:
-                return True
-    return False
+            if unsupported and any(
+                token.lstrip(b"-!").split(b"=", 1)[0] in fields
+                for token in tokens[1:]
+            ):
+                return None
+            if not matched:
+                continue
+            for token in tokens[1:]:
+                if token.startswith(b"-"):
+                    field, value = token[1:], b"unset"
+                elif token.startswith(b"!"):
+                    field, value = token[1:], b"unspecified"
+                elif b"=" in token:
+                    field, value = token.split(b"=", 1)
+                else:
+                    field, value = token, b"set"
+                if field in fields:
+                    effective[field] = value
+    if (
+        effective.get(b"eol") != b"crlf"
+        or effective.get(b"text", b"unspecified") not in {b"set", b"unspecified"}
+        or any(effective.get(field, b"unspecified") not in {b"unset", b"unspecified"}
+               for field in (b"filter", b"ident", b"working-tree-encoding"))
+    ):
+        return None
+    return effective
 
 
 def _explicit_index_crlf_only(
@@ -818,10 +853,11 @@ def _explicit_index_crlf_only(
     pathname: bytes,
     committed_attrs: dict[bytes, tuple[bytes, bytes]],
 ) -> bool:
-    """Allow only explicit, HEAD-anchored, non-executable CRLF normalization."""
-    if not _committed_crlf_rule_matches(
+    """Allow CRLF only if indexed Git attributes agree with pinned HEAD rules."""
+    committed = _committed_crlf_attributes(
         repo, environment, pathname, committed_attrs,
-    ):
+    )
+    if committed is None:
         return False
     fields = (b"text", b"eol", b"filter", b"ident", b"working-tree-encoding")
     raw = _bounded_git_metadata(
@@ -842,11 +878,10 @@ def _explicit_index_crlf_only(
         attributes[attribute] = value
     return (
         len(attributes) == len(fields)
-        and attributes[b"eol"] == b"crlf"
-        and attributes[b"text"] in {b"set", b"unspecified"}
-        and attributes[b"filter"] in {b"unspecified", b"unset"}
-        and attributes[b"ident"] in {b"unspecified", b"unset"}
-        and attributes[b"working-tree-encoding"] in {b"unspecified", b"unset"}
+        and all(
+            attributes[field] == committed.get(field, b"unspecified")
+            for field in fields
+        )
     )
 
 
