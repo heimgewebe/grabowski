@@ -68,6 +68,291 @@ def _pr(**overrides) -> dict:
     return payload
 
 
+class ReviewEvidenceCiRenameAwareConsumerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # Existing REST-only fixtures supply matching records for both witnesses.
+        # New adversarial Compare tests below disable this compatibility mock.
+        from unittest import mock
+        self._pinned_fixture = mock.patch.object(
+            ci, "_revision_bound_pr_file_evidence",
+            side_effect=lambda repo_name, pr: gate._load_pull_file_evidence(
+                Path.cwd(), repo_slug=repo_name, pr=pr["number"]
+            ),
+        )
+        self._pinned_fixture.start()
+        self.addCleanup(self._pinned_fixture.stop)
+
+    def test_graphql_only_docs_destination_must_include_critical_rename_source(self):
+        from unittest import mock
+        graphql = _pr(files=[{"path": "docs/ci.md"}])
+        rest = [{
+            "path": "docs/ci.md",
+            "status": "renamed",
+            "previousPath": ".github/workflows/ci.yml",
+        }]
+        with mock.patch.object(gate, "_load_pull_file_evidence", return_value=rest):
+            enriched = ci._require_rename_aware_pr(
+                "heimgewebe/grabowski", 42, graphql
+            )
+        self.assertEqual(graphql["files"], [{"path": "docs/ci.md"}])
+        self.assertTrue(enriched["pullFilesEvidenceComplete"])
+        complexity = gate.classify_complexity(
+            enriched, None, repo_name="heimgewebe/grabowski"
+        )
+        self.assertEqual("high_critical", complexity["review_tier"])
+        self.assertTrue(complexity["high_critical"])
+        self.assertGreaterEqual(complexity["minimum_self_review_iterations"], 4)
+        self.assertFalse(complexity["independent_review_required"])
+        self.assertTrue(any(".github/workflows/ci.yml" in reason for reason in
+                            complexity["high_critical_reasons"]))
+
+    def test_rest_docs_rename_preserves_documentation_tier(self):
+        from unittest import mock
+        graphql = _pr(files=[{"path": "docs/new.md"}])
+        rest = [{
+            "path": "docs/new.md", "status": "renamed",
+            "previousPath": "docs/old.md",
+        }]
+        with mock.patch.object(gate, "_load_pull_file_evidence", return_value=rest):
+            enriched = ci._require_rename_aware_pr(
+                "heimgewebe/grabowski", 42, graphql
+            )
+        complexity = gate.classify_complexity(
+            enriched, None, repo_name="heimgewebe/example"
+        )
+        self.assertEqual("documentation", complexity["review_tier"])
+        self.assertFalse(complexity["independent_review_required"])
+
+    def test_missing_incomplete_or_invalid_rest_rename_evidence_fails_closed(self):
+        from unittest import mock
+        graphql = _pr(files=[{"path": "docs/ci.md"}])
+        invalid_cases = (
+            None,
+            [],
+            [{"path": "docs/ci.md"}],
+            [{"path": "docs/ci.md", "status": "renamed"}],
+            [{"path": "docs/ci.md", "status": "renamed", "previousPath": ""}],
+            [{"path": "docs/ci.md", "status": "renamed",
+              "previousPath": "../.github/workflows/ci.yml"}],
+            [{"path": "docs/ci.md", "status": "invalid"}],
+            [{"path": "docs/ci.md", "status": "modified",
+              "previousPath": ".github/workflows/ci.yml"}],
+            [{"path": "docs/ci.md", "status": "modified"}] * 2,
+        )
+        for rest in invalid_cases:
+            with self.subTest(rest=rest), mock.patch.object(
+                gate, "_load_pull_file_evidence", return_value=rest
+            ):
+                with self.assertRaisesRegex(ci.CiEvidenceError, "rename-aware"):
+                    ci._require_rename_aware_pr(
+                        "heimgewebe/grabowski", 42, graphql
+                    )
+
+    def test_graphql_and_rest_path_identity_must_match(self):
+        from unittest import mock
+        graphql = _pr(files=[{"path": "docs/ci.md"}])
+        with mock.patch.object(
+            gate, "_load_pull_file_evidence",
+            return_value=[{"path": "docs/other.md", "status": "modified"}],
+        ):
+            with self.assertRaisesRegex(ci.CiEvidenceError, "rename-aware"):
+                ci._require_rename_aware_pr(
+                    "heimgewebe/grabowski", 42, graphql
+                )
+
+    def test_rest_unavailable_blocks_without_optimistic_graphql_fallback(self):
+        from unittest import mock
+        graphql = _pr(files=[{"path": "docs/ci.md"}])
+        with mock.patch.object(
+            gate, "_load_pull_file_evidence",
+            side_effect=RuntimeError("HTTP 403"),
+        ):
+            with self.assertRaisesRegex(ci.CiEvidenceError, "rename-aware"):
+                ci._require_rename_aware_pr(
+                    "heimgewebe/grabowski", 42, graphql
+                )
+
+    def test_incomplete_graphql_page_can_use_full_rest_evidence(self):
+        from unittest import mock
+        graphql = _pr(changedFiles=2, files=[{"path": "docs/one.md"}])
+        rest = [
+            {"path": "docs/one.md", "status": "modified"},
+            {"path": "docs/two.md", "status": "modified"},
+        ]
+        with mock.patch.object(gate, "_load_pull_file_evidence", return_value=rest):
+            enriched = ci._require_rename_aware_pr(
+                "heimgewebe/grabowski", 42, graphql
+            )
+        self.assertEqual(len(enriched["files"]), 2)
+
+    def test_a_b_a_stale_rest_same_path_added_must_not_downgrade_critical_rename(self):
+        # A currently renames a signed workflow out to docs; B was a plain
+        # added docs file. REST may still expose B after the PR returned to A.
+        # Both snapshots contain the *same destination* and changedFiles=1.
+        from unittest import mock
+        self._pinned_fixture.stop()
+        graphql = _pr(files=[{"path": "docs/ci.md"}])
+        stale_rest = [{"path": "docs/ci.md", "status": "added"}]
+        pinned = {
+            "base_commit": {"sha": "c" * 40},
+            "commits": [{"sha": "a" * 40}],
+            "files": [{
+                "filename": "docs/ci.md",
+                "status": "renamed",
+                "previous_filename": ".github/workflows/ci.yml",
+            }],
+        }
+        with mock.patch.object(
+            gate, "_load_pull_file_evidence", return_value=stale_rest
+        ), mock.patch.object(ci, "_run_json", return_value=pinned):
+            with self.assertRaisesRegex(ci.CiEvidenceError, "drifted"):
+                ci._require_rename_aware_pr("heimgewebe/grabowski", 42, graphql)
+
+    def test_revision_bound_compare_rejects_identity_drift_and_missing_metadata(self):
+        from unittest import mock
+        self._pinned_fixture.stop()
+        graphql = _pr(files=[{"path": "docs/ci.md"}])
+        rest = [{"path": "docs/ci.md", "status": "modified"}]
+        exact = {
+            "base_commit": {"sha": "c" * 40},
+            "commits": [{"sha": "a" * 40}],
+            "files": [{"filename": "docs/ci.md", "status": "modified"}],
+        }
+        for patched in (
+            dict(exact, base_commit={"sha": "d" * 40}),
+            dict(exact, commits=[{"sha": "b" * 40}]),
+            dict(exact, files=[]),
+            dict(exact, files=None),
+            dict(exact, files=[{"filename": "docs/ci.md", "status": "renamed"}]),
+        ):
+            with self.subTest(patched=patched), mock.patch.object(
+                gate, "_load_pull_file_evidence", return_value=rest
+            ), mock.patch.object(ci, "_run_json", return_value=patched):
+                with self.assertRaises(ci.CiEvidenceError):
+                    ci._require_rename_aware_pr("heimgewebe/grabowski", 42, graphql)
+
+    def test_revision_bound_compare_accepts_matching_documentation_rename(self):
+        from unittest import mock
+        self._pinned_fixture.stop()
+        graphql = _pr(files=[{"path": "docs/new.md"}])
+        rest = [{
+            "path": "docs/new.md", "status": "renamed",
+            "previousPath": "docs/old.md",
+        }]
+        exact = {
+            "base_commit": {"sha": "c" * 40},
+            "commits": [{"sha": "a" * 40}],
+            "files": [{
+                "filename": "docs/new.md", "status": "renamed",
+                "previous_filename": "docs/old.md",
+            }],
+        }
+        with mock.patch.object(
+            gate, "_load_pull_file_evidence", return_value=rest
+        ), mock.patch.object(ci, "_run_json", return_value=exact):
+            enriched = ci._require_rename_aware_pr(
+                "heimgewebe/grabowski", 42, graphql
+            )
+        result = gate.classify_complexity(
+            enriched, None, repo_name="heimgewebe/example"
+        )
+        self.assertEqual("documentation", result["review_tier"])
+
+    def test_attestation_publication_blocks_stale_same_path_rest_origin(self):
+        from unittest import mock
+        self._pinned_fixture.stop()
+        graphql = _pr(files=[{"path": "docs/ci.md"}])
+        stale = [{"path": "docs/ci.md", "status": "modified"}]
+        exact = {
+            "base_commit": {"sha": "c" * 40},
+            "commits": [{"sha": "a" * 40}],
+            "files": [{
+                "filename": "docs/ci.md", "status": "renamed",
+                "previous_filename": ".github/workflows/ci.yml",
+            }],
+        }
+        args = ci.build_parser().parse_args([
+            "evaluate-comment", "--pr", "42", "--repo-name",
+            "heimgewebe/grabowski", "--actor", "writer",
+            "--publish-status", "--comment-id", "17",
+        ])
+        status = ci.build_status_projection(_audit_bytes(
+            review_tier="documentation", minimum_review_iterations=1,
+            actual_review_iterations=1,
+        ))
+        with mock.patch.dict(ci.os.environ, {
+            "GITHUB_ACTOR": "writer", "REVIEW_GATE_COMMENT_BODY": "fixture",
+        }), mock.patch.object(
+            ci, "collaborator_permission", return_value="write"
+        ), mock.patch.object(
+            ci, "load_live_pr", return_value=graphql
+        ), mock.patch.object(
+            ci, "current_comment_authorization_state",
+            return_value=ci.COMMENT_STATE_CURRENT
+        ), mock.patch.object(
+            ci, "current_diff_sha256s", return_value=("b" * 64,)
+        ), mock.patch.object(
+            ci, "parse_comment_evidence", return_value=(status, True)
+        ), mock.patch.object(
+            gate, "_load_pull_file_evidence", return_value=stale
+        ), mock.patch.object(
+            ci, "_run_json", return_value=exact
+        ), mock.patch.object(ci, "publish_commit_status") as published:
+            result = ci.evaluate_comment_command(args)
+        self.assertEqual(1, result)
+        published.assert_called_once()
+        self.assertFalse(published.call_args.kwargs["passed"])
+
+    def test_actual_evaluate_comment_never_publishes_optimistic_pass_on_missing_rest(self):
+        from unittest import mock
+        args = ci.build_parser().parse_args([
+            "evaluate-comment", "--pr", "42", "--repo-name",
+            "heimgewebe/grabowski", "--actor", "writer",
+            "--publish-status", "--comment-id", "17",
+        ])
+        graphql = _pr(files=[{"path": "docs/ci.md"}])
+        projection = ci.build_status_projection(_audit_bytes(
+            review_tier="documentation", minimum_review_iterations=1,
+            actual_review_iterations=1,
+        ))
+        # Exercise the actual publication path, not only the REST helper.
+        # Path-only, invalid rename metadata, and an authentic critical
+        # workflow rename must all deny a documentation-level review PASS.
+        blocked_rest_cases = (
+            None,
+            [{"path": "docs/ci.md"}],
+            [{"path": "docs/ci.md", "status": "renamed"}],
+            [{"path": "docs/ci.md", "status": "modified",
+              "previousPath": ".github/workflows/ci.yml"}],
+            [{"path": "docs/ci.md", "status": "renamed",
+              "previousPath": ".github/workflows/ci.yml"}],
+        )
+        with mock.patch.dict(ci.os.environ, {
+            "GITHUB_ACTOR": "writer",
+            "REVIEW_GATE_COMMENT_BODY": "fixture",
+        }), mock.patch.object(
+            ci, "collaborator_permission", return_value="write"
+        ), mock.patch.object(
+            ci, "load_live_pr", return_value=graphql
+        ), mock.patch.object(
+            ci, "current_comment_authorization_state",
+            return_value=ci.COMMENT_STATE_CURRENT
+        ), mock.patch.object(
+            ci, "current_diff_sha256s", return_value=("b" * 64,)
+        ), mock.patch.object(
+            ci, "parse_comment_evidence", return_value=(projection, True)
+        ), mock.patch.object(ci, "publish_commit_status") as published:
+            for rest in blocked_rest_cases:
+                with self.subTest(rest=rest), mock.patch.object(
+                    gate, "_load_pull_file_evidence", return_value=rest
+                ):
+                    published.reset_mock()
+                    result = ci.evaluate_comment_command(args)
+                    self.assertEqual(1, result)
+                    published.assert_called_once()
+                    self.assertFalse(published.call_args.kwargs["passed"])
+
+
 class ReviewEvidenceCiProjectionTests(unittest.TestCase):
     def test_projection_strips_private_audit_content(self) -> None:
         audit_bytes = _audit_bytes()

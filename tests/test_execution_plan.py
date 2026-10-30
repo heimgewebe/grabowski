@@ -12,6 +12,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 import grabowski_execution_plan as execution_plan
+import grabowski_coding_agent_router as router
 
 
 SHA_A = "a" * 64
@@ -141,10 +142,52 @@ class ExecutionPlanTests(unittest.TestCase):
         self.assertEqual("delivery", plan["route_binding"]["effect_profile"])
         self.assertEqual(plan, execution_plan.validate_execution_plan(plan))
 
+    def test_real_router_self_review_route_builds_with_verifier_quorum(self) -> None:
+        route = router.canonical_execution_route(
+            "bounded-patch",
+            changed_files=1,
+            duration_minutes=30,
+            novelty="low",
+            risk_flags=[],
+            latency_priority=False,
+            need_review=False,
+            verification_policy="self_review",
+            effect_profile="candidate",
+        )
+        plan = writer_verify_plan(
+            route_decision=route,
+            verification_policy="self_review",
+        )
+        self.assertEqual("self_review", plan["verification_policy"])
+        self.assertEqual(1, plan["completion_policy"]["verifier_quorum"])
+
+    def test_delivery_profile_accepts_policy_v5_self_review(self) -> None:
+        plan = writer_verify_plan(
+            route_decision=route_decision(
+                effect_profile="delivery", verification_policy="self_review"
+            ),
+            verification_policy="self_review",
+        )
+        self.assertEqual("self_review", plan["route_binding"]["verification_policy"])
+
+    def test_self_review_requires_verifier_quorum(self) -> None:
+        with self.assertRaisesRegex(
+            execution_plan.ExecutionPlanError, "self review requires verifier quorum"
+        ):
+            writer_verify_plan(
+                route_decision=route_decision(verification_policy="self_review"),
+                verification_policy="self_review",
+                completion_policy={
+                    "required_nodes": ["writer", "tests", "reduce"],
+                    "require_all_critical": True,
+                    "verifier_quorum": 0,
+                },
+            )
+
     def test_delivery_profile_rejects_deterministic_verification(self) -> None:
         with self.assertRaisesRegex(
             execution_plan.ExecutionPlanError,
-            "requires verification_policy=independent_review",
+            "requires verification_policy=self_review or independent_review",
         ):
             execution_plan.route_binding_from_decision(
                 route_decision(

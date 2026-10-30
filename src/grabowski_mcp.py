@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from fnmatch import fnmatch
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 import asyncio
 import ast
 import base64
@@ -51,6 +52,7 @@ import grabowski_transport_assertion
 import grabowski_serving_process
 import grabowski_connector_contract
 import grabowski_connector_policy
+import grabowski_self_review_execution as self_review_execution
 import grabowski_lifecycle_read_surface as lifecycle_read_surface
 import grabowski_system_map
 import grabowski_blockades as blockade_policy
@@ -86,11 +88,13 @@ AGENT_INSTRUCTION_RULES: tuple[tuple[str, str], ...] = (
     ),
     (
         "mutation-preconditions",
-        "Before a mutation, determine the target, expected result, validation, stop condition, and rollback.",
+        "Before mutation: target, expected result, validation, stop condition, "
+        "rollback."
     ),
     (
         "state-check-before-retry",
-        "After a transport, platform-filter, or policy failure, verify target state; do not repeat an unchanged call without state evidence.",
+        "Transport/platform-filter/policy failure: verify target state; do not "
+        "repeat an unchanged call without state evidence."
     ),
     (
         "pre-runtime-platform-denial",
@@ -98,15 +102,24 @@ AGENT_INSTRUCTION_RULES: tuple[tuple[str, str], ...] = (
     ),
     (
         "platform-filter-narrowing",
-        "After readback proves an upstream platform filter caused no effect, continue the authorized goal through an existing semantically narrower typed operation when available; do not weaken, disguise, bypass, or repackage the platform safeguard.",
+        "After readback proves upstream platform filter caused no effect, "
+        "continue authorized goal via existing semantically narrower typed "
+        "operation if available; do not weaken, disguise, bypass or repackage "
+        "safeguard."
     ),
     (
         "publication-pending-is-local",
-        "platform_publication_pending is operation-local: proceed if required tool/schema active; else seek fresh request-bound evidence.",
+        "platform_publication_pending is local: proceed if required tool/schema "
+        "active; else seek fresh request-bound evidence."
     ),
     (
         "transport-roundtrip-before-mutation",
-        "Mutations normally. Fresh shared_unlabeled challenge: grip_run transport-roundtrip action=execute with challenge_receipt_sha256, exact target_tool_name, exact unchanged target_arguments; retention=same-process optimization. Stable scope may action=ack then invoke unchanged target once. action=begin requires exact target_tool_name/target_arguments. Read back ambiguous effects before retry.",
+        "Fresh shared_unlabeled challenge: grip_run transport-roundtrip "
+        "action=execute with challenge_receipt_sha256, exact target_tool_name, "
+        "exact unchanged target_arguments; same-process optimization. Stable "
+        "scope may action=ack; unchanged target once. action=begin requires "
+        "exact target_tool_name/target_arguments. Read back ambiguous effects "
+        "before retry."
     ),
     (
         "typed-operation-preference",
@@ -114,23 +127,50 @@ AGENT_INSTRUCTION_RULES: tuple[tuple[str, str], ...] = (
     ),
     (
         "github-connector-first",
-        "GitHub PR reads and typed PR mutations: platform GitHub connector first; local gh only after observed connector unavailability or authorization failure. Never create GHA helper workflows, observer lanes, or coordination leases for local gh auth/keyring recovery. Merges require expected_head_sha, GitHub rulesets/branch protection, and read back state.",
+        "Platform GitHub connector first for GitHub PR reads and typed PR "
+        "mutations; local gh only on observed connector unavailability or "
+        "authorization failure. No GHA helper workflows, observer lanes or "
+        "coordination leases for local gh auth/keyring. Merges require "
+        "expected_head_sha, GitHub rulesets/branch protection; read back state."
     ),
     (
         "goal-fidelity-before-continuation",
-        "User outcome outranks strategy. Use minimum sufficient mechanism; persistent complexity requires proof of benefit. Compare a simpler path with fresh evidence; choose CONTINUE/CHANGE/PARK-STOP. A tool failure alone is not strategic evidence. Managed dirty checkout after ensure: continue only from exact lane/lifecycle/checkout evidence with fresh Git preimage; never reset/clean/stash merely to satisfy ensure.",
+        "User outcome first; minimum sufficient mechanism. Persistent "
+        "complexity: proof of benefit. Simpler path, fresh evidence: "
+        "CONTINUE/CHANGE/PARK-STOP. Tool failure not strategic evidence. "
+        "Managed dirty checkout: only exact lane/lifecycle/checkout evidence + "
+        "fresh Git preimage; never reset/clean/stash."
     ),
     (
         "operator-obligation-lifecycle",
-        "Nontrivial: grip_run operator-obligation-list+operator-obligation-open; before end operator-obligation-status. End only if operator-obligation-close completed/explicitly blocked/durably delegated, or operator-obligation-resolve defers/supersedes with continuation_required=false/work_complete=false. Resume with new obligation.",
+        "Nontrivial: grip_run "
+        "operator-obligation-list+operator-obligation-open; before end "
+        "operator-obligation-status. End only via operator-obligation-close "
+        "completed/explicitly blocked/durably delegated or "
+        "operator-obligation-resolve defers/supersedes with "
+        "continuation_required=false/work_complete=false. Resume with new "
+        "obligation."
     ),
     (
         "convergence-before-high-risk-closure",
-        "Bind risk-adaptive system_convergence_plan at admission when classified. Completion != systemic convergence. Before claim resolve required criticality; hard gate: hash-bound grip_run convergence-assess must be terminally_closed and receipt-bound. Nonterminal blocks only claim; no mutation authority.",
+        "At admission bind risk-adaptive system_convergence_plan if classified. "
+        "Completion != systemic convergence. For required criticality, "
+        "hash-bound grip_run convergence-assess must be terminally_closed and "
+        "receipt-bound before claim. Nonterminal blocks only claim; no mutation "
+        "authority."
     ),
     (
         "no-authority-escalation",
-        "No action/merge/deploy/secret/retry authority granted. Calls need reason+user_intent. report_outcome once as final tool call before every final answer; read-only/partial/failed/blocked included.",
+        "No action/merge/deploy/secret/retry authority. Calls: "
+        "reason+user_intent. report_outcome once final tool call before every "
+        "final answer; read-only/partial/failed/blocked."
+    ),
+    (
+        "selective-repoground-retrieval",
+        "Known file/symbol: typed Git/file read first; no RepoGround preflight. "
+        "Unknown callers, impacts/tests or history/cross-repo: bounded "
+        "RepoGround query on fresh bundle; verify citations in Git. "
+        "Stale/unavailable/low coverage: Git fallback; optional."
     ),
 )
 
@@ -585,6 +625,9 @@ TOOL_CAPABILITY_REQUIREMENTS = {
     "grabowski_destroy_path": ("file_destroy",),
     "grabowski_rollback_text": ("rollback_text",),
     "grabowski_verify_audit": ("audit_verify",),
+    "grabowski_self_review_session_start": ("file_write",),
+    "grabowski_self_review_source_read": ("file_write",),
+    "grabowski_self_review_axis_submit": ("file_write",),
     "grabowski_audit_query": ("audit_read",),
     "grabowski_audit_trace": ("audit_read",),
     "grabowski_audit_analyze": ("audit_read",),
@@ -694,7 +737,7 @@ TOOL_CAPABILITY_REQUIREMENTS = {
     "grabowski_checkout_retain": ("git_cli", "resource_lease"),
     "grabowski_checkout_archive": ("git_cli", "resource_lease"),
     "grabowski_checkout_cleanup": ("git_cli", "resource_lease"),
-    "grabowski_checkout_uncertainty_status": (),
+    "grabowski_checkout_uncertainty_status": ("resource_lease",),
     "grabowski_checkout_uncertainty_reconcile": ("git_cli", "resource_lease"),
     "grabowski_github": ("github_cli",),
     "grabowski_user_service": ("user_service_control",),
@@ -858,6 +901,7 @@ OPERATOR_CAPABILITY_REQUIREMENT_TOOLS = {
     "grabowski_checkout_retain",
     "grabowski_checkout_archive",
     "grabowski_checkout_cleanup",
+    "grabowski_checkout_uncertainty_status",
     "grabowski_checkout_uncertainty_reconcile",
     "grabowski_github",
     "grabowski_user_service",
@@ -7220,6 +7264,207 @@ def grabowski_status(
             }
         )
     return _project_status_fields(base_payload, fields)
+
+
+_FIRST_PARTY_CONSUMED_SIGNED_EVIDENCE: ContextVar[dict[str, Any] | None] = ContextVar(
+    "grabowski_first_party_consumed_signed_evidence", default=None,
+)
+
+
+@contextmanager
+def _first_party_preconsumed_transport(evidence: dict[str, Any]) -> Iterator[None]:
+    """Carry one server-consumed ingress receipt into this exact tool execution.
+
+    FastMCP dispatch admits and consumes the signed request before invoking a
+    synchronous handler in a worker thread. The handler must authenticate the
+    same already-consumed receipt, never consume the MAC a second time. Caller
+    arguments cannot set this private, execution-scoped transport context.
+    """
+    if (
+        _FIRST_PARTY_CONSUMED_SIGNED_EVIDENCE.get() is not None
+        or not isinstance(evidence, dict)
+        or evidence.get("state") != "consumed"
+        or evidence.get("transport_mode") != "signed-one-call-v1"
+    ):
+        raise RuntimeError("first-party signed transport handoff invalid")
+    token = _FIRST_PARTY_CONSUMED_SIGNED_EVIDENCE.set(dict(evidence))
+    try:
+        yield
+    finally:
+        _FIRST_PARTY_CONSUMED_SIGNED_EVIDENCE.reset(token)
+
+
+def _authenticated_self_review_issuer(
+    ctx: Context | None, *, tool_name: str, arguments: dict[str, Any],
+) -> dict[str, Any]:
+    """Use the same real signed request consumed by the outer MCP dispatcher."""
+    authorization = _transport_authorize_connector_tool(ctx, tool_name, arguments)
+    if not isinstance(authorization, dict):
+        raise RuntimeError(
+            "first-party semantic review requires an enrolled authenticated connector"
+        )
+    runtime_binding = _transport_roundtrip_runtime_binding()
+    arguments_sha256 = grabowski_transport_assertion.canonical_arguments_sha256(
+        arguments
+    )
+    evidence = _FIRST_PARTY_CONSUMED_SIGNED_EVIDENCE.get()
+    if evidence is None:
+        # Direct, non-wrapped test or transport entrypoints still require a
+        # genuine one-call MAC and exactly one durable replay-filter consume.
+        evidence = _transport_signed_one_call_evidence(
+            ctx,
+            tool_name=tool_name,
+            arguments_sha256=arguments_sha256,
+            runtime_binding=runtime_binding,
+        )
+    else:
+        # The transport proof was already consumed by this *same* server-owned
+        # dispatch. Rebind it to the handler's exact tool, domain arguments,
+        # primary connector scope, request identity and immutable release.
+        scope = _transport_connector_capability_scope(ctx)
+        if (
+            not isinstance(scope, dict)
+            or evidence.get("tool_name") != tool_name
+            or evidence.get("arguments_sha256") != arguments_sha256
+            or evidence.get("request_id")
+               != _transport_context_header(ctx, _TRANSPORT_REQUEST_ID_HEADER)
+            or evidence.get("runtime_binding_sha256")
+               != grabowski_transport_assertion.runtime_binding_sha256(
+                   runtime_binding
+               )
+            or evidence.get("client_scope_sha256")
+               != grabowski_transport_roundtrip.client_scope_sha256(scope)
+        ):
+            raise RuntimeError("first-party signed transport handoff mismatch")
+    if not isinstance(evidence, dict):
+        raise RuntimeError(
+            "first-party semantic review requires fresh signed one-call ingress"
+        )
+    return self_review_execution.authenticated_first_party_issuer(
+        authorization["connector_id"], evidence, expected_tool=tool_name,
+    )
+
+
+@mcp.tool(
+    name="grabowski_self_review_session_start", annotations=CREATE_ANNOTATIONS,
+)
+def grabowski_self_review_session_start(
+    review_batch_id: str,
+    reason: str,
+    user_intent: str,
+    ctx: Context | None = None,
+    workspace_id: str | None = None,
+) -> dict[str, Any]:
+    """Start a stored-plan review, or derive a frozen Candidate with workspace_id and an empty batch ID."""
+    _require_mutations_enabled(
+        "file_write", path=str(self_review_execution.FIRST_PARTY_REVIEW_ROOT),
+    )
+    arguments = {
+        "review_batch_id": review_batch_id,
+        "reason": reason,
+        "user_intent": user_intent,
+    }
+    if workspace_id is not None:
+        arguments["workspace_id"] = workspace_id
+    issuer = _authenticated_self_review_issuer(
+        ctx, tool_name=self_review_execution.FIRST_PARTY_TOOL_START,
+        arguments=arguments,
+    )
+    from grabowski_self_review_producer import _load_plan, _store_plan, plan_frozen_candidate_review
+    if workspace_id is not None:
+        if review_batch_id != "":
+            raise ValueError("Candidate session derives its batch; review_batch_id must be empty")
+        plan = plan_frozen_candidate_review(workspace_id)
+        _store_plan(plan)
+    else:
+        plan = _load_plan(review_batch_id)
+    return self_review_execution.start_first_party_review_session(plan, issuer)
+
+
+@mcp.tool(
+    name="grabowski_self_review_source_read", annotations=CREATE_ANNOTATIONS,
+)
+def grabowski_self_review_source_read(
+    review_session_id: str,
+    session_nonce: str,
+    axis: str,
+    read_kind: str,
+    path: str,
+    revision: str,
+    start_line: int,
+    end_line: int,
+    reason: str,
+    user_intent: str,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    """Read and persist exact immutable Git bytes for one semantic axis."""
+    _require_mutations_enabled(
+        "file_write", path=str(self_review_execution.FIRST_PARTY_REVIEW_ROOT),
+    )
+    arguments = {
+        "review_session_id": review_session_id,
+        "session_nonce": session_nonce,
+        "axis": axis,
+        "read_kind": read_kind,
+        "path": path,
+        "revision": revision,
+        "start_line": start_line,
+        "end_line": end_line,
+        "reason": reason,
+        "user_intent": user_intent,
+    }
+    issuer = _authenticated_self_review_issuer(
+        ctx, tool_name=self_review_execution.FIRST_PARTY_TOOL_READ,
+        arguments=arguments,
+    )
+    return self_review_execution.record_first_party_source_read(
+        review_session_id, session_nonce, axis, read_kind,
+        path, revision, start_line, end_line, issuer,
+    )
+
+
+@mcp.tool(
+    name="grabowski_self_review_axis_submit", annotations=CREATE_ANNOTATIONS,
+)
+def grabowski_self_review_axis_submit(
+    review_session_id: str,
+    session_nonce: str,
+    report: dict[str, Any],
+    reason: str,
+    user_intent: str,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    """Persist a substantive axis verdict; report={"finalize": true} seals a five-axis Candidate handoff."""
+    _require_mutations_enabled(
+        "file_write", path=str(self_review_execution.FIRST_PARTY_REVIEW_ROOT),
+    )
+    arguments = {
+        "review_session_id": review_session_id,
+        "session_nonce": session_nonce,
+        "report": report,
+        "reason": reason,
+        "user_intent": user_intent,
+    }
+    issuer = _authenticated_self_review_issuer(
+        ctx, tool_name=self_review_execution.FIRST_PARTY_TOOL_SUBMIT,
+        arguments=arguments,
+    )
+    if set(report) == {"finalize"} and report["finalize"] is True:
+        sealed = self_review_execution.finalize_first_party_candidate(
+            review_session_id, session_nonce, issuer,
+        )
+        from grabowski_self_review_producer import candidate_review_command
+        return {
+            "status": "candidate_review_finalized",
+            "workspace_id": sealed["binding"]["candidate_binding"]["workspace_id"],
+            "candidate_id": sealed["binding"]["candidate_binding"]["candidate"]["candidate_id"],
+            "replacement_argv": candidate_review_command(sealed["binding"]["review_batch_id"]),
+            "next_action": "grabowski_agent_workspace_role_retry",
+            "role": "review", "review_task_started": False,
+        }
+    return self_review_execution.submit_first_party_axis_review(
+        review_session_id, session_nonce, report, issuer,
+    )
 
 
 @mcp.tool(name="grabowski_list_directory", annotations=READ_ANNOTATIONS)

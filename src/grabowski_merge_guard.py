@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import datetime, timezone
+import fcntl
 import hashlib
 import hmac
 import json
@@ -17,6 +19,7 @@ from urllib.parse import quote, urlsplit
 import weakref
 
 import grabowski_decision_reviews as decision_reviews
+import grabowski_git_ssh
 from grabowski_pr_diff import (
     GITHUB_PR_DIFF_IDENTITY_CANONICALIZATION,
     canonicalize_github_pr_diff_identity,
@@ -25,6 +28,87 @@ from grabowski_pr_diff import (
     bound_local_pr_git_diff,
     BoundLocalDiffError,
 )
+
+
+@contextmanager
+def _first_party_merge_signer_snapshot_guard(review_evidence: Any):
+    """Hold historical signed REJECTs fixed through Captain merge dispatch.
+
+    Both direct first-party and legacy high-critical audits validate signed
+    first-party REJECT history. The established receipt lock is shared during
+    final revalidation and the actual merge effect. An authenticated REJECT
+    submission requires the same lock exclusively and must wait.
+    """
+    if (
+        not isinstance(review_evidence, dict)
+        or (
+            review_evidence.get("review_tier") not in {
+                "very_small", "documentation", "standard", "important_repo",
+                "high_critical",
+            }
+            and review_evidence.get("review_origin")
+            != "first_party_authenticated_controller_v1"
+        )
+    ):
+        yield
+        return
+    import grabowski_self_review_execution as source
+    root = source.FIRST_PARTY_REVIEW_ROOT
+    if (root / ".lock").exists():
+        descriptor = source._first_party_lock(root, read_only=True)
+    else:
+        # Pin the lock before a concurrent first-ever session can create it.
+        # Downgrade EX -> SH atomically so nested signed-history readers
+        # may take their ordinary shared lock without a self-deadlock.
+        descriptor = source._first_party_lock(root)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_SH)
+        except BaseException:
+            source._release_first_party_lock(descriptor)
+            raise
+    try:
+        yield
+    finally:
+        source._release_first_party_lock(descriptor)
+
+
+def _signed_first_party_material_history_errors(bindings: dict[str, Any]) -> list[str]:
+    """Recheck immutable signed material debt for ordinary self-review tiers.
+
+    Only signed records of this exact repo/PR/base/head/diff can match.
+    An empty registry is legitimate; an untrustworthy present registry is not.
+    The caller holds the same signer lock until the GitHub merge effect.
+    """
+    import grabowski_self_review_execution as provenance
+
+    root = provenance.FIRST_PARTY_REVIEW_ROOT
+    registry = root / "sessions"
+    if registry.is_symlink():
+        return ["merge_guard_signed_first_party_history_invalid"]
+    if not registry.exists():
+        return []
+    repo = bindings.get("repository")
+    if not isinstance(repo, str) or re.fullmatch(r"heimgewebe/[A-Za-z0-9_.-]+", repo) is None:
+        return ["merge_guard_signed_first_party_history_binding_invalid"]
+    binding = {
+        "repo": repo,
+        "pr": bindings.get("pull_request"),
+        "base_sha": bindings.get("base_sha"),
+        "head_sha": bindings.get("head_sha"),
+        "diff_sha256": bindings.get("diff_sha256"),
+        "review_batch_id": "0" * 32,
+        "review_purpose": "pull_request",
+    }
+    try:
+        provenance._assert_no_first_party_reject_for_legacy_review(
+            binding,
+            repository=Path.home() / "repos" / repo.split("/")[-1],
+            root=root, signers=provenance.TRUSTED_SIGNERS,
+            root_owned_signers=True,
+        )
+    except (provenance.ReviewExecutionRejected, OSError, ValueError, KeyError, TypeError):
+        return ["merge_guard_signed_first_party_material_reject_or_invalid_history"]
+    return []
 
 
 class MergeGuardResourceAuthority(Protocol):
@@ -541,8 +625,102 @@ def captain_request_sha256(parameters: dict[str, Any]) -> str:
     return _sha256_json(visible)
 
 
+REVIEW_POLICY_VERSION = 5  # Server-attested phases; bound to review_evidence_schemas.py.
+HIGH_CRITICAL_REVIEW_AXES = (
+    "contracts_correctness",
+    "regression_compatibility",
+    "tests_negative_cases",
+    "security_authority_concurrency",
+    "adversarial_countercheck",
+)
+
+
+def high_critical_review_pass_evidence_errors(evidence: Any) -> list[str]:
+    """Validate the full five-pass audit records, not a caller-supplied hex digest.
+
+    Structural integrity does not independently authenticate who performed a
+    review. The trusted review producer and existing PR/CI origin gates remain
+    mandatory and cannot be inferred from this function.
+    """
+    if not isinstance(evidence, dict):
+        return ["high_critical_review_pass_records_missing_or_invalid"]
+    passes = evidence.get("review_iterations")
+    if not isinstance(passes, list) or not 5 <= len(passes) <= 32:
+        return ["high_critical_review_pass_records_missing_or_invalid"]
+    errors: list[str] = []
+    if type(evidence.get("actual_review_iterations")) is not int or (
+        evidence["actual_review_iterations"] != len(passes)
+    ):
+        errors.append("high_critical_review_pass_count_mismatch")
+    axes = [
+        item.get("axis") if isinstance(item, dict) else None
+        for item in passes
+    ]
+    if (
+        axes[:5] != list(HIGH_CRITICAL_REVIEW_AXES)
+        or evidence.get("review_pass_axes") != axes
+    ):
+        errors.append("high_critical_review_axes_invalid")
+    summaries: list[str] = []
+    for index, item in enumerate(passes, start=1):
+        if not isinstance(item, dict):
+            errors.append("high_critical_review_pass_record_invalid")
+            continue
+        if type(item.get("n")) is not int or item["n"] != index:
+            errors.append("high_critical_review_pass_number_invalid")
+        summary = item.get("summary")
+        if not isinstance(summary, str) or len(" ".join(summary.split())) < 36:
+            errors.append("high_critical_review_pass_summary_invalid")
+        else:
+            summaries.append(" ".join(summary.split()).casefold())
+        refs = item.get("evidence_refs")
+        if (
+            not isinstance(refs, list) or not refs
+            or len(refs) > 64
+            or any(
+                not isinstance(ref, str) or not 8 <= len(ref) <= 1024
+                or any(ord(ch) < 32 or ord(ch) == 127 for ch in ref)
+                for ref in refs
+            )
+        ):
+            errors.append("high_critical_review_pass_refs_invalid")
+        count = item.get("material_findings")
+        if type(count) is not int or count < 0:
+            errors.append("high_critical_review_pass_findings_invalid")
+    if len(summaries) != len(set(summaries)):
+        errors.append("high_critical_review_pass_summaries_duplicated")
+    try:
+        encoded = json.dumps(
+            passes, sort_keys=True, separators=(",", ":"),
+            ensure_ascii=False, allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError):
+        return [*errors, "high_critical_review_pass_serialization_invalid"]
+    if len(encoded) > 64 * 1024:
+        errors.append("high_critical_review_pass_records_oversized")
+    digest = evidence.get("review_pass_evidence_sha256")
+    if (
+        not isinstance(digest, str)
+        or _SHA256_RE.fullmatch(digest) is None
+        or digest != hashlib.sha256(encoded).hexdigest()
+    ):
+        errors.append("high_critical_review_pass_evidence_digest_invalid")
+    # Hashes alone prove bytes, not that reviews actually ran. Do not accept
+    # a client-authored five-pass packet without server-signed, task-bound
+    # private execution receipts. Malformed records fail before private reads.
+    if not errors:
+        from grabowski_self_review_execution import review_receipt_errors
+        errors.extend(review_receipt_errors(evidence))
+    return errors
+
+
 def independent_review_requirement(parameters: dict[str, Any]) -> dict[str, Any]:
-    """Resolve the provider-neutral independent-review floor for one Captain request."""
+    """Separate risk-scaled self-review quality from explicit reviewer opt-in.
+
+    Missing, malformed or obsolete audit policy evidence blocks every merge.
+    A historical high-critical requirement is not silently waived: it must be
+    replaced by a fresh current-policy audit bound to this exact PR revision.
+    """
     review_evidence = parameters.get("review_evidence")
     review_tier = (
         review_evidence.get("review_tier")
@@ -556,23 +734,195 @@ def independent_review_requirement(parameters: dict[str, Any]) -> dict[str, Any]
     )
     explicit_value = parameters.get("independent_review_required")
     errors: list[str] = []
-    if policy_value is not None and not isinstance(policy_value, bool):
-        errors.append("independent_review_policy_invalid")
-    if explicit_value is not None and not isinstance(explicit_value, bool):
+    if not isinstance(review_evidence, dict):
+        errors.append("review_evidence_missing")
+    else:
+        version = review_evidence.get("review_policy_version")
+        if type(version) is not int or version != REVIEW_POLICY_VERSION:
+            errors.append("review_policy_version_stale_or_invalid")
+        if type(policy_value) is not bool:
+            errors.append("independent_review_policy_invalid")
+    if explicit_value is not None and type(explicit_value) is not bool:
         errors.append("independent_review_required_invalid")
-    high_critical_floor = review_tier == "high_critical"
+    high_critical_risk = review_tier == "high_critical"
+    if high_critical_risk:
+        minimum = (
+            review_evidence.get("minimum_review_iterations")
+            if isinstance(review_evidence, dict) else None
+        )
+        actual = (
+            review_evidence.get("actual_review_iterations")
+            if isinstance(review_evidence, dict) else None
+        )
+        if (
+            type(minimum) is not int or minimum != 5
+            or type(actual) is not int or actual < 5
+        ):
+            errors.append("high_critical_self_review_depth_invalid")
+        errors.extend(high_critical_review_pass_evidence_errors(review_evidence))
     policy_required = policy_value is True
     explicitly_required = explicit_value is True
-    required = high_critical_floor or policy_required or explicitly_required
-    if high_critical_floor and policy_value is not True:
-        errors.append("independent_review_high_critical_floor_not_acknowledged")
     return {
         "review_tier": review_tier,
-        "high_critical_floor": high_critical_floor,
+        "high_critical_risk": high_critical_risk,
+        "high_critical_floor": False,
+        "review_policy_version": REVIEW_POLICY_VERSION,
         "policy_required": policy_required,
         "explicitly_required": explicitly_required,
-        "required": required,
+        "required": policy_required or explicitly_required,
         "errors": errors,
+    }
+
+
+def decision_review_blocking_errors(
+    reconciliation: Any, *, independent_required: bool,
+) -> dict[str, Any]:
+    """Preserve all review debt; distinguish *proven* pre-result outages.
+
+    Optional reviewer unavailability is not a semantic review verdict. Ignore
+    only three precisely classified infrastructure-only error families when
+    every same-slot attempt is a terminal, authentic, result-free infrastructure
+    attempt. A material REJECT, unresolved job, malformed origin, stale diff,
+    or any other error always survives. Do not synthesize a PASS or 'settled'.
+    """
+    if not isinstance(reconciliation, dict):
+        return {
+            "errors": ["decision_review_reconciliation_invalid"],
+            "ignored_unavailable": [], "status": "blocked",
+        }
+    raw_errors = reconciliation.get("errors")
+    if not isinstance(raw_errors, list) or any(
+        not isinstance(item, str) or not item for item in raw_errors
+    ):
+        return {
+            "errors": ["decision_review_reconciliation_errors_invalid"],
+            "ignored_unavailable": [], "status": "blocked",
+        }
+    if independent_required or not raw_errors:
+        return {
+            "errors": list(raw_errors),
+            "ignored_unavailable": [],
+            "status": reconciliation.get("status"),
+        }
+
+    attempts = reconciliation.get("attempts")
+    slots = reconciliation.get("slots")
+    total = reconciliation.get("attempt_count")
+    if (
+        not isinstance(attempts, list) or not isinstance(slots, list)
+        or type(total) is not int or total != len(attempts)
+        or type(reconciliation.get("slot_count")) is not int
+        or reconciliation["slot_count"] != len(slots)
+        or not attempts or not slots
+    ):
+        return {
+            "errors": list(raw_errors),
+            "ignored_unavailable": [], "status": "blocked",
+        }
+    by_slot: dict[str, list[dict[str, Any]]] = {}
+    for item in attempts:
+        if not isinstance(item, dict) or not isinstance(item.get("slot"), str):
+            return {
+                "errors": list(raw_errors), "ignored_unavailable": [], "status": "blocked",
+            }
+        by_slot.setdefault(item["slot"], []).append(item)
+    eligible: dict[str, set[str]] = {}
+    for slot in slots:
+        if not isinstance(slot, dict) or not isinstance(slot.get("slot"), str):
+            continue
+        name = slot["slot"]
+        rows = by_slot.get(name, [])
+        if any(
+            not isinstance(row, dict) or not isinstance(row.get("unit"), str)
+            for row in rows
+        ):
+            continue
+        if (
+            not rows or type(slot.get("attempt_count")) is not int
+            or slot["attempt_count"] != len(rows)
+            or any(
+                type(slot.get(field)) is not int or slot[field] != expected
+                for field, expected in (
+                    ("pass_count", 0),
+                    ("independent_pass_count", 0),
+                    ("material_reject_count", 0),
+                    ("unresolved_count", 0),
+                    ("infrastructure_error_count", len(rows)),
+                )
+            )
+            or slot.get("units_sha256")
+            != _sha256_json(sorted(row.get("unit") for row in rows))
+            or any(
+                not isinstance(row.get("unit"), str)
+                or re.fullmatch(r"grabowski-job-[0-9a-f]{12}", row["unit"]) is None
+                or re.fullmatch(r"[0-9a-f]{64}", str(row.get("origin_sha256"))) is None
+                or row.get("terminal") is not True
+                or row.get("classification") != "infrastructure_error"
+                or row.get("verdict") is not None
+                or row.get("material_findings") is not None
+                or row.get("result_sha256") is not None
+                or row.get("diff_identity_deferred") is not False
+                # Legacy "infrastructure_error" can mean an unstructured
+                # semantic REJECT. Optional absence is advisory only for
+                # a server-proven never-started job or a fully verified V2
+                # role receipt proving auth refusal or quota exhaustion
+                # before any semantic review work.
+                or not (
+                    (
+                        row.get("terminal_status") == "launch_failed"
+                        and row.get("stdout_tail_sha256") is None
+                        and row.get("review_role_receipt_sha256") is None
+                        and row.get("pre_result_quota_failure_verified") is False
+                        and row.get("pre_result_auth_failure_verified") is not True
+                    )
+                    or (
+                        row.get("terminal_status") == "failed"
+                        and (
+                            row.get("pre_result_quota_failure_verified") is True
+                            or row.get("pre_result_auth_failure_verified") is True
+                        )
+                        and row.get("review_role_verified") is True
+                        and row.get("review_route_verified") is True
+                        and row.get("independence_verified") is True
+                        and isinstance(row.get("review_role_receipt_sha256"), str)
+                        and _SHA256_RE.fullmatch(row["review_role_receipt_sha256"]) is not None
+                    )
+                )
+                for row in rows
+            )
+        ):
+            continue
+        eligible[name] = {str(row["unit"]) for row in rows}
+
+    ignored: list[str] = []
+    blocking: list[str] = []
+    for error in raw_errors:
+        slot_error = error.split(":", 2)
+        if (
+            len(slot_error) == 2
+            and slot_error[0] in {
+                "decision_review_slot_without_pass",
+                "decision_review_named_provider_slot_without_independent_pass",
+            }
+            and slot_error[1] in eligible
+        ):
+            ignored.append(error)
+        elif (
+            len(slot_error) == 3
+            and slot_error[0] == "decision_review_infrastructure_not_superseded"
+            and slot_error[1] in eligible
+            and slot_error[2] in eligible[slot_error[1]]
+        ):
+            ignored.append(error)
+        else:
+            blocking.append(error)
+    return {
+        "errors": blocking,
+        "ignored_unavailable": ignored,
+        "status": (
+            "blocked" if blocking else "optional_unavailable" if ignored
+            else reconciliation.get("status")
+        ),
     }
 
 
@@ -1217,7 +1567,7 @@ def _merge_guard_identifier(namespace: str, value: str) -> str:
 def merge_guard_repository_root(repo_path: Path) -> Path:
     completed = subprocess.run(
         [
-            "git",
+            grabowski_git_ssh.trusted_git_cli_path(),
             "-C",
             str(repo_path),
             "rev-parse",
@@ -1283,7 +1633,7 @@ def _merge_guard_github_repository_identity(remote: str) -> str:
 def merge_guard_repository_identity(repo_path: Path) -> tuple[Path, str]:
     repository = merge_guard_repository_root(repo_path)
     completed = subprocess.run(
-        ["git", "-C", str(repository), "remote", "get-url", "origin"],
+        [grabowski_git_ssh.trusted_git_cli_path(), "-C", str(repository), "remote", "get-url", "origin"],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -1376,7 +1726,7 @@ def _merge_guard_local_git_bytes(
 ) -> dict[str, Any]:
     completed = subprocess.run(
         [
-            "git",
+            grabowski_git_ssh.trusted_git_cli_path(),
             "-C",
             str(repo_path),
             "-c",
@@ -2084,7 +2434,7 @@ def _github_rules_plan_limit_error(stderr: str) -> bool:
 
 def _merge_guard_git_command(repo_path: Path, args: list[str], *, timeout: int = 60) -> dict[str, Any]:
     completed = subprocess.run(
-        ["git", "-C", str(repo_path), *args],
+        [grabowski_git_ssh.trusted_git_cli_path(), "-C", str(repo_path), *args],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -5859,7 +6209,10 @@ class CaptainMergeGuardRunner:
         # live revalidation and GitHub merge dispatch closes the registration
         # TOCTOU: a reviewer cannot become decision-bound between reconciliation
         # and the merge call and then be omitted from this decision.
-        with decision_reviews.decision_review_lock(decision_binding):
+        with decision_reviews.decision_review_lock(decision_binding), \
+                _first_party_merge_signer_snapshot_guard(
+                    self.parameters.get("review_evidence"),
+                ):
             equivalent_review_diff_sha256s = _verified_decision_review_diff_aliases(
                 bindings, self.receipt.get("live_diff")
             )
@@ -5888,6 +6241,10 @@ class CaptainMergeGuardRunner:
                 or independent_pass_count < 1
             ):
                 independent_errors.append("merge_guard_independent_review_pass_missing")
+            if independent_requirement["review_tier"] != "high_critical":
+                independent_errors.extend(
+                    _signed_first_party_material_history_errors(bindings)
+                )
             independent_errors = sorted(set(independent_errors))
             self.receipt["independent_review_revalidation"] = {
                 **independent_requirement,
@@ -5902,7 +6259,15 @@ class CaptainMergeGuardRunner:
                 ),
                 "errors": independent_errors,
             }
-            revalidation_errors = list(decision_reconciliation.get("errors", []))
+            optional_review = decision_review_blocking_errors(
+                decision_reconciliation,
+                independent_required=independent_requirement["required"],
+            )
+            self.receipt["optional_review_unavailability"] = {
+                "status": optional_review["status"],
+                "ignored_unavailable": optional_review["ignored_unavailable"],
+            }
+            revalidation_errors = list(optional_review["errors"])
             revalidation_errors.extend(independent_errors)
             revalidation_errors.extend(self._revalidate_dispatch_bindings(bindings))
             revalidation_errors.extend(self._revalidate_repository_policy())

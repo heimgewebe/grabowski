@@ -10,6 +10,7 @@ import shutil
 import signal
 import stat
 import subprocess
+import sys
 import tempfile
 from typing import Iterable
 
@@ -385,7 +386,7 @@ def prepare_external_agent_command(command: list[str]) -> PreparedSandboxCommand
             )
         return PreparedSandboxCommand(
             command=(
-                "/usr/bin/python3",
+                str(sandbox_python_executable()),
                 "-I",
                 "-S",
                 "-c",
@@ -442,7 +443,12 @@ def _git_command_environment() -> dict[str, str]:
 
 def safe_git_environment(base: dict[str, str] | None = None) -> dict[str, str]:
     """Return a non-interactive Git environment with executable helpers disabled."""
-    environment = dict(os.environ if base is None else base)
+    inherited = os.environ if base is None else base
+    # Git scope, helpers and tracing must not inherit caller authority.
+    # Reinstall only the audited Git overrides below.
+    environment = {
+        key: value for key, value in inherited.items() if not key.startswith("GIT_")
+    }
     # Flowlines exporter authentication is server-only and must never cross
     # into agent, workspace, reviewer, or writer child processes.
     for key in (
@@ -522,6 +528,40 @@ def require_bwrap() -> Path:
     return BWRAP.resolve(strict=True)
 
 
+def _sandbox_python_path_allowed(resolved: Path) -> bool:
+    """Only accept interpreters reachable through the minimal read-only mounts."""
+    if resolved.is_relative_to(Path("/usr")):
+        return True
+    if resolved.is_relative_to(Path("/nix/store")):
+        return _trusted_nix_store() == Path("/nix/store")
+    return False
+
+
+def sandbox_python_executable() -> Path:
+    """Select a real interpreter, never one outside /usr or trusted Nix store.
+
+    On NixOS, /usr/bin/python3 often resolves through /run/current-system to
+    /nix/store; only its immutable resolved target is mounted in role sandboxes.
+    The host user's private virtualenv and untrusted interpreter paths remain
+    unavailable to the read-only reviewer.
+    """
+    candidates = (Path(sys.executable), Path("/usr/bin/python3"))
+    seen: set[Path] = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve(strict=True)
+        except OSError:
+            continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if not _sandbox_python_path_allowed(resolved):
+            continue
+        if resolved.is_file() and os.access(resolved, os.X_OK):
+            return resolved
+    raise AgentSandboxError("no Python interpreter is available inside the minimal role sandbox")
+
+
 def _safe_existing_path(value: Path, field: str, *, directory: bool | None = None) -> Path:
     if not value.is_absolute() or value.is_symlink():
         raise AgentSandboxError(f"{field} must be an absolute non-symlink path")
@@ -532,6 +572,81 @@ def _safe_existing_path(value: Path, field: str, *, directory: bool | None = Non
     if directory is False and not stat.S_ISREG(metadata.st_mode):
         raise AgentSandboxError(f"{field} must be a regular file")
     return resolved
+
+
+_NIX_STORE = Path("/nix/store")
+_NIX_LD_LIBRARY_DIR = Path("/run/current-system/sw/share/nix-ld/lib")
+_NIX_VENDOR_ELF_TARGETS = frozenset({
+    ANTIGRAVITY_SANDBOX_EXECUTABLE,
+    CLAUDE_SANDBOX_EXECUTABLE,
+    CODEX_SANDBOX_EXECUTABLE,
+    GROK_SANDBOX_EXECUTABLE,
+})
+
+
+def _trusted_nix_store() -> Path | None:
+    """Only mount the fixed, root-controlled Nix store; never trust caller paths."""
+    if not os.path.lexists(_NIX_STORE):
+        return None
+    caller_groups = {os.getegid(), *os.getgroups()}
+    for directory in (_NIX_STORE.parent, _NIX_STORE):
+        try:
+            metadata = directory.lstat()
+            caller_can_write = os.access(directory, os.W_OK)
+        except OSError as exc:
+            raise AgentSandboxError("Nix store is not safely inspectable") from exc
+        mode = stat.S_IMODE(metadata.st_mode)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != 0
+            or mode & 0o002
+            or (mode & 0o020 and metadata.st_gid in caller_groups)
+            or caller_can_write
+        ):
+            raise AgentSandboxError("Nix store must be root-owned and non-writable by the reviewer UID")
+    return _NIX_STORE
+
+
+def _trusted_nix_vendor_elf_runtime(nix_store: Path) -> tuple[Path, Path]:
+    """Pin a root-owned glibc loader and library closure inside the trusted store.
+
+    The mutable /run/current-system path is only a source of candidates, never
+    a sandbox mount or environment value. Fail closed if it resolves outside
+    the verified immutable Nix store or becomes writable by the caller.
+    """
+    try:
+        libraries = _NIX_LD_LIBRARY_DIR.resolve(strict=True)
+        loader = (_NIX_LD_LIBRARY_DIR / "ld.so").resolve(strict=True)
+        for candidate, is_directory in ((libraries, True), (loader, False)):
+            if not candidate.is_relative_to(nix_store):
+                raise AgentSandboxError("NixOS ELF runtime must resolve inside trusted Nix store")
+            metadata = candidate.stat()
+            if (
+                (not stat.S_ISDIR(metadata.st_mode) if is_directory else not stat.S_ISREG(metadata.st_mode))
+                or metadata.st_uid != 0
+                or stat.S_IMODE(metadata.st_mode) & 0o022
+                or os.access(candidate, os.W_OK)
+            ):
+                raise AgentSandboxError("NixOS ELF runtime must be root-owned and non-writable")
+    except (OSError, RuntimeError) as exc:
+        raise AgentSandboxError("NixOS ELF runtime is not safely available") from exc
+    return loader, libraries
+
+
+def _trusted_nixos_ca_bundle(
+    nix_store: Path | None,
+    source: Path = Path("/etc/ssl/certs/ca-certificates.crt"),
+) -> Path | None:
+    """Expose the host trust store only when it resolves inside the trusted Nix store."""
+    if nix_store is None:
+        return None
+    try:
+        candidate = source.resolve(strict=True)
+        if candidate.is_relative_to(nix_store) and candidate.is_file():
+            return candidate
+    except OSError:
+        pass
+    return None
 
 
 def _bind_file(arguments: list[str], source: str, target: str | None = None) -> None:
@@ -855,6 +970,23 @@ def minimal_sandbox_argv(
         directory=True,
     )
     writable = _normalized_writable_paths(worktree, writable_paths)
+    nix_store = _trusted_nix_store()
+    extra_read_only = tuple(extra_read_only)
+    # Only vendor binaries need the generic ELF compatibility loader. Nix-built
+    # Python and test processes keep their own RPATH/loader and clean environment.
+    needs_nix_elf_runtime = (
+        nix_store is not None
+        and not Path("/usr/lib64").exists()
+        and any(target in _NIX_VENDOR_ELF_TARGETS for _, target in extra_read_only)
+    )
+    nix_elf_runtime = (
+        _trusted_nix_vendor_elf_runtime(nix_store) if needs_nix_elf_runtime else None
+    )
+    if nix_store is not None and (
+        worktree.is_relative_to(nix_store.parent)
+        or (common is not None and common.is_relative_to(nix_store.parent))
+    ):
+        raise AgentSandboxError("workspace and git metadata may not shadow the read-only Nix store")
     adler_read_only, adler_directories = _adler_inbox_sandbox_binding(worktree)
     if workspace_writable and not writable:
         raise AgentSandboxError("writer sandbox requires at least one bounded writable path")
@@ -881,12 +1013,28 @@ def minimal_sandbox_argv(
     ]
     if Path("/usr/lib64").exists():
         arguments.extend(["--symlink", "usr/lib64", "/lib64"])
+    if nix_store is not None:
+        arguments.extend(["--dir", "/nix", "--ro-bind", str(nix_store), str(nix_store)])
+    if nix_elf_runtime is not None:
+        # Bind the actual immutable glibc loader, not the host nix-ld shim.
+        # No /run/current-system mount or host environment is exposed.
+        arguments.extend([
+            "--dir", "/lib64",
+            "--ro-bind", str(nix_elf_runtime[0]), "/lib64/ld-linux-x86-64.so.2",
+        ])
     arguments.extend(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--dir", "/etc"])
     normalized_directories: list[str] = []
     for value in (*adler_directories, *tuple(extra_directories)):
         raw = str(value)
         path = Path(raw)
-        if not path.is_absolute() or raw in {"/", "/proc", "/dev", "/usr", "/etc"} or "\x00" in raw or ".." in path.parts:
+        if (
+            not path.is_absolute()
+            or raw in {"/", "/proc", "/dev", "/usr", "/etc"}
+            or path.is_relative_to(Path("/nix"))
+            or (nix_elf_runtime is not None and path.is_relative_to(Path("/lib64")))
+            or "\x00" in raw
+            or ".." in path.parts
+        ):
             raise AgentSandboxError("extra sandbox directory must be a safe absolute path")
         normalized_directories.append(raw.rstrip("/"))
     for directory in sorted(set(normalized_directories), key=lambda item: (len(Path(item).parts), item)):
@@ -911,10 +1059,22 @@ def minimal_sandbox_argv(
     seen_targets = {str(worktree), *(str(item) for item in writable)}
     if common is not None:
         seen_targets.add(str(common))
-    for source_value, target_value in (*adler_read_only, *tuple(extra_read_only)):
+    if nix_elf_runtime is not None:
+        seen_targets.update({"/lib64", "/lib64/ld-linux-x86-64.so.2"})
+    for source_value, target_value in (*adler_read_only, *extra_read_only):
         source = _safe_existing_path(source_value, "extra_read_only source")
-        if not target_value.is_absolute() or "\x00" in str(target_value):
-            raise AgentSandboxError("extra_read_only target must be absolute")
+        if (
+            not target_value.is_absolute()
+            or "\x00" in str(target_value)
+            or ".." in target_value.parts
+            or target_value.is_relative_to(Path("/nix"))
+            or target_value.resolve(strict=False).is_relative_to(Path("/nix"))
+            or (
+                nix_elf_runtime is not None
+                and target_value.is_relative_to(Path("/lib64"))
+            )
+        ):
+            raise AgentSandboxError("extra_read_only target must be absolute and outside /nix")
         target = str(target_value)
         if target in seen_targets:
             raise AgentSandboxError(f"duplicate sandbox target: {target}")
@@ -946,6 +1106,7 @@ def minimal_sandbox_argv(
         if (
             not target_path.is_absolute()
             or "\x00" in str(target_path)
+            or ".." in target_path.parts
             or target_path == Path("/tmp")
             or not target_path.is_relative_to(Path("/tmp"))
         ):
@@ -985,6 +1146,13 @@ def minimal_sandbox_argv(
     )
     for key, value in _git_command_environment().items():
         arguments.extend(["--setenv", key, value])
+    if nix_elf_runtime is not None:
+        arguments.extend(["--setenv", "LD_LIBRARY_PATH", str(nix_elf_runtime[1])])
+    # NixOS symlinks its CA bundle into /nix/store. /etc/ssl/certs alone
+    # does not expose that bundle in a read-only bubblewrap namespace.
+    ca_bundle = _trusted_nixos_ca_bundle(nix_store)
+    if ca_bundle is not None:
+        arguments.extend(["--setenv", "SSL_CERT_FILE", str(ca_bundle)])
     arguments.extend(
         [
             "--chdir",

@@ -41,7 +41,7 @@ CLAUDE_PLAN_TYPES = {"pro", "max", "team", "enterprise"}
 QUALITY_CLASSES = {"S", "A", "B", "C", "HARNESS", "CONTROLLER"}
 EFFORT_LEVELS = {"low", "medium", "high", "xhigh", "max"}
 PAID_ONLY_MODEL_IDS = frozenset({"claude-fable-5"})
-VERIFICATION_POLICIES = frozenset({"deterministic", "independent_review", "competition"})
+VERIFICATION_POLICIES = frozenset({"deterministic", "self_review", "independent_review", "competition"})
 MANDATORY_INDEPENDENT_VERIFICATION_TASK_CLASSES = frozenset(
     {"architecture", "complex-patch", "deep-debug", "migration"}
 )
@@ -1206,7 +1206,9 @@ def _grok_auth_file_identity(*, home: Path | None = None) -> str | None:
             os.close(descriptor)
 
 
-def _state_catalog_fresh(state: dict[str, Any]) -> bool:
+def _state_catalog_fresh(
+    state: dict[str, Any], *, require_grok_auth_identity: bool = True,
+) -> bool:
     catalog_state = state.get("catalog", {})
     observed = _parse_time(catalog_state.get("observed_at"))
     if observed is None:
@@ -1214,6 +1216,11 @@ def _state_catalog_fresh(state: dict[str, Any]) -> bool:
     age = (_utc_now() - observed).total_seconds()
     if not 0 <= age <= CATALOG_FRESHNESS_SECONDS:
         return False
+    if not require_grok_auth_identity:
+        # A Codex-only sandbox has no reason to read Grok's private auth
+        # directory. Preserve timestamp and catalog identity checks while
+        # letting route-specific callers ignore that unrelated credential.
+        return True
     providers = catalog_state.get("providers")
     # Freshness is not a structural validator. Preserve malformed-state
     # classification for the normal router validation path, and permit bounded
@@ -2140,7 +2147,8 @@ def _validate_request(
 
 
 def _current_contrast_state(
-    catalog: dict[str, Any], validation: dict[str, Any]
+    catalog: dict[str, Any], validation: dict[str, Any],
+    *, require_grok_auth_identity: bool = True,
 ) -> tuple[dict[str, Any] | None, str, str | None]:
     state, error_type = _load_optional_advisory_state()
     if error_type is not None:
@@ -2149,7 +2157,9 @@ def _current_contrast_state(
         return None, "router-state-unavailable", None
     if state.get("catalog_sha256") != validation["catalog_sha256"]:
         return None, "router-state-catalog-mismatch", None
-    if not _state_catalog_fresh(state):
+    if not _state_catalog_fresh(
+        state, require_grok_auth_identity=require_grok_auth_identity
+    ):
         return None, "router-state-stale", None
     return state, "current", None
 
@@ -2190,7 +2200,12 @@ def select_contrast_routes(
         raise CodingAgentRouterError("max_candidates must be 1 or 2")
     if type(allow_paid) is not bool:
         raise CodingAgentRouterError("allow_paid must be boolean")
-    state, status, error_type = _current_contrast_state(catalog, validation)
+    state, status, error_type = _current_contrast_state(
+        catalog, validation,
+        require_grok_auth_identity=(
+            allowed_harnesses is None or "grok" in allowed_harnesses
+        ),
+    )
     if state is None:
         return {
             "status": status,
@@ -2391,7 +2406,10 @@ def coding_agent_pre_dispatch_admission(argv: list[str]) -> dict[str, Any]:
         )
 
     capacity_contract = next(iter(capacity_contracts.values()))
-    state, state_status, state_error_type = _current_contrast_state(catalog, validation)
+    state, state_status, state_error_type = _current_contrast_state(
+        catalog, validation,
+        require_grok_auth_identity=capacity_contract["harness"] == "grok",
+    )
     if state is None:
         return _pre_dispatch_admission_receipt(
             {
@@ -2517,7 +2535,9 @@ def _advisory_route_execution_contract(
         raise CodingAgentRouterError(
             "paid-only route requires explicit paid execution authorization"
         )
-    state, status, error_type = _current_contrast_state(catalog, validation)
+    state, status, error_type = _current_contrast_state(
+        catalog, validation, require_grok_auth_identity=route["harness"] == "grok"
+    )
     if state is None:
         suffix = f" ({error_type})" if error_type else ""
         raise CodingAgentRouterError(
@@ -2770,7 +2790,7 @@ def canonical_execution_route(
         or verification_policy not in VERIFICATION_POLICIES
     ):
         raise CodingAgentRouterError(
-            "verification_policy must be deterministic, independent_review or competition"
+            "verification_policy must be deterministic, self_review, independent_review or competition"
         )
     if effect_profile not in {"candidate", "delivery"}:
         raise CodingAgentRouterError(
@@ -2789,24 +2809,27 @@ def canonical_execution_route(
             )
         verification_policy_value = "independent_review"
     elif verification_floor_required:
-        if verification_policy not in (None, "independent_review"):
+        if verification_policy not in (None, "self_review", "independent_review"):
             raise CodingAgentRouterError(
-                "verification floor requires verification_policy=independent_review; "
-                "run competition through the separate contrast surface"
+                "verification floor requires verification_policy=self_review "
+                "or independent_review; run competition through the separate contrast surface"
             )
-        verification_policy_value = "independent_review"
+        verification_policy_value = verification_policy or "self_review"
     else:
         verification_policy_value = verification_policy or "deterministic"
     independent_review_required = bool(
-        direct_review_task
-        or review_value
-        or verification_floor_required
+        direct_review_task or review_value
         or verification_policy_value == "independent_review"
     )
-    if effect_profile == "delivery" and verification_policy_value != "independent_review":
+    self_review_required = verification_policy_value == "self_review"
+    if effect_profile == "delivery" and verification_policy_value not in {
+        "self_review", "independent_review",
+    }:
         raise CodingAgentRouterError(
-            "effect_profile=delivery requires verification_policy=independent_review"
+            "effect_profile=delivery requires verification_policy=self_review or independent_review"
         )
+    # Routing chooses the obligation, not a PASS: Captain and the PR gate
+    # still validate substantive, exact-diff review evidence before merging.
     external_review_requested = independent_review_required
     external_review_block_reasons = [
         f"sensitive_context:{flag}" for flag in sensitive_external_review_flags
@@ -2845,7 +2868,7 @@ def canonical_execution_route(
     review_fallbacks: list[dict[str, Any]] = []
     review_ranked_candidates: list[dict[str, Any]] = []
     excluded: dict[str, list[str]] = {}
-    review_status = "not-requested"
+    review_status = "self-review-required" if self_review_required else "not-requested"
     review_state_error_type: str | None = None
 
     state: dict[str, Any] | None = None
@@ -3075,6 +3098,7 @@ def canonical_execution_route(
         "effect_profile": effect_profile,
         "verification_policy": verification_policy_value,
         "independent_review_required": independent_review_required,
+        "self_review_required": self_review_required,
         "review_task_class": review_task_class,
         "external_review_selection_allowed": external_review_selection_allowed,
         "external_review_block_reasons": external_review_block_reasons,

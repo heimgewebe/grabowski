@@ -1359,6 +1359,78 @@ class AgentWorkspaceTests(unittest.TestCase):
                 expected_lane_receipt_sha256=lane["receipt_sha256"],
             )
 
+    def test_existing_lane_workspace_accepts_exact_continuation_not_replay(self) -> None:
+        lane = self.lane_receipt(idempotency_key="workspace-existing-continuation")
+        # The real managed Checkout includes its immutable physical identity.
+        # Supply that live identity in this isolated fixture before freezing
+        # the workspace plan; the production verifier remains unchanged.
+        with workspace.work_acquire._lane_lock(lane["lane_id"]) as path_to_receipt:
+            current = workspace.work_acquire._read_state(path_to_receipt)
+            current["worktree_receipt"]["lifecycle"]["physical_checkout"] = (
+                workspace.physical_checkout.capture_physical_checkout_identity(
+                    self.git.writer
+                )
+            )
+            lane = workspace.work_acquire._write_state(path_to_receipt, current)
+        manifest = self.lane_manifest(lane)
+        original_sha = lane["receipt_sha256"]
+        lifecycle = lane["worktree_receipt"]["lifecycle"]
+        original_worktree_sha = "a" * 64
+        preimage = {
+            "schema_version": 1,
+            "kind": "grabowski.work_lane_continuation_preimage",
+            "lane_id": lane["lane_id"],
+            "checkout_key": lifecycle["checkout_key"],
+            "checkout_path": str(self.git.writer),
+            "branch": "feat/writer",
+            "head": self.git.base,
+            "ensure_head": self.git.base,
+            "physical_identity_sha256": lifecycle["physical_checkout"]["physical_identity_sha256"],
+            "lifecycle_retention_until_unix": lifecycle["expires_at_unix"],
+            "lifecycle_updated_at_unix": lifecycle["updated_at_unix"],
+            "prior_worktree_receipt_sha256": original_worktree_sha,
+        }
+        preimage["preimage_sha256"] = workspace.work_acquire._sha(preimage)
+
+        def store_continuation(*, attempt: int = 2, changed_preimage: dict | None = None) -> dict:
+            with workspace.work_acquire._lane_lock(lane["lane_id"]) as receipt_path:
+                current = workspace.work_acquire._read_state(receipt_path)
+                return workspace.work_acquire._write_state(
+                    receipt_path,
+                    {
+                        **current,
+                        "decision": "CONTINUE_EXISTING",
+                        "attempt_count": attempt,
+                        "continuation_preimage": preimage if changed_preimage is None else changed_preimage,
+                        "worktree_receipt": {
+                            **current["worktree_receipt"],
+                            "durable_receipt_sha256": original_worktree_sha,
+                        },
+                    },
+                )
+
+        renewed = store_continuation()
+        self.assertNotEqual(original_sha, renewed["receipt_sha256"])
+        # The immutable workspace still pins the original receipt SHA. The
+        # renewed WorkAcquire receipt is revalidated, not copied into it.
+        result = workspace._lane_binding_status(manifest, read_only=False)
+        self.assertTrue(result["valid"], result)
+        self.assertEqual(result["binding_sha256"], manifest["resources"]["lane_binding"]["binding_sha256"])
+        with self.assertRaisesRegex(workspace.AgentWorkspaceError, "digest drifted"):
+            workspace._lane_receipt(lane["lane_id"], original_sha)
+
+        for case, attempt, changed in (
+            ("replay", 1, preimage),
+            ("missing_preimage", 2, {}),
+            ("different_branch", 2, {**preimage, "branch": "feat/other"}),
+            ("invalid_preimage_digest", 2, {**preimage, "preimage_sha256": "0" * 64}),
+        ):
+            with self.subTest(case=case):
+                store_continuation(attempt=attempt, changed_preimage=changed)
+                denied = workspace._lane_binding_status(manifest, read_only=False)
+                self.assertFalse(denied["valid"], denied)
+                self.assertIn("digest drifted", denied["error"])
+
     def test_lane_backed_normalize_rejects_configured_scoped_writer_command(self) -> None:
         lane = self.lane_receipt(
             scoped_writer_argv=["true"],
@@ -1611,7 +1683,7 @@ class AgentWorkspaceTests(unittest.TestCase):
                 workspace._workspace_dir("gaw-absent-workspace")
         self.assertFalse(root.exists())
 
-    def test_lane_backed_status_rejects_checkout_wal_without_sidecar_writes(self) -> None:
+    def test_lane_backed_status_gates_live_checkout_wal_read_marks(self) -> None:
         lane = self.lane_receipt(idempotency_key="lane-strict-checkout-wal")
         plan = self.normalize_lane(lane)
         database = workspace.checkouts.CHECKOUT_DB
@@ -1624,19 +1696,33 @@ class AgentWorkspaceTests(unittest.TestCase):
             shm = Path(str(database) + "-shm")
             self.assertTrue(wal.is_file())
             self.assertTrue(shm.is_file())
-            before = {path: path.read_bytes() for path in (database, wal, shm)}
+            # Logical DB and committed WAL bytes are immutable for a reader.
+            # Existing SHM may change only as SQLite updates transient read marks.
+            before = {path: path.read_bytes() for path in (database, wal)}
+            shm_inode = shm.stat().st_ino
+            before_shm = shm.read_bytes()
             with mock.patch.object(
                 workspace.operator,
                 "_require_operator_mutation",
-                side_effect=AssertionError("READ_ONLY workspace status requested mutation"),
-            ) as gate:
+                side_effect=PermissionError("WAL SHM mutation admission denied"),
+            ) as denied_gate:
+                denied = workspace._lane_binding_status(plan)
+            # A status-only caller cannot update SQLite SHM read marks.
+            self.assertFalse(denied["valid"], denied)
+            self.assertIn("WAL SHM mutation admission denied", denied["error"])
+            denied_gate.assert_any_call("resource_lease")
+            self.assertEqual(before_shm, shm.read_bytes())
+            # An admitted operator may pin a normal live WAL snapshot.
+            with mock.patch.object(
+                workspace.operator, "_require_operator_mutation"
+            ) as admitted_gate:
                 observed = workspace._lane_binding_status(plan)
-            self.assertFalse(observed["valid"])
-            self.assertIn("Strict read-only snapshot unavailable", observed["error"])
-            gate.assert_not_called()
+            self.assertTrue(observed["valid"], observed)
+            admitted_gate.assert_any_call("resource_lease")
             self.assertEqual(
-                before, {path: path.read_bytes() for path in (database, wal, shm)}
+                before, {path: path.read_bytes() for path in (database, wal)}
             )
+            self.assertEqual(shm_inode, shm.stat().st_ino)
         finally:
             keeper.close()
 
@@ -1650,7 +1736,7 @@ class AgentWorkspaceTests(unittest.TestCase):
             keeper.commit()
             self.assertTrue(Path(str(workspace.resources.RESOURCE_DB) + "-wal").is_file())
             self.assertTrue(Path(str(workspace.resources.RESOURCE_DB) + "-shm").is_file())
-            self.assertFalse(workspace._lane_binding_status(plan)["valid"])
+            self.assertTrue(workspace._lane_binding_status(plan)["valid"])
             with mock.patch.object(
                 workspace.operator, "_require_operator_mutation"
             ) as mutation_gate:
@@ -1661,18 +1747,19 @@ class AgentWorkspaceTests(unittest.TestCase):
             self.assertEqual([mock.call("resource_lease")] * mutation_gate.call_count, mutation_gate.call_args_list)
         finally:
             keeper.close()
-        # SQLite fixture connections may survive keeper.close() on Python 3.12.
-        # Strict public READ_ONLY must reject any remaining WAL/SHM sidecars.
+        # Depending on SQLite/Python shutdown timing, sidecars may remain.
+        # A complete pair is permitted; an orphaned WAL or SHM must fail closed.
         wal = Path(str(workspace.resources.RESOURCE_DB) + "-wal")
         shm = Path(str(workspace.resources.RESOURCE_DB) + "-shm")
         checkout_wal = Path(str(workspace.checkouts.CHECKOUT_DB) + "-wal")
         checkout_shm = Path(str(workspace.checkouts.CHECKOUT_DB) + "-shm")
         observed = workspace._lane_binding_status(plan)
-        if any(path.exists() for path in (wal, shm, checkout_wal, checkout_shm)):
+        unpaired = wal.exists() != shm.exists() or checkout_wal.exists() != checkout_shm.exists()
+        if unpaired:
             self.assertFalse(observed["valid"])
             self.assertIn("Strict read-only snapshot unavailable", observed["error"])
         else:
-            self.assertTrue(observed["valid"])
+            self.assertTrue(observed["valid"], observed)
         # The exact lease must remain readable from a genuinely quiescent
         # SQLite backup, independent of other fixture writers' lifetimes.
         snapshot = self.root / "quiescent-resource-snapshot.sqlite3"
@@ -1970,8 +2057,12 @@ class AgentWorkspaceTests(unittest.TestCase):
             before = {
                 str(path): path.read_bytes()
                 for database in databases
-                for path in (database, Path(str(database) + "-wal"), Path(str(database) + "-shm"))
+                for path in (database, Path(str(database) + "-wal"))
             }
+            # SHM read-mark bytes are allowed to vary. Identity and data/WAL
+            # durability remain independently asserted under actual SQLite locks.
+            shms = {str(database): Path(str(database) + "-shm").stat().st_ino
+                    for database in databases}
             with (
                 mock.patch.object(workspace, "_writer_attempts", return_value=[{"actor": "initial_writer"}]),
                 mock.patch.object(workspace, "_writer_task_binding_reasons", return_value=[]),
@@ -1998,20 +2089,45 @@ class AgentWorkspaceTests(unittest.TestCase):
                             manifest, writer, snapshot, read_only=False
                         )
 
+                # Status-only access must also pass admission when native WAL
+                # observation would mutate existing SHM read marks.
                 with mock.patch.object(
-                    workspace.operator,
-                    "_require_operator_mutation",
-                    side_effect=AssertionError("READ_ONLY must not enter mutation"),
-                ) as gate:
-                    strict = workspace._writer_handoff_eligibility(
+                    workspace.operator, "_require_operator_mutation"
+                ) as admission:
+                    admitted = workspace._writer_handoff_eligibility(
                         manifest, writer, snapshot, read_only=True
                     )
-                gate.assert_not_called()
-                self.assertIn("work_lane_binding_invalid", strict["reasons"])
-                self.assertIn("checkout_lifecycle_unobservable", strict["reasons"])
-                self.assertIn("workspace_lease_unobservable", strict["reasons"])
+                admission.assert_any_call("resource_lease")
+                self.assertNotIn("work_lane_binding_invalid", admitted["reasons"])
+                self.assertNotIn("checkout_lifecycle_unobservable", admitted["reasons"])
+                self.assertNotIn("workspace_lease_unobservable", admitted["reasons"])
+                before_denied_shm = {
+                    str(database): Path(str(database) + "-shm").read_bytes()
+                    for database in databases
+                }
+                with mock.patch.object(
+                    workspace.operator, "_require_operator_mutation",
+                    side_effect=PermissionError("WAL SHM admission denied"),
+                ) as denied_gate:
+                    denied = workspace._writer_handoff_eligibility(
+                        manifest, writer, snapshot, read_only=True
+                    )
+                denied_gate.assert_any_call("resource_lease")
+                self.assertIn("work_lane_binding_invalid", denied["reasons"])
+                self.assertIn("checkout_lifecycle_unobservable", denied["reasons"])
+                self.assertIn("workspace_lease_unobservable", denied["reasons"])
+                self.assertEqual(
+                    before_denied_shm,
+                    {
+                        str(database): Path(str(database) + "-shm").read_bytes()
+                        for database in databases
+                    },
+                )
                 for filename, payload in before.items():
                     self.assertEqual(Path(filename).read_bytes(), payload)
+                for database in databases:
+                    shm = Path(str(database) + "-shm")
+                    self.assertEqual(shms[str(database)], shm.stat().st_ino)
         finally:
             for connection in keepers:
                 connection.close()
@@ -3478,6 +3594,36 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertTrue(workspace._verify_patch_artifact(frozen["writer_result"]))
         self.assertTrue(self.git.writer.exists())
 
+    def test_controller_self_review_waits_without_launching_negative_role(self) -> None:
+        manifest = self.manifest()
+        manifest["commands"]["review"] = list(
+            workspace.CONTROLLER_SELF_REVIEW_PENDING_ARGV
+        )
+        workspace._write_manifest(manifest)
+        (self.git.writer / "src" / "app.py").write_text(
+            "dirty = True\\n", encoding="utf-8"
+        )
+        role_starts = []
+        def start_role(_manifest, role, _snapshot):
+            role_starts.append(role)
+            return {"task_id": f"{role}-task"}
+        with (
+            mock.patch.object(
+                workspace, "_task_public",
+                return_value={"task_id": "writer-task", "state": "completed", "terminal": True},
+            ),
+            mock.patch.object(workspace, "_start_role_task", side_effect=start_role),
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+        ):
+            result = workspace.grabowski_agent_workspace_collect(manifest["workspace_id"])
+        self.assertEqual(result["state"], "controller_self_review_pending")
+        self.assertEqual(result["receipt_status"], "passed")
+        self.assertRegex(result["candidate_id"], r"^[a-f0-9]{64}$")
+        self.assertEqual(role_starts, ["tests"])
+        saved = workspace._manifest(manifest["workspace_id"])
+        self.assertIsNone(saved["tasks"]["review"])
+        self.assertTrue(saved["frozen_writer"]["dirty"])
+
     def test_dirty_grok_role_argv_binds_exact_frozen_patch_with_untracked_files(self) -> None:
         manifest = self.manifest()
         (self.git.writer / "src" / "app.py").write_text("dirty = True\n", encoding="utf-8")
@@ -4271,7 +4417,7 @@ class AgentWorkspaceTests(unittest.TestCase):
             prepared.probe_executable, str(sandbox.CODEX_SANDBOX_EXECUTABLE)
         )
         self.assertEqual(
-            prepared.command[:4], ("/usr/bin/python3", "-I", "-S", "-c")
+            prepared.command[:4], (str(sandbox.sandbox_python_executable()), "-I", "-S", "-c")
         )
         self.assertIn(str(sandbox.CODEX_SANDBOX_AUTH_LOCK), prepared.command)
         self.assertIn(str(sandbox.CODEX_SANDBOX_EXECUTABLE), prepared.command)
@@ -4395,7 +4541,7 @@ class AgentWorkspaceTests(unittest.TestCase):
         auth.chmod(0o600)
         executable = self.root / "codex-persistent-bin"
         executable.write_text(
-            "#!/usr/bin/python3\n"
+            f"#!{sandbox.sandbox_python_executable()}\n"
             "from pathlib import Path\n"
             "auth = Path.home() / '.codex' / 'auth.json'\n"
             "config = Path.home() / '.codex' / 'config.toml'\n"
@@ -4463,7 +4609,7 @@ class AgentWorkspaceTests(unittest.TestCase):
         auth.chmod(0o600)
         executable = self.root / "codex-concurrent-bin"
         executable.write_text(
-            "#!/usr/bin/python3\n"
+            f"#!{sandbox.sandbox_python_executable()}\n"
             "from pathlib import Path\n"
             "import time\n"
             "auth = Path.home() / '.codex' / 'auth.json'\n"
@@ -4911,6 +5057,31 @@ class AgentWorkspaceTests(unittest.TestCase):
         start.assert_not_called()
         self.assertTrue(observed["add"])
         self.assertFalse(state["held"])
+
+    def test_controller_pending_review_has_deferred_not_fake_passed_toolchain_preflight(self) -> None:
+        # The controller-review sentinel is never run. An executable probe for
+        # its python3 -c placeholder is an artificial NixOS bootstrap blocker.
+        command = list(workspace.CONTROLLER_SELF_REVIEW_PENDING_ARGV)
+        manifest = {"commands": {"review": command}}
+        with mock.patch.object(
+            workspace, "_role_toolchain_preflight",
+            side_effect=AssertionError("non-executed controller sentinel was probed"),
+        ) as probe:
+            result = workspace._creation_role_preflight(manifest, "review", command)
+        probe.assert_not_called()
+        self.assertEqual(result["command_sha256"], workspace._sha256_json(command))
+        self.assertEqual(result["failure_classification"], "controller_self_review_pending")
+        self.assertIs(result["passed"], False)
+        self.assertIs(result["deferred"], True)
+        self.assertIs(result["executed"], False)
+
+        with mock.patch.object(
+            workspace, "_role_toolchain_preflight",
+            return_value={"passed": False, "failure_classification": "environment_toolchain_failure"},
+        ) as probe:
+            ordinary = workspace._creation_role_preflight(manifest, "review", ["true"])
+        probe.assert_called_once_with(manifest, "review", ["true"])
+        self.assertIs(ordinary["passed"], False)
 
     def test_create_blocks_before_writer_when_read_only_role_preflight_fails(self) -> None:
         calls: list[str] = []
@@ -7357,6 +7528,276 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertEqual(result["returncode"], 1)
         start.assert_not_called()
 
+    def test_pending_controller_review_refuses_synthetic_retry_pass(self) -> None:
+        manifest = self.manifest()
+        (self.git.writer / "src" / "app.py").write_text(
+            "review_pending = True\\n", encoding="utf-8",
+        )
+        snapshot = workspace._git_snapshot(manifest, workspace._run)
+        writer_result = workspace._materialize_writer_patch(
+            manifest, snapshot, workspace._run,
+        )
+        manifest["frozen_writer"] = {
+            "writer_head": snapshot["writer_head"],
+            "diff_sha256": snapshot["diff_sha256"],
+            "dirty": snapshot["dirty"],
+            "writer_result": writer_result,
+        }
+        manifest["commands"]["review"] = list(
+            workspace.CONTROLLER_SELF_REVIEW_PENDING_ARGV
+        )
+        workspace._write_manifest(manifest)
+        classification, detail = workspace._role_retry_classification(
+            manifest, "review", manifest["frozen_writer"],
+        )
+        self.assertEqual(classification, "eligible")
+        self.assertEqual(detail["prior_failure_classification"], "controller_self_review_pending")
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(workspace.tasks, "grabowski_task_start") as started,
+        ):
+            blocked = workspace.grabowski_agent_workspace_role_retry(
+                manifest["workspace_id"], "review",
+                ["python3", "-c", "print('PASS')"],
+            )
+        self.assertEqual(blocked["state"], "authentic_review_route_required")
+        self.assertEqual(blocked["retry_status"], "blocked")
+        self.assertFalse(blocked["review_task_started"])
+        started.assert_not_called()
+        self.assertIsNone(workspace._manifest(manifest["workspace_id"])["tasks"]["review"])
+
+    def test_pending_controller_second_review_retry_still_refuses_synthetic_pass(self) -> None:
+        # A genuine reviewer may fail for environmental reasons. An additional
+        # retry must not turn that failure into a caller-selected Python PASS.
+        manifest = self.manifest()
+        (self.git.writer / "src" / "app.py").write_text(
+            "review_pending = True\n", encoding="utf-8",
+        )
+        snapshot = workspace._git_snapshot(manifest, workspace._run)
+        manifest["frozen_writer"] = {
+            "writer_head": snapshot["writer_head"],
+            "diff_sha256": snapshot["diff_sha256"],
+            "dirty": snapshot["dirty"],
+            "writer_result": workspace._materialize_writer_patch(
+                manifest, snapshot, workspace._run,
+            ),
+        }
+        manifest["commands"]["review"] = list(
+            workspace.CONTROLLER_SELF_REVIEW_PENDING_ARGV
+        )
+        manifest["tasks"]["review"] = "authentic-review-toolchain-failure"
+        workspace._write_manifest(manifest)
+        receipt = signed_role_receipt(
+            "review", manifest, snapshot, returncode=127,
+            verdict="INVALID",
+            failure_classification="environment_toolchain_failure",
+        )
+        workspace._atomic_json(
+            workspace._role_receipt_path(manifest, "review"), receipt,
+        )
+        replacement = ["python3", "-c", "print('PASS')"]
+
+        def fake_task_start(**kwargs):
+            return {"task": {
+                "task_id": "synthetic-review-task-2",
+                "host": kwargs["host"], "attempt": 1,
+                "resume_policy": "never",
+                "argv_sha256": workspace._sha256_json(kwargs["argv"]),
+                "cwd": kwargs["cwd"],
+            }}
+
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(
+                workspace, "_task_public",
+                return_value={
+                    "task_id": manifest["tasks"]["review"],
+                    "state": "failed", "terminal": True,
+                },
+            ),
+            mock.patch.object(
+                workspace, "_role_toolchain_preflight",
+                return_value=passing_toolchain_preflight(
+                    manifest, "review", replacement,
+                ),
+            ),
+            mock.patch.object(
+                workspace.tasks, "grabowski_task_start",
+                side_effect=fake_task_start,
+            ) as started,
+        ):
+            blocked = workspace.grabowski_agent_workspace_role_retry(
+                manifest["workspace_id"], "review", replacement,
+            )
+        self.assertEqual(blocked["state"], "authentic_review_route_required")
+        self.assertEqual(blocked["retry_status"], "blocked")
+        started.assert_not_called()
+
+    def test_pending_controller_review_can_start_real_optional_catalogue_reviewer(self) -> None:
+        manifest = self.manifest()
+        (self.git.writer / "src" / "app.py").write_text(
+            "review_pending = True\\n", encoding="utf-8",
+        )
+        snapshot = workspace._git_snapshot(manifest, workspace._run)
+        writer_result = workspace._materialize_writer_patch(
+            manifest, snapshot, workspace._run,
+        )
+        manifest["frozen_writer"] = {
+            "writer_head": snapshot["writer_head"],
+            "diff_sha256": snapshot["diff_sha256"],
+            "dirty": snapshot["dirty"],
+            "writer_result": writer_result,
+        }
+        manifest["commands"]["review"] = list(
+            workspace.CONTROLLER_SELF_REVIEW_PENDING_ARGV
+        )
+        # First-party preflight may have persisted an abandoned batch.
+        manifest["first_party_candidate_review_batch"] = "abandoned-preflight-batch"
+        workspace._write_manifest(manifest)
+        replacement = [
+            "claude", "--model", "claude-opus-5-5",
+            "--effort", "high", "--permission-mode", "plan",
+            "Review the exact bound frozen Candidate; give only real findings.",
+        ]
+        from grabowski_decision_reviews import _review_route_evidence
+        self.assertIsNotNone(_review_route_evidence(replacement))
+
+        def fake_task_start(**kwargs):
+            self.assertIn("--review-input-sha256", kwargs["argv"])
+            return {"task": {
+                "task_id": "authentic-readonly-review-task",
+                "host": kwargs["host"], "attempt": 1,
+                "resume_policy": "never",
+                "argv_sha256": workspace._sha256_json(kwargs["argv"]),
+                "cwd": kwargs["cwd"],
+            }}
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            # The optional catalogue-route unit test must not depend on the
+            # host's real root-owned signer registry. Separate signed E2E
+            # fixtures test the actual provenance/verifier independently.
+            mock.patch(
+                "grabowski_self_review_producer.assert_candidate_review_history",
+                return_value=None,
+            ) as history_guard,
+            mock.patch.object(workspace, "_role_toolchain_preflight", return_value={
+                "passed": True,
+                "command_sha256": workspace._sha256_json(replacement),
+                "environment": {"environment_sha256": "a" * 64},
+            }),
+            mock.patch.object(
+                workspace.tasks, "grabowski_task_start",
+                side_effect=fake_task_start,
+            ) as started,
+        ):
+            retried = workspace.grabowski_agent_workspace_role_retry(
+                manifest["workspace_id"], "review", replacement,
+            )
+        history_guard.assert_called_once_with(manifest["workspace_id"])
+        self.assertEqual(retried["state"], "retry_started")
+        self.assertEqual(retried["attempt"], 1)
+        self.assertEqual(
+            retried["attempt_record"]["retry_reason"],
+            "controller_self_review_optional_role_handoff",
+        )
+        self.assertEqual(
+            retried["attempt_record"]["previous_failure_classification"],
+            "controller_self_review_pending",
+        )
+        self.assertEqual(started.call_count, 1)
+        self.assertEqual(
+            workspace._manifest(manifest["workspace_id"])["tasks"]["review"],
+            "authentic-readonly-review-task",
+        )
+        # Attempt one retains the authentic replacement-command hash,
+        # but consumes no environment-recovery retry allowance.
+        persisted = workspace._manifest(manifest["workspace_id"])
+        self.assertNotIn("first_party_candidate_review_batch", persisted)
+        from grabowski_self_review_producer import verify_workspace_candidate_review
+        with mock.patch(
+            "grabowski_self_review_producer.assert_candidate_review_history",
+            return_value=None,
+        ) as fallback_history:
+            verify_workspace_candidate_review(persisted)
+        fallback_history.assert_called_once_with(manifest["workspace_id"])
+        retry_state = persisted["role_retries"]["review"]
+        self.assertEqual(retry_state["count"], 1)
+        self.assertEqual(
+            workspace._role_recovery_attempts_used(persisted, "review", retry_state),
+            0,
+        )
+        self.assertEqual(
+            workspace._expected_role_argv_sha256(persisted, "review"),
+            workspace._sha256_json(replacement),
+        )
+
+        # The genuine model route may report an environment failure before
+        # producing a semantic verdict. One ordinary recovery retry remains.
+        environment_failure = signed_role_receipt(
+            "review", persisted, snapshot,
+            argv_sha256=workspace._sha256_json(replacement),
+            returncode=127, verdict="INVALID",
+            failure_classification="environment_toolchain_failure",
+        )
+        workspace._atomic_json(
+            workspace._role_receipt_path(persisted, "review", attempt=1),
+            environment_failure,
+        )
+
+        def restart_task(**kwargs):
+            return {"task": {
+                "task_id": "authentic-review-task-2",
+                "host": kwargs["host"], "attempt": 1,
+                "resume_policy": "never",
+                "argv_sha256": workspace._sha256_json(kwargs["argv"]),
+                "cwd": kwargs["cwd"],
+            }}
+
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch(
+                "grabowski_self_review_producer.assert_candidate_review_history",
+                return_value=None,
+            ) as recovery_history_guard,
+            mock.patch.object(
+                workspace, "_task_public",
+                return_value={
+                    "task_id": "authentic-readonly-review-task",
+                    "state": "failed", "terminal": True,
+                },
+            ),
+            mock.patch.object(
+                workspace, "_role_toolchain_preflight",
+                return_value=passing_toolchain_preflight(
+                    persisted, "review", replacement,
+                ),
+            ),
+            mock.patch.object(
+                workspace.tasks, "grabowski_task_start",
+                side_effect=restart_task,
+            ) as restarted,
+        ):
+            recovered = workspace.grabowski_agent_workspace_role_retry(
+                manifest["workspace_id"], "review", replacement,
+            )
+        recovery_history_guard.assert_called_once_with(manifest["workspace_id"])
+        self.assertEqual(recovered["state"], "retry_started")
+        self.assertEqual(recovered["attempt"], 2)
+        self.assertEqual(restarted.call_count, 1)
+        after_recovery = workspace._manifest(manifest["workspace_id"])
+        retry_state = after_recovery["role_retries"]["review"]
+        self.assertEqual(retry_state["count"], 2)
+        self.assertEqual(
+            workspace._role_recovery_attempts_used(
+                after_recovery, "review", retry_state,
+            ),
+            1,
+        )
+        self.assertEqual(
+            workspace._expected_role_argv_sha256(after_recovery, "review"),
+            workspace._sha256_json(replacement),
+        )
+
     def test_role_retry_blocks_on_review_needs_change(self) -> None:
         manifest = self.manifest()
         (self.git.writer / "src" / "app.py").write_text("dirty = True\n", encoding="utf-8")
@@ -8393,6 +8834,27 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertTrue(first_path.is_file())
         self.assertTrue(second_path.is_file())
         self.assertEqual(len(manifest["outcome_receipts"]["collection"]["history"]), 2)
+
+
+    def test_native_nix_store_virtualenv_needs_no_second_sandbox_mount(self) -> None:
+        # A native Nix package already lives under the sandbox's immutable
+        # /nix/store bind. Rebinding it as a generic venv adds a forbidden
+        # /nix directory even though no additional access is necessary.
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary) / "repo"
+            repo.mkdir()
+            package = Path("/nix/store/" + "a" * 32 + "-grabowski-operator-test")
+            with (
+                mock.patch.object(Path, "resolve", autospec=True,
+                                  side_effect=lambda path, strict=False: path),
+                mock.patch.object(Path, "is_file", autospec=True,
+                                  side_effect=lambda path: path == package / "pyvenv.cfg"),
+            ):
+                bindings, directories = role._declared_virtualenv_binding(
+                    repo, [str(package / "bin/python3"), "-m", "grabowski_self_review_producer"]
+                )
+        self.assertEqual(bindings, [])
+        self.assertEqual(directories, [])
 
 
     def test_declared_external_virtualenv_is_bound_read_only_without_home_tree(self) -> None:
@@ -12896,9 +13358,7 @@ class AgentWorkspaceTests(unittest.TestCase):
                 side_effect=AssertionError("READ_ONLY candidate requested writer lane"),
             ) as writer_lane,
             mock.patch.object(
-                workspace.operator,
-                "_require_operator_mutation",
-                side_effect=AssertionError("READ_ONLY candidate requested mutation"),
+                workspace.operator, "_require_operator_mutation"
             ) as mutation_gate,
         ):
             status = workspace.grabowski_agent_workspace_status(
@@ -12906,7 +13366,9 @@ class AgentWorkspaceTests(unittest.TestCase):
             )
 
         writer_lane.assert_not_called()
-        mutation_gate.assert_not_called()
+        # The task/resource WAL inventory conditionally requires SHM mutation
+        # admission even for a status projection; that permission was granted.
+        mutation_gate.assert_any_call("resource_lease")
         self.assertTrue(status["candidate_revision"]["eligible"])
         self.assertEqual(
             status["candidate_revision"]["candidate_id"], candidate["candidate_id"]

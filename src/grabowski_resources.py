@@ -36,6 +36,8 @@ SERVER_OWNED_AUTHORITY_METADATA_KINDS = frozenset(
 )
 PUBLIC_RESERVED_AUTHORITY_METADATA_FIELDS = frozenset({"unit_file_config_root"})
 DEFAULT_RESOURCE_LIST_LIMIT = 200
+# Bureau runtime refresh requires 67 exact path/service leases; retain an atomic bound.
+MAX_ATOMIC_RESOURCE_KEYS = 96
 RESOURCE_DB = Path(
     os.environ.get(
         "GRABOWSKI_RESOURCE_DB",
@@ -471,7 +473,10 @@ def _validate_resource_lease_contract(connection: sqlite3.Connection) -> str:
 def _begin_resource_lease_projection_read(
     connection: sqlite3.Connection, *, quick_integrity: bool = False
 ) -> str:
-    connection.execute("BEGIN")
+    # The WAL inventory reader may already have pinned a transaction.
+    # A second BEGIN aborts the lease projection; retain that exact snapshot.
+    if not connection.in_transaction:
+        connection.execute("BEGIN")
     if quick_integrity:
         _resource_sqlite_integrity(connection, "Resource database", quick=True)
     return _validate_resource_lease_contract(connection)
@@ -1415,8 +1420,10 @@ def normalize_resource_keys(values: Iterable[str]) -> list[str]:
     normalized = sorted({normalize_resource_key(value) for value in values})
     if not normalized:
         raise ValueError("at least one resource key is required")
-    if len(normalized) > 64:
-        raise ValueError("at most 64 resource keys may be acquired atomically")
+    if len(normalized) > MAX_ATOMIC_RESOURCE_KEYS:
+        raise ValueError(
+            f"at most {MAX_ATOMIC_RESOURCE_KEYS} resource keys may be acquired atomically"
+        )
     return normalized
 
 
@@ -8160,11 +8167,16 @@ def inspect_resources(resource_keys: Iterable[str]) -> dict[str, dict[str, Any]]
 
 @contextmanager
 def _resource_readonly_snapshot() -> Iterator[sqlite3.Connection]:
-    """Observe a stable store without writes; active WAL sidecars fail closed."""
+    """Observe a stable, transaction-pinned WAL or quiescent store without writes."""
     if RESOURCE_DB.is_symlink() or not RESOURCE_DB.is_file() or RESOURCE_DB.stat().st_size == 0:
         raise RuntimeError("Resource store cannot be observed without explicit initialization")
-    with _resource_inventory_readonly_sqlite(
-        RESOURCE_DB, allow_wal_copy=False
+    with sqlite_store.inventory_coherent_readonly_sqlite(
+        RESOURCE_DB,
+        temporary_prefix="unused-resource-readonly.",
+        error_type=ResourceSchemaInventoryChanged,
+        wal_mutation_admission=lambda: operator._require_operator_mutation(
+            "resource_lease"
+        ),
     ) as connection:
         if _resource_schema_version(connection) != RESOURCE_CURRENT_SCHEMA_VERSION:
             raise RuntimeError("Resource store requires an explicit schema migration")

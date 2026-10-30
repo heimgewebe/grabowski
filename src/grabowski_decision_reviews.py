@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 import fcntl
 import hashlib
 import hmac
@@ -25,14 +25,34 @@ BINDING_SCHEMA_VERSION = 1
 RESULT_KIND = "grabowski_decision_bound_review_result"
 RESULT_SCHEMA_VERSION = 1
 RESULT_PREFIX = "GRABOWSKI_DECISION_REVIEW_V1="
-MAX_JOB_DIRECTORIES = 10_000
+# Match str.splitlines() after UTF-8 decoding with errors="replace", as used
+# by _parse_result_marker. Scan the raw bytes so marker budgets stay in bytes.
+_STDOUT_LINE_SEPARATOR_RE = re.compile(
+    rb"\r\n|[\n\r\v\f\x1c-\x1e]|\xc2\x85|\xe2\x80[\xa8\xa9]"
+)
+# Full scan (including late material REJECTs) is already bounded by all job
+# directories and aggregate metadata bytes; an extra global review-attempt
+# cap cannot safely terminate an unrelated PR before the full scan completes.
+MAX_JOB_DIRECTORIES = 16_384  # Hard cap on *all* scanned directory entries
 MAX_METADATA_BYTES = 256 * 1024
+MAX_TOTAL_METADATA_BYTES = 128 * 1024 * 1024
 MAX_FINALIZATION_BYTES = 256 * 1024
 MAX_STDOUT_TAIL_BYTES = 256 * 1024
+# Non-review origins must not conceal review results retained in their job logs.
+# This is a separate, bounded verification budget, not a limit increase for
+# admitted review evidence.
+# Scan the entire historical ordinary-job output up to the finite budget
+# rather than treating an unrelated 24-MiB log as fatal review evidence.
+MAX_UNBOUND_STDOUT_BYTES = 128 * 1024 * 1024
+MAX_UNBOUND_MARKER_BYTES = 256 * 1024
 MAX_ROLE_RECEIPT_BYTES = 4 * 1024 * 1024
 MAX_REVIEW_ROLE_MODULE_BYTES = 1024 * 1024
 REVIEW_ROLE_MODULE = "grabowski_agent_role"
 REVIEW_ROLE_ATTEMPT_RECEIPT_NAME = "review-role-attempt.json"
+
+class ReviewMetadataBudgetExceeded(ValueError):
+    pass
+
 REVIEW_ROLE_SANDBOX = "bubblewrap-minimal-root-read-only-worktree-v1"
 REVIEW_ROLE_PYTHON = os.path.abspath(sys.executable)
 REVIEW_ROLE_STABLE_PYTHON = Path.home() / ".local/share/grabowski-mcp/.venv/bin/python"
@@ -49,6 +69,7 @@ _SHA40_RE = re.compile(r"[0-9a-f]{40}\Z")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _SLOT_RE = re.compile(r"[A-Za-z0-9._:-]{1,64}\Z")
 _UNIT_RE = re.compile(r"grabowski-job-([0-9a-f]{12})\Z")
+_RGPM_UNIT_RE = re.compile(r"grabowski-job-rgpm-[0-9a-f]{16}-[0-9]{2}\Z")
 _REVIEW_ROLE_RELEASE_ID_RE = re.compile(
     r"[0-9a-f]{12}-srcset[0-9a-f]{12}-lock[0-9a-f]{12}-contract[0-9a-f]{12}"
     r"(?:-attempt[1-9][0-9]{0,2})?\Z"
@@ -102,6 +123,10 @@ _CLAUDE_QUOTA_RESULT_RE = re.compile(
 # New provider fields must be understood before claiming zero semantic output.
 _CLAUDE_QUOTA_UUID_RE = re.compile(
     r"[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}\Z"
+)
+_CLAUDE_AUTH_REVOKED_RESULT = (
+    "Failed to authenticate: OAuth token revoked. "
+    "Please log in again or contact your administrator."
 )
 _CLAUDE_QUOTA_ENVELOPE_FIELDS = frozenset({
     "type", "is_error", "terminal_reason", "api_error_status", "duration_api_ms",
@@ -205,6 +230,104 @@ def _historical_review_role_module_matches(
     ):
         return False
     return hmac.compare_digest(hashlib.sha256(payload).hexdigest(), expected_sha256)
+
+
+_NIX_REVIEW_STORE_ROOT = Path("/nix/store")
+_NIX_REVIEW_OWNER_UID = 0
+_NIX_REVIEW_OPERATOR_RELEASE_RE = re.compile(
+    r"[0123456789abcdfghijklmnpqrsvwxyz]{32}-grabowski-operator-[0-9a-f]{8,40}\Z"
+)
+
+
+def _historical_nix_review_role_origin_matches(
+    runner_python: Any, runner_module_path: Any, runner_module_sha256: Any,
+) -> bool:
+    """Preserve exact V2 role provenance across immutable NixOS release rotations.
+
+    One source package MUST own both the canonical Python entrypoint and role
+    module. The Nix store may be group-writable for its daemon; every package
+    component is root-owned, non-writable and module bytes are SHA-pinned.
+    No arbitrary Python path, symlinked role module or caller-selected digest
+    grants review authority without the independently validated job origin.
+    """
+    if (
+        not isinstance(runner_python, str)
+        or not isinstance(runner_module_path, str)
+        or not isinstance(runner_module_sha256, str)
+        or _SHA256_RE.fullmatch(runner_module_sha256) is None
+    ):
+        return False
+    interpreter = Path(runner_python)
+    module = Path(runner_module_path)
+    release = interpreter.parent.parent
+    relative = None
+    try:
+        relative = module.relative_to(release).parts
+        if (
+            release.parent != _NIX_REVIEW_STORE_ROOT
+            or _NIX_REVIEW_OPERATOR_RELEASE_RE.fullmatch(release.name) is None
+            or interpreter != release / "bin" / "python3"
+            or len(relative) != 4
+            or relative[0] != "lib"
+            or _REVIEW_ROLE_PYTHON_DIR_RE.fullmatch(relative[1]) is None
+            or relative[2:] != ("site-packages", f"{REVIEW_ROLE_MODULE}.py")
+        ):
+            return False
+        store = _NIX_REVIEW_STORE_ROOT.lstat()
+        store_mode = stat.S_IMODE(store.st_mode)
+        if (
+            not stat.S_ISDIR(store.st_mode)
+            or store.st_uid != _NIX_REVIEW_OWNER_UID
+            or store_mode & 0o002
+            or (store_mode & 0o020 and not store_mode & stat.S_ISVTX)
+        ):
+            return False
+        for directory in (
+            release, release / "bin", release / "lib",
+            release / "lib" / relative[1],
+            release / "lib" / relative[1] / "site-packages",
+        ):
+            info = directory.lstat()
+            if (
+                not stat.S_ISDIR(info.st_mode)
+                or info.st_uid != _NIX_REVIEW_OWNER_UID
+                or stat.S_IMODE(info.st_mode) & 0o222
+            ):
+                return False
+        module_info = module.lstat()
+        if (
+            not stat.S_ISREG(module_info.st_mode)
+            or module_info.st_uid != _NIX_REVIEW_OWNER_UID
+            or not 0 < module_info.st_size <= MAX_REVIEW_ROLE_MODULE_BYTES
+            or stat.S_IMODE(module_info.st_mode) & 0o222
+            or module.resolve(strict=True) != module
+        ):
+            return False
+        python_info = interpreter.lstat()
+        if (
+            python_info.st_uid != _NIX_REVIEW_OWNER_UID
+            or not (
+                stat.S_ISLNK(python_info.st_mode)
+                or stat.S_ISREG(python_info.st_mode)
+            )
+        ):
+            return False
+        python_target = interpreter.resolve(strict=True)
+        target_info = python_target.stat()
+        if (
+            _NIX_REVIEW_STORE_ROOT not in python_target.parents
+            or not stat.S_ISREG(target_info.st_mode)
+            or target_info.st_uid != _NIX_REVIEW_OWNER_UID
+            or stat.S_IMODE(target_info.st_mode) & 0o222
+            or not stat.S_IMODE(target_info.st_mode) & 0o111
+        ):
+            return False
+        return hmac.compare_digest(
+            hashlib.sha256(module.read_bytes()).hexdigest(),
+            runner_module_sha256,
+        )
+    except (OSError, ValueError, RuntimeError):
+        return False
 
 
 def _historical_review_role_python_matches(value: Any) -> bool:
@@ -410,33 +533,97 @@ def decision_review_lock(binding: dict[str, Any]) -> Iterator[None]:
             os.close(descriptor)
 
 
+def _review_stat_file_identity(value: os.stat_result) -> tuple[int, ...]:
+    """Compare physical identity and all writable inode metadata of evidence."""
+    return (
+        value.st_dev, value.st_ino, value.st_mode, value.st_uid,
+        value.st_nlink, value.st_size, value.st_mtime_ns, value.st_ctime_ns,
+    )
+
+
+def _review_stat_parent_identity(value: os.stat_result) -> tuple[int, ...]:
+    """Pin a V1 external receipt's parent without blocking unrelated writes."""
+    return (
+        value.st_dev, value.st_ino, value.st_mode, value.st_uid, value.st_nlink,
+    )
+
+
 def _read_private_bytes(
-    path: Path, max_bytes: int, *, require_private_parent: bool = True
+    path: Path, max_bytes: int, *, require_private_parent: bool = True,
+    parent_fd: int | None = None,
+    aggregate_metadata_bytes: list[int] | None = None,
+    allow_legacy_readable: bool = False,
+    external_v1_snapshots: list[tuple[Path, tuple[int, ...], tuple[int, ...] | None]] | None = None,
 ) -> bytes:
-    """Read a size-bounded, owner-private regular file through a stable fd."""
+    """Read bounded stable owner-owned bytes; ordinary legacy logs may be 0644.
+
+    The only relaxed caller searches for blocking evidence under a verified
+    owner-private directory. It cannot use such bytes to grant a review PASS.
+    """
+    if allow_legacy_readable and not require_private_parent:
+        raise ValueError("legacy readable stdout requires an owner-private parent")
     flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
-    parent_fd = os.open(path.parent, flags | os.O_DIRECTORY)
+    owns_parent = parent_fd is None
+    if parent_fd is None:
+        try:
+            parent_fd = os.open(path.parent, flags | os.O_DIRECTORY)
+        except FileNotFoundError as exc:
+            if external_v1_snapshots is not None:
+                # Without a pinned parent, late V1 evidence could hide a REJECT.
+                raise ValueError("external V1 role receipt parent missing") from exc
+            raise
     try:
         parent = os.fstat(parent_fd)
         if not stat.S_ISDIR(parent.st_mode):
             raise ValueError("review evidence parent is not a directory")
+        external_parent_identity = (
+            _review_stat_parent_identity(parent)
+            if external_v1_snapshots is not None else None
+        )
         if require_private_parent and (
             parent.st_uid != os.getuid()
             or stat.S_IMODE(parent.st_mode) & 0o077
         ):
             raise ValueError("review evidence parent is not owner-private")
-        descriptor = os.open(path.name, flags, dir_fd=parent_fd)
+        try:
+            descriptor = os.open(path.name, flags, dir_fd=parent_fd)
+        except FileNotFoundError:
+            if external_v1_snapshots is not None:
+                # A missing V1 role receipt can publish later during the scan.
+                # Pin that negative observation just like a previously read file.
+                if (
+                    _review_stat_parent_identity(os.fstat(parent_fd))
+                    != external_parent_identity
+                ):
+                    raise ValueError("external V1 role receipt parent changed")
+                external_v1_snapshots.append(
+                    (path, external_parent_identity, None)
+                )
+            raise
         try:
             before = os.fstat(descriptor)
             if (
                 not stat.S_ISREG(before.st_mode)
                 or before.st_nlink != 1
                 or before.st_uid != os.getuid()
-                or stat.S_IMODE(before.st_mode) & 0o077
+                or (
+                    stat.S_IMODE(before.st_mode) & 0o077
+                    and not (
+                        allow_legacy_readable
+                        and stat.S_IMODE(before.st_mode) == 0o644
+                    )
+                )
             ):
                 raise ValueError(f"{path.name} is not one owner-private regular file")
             if before.st_size > max_bytes:
                 raise ValueError(f"{path.name} is too large")
+            if aggregate_metadata_bytes is not None:
+                observed = aggregate_metadata_bytes[0] + before.st_size
+                if observed > MAX_TOTAL_METADATA_BYTES:
+                    raise ReviewMetadataBudgetExceeded(
+                        "decision review metadata aggregate budget exceeded"
+                    )
+                aggregate_metadata_bytes[0] = observed
             content = bytearray()
             while len(content) <= max_bytes:
                 chunk = os.read(descriptor, min(65536, max_bytes + 1 - len(content)))
@@ -453,19 +640,42 @@ def _read_private_bytes(
                     after.st_size, after.st_mtime_ns, after.st_ctime_ns)
             ):
                 raise ValueError(f"{path.name} changed during read")
+            if external_v1_snapshots is not None:
+                # V1 receipts can live outside the job root. Preserve the FD
+                # preimage, not a later path stat: both inode rewrites and
+                # replacements must invalidate a formerly observed PASS.
+                file_identity = _review_stat_file_identity(before)
+                linked = os.stat(
+                    path.name, dir_fd=parent_fd, follow_symlinks=False
+                )
+                if (
+                    _review_stat_file_identity(linked) != file_identity
+                    or _review_stat_parent_identity(os.fstat(parent_fd))
+                    != external_parent_identity
+                ):
+                    raise ValueError(f"{path.name} changed after review evidence read")
+                external_v1_snapshots.append(
+                    (path, external_parent_identity, file_identity)
+                )
             return bytes(content)
         finally:
             os.close(descriptor)
     finally:
-        os.close(parent_fd)
+        if owns_parent:
+            os.close(parent_fd)
 
 
 def _read_private_json(
-    path: Path, max_bytes: int, *, require_private_parent: bool = True
+    path: Path, max_bytes: int, *, require_private_parent: bool = True,
+    parent_fd: int | None = None,
+    aggregate_metadata_bytes: list[int] | None = None,
+    external_v1_snapshots: list[tuple[Path, tuple[int, ...], tuple[int, ...] | None]] | None = None,
 ) -> dict[str, Any]:
     """Read one stable owner-private JSON object without following its path."""
     content = _read_private_bytes(
-        path, max_bytes, require_private_parent=require_private_parent
+        path, max_bytes, require_private_parent=require_private_parent,
+        parent_fd=parent_fd, aggregate_metadata_bytes=aggregate_metadata_bytes,
+        external_v1_snapshots=external_v1_snapshots,
     )
     try:
         value = json.loads(content.decode("utf-8"))
@@ -476,9 +686,220 @@ def _read_private_json(
     return value
 
 
-def _read_stdout_tail(path: Path) -> tuple[str, str]:
-    payload = _read_private_bytes(path, MAX_STDOUT_TAIL_BYTES)
+def _read_stdout_tail(
+    path: Path, *, parent_fd: int | None = None
+) -> tuple[str, str]:
+    payload = _read_private_bytes(path, MAX_STDOUT_TAIL_BYTES, parent_fd=parent_fd)
     return payload.decode("utf-8", errors="replace"), hashlib.sha256(payload).hexdigest()
+
+
+def _unbound_stdout_has_target_result(
+    directory: Path, *, parent_fd: int, aggregate_bytes: list[int],
+    expected: dict[str, Any], allow_legacy_readable: bool,
+) -> bool:
+    """Scan complete owner-pinned ordinary stdout, not an arbitrary 8-MiB prefix.
+
+    Memory use is bounded by one chunk and a candidate review marker. A giant
+    unrelated line is skipped rather than buffered. An oversized candidate,
+    unreadable evidence or a changed inode fails closed.
+    """
+    parent = os.fstat(parent_fd)
+    if (
+        not stat.S_ISDIR(parent.st_mode)
+        or parent.st_uid != os.getuid()
+        or stat.S_IMODE(parent.st_mode) & 0o077
+    ):
+        raise ValueError("unbound review evidence parent is not owner-private")
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+    fd = os.open("stdout.log", flags, dir_fd=parent_fd)
+    try:
+        before = os.fstat(fd)
+        mode = stat.S_IMODE(before.st_mode)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.getuid()
+            or before.st_nlink != 1
+            or (mode & 0o077 and not (allow_legacy_readable and mode == 0o644))
+        ):
+            raise ValueError("unbound stdout is not one owner-private regular file")
+        if before.st_size > MAX_UNBOUND_STDOUT_BYTES:
+            raise ValueError("unbound stdout exceeds bounded inspection budget")
+        total_budget = aggregate_bytes[0] + before.st_size
+        if total_budget > MAX_TOTAL_METADATA_BYTES:
+            raise ReviewMetadataBudgetExceeded(
+                "decision review unbound stdout aggregate budget exceeded"
+            )
+        aggregate_bytes[0] = total_budget
+
+        prefix = RESULT_PREFIX.encode("ascii")
+        line = bytearray()
+        maybe_marker = True
+        found = False
+        read_size = 0
+        separator_carry = b""
+
+        def exact_target_marker(candidate: bytearray) -> bool:
+            if not candidate.startswith(prefix):
+                return False
+            try:
+                result = json.loads(
+                    candidate[len(prefix):].decode("utf-8", errors="replace")
+                )
+            except json.JSONDecodeError:
+                return False  # A malformed marker is not a decision.
+            return isinstance(result, dict) and _raw_binding_targets_pr_head(
+                result, expected
+            )
+
+        while True:
+            raw_chunk = os.read(fd, 65536)
+            read_size += len(raw_chunk)
+            if read_size > before.st_size:
+                raise ValueError("unbound stdout grew during inspection")
+            chunk = separator_carry + raw_chunk
+            separator_carry = b""
+            if raw_chunk:
+                # Retain only a possible unfinished CRLF/NEL/LS/PS boundary.
+                # At EOF, flush it unchanged: an incomplete UTF-8 sequence is
+                # ordinary data, while a trailing CR is itself a boundary.
+                if chunk.endswith(b"\xe2\x80"):
+                    separator_carry = chunk[-2:]
+                elif chunk.endswith((b"\r", b"\xc2", b"\xe2")):
+                    separator_carry = chunk[-1:]
+                if separator_carry:
+                    chunk = chunk[:-len(separator_carry)]
+            fragments = _STDOUT_LINE_SEPARATOR_RE.split(chunk)
+            for index, fragment in enumerate(fragments):
+                if maybe_marker:
+                    line.extend(fragment)
+                    if not (prefix.startswith(line) or line.startswith(prefix)):
+                        maybe_marker = False
+                        line.clear()
+                    elif len(line) > MAX_UNBOUND_MARKER_BYTES:
+                        raise ValueError("unbound decision marker exceeds bounded size")
+                if index < len(fragments) - 1:
+                    if maybe_marker and exact_target_marker(line):
+                        found = True
+                    line.clear()
+                    maybe_marker = True
+            if not raw_chunk:
+                break
+        if maybe_marker and exact_target_marker(line):
+            found = True
+        after = os.fstat(fd)
+        linked = os.stat("stdout.log", dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            read_size != before.st_size
+            or _review_stat_file_identity(after) != _review_stat_file_identity(before)
+            or _review_stat_file_identity(linked) != _review_stat_file_identity(before)
+        ):
+            raise ValueError("unbound stdout changed during inspection")
+        return found
+    finally:
+        os.close(fd)
+
+
+def _unbound_review_result_visible(
+    directory: Path, *, parent_fd: int, aggregate_bytes: list[int],
+    expected: dict[str, Any], allow_legacy_readable_stdout: bool = False,
+) -> bool:
+    """Find review evidence in a job whose valid origin now denies review status.
+
+    Only evidence for this exact PR/head blocks. Unrelated ordinary jobs may
+    print literal marker text or retain other revisions' role receipts.
+    This detects surviving evidence, not coordinated same-UID tampering of
+    metadata plus every secondary artifact.
+    """
+    try:
+        receipt = _read_private_json(
+            directory / REVIEW_ROLE_ATTEMPT_RECEIPT_NAME,
+            MAX_ROLE_RECEIPT_BYTES, parent_fd=parent_fd,
+            aggregate_metadata_bytes=aggregate_bytes,
+        )
+    except FileNotFoundError:
+        pass
+    else:
+        head = receipt.get("expected_head")
+        if not isinstance(head, str) or _SHA40_RE.fullmatch(head) is None:
+            raise ValueError("unbound role receipt head is invalid")
+        if head == expected["head_sha"]:
+            base_head = receipt.get("expected_base_head")
+            if not isinstance(base_head, str) or _SHA40_RE.fullmatch(base_head) is None:
+                raise ValueError("unbound role receipt base head is invalid")
+            # A matching HEAD from another PR base is not proof of a review
+            # of this revision. The role's expected_diff_sha256 is a workspace
+            # diff and cannot be equated to the canonical PR diff identity.
+            # Still scan any surviving stdout for an exact-bound REJECT.
+            if base_head == expected["base_sha"]:
+                return True
+    return _unbound_stdout_has_target_result(
+        directory, parent_fd=parent_fd, aggregate_bytes=aggregate_bytes,
+        expected=expected, allow_legacy_readable=allow_legacy_readable_stdout,
+    )
+
+
+def _exact_empty_prelaunch_stub(directory_fd: int) -> bool:
+    """Narrow legacy footprint from failed pre-origin job preparation.
+
+    This is a pinned filesystem classification, NOT proof that an adversary
+    never started work and subsequently erased all same-UID evidence.
+    """
+    parent_before = os.fstat(directory_fd)
+    if (
+        not stat.S_ISDIR(parent_before.st_mode)
+        or parent_before.st_uid != os.geteuid()
+        or stat.S_IMODE(parent_before.st_mode) & 0o077
+    ):
+        return False
+    observed: dict[str, os.stat_result] = {}
+    with os.scandir(directory_fd) as entries:
+        for entry in entries:
+            if len(observed) >= 2 or entry.name not in {"stdout.log", "stderr.log"}:
+                return False
+            observed[entry.name] = entry.stat(follow_symlinks=False)
+    if set(observed) != {"stdout.log", "stderr.log"}:
+        return False
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK | os.O_NOFOLLOW
+    descriptors: list[int] = []
+    try:
+        for name in ("stdout.log", "stderr.log"):
+            fd = os.open(name, flags, dir_fd=directory_fd)
+            descriptors.append(fd)
+            before = os.fstat(fd)
+            snapshot = observed[name]
+            identity = lambda s: (
+                s.st_dev, s.st_ino, s.st_mode, s.st_uid, s.st_nlink,
+                s.st_size, s.st_mtime_ns, s.st_ctime_ns,
+            )
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_uid != os.geteuid()
+                or stat.S_IMODE(before.st_mode) != 0o600
+                or before.st_nlink != 1
+                or before.st_size != 0
+                or identity(before) != identity(snapshot)
+                or os.read(fd, 1) != b""
+                or identity(os.fstat(fd)) != identity(before)
+                or identity(os.stat(name, dir_fd=directory_fd, follow_symlinks=False))
+                != identity(before)
+            ):
+                return False
+        with os.scandir(directory_fd) as entries:
+            after_names = sorted(entry.name for entry in entries)
+        after = os.fstat(directory_fd)
+        return (
+            after_names == ["stderr.log", "stdout.log"]
+            and (
+                parent_before.st_dev, parent_before.st_ino,
+                parent_before.st_mtime_ns, parent_before.st_ctime_ns,
+            ) == (
+                after.st_dev, after.st_ino,
+                after.st_mtime_ns, after.st_ctime_ns,
+            )
+        )
+    finally:
+        for fd in descriptors:
+            os.close(fd)
 
 
 def _raw_binding_targets_pr_head(value: Any, expected: dict[str, Any]) -> bool:
@@ -515,12 +936,19 @@ def _proven_not_started(metadata: dict[str, Any]) -> bool:
         and launcher["returncode"] != 0
     )
 
-
-def _validated_origin_binding(directory: Path) -> tuple[dict[str, Any], dict[str, Any] | None, dict[str, Any] | None]:
+def _validated_origin_binding(
+    directory: Path, *, raw_metadata: dict[str, Any] | None = None,
+    parent_fd: int | None = None, expected: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any] | None, dict[str, Any] | None]:
     unit = directory.name
     if _UNIT_RE.fullmatch(unit) is None:
         raise ValueError("job unit is invalid")
-    metadata = _read_private_json(directory / "metadata.json", MAX_METADATA_BYTES)
+    metadata = (
+        raw_metadata if raw_metadata is not None
+        else _read_private_json(
+            directory / "metadata.json", MAX_METADATA_BYTES, parent_fd=parent_fd
+        )
+    )
     try:
         origin = job_origin.validate_origin(
             metadata.get("origin"),
@@ -539,6 +967,12 @@ def _validated_origin_binding(directory: Path) -> tuple[dict[str, Any], dict[str
     if raw_binding is None:
         return metadata, None, None
     binding = normalize_binding(raw_binding)
+    # Validate the signed Origin and exact metadata binding first.
+    # Foreign reviews cannot grant a PASS or require today's model binaries;
+    # surviving current-head receipts and material REJECTs are still scanned
+    # across every historical job after a runtime or release rotation.
+    if expected is not None and not _binding_matches_pr_head(binding, expected):
+        return metadata, binding, None
     origin_cwd = scope.get("cwd")
     if not isinstance(origin_cwd, str) or not origin_cwd:
         raise ValueError("job origin cwd is invalid")
@@ -574,10 +1008,12 @@ def _validated_origin_binding(directory: Path) -> tuple[dict[str, Any], dict[str
     return metadata, binding, provenance
 
 
-def _validated_finalization(directory: Path, metadata: dict[str, Any]) -> dict[str, Any] | None:
+def _validated_finalization(
+    directory: Path, metadata: dict[str, Any], *, parent_fd: int | None = None,
+) -> dict[str, Any] | None:
     path = directory / "finalization.json"
     try:
-        receipt = _read_private_json(path, MAX_FINALIZATION_BYTES)
+        receipt = _read_private_json(path, MAX_FINALIZATION_BYTES, parent_fd=parent_fd)
     except FileNotFoundError:
         return None
     payload_sha256 = receipt.get("payload_sha256")
@@ -957,12 +1393,19 @@ def _normalize_review_role_provenance(
     runner_module_path, runner_module_sha256 = module_identity
     recorded_runner_python = value.get("runner_python")
     stable_python = str(REVIEW_ROLE_STABLE_PYTHON.expanduser())
-    runner_python_matches = (
-        recorded_runner_python == REVIEW_ROLE_PYTHON
-        and recorded_runner_python != stable_python
-    ) or _historical_review_role_python_matches(recorded_runner_python)
     recorded_module_path = value.get("runner_module_path")
     recorded_module_sha256 = value.get("runner_module_sha256")
+    nix_origin_matches = _historical_nix_review_role_origin_matches(
+        recorded_runner_python, recorded_module_path, recorded_module_sha256,
+    )
+    runner_python_matches = (
+        (
+            recorded_runner_python == REVIEW_ROLE_PYTHON
+            and recorded_runner_python != stable_python
+        )
+        or _historical_review_role_python_matches(recorded_runner_python)
+        or nix_origin_matches
+    )
     # Historical attempts bind the module bytes installed when the review ran.
     # A later source upgrade must not erase that evidence. Never trust an
     # arbitrary caller-selected digest: require the exact byte-matching module
@@ -976,6 +1419,7 @@ def _normalize_review_role_provenance(
             recorded_module_path,
             expected_sha256=recorded_module_sha256,
         )
+        or nix_origin_matches
     )
     if (
         schema not in {1, 2}
@@ -1101,13 +1545,13 @@ def _claude_no_external_activity(usage: Any, subagents: Any) -> bool:
     return True
 
 
-def _proven_claude_quota_failure_before_review(
-    receipt: dict[str, Any], provenance: dict[str, Any]
+def _proven_claude_pre_result_failure_before_review(
+    receipt: dict[str, Any], provenance: dict[str, Any], *, auth_401: bool = False,
 ) -> bool:
-    """Accept only an exact, bound 429 transport envelope with zero model work.
+    """Verify a narrow, authenticated Claude 429 or revoked-OAuth 401 with zero review work.
 
-    This never grants a review PASS: a later independent PASS from the same
-    registered provider slot is still mandatory before settlement.
+    This never grants a review PASS, forgives ambiguous output, or erases a REJECT.
+    The sole 401 shape is the observed first-party authentication refusal.
     """
     if (
         provenance.get("schema_version") != 2
@@ -1150,7 +1594,10 @@ def _proven_claude_quota_failure_before_review(
         envelope = json.loads(tail, object_pairs_hook=unique_json_object)
     except ValueError:
         return False
-    if not isinstance(envelope, dict) or set(envelope) - _CLAUDE_QUOTA_ENVELOPE_FIELDS:
+    permitted_fields = _CLAUDE_QUOTA_ENVELOPE_FIELDS | (
+        frozenset({"api_error_origin", "safety_stops"}) if auth_401 else frozenset()
+    )
+    if not isinstance(envelope, dict) or set(envelope) - permitted_fields:
         return False
     # The actual 429 result has one CLI wrapper turn, not one model turn.
     # An unexpected count, tool trace or provider state is not pre-result proof.
@@ -1187,16 +1634,29 @@ def _proven_claude_quota_failure_before_review(
         and envelope.get("is_error") is True
         and envelope.get("terminal_reason") == "api_error"
         and type(envelope.get("api_error_status")) is int
-        and envelope["api_error_status"] == 429
+        and envelope["api_error_status"] == (401 if auth_401 else 429)
         and type(envelope.get("duration_api_ms")) is int
         and envelope["duration_api_ms"] == 0
         and envelope.get("modelUsage") == {}
         and envelope.get("structured_output") is None
         and isinstance(envelope.get("result"), str)
         and len(envelope["result"]) <= 256
-        and _CLAUDE_QUOTA_RESULT_RE.fullmatch(envelope["result"]) is not None
+        and (
+            (
+                envelope.get("api_error_origin") == "first_party"
+                and envelope["result"] == _CLAUDE_AUTH_REVOKED_RESULT
+            )
+            if auth_401 else (
+                _CLAUDE_QUOTA_RESULT_RE.fullmatch(envelope["result"]) is not None
+            )
+        )
         and isinstance(usage, dict) and usage.get("iterations") == []
         and envelope.get("permission_denials") == []
+        and (
+            type(envelope.get("safety_stops")) is int
+            and envelope["safety_stops"] == 0
+            if auth_401 else True
+        )
         and type(envelope.get("total_cost_usd")) in {int, float}
         and envelope["total_cost_usd"] == 0
         and isinstance(usage, dict)
@@ -1211,17 +1671,191 @@ def _proven_claude_quota_failure_before_review(
     )
 
 
+def _proven_claude_quota_failure_before_review(
+    receipt: dict[str, Any], provenance: dict[str, Any],
+) -> bool:
+    return _proven_claude_pre_result_failure_before_review(receipt, provenance)
+
+
+def _proven_claude_auth_failure_before_review(
+    receipt: dict[str, Any], provenance: dict[str, Any],
+) -> bool:
+    return _proven_claude_pre_result_failure_before_review(
+        receipt, provenance, auth_401=True,
+    )
+
+
+def _proven_grok_quota_failure_before_review(
+    receipt: dict[str, Any], provenance: dict[str, Any]
+) -> bool:
+    """Recognize only the authenticated, three-event, pre-result xAI 402.
+
+    Recognition is *not* a review decision. It keeps the failed job in history
+    and requires a later real independent PASS from the same provider slot.
+    Any model text, tool use, unknown event, truncation or ambiguous error
+    remains invalid_result, permanently fail-closed.
+    """
+    route = provenance.get("review_route")
+    if (
+        provenance.get("schema_version") != 2
+        or not isinstance(route, dict)
+        or route.get("provider_family") != "xai"
+        or route.get("route_id") != "grok-4.6-review-high"
+        or receipt.get("verdict") != "INVALID"
+        or receipt.get("findings") != []
+        or receipt.get("failure_classification") != "invalid_review_output"
+        or type(receipt.get("returncode")) is not int
+        or receipt["returncode"] != 126
+        or receipt.get("error") != "Grok review stream used unsupported event type: error"
+        or type(receipt.get("review_document_bytes")) is not int
+        or receipt["review_document_bytes"] != 0
+        or receipt.get("review_document_sha256") is not None
+        or receipt.get("review_document_normalizations") != []
+        or receipt.get("review_findings_normalized") is not False
+        or receipt.get("review_input_source") != "committed_diff"
+        or type(receipt.get("review_input_bytes")) is not int
+        or not 0 < receipt["review_input_bytes"] <= 1024 * 1024
+        or not isinstance(receipt.get("review_input_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", receipt["review_input_sha256"]) is None
+    ):
+        return False
+    probe = receipt.get("post_failure_toolchain_probe")
+    if (
+        not isinstance(probe, dict)
+        or probe.get("passed") is not True
+        or probe.get("failure_classification") != "passed"
+        or probe.get("missing_executable") is not False
+        or probe.get("missing_python_module") is not False
+    ):
+        return False
+    provider_fields = {
+        "review_provider_available_commands_events",
+        "review_provider_available_tools",
+        "review_provider_completed_commands",
+        "review_provider_completed_tool_calls",
+        "review_provider_completed_tools",
+        "review_provider_stream_bytes",
+        "review_provider_stream_contract",
+        "review_provider_stream_events",
+        "review_provider_stream_sha256",
+    }
+    if (
+        {key for key in receipt if key.startswith("review_provider_")} != provider_fields
+        or receipt.get("review_provider_stream_contract")
+        != "grok-streaming-json-bound-diff-review-v2"
+        or type(receipt.get("review_provider_stream_events")) is not int
+        or receipt["review_provider_stream_events"] != 3
+        # The original parser returns on the unsupported "error" event
+        # before committing its in-progress available-command count.
+        or type(receipt.get("review_provider_available_commands_events")) is not int
+        or receipt["review_provider_available_commands_events"] != 0
+        or receipt.get("review_provider_available_tools") != []
+        or receipt.get("review_provider_completed_commands") != []
+        or type(receipt.get("review_provider_completed_tool_calls")) is not int
+        or receipt["review_provider_completed_tool_calls"] != 0
+        or receipt.get("review_provider_completed_tools") != []
+    ):
+        return False
+    stdout = receipt.get("stdout_tail")
+    stderr = receipt.get("stderr_tail")
+    if not isinstance(stdout, str) or not isinstance(stderr, str):
+        return False
+    raw_stdout = stdout.encode("utf-8")
+    raw_stderr = stderr.encode("utf-8")
+    if (
+        not raw_stdout or len(raw_stdout) > 4096
+        or type(receipt.get("stdout_bytes")) is not int
+        or receipt["stdout_bytes"] != len(raw_stdout)
+        or receipt.get("stdout_sha256") != hashlib.sha256(raw_stdout).hexdigest()
+        or type(receipt.get("review_provider_stream_bytes")) is not int
+        or receipt["review_provider_stream_bytes"] != len(raw_stdout)
+        or receipt.get("review_provider_stream_sha256") != receipt["stdout_sha256"]
+        or type(receipt.get("stderr_bytes")) is not int
+        or receipt["stderr_bytes"] != len(raw_stderr)
+        or receipt.get("stderr_sha256") != hashlib.sha256(raw_stderr).hexdigest()
+    ):
+        return False
+
+    error_message = (
+        "API error (status 402 Payment Required): "
+        "Grok Build usage balance exhausted"
+    )
+    wrapped = (
+        'Internal error: {\n  "message": "' + error_message
+        + '",\n  "http_status": 402\n}'
+    )
+    if stderr != "Error: " + wrapped + "\n":
+        return False
+    # No silent duplicate JSON member, Unicode alias, partial/truncated stream,
+    # embedded prose, usage, tool event or end_turn can masquerade as zero work.
+    lines = stdout.splitlines(keepends=True)
+    if len(lines) != 3 or any(not line.endswith("\n") for line in lines):
+        return False
+
+    def reject_duplicate_members(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("duplicate Grok quota stream key")
+            value[key] = item
+        return value
+
+    try:
+        events = [
+            json.loads(line[:-1], object_pairs_hook=reject_duplicate_members)
+            for line in lines
+        ]
+    except (ValueError, UnicodeError):
+        return False
+    six_commands = [
+        "compact", "always-approve", "context",
+        "session-info", "feedback", "goal",
+    ]
+    # These are the only two complete provider preflight sequences proven
+    # in immutable, origin-bound failed review receipts. Do not accept subsets,
+    # mixed lists, reordered commands or any additional result/tool events.
+    known_commands = (
+        six_commands,
+        [*six_commands[:2], "memory", *six_commands[2:]],
+    )
+    return any(
+        events == [
+            {"type": "available_commands", "tools": [], "commands": commands},
+            {"type": "available_commands", "tools": [], "commands": commands},
+            {"type": "error", "message": wrapped},
+        ]
+        for commands in known_commands
+    )
+
+
 def _validated_review_role_evidence(
-    metadata: dict[str, Any], binding: dict[str, Any], provenance: dict[str, Any] | None
+    metadata: dict[str, Any], binding: dict[str, Any], provenance: dict[str, Any] | None,
+    *, directory: Path | None = None, parent_fd: int | None = None,
+    aggregate_bytes: list[int] | None = None,
+    external_v1_snapshots: list[tuple[Path, tuple[int, ...], tuple[int, ...] | None]] | None = None,
 ) -> dict[str, Any] | None:
     if provenance is None:
         return None
     # V1 allowed caller-selected private files in shared directories. Retain
     # its fd/no-follow/owner/nlink/size checks; require a private parent for
     # new V2 job-owned receipts only.
+    receipt_path = Path(provenance["role_receipt_path"])
+    pinned_receipt_fd = None
+    if provenance["schema_version"] == 2 and parent_fd is not None:
+        if (
+            directory is None
+            or receipt_path != directory / REVIEW_ROLE_ATTEMPT_RECEIPT_NAME
+        ):
+            raise ValueError("review role receipt directory binding mismatch")
+        pinned_receipt_fd = parent_fd
     receipt = _read_private_json(
-        Path(provenance["role_receipt_path"]), MAX_ROLE_RECEIPT_BYTES,
+        receipt_path, MAX_ROLE_RECEIPT_BYTES,
         require_private_parent=provenance["schema_version"] == 2,
+        parent_fd=pinned_receipt_fd,
+        aggregate_metadata_bytes=aggregate_bytes,
+        external_v1_snapshots=(
+            external_v1_snapshots if provenance["schema_version"] == 1 else None
+        ),
     )
     expected_receipt_sha256 = _agent_role_receipt_sha256(receipt)
     if receipt.get("receipt_sha256") != expected_receipt_sha256:
@@ -1272,7 +1906,14 @@ def _validated_review_role_evidence(
         "result": result,
         "pre_result_quota_failure_verified": (
             result is None
-            and _proven_claude_quota_failure_before_review(receipt, provenance)
+            and (
+                _proven_claude_quota_failure_before_review(receipt, provenance)
+                or _proven_grok_quota_failure_before_review(receipt, provenance)
+            )
+        ),
+        "pre_result_auth_failure_verified": (
+            result is None
+            and _proven_claude_auth_failure_before_review(receipt, provenance)
         ),
     }
 
@@ -1318,7 +1959,401 @@ def _attempt_started_after(candidate: dict[str, Any], prior: dict[str, Any]) -> 
     return candidate_ns > prior_ns
 
 
-def reconcile(
+
+def _external_v1_role_receipts_unchanged(
+    snapshots: list[tuple[Path, tuple[int, ...], tuple[int, ...] | None]],
+) -> bool:
+    """Recheck every earlier external V1 receipt after the full registry scan.
+
+    Unlike V2 evidence, historical V1 role receipts can reside outside the
+    scanned job directory. No receipt is reinterpreted or granted authority
+    here; this only invalidates prior observations if their path, parent or
+    physical file identity changed.
+    """
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    for path, parent_identity, file_identity in snapshots:
+        try:
+            parent_fd = os.open(path.parent, flags)
+            try:
+                if _review_stat_parent_identity(os.fstat(parent_fd)) != parent_identity:
+                    return False
+                try:
+                    observed = os.stat(
+                        path.name, dir_fd=parent_fd, follow_symlinks=False
+                    )
+                except FileNotFoundError:
+                    if file_identity is not None:
+                        return False
+                else:
+                    if (
+                        file_identity is None
+                        or _review_stat_file_identity(observed) != file_identity
+                    ):
+                        return False
+            finally:
+                os.close(parent_fd)
+        except OSError:
+            return False
+    return True
+
+
+def _review_child_file_snapshot(
+    directory_fd: int,
+) -> tuple[tuple[str, tuple[int, ...] | None], ...]:
+    """Bounded no-follow snapshots of files whose in-place writes can hide R3.
+
+    A directory's mtime/ctime does not advance when an existing child file is
+    rewritten. Keep the first file-level stat preimages and verify them both
+    after examining a job and at the end of the complete registry scan.
+    This is drift detection, not authentication against prior same-UID edits.
+    """
+    snapshots: list[tuple[str, tuple[int, ...] | None]] = []
+    for name in (
+        "metadata.json", "stdout.log", "stderr.log", "finalization.json",
+        REVIEW_ROLE_ATTEMPT_RECEIPT_NAME, "review-role-receipt.json",
+    ):
+        try:
+            value = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            snapshots.append((name, None))
+            continue
+        snapshots.append((name, (
+            value.st_dev, value.st_ino, value.st_mode, value.st_uid,
+            value.st_nlink, value.st_size, value.st_mtime_ns, value.st_ctime_ns,
+        )))
+    return tuple(snapshots)
+
+
+def _iter_pinned_review_job_directories(
+    root: Path, errors: list[str], metadata_budget: list[int], *,
+    expected: dict[str, Any], unbound_stdout_budget: list[int],
+) -> Iterator[tuple[Path, int]]:
+    dir_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+    try:
+        root_fd = os.open(root, dir_flags)
+    except OSError:
+        errors.append("decision_review_jobs_root_invalid")
+        return
+    try:
+        root_stat = os.fstat(root_fd)
+        if (
+            not stat.S_ISDIR(root_stat.st_mode)
+            or root_stat.st_uid != os.geteuid()
+            or stat.S_IMODE(root_stat.st_mode) & 0o077
+        ):
+            errors.append("decision_review_jobs_root_invalid")
+            return
+        names: list[tuple[str, int, int]] = []
+        original_root_entries: dict[str, tuple[int, int]] = {}
+        # Child writes do not advance the jobs root mtime. Revalidate each
+        # processed child's pinned directory identity after the whole scan.
+        inspected_children: list[tuple[str, tuple[int, ...], tuple[Any, ...]]] = []
+        seen = 0
+        with os.scandir(root_fd) as entries:
+            for entry in entries:
+                seen += 1
+                try:
+                    initial_entry_stat = entry.stat(follow_symlinks=False)
+                except OSError:
+                    errors.append("decision_review_job_inventory_unverifiable")
+                    return
+                original_root_entries[entry.name] = (
+                    initial_entry_stat.st_dev, initial_entry_stat.st_ino,
+                )
+                if seen > MAX_JOB_DIRECTORIES:
+                    errors.append("decision_review_job_inventory_truncated")
+                    return
+                if _UNIT_RE.fullmatch(entry.name) is not None:
+                    try:
+                        entry_stat = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        errors.append("decision_review_job_inventory_unverifiable")
+                        return
+                    if not stat.S_ISDIR(entry_stat.st_mode):
+                        errors.append("decision_review_job_inventory_unverifiable")
+                        return
+                    # Bind the observed dentry inode to its later O_NOFOLLOW fd.
+                    names.append((entry.name, entry_stat.st_dev, entry_stat.st_ino))
+                    continue
+                try:
+                    if entry.is_symlink():
+                        errors.append("decision_review_noncanonical_job_unverifiable")
+                        return
+                    is_dir = entry.is_dir(follow_symlinks=False)
+                except OSError:
+                    errors.append("decision_review_noncanonical_job_unverifiable")
+                    return
+                if not is_dir:
+                    if entry.name.startswith("grabowski-job-"):
+                        errors.append("decision_review_noncanonical_job_unverifiable")
+                        return
+                    continue
+                try:
+                    foreign_fd = os.open(entry.name, dir_flags, dir_fd=root_fd)
+                except OSError:
+                    errors.append("decision_review_noncanonical_job_unverifiable")
+                    return
+                foreign_files_before = None
+                try:
+                    foreign_stat = os.fstat(foreign_fd)
+                    if (
+                        not stat.S_ISDIR(foreign_stat.st_mode)
+                        or foreign_stat.st_uid != os.geteuid()
+                        or stat.S_IMODE(foreign_stat.st_mode) & 0o077
+                    ):
+                        errors.append("decision_review_noncanonical_job_unverifiable")
+                        return
+                    # Pin both the directory and the already existing files.
+                    # In-place writes do not change the directory timestamps.
+                    foreign_files_before = _review_child_file_snapshot(foreign_fd)
+                    inspected_children.append((entry.name, (
+                        foreign_stat.st_dev, foreign_stat.st_ino,
+                        foreign_stat.st_mode, foreign_stat.st_uid,
+                        foreign_stat.st_nlink, foreign_stat.st_mtime_ns,
+                        foreign_stat.st_ctime_ns,
+                    ), foreign_files_before))
+                    # RepoGround rgpm jobs are a separate, signed job namespace.
+                    # Inspect their metadata, but NEVER admit them as DecisionReviews.
+                    if _RGPM_UNIT_RE.fullmatch(entry.name) is None:
+                        try:
+                            os.stat("metadata.json", dir_fd=foreign_fd, follow_symlinks=False)
+                        except FileNotFoundError:
+                            # A renamed old R3 job may retain an exact-bound
+                            # REJECT stdout even when its metadata is missing.
+                            # Unknown noncanonical bundles are still harmless
+                            # only when no such secondary evidence survives.
+                            try:
+                                if _unbound_review_result_visible(
+                                    root / entry.name, parent_fd=foreign_fd,
+                                    aggregate_bytes=unbound_stdout_budget,
+                                    expected=expected,
+                                    allow_legacy_readable_stdout=True,
+                                ):
+                                    errors.append(
+                                        f"decision_review_unbound_result:{entry.name}"
+                                    )
+                                    return
+                            except FileNotFoundError:
+                                pass  # A genuine bundle may have no stdout.
+                            except (OSError, ValueError) as exc:
+                                errors.append(
+                                    f"decision_review_unbound_evidence_invalid:"
+                                    f"{entry.name}:{type(exc).__name__}"
+                                )
+                                return
+                            continue
+                        except OSError:
+                            errors.append("decision_review_noncanonical_job_unverifiable")
+                            return
+                        errors.append("decision_review_noncanonical_job_directory")
+                        return
+                    try:
+                        foreign_metadata = _read_private_json(
+                            root / entry.name / "metadata.json", MAX_METADATA_BYTES,
+                            parent_fd=foreign_fd,
+                            aggregate_metadata_bytes=metadata_budget,
+                        )
+                    except FileNotFoundError:
+                        foreign_metadata = None  # Historical rgpm jobs may lack metadata.
+                    except (OSError, ValueError):
+                        errors.append("decision_review_noncanonical_job_unverifiable")
+                        return
+                    if foreign_metadata is not None:
+                        try:
+                            foreign_origin = job_origin.validate_origin(
+                                foreign_metadata.get("origin"),
+                                foreign_metadata.get("origin_sha256"),
+                                expected_unit=entry.name,
+                            )
+                            if any(
+                                foreign_metadata.get(key) != foreign_origin.get(key)
+                                for key in ("unit", "job_id", "owner", "argv_sha256", "scope")
+                            ):
+                                raise ValueError("foreign job metadata origin mismatch")
+                            foreign_scope = foreign_origin.get("scope")
+                            if (
+                                not isinstance(foreign_scope, dict)
+                                or foreign_scope.get("decision_bound_review") is not None
+                            ):
+                                raise ValueError("foreign job may contain a review decision")
+                        except ValueError:
+                            errors.append("decision_review_noncanonical_job_unverifiable")
+                            return
+                    # A hash-valid rgpm/ordinary Origin cannot prove a formerly
+                    # bound review never existed. The canonical job might have
+                    # been renamed and rebound while retaining a material REJECT.
+                    # Reuse the same bounded FD-pinned secondary-evidence check;
+                    # never grant foreign jobs a PASS or advance their clock.
+                    try:
+                        if _unbound_review_result_visible(
+                            root / entry.name, parent_fd=foreign_fd,
+                            aggregate_bytes=unbound_stdout_budget, expected=expected,
+                            allow_legacy_readable_stdout=True,
+                        ):
+                            errors.append(f"decision_review_unbound_result:{entry.name}")
+                            return
+                    except FileNotFoundError:
+                        # Legitimate historic rgpm jobs may lack stdout. A
+                        # matching role receipt would already have blocked above.
+                        pass
+                    except (OSError, ValueError) as exc:
+                        errors.append(
+                            f"decision_review_unbound_evidence_invalid:"
+                            f"{entry.name}:{type(exc).__name__}"
+                        )
+                        return
+                    continue
+                except OSError:
+                    errors.append("decision_review_noncanonical_job_unverifiable")
+                    return
+                finally:
+                    if foreign_files_before is not None:
+                        try:
+                            if _review_child_file_snapshot(foreign_fd) != foreign_files_before:
+                                errors.append("decision_review_job_file_changed")
+                        except OSError:
+                            errors.append("decision_review_job_file_changed")
+                    os.close(foreign_fd)
+        if errors:
+            return
+        for unit, expected_dev, expected_ino in sorted(names):
+            try:
+                job_fd = os.open(unit, dir_flags, dir_fd=root_fd)
+            except OSError:
+                errors.append("decision_review_job_inventory_unverifiable")
+                return
+            job_stat = None
+            job_files_before = None
+            try:
+                job_stat = os.fstat(job_fd)
+                if (
+                    not stat.S_ISDIR(job_stat.st_mode)
+                    or job_stat.st_uid != os.geteuid()
+                    or stat.S_IMODE(job_stat.st_mode) & 0o077
+                    or (job_stat.st_dev, job_stat.st_ino) != (expected_dev, expected_ino)
+                ):
+                    errors.append("decision_review_job_inventory_unverifiable")
+                    return
+                job_files_before = _review_child_file_snapshot(job_fd)
+                yield root / unit, job_fd
+            finally:
+                try:
+                    if job_stat is not None:
+                        job_after = os.fstat(job_fd)
+                        if (
+                            job_after.st_mtime_ns != job_stat.st_mtime_ns
+                            or job_after.st_ctime_ns != job_stat.st_ctime_ns
+                        ):
+                            errors.append("decision_review_job_directory_changed")
+                        elif job_files_before is not None:
+                            if _review_child_file_snapshot(job_fd) != job_files_before:
+                                errors.append("decision_review_job_file_changed")
+                            else:
+                                inspected_children.append((unit, (
+                                    job_after.st_dev, job_after.st_ino,
+                                    job_after.st_mode, job_after.st_uid,
+                                    job_after.st_nlink, job_after.st_mtime_ns,
+                                    job_after.st_ctime_ns,
+                                ), job_files_before))
+                except OSError:
+                    errors.append("decision_review_job_directory_changed")
+                finally:
+                    os.close(job_fd)
+        # An earlier stub may publish metadata or a material REJECT while
+        # a later child is being evaluated. A final root-only stat misses it.
+        for unit, snapshot, files_before in inspected_children:
+            try:
+                child_fd = os.open(unit, dir_flags, dir_fd=root_fd)
+                try:
+                    child_after = os.fstat(child_fd)
+                    files_after = _review_child_file_snapshot(child_fd)
+                finally:
+                    os.close(child_fd)
+            except OSError:
+                errors.append("decision_review_job_directory_changed")
+                return
+            if (
+                not stat.S_ISDIR(child_after.st_mode)
+                or (
+                    child_after.st_dev, child_after.st_ino,
+                    child_after.st_mode, child_after.st_uid,
+                    child_after.st_nlink, child_after.st_mtime_ns,
+                    child_after.st_ctime_ns,
+                ) != snapshot
+            ):
+                errors.append("decision_review_job_directory_changed")
+                return
+            if files_after != files_before:
+                errors.append("decision_review_job_file_changed")
+                return
+        try:
+            after = os.stat(root, follow_symlinks=False)
+        except OSError:
+            errors.append("decision_review_jobs_root_invalid")
+            return
+        if (
+            root_stat.st_dev, root_stat.st_ino,
+            root_stat.st_mtime_ns, root_stat.st_ctime_ns,
+        ) != (
+            after.st_dev, after.st_ino, after.st_mtime_ns, after.st_ctime_ns,
+        ):
+            # New jobs can legitimately register during the long read-only scan.
+            # Retry the ENTIRE reconciliation only for a proven monotonic
+            # addition; removals, replacement inodes and permissions changes
+            # remain contradictory evidence and must stay blocking.
+            try:
+                # os.scandir(fd) duplicates a descriptor sharing the kernel
+                # directory offset. The initial scan exhausted root_fd; a
+                # second scandir(root_fd) would see an empty directory.
+                fresh_fd = os.open(root, dir_flags)
+                try:
+                    fresh_root = os.fstat(fresh_fd)
+                    if (
+                        fresh_root.st_dev != root_stat.st_dev
+                        or fresh_root.st_ino != root_stat.st_ino
+                    ):
+                        errors.append("decision_review_jobs_root_changed")
+                        return
+                    with os.scandir(fresh_fd) as entries:
+                        current_entries = {
+                            entry.name: entry.stat(follow_symlinks=False)
+                            for entry in entries
+                        }
+                finally:
+                    os.close(fresh_fd)
+            except OSError:
+                errors.append("decision_review_jobs_root_changed")
+                return
+            added_names = set(current_entries) - set(original_root_entries)
+            unchanged = all(
+                name in current_entries and (
+                    current_entries[name].st_dev, current_entries[name].st_ino,
+                ) == identity
+                for name, identity in original_root_entries.items()
+            )
+            additions_are_new_private_jobs = bool(added_names) and all(
+                _UNIT_RE.fullmatch(name) is not None
+                and stat.S_ISDIR(current_entries[name].st_mode)
+                and current_entries[name].st_uid == os.geteuid()
+                and not (stat.S_IMODE(current_entries[name].st_mode) & 0o077)
+                for name in added_names
+            )
+            if (
+                root_stat.st_dev == after.st_dev
+                and root_stat.st_ino == after.st_ino
+                and root_stat.st_uid == after.st_uid
+                and root_stat.st_mode == after.st_mode
+                and unchanged
+                and additions_are_new_private_jobs
+            ):
+                errors.append("decision_review_jobs_root_addition_race")
+            else:
+                errors.append("decision_review_jobs_root_changed")
+    finally:
+        os.close(root_fd)
+
+
+def _reconcile_once(
     *,
     repo: str,
     pr: int,
@@ -1369,6 +2404,8 @@ def reconcile(
             "accepted_diff_sha256s": accepted_diff_sha256s_projection,
             "accepted_diff_sha256s_sha256": sha256_json(accepted_diff_sha256s_projection),
             "attempt_count": 0,
+            "skipped_prelaunch_stub_count": 0,
+            "skipped_prelaunch_stub_units_sha256": sha256_json([]),
             "slot_count": 0,
             "slots": [],
             "errors": [],
@@ -1378,220 +2415,275 @@ def reconcile(
                 "reviews_started_outside_grabowski_job_start",
             ],
         }
-    if root.is_symlink() or not root.is_dir():
-        errors.append("decision_review_jobs_root_invalid")
-        directories: list[Path] = []
-    else:
-        directories = []
-        with os.scandir(root) as entries:
-            for entry in entries:
-                if _UNIT_RE.fullmatch(entry.name) is None:
-                    continue
-                try:
-                    if not entry.is_dir(follow_symlinks=False):
-                        continue
-                except OSError:
-                    continue
-                directories.append(Path(entry.path))
-        directories.sort(key=lambda item: item.name)
-        if len(directories) > MAX_JOB_DIRECTORIES:
-            errors.append("decision_review_job_inventory_truncated")
-            directories = directories[:MAX_JOB_DIRECTORIES]
-
-    for directory in directories:
-        raw_targets_pr_head = False
-        try:
-            raw_metadata = _read_private_json(directory / "metadata.json", MAX_METADATA_BYTES)
-            raw_scope = raw_metadata.get("scope")
-            raw_review_binding = (
-                raw_scope.get("decision_bound_review")
-                if isinstance(raw_scope, dict)
-                else None
-            )
-            raw_targets_pr_head = _raw_binding_targets_pr_head(
-                raw_review_binding, expected
-            )
-            metadata, binding, provenance = _validated_origin_binding(directory)
-        except (FileNotFoundError, OSError, ValueError) as exc:
-            if raw_targets_pr_head:
-                errors.append(f"decision_review_origin_invalid:{directory.name}:{type(exc).__name__}")
-            continue
-        if binding is None or not _binding_matches_pr_head(binding, expected):
-            continue
-
-        attempt: dict[str, Any] = {
-            "unit": directory.name,
-            "slot": binding["slot"],
-            "origin_sha256": metadata.get("origin_sha256"),
-            "created_at_unix": metadata["origin"].get("created_at_unix"),
-            "started_at_unix_ns": metadata["scope"].get("started_at_unix_ns"),
-            "terminal": False,
-            "terminal_status": None,
-            "classification": "unresolved",
-            "verdict": None,
-            "material_findings": None,
-            "result_sha256": None,
-            "stdout_tail_sha256": None,
-            "review_role_verified": False,
-            "review_route_verified": False,
-            "review_route_id": None,
-            "review_provider_family": None,
-            "independence_verified": False,
-            "review_role_receipt_sha256": None,
-            "diff_identity_deferred": False,
-        }
-        if binding["base_sha"] != expected["base_sha"]:
-            errors.append(f"decision_review_base_sha_drift:{directory.name}")
-            attempt["classification"] = "binding_drift"
-            attempts.append(attempt)
-            continue
-        diff_binding_drift = False
-        if binding["diff_sha256"] not in accepted_diff_sha256s:
-            if defer_diff_identity:
-                attempt["diff_identity_deferred"] = True
-            else:
-                diff_binding_drift = True
-        if _proven_not_started(metadata):
-            attempt["terminal"] = True
-            attempt["terminal_status"] = "launch_failed"
-            if diff_binding_drift:
-                errors.append(f"decision_review_diff_sha256_drift:{directory.name}")
-                attempt["classification"] = "binding_drift"
-            else:
-                attempt["classification"] = "infrastructure_error"
-            attempts.append(attempt)
-            continue
-        try:
-            finalization = _validated_finalization(directory, metadata)
-        except (FileNotFoundError, OSError, ValueError) as exc:
-            errors.append(f"decision_review_finalization_invalid:{directory.name}:{type(exc).__name__}")
-            attempt["classification"] = "invalid_finalization"
-            attempts.append(attempt)
-            continue
-        if finalization is None:
-            errors.append(f"decision_review_not_terminal:{directory.name}")
-            attempt["classification"] = "not_terminal"
-            attempts.append(attempt)
-            continue
-        attempt["terminal"] = True
-        attempt["terminal_status"] = finalization["final_status"]
-        try:
-            stdout_text, stdout_tail_sha256 = _read_stdout_tail(directory / "stdout.log")
-            attempt["stdout_tail_sha256"] = stdout_tail_sha256
-        except (FileNotFoundError, OSError, ValueError) as exc:
-            errors.append(f"decision_review_result_invalid:{directory.name}:{type(exc).__name__}")
-            attempt["classification"] = "invalid_result"
-            attempts.append(attempt)
-            continue
-        try:
-            role_evidence = _validated_review_role_evidence(metadata, binding, provenance)
-        except FileNotFoundError as exc:
-            # A drifted diff binding is repairable only when a valid provenance-
-            # bound role receipt proves that no semantic review result exists.
-            # Missing role evidence cannot establish that narrow condition.
-            if diff_binding_drift:
-                errors.append(f"decision_review_diff_sha256_drift:{directory.name}")
-                attempt["classification"] = "binding_drift"
-                attempts.append(attempt)
-                continue
-            # A non-success terminal provenance-bound reviewer whose role
-            # receipt was never created has no semantic review result. Treat
-            # only the known pre-result termination states like the existing
-            # no-marker infrastructure path so a later exact-bound PASS can
-            # supersede them. A succeeded reviewer missing its create-only
-            # receipt is contradictory and remains fail-closed, as do malformed,
-            # unreadable or binding-invalid receipts below.
-            # The V2 reviewer can have finished a material REJECT before a
-            # failed receipt write. A missing receipt is not proof of a
-            # pre-review failure, even when systemd reports a failed unit.
-            # Only a server-proven non-start above can be retried safely.
-            if (
-                (provenance is None or provenance.get("schema_version") != 2)
-                and attempt["terminal_status"] in _PRE_RESULT_INFRASTRUCTURE_STATUSES
-            ):
-                attempt["classification"] = "infrastructure_error"
-                attempts.append(attempt)
-                continue
-            errors.append(
-                f"decision_review_result_invalid:{directory.name}:{type(exc).__name__}"
-            )
-            attempt["classification"] = "invalid_result"
-            attempts.append(attempt)
-            continue
-        except (OSError, ValueError) as exc:
-            errors.append(f"decision_review_result_invalid:{directory.name}:{type(exc).__name__}")
-            attempt["classification"] = "invalid_result"
-            attempts.append(attempt)
-            continue
-        if role_evidence is not None:
-            attempt["review_role_verified"] = role_evidence["role_verified"]
-            attempt["review_route_verified"] = role_evidence["route_verified"]
-            attempt["independence_verified"] = role_evidence["independence_verified"]
-            attempt["review_role_receipt_sha256"] = role_evidence["role_receipt_sha256"]
-            review_route = role_evidence.get("review_route")
-            if isinstance(review_route, dict):
-                attempt["review_route_id"] = review_route.get("route_id")
-                attempt["review_provider_family"] = review_route.get("provider_family")
-            result = role_evidence["result"]
-        else:
+    metadata_budget = [0]
+    unbound_stdout_budget = [0]
+    external_v1_snapshots: list[tuple[Path, tuple[int, ...], tuple[int, ...] | None]] = []
+    skipped_prelaunch_stubs: list[str] = []
+    iterator = _iter_pinned_review_job_directories(
+        root, errors, metadata_budget, expected=expected,
+        unbound_stdout_budget=unbound_stdout_budget,
+    )
+    with closing(iterator):
+        for directory, directory_fd in iterator:
+            raw_targets_pr_head = False
             try:
-                result = _parse_result_marker(stdout_text, binding)
-            except ValueError as exc:
+                try:
+                    raw_metadata = _read_private_json(
+                        directory / "metadata.json", MAX_METADATA_BYTES,
+                        parent_fd=directory_fd, aggregate_metadata_bytes=metadata_budget,
+                    )
+                except FileNotFoundError:
+                    if _exact_empty_prelaunch_stub(directory_fd):
+                        skipped_prelaunch_stubs.append(directory.name)
+                        continue
+                    raise
+                raw_scope = raw_metadata.get("scope")
+                raw_review_binding = (
+                    raw_scope.get("decision_bound_review")
+                    if isinstance(raw_scope, dict)
+                    else None
+                )
+                raw_origin = raw_metadata.get("origin")
+                raw_origin_scope = (
+                    raw_origin.get("scope")
+                    if isinstance(raw_origin, dict) else None
+                )
+                raw_origin_binding = (
+                    raw_origin_scope.get("decision_bound_review")
+                    if isinstance(raw_origin_scope, dict) else None
+                )
+                raw_targets_pr_head = (
+                    _raw_binding_targets_pr_head(raw_review_binding, expected)
+                    or _raw_binding_targets_pr_head(raw_origin_binding, expected)
+                )
+                # Do not cap the number of unrelated historic review attempts:
+                # _iter_pinned_review_job_directories and the aggregate
+                # metadata budget already guarantee a finite authenticated
+                # full scan, including a later same-revision REJECT.
+                metadata, binding, provenance = _validated_origin_binding(
+                    directory, raw_metadata=raw_metadata, parent_fd=directory_fd,
+                    expected=expected,
+                )
+            except ReviewMetadataBudgetExceeded:
+                errors.append("decision_review_metadata_aggregate_budget_exceeded")
+                attempts = []
+                break
+            except (FileNotFoundError, OSError, ValueError) as exc:
+                # Missing or corrupted canonical metadata could conceal a
+                # material REJECT, regardless of any recoverable PR/head hint.
+                # Do not infer a legacy exemption from absence of evidence.
+                errors.append(
+                    f"decision_review_origin_invalid:{directory.name}:{type(exc).__name__}"
+                )
+                continue
+            if binding is None or not _binding_matches_pr_head(binding, expected):
+                # A review origin rewritten as an ordinary job OR as a valid
+                # review for a foreign revision must not conceal surviving
+                # evidence from this PR/head.
+                try:
+                    if _unbound_review_result_visible(
+                        directory, parent_fd=directory_fd,
+                        aggregate_bytes=unbound_stdout_budget,
+                        expected=expected,
+                    ):
+                        errors.append(f"decision_review_unbound_result:{directory.name}")
+                except (OSError, ValueError) as exc:
+                    errors.append(
+                        f"decision_review_unbound_evidence_invalid:"
+                        f"{directory.name}:{type(exc).__name__}"
+                    )
+                continue
+
+            attempt: dict[str, Any] = {
+                "unit": directory.name,
+                "slot": binding["slot"],
+                "origin_sha256": metadata.get("origin_sha256"),
+                "created_at_unix": metadata["origin"].get("created_at_unix"),
+                "started_at_unix_ns": metadata["scope"].get("started_at_unix_ns"),
+                "terminal": False,
+                "terminal_status": None,
+                "classification": "unresolved",
+                "verdict": None,
+                "material_findings": None,
+                "result_sha256": None,
+                "stdout_tail_sha256": None,
+                "review_role_verified": False,
+                "review_route_verified": False,
+                "review_route_id": None,
+                "review_provider_family": None,
+                "independence_verified": False,
+                "review_role_receipt_sha256": None,
+                "pre_result_quota_failure_verified": False,
+                "pre_result_auth_failure_verified": False,
+                "diff_identity_deferred": False,
+            }
+            if binding["base_sha"] != expected["base_sha"]:
+                errors.append(f"decision_review_base_sha_drift:{directory.name}")
+                attempt["classification"] = "binding_drift"
+                attempts.append(attempt)
+                continue
+            diff_binding_drift = False
+            if binding["diff_sha256"] not in accepted_diff_sha256s:
+                if defer_diff_identity:
+                    attempt["diff_identity_deferred"] = True
+                else:
+                    diff_binding_drift = True
+            if _proven_not_started(metadata):
+                attempt["terminal"] = True
+                attempt["terminal_status"] = "launch_failed"
+                if diff_binding_drift:
+                    errors.append(f"decision_review_diff_sha256_drift:{directory.name}")
+                    attempt["classification"] = "binding_drift"
+                else:
+                    attempt["classification"] = "infrastructure_error"
+                attempts.append(attempt)
+                continue
+            try:
+                finalization = _validated_finalization(directory, metadata, parent_fd=directory_fd)
+            except (FileNotFoundError, OSError, ValueError) as exc:
+                errors.append(f"decision_review_finalization_invalid:{directory.name}:{type(exc).__name__}")
+                attempt["classification"] = "invalid_finalization"
+                attempts.append(attempt)
+                continue
+            if finalization is None:
+                errors.append(f"decision_review_not_terminal:{directory.name}")
+                attempt["classification"] = "not_terminal"
+                attempts.append(attempt)
+                continue
+            attempt["terminal"] = True
+            attempt["terminal_status"] = finalization["final_status"]
+            try:
+                stdout_text, stdout_tail_sha256 = _read_stdout_tail(directory / "stdout.log", parent_fd=directory_fd)
+                attempt["stdout_tail_sha256"] = stdout_tail_sha256
+            except (FileNotFoundError, OSError, ValueError) as exc:
                 errors.append(f"decision_review_result_invalid:{directory.name}:{type(exc).__name__}")
                 attempt["classification"] = "invalid_result"
                 attempts.append(attempt)
                 continue
-        if result is not None:
-            attempt["result_sha256"] = sha256_json(result)
-            attempt["verdict"] = result["verdict"]
-            attempt["material_findings"] = result["material_findings"]
-        if diff_binding_drift:
-            # Never accept a semantic PASS/REJECT for an unproven diff identity.
-            # A terminal failed reviewer with no formal semantic result is
-            # different: it established no review decision at all, so it may be
-            # superseded by a later exact-bound PASS in the same slot.
-            if (
-                result is None
-                and attempt["terminal_status"] in _PRE_RESULT_INFRASTRUCTURE_STATUSES
-                and (provenance is None or provenance.get("schema_version") != 2)
-            ):
-                attempt["classification"] = "infrastructure_error"
-                attempts.append(attempt)
-                continue
-            errors.append(f"decision_review_diff_sha256_drift:{directory.name}")
-            attempt["classification"] = "binding_drift"
-            attempts.append(attempt)
-            continue
-        if result is None:
-            # A V2 role receipt containing malformed or non-semantic output
-            # cannot prove whether the provider emitted a material finding.
-            # Preserve legacy handling for old immutable attempts, but never
-            # supersede the new ambiguous evidence on a later PASS.
-            if provenance is not None and provenance.get("schema_version") == 2:
+            try:
+                role_evidence = _validated_review_role_evidence(
+                    metadata, binding, provenance, directory=directory,
+                    parent_fd=directory_fd, aggregate_bytes=metadata_budget,
+                    external_v1_snapshots=external_v1_snapshots,
+                )
+            except FileNotFoundError as exc:
+                # A drifted diff binding is repairable only when a valid provenance-
+                # bound role receipt proves that no semantic review result exists.
+                # Missing role evidence cannot establish that narrow condition.
+                if diff_binding_drift:
+                    errors.append(f"decision_review_diff_sha256_drift:{directory.name}")
+                    attempt["classification"] = "binding_drift"
+                    attempts.append(attempt)
+                    continue
+                # A non-success terminal provenance-bound reviewer whose role
+                # receipt was never created has no semantic review result. Treat
+                # only the known pre-result termination states like the existing
+                # no-marker infrastructure path so a later exact-bound PASS can
+                # supersede them. A succeeded reviewer missing its create-only
+                # receipt is contradictory and remains fail-closed, as do malformed,
+                # unreadable or binding-invalid receipts below.
+                # The V2 reviewer can have finished a material REJECT before a
+                # failed receipt write. A missing receipt is not proof of a
+                # pre-review failure, even when systemd reports a failed unit.
+                # Only a server-proven non-start above can be retried safely.
                 if (
-                    role_evidence is not None
-                    and role_evidence.get("pre_result_quota_failure_verified") is True
+                    (provenance is None or provenance.get("schema_version") != 2)
                     and attempt["terminal_status"] in _PRE_RESULT_INFRASTRUCTURE_STATUSES
-                    and attempt["terminal_status"] == "failed"
                 ):
                     attempt["classification"] = "infrastructure_error"
-                    attempt["pre_result_quota_failure_verified"] = True
-                else:
-                    attempt["classification"] = "invalid_result"
-                    errors.append(f"decision_review_result_invalid:{directory.name}:InvalidReviewDocument")
+                    attempts.append(attempt)
+                    continue
+                errors.append(
+                    f"decision_review_result_invalid:{directory.name}:{type(exc).__name__}"
+                )
+                attempt["classification"] = "invalid_result"
+                attempts.append(attempt)
+                continue
+            except (OSError, ValueError) as exc:
+                errors.append(f"decision_review_result_invalid:{directory.name}:{type(exc).__name__}")
+                attempt["classification"] = "invalid_result"
+                attempts.append(attempt)
+                continue
+            if role_evidence is not None:
+                attempt["review_role_verified"] = role_evidence["role_verified"]
+                attempt["review_route_verified"] = role_evidence["route_verified"]
+                attempt["independence_verified"] = role_evidence["independence_verified"]
+                attempt["review_role_receipt_sha256"] = role_evidence["role_receipt_sha256"]
+                review_route = role_evidence.get("review_route")
+                if isinstance(review_route, dict):
+                    attempt["review_route_id"] = review_route.get("route_id")
+                    attempt["review_provider_family"] = review_route.get("provider_family")
+                result = role_evidence["result"]
             else:
-                attempt["classification"] = "infrastructure_error"
+                try:
+                    result = _parse_result_marker(stdout_text, binding)
+                except ValueError as exc:
+                    errors.append(f"decision_review_result_invalid:{directory.name}:{type(exc).__name__}")
+                    attempt["classification"] = "invalid_result"
+                    attempts.append(attempt)
+                    continue
+            if result is not None:
+                attempt["result_sha256"] = sha256_json(result)
+                attempt["verdict"] = result["verdict"]
+                attempt["material_findings"] = result["material_findings"]
+            if diff_binding_drift:
+                # Never accept a semantic PASS/REJECT for an unproven diff identity.
+                # A terminal failed reviewer with no formal semantic result is
+                # different: it established no review decision at all, so it may be
+                # superseded by a later exact-bound PASS in the same slot.
+                if (
+                    result is None
+                    and attempt["terminal_status"] in _PRE_RESULT_INFRASTRUCTURE_STATUSES
+                    and (provenance is None or provenance.get("schema_version") != 2)
+                ):
+                    attempt["classification"] = "infrastructure_error"
+                    attempts.append(attempt)
+                    continue
+                errors.append(f"decision_review_diff_sha256_drift:{directory.name}")
+                attempt["classification"] = "binding_drift"
+                attempts.append(attempt)
+                continue
+            if result is None:
+                # A V2 role receipt containing malformed or non-semantic output
+                # cannot prove whether the provider emitted a material finding.
+                # Preserve legacy handling for old immutable attempts, but never
+                # supersede the new ambiguous evidence on a later PASS.
+                if provenance is not None and provenance.get("schema_version") == 2:
+                    if (
+                        role_evidence is not None
+                        and (
+                            role_evidence.get("pre_result_quota_failure_verified") is True
+                            or role_evidence.get("pre_result_auth_failure_verified") is True
+                        )
+                        and attempt["terminal_status"] in _PRE_RESULT_INFRASTRUCTURE_STATUSES
+                        and attempt["terminal_status"] == "failed"
+                    ):
+                        attempt["classification"] = "infrastructure_error"
+                        attempt["pre_result_quota_failure_verified"] = (
+                            role_evidence.get("pre_result_quota_failure_verified") is True
+                        )
+                        attempt["pre_result_auth_failure_verified"] = (
+                            role_evidence.get("pre_result_auth_failure_verified") is True
+                        )
+                    else:
+                        attempt["classification"] = "invalid_result"
+                        errors.append(f"decision_review_result_invalid:{directory.name}:InvalidReviewDocument")
+                else:
+                    attempt["classification"] = "infrastructure_error"
+                attempts.append(attempt)
+                continue
+            if result["verdict"] == "REJECT_THIS_REVISION":
+                attempt["classification"] = "material_reject"
+                errors.append(f"decision_review_material_reject:{binding['slot']}:{directory.name}")
+            elif finalization["final_status"] != "succeeded":
+                attempt["classification"] = "pass_from_failed_job"
+                errors.append(f"decision_review_pass_from_failed_job:{directory.name}")
+            else:
+                attempt["classification"] = "pass"
             attempts.append(attempt)
-            continue
-        if result["verdict"] == "REJECT_THIS_REVISION":
-            attempt["classification"] = "material_reject"
-            errors.append(f"decision_review_material_reject:{binding['slot']}:{directory.name}")
-        elif finalization["final_status"] != "succeeded":
-            attempt["classification"] = "pass_from_failed_job"
-            errors.append(f"decision_review_pass_from_failed_job:{directory.name}")
-        else:
-            attempt["classification"] = "pass"
-        attempts.append(attempt)
+
+    if not _external_v1_role_receipts_unchanged(external_v1_snapshots):
+        errors.append("decision_review_external_role_receipt_changed")
 
     slots: list[dict[str, Any]] = []
     for slot in sorted({str(item["slot"]) for item in attempts}):
@@ -1617,10 +2709,13 @@ def reconcile(
         unsuperseded_infrastructure = []
         for infrastructure_attempt in infrastructure:
             eligible_passes = passes
-            if infrastructure_attempt.get("pre_result_quota_failure_verified") is True:
-                # A legacy generic PASS cannot replace authenticated Claude
-                # quota evidence. The later PASS itself must be independent
-                # and from the same provider family, not merely an old PASS.
+            if (
+                infrastructure_attempt.get("pre_result_quota_failure_verified") is True
+                or infrastructure_attempt.get("pre_result_auth_failure_verified") is True
+            ):
+                # A legacy generic PASS cannot replace authenticated provider
+                # failure evidence. The later PASS must be independently
+                # verified for this provider when settling the same slot.
                 family = infrastructure_attempt.get("review_provider_family")
                 eligible_passes = [
                     item for item in independent_passes
@@ -1685,6 +2780,8 @@ def reconcile(
                 "review_provider_family",
                 "independence_verified",
                 "review_role_receipt_sha256",
+                "pre_result_quota_failure_verified",
+                "pre_result_auth_failure_verified",
                 "diff_identity_deferred",
             )
         }
@@ -1699,6 +2796,8 @@ def reconcile(
         "accepted_diff_sha256s": accepted_diff_sha256s_projection,
         "accepted_diff_sha256s_sha256": sha256_json(accepted_diff_sha256s_projection),
         "attempt_count": len(attempts_projection),
+        "skipped_prelaunch_stub_count": len(skipped_prelaunch_stubs),
+        "skipped_prelaunch_stub_units_sha256": sha256_json(sorted(skipped_prelaunch_stubs)),
         "slot_count": len(slots),
         "slots": slots,
         "deferred_diff_identity_count": sum(
@@ -1715,3 +2814,44 @@ def reconcile(
             "absence_of_same_uid_out_of_band_file_tampering",
         ],
     }
+
+def reconcile(
+    *,
+    repo: str,
+    pr: int,
+    head_sha: str,
+    base_sha: str,
+    diff_sha256: str,
+    equivalent_diff_sha256s: list[str] | tuple[str, ...] | None = None,
+    defer_diff_identity: bool = False,
+    jobs_root: Path | None = None,
+) -> dict[str, Any]:
+    """Bounded fresh full rescans for monotonic concurrent job registrations.
+
+    Only missing slots and documented pre-result infrastructure debt may be
+    superseded by a complete new snapshot. Never discard a material REJECT,
+    malformed provenance or changed/remapped prior directory. Three racing
+    scans without stability remain a hard block, never a presumed PASS.
+    """
+    result: dict[str, Any] = {}
+    for _ in range(3):
+        result = _reconcile_once(
+            repo=repo, pr=pr, head_sha=head_sha, base_sha=base_sha,
+            diff_sha256=diff_sha256,
+            equivalent_diff_sha256s=equivalent_diff_sha256s,
+            defer_diff_identity=defer_diff_identity, jobs_root=jobs_root,
+        )
+        errors = result.get("errors", [])
+        if "decision_review_jobs_root_addition_race" not in errors:
+            return result
+        if any(
+            error != "decision_review_jobs_root_addition_race"
+            and not error.startswith((
+                "decision_review_slot_without_pass:",
+                "decision_review_named_provider_slot_without_independent_pass:",
+                "decision_review_infrastructure_not_superseded:",
+            ))
+            for error in errors
+        ):
+            return result
+    return result

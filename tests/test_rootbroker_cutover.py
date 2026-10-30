@@ -131,6 +131,10 @@ def _root_task_action() -> dict[str, object]:
     return value
 
 
+def _nixos_restic_root_unit_action() -> dict[str, object]:
+    return _bound_action(cutover.NIXOS_RESTIC_ROOT_UNIT_ACTION)
+
+
 def _bootstrap_recovery_action() -> dict[str, object]:
     return _bound_action(cutover.BOOTSTRAP_RECOVERY_ACTION)
 
@@ -211,6 +215,7 @@ def _example_config_text() -> str:
                 cutover.POWER_ACTION: _power_action(),
                 cutover.BLOCKADE_LIFECYCLE_ACTION: _lifecycle(),
                 cutover.ROOT_TASK_ACTION: _root_task_action(),
+                cutover.NIXOS_RESTIC_ROOT_UNIT_ACTION: _nixos_restic_root_unit_action(),
                 cutover.PROCESS_OBSERVER_ACTION: _bound_action(cutover.PROCESS_OBSERVER_ACTION),
                 cutover.PLATFORM_CONNECTOR_CAPTURE_ACTION: _platform_connector_capture_action(),
                 cutover.CRITICAL_USER_DATA_INVENTORY_ACTION: _critical_user_data_inventory_action(),
@@ -1170,6 +1175,148 @@ class RootbrokerCutoverTests(unittest.TestCase):
             ).hexdigest(),
         )
 
+    def test_native_restic_root_unit_reader_binds_exact_fixed_broker_action(self) -> None:
+        expected = _nixos_restic_root_unit_action()
+        reader = cutover._nixos_restic_root_unit_action_from_repository
+        self.assertEqual(
+            reader(Path("/tmp/repository"), expected_head=HEAD, runner=FakeRunner()),
+            expected,
+        )
+        for field, value in (
+            ("enabled", False),
+            ("mode", "argv-json"),
+            ("target_pattern", ".*"),
+            ("argv", ["/bin/sh", "-c", "systemctl start arbitrary.service"]),
+            ("timeout_seconds", 61),
+            ("timeout_seconds", True),
+            ("allowed_peer_uid", 0),
+            ("allowed_peer_uid", True),
+            ("allowed_peer_unit", "foreign.service"),
+            ("kill_switch_path", "/tmp/unsafe-marker"),
+            ("legacy_kill_switch_path", "/tmp/unsafe-legacy-marker"),
+            ("unexpected", "extra-privilege"),
+        ):
+            with self.subTest(field=field, value=value):
+                sample = json.loads(_example_config_text())
+                sample["actions"][cutover.NIXOS_RESTIC_ROOT_UNIT_ACTION][field] = value
+                with self.assertRaisesRegex(
+                    cutover.CutoverError,
+                    "native Restic root unit action",
+                ):
+                    reader(
+                        Path("/tmp/repository"),
+                        expected_head=HEAD,
+                        runner=FakeRunner(blobs={
+                            "config/privileged-actions.example.json": json.dumps(sample)
+                        }),
+                    )
+        missing = json.loads(_example_config_text())
+        del missing["actions"][cutover.NIXOS_RESTIC_ROOT_UNIT_ACTION]
+        with self.assertRaisesRegex(cutover.CutoverError, "native Restic root unit action"):
+            reader(
+                Path("/tmp/repository"), expected_head=HEAD,
+                runner=FakeRunner(blobs={
+                    "config/privileged-actions.example.json": json.dumps(missing)
+                }),
+            )
+
+    def test_merge_installs_native_restic_root_unit_only_from_fixed_contract(self) -> None:
+        original = _installed_config()
+        merged, evidence = cutover.merge_privileged_config(
+            original,
+            publisher=_canonical_publisher(),
+            power=_power_action(),
+            lifecycle=_lifecycle(),
+            root_task=_root_task_action(),
+            nixos_restic_root_unit=_nixos_restic_root_unit_action(),
+        )
+        self.assertEqual(merged["actions"][cutover.NIXOS_RESTIC_ROOT_UNIT_ACTION],
+                         _nixos_restic_root_unit_action())
+        self.assertNotIn(cutover.NIXOS_RESTIC_ROOT_UNIT_ACTION, original["actions"])
+        self.assertEqual(merged["actions"]["edit_system_service"],
+                         original["actions"]["edit_system_service"])
+        self.assertFalse(evidence["nixos_restic_root_unit_preexisting"])
+        self.assertIsNone(evidence["nixos_restic_root_unit_before_sha256"])
+        self.assertEqual(
+            evidence["nixos_restic_root_unit_sha256"],
+            hashlib.sha256(
+                cutover._canonical_json(_nixos_restic_root_unit_action())
+            ).hexdigest(),
+        )
+        installed = json.loads(json.dumps(original))
+        installed["actions"][cutover.NIXOS_RESTIC_ROOT_UNIT_ACTION] = (
+            _nixos_restic_root_unit_action()
+        )
+        repeated, receipt = cutover.merge_privileged_config(
+            installed,
+            publisher=_canonical_publisher(),
+            power=_power_action(),
+            lifecycle=_lifecycle(),
+            root_task=_root_task_action(),
+            nixos_restic_root_unit=_nixos_restic_root_unit_action(),
+        )
+        self.assertEqual(repeated["actions"][cutover.NIXOS_RESTIC_ROOT_UNIT_ACTION],
+                         _nixos_restic_root_unit_action())
+        self.assertTrue(receipt["nixos_restic_root_unit_preexisting"])
+        self.assertEqual(receipt["nixos_restic_root_unit_before_sha256"],
+                         receipt["nixos_restic_root_unit_sha256"])
+
+    def test_merge_rejects_native_restic_root_unit_privilege_drift(self) -> None:
+        for field, value in (
+            ("argv", ["/bin/sh", "-c", "true"]),
+            ("allowed_peer_uid", 0),
+            ("timeout_seconds", 120),
+            ("kill_switch_path", "/tmp/no-kill-switch"),
+        ):
+            with self.subTest(field=field):
+                current = _installed_config()
+                drifted = _nixos_restic_root_unit_action()
+                drifted[field] = value
+                current["actions"][cutover.NIXOS_RESTIC_ROOT_UNIT_ACTION] = drifted
+                with self.assertRaisesRegex(
+                    cutover.CutoverError,
+                    "installed NixOS Restic root unit differs",
+                ):
+                    cutover.merge_privileged_config(
+                        current,
+                        publisher=_canonical_publisher(),
+                        power=_power_action(),
+                        lifecycle=_lifecycle(),
+                        root_task=_root_task_action(),
+                        nixos_restic_root_unit=_nixos_restic_root_unit_action(),
+                    )
+                # The automatic path may replace a drifted installed policy,
+                # but ONLY with the fixed, commit-validated source action.
+                corrected, evidence = cutover.merge_privileged_config(
+                    current,
+                    publisher=_canonical_publisher(),
+                    power=_power_action(),
+                    lifecycle=_lifecycle(),
+                    root_task=_root_task_action(),
+                    nixos_restic_root_unit=_nixos_restic_root_unit_action(),
+                    allow_controlled_updates=True,
+                )
+                self.assertEqual(
+                    corrected["actions"][cutover.NIXOS_RESTIC_ROOT_UNIT_ACTION],
+                    _nixos_restic_root_unit_action(),
+                )
+                self.assertTrue(evidence["nixos_restic_root_unit_preexisting"])
+                # Automatic cutover also fails closed if its own new input
+                # is broadened, even if controlled updates were requested.
+                with self.assertRaisesRegex(
+                    cutover.CutoverError,
+                    "native Restic root unit action differs",
+                ):
+                    cutover.merge_privileged_config(
+                        _installed_config(),
+                        publisher=_canonical_publisher(),
+                        power=_power_action(),
+                        lifecycle=_lifecycle(),
+                        root_task=_root_task_action(),
+                        nixos_restic_root_unit=drifted,
+                        allow_controlled_updates=True,
+                    )
+
     def test_merge_adds_commit_bound_secret_pty_action(self) -> None:
         merged, evidence = cutover.merge_privileged_config(
             _installed_config(),
@@ -1923,6 +2070,10 @@ class RootbrokerCutoverTests(unittest.TestCase):
             self.assertFalse(plan["root_mutation"])
             self.assertTrue(plan["merge_evidence"]["secret_pty_bound"])
             self.assertEqual(
+                merge.call_args.kwargs["nixos_restic_root_unit"],
+                _nixos_restic_root_unit_action(),
+            )
+            self.assertEqual(
                 merge.call_args.kwargs["secret_pty"],
                 secret_pty,
             )
@@ -1976,6 +2127,11 @@ class RootbrokerCutoverTests(unittest.TestCase):
                 _root_task_action(),
             )
             self.assertFalse(receipt["merge_evidence"]["root_task_preexisting"])
+            self.assertEqual(
+                installed_config["actions"][cutover.NIXOS_RESTIC_ROOT_UNIT_ACTION],
+                _nixos_restic_root_unit_action(),
+            )
+            self.assertFalse(receipt["merge_evidence"]["nixos_restic_root_unit_preexisting"])
             power = installed_config["actions"][cutover.POWER_ACTION]
             self.assertEqual(power, _power_action())
             self.assertNotIn("gate", power)

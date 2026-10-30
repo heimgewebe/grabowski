@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, closing
 import json
 import os
 from pathlib import Path
@@ -125,6 +125,21 @@ class WorktreeEnsureTests(unittest.TestCase):
             "owner_id": self.owner,
             "expires_at_unix": int(time.time()) + 3600,
         }
+
+    def _record_live_writer_lease(self, checkout_path: Path) -> None:
+        now = int(time.time())
+        with closing(checkouts.resources._database()) as connection, connection:
+            connection.execute(
+                "INSERT INTO leases(resource_key, owner_id, purpose, "
+                "acquired_at_unix, updated_at_unix, expires_at_unix, "
+                "metadata_sha256, metadata_json, reclaimed_from_owner) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+                (
+                    f"path:{checkout_path}", self.owner, "active writer fixture",
+                    now, now, now + 3600, "a" * 64, "{}",
+                ),
+            )
+            connection.commit()
 
     def _isolation_admission(
         self, parameters: dict[str, object]
@@ -300,7 +315,7 @@ class WorktreeEnsureTests(unittest.TestCase):
             str(parameters["branch"]),
         )
 
-    def test_default_active_limit_admits_thirteen_disjoint_worktrees(self) -> None:
+    def test_idle_retained_checkouts_do_not_block_twenty_four_disjoint_worktrees(self) -> None:
         self.assertEqual(
             checkouts._configured_active_checkout_limit({}),
             checkouts.DEFAULT_MAX_ACTIVE_CHECKOUTS_PER_REPO,
@@ -316,7 +331,7 @@ class WorktreeEnsureTests(unittest.TestCase):
             "MAX_ACTIVE_CHECKOUTS_PER_REPO",
             checkouts.DEFAULT_MAX_ACTIVE_CHECKOUTS_PER_REPO,
         ):
-            for index in range(13):
+            for index in range(24):
                 parameters = self._parameters(
                     key=f"parallel-{index:02d}",
                     branch=f"feat/parallel-{index:02d}",
@@ -329,17 +344,19 @@ class WorktreeEnsureTests(unittest.TestCase):
 
         self.assertEqual(
             [receipt["result_state"] for receipt in receipts],
-            ["CREATED"] * 13,
+            ["CREATED"] * 24,
         )
         self.assertEqual(capacity["configured_limit"], 16)
         self.assertEqual(capacity["effective_capacity"], 16)
-        self.assertEqual(capacity["used"], 13)
-        self.assertEqual(capacity["free"], 3)
+        self.assertEqual(capacity["raw_active_rows"], 24)
+        self.assertEqual(capacity["retained_without_live_lease_rows"], 24)
+        self.assertEqual(capacity["used"], 0)
+        self.assertEqual(capacity["free"], 16)
         self.assertFalse(capacity["saturated"])
         self.assertIsNone(capacity["limiting_reason"])
         self.assertEqual(
             len({Path(str(receipt["post_state"]["target_path"])) for receipt in receipts}),
-            13,
+            24,
         )
 
     def test_active_limit_blocks_new_growth_without_deleting_existing_checkout(self) -> None:
@@ -358,6 +375,7 @@ class WorktreeEnsureTests(unittest.TestCase):
 
         with patch.object(checkouts, "MAX_ACTIVE_CHECKOUTS_PER_REPO", 1):
             created = self._ensure(first, assess_admission=allow_admission)
+            self._record_live_writer_lease(Path(str(first["target_path"])))
             blocked = self._ensure(second, assess_admission=allow_admission)
 
         self.assertEqual(created["result_state"], "CREATED")
@@ -375,7 +393,7 @@ class WorktreeEnsureTests(unittest.TestCase):
                 "free": 0,
                 "saturated": True,
                 "limiting_reason": checkouts.ACTIVE_CHECKOUT_LIMITING_REASON,
-                "capacity_semantics": "unexpired_active_retention",
+                "capacity_semantics": "live_checkout_path_or_branch_leases",
                 "does_not_establish": [
                     "checkout_terminality",
                     "checkout_cleanup_eligibility",
@@ -385,6 +403,34 @@ class WorktreeEnsureTests(unittest.TestCase):
         )
         self.assertTrue(Path(str(first["target_path"])).is_dir())
         self.assertFalse(Path(str(second["target_path"])).exists())
+
+    def test_shared_owner_retained_sibling_is_not_an_active_checkout_slot(self) -> None:
+        # The same controller owner may have several retained worktrees but a
+        # live lease on only one.  Capacity is checkout-keyed, not owner-keyed.
+        allow = lambda **_kwargs: {"decision": "allow", "blocker_codes": []}
+        first = self._parameters(
+            key="shared-owner-first", branch="feat/shared-owner-first",
+            target=self.worktree_root / "shared-owner-first",
+        )
+        sibling = self._parameters(
+            key="shared-owner-sibling", branch="feat/shared-owner-sibling",
+            target=self.worktree_root / "shared-owner-sibling",
+        )
+        next_lane = self._parameters(
+            key="shared-owner-next", branch="feat/shared-owner-next",
+            target=self.worktree_root / "shared-owner-next",
+        )
+        with patch.object(checkouts, "MAX_ACTIVE_CHECKOUTS_PER_REPO", 2):
+            self.assertEqual(self._ensure(first, assess_admission=allow)["result_state"], "CREATED")
+            self.assertEqual(self._ensure(sibling, assess_admission=allow)["result_state"], "CREATED")
+            self._record_live_writer_lease(Path(str(first["target_path"])))
+            capacity = checkouts.active_capacity_projection(self.repo)
+            self.assertEqual(capacity["used"], 1)
+            self.assertEqual(capacity["retained_without_live_lease_rows"], 1)
+            allowed = self._ensure(next_lane, assess_admission=allow)
+        self.assertEqual(allowed["result_state"], "CREATED")
+        self.assertTrue(Path(str(sibling["target_path"])).exists())
+        self.assertTrue(Path(str(first["target_path"])).exists())
 
     def test_capacity_error_without_projection_proof_keeps_generic_rejection(self) -> None:
         parameters = self._parameters(
@@ -511,6 +557,7 @@ class WorktreeEnsureTests(unittest.TestCase):
                 expected_head=self.head,
                 expected_branch="feat/active-second",
             )
+            self._record_live_writer_lease(second)
             with self.assertRaisesRegex(RuntimeError, "active checkout limit"):
                 checkouts._reserve_checkout_lifecycle(**first_contract)
 

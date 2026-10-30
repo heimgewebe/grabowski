@@ -20,6 +20,9 @@
     "grabowski_destroy_path",
     "grabowski_rollback_text",
     "grabowski_verify_audit",
+    "grabowski_self_review_session_start",
+    "grabowski_self_review_source_read",
+    "grabowski_self_review_axis_submit",
     "grabowski_audit_query",
     "grabowski_audit_trace",
     "grabowski_audit_analyze",
@@ -314,6 +317,10 @@
       "source": "src/grabowski_grips.py"
     },
     {
+      "module": "grabowski_git_ssh",
+      "source": "src/grabowski_git_ssh.py"
+    },
+    {
       "module": "grabowski_post_merge_sync_apply",
       "source": "src/grabowski_post_merge_sync_apply.py"
     },
@@ -420,6 +427,14 @@
     {
       "module": "grabowski_release_admission",
       "source": "src/grabowski_release_admission.py"
+    },
+    {
+      "module": "grabowski_self_review_execution",
+      "source": "src/grabowski_self_review_execution.py"
+    },
+    {
+      "module": "grabowski_self_review_producer",
+      "source": "src/grabowski_self_review_producer.py"
     },
     {
       "module": "grabowski_self_deploy",
@@ -634,6 +649,10 @@
       "source": "src/grabowski_agent_sandbox.py"
     },
     {
+      "module": "grabowski_codex_preflight",
+      "source": "src/grabowski_codex_preflight.py"
+    },
+    {
       "module": "grabowski_agent_writer",
       "source": "src/grabowski_agent_writer.py"
     },
@@ -755,6 +774,11 @@
       "kind": "python_module",
       "launcher_module": "grabowski_agent_workspace",
       "spawned_module": "grabowski_agent_role"
+    },
+    {
+      "kind": "python_module",
+      "launcher_module": "grabowski_self_review_producer",
+      "spawned_module": "grabowski_self_review_producer"
     },
     {
       "kind": "python_module",

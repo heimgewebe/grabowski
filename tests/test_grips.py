@@ -1,5 +1,6 @@
 from __future__ import annotations
 import asyncio
+from contextlib import contextmanager
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 
@@ -65,12 +66,14 @@ def _self_review_audit(
     return {
         "schema_version": 1,
         "kind": "grabowski_self_review_audit",
+        "review_policy_version": merge_guard.REVIEW_POLICY_VERSION,
         "repo": "heimgewebe/grabowski",
         "pr": 7,
         "generated_at": "2026-07-10T12:00:00+00:00",
         "head_sha": head,
         "diff_sha256": diff_sha256,
         "review_tier": tier,
+        "independent_review_required": False,
         "gate_verdict": "PASS",
         "self_review_gate_valid": True,
         "minimum_review_iterations": minimum,
@@ -264,11 +267,17 @@ class FakeGit:
             return {"returncode": 0, "stdout": self.branch, "stderr": ""}
         if argv == ["rev-parse", "HEAD"]:
             return {"returncode": 0, "stdout": self.head, "stderr": ""}
-        if argv == ["config", "--get", f"branch.{self.branch}.remote"]:
+        if argv in (
+            ["config", "--get", f"branch.{self.branch}.remote"],
+            ["config", "--get-all", f"branch.{self.branch}.remote"],
+        ):
             if self.configured_upstream_remote is None:
                 return {"returncode": 1, "stdout": "", "stderr": ""}
             return {"returncode": 0, "stdout": self.configured_upstream_remote, "stderr": ""}
-        if argv == ["config", "--get", f"branch.{self.branch}.merge"]:
+        if argv in (
+            ["config", "--get", f"branch.{self.branch}.merge"],
+            ["config", "--get-all", f"branch.{self.branch}.merge"],
+        ):
             if self.configured_upstream_merge is None:
                 return {"returncode": 1, "stdout": "", "stderr": ""}
             return {"returncode": 0, "stdout": self.configured_upstream_merge, "stderr": ""}
@@ -6742,12 +6751,14 @@ class GripFoundationTests(unittest.TestCase):
         audit = {
             "schema_version": 1,
             "kind": "grabowski_self_review_audit",
+        "review_policy_version": merge_guard.REVIEW_POLICY_VERSION,
             "repo": "heimgewebe/grabowski",
             "pr": 7,
             "generated_at": "2026-07-10T12:00:00+00:00",
             "head_sha": head,
             "diff_sha256": "0" * 64,
             "review_tier": "extreme",
+            "independent_review_required": False,
             "gate_verdict": "PASS",
             "self_review_gate_valid": True,
             "minimum_review_iterations": 2,
@@ -6779,12 +6790,14 @@ class GripFoundationTests(unittest.TestCase):
         audit = {
             "schema_version": 1,
             "kind": "grabowski_self_review_audit",
+        "review_policy_version": merge_guard.REVIEW_POLICY_VERSION,
             "repo": "heimgewebe/grabowski",
             "pr": 7,
             "generated_at": "2026-07-10T12:00:00+00:00",
             "head_sha": head,
             "diff_sha256": "0" * 64,
             "review_tier": "standard",
+            "independent_review_required": False,
             "gate_verdict": "PASS",
             "self_review_gate_valid": True,
             "minimum_review_iterations": 2,
@@ -7951,7 +7964,12 @@ class GripFoundationTests(unittest.TestCase):
                 case["coordinator"].run_workspace_candidate_coordinator.assert_not_called()
                 case["nested"].assert_not_called()
 
-    def _source_route_decision(self, *, executor: str = "scoped_writer") -> dict[str, object]:
+    def _source_route_decision(
+        self,
+        *,
+        executor: str = "scoped_writer",
+        verification_policy: str = "independent_review",
+    ) -> dict[str, object]:
         writer_route = "claude-sonnet-5-high" if executor == "scoped_writer" else "grabowski-primary"
         writer = (
             {
@@ -7988,7 +8006,7 @@ class GripFoundationTests(unittest.TestCase):
             "executor": executor,
             "writer_route": writer_route,
             "effect_profile": "candidate",
-            "verification_policy": "independent_review",
+            "verification_policy": verification_policy,
             "task_class": "bounded-patch",
             "direct_work_required": executor == "controller",
             "direct_review_required": False,
@@ -8232,6 +8250,148 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual(lane_receipt, create_kwargs["expected_lane_receipt_sha256"])
         self.assertEqual(writer_command, create_kwargs["writer_argv"])
         continuation.assert_called_once()
+
+    def test_agent_execution_controller_review_pending_does_not_schedule_retry_loop(self) -> None:
+        workspace_id = "gaw-controller-review-handoff"
+        workspace = types.SimpleNamespace()
+        coordinator = types.SimpleNamespace(
+            run_workspace_candidate_coordinator=Mock(return_value={
+                "workspace_id": workspace_id,
+                "state": "pending",
+                "reason": "controller_self_review_pending",
+                "status": {
+                    "tasks": {"review": {"task_id": None, "terminal": False}},
+                    "frozen_writer": {"diff_sha256": "a" * 64},
+                },
+            })
+        )
+        continuation = Mock()
+        with (
+            patch.object(
+                grips, "_agent_execution_happy_path_modules",
+                return_value=(coordinator, workspace),
+            ),
+            patch.object(
+                grips, "_agent_execution_bound_writer_command",
+                return_value=["python3", "-c", "pass"],
+            ),
+            patch.object(
+                grips, "_agent_execution_bound_effect_profile",
+                return_value="candidate",
+            ),
+            patch.object(grips, "_agent_execution_start_continuation", continuation),
+        ):
+            result = grips.run_grip(
+                "agent-execution-happy-path",
+                {
+                    "workspace_id": workspace_id,
+                    "base": "main",
+                    "title": "Persist candidate pending genuine controller review",
+                },
+                allow_mutation=True,
+                command_runner=FakeGit(),
+                github_runner=FakeGh(),
+            )
+        self.assertEqual(result["receipt"]["status"], "passed")
+        self.assertEqual(result["output"]["state"], "controller_self_review_pending")
+        self.assertEqual(result["output"]["next_action"], "controller_self_review_bound_candidate")
+        self.assertFalse(result["output"]["integration_ready"])
+        self.assertFalse(result["output"]["reconcile_required"])
+        self.assertIsNone(result["output"]["continuation"])
+        continuation.assert_not_called()
+
+    def test_agent_execution_self_review_frontdoor_stays_pending_after_green_tests(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp).resolve()
+            head = "a" * 40
+            route = self._source_route_decision(verification_policy="self_review")
+            execution_plan = __import__("grabowski_execution_plan")
+            lane_id = "b" * 32
+            lane_receipt = "c" * 64
+            workspace_id = "gaw-p5-self-review"
+
+            def acquire(parameters: dict[str, object], **kwargs: object) -> dict[str, object]:
+                del kwargs
+                return {
+                    "state": "ready",
+                    "lane_id": lane_id,
+                    "receipt_sha256": lane_receipt,
+                    "inputs": {
+                        "execution_plan": deepcopy(parameters["execution_plan"]),
+                        "source": {"kind": "direct-user", "id": "self-review-source"},
+                        "scoped_writer": {
+                            "actor": "scoped-writer:claude-sonnet-5-high",
+                            "role": "scoped_writer",
+                        },
+                    },
+                }
+
+            work_acquire = types.SimpleNamespace(
+                acquire_work=Mock(side_effect=acquire),
+                operator=types.SimpleNamespace(
+                    _require_operator_mutation=Mock(),
+                    _require_operator_capability=Mock(),
+                    base=types.SimpleNamespace(_append_audit=Mock()),
+                ),
+            )
+            workspace = types.SimpleNamespace(
+                _lane_workspace_identity=Mock(return_value=(workspace_id, workspace_id)),
+                grabowski_agent_workspace_create=Mock(return_value={
+                    "workspace": {
+                        "workspace_id": workspace_id,
+                        "resources": {
+                            "lane_binding": {
+                                "lane_id": lane_id,
+                                "receipt_sha256": lane_receipt,
+                            }
+                        },
+                    }
+                }),
+            )
+            router = types.SimpleNamespace(
+                canonical_execution_route=Mock(return_value=route)
+            )
+            test_argv = ["python3", "-m", "unittest", "-q"]
+            parameters = {
+                "source_kind": "direct-user",
+                "source_id": "self-review-source",
+                "repo": str(repo),
+                "source_revision": head,
+                "write_paths": ["src/grabowski_grips.py"],
+                "objective": "Implement the bounded source request",
+                "test_argv": test_argv,
+                "verification_policy": "self_review",
+                "retention_until_unix": int(time.time()) + 9000,
+                "_server_runtime_actor_identity": (
+                    grips.grabowski_merge_guard.issue_server_runtime_actor_identity(
+                        object(), profile="operator"
+                    )
+                ),
+            }
+            with patch.object(
+                grips,
+                "_agent_execution_frontdoor_modules",
+                return_value=(router, execution_plan, work_acquire, workspace),
+            ):
+                result = grips._agent_execution_source_request(
+                    parameters,
+                    {"checks": []},
+                    FakeGit(head=head),
+                )
+
+        self.assertEqual("workspace_ready", result["state"])
+        self.assertEqual("self_review", result["verification_policy"])
+        self.assertEqual(1, result["execution_plan"]["completion_policy"]["verifier_quorum"])
+        create_kwargs = workspace.grabowski_agent_workspace_create.call_args.kwargs
+        self.assertEqual(test_argv, create_kwargs["test_argv"])
+        self.assertNotEqual(test_argv, create_kwargs["review_argv"])
+        review_command = " ".join(create_kwargs["review_argv"])
+        self.assertEqual(
+            create_kwargs["review_argv"],
+            list(__import__("grabowski_agent_workspace").CONTROLLER_SELF_REVIEW_PENDING_ARGV),
+        )
+        self.assertNotIn("'BLOCK'", review_command)
+        self.assertNotIn("'PASS'", review_command)
 
     def test_agent_execution_happy_path_source_mode_binds_direct_controller_lane_without_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -8544,7 +8704,7 @@ class GripFoundationTests(unittest.TestCase):
         contract_path = Path(__file__).resolve().parents[1] / "config" / "runtime-entrypoint.json"
         contract = json.loads(contract_path.read_text())
         self.assertNotIn("agent-execution-happy-path", contract["expected_tools"])
-        self.assertEqual(203, len(contract["expected_tools"]))
+        self.assertEqual(206, len(contract["expected_tools"]))
         self.assertIn("grabowski_operational_guidance", contract["expected_tools"])
         supporting = {
             (item["module"], item["source"])
@@ -9784,6 +9944,17 @@ class GripFoundationTests(unittest.TestCase):
         self.assertFalse(any("fetch" in call for call in fake.calls))
         operator.grabowski_git.assert_not_called()
 
+    def test_branch_publish_uses_shared_hardened_ssh(self) -> None:
+        hardened = "/trusted/ssh -F /dev/null -oBatchMode=yes -i /trusted/key"
+        with (
+            patch.object(grips.grabowski_git_ssh, "hardened_git_ssh_command", return_value=hardened) as command,
+            patch.object(grips.subprocess, "run", return_value=types.SimpleNamespace(returncode=0, stdout="", stderr="")) as run,
+        ):
+            grips._default_command_runner(Path("/does-not-need-to-exist"), ["push", "origin", "HEAD:refs/heads/feature"])
+        command.assert_called_once_with()
+        self.assertEqual(hardened, run.call_args.kwargs["env"]["GIT_SSH_COMMAND"])
+        self.assertEqual("ssh", run.call_args.kwargs["env"]["GIT_ALLOW_PROTOCOL"])
+
     def test_branch_publish_requires_allow_mutation(self) -> None:
         result = grips.run_grip(
             "branch-publish",
@@ -9825,6 +9996,84 @@ class GripFoundationTests(unittest.TestCase):
         self.assertIn("--set-upstream", push)
         checks = {item["id"]: item["status"] for item in result["receipt"]["checks"]}
         self.assertEqual("pass", checks["upstream"])
+
+    def test_branch_publish_accepts_configured_upstream_when_remote_tracking_ref_is_absent(self) -> None:
+        class MissingLocalTrackingRef(FakeGit):
+            def __call__(self, repo: Path, argv: list[str]) -> dict[str, object]:
+                if argv == ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]:
+                    self.calls.append(tuple(argv))
+                    return {"returncode": 128, "stdout": "", "stderr": "upstream remote-tracking ref not fetched"}
+                return super().__call__(repo, argv)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = MissingLocalTrackingRef(
+                upstream=None,
+                configured_upstream_remote="origin",
+                configured_upstream_merge="refs/heads/feat/work",
+            )
+            result = grips.run_grip(
+                "branch-publish",
+                {"repo": tmp, "branch": "feat/work", "expected_head": "a" * 40},
+                allow_mutation=True,
+                command_runner=fake,
+            )
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertEqual("origin/feat/work", result["output"]["upstream"])
+        self.assertEqual("pass", {c["id"]: c["status"] for c in result["receipt"]["checks"]}["upstream"])
+
+    def test_branch_publish_rejects_configured_upstream_mismatch_after_remote_readback(self) -> None:
+        class MissingLocalTrackingRef(FakeGit):
+            def __call__(self, repo: Path, argv: list[str]) -> dict[str, object]:
+                if argv == ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]:
+                    self.calls.append(tuple(argv))
+                    return {"returncode": 128, "stdout": "", "stderr": "upstream not fetched"}
+                return super().__call__(repo, argv)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = MissingLocalTrackingRef(
+                upstream=None,
+                configured_upstream_remote="origin",
+                configured_upstream_merge="refs/heads/unrelated",
+            )
+            result = grips.run_grip(
+                "branch-publish",
+                {"repo": tmp, "branch": "feat/work", "expected_head": "a" * 40},
+                allow_mutation=True,
+                command_runner=fake,
+            )
+        self.assertEqual("failed", result["receipt"]["status"])
+        self.assertEqual("fail", {c["id"]: c["status"] for c in result["receipt"]["checks"]}["upstream"])
+
+    def test_branch_publish_rejects_duplicate_upstream_config_values(self) -> None:
+        class MissingLocalTrackingRef(FakeGit):
+            def __call__(self, repo: Path, argv: list[str]) -> dict[str, object]:
+                if argv == ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]:
+                    self.calls.append(tuple(argv))
+                    return {"returncode": 128, "stdout": "", "stderr": "upstream not fetched"}
+                return super().__call__(repo, argv)
+
+        for label, configured_remote, configured_merge in (
+            ("merge", "origin", "refs/heads/unrelated\nrefs/heads/feat/work"),
+            ("remote", "wrong-remote\norigin", "refs/heads/feat/work"),
+        ):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                fake = MissingLocalTrackingRef(
+                    upstream=None,
+                    configured_upstream_remote=configured_remote,
+                    configured_upstream_merge=configured_merge,
+                )
+                result = grips.run_grip(
+                    "branch-publish",
+                    {"repo": tmp, "branch": "feat/work", "expected_head": "a" * 40},
+                    allow_mutation=True,
+                    command_runner=fake,
+                )
+                self.assertEqual("failed", result["receipt"]["status"])
+                checks = {c["id"]: c["status"] for c in result["receipt"]["checks"]}
+                self.assertEqual("pass", checks["remote_head"])
+                self.assertEqual("fail", checks["upstream"])
+                self.assertIn(("config", "--get-all", "branch.feat/work.merge"), fake.calls)
+                self.assertIn(("config", "--get-all", "branch.feat/work.remote"), fake.calls)
 
     def test_branch_publish_rejects_remote_option_injection_before_git(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -10896,7 +11145,7 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual("protocol.ext.allow", env["GIT_CONFIG_KEY_2"])
         self.assertEqual("never", env["GIT_CONFIG_VALUE_2"])
         self.assertEqual("ssh", env["GIT_ALLOW_PROTOCOL"])
-        self.assertEqual("/usr/bin/ssh -F /dev/null -oBatchMode=yes -oProxyCommand=none -oPermitLocalCommand=no -oClearAllForwardings=yes", env["GIT_SSH_COMMAND"])
+        self.assertEqual("/__grabowski_ssh_transport_disabled__/ssh", env["GIT_SSH_COMMAND"])
         self.assertEqual("/bin/false", env["GIT_ASKPASS"])
         self.assertEqual("cat", env["GIT_PAGER"])
         self.assertEqual("cat", env["PAGER"])
@@ -12183,6 +12432,22 @@ def captain_action(**overrides) -> dict[str, object]:
     return action
 
 
+def _captain_material_review_passes() -> list[dict[str, object]]:
+    return [
+        {
+            "n": n,
+            "axis": axis,
+            "summary": (
+                f"Verified the actual review method {axis} in iteration {n} "
+                "against the concrete review gate and regression fixtures."
+            ),
+            "evidence_refs": [f"tests/test_grips.py:critical-pass-{n}-negative"],
+            "material_findings": 0,
+        }
+        for n, axis in enumerate(merge_guard.HIGH_CRITICAL_REVIEW_AXES, start=1)
+    ]
+
+
 def captain_parameters(actions: list[dict[str, object]] | None = None, **overrides) -> dict[str, object]:
     source = str(overrides.get("status_projection_source", "bureau status-projection"))
     projection = {
@@ -12192,6 +12457,7 @@ def captain_parameters(actions: list[dict[str, object]] | None = None, **overrid
         "generated_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
         "run_id": "captain-status-projection-test-run",
     }
+    passes = _captain_material_review_passes()
     parameters: dict[str, object] = {
         "actions": actions if actions is not None else [captain_action()],
         "status_projection": projection,
@@ -12205,6 +12471,7 @@ def captain_parameters(actions: list[dict[str, object]] | None = None, **overrid
         "review_evidence": {
             "schema_version": 1,
             "kind": "grabowski_self_review_audit",
+        "review_policy_version": merge_guard.REVIEW_POLICY_VERSION,
             "repo": "heimgewebe/grabowski",
             "pr": 96,
             "generated_at": "2026-07-10T12:00:00+00:00",
@@ -12212,9 +12479,17 @@ def captain_parameters(actions: list[dict[str, object]] | None = None, **overrid
             "base_sha": CAPTAIN_BASE_SHA,
             "diff_sha256": CAPTAIN_DIFF,
             "review_tier": "high_critical",
-            "independent_review_required": True,
-            "minimum_review_iterations": 4,
-            "actual_review_iterations": 4,
+            "independent_review_required": False,
+            "minimum_review_iterations": 5,
+            "actual_review_iterations": 5,
+            "review_pass_axes": list(merge_guard.HIGH_CRITICAL_REVIEW_AXES),
+            "review_iterations": passes,
+            "review_pass_evidence_sha256": hashlib.sha256(
+                json.dumps(
+                    passes, sort_keys=True, separators=(",", ":"),
+                    ensure_ascii=False,
+                ).encode("utf-8")
+            ).hexdigest(),
             "all_findings_triaged": True,
             "finding_count": 0,
             "material_findings_remaining": 0,
@@ -12302,6 +12577,9 @@ def authorized_captain_run_parameters(**overrides) -> dict[str, object]:
     review_evidence = parameters.get("review_evidence")
     if isinstance(review_evidence, dict):
         review_evidence.setdefault("external_review_required", True)
+        # Explicit additional review for legacy high-assurance merge/security tests;
+        # ordinary captain_parameters() remains self-review-first by default.
+        review_evidence["independent_review_required"] = True
     parameters.pop("human_authorization")
     parameters.pop("execution_authority")
     parameters["execution_intent"] = captain_execution_intent(parameters)
@@ -12528,6 +12806,15 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             return_value=captain_independent_review_reconciliation(),
         )
         self._decision_review_patch.start()
+        # These action-envelope fixtures isolate policy/dispatch from the
+        # separately tested signed task origin. The dedicated production
+        # no-origin rejection and real signer suite never apply this patch.
+        signer_origin_fixture = patch(
+            "grabowski_self_review_execution.review_receipt_errors",
+            return_value=[],
+        )
+        signer_origin_fixture.start()
+        self.addCleanup(signer_origin_fixture.stop)
         # These historical tests cover downstream scheduler receipt behavior,
         # not independent high-critical release authorization. A positive
         # source classification is explicit only for these bounded fixtures.
@@ -12544,7 +12831,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         }:
             self._noncritical_source_fixture = patch(
                 "grabowski_self_deploy._require_release_source_admission",
-                return_value={"status": "non-runtime-documentation", "serving_repo_head": "a" * 40, "target_repo_head": CAPTAIN_HEAD, "changed_path_count": 1, "independent_review_required": False},
+                return_value={"status": "non-runtime-documentation", "serving_repo_head": "a" * 40, "target_repo_head": CAPTAIN_HEAD, "changed_path_count": 1, "critical_release_source": False, "independent_review_required": False},
             )
             self._noncritical_source_fixture.start()
             self.addCleanup(self._noncritical_source_fixture.stop)
@@ -13038,15 +13325,16 @@ class CaptainAuthorityPathTests(unittest.TestCase):
 
         self.assertIn("review_evidence_missing", result["output"]["blocked_reasons"])
 
-    def test_high_critical_merge_uses_independent_policy_without_codex_or_external_transport(self) -> None:
+    def test_high_critical_selfreview_policy_without_codex_or_external_transport(self) -> None:
         parameters = captain_parameters(codex_review_required=False)
         parameters.pop("codex_review_evidence")
         result = self.run_captain(parameters)
 
         independent = self.gate(result, "independent-review-policy")
         self.assertEqual("pass", independent["status"])
-        self.assertTrue(independent["details"]["required"])
-        self.assertTrue(independent["details"]["high_critical_floor"])
+        self.assertFalse(independent["details"]["required"])
+        self.assertTrue(independent["details"]["high_critical_risk"])
+        self.assertFalse(independent["details"]["high_critical_floor"])
         self.assertEqual(
             "captain-preflight-and-atomic-merge-guard",
             independent["details"]["settlement_stage"],
@@ -13058,6 +13346,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
 
     def test_high_critical_preflight_ignores_generic_decision_bound_pass(self) -> None:
         parameters = captain_parameters(codex_review_required=False)
+        parameters["review_evidence"]["independent_review_required"] = True
         parameters.pop("codex_review_evidence")
         with patch.object(
             merge_guard.decision_reviews,
@@ -13074,6 +13363,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
 
     def test_high_critical_preflight_rejects_unproven_independent_named_pass(self) -> None:
         parameters = captain_parameters(codex_review_required=False)
+        parameters["review_evidence"]["independent_review_required"] = True
         parameters.pop("codex_review_evidence")
         with patch.object(
             merge_guard.decision_reviews,
@@ -13113,7 +13403,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertEqual(1, gate["details"]["deferred_diff_identity_count"])
         self.assertTrue(reconcile.call_args.kwargs["defer_diff_identity"])
 
-    def test_high_critical_preflight_blocks_without_independent_pass(self) -> None:
+    def test_high_critical_preflight_accepts_current_selfreview_without_independent_pass(self) -> None:
         parameters = captain_parameters(codex_review_required=False)
         parameters.pop("codex_review_evidence")
         with patch.object(
@@ -13126,9 +13416,9 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             result = self.run_captain(parameters)
 
         gate = self.gate(result, "independent-review-policy")
-        self.assertEqual("blocked", gate["status"])
-        self.assertIn("independent_review_pass_missing", result["output"]["blocked_reasons"])
-        self.assertIn("independent_review_pass_missing", gate["details"])
+        self.assertEqual("pass", gate["status"])
+        self.assertFalse(gate["details"]["required"])
+        self.assertNotIn("independent_review_pass_missing", result["output"]["blocked_reasons"])
 
     def test_high_critical_preflight_blocks_infrastructure_only_review(self) -> None:
         parameters = captain_parameters(codex_review_required=False)
@@ -13151,9 +13441,57 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             "decision_review_slot_without_pass:independent-reviewer",
             result["output"]["blocked_reasons"],
         )
-        self.assertIn("independent_review_pass_missing", result["output"]["blocked_reasons"])
+        self.assertNotIn("independent_review_pass_missing", result["output"]["blocked_reasons"])
 
-    def test_high_critical_audit_cannot_omit_independent_review_floor(self) -> None:
+    def test_high_critical_preflight_ignores_only_verified_pre_result_outage(self) -> None:
+        parameters = captain_parameters(codex_review_required=False)
+        parameters.pop("codex_review_evidence")
+        unit = "grabowski-job-aaaaaaaaaaaa"
+        attempt = {
+            "unit": unit, "slot": "independent-reviewer",
+            "origin_sha256": "1" * 64,
+            "terminal": True, "terminal_status": "launch_failed",
+            "classification": "infrastructure_error",
+            "stdout_tail_sha256": None,
+            "review_role_receipt_sha256": None,
+            "pre_result_quota_failure_verified": False,
+            "verdict": None, "material_findings": None,
+            "result_sha256": None, "diff_identity_deferred": False,
+        }
+        reconciliation = {
+            "status": "blocked", "attempt_count": 1, "slot_count": 1,
+            "slots": [{
+                "slot": "independent-reviewer", "attempt_count": 1,
+                "pass_count": 0, "independent_pass_count": 0,
+                "material_reject_count": 0, "infrastructure_error_count": 1,
+                "unresolved_count": 0,
+                "units_sha256": merge_guard._sha256_json([unit]),
+            }],
+            "attempts": [attempt],
+            "errors": [
+                "decision_review_slot_without_pass:independent-reviewer",
+                f"decision_review_infrastructure_not_superseded:independent-reviewer:{unit}",
+            ],
+        }
+        with patch.object(
+            merge_guard.decision_reviews, "reconcile", return_value=reconciliation,
+        ):
+            result = self.run_captain(parameters)
+        gate = self.gate(result, "independent-review-policy")
+        self.assertEqual(gate["status"], "pass")
+        self.assertFalse(gate["details"]["required"])
+        self.assertEqual(len(gate["details"]["optional_review_unavailability"]), 2)
+        # A real material finding is never advisory, even beside quota errors.
+        reconciliation["errors"].append(
+            "decision_review_material_reject:independent-reviewer:grabowski-job-bbbbbbbbbbbb"
+        )
+        with patch.object(
+            merge_guard.decision_reviews, "reconcile", return_value=reconciliation,
+        ):
+            blocked = self.run_captain(parameters)
+        self.assertEqual(self.gate(blocked, "independent-review-policy")["status"], "blocked")
+
+    def test_current_v4_audit_cannot_omit_independent_review_contract(self) -> None:
         parameters = captain_parameters()
         del parameters["review_evidence"]["independent_review_required"]
         result = self.run_captain(parameters)
@@ -13161,11 +13499,11 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         gate = self.gate(result, "independent-review-policy")
         self.assertEqual("blocked", gate["status"])
         self.assertIn(
-            "independent_review_high_critical_floor_not_acknowledged",
+            "independent_review_policy_invalid",
             result["output"]["blocked_reasons"],
         )
 
-    def test_caller_false_cannot_downgrade_high_critical_independent_review(self) -> None:
+    def test_high_critical_caller_false_does_not_lower_risk_or_require_provider(self) -> None:
         parameters = captain_parameters(
             independent_review_required=False,
             codex_review_required=False,
@@ -13174,9 +13512,10 @@ class CaptainAuthorityPathTests(unittest.TestCase):
 
         gate = self.gate(result, "independent-review-policy")
         self.assertEqual("pass", gate["status"])
-        self.assertTrue(gate["details"]["required"])
+        self.assertFalse(gate["details"]["required"])
         self.assertFalse(gate["details"]["explicitly_required"])
-        self.assertTrue(gate["details"]["high_critical_floor"])
+        self.assertTrue(gate["details"]["high_critical_risk"])
+        self.assertFalse(gate["details"]["high_critical_floor"])
 
     def test_invalid_independent_review_requirement_blocks(self) -> None:
         parameters = captain_parameters(independent_review_required="yes")
@@ -13241,7 +13580,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertEqual("pass", independent["status"])
         self.assertFalse(independent["details"]["required"])
 
-    def test_legacy_standard_audit_without_independent_field_remains_compatible(self) -> None:
+    def test_missing_current_audit_review_requirement_contract_blocks(self) -> None:
         parameters = captain_parameters()
         parameters["review_evidence"]["review_tier"] = "standard"
         del parameters["review_evidence"]["independent_review_required"]
@@ -13250,8 +13589,8 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         result = self.run_captain(parameters)
 
         gate = self.gate(result, "independent-review-policy")
-        self.assertEqual("pass", gate["status"])
-        self.assertFalse(gate["details"]["required"])
+        self.assertEqual("blocked", gate["status"])
+        self.assertIn("independent_review_policy_invalid", result["output"]["blocked_reasons"])
 
     def test_standard_preflight_still_blocks_existing_material_reject(self) -> None:
         parameters = captain_parameters()
@@ -13588,6 +13927,52 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertEqual(["merge", "squash", "rebase"], execution["merge_policy"]["allowed_methods"])
         self.assertEqual([], execution["automatic_platform_effects"])
         self.assertEqual("not_evaluated", execution["effect_scope_decision"]["decision"])
+
+    def test_captain_merge_dispatch_remains_inside_first_party_signer_guard(self) -> None:
+        parameters = captain_parameters(
+            trusted_owner_mode=True,
+            autonomy_policy=grips.CAPTAIN_TRUSTED_OWNER_AUTONOMY_POLICY,
+            allow_execution=True,
+        )
+        parameters.pop("human_authorization")
+        parameters.pop("execution_authority")
+        parameters["execution_intent"] = captain_execution_intent(parameters)
+        observations = {"entered": False, "during_dispatch": False, "left": False}
+
+        @contextmanager
+        def witness(review_evidence):
+            self.assertIs(review_evidence, parameters["review_evidence"])
+            observations["entered"] = True
+            try:
+                yield
+            finally:
+                observations["left"] = True
+
+        class ProbeGh(FakeGh):
+            def __call__(self, repo, args):
+                if args[:2] == ["pr", "merge"]:
+                    observations["during_dispatch"] = (
+                        observations["entered"] and not observations["left"]
+                    )
+                return super().__call__(repo, args)
+
+        gh = ProbeGh(view={
+            "number": 96, "state": "OPEN", "baseRefName": "main",
+            "headRefName": "feat/captain", "headRefOid": CAPTAIN_HEAD,
+            "isDraft": False, "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
+        })
+        with patch.object(
+            merge_guard, "_first_party_merge_signer_snapshot_guard",
+            side_effect=witness,
+        ):
+            result = grips.grip_run(
+                "captain-run", parameters, profile="captain",
+                allow_mutation=True, command_runner=FakeGit(), github_runner=gh,
+            )
+        self.assertEqual(result["status"], "passed")
+        self.assertTrue(observations["entered"])
+        self.assertTrue(observations["during_dispatch"])
+        self.assertTrue(observations["left"])
 
     def test_captain_run_treats_exact_merge_queue_entry_as_scheduled_after_dispatch(self) -> None:
         parameters = authorized_captain_run_parameters()
@@ -21783,6 +22168,15 @@ class CaptainExecutionIntentTests(unittest.TestCase):
             return_value=captain_independent_review_reconciliation(),
         )
         self._decision_review_patch.start()
+        # These action-envelope fixtures isolate policy/dispatch from the
+        # separately tested signed task origin. The dedicated production
+        # no-origin rejection and real signer suite never apply this patch.
+        signer_origin_fixture = patch(
+            "grabowski_self_review_execution.review_receipt_errors",
+            return_value=[],
+        )
+        signer_origin_fixture.start()
+        self.addCleanup(signer_origin_fixture.stop)
 
     def tearDown(self) -> None:
         self._decision_review_patch.stop()

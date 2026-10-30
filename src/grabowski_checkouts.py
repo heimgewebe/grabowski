@@ -665,15 +665,25 @@ def _readonly_connection(path: Path) -> sqlite3.Connection | None:
     if path.is_symlink():
         raise PermissionError(f"SQLite database may not be a symlink: {path}")
     if stack is not None:
-        # Even mode=ro creates SHM for live WAL; the already existing strict
-        # reader fails closed and keeps preimage checks until inventory returns.
+        # SQLite mode=ro can mutate an existing SHM read mark. The admission
+        # capability belongs to the observed store, not the checkout caller.
+        if path == tasks.TASK_DB:
+            wal_mutation_admission = lambda: operator._require_operator_mutation(
+                "durable_job"
+            )
+        else:
+            wal_mutation_admission = lambda: operator._require_operator_mutation(
+                "resource_lease"
+            )
+        # Pin the existing WAL transaction when both private sidecars exist.
+        # Missing/unsafe sidecars fail closed without creating SHM.
         return stack.enter_context(
-            sqlite_store.inventory_readonly_sqlite(
+            sqlite_store.inventory_coherent_readonly_sqlite(
                 path,
                 temporary_prefix="unused-checkout-inventory-readonly.",
                 error_type=RuntimeError,
                 message="Strict read-only checkout inventory changed",
-                allow_wal_copy=False,
+                wal_mutation_admission=wal_mutation_admission,
             )
         )
     resolved = path.resolve(strict=True)
@@ -810,18 +820,51 @@ def _phase_count(
     return int(row["total"] if row is not None else 0)
 
 
+
+def _live_checkout_lease_keys(*, now: int) -> dict[str, str]:
+    """Observe exact live checkout path/branch lease keys, never generic owner activity.
+
+    An owner may preserve multiple historical checkouts while writing to one.
+    Counting every checkout with that owner would incorrectly block new work.
+    """
+    if not resources.RESOURCE_DB.exists():
+        return {}
+
+    def read_once() -> dict[str, str]:
+        with resources._resource_readonly_snapshot() as resource_connection:
+            rows = resource_connection.execute(
+                "SELECT resource_key, owner_id FROM leases WHERE expires_at_unix>?",
+                (now,),
+            ).fetchall()
+        return {str(row["resource_key"]): str(row["owner_id"]) for row in rows}
+
+    try:
+        return read_once()
+    except resources.ResourceSchemaInventoryChanged:
+        # SQLite can remove a checkpointed WAL between the sidecar check and
+        # its first stat; one fresh read recovers a quiescent snapshot.
+        return read_once()
+
+
 def _active_lifecycle_consumes_capacity(
     lifecycle: sqlite3.Row,
     *,
     now: int,
+    live_leases: Mapping[str, str] | None = None,
 ) -> bool:
-    """Return whether an active lifecycle binding reserves creation capacity.
-
-    Active creation capacity is a time-bounded concurrency gate.  Retention
-    expiry releases only that global slot; it does not terminalize, archive,
-    delete, adopt, or authorize reuse of the checkout path or branch.
-    """
-    return int(lifecycle["retention_until_unix"]) > now
+    """Count only resources bound to this checkout, not another lane of its owner."""
+    leases = _live_checkout_lease_keys(now=now) if live_leases is None else live_leases
+    owner = str(lifecycle["owner_id"])
+    path_key = f"path:{lifecycle['checkout_path']}"
+    branch = lifecycle["expected_branch"]
+    branch_key = (
+        f"repo:{lifecycle['repo_path']}:branch:{branch}"
+        if isinstance(branch, str) and branch
+        else None
+    )
+    return leases.get(path_key) == owner or (
+        branch_key is not None and leases.get(branch_key) == owner
+    )
 
 
 def _active_creation_count(
@@ -830,17 +873,22 @@ def _active_creation_count(
     repo_common_dir: Path,
     exclude_checkout_key: str,
     now: int,
+    live_leases: Mapping[str, str] | None = None,
 ) -> int:
-    """Count active bindings with an effective retention-based capacity lease."""
+    """Count distinct checkout identities with exact, live execution leases."""
+    leases = _live_checkout_lease_keys(now=now) if live_leases is None else live_leases
     rows = connection.execute(
         """
-        SELECT retention_until_unix
+        SELECT owner_id, repo_path, checkout_path, expected_branch
         FROM lifecycle_bindings
         WHERE repo_common_dir=? AND phase='active' AND checkout_key<>?
         """,
         (str(repo_common_dir), exclude_checkout_key),
     ).fetchall()
-    return sum(1 for row in rows if int(row["retention_until_unix"]) > now)
+    return sum(
+        1 for row in rows
+        if _active_lifecycle_consumes_capacity(row, now=now, live_leases=leases)
+    )
 
 
 def _active_capacity_projection_from_connection(
@@ -863,13 +911,18 @@ def _active_capacity_projection_from_connection(
         )
     rows = connection.execute(
         """
-        SELECT checkout_path, retention_until_unix
+        SELECT checkout_path, repo_path, expected_branch, owner_id, retention_until_unix
         FROM lifecycle_bindings
         WHERE repo_common_dir=? AND phase='active'
         ORDER BY checkout_path ASC
         """,
         (str(repo_common_dir),),
     ).fetchall()
+    live_leases = _live_checkout_lease_keys(now=now)
+    live_reserved = sum(
+        1 for row in rows
+        if _active_lifecycle_consumes_capacity(row, now=now, live_leases=live_leases)
+    )
     unexpired = sum(
         1 for row in rows if int(row["retention_until_unix"]) > now
     )
@@ -900,7 +953,7 @@ def _active_capacity_projection_from_connection(
     expired_unclassified = len(expired_rows) - classified_expired
     classification_complete = expired_unclassified == 0
     limit = _phase_limit("active")
-    used = unexpired
+    used = live_reserved
     does_not_establish = [
         "checkout_terminality",
         "checkout_cleanup_eligibility",
@@ -922,6 +975,14 @@ def _active_capacity_projection_from_connection(
         ),
         "raw_active_rows": len(rows),
         "unexpired_active_rows": unexpired,
+        "live_lease_backed_active_rows": live_reserved,
+        "retained_without_live_lease_rows": sum(
+            1 for row in rows
+            if int(row["retention_until_unix"]) > now
+            and not _active_lifecycle_consumes_capacity(
+                row, now=now, live_leases=live_leases,
+            )
+        ),
         "expired_active_rows": len(expired_rows),
         "expired_present_active_rows": expired_present,
         "expired_missing_active_rows": expired_missing,
@@ -930,7 +991,7 @@ def _active_capacity_projection_from_connection(
         "path_classification_complete": classification_complete,
         "path_observations_attempted": path_observations_attempted,
         "path_observation_limit": max_path_observations,
-        "capacity_semantics": "unexpired_active_retention",
+        "capacity_semantics": "live_checkout_path_or_branch_leases",
         "does_not_establish": does_not_establish,
     }
 
@@ -946,6 +1007,8 @@ def _unavailable_active_capacity_projection() -> dict[str, Any]:
         "limiting_reason": None,
         "raw_active_rows": None,
         "unexpired_active_rows": None,
+        "live_lease_backed_active_rows": None,
+        "retained_without_live_lease_rows": None,
         "expired_active_rows": None,
         "expired_present_active_rows": None,
         "expired_missing_active_rows": None,
@@ -954,7 +1017,7 @@ def _unavailable_active_capacity_projection() -> dict[str, Any]:
         "path_classification_complete": False,
         "path_observations_attempted": 0,
         "path_observation_limit": None,
-        "capacity_semantics": "unexpired_active_retention",
+        "capacity_semantics": "live_checkout_path_or_branch_leases",
         "does_not_establish": [
             "absence_of_active_bindings",
             "checkout_terminality",
@@ -1076,9 +1139,14 @@ def _reserve_checkout_lifecycle(
     )
     branch = _expected_branch(expected_branch)
     checkout_key = _checkout_key(common_dir, checkout)
-    now = _now()
     with closing(_database()) as connection, connection:
+        # Capacity and the lease snapshot must share one serialized checkout
+        # admission point. A snapshot taken before BEGIN IMMEDIATE can omit
+        # another lane's newly committed checkout despite seeing its lifecycle
+        # row, allowing an extra active writer beyond the configured limit.
         connection.execute("BEGIN IMMEDIATE")
+        now = _now()
+        live_leases = _live_checkout_lease_keys(now=now)
         existing = connection.execute(
             "SELECT * FROM lifecycle_bindings WHERE checkout_key=?",
             (checkout_key,),
@@ -1120,13 +1188,12 @@ def _reserve_checkout_lifecycle(
             repo_common_dir=common_dir,
             exclude_checkout_key=checkout_key,
             now=now,
+            live_leases=live_leases,
         )
         limit = _phase_limit("active")
-        existing_consumes_capacity = (
-            existing is not None
-            and _active_lifecycle_consumes_capacity(existing, now=now)
-        )
-        if count >= limit and not existing_consumes_capacity:
+        # The count excludes the candidate checkout. A returning lease cannot
+        # exempt a separate 17th active writer when every other slot is full.
+        if count >= limit:
             raise RuntimeError(
                 f"Per-repository active checkout limit reached: active={count} limit={limit}"
             )
@@ -4537,14 +4604,16 @@ def grabowski_checkout_uncertainty_status(fence_id: str = "") -> dict[str, Any]:
         raise ValueError("fence_id must be a 32-character lowercase hex identifier")
     if CHECKOUT_DB.is_symlink() or not CHECKOUT_DB.is_file():
         raise RuntimeError("Checkout uncertainty store is unavailable")
-    # The shared inventory reader rejects live WAL/SHM, reads immutable
-    # quiescent content, and checks file identity before and after the read.
-    with sqlite_store.inventory_readonly_sqlite(
+    # A pinned WAL read transaction is consistent with concurrent writers;
+    # neither normal WAL sidecars nor quiescent data are modified here.
+    with sqlite_store.inventory_coherent_readonly_sqlite(
         CHECKOUT_DB,
         temporary_prefix="unused-checkout-uncertainty.",
         error_type=RuntimeError,
         message="Checkout uncertainty snapshot changed",
-        allow_wal_copy=False,
+        wal_mutation_admission=lambda: operator._require_operator_mutation(
+            "resource_lease"
+        ),
     ) as connection:
         try:
             version = connection.execute(
@@ -7242,19 +7311,81 @@ def grabowski_checkout_retain(
     until = _retention_until(retention_until_unix)
     retain_purpose = _purpose(purpose)
     _require_retention_owner(record["checkout_key"], owner)
-    lease = _acquire_checkout_resources(
-        owner_id=owner,
-        repo_common_dir=common_dir,
-        checkout_path=checkout,
-        purpose=f"retain linked checkout: {retain_purpose}",
-        retention_until_unix=until,
-        metadata={
-            "checkout_path": str(checkout),
-            "repo": str(top_level),
-            "head": expected_head,
-            "branch": expected_branch,
-        },
+    # A Work Lane already holds the checkout and branch leases. The generic
+    # short-lived checkout-op owner must not steal or require releasing them.
+    # Extend only the same active lifecycle under its exact source and owner;
+    # never turn a stale lease, foreign checkout or completed binding into work.
+    lane_binding = (
+        _strict_lifecycle_binding(record["checkout_key"])
+        if re.fullmatch(r"lane:[0-9a-f]{32}", owner) else None
     )
+    same_lane_renewal = lane_binding is not None and lane_binding.get("owner_id") == owner
+    renewed_lifecycle = None
+    if same_lane_renewal:
+        assert lane_binding is not None
+        previous = _retention_records([record["checkout_key"]]).get(record["checkout_key"])
+        if (
+            lane_binding.get("phase") != "active"
+            or lane_binding.get("repo_common_dir") != str(common_dir)
+            or lane_binding.get("repo_path") != str(top_level)
+            or lane_binding.get("checkout_path") != str(checkout)
+            or lane_binding.get("expected_head") != expected_head
+            or lane_binding.get("expected_branch") != expected_branch
+            or lane_binding.get("purpose") != retain_purpose
+            or not isinstance(previous, dict)
+            or previous.get("owner_id") != owner
+            or previous.get("checkout_path") != str(checkout)
+            or previous.get("expected_head") != expected_head
+            or previous.get("expected_branch") != expected_branch
+            or until <= max(
+                int(previous.get("retention_until_unix") or 0),
+                int(lane_binding.get("retention_until_unix") or 0),
+            )
+        ):
+            raise PermissionError("same-lane checkout retention identity or monotonicity invalid")
+        keys = [
+            resources.normalize_resource_key(f"path:{checkout}"),
+            resources.normalize_resource_key(f"repo:{top_level}:branch:{record['branch']}"),
+        ]
+        held = []
+        for key in keys:
+            current = resources.inspect_resource(key)
+            if (
+                not isinstance(current, dict)
+                or current.get("owner_id") != owner
+                or type(current.get("expires_at_unix")) is not int
+                or current["expires_at_unix"] <= _now()
+            ):
+                raise PermissionError("same-lane checkout renewal requires live exact owner leases")
+            held.append(current)
+        renewed_lifecycle = _reserve_checkout_lifecycle(
+            repo_common_dir=common_dir,
+            repo_path=top_level,
+            checkout_path=checkout,
+            owner_id=owner,
+            purpose=retain_purpose,
+            source_kind=lane_binding["source"]["kind"],
+            source_id=lane_binding["source"]["id"],
+            artifact_class=lane_binding["artifact_class"],
+            retention_until_unix=until,
+            expected_head=expected_head,
+            expected_branch=expected_branch,
+        )
+        lease = {"owner_id": owner, "leases": held, "reused_lane_owner": True}
+    else:
+        lease = _acquire_checkout_resources(
+            owner_id=owner,
+            repo_common_dir=common_dir,
+            checkout_path=checkout,
+            purpose=f"retain linked checkout: {retain_purpose}",
+            retention_until_unix=until,
+            metadata={
+                "checkout_path": str(checkout),
+                "repo": str(top_level),
+                "head": expected_head,
+                "branch": expected_branch,
+            },
+        )
     try:
         retention = _upsert_retention(
             checkout_key=record["checkout_key"],
@@ -7268,7 +7399,10 @@ def grabowski_checkout_retain(
             expected_branch=expected_branch,
         )
     finally:
-        lease_release = _release_checkout_resources(lease)
+        lease_release = (
+            {"released": [], "owner_id": owner, "preserved_lane_leases": True}
+            if same_lane_renewal else _release_checkout_resources(lease)
+        )
     audit = {
         "timestamp_unix": _now(),
         "operation": "checkout-retain",
@@ -7282,7 +7416,11 @@ def grabowski_checkout_retain(
         "resource_keys": [item["resource_key"] for item in lease["leases"]],
     }
     base._append_audit(audit)
-    return {"retention": retention, "lease": lease, "lease_release": lease_release, "audit": audit}
+    return {
+        "retention": retention, "lease": lease, "lease_release": lease_release,
+        "audit": audit,
+        **({"lifecycle": renewed_lifecycle} if renewed_lifecycle is not None else {}),
+    }
 
 
 def _terminal_detached_archive_transition(

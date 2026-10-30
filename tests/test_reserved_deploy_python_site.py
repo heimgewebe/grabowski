@@ -72,6 +72,7 @@ class ReservedWorkerPythonSiteTests(unittest.TestCase):
             self.assertEqual("launch_submitted", job["final_status"])
             argv = run.call_args_list[0].args[0]
             before_command = argv[:argv.index("--")]
+            self.assertNotIn("--collect", before_command)
             self.assertIn(
                 "--setenv=PYTHONPYCACHEPREFIX=/dev/null/grabowski-runtime-deploy",
                 before_command,

@@ -187,6 +187,39 @@ class CodingAgentRouterTests(unittest.TestCase):
             json.dumps(self.state, sort_keys=True, indent=2) + "\n", encoding="utf-8"
         )
 
+    def test_codex_only_juno_does_not_require_unrelated_grok_auth(self) -> None:
+        self.grok_auth_identity_mock.return_value = None
+        self.assertFalse(router._state_catalog_fresh(self.state))
+        self.assertTrue(router._state_catalog_fresh(
+            self.state, require_grok_auth_identity=False
+        ))
+        codex = router.select_contrast_routes(
+            "triage", changed_files=0, duration_minutes=3,
+            novelty="low", risk_flags=["private-context", "user_data"],
+            latency_priority=True, max_candidates=2, allow_paid=False,
+            allowed_harnesses={"codex"},
+        )
+        self.assertEqual(codex["status"], "recommended")
+        self.assertTrue(codex["routes"])
+        contract = router.advisory_route_execution_contract(
+            codex["routes"][0]["route"], paid_execution_authorized=False
+        )
+        self.assertEqual(contract["harness"], "codex")
+        self.assertFalse(contract["paid_only"])
+        for allowed in (None, {"grok"}, {"codex", "grok"}):
+            broad = router.select_contrast_routes(
+                "triage", allowed_harnesses=allowed
+            )
+            self.assertEqual(broad["status"], "router-state-stale")
+        self.state["catalog"]["observed_at"] = (
+            datetime.now(timezone.utc) - timedelta(hours=2)
+        ).isoformat()
+        self._write_state()
+        stale = router.select_contrast_routes(
+            "triage", allowed_harnesses={"codex"}
+        )
+        self.assertEqual(stale["status"], "router-state-stale")
+
     def test_catalog_freshness_invalidates_on_grok_auth_file_change(self) -> None:
         self.assertTrue(router._state_catalog_fresh(self.state))
         self.grok_auth_identity_mock.return_value = "b" * 64
@@ -2015,6 +2048,14 @@ class CodingAgentRouterTests(unittest.TestCase):
         self.assertNotIn("claude-fable-5-contrast-high", all_review_routes)
         self.assertNotIn("claude-fable-5-writer-high", all_review_routes)
 
+    def test_grok_47_quality_and_review_policy_indexes_remain_consistent(self) -> None:
+        policy = self.catalog["policy"]
+        self.assertEqual(self.catalog["models"]["grok-4.7"]["quality_prior_class"], "A")
+        self.assertIn("grok-4.7", policy["quality_classes"]["A"]["models"])
+        self.assertIn("grok-4.6", policy["quality_classes"]["A"]["models"])
+        self.assertIn("grok-4.7-review-high", policy["frontier_model_policy"]["upper_review_or_contrast_routes"])
+        self.assertIn("grok-4.6-review-high", policy["frontier_model_policy"]["upper_review_or_contrast_routes"])
+
     def test_jules_is_a_managed_harness_not_a_ranked_model_claim(self) -> None:
         model = self.catalog["models"]["jules-managed-latest"]
         self.assertEqual(model["identity_kind"], "managed-harness-placeholder")
@@ -2517,14 +2558,49 @@ class CodingAgentRouterTests(unittest.TestCase):
         self.assertEqual(result["executor"], "controller")
         self.assertEqual(result["writer_route"], "grabowski-primary")
 
+    def test_critical_default_routes_to_substantive_self_review_without_provider_gap(self) -> None:
+        result = self._route(
+            "complex-patch", need_review=False, novelty="high",
+            risk_flags=["security-sensitive", "private-context"],
+        )
+        self.assertEqual(result["verification_policy"], "self_review")
+        self.assertTrue(result["verification_floor"]["required"])
+        self.assertTrue(result["self_review_required"])
+        self.assertFalse(result["independent_review_required"])
+        self.assertEqual(result["review_gap"], 0)
+        self.assertEqual(result["review_quorum"]["external_advisory_target"], 0)
+        self.assertFalse(result["external_review_selection_allowed"])
+        self.assertEqual(result["review_status"], "self-review-required")
+
+    def test_explicit_independent_review_still_requires_an_external_provider(self) -> None:
+        result = self._route(
+            "complex-patch", need_review=True, novelty="high",
+            risk_flags=["high-risk"],
+        )
+        self.assertEqual(result["verification_policy"], "independent_review")
+        self.assertTrue(result["independent_review_required"])
+        self.assertEqual(result["review_quorum"]["external_advisory_target"], 1)
+
+    def test_low_risk_explicit_self_review_is_not_deterministic_waiver(self) -> None:
+        result = self._route(
+            "bounded-patch", need_review=False, novelty="low",
+            risk_flags=[], verification_policy="self_review",
+        )
+        self.assertEqual(result["verification_policy"], "self_review")
+        self.assertTrue(result["self_review_required"])
+        self.assertFalse(result["independent_review_required"])
+        self.assertFalse(result["verification_floor"]["required"])
+
     def test_verification_floor_blocks_downgrades_but_keeps_low_risk_axis(self) -> None:
         floored = self._route(
             "complex-patch", need_review=False, novelty="medium", risk_flags=[]
         )
-        self.assertEqual(floored["verification_policy"], "independent_review")
+        self.assertEqual(floored["verification_policy"], "self_review")
         self.assertTrue(floored["verification_floor"]["required"])
         self.assertEqual(floored["verification_floor"]["reasons"], ["task_class:complex-patch"])
-        self.assertTrue(floored["independent_review_required"])
+        self.assertTrue(floored["self_review_required"])
+        self.assertFalse(floored["independent_review_required"])
+        self.assertEqual(floored["review_gap"], 0)
         with self.assertRaisesRegex(
             router.CodingAgentRouterError, "verification floor requires"
         ):
@@ -2556,10 +2632,10 @@ class CodingAgentRouterTests(unittest.TestCase):
         self.assertEqual(explicit_review["review_task_class"], "independent-review")
         self.assertEqual(explicit_review["review_quorum"]["external_advisory_target"], 1)
         high_novelty = self._route("bounded-patch", need_review=False, novelty="high", risk_flags=[])
-        self.assertEqual(high_novelty["verification_policy"], "independent_review")
+        self.assertEqual(high_novelty["verification_policy"], "self_review")
         self.assertEqual(high_novelty["verification_floor"]["reasons"], ["novelty:high"])
         high_risk = self._route("bounded-patch", need_review=False, novelty="medium", risk_flags=["high-risk"])
-        self.assertEqual(high_risk["verification_policy"], "independent_review")
+        self.assertEqual(high_risk["verification_policy"], "self_review")
         self.assertEqual(high_risk["verification_floor"]["reasons"], ["risk_flag:high-risk"])
         established_critical = self._route(
             "bounded-patch",
@@ -2567,7 +2643,7 @@ class CodingAgentRouterTests(unittest.TestCase):
             novelty="medium",
             risk_flags=["schema", "concurrency", "deployment"],
         )
-        self.assertEqual(established_critical["verification_policy"], "independent_review")
+        self.assertEqual(established_critical["verification_policy"], "self_review")
         self.assertEqual(
             established_critical["verification_floor"]["reasons"],
             ["risk_flag:concurrency", "risk_flag:deployment", "risk_flag:schema"],
@@ -2586,19 +2662,17 @@ class CodingAgentRouterTests(unittest.TestCase):
             novelty="high",
             risk_flags=["private-context", "user_data"],
         )
-        self.assertEqual(private_floored["verification_policy"], "independent_review")
-        self.assertTrue(private_floored["independent_review_required"])
+        self.assertEqual(private_floored["verification_policy"], "self_review")
+        self.assertTrue(private_floored["self_review_required"])
+        self.assertFalse(private_floored["independent_review_required"])
         self.assertFalse(private_floored["external_review_selection_allowed"])
         self.assertEqual(
             private_floored["external_review_block_reasons"],
             ["sensitive_context:private-context", "sensitive_context:user_data"],
         )
         self.assertEqual(private_floored["reviewers"], [])
-        self.assertEqual(private_floored["review_gap"], 1)
-        self.assertEqual(
-            private_floored["review_status"],
-            "external-review-blocked-sensitive-context",
-        )
+        self.assertEqual(private_floored["review_gap"], 0)
+        self.assertEqual(private_floored["review_status"], "self-review-required")
         security = self._route(
             "bounded-patch",
             need_review=False,
