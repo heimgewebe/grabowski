@@ -1944,13 +1944,19 @@ def _assert_prior_first_party_material_findings_resolved(
                             old_binding["review_purpose"] == "pull_request"
                             and old.get("canonical_diff_sha256") == old_binding["diff_sha256"]
                         ):
-                            axes_fd = _private_dir(historical_root / "axes")
-                            try:
-                                with os.scandir(axes_fd) as axis_entries:
-                                    if next(axis_entries, None) is None:
-                                        continue
-                            finally:
-                                os.close(axes_fd)
+                            # Both signed-semantic and source-read registries
+                            # must be truly empty: tampered or unsigned read
+                            # sidecars are not silently ignored.
+                            for category in ("axes", "reads"):
+                                evidence_fd = _private_dir(historical_root / category)
+                                try:
+                                    with os.scandir(evidence_fd) as entries:
+                                        if next(entries, None) is not None:
+                                            break
+                                finally:
+                                    os.close(evidence_fd)
+                            else:
+                                continue
                         raise ReviewExecutionRejected("previous same-revision session origin invalid")
                     old_reads = _load_first_party_reads(
                         old, historical_root, signers=signers,

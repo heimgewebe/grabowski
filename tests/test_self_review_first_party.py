@@ -1072,6 +1072,17 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
         invalid_axis.write_text("{}", encoding="utf-8")
         invalid_axis.chmod(0o600)
         self.assertTrue(self._receipt_errors(audit, receipts))
+        invalid_axis.unlink()
+
+        # A malformed/unsigned READ sidecar is also not an empty inert session.
+        # The old axis-only exception silently accepted this adversarial case.
+        invalid_read = legacy_root / "reads" / ("a" * 32 + ".json")
+        invalid_read.write_text("{}", encoding="utf-8")
+        invalid_read.chmod(0o600)
+        self.assertTrue(
+            self._receipt_errors(audit, receipts),
+            "malformed old read record must remain fail-closed",
+        )
 
     def test_prior_signed_material_reject_remains_blocking_across_batches(self) -> None:
         # No change to Git source, PR or canonical diff between batches.
