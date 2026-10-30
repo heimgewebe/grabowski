@@ -2209,6 +2209,58 @@ class RepoGroundContextBridgeToolTests(unittest.TestCase):
         self.assertEqual(result["ranges"][1]["file_path"], "src/second.py")
         self.assertIsNone(result["snippets"][0]["text_excerpt"])
 
+    def test_agent_query_preserves_nested_call_graph_symbol_addresses(self) -> None:
+        """Resolved callers/callees must keep the symbol that graph navigation found."""
+        for relation, nested_key, symbol_name, first in (
+            ("callers", "caller_symbol", "build_tree", 3124),
+            ("callees", "callee_symbol", "get_repo_sort_index", 2226),
+        ):
+            with self.subTest(relation=relation):
+                symbol = {
+                    "id": f"py:merge.py:function:{symbol_name}",
+                    "kind": "function",
+                    "name": symbol_name,
+                    "qualified_name": symbol_name,
+                    "path": "merger/repoground/core/merge.py",
+                    "start_line": first,
+                    "end_line": first + 9,
+                    "range_ref": f"file:merger/repoground/core/merge.py#L{first}-L{first + 9}",
+                }
+                navigation = mcp._repoground_query_snippets({
+                    "route": relation,
+                    "navigation_hits": [{
+                        "path": symbol["path"],
+                        nested_key: symbol,
+                        "call_site_count": 1,
+                    }],
+                })
+                self.assertEqual(navigation["source_shape"], "agent_frontdoor.navigation_hits")
+                self.assertEqual(navigation["hit_count"], 1)
+                hit = navigation["snippets"][0]
+                self.assertEqual(hit["chunk_id"], symbol["id"])
+                self.assertEqual(hit["symbol"]["name"], symbol_name)
+                self.assertEqual(hit["symbol"]["range_ref"], symbol["range_ref"])
+                self.assertEqual(hit["line_range"]["start_line"], first)
+                self.assertEqual(hit["line_range"]["end_line"], first + 9)
+                self.assertEqual(navigation["ranges"][0]["file_path"], symbol["path"])
+                self.assertEqual(navigation["ranges"][0]["start_line"], first)
+                self.assertIsNone(hit["citation_id"])
+                self.assertIsNone(hit["range_ref"])
+
+        # A conflicting nested source must never promote incorrect line evidence.
+        mismatch = mcp._repoground_query_snippets({
+            "navigation_hits": [{
+                "path": "src/real.py",
+                "caller_symbol": {
+                    "path": "src/unrelated.py", "name": "untrusted",
+                    "start_line": 42, "end_line": 45,
+                },
+            }],
+        })
+        self.assertEqual(mismatch["snippets"][0]["path"], "src/real.py")
+        self.assertIsNone(mismatch["snippets"][0]["symbol"]["name"])
+        self.assertIsNone(mismatch["snippets"][0]["line_range"]["start_line"])
+
     def test_agent_query_preserves_optional_structured_evidence(self) -> None:
         _repo, head = self._git_repo("demo-repo")
         self._write_bundle("demo-repo-max-260701-1200", commit=head)
