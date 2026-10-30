@@ -150,6 +150,27 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "effects": [],
         "reversibility": "not-applicable",
     },
+    "grabowski_self_review_session_start": {
+        "category": "audit",
+        "purpose": "Start one signed-ingress-bound semantic review session for an immutable stored review plan.",
+        "risk_class": "medium",
+        "effects": ["private-review-session-create"],
+        "reversibility": "new-review-batch",
+    },
+    "grabowski_self_review_source_read": {
+        "category": "audit",
+        "purpose": "Return and immutably persist exact Git diff or source bytes inspected for one semantic review axis.",
+        "risk_class": "medium",
+        "effects": ["private-source-read-receipt-create"],
+        "reversibility": "new-review-batch",
+    },
+    "grabowski_self_review_axis_submit": {
+        "category": "audit",
+        "purpose": "Persist one substantive source-read-bound semantic axis verdict from the authenticated controller.",
+        "risk_class": "medium",
+        "effects": ["private-semantic-review-receipt-create"],
+        "reversibility": "new-review-batch",
+    },
     "grabowski_audit_query": {
         "category": "audit",
         "purpose": "Query bounded safe fields from a verified audit snapshot with explicit scan completeness.",

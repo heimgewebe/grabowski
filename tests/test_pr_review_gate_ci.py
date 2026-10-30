@@ -100,7 +100,9 @@ class ReviewEvidenceCiRenameAwareConsumerTests(unittest.TestCase):
             enriched, None, repo_name="heimgewebe/grabowski"
         )
         self.assertEqual("high_critical", complexity["review_tier"])
-        self.assertTrue(complexity["independent_review_required"])
+        self.assertTrue(complexity["high_critical"])
+        self.assertGreaterEqual(complexity["minimum_self_review_iterations"], 4)
+        self.assertFalse(complexity["independent_review_required"])
         self.assertTrue(any(".github/workflows/ci.yml" in reason for reason in
                             complexity["high_critical_reasons"]))
 

@@ -36,6 +36,8 @@ SERVER_OWNED_AUTHORITY_METADATA_KINDS = frozenset(
 )
 PUBLIC_RESERVED_AUTHORITY_METADATA_FIELDS = frozenset({"unit_file_config_root"})
 DEFAULT_RESOURCE_LIST_LIMIT = 200
+# Bureau runtime refresh requires 67 exact path/service leases; retain an atomic bound.
+MAX_ATOMIC_RESOURCE_KEYS = 96
 RESOURCE_DB = Path(
     os.environ.get(
         "GRABOWSKI_RESOURCE_DB",
@@ -1418,8 +1420,10 @@ def normalize_resource_keys(values: Iterable[str]) -> list[str]:
     normalized = sorted({normalize_resource_key(value) for value in values})
     if not normalized:
         raise ValueError("at least one resource key is required")
-    if len(normalized) > 64:
-        raise ValueError("at most 64 resource keys may be acquired atomically")
+    if len(normalized) > MAX_ATOMIC_RESOURCE_KEYS:
+        raise ValueError(
+            f"at most {MAX_ATOMIC_RESOURCE_KEYS} resource keys may be acquired atomically"
+        )
     return normalized
 
 

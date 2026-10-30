@@ -384,6 +384,38 @@ def stamp_claude_quota_429(directory: Path, *, envelope_updates: dict | None = N
     write_private(receipt_path, json.dumps(receipt))
 
 
+def stamp_claude_oauth_401(directory: Path, *, envelope_updates: dict | None = None,
+                           receipt_updates: dict | None = None) -> None:
+    """Synthetic receipt with the exact observed provider-auth refusal, no model work."""
+    stamp_claude_quota_429(directory)
+    path = directory / reviews.REVIEW_ROLE_ATTEMPT_RECEIPT_NAME
+    receipt = json.loads(path.read_text(encoding="utf-8"))
+    envelope = json.loads(receipt["stdout_tail"])
+    envelope.update({
+        "api_error_status": 401,
+        "api_error_origin": "first_party",
+        "safety_stops": 0,
+        "result": (
+            "Failed to authenticate: OAuth token revoked. "
+            "Please log in again or contact your administrator."
+        ),
+    })
+    if envelope_updates:
+        envelope.update(envelope_updates)
+    payload = json.dumps(envelope, separators=(",", ":")).encode("utf-8")
+    digest = hashlib.sha256(payload).hexdigest()
+    receipt.update({
+        "stdout_tail": payload.decode("utf-8"),
+        "stdout_bytes": len(payload),
+        "stdout_sha256": digest,
+        "review_provider_envelope_bytes": len(payload),
+        "review_provider_envelope_sha256": digest,
+    })
+    receipt.update(receipt_updates or {})
+    receipt["receipt_sha256"] = reviews._agent_role_receipt_sha256(receipt)
+    write_private(path, json.dumps(receipt))
+
+
 class DecisionReviewReconciliationTests(unittest.TestCase):
     def test_rgpm_signed_v2_review_pass_cannot_grant_captain_authority(self) -> None:
         # Construct a valid foreign-namespace reviewer under the old, widened
@@ -555,7 +587,7 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
         self.assertEqual(checked["errors"], [])
         self.assertEqual(checked["attempt_count"], 1)
 
-    def test_review_attempt_hard_cap_never_yields_partial_pass(self) -> None:
+    def test_unrelated_historical_review_count_cannot_hide_material_reject(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             jobs = Path(temp) / "jobs"
             jobs.mkdir(mode=0o700)
@@ -569,11 +601,17 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
                 terminal_status="succeeded",
                 review_result=result("A", "REJECT_THIS_REVISION", 1),
             )
-            with mock.patch.object(reviews, "MAX_BOUND_REVIEW_JOBS", 1):
+            # A historic attempt count is not an admission budget. The bounded
+            # full directory and metadata scan must still find the late REJECT.
+            with mock.patch.object(reviews, "MAX_BOUND_REVIEW_JOBS", 1, create=True):
                 checked = self.reconcile(jobs)
         self.assertEqual(checked["status"], "blocked")
-        self.assertIn("decision_review_attempt_inventory_truncated", checked["errors"])
-        self.assertEqual(checked["attempt_count"], 0)
+        self.assertEqual(checked["attempt_count"], 2)
+        self.assertEqual(checked["slots"][0]["material_reject_count"], 1)
+        self.assertFalse(
+            any("inventory_truncated" in error for error in checked["errors"]),
+            checked["errors"],
+        )
 
     def test_noncanonical_renamed_reject_blocks_inventory(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -873,6 +911,171 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
         self.assertIn("decision_review_metadata_aggregate_budget_exceeded", checked["errors"])
         self.assertEqual(checked["attempt_count"], 0)
 
+    def test_v2_oauth_401_without_model_work_is_infrastructure_not_review(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            jobs = Path(temporary) / "jobs"
+            jobs.mkdir(mode=0o700)
+            failed = make_job(
+                jobs, suffix="a88888888888", slot="independent-claude",
+                terminal_status="failed", review_result=None,
+                review_role=True, attempt_bound=True, attempt_epoch=2,
+            )
+            stamp_claude_oauth_401(failed)
+            outcome = self.reconcile(jobs)
+            self.assertEqual(outcome["attempts"][0]["classification"], "infrastructure_error")
+            self.assertTrue(outcome["attempts"][0]["pre_result_auth_failure_verified"])
+            self.assertFalse(outcome["attempts"][0]["pre_result_quota_failure_verified"])
+            self.assertEqual(outcome["slots"][0]["material_reject_count"], 0)
+            self.assertEqual(outcome["slots"][0]["independent_pass_count"], 0)
+            import grabowski_merge_guard as merge_guard
+            optional = merge_guard.decision_review_blocking_errors(
+                outcome, independent_required=False,
+            )
+            self.assertEqual(optional["errors"], [])
+            self.assertEqual(optional["status"], "optional_unavailable")
+            self.assertEqual(outcome["status"], "blocked")
+            self.assertIn(
+                "decision_review_named_provider_slot_without_independent_pass:independent-claude",
+                optional["ignored_unavailable"],
+            )
+
+    def test_v2_oauth_401_provider_switch_does_not_poison_optional_review(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            jobs = Path(temporary) / "jobs"
+            jobs.mkdir(mode=0o700)
+            failed = make_job(
+                jobs, suffix="a88888888888", slot="independent-claude",
+                terminal_status="failed", review_result=None,
+                review_role=True, attempt_bound=True, attempt_epoch=2,
+            )
+            stamp_claude_oauth_401(failed)
+            make_job(
+                jobs, suffix="b99999999999", slot="independent-grok",
+                terminal_status="succeeded", review_result=None,
+                review_role=True, attempt_bound=True, attempt_epoch=2,
+                role_command_override=[
+                    "grok", "--model", "grok-4.6", "-p", "Read-only frozen revision review",
+                ],
+                created_at_unix=1_787_000_200,
+            )
+            outcome = self.reconcile(jobs)
+            import grabowski_merge_guard as merge_guard
+            summary = merge_guard.independent_review_reconciliation_summary(outcome)
+            self.assertEqual(summary["pass_count"], 1)
+            optional = merge_guard.decision_review_blocking_errors(
+                outcome, independent_required=False,
+            )
+            self.assertEqual(optional["errors"], [])
+            self.assertTrue(any(
+                x.startswith("decision_review_infrastructure_not_superseded:independent-claude:")
+                for x in optional["ignored_unavailable"]
+            ))
+
+    def test_v2_oauth_401_ambiguous_envelopes_cannot_hide_semantic_reject(self) -> None:
+        cases = [
+            ("model_work", {"usage": {"input_tokens": 1}}, {}),
+            ("auth_origin_missing", {"api_error_origin": None}, {}),
+            ("unfamiliar_field", {"model_text": "REJECT_THIS_REVISION"}, {}),
+            ("other_message", {"result": "REJECT_THIS_REVISION: material findings"}, {}),
+            ("result_nonstring", {"result": {"verdict": "REJECT_THIS_REVISION"}}, {}),
+            ("response_work", {"duration_api_ms": 2}, {}),
+            ("safety_stop", {"safety_stops": 1}, {}),
+            ("safety_stop_bool", {"safety_stops": True}, {}),
+            ("document", {}, {"review_document_bytes": 14}),
+            ("hash_tamper", {}, {"review_provider_envelope_sha256": "f" * 64}),
+        ]
+        for label, envelope_updates, receipt_updates in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary:
+                jobs = Path(temporary) / "jobs"
+                jobs.mkdir(mode=0o700)
+                failed = make_job(
+                    jobs, suffix="a88888888888", slot="independent-claude",
+                    terminal_status="failed", review_result=None,
+                    review_role=True, attempt_bound=True, attempt_epoch=2,
+                )
+                stamp_claude_oauth_401(
+                    failed,
+                    envelope_updates=envelope_updates,
+                    receipt_updates=receipt_updates,
+                )
+                outcome = self.reconcile(jobs)
+                self.assertEqual(outcome["status"], "blocked")
+                self.assertEqual(outcome["attempts"][0]["classification"], "invalid_result")
+                self.assertIn(
+                    "decision_review_result_invalid:grabowski-job-a88888888888:InvalidReviewDocument",
+                    outcome["errors"],
+                )
+
+    def test_v2_oauth_401_never_overrides_historical_material_reject(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            jobs = Path(temporary) / "jobs"
+            jobs.mkdir(mode=0o700)
+            failed = make_job(
+                jobs, suffix="a88888888888", slot="independent-claude",
+                terminal_status="failed", review_result=None,
+                review_role=True, attempt_bound=True, attempt_epoch=2,
+            )
+            stamp_claude_oauth_401(failed)
+            make_job(
+                jobs, suffix="b99999999999", slot="independent-other",
+                terminal_status="succeeded",
+                review_result=result("independent-other", "REJECT_THIS_REVISION", 1),
+            )
+            outcome = self.reconcile(jobs)
+            import grabowski_merge_guard as merge_guard
+            optional = merge_guard.decision_review_blocking_errors(
+                outcome, independent_required=False,
+            )
+            self.assertEqual(optional["status"], "blocked")
+            self.assertTrue(any(
+                x.startswith("decision_review_material_reject:")
+                for x in optional["errors"]
+            ))
+
+    def test_jobsroot_new_job_during_scan_is_rescanned_for_material_reject(self) -> None:
+        for verdict in ("PASS_THIS_REVISION", "REJECT_THIS_REVISION"):
+            with self.subTest(verdict=verdict), tempfile.TemporaryDirectory() as temporary:
+                jobs = Path(temporary) / "jobs"
+                jobs.mkdir(mode=0o700)
+                initial = make_job(
+                    jobs, suffix="a88888888888", slot="A",
+                    terminal_status="succeeded",
+                    review_result=result("A", "PASS_THIS_REVISION", 0),
+                )
+                read_original = reviews._read_private_json
+                added = False
+
+                def add_on_first_read(path, *args, **kwargs):
+                    nonlocal added
+                    if not added and Path(path) == initial / "metadata.json":
+                        added = True
+                        make_job(
+                            jobs, suffix="b99999999999", slot="B",
+                            terminal_status="succeeded",
+                            review_result=result(
+                                "B", verdict,
+                                1 if verdict == "REJECT_THIS_REVISION" else 0,
+                            ),
+                        )
+                    return read_original(path, *args, **kwargs)
+
+                with mock.patch.object(
+                    reviews, "_read_private_json", side_effect=add_on_first_read,
+                ):
+                    outcome = self.reconcile(jobs)
+                self.assertTrue(added)
+                self.assertEqual(outcome["attempt_count"], 2, repr(outcome["errors"]))
+                self.assertNotIn("decision_review_jobs_root_changed", outcome["errors"])
+                if verdict == "REJECT_THIS_REVISION":
+                    self.assertEqual(outcome["status"], "blocked")
+                    self.assertTrue(any(
+                        x.startswith("decision_review_material_reject:b:")
+                        for x in outcome["errors"]
+                    ))
+                else:
+                    self.assertEqual(outcome["status"], "settled")
+                    self.assertEqual(outcome["errors"], [])
+
     def test_v2_claude_429_blocks_until_exact_later_same_slot_pass(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             jobs = Path(temporary) / "jobs"
@@ -887,6 +1090,9 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
             self.assertEqual(prior["status"], "blocked")
             self.assertIn("decision_review_slot_without_pass:claude", prior["errors"])
             self.assertEqual(prior["attempts"][0]["classification"], "infrastructure_error")
+            self.assertTrue(prior["attempts"][0]["pre_result_quota_failure_verified"])
+            self.assertEqual(prior["attempts"][0]["terminal_status"], "failed")
+            self.assertTrue(prior["attempts"][0]["review_role_verified"])
             make_job(
                 jobs, suffix="b99999999999", slot="claude",
                 terminal_status="succeeded", review_result=None,
@@ -3468,6 +3674,113 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
             f"decision_review_unbound_evidence_invalid:{ordinary.name}:ValueError",
             checked["errors"],
         )
+
+    def test_foreign_historical_origin_is_not_current_review(self) -> None:
+        # A hash-valid foreign job may contain stale, currently unverifiable
+        # semantic role provenance. It is not a review of this PR/head.
+        # A surviving exact-bound REJECT must nevertheless remain visible.
+        for retained_reject in (False, True):
+            with self.subTest(retained_reject=retained_reject):
+                with tempfile.TemporaryDirectory() as tmp:
+                    jobs = Path(tmp) / "jobs"
+                    jobs.mkdir(mode=0o700)
+                    make_job(
+                        jobs, suffix="aaaaaaaaa401", slot="A",
+                        terminal_status="succeeded",
+                        review_result=result("A", "PASS_THIS_REVISION", 0),
+                    )
+                    foreign = make_job(
+                        jobs, suffix="bbbbbbbbb402", slot="A",
+                        terminal_status="succeeded", review_result=None,
+                    )
+                    metadata_path = foreign / "metadata.json"
+                    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                    scope = dict(metadata["scope"])
+                    bound = dict(scope["decision_bound_review"])
+                    bound.update({
+                        "repo": "heimgewebe/repoground",
+                        "pr": 1357,
+                        "head_sha": "f" * 40,
+                        "base_sha": "e" * 40,
+                    })
+                    scope["decision_bound_review"] = bound
+                    scope["decision_review_attempt_epoch"] = 2
+                    scope["decision_review_provenance"] = {
+                        "schema_version": 2, "obsolete_runner": "old-release",
+                    }
+                    metadata["scope"] = scope
+                    metadata["origin"]["scope"] = scope
+                    metadata["origin_sha256"] = reviews.sha256_json(metadata["origin"])
+                    write_private(metadata_path, json.dumps(metadata))
+                    if retained_reject:
+                        write_private(
+                            foreign / "stdout.log",
+                            reviews.RESULT_PREFIX +
+                            json.dumps(result("A", "REJECT_THIS_REVISION", 1)) + "\n",
+                        )
+                    outcome = self.reconcile(jobs)
+                if retained_reject:
+                    self.assertEqual(outcome["status"], "blocked")
+                    self.assertIn(
+                        f"decision_review_unbound_result:{foreign.name}", outcome["errors"],
+                    )
+                else:
+                    self.assertEqual(outcome["status"], "settled")
+                    self.assertEqual(outcome["errors"], [])
+
+    def test_ordinary_24mb_stdout_stream_preserves_late_reject(self) -> None:
+        # Exercise the actual 24,092,538-byte failure size with no giant
+        # in-memory test string; the marker may be the very last line.
+        for retained_reject in (False, True):
+            with self.subTest(retained_reject=retained_reject):
+                with tempfile.TemporaryDirectory() as tmp:
+                    jobs = Path(tmp) / "jobs"
+                    jobs.mkdir(mode=0o700)
+                    make_job(
+                        jobs, suffix="aaaaaaaaa411", slot="A",
+                        terminal_status="succeeded",
+                        review_result=result("A", "PASS_THIS_REVISION", 0),
+                    )
+                    ordinary = jobs / "grabowski-job-bbbbbbbbb412"
+                    ordinary.mkdir(mode=0o700)
+                    scope = {
+                        "cwd": "/tmp", "argv_sha256": "e" * 64,
+                        "runtime_seconds": 60,
+                    }
+                    origin, digest = job_origin.build_origin(
+                        unit=ordinary.name, owner=f"uid:{os.getuid()}",
+                        argv_sha256="e" * 64, scope=scope,
+                        notify_on_done={"requested": False, "channels": []},
+                        created_at_unix=1_787_000_000,
+                        started_at="2026-08-18T12:00:00Z",
+                        invoker_tool="grabowski_job_start",
+                    )
+                    write_private(ordinary / "metadata.json", json.dumps({
+                        "unit": ordinary.name, "job_id": origin["job_id"],
+                        "owner": origin["owner"], "argv_sha256": origin["argv_sha256"],
+                        "scope": scope, "origin": origin, "origin_sha256": digest,
+                    }))
+                    marker = (
+                        b"\n" + reviews.RESULT_PREFIX.encode("ascii") +
+                        json.dumps(result("A", "REJECT_THIS_REVISION", 1)).encode("ascii") +
+                        b"\n"
+                    ) if retained_reject else b""
+                    with (ordinary / "stdout.log").open("wb") as stream:
+                        stream.write(b"ordinary job output\n")
+                        stream.seek(24_092_538 - len(marker))
+                        stream.write(marker)
+                        stream.truncate(24_092_538)
+                    os.chmod(ordinary / "stdout.log", 0o600)
+                    outcome = self.reconcile(jobs)
+                if retained_reject:
+                    self.assertEqual(outcome["status"], "blocked")
+                    self.assertIn(
+                        f"decision_review_unbound_result:{ordinary.name}",
+                        outcome["errors"],
+                    )
+                else:
+                    self.assertEqual(outcome["status"], "settled")
+                    self.assertEqual(outcome["errors"], [])
 
     def test_malformed_targeted_registration_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

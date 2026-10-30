@@ -26,9 +26,15 @@ BINDING_SCHEMA_VERSION = 1
 RESULT_KIND = "grabowski_decision_bound_review_result"
 RESULT_SCHEMA_VERSION = 1
 RESULT_PREFIX = "GRABOWSKI_DECISION_REVIEW_V1="
-# Full registry scan retains late material REJECTs; this is not an archive solution.
-MAX_JOB_DIRECTORIES = 16_384  # Hard cap on all scanned directory entries
-MAX_BOUND_REVIEW_JOBS = 10_000  # Independent attempts, not unrelated job entries
+# Match str.splitlines() after UTF-8 decoding with errors="replace", as used
+# by _parse_result_marker. Scan the raw bytes so marker budgets stay in bytes.
+_STDOUT_LINE_SEPARATOR_RE = re.compile(
+    rb"\r\n|[\n\r\v\f\x1c-\x1e]|\xc2\x85|\xe2\x80[\xa8\xa9]"
+)
+# Full scan (including late material REJECTs) is already bounded by all job
+# directories and aggregate metadata bytes; an extra global review-attempt
+# cap cannot safely terminate an unrelated PR before the full scan completes.
+MAX_JOB_DIRECTORIES = 16_384  # Hard cap on *all* scanned directory entries
 MAX_METADATA_BYTES = 256 * 1024
 MAX_TOTAL_METADATA_BYTES = 128 * 1024 * 1024
 MAX_FINALIZATION_BYTES = 256 * 1024
@@ -36,7 +42,10 @@ MAX_STDOUT_TAIL_BYTES = 256 * 1024
 # Non-review origins must not conceal review results retained in their job logs.
 # This is a separate, bounded verification budget, not a limit increase for
 # admitted review evidence.
-MAX_UNBOUND_STDOUT_BYTES = 32 * 1024 * 1024
+# Scan the entire historical ordinary-job output up to the finite budget
+# rather than treating an unrelated 24-MiB log as fatal review evidence.
+MAX_UNBOUND_STDOUT_BYTES = 128 * 1024 * 1024
+MAX_UNBOUND_MARKER_BYTES = 256 * 1024
 MAX_ROLE_RECEIPT_BYTES = 4 * 1024 * 1024
 MAX_REVIEW_ROLE_MODULE_BYTES = 1024 * 1024
 REVIEW_ROLE_MODULE = "grabowski_agent_role"
@@ -115,6 +124,10 @@ _CLAUDE_QUOTA_RESULT_RE = re.compile(
 # New provider fields must be understood before claiming zero semantic output.
 _CLAUDE_QUOTA_UUID_RE = re.compile(
     r"[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}\Z"
+)
+_CLAUDE_AUTH_REVOKED_RESULT = (
+    "Failed to authenticate: OAuth token revoked. "
+    "Please log in again or contact your administrator."
 )
 _CLAUDE_QUOTA_ENVELOPE_FIELDS = frozenset({
     "type", "is_error", "terminal_reason", "api_error_status", "duration_api_ms",
@@ -218,6 +231,104 @@ def _historical_review_role_module_matches(
     ):
         return False
     return hmac.compare_digest(hashlib.sha256(payload).hexdigest(), expected_sha256)
+
+
+_NIX_REVIEW_STORE_ROOT = Path("/nix/store")
+_NIX_REVIEW_OWNER_UID = 0
+_NIX_REVIEW_OPERATOR_RELEASE_RE = re.compile(
+    r"[0123456789abcdfghijklmnpqrsvwxyz]{32}-grabowski-operator-[0-9a-f]{8,40}\Z"
+)
+
+
+def _historical_nix_review_role_origin_matches(
+    runner_python: Any, runner_module_path: Any, runner_module_sha256: Any,
+) -> bool:
+    """Preserve exact V2 role provenance across immutable NixOS release rotations.
+
+    One source package MUST own both the canonical Python entrypoint and role
+    module. The Nix store may be group-writable for its daemon; every package
+    component is root-owned, non-writable and module bytes are SHA-pinned.
+    No arbitrary Python path, symlinked role module or caller-selected digest
+    grants review authority without the independently validated job origin.
+    """
+    if (
+        not isinstance(runner_python, str)
+        or not isinstance(runner_module_path, str)
+        or not isinstance(runner_module_sha256, str)
+        or _SHA256_RE.fullmatch(runner_module_sha256) is None
+    ):
+        return False
+    interpreter = Path(runner_python)
+    module = Path(runner_module_path)
+    release = interpreter.parent.parent
+    relative = None
+    try:
+        relative = module.relative_to(release).parts
+        if (
+            release.parent != _NIX_REVIEW_STORE_ROOT
+            or _NIX_REVIEW_OPERATOR_RELEASE_RE.fullmatch(release.name) is None
+            or interpreter != release / "bin" / "python3"
+            or len(relative) != 4
+            or relative[0] != "lib"
+            or _REVIEW_ROLE_PYTHON_DIR_RE.fullmatch(relative[1]) is None
+            or relative[2:] != ("site-packages", f"{REVIEW_ROLE_MODULE}.py")
+        ):
+            return False
+        store = _NIX_REVIEW_STORE_ROOT.lstat()
+        store_mode = stat.S_IMODE(store.st_mode)
+        if (
+            not stat.S_ISDIR(store.st_mode)
+            or store.st_uid != _NIX_REVIEW_OWNER_UID
+            or store_mode & 0o002
+            or (store_mode & 0o020 and not store_mode & stat.S_ISVTX)
+        ):
+            return False
+        for directory in (
+            release, release / "bin", release / "lib",
+            release / "lib" / relative[1],
+            release / "lib" / relative[1] / "site-packages",
+        ):
+            info = directory.lstat()
+            if (
+                not stat.S_ISDIR(info.st_mode)
+                or info.st_uid != _NIX_REVIEW_OWNER_UID
+                or stat.S_IMODE(info.st_mode) & 0o222
+            ):
+                return False
+        module_info = module.lstat()
+        if (
+            not stat.S_ISREG(module_info.st_mode)
+            or module_info.st_uid != _NIX_REVIEW_OWNER_UID
+            or not 0 < module_info.st_size <= MAX_REVIEW_ROLE_MODULE_BYTES
+            or stat.S_IMODE(module_info.st_mode) & 0o222
+            or module.resolve(strict=True) != module
+        ):
+            return False
+        python_info = interpreter.lstat()
+        if (
+            python_info.st_uid != _NIX_REVIEW_OWNER_UID
+            or not (
+                stat.S_ISLNK(python_info.st_mode)
+                or stat.S_ISREG(python_info.st_mode)
+            )
+        ):
+            return False
+        python_target = interpreter.resolve(strict=True)
+        target_info = python_target.stat()
+        if (
+            _NIX_REVIEW_STORE_ROOT not in python_target.parents
+            or not stat.S_ISREG(target_info.st_mode)
+            or target_info.st_uid != _NIX_REVIEW_OWNER_UID
+            or stat.S_IMODE(target_info.st_mode) & 0o222
+            or not stat.S_IMODE(target_info.st_mode) & 0o111
+        ):
+            return False
+        return hmac.compare_digest(
+            hashlib.sha256(module.read_bytes()).hexdigest(),
+            runner_module_sha256,
+        )
+    except (OSError, ValueError, RuntimeError):
+        return False
 
 
 def _historical_review_role_python_matches(value: Any) -> bool:
@@ -583,6 +694,112 @@ def _read_stdout_tail(
     return payload.decode("utf-8", errors="replace"), hashlib.sha256(payload).hexdigest()
 
 
+def _unbound_stdout_has_target_result(
+    directory: Path, *, parent_fd: int, aggregate_bytes: list[int],
+    expected: dict[str, Any], allow_legacy_readable: bool,
+) -> bool:
+    """Scan complete owner-pinned ordinary stdout, not an arbitrary 8-MiB prefix.
+
+    Memory use is bounded by one chunk and a candidate review marker. A giant
+    unrelated line is skipped rather than buffered. An oversized candidate,
+    unreadable evidence or a changed inode fails closed.
+    """
+    parent = os.fstat(parent_fd)
+    if (
+        not stat.S_ISDIR(parent.st_mode)
+        or parent.st_uid != os.getuid()
+        or stat.S_IMODE(parent.st_mode) & 0o077
+    ):
+        raise ValueError("unbound review evidence parent is not owner-private")
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+    fd = os.open("stdout.log", flags, dir_fd=parent_fd)
+    try:
+        before = os.fstat(fd)
+        mode = stat.S_IMODE(before.st_mode)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.getuid()
+            or before.st_nlink != 1
+            or (mode & 0o077 and not (allow_legacy_readable and mode == 0o644))
+        ):
+            raise ValueError("unbound stdout is not one owner-private regular file")
+        if before.st_size > MAX_UNBOUND_STDOUT_BYTES:
+            raise ValueError("unbound stdout exceeds bounded inspection budget")
+        total_budget = aggregate_bytes[0] + before.st_size
+        if total_budget > MAX_TOTAL_METADATA_BYTES:
+            raise ReviewMetadataBudgetExceeded(
+                "decision review unbound stdout aggregate budget exceeded"
+            )
+        aggregate_bytes[0] = total_budget
+
+        prefix = RESULT_PREFIX.encode("ascii")
+        line = bytearray()
+        maybe_marker = True
+        found = False
+        read_size = 0
+        separator_carry = b""
+
+        def exact_target_marker(candidate: bytearray) -> bool:
+            if not candidate.startswith(prefix):
+                return False
+            try:
+                result = json.loads(
+                    candidate[len(prefix):].decode("utf-8", errors="replace")
+                )
+            except json.JSONDecodeError:
+                return False  # A malformed marker is not a decision.
+            return isinstance(result, dict) and _raw_binding_targets_pr_head(
+                result, expected
+            )
+
+        while True:
+            raw_chunk = os.read(fd, 65536)
+            read_size += len(raw_chunk)
+            if read_size > before.st_size:
+                raise ValueError("unbound stdout grew during inspection")
+            chunk = separator_carry + raw_chunk
+            separator_carry = b""
+            if raw_chunk:
+                # Retain only a possible unfinished CRLF/NEL/LS/PS boundary.
+                # At EOF, flush it unchanged: an incomplete UTF-8 sequence is
+                # ordinary data, while a trailing CR is itself a boundary.
+                if chunk.endswith(b"\xe2\x80"):
+                    separator_carry = chunk[-2:]
+                elif chunk.endswith((b"\r", b"\xc2", b"\xe2")):
+                    separator_carry = chunk[-1:]
+                if separator_carry:
+                    chunk = chunk[:-len(separator_carry)]
+            fragments = _STDOUT_LINE_SEPARATOR_RE.split(chunk)
+            for index, fragment in enumerate(fragments):
+                if maybe_marker:
+                    line.extend(fragment)
+                    if not (prefix.startswith(line) or line.startswith(prefix)):
+                        maybe_marker = False
+                        line.clear()
+                    elif len(line) > MAX_UNBOUND_MARKER_BYTES:
+                        raise ValueError("unbound decision marker exceeds bounded size")
+                if index < len(fragments) - 1:
+                    if maybe_marker and exact_target_marker(line):
+                        found = True
+                    line.clear()
+                    maybe_marker = True
+            if not raw_chunk:
+                break
+        if maybe_marker and exact_target_marker(line):
+            found = True
+        after = os.fstat(fd)
+        linked = os.stat("stdout.log", dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            read_size != before.st_size
+            or _review_stat_file_identity(after) != _review_stat_file_identity(before)
+            or _review_stat_file_identity(linked) != _review_stat_file_identity(before)
+        ):
+            raise ValueError("unbound stdout changed during inspection")
+        return found
+    finally:
+        os.close(fd)
+
+
 def _unbound_review_result_visible(
     directory: Path, *, parent_fd: int, aggregate_bytes: list[int],
     expected: dict[str, Any], allow_legacy_readable_stdout: bool = False,
@@ -616,26 +833,10 @@ def _unbound_review_result_visible(
             # Still scan any surviving stdout for an exact-bound REJECT.
             if base_head == expected["base_sha"]:
                 return True
-    # An oversized unbound stdout can retain a material REJECT even after
-    # its origin metadata has been rebound to an ordinary job. Without an
-    # independent, authenticated origin record, it cannot be classified as
-    # harmless. Keep the FD-pinned bounded read fail-closed on oversize.
-    stdout = _read_private_bytes(
-        directory / "stdout.log", MAX_UNBOUND_STDOUT_BYTES,
-        parent_fd=parent_fd, aggregate_metadata_bytes=aggregate_bytes,
-        allow_legacy_readable=allow_legacy_readable_stdout,
+    return _unbound_stdout_has_target_result(
+        directory, parent_fd=parent_fd, aggregate_bytes=aggregate_bytes,
+        expected=expected, allow_legacy_readable=allow_legacy_readable_stdout,
     )
-    for line in stdout.decode("utf-8", errors="replace").splitlines():
-        if not line.startswith(RESULT_PREFIX):
-            continue
-        try:
-            marker = json.loads(line[len(RESULT_PREFIX):])
-        except json.JSONDecodeError:
-            # A quoted marker name is not an authenticated review decision.
-            continue
-        if isinstance(marker, dict) and _raw_binding_targets_pr_head(marker, expected):
-            return True
-    return False
 
 
 def _exact_empty_prelaunch_stub(directory_fd: int) -> bool:
@@ -767,11 +968,10 @@ def _validated_origin_binding(
     if raw_binding is None:
         return metadata, None, None
     binding = normalize_binding(raw_binding)
-    # A foreign PR/head cannot contribute a PASS to this reconciliation.
-    # Its authenticated Origin and structured binding are still verified;
-    # the caller must scan any retained exact-head role receipt/stdout for
-    # a displaced REJECT. Do not require historical runner binaries for
-    # unrelated reviews after a runtime or release rotation.
+    # Validate the signed Origin and exact metadata binding first.
+    # Foreign reviews cannot grant a PASS or require today's model binaries;
+    # surviving current-head receipts and material REJECTs are still scanned
+    # across every historical job after a runtime or release rotation.
     if expected is not None and not _binding_matches_pr_head(binding, expected):
         return metadata, binding, None
     origin_cwd = scope.get("cwd")
@@ -1402,8 +1602,8 @@ def _normalize_review_role_provenance(
     stable_python = str(REVIEW_ROLE_STABLE_PYTHON.expanduser())
     recorded_module_path = value.get("runner_module_path")
     recorded_module_sha256 = value.get("runner_module_sha256")
-    # Common/current runtime receipts need no historical Nix closure query.
-    # Only unresolved runner/module identity pairs enter the explicit fallback.
+    # Retain exact current/legacy bindings; a historical Nix reviewer is
+    # accepted only with matching root-owned immutable interpreter AND module.
     current_runner = (
         recorded_runner_python == REVIEW_ROLE_PYTHON
         and recorded_runner_python != stable_python
@@ -1424,8 +1624,13 @@ def _normalize_review_role_provenance(
     )
     historical_nix = False
     if not ((current_runner or legacy_runner) and (current_module or legacy_module)):
-        historical_nix = _historical_nix_review_role_matches(
-            recorded_runner_python, recorded_module_path, recorded_module_sha256,
+        historical_nix = (
+            _historical_nix_review_role_matches(
+                recorded_runner_python, recorded_module_path, recorded_module_sha256,
+            )
+            or _historical_nix_review_role_origin_matches(
+                recorded_runner_python, recorded_module_path, recorded_module_sha256,
+            )
         )
     runner_python_matches = current_runner or legacy_runner or historical_nix
     module_identity_matches = current_module or legacy_module or historical_nix
@@ -1553,13 +1758,13 @@ def _claude_no_external_activity(usage: Any, subagents: Any) -> bool:
     return True
 
 
-def _proven_claude_quota_failure_before_review(
-    receipt: dict[str, Any], provenance: dict[str, Any]
+def _proven_claude_pre_result_failure_before_review(
+    receipt: dict[str, Any], provenance: dict[str, Any], *, auth_401: bool = False,
 ) -> bool:
-    """Accept only an exact, bound 429 transport envelope with zero model work.
+    """Verify a narrow, authenticated Claude 429 or revoked-OAuth 401 with zero review work.
 
-    This never grants a review PASS: a later independent PASS from the same
-    registered provider slot is still mandatory before settlement.
+    This never grants a review PASS, forgives ambiguous output, or erases a REJECT.
+    The sole 401 shape is the observed first-party authentication refusal.
     """
     if (
         provenance.get("schema_version") != 2
@@ -1602,7 +1807,10 @@ def _proven_claude_quota_failure_before_review(
         envelope = json.loads(tail, object_pairs_hook=unique_json_object)
     except ValueError:
         return False
-    if not isinstance(envelope, dict) or set(envelope) - _CLAUDE_QUOTA_ENVELOPE_FIELDS:
+    permitted_fields = _CLAUDE_QUOTA_ENVELOPE_FIELDS | (
+        frozenset({"api_error_origin", "safety_stops"}) if auth_401 else frozenset()
+    )
+    if not isinstance(envelope, dict) or set(envelope) - permitted_fields:
         return False
     # The actual 429 result has one CLI wrapper turn, not one model turn.
     # An unexpected count, tool trace or provider state is not pre-result proof.
@@ -1639,16 +1847,29 @@ def _proven_claude_quota_failure_before_review(
         and envelope.get("is_error") is True
         and envelope.get("terminal_reason") == "api_error"
         and type(envelope.get("api_error_status")) is int
-        and envelope["api_error_status"] == 429
+        and envelope["api_error_status"] == (401 if auth_401 else 429)
         and type(envelope.get("duration_api_ms")) is int
         and envelope["duration_api_ms"] == 0
         and envelope.get("modelUsage") == {}
         and envelope.get("structured_output") is None
         and isinstance(envelope.get("result"), str)
         and len(envelope["result"]) <= 256
-        and _CLAUDE_QUOTA_RESULT_RE.fullmatch(envelope["result"]) is not None
+        and (
+            (
+                envelope.get("api_error_origin") == "first_party"
+                and envelope["result"] == _CLAUDE_AUTH_REVOKED_RESULT
+            )
+            if auth_401 else (
+                _CLAUDE_QUOTA_RESULT_RE.fullmatch(envelope["result"]) is not None
+            )
+        )
         and isinstance(usage, dict) and usage.get("iterations") == []
         and envelope.get("permission_denials") == []
+        and (
+            type(envelope.get("safety_stops")) is int
+            and envelope["safety_stops"] == 0
+            if auth_401 else True
+        )
         and type(envelope.get("total_cost_usd")) in {int, float}
         and envelope["total_cost_usd"] == 0
         and isinstance(usage, dict)
@@ -1660,6 +1881,20 @@ def _proven_claude_quota_failure_before_review(
             )
         )
         and _claude_no_external_activity(usage, subagents)
+    )
+
+
+def _proven_claude_quota_failure_before_review(
+    receipt: dict[str, Any], provenance: dict[str, Any],
+) -> bool:
+    return _proven_claude_pre_result_failure_before_review(receipt, provenance)
+
+
+def _proven_claude_auth_failure_before_review(
+    receipt: dict[str, Any], provenance: dict[str, Any],
+) -> bool:
+    return _proven_claude_pre_result_failure_before_review(
+        receipt, provenance, auth_401=True,
     )
 
 
@@ -1988,6 +2223,10 @@ def _validated_review_role_evidence(
             result is None
             and _proven_grok_historical_cli_pre_result(receipt, provenance)
         ),
+        "pre_result_auth_failure_verified": (
+            result is None
+            and _proven_claude_auth_failure_before_review(receipt, provenance)
+        ),
     }
 
 
@@ -2117,6 +2356,7 @@ def _iter_pinned_review_job_directories(
             errors.append("decision_review_jobs_root_invalid")
             return
         names: list[tuple[str, int, int]] = []
+        original_root_entries: dict[str, tuple[int, int]] = {}
         # Child writes do not advance the jobs root mtime. Revalidate each
         # processed child's pinned directory identity after the whole scan.
         inspected_children: list[tuple[str, tuple[int, ...], tuple[Any, ...]]] = []
@@ -2124,6 +2364,14 @@ def _iter_pinned_review_job_directories(
         with os.scandir(root_fd) as entries:
             for entry in entries:
                 seen += 1
+                try:
+                    initial_entry_stat = entry.stat(follow_symlinks=False)
+                except OSError:
+                    errors.append("decision_review_job_inventory_unverifiable")
+                    return
+                original_root_entries[entry.name] = (
+                    initial_entry_stat.st_dev, initial_entry_stat.st_ino,
+                )
                 if seen > MAX_JOB_DIRECTORIES:
                     errors.append("decision_review_job_inventory_truncated")
                     return
@@ -2361,12 +2609,63 @@ def _iter_pinned_review_job_directories(
         ) != (
             after.st_dev, after.st_ino, after.st_mtime_ns, after.st_ctime_ns,
         ):
-            errors.append("decision_review_jobs_root_changed")
+            # New jobs can legitimately register during the long read-only scan.
+            # Retry the ENTIRE reconciliation only for a proven monotonic
+            # addition; removals, replacement inodes and permissions changes
+            # remain contradictory evidence and must stay blocking.
+            try:
+                # os.scandir(fd) duplicates a descriptor sharing the kernel
+                # directory offset. The initial scan exhausted root_fd; a
+                # second scandir(root_fd) would see an empty directory.
+                fresh_fd = os.open(root, dir_flags)
+                try:
+                    fresh_root = os.fstat(fresh_fd)
+                    if (
+                        fresh_root.st_dev != root_stat.st_dev
+                        or fresh_root.st_ino != root_stat.st_ino
+                    ):
+                        errors.append("decision_review_jobs_root_changed")
+                        return
+                    with os.scandir(fresh_fd) as entries:
+                        current_entries = {
+                            entry.name: entry.stat(follow_symlinks=False)
+                            for entry in entries
+                        }
+                finally:
+                    os.close(fresh_fd)
+            except OSError:
+                errors.append("decision_review_jobs_root_changed")
+                return
+            added_names = set(current_entries) - set(original_root_entries)
+            unchanged = all(
+                name in current_entries and (
+                    current_entries[name].st_dev, current_entries[name].st_ino,
+                ) == identity
+                for name, identity in original_root_entries.items()
+            )
+            additions_are_new_private_jobs = bool(added_names) and all(
+                _UNIT_RE.fullmatch(name) is not None
+                and stat.S_ISDIR(current_entries[name].st_mode)
+                and current_entries[name].st_uid == os.geteuid()
+                and not (stat.S_IMODE(current_entries[name].st_mode) & 0o077)
+                for name in added_names
+            )
+            if (
+                root_stat.st_dev == after.st_dev
+                and root_stat.st_ino == after.st_ino
+                and root_stat.st_uid == after.st_uid
+                and root_stat.st_mode == after.st_mode
+                and unchanged
+                and additions_are_new_private_jobs
+            ):
+                errors.append("decision_review_jobs_root_addition_race")
+            else:
+                errors.append("decision_review_jobs_root_changed")
     finally:
         os.close(root_fd)
 
 
-def reconcile(
+def _reconcile_once(
     *,
     repo: str,
     pr: int,
@@ -2436,7 +2735,6 @@ def reconcile(
         root, errors, metadata_budget, expected=expected,
         unbound_stdout_budget=unbound_stdout_budget,
     )
-    review_attempt_count = 0
     with closing(iterator):
         for directory, directory_fd in iterator:
             raw_targets_pr_head = False
@@ -2470,12 +2768,10 @@ def reconcile(
                     _raw_binding_targets_pr_head(raw_review_binding, expected)
                     or _raw_binding_targets_pr_head(raw_origin_binding, expected)
                 )
-                if raw_review_binding is not None or raw_origin_binding is not None:
-                    review_attempt_count += 1
-                    if review_attempt_count > MAX_BOUND_REVIEW_JOBS:
-                        errors.append("decision_review_attempt_inventory_truncated")
-                        attempts = []
-                        break
+                # Do not cap the number of unrelated historic review attempts:
+                # _iter_pinned_review_job_directories and the aggregate
+                # metadata budget already guarantee a finite authenticated
+                # full scan, including a later same-revision REJECT.
                 metadata, binding, provenance = _validated_origin_binding(
                     directory, raw_metadata=raw_metadata, parent_fd=directory_fd,
                     expected=expected,
@@ -2529,6 +2825,9 @@ def reconcile(
                 "review_provider_family": None,
                 "independence_verified": False,
                 "review_role_receipt_sha256": None,
+                "pre_result_quota_failure_verified": False,
+                "pre_result_cli_failure_verified": False,
+                "pre_result_auth_failure_verified": False,
                 "diff_identity_deferred": False,
             }
             if binding["base_sha"] != expected["base_sha"]:
@@ -2668,6 +2967,7 @@ def reconcile(
                         and (
                             role_evidence.get("pre_result_quota_failure_verified") is True
                             or role_evidence.get("pre_result_cli_failure_verified") is True
+                            or role_evidence.get("pre_result_auth_failure_verified") is True
                         )
                         and attempt["terminal_status"] in _PRE_RESULT_INFRASTRUCTURE_STATUSES
                         and attempt["terminal_status"] == "failed"
@@ -2678,6 +2978,9 @@ def reconcile(
                         )
                         attempt["pre_result_cli_failure_verified"] = (
                             role_evidence.get("pre_result_cli_failure_verified") is True
+                        )
+                        attempt["pre_result_auth_failure_verified"] = (
+                            role_evidence.get("pre_result_auth_failure_verified") is True
                         )
                     else:
                         attempt["classification"] = "invalid_result"
@@ -2735,9 +3038,10 @@ def reconcile(
             if (
                 infrastructure_attempt.get("pre_result_quota_failure_verified") is True
                 or infrastructure_attempt.get("pre_result_cli_failure_verified") is True
+                or infrastructure_attempt.get("pre_result_auth_failure_verified") is True
             ):
-                # Only authenticated, pre-semantic infrastructure failures can
-                # use this same-family cross-slot replacement, never rejections.
+                # Only authenticated pre-semantic failures can be superseded
+                # by a later independent PASS from the same provider family.
                 family = infrastructure_attempt.get("review_provider_family")
                 eligible_passes = [
                     item for item in global_independent_passes
@@ -2755,6 +3059,7 @@ def reconcile(
             and all(
                 item.get("pre_result_quota_failure_verified") is True
                 or item.get("pre_result_cli_failure_verified") is True
+                or item.get("pre_result_auth_failure_verified") is True
                 for item in infrastructure
             )
         )
@@ -2821,6 +3126,9 @@ def reconcile(
                 "review_provider_family",
                 "independence_verified",
                 "review_role_receipt_sha256",
+                "pre_result_quota_failure_verified",
+                "pre_result_cli_failure_verified",
+                "pre_result_auth_failure_verified",
                 "diff_identity_deferred",
             )
         }
@@ -2853,3 +3161,44 @@ def reconcile(
             "absence_of_same_uid_out_of_band_file_tampering",
         ],
     }
+
+def reconcile(
+    *,
+    repo: str,
+    pr: int,
+    head_sha: str,
+    base_sha: str,
+    diff_sha256: str,
+    equivalent_diff_sha256s: list[str] | tuple[str, ...] | None = None,
+    defer_diff_identity: bool = False,
+    jobs_root: Path | None = None,
+) -> dict[str, Any]:
+    """Bounded fresh full rescans for monotonic concurrent job registrations.
+
+    Only missing slots and documented pre-result infrastructure debt may be
+    superseded by a complete new snapshot. Never discard a material REJECT,
+    malformed provenance or changed/remapped prior directory. Three racing
+    scans without stability remain a hard block, never a presumed PASS.
+    """
+    result: dict[str, Any] = {}
+    for _ in range(3):
+        result = _reconcile_once(
+            repo=repo, pr=pr, head_sha=head_sha, base_sha=base_sha,
+            diff_sha256=diff_sha256,
+            equivalent_diff_sha256s=equivalent_diff_sha256s,
+            defer_diff_identity=defer_diff_identity, jobs_root=jobs_root,
+        )
+        errors = result.get("errors", [])
+        if "decision_review_jobs_root_addition_race" not in errors:
+            return result
+        if any(
+            error != "decision_review_jobs_root_addition_race"
+            and not error.startswith((
+                "decision_review_slot_without_pass:",
+                "decision_review_named_provider_slot_without_independent_pass:",
+                "decision_review_infrastructure_not_superseded:",
+            ))
+            for error in errors
+        ):
+            return result
+    return result
