@@ -91,7 +91,17 @@ def _managed_repository_identity(
         root / ".grabowski-worktrees",
         root / ("." + repository_name + "-worktrees"),
     }
-    if real != canonical and real.parent not in worktrees:
+    # _agent_execution_source_request creates AEF checkouts beside the
+    # canonical repo using _agent_execution_slug(repo.name, maximum=16).
+    # This admits that source layout, not mutable lane/lease authority: signed
+    # historical reviews must remain verifiable after regular lane release.
+    aef_repo_slug = re.sub(r"[^a-z0-9]+", "-", repository_name.lower()).strip("-")
+    aef_repo_slug = (aef_repo_slug or "source")[:16].rstrip("-") or "source"
+    aef_checkout = real.parent == root and re.fullmatch(
+        re.escape(f".grabowski-aef-{aef_repo_slug}-") + r"[0-9a-f]{12}",
+        real.name,
+    ) is not None
+    if real != canonical and real.parent not in worktrees and not aef_checkout:
         raise provenance.ReviewExecutionRejected("review source not a managed checkout")
     if common != (canonical / ".git").resolve(strict=True):
         raise provenance.ReviewExecutionRejected("review source Git common-dir mismatch")
