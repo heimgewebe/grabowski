@@ -1925,22 +1925,22 @@ def _assert_prior_first_party_material_findings_resolved(
                     )
                     if legacy_history_only and not isinstance(old.get("worktree"), str):
                         raise ReviewExecutionRejected("previous signed review worktree invalid")
+                    old_binding = _first_party_binding(candidate)
                     if "canonical_diff_sha256" not in session:
-                        # The legacy fallback has no current first-party batch.
-                        # Inspect the signed registry first: unrelated history
-                        # must not require the target revision to be checked out.
+                        # The legacy fallback must check the signed historical
+                        # checkout against ITS authenticated repository spelling.
+                        # The current caller may be a case alias of that origin.
                         from grabowski_self_review_producer import _current_source
 
                         session["source_raw_diff_sha256"] = _current_source(
-                            historical_repository, decisive,
+                            historical_repository, old_binding,
                         )
                         session["canonical_diff_sha256"] = hashlib.sha256(
-                            _first_party_diff(historical_repository, decisive)
+                            _first_party_diff(historical_repository, old_binding)
                         ).hexdigest()
                         session["changed_paths"] = _first_party_changed_paths(
-                            historical_repository, decisive,
+                            historical_repository, old_binding,
                         )
-                    old_binding = _first_party_binding(candidate)
                     if (
                         old.get("schema_version") != 1
                         or old.get("binding_sha256") != _digest(old_binding)

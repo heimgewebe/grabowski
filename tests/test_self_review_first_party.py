@@ -1444,6 +1444,13 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
                 [], captain._signed_first_party_material_history_errors(binding),
                 "a genuinely later signed resolution must clear the exact finding",
             )
+            for alias in ("heimgewebe/Grabowski", "Heimgewebe/grabowski", "HEIMGEWEBE/Grabowski"):
+                self.assertEqual(
+                    [], captain._signed_first_party_material_history_errors({
+                        **binding, "repository": alias,
+                    }),
+                    "a signed resolution must also clear the same GitHub repository under case aliases",
+                )
 
     def test_signed_mixed_case_historical_repository_reject_and_resolution(self) -> None:
         # The original record is genuinely signed for a managed mixed-case
