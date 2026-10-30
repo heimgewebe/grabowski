@@ -137,6 +137,50 @@ class NixStoreSandboxTests(unittest.TestCase):
                 with self.assertRaisesRegex(sandbox.AgentSandboxError, "non-writable"):
                     sandbox._trusted_nix_store()
 
+    def test_nixos_ca_bundle_requires_trusted_immutable_store_target(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            store = root / "nix" / "store"
+            store.mkdir(parents=True)
+            trusted_ca = store / "trusted-ca.crt"
+            trusted_ca.write_text("test-only root certificate", encoding="utf-8")
+            link = root / "ca-certificates.crt"
+            link.symlink_to(trusted_ca)
+            self.assertEqual(
+                sandbox._trusted_nixos_ca_bundle(store, link), trusted_ca
+            )
+            self.assertIsNone(sandbox._trusted_nixos_ca_bundle(None, link))
+            other = root / "mutable-ca.crt"
+            other.write_text("outside immutable store", encoding="utf-8")
+            link.unlink()
+            link.symlink_to(other)
+            self.assertIsNone(sandbox._trusted_nixos_ca_bundle(store, link))
+            link.unlink()
+            self.assertIsNone(sandbox._trusted_nixos_ca_bundle(store, link))
+
+    def test_nixos_ca_bundle_readonly_environment_without_writable_overlay(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            worktree = root / "worktree"
+            worktree.mkdir()
+            store = root / "nix" / "store"
+            store.mkdir(parents=True)
+            ca_bundle = store / "trusted-ca.crt"
+            ca_bundle.write_text("test-only root certificate", encoding="utf-8")
+            with (
+                mock.patch.object(sandbox, "_trusted_nix_store", return_value=store),
+                mock.patch.object(
+                    sandbox, "_trusted_nixos_ca_bundle", return_value=ca_bundle
+                ),
+            ):
+                argv = sandbox.minimal_sandbox_argv(
+                    workspace=worktree, command=["/usr/bin/true"],
+                    workspace_writable=False,
+                )
+            triples = [argv[index:index + 3] for index in range(len(argv) - 2)]
+            self.assertIn(["--setenv", "SSL_CERT_FILE", str(ca_bundle)], triples)
+            self.assertNotIn(["--bind", str(ca_bundle), str(ca_bundle)], triples)
+
     def test_fixed_store_is_bound_read_only_without_a_write_overlay(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             worktree = Path(raw) / "repo"
