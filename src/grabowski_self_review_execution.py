@@ -67,7 +67,10 @@ FIRST_PARTY_REVIEW_ROOT = (
     Path.home() / ".local/state/grabowski/first-party-self-reviews"
 )
 FIRST_PARTY_SESSION_TTL_SECONDS = 24 * 60 * 60
-FIRST_PARTY_MAX_DIFF_BYTES = 1024 * 1024
+FIRST_PARTY_MAX_DIFF_BYTES = 32 * 1024 * 1024
+FIRST_PARTY_MAX_CHANGED_PATHS = 4096
+# Only signed session inventories may exceed the standard per-record cap.
+FIRST_PARTY_MAX_SESSION_BYTES = 512 * 1024
 FIRST_PARTY_MAX_READ_BYTES = 256 * 1024
 FIRST_PARTY_MAX_READ_LINES = 1000
 FIRST_PARTY_SESSION_KIND = "grabowski_first_party_semantic_review_session_v1"
@@ -973,8 +976,13 @@ def _write_signed_record(
 
 def _read_signed_record(
     path: Path, *, signers: Path, root_owned_signers: bool,
-    max_bytes: int = MAX_RECEIPT,
+    max_bytes: int | None = None,
 ) -> dict[str, Any]:
+    if max_bytes is None:
+        max_bytes = (
+            FIRST_PARTY_MAX_SESSION_BYTES
+            if path.name == "session.json" else MAX_RECEIPT
+        )
     parent_fd = _private_dir(path.parent)
     try:
         material = _private_read(
@@ -1130,7 +1138,7 @@ def _first_party_changed_paths(
     except UnicodeError as exc:
         raise ReviewExecutionRejected("first-party changed path encoding invalid") from exc
     if (
-        not 1 <= len(paths) <= 256
+        not 1 <= len(paths) <= FIRST_PARTY_MAX_CHANGED_PATHS
         or len(paths) != len(set(paths))
         or any(
             not path or len(path) > 512 or ".." in Path(path).parts
@@ -1254,6 +1262,7 @@ def start_first_party_review_session(
             _ensure_private_state_directory(staged_root / "axes")
             receipt_sha256, signature_sha256 = _write_signed_record(
                 staged_root / "session.json", session, key=key, signers=signers,
+                max_bytes=FIRST_PARTY_MAX_SESSION_BYTES,
             )
             _read_signed_record(
                 staged_root / "session.json", signers=signers,
