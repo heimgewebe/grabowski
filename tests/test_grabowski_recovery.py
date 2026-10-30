@@ -1058,6 +1058,11 @@ class NativeNixOSResticProofTests(unittest.TestCase):
             # older snapshot solely because its realtime timestamp is higher.
             ("crossboot_no_cursor_ambiguous",
              clean + [newer_clock_rollback], postboot(), False),
+            ("crossboot_later_backdated_outside_since",
+             cursor_clean + [with_cursor(manager(
+                 "start", (self.now - recovery.MAX_AGE_SECONDS - 60) * 1_000_000,
+                 1_000_000, _BOOT_ID="c" * 32, INVOCATION_ID="f" * 32,
+             ), 13)], postboot(), False),
             ("crossboot_later_failed_cursor",
              cursor_clean + [with_cursor(newer_clock_rollback, 13)],
              postboot(), False),
@@ -1105,9 +1110,18 @@ class NativeNixOSResticProofTests(unittest.TestCase):
                 if argv[0].endswith("/systemctl"):
                     return {"returncode": 0, "stdout": unit_output}
                 if argv[0].endswith("/journalctl"):
+                    # Simulate journald's actual --since realtime truncation.
+                    # A later boot can have an earlier wall clock.
+                    available = events
+                    if "--since" in argv:
+                        since = int(argv[argv.index("--since") + 1].lstrip("@"))
+                        available = [
+                            event for event in events
+                            if int(event["__REALTIME_TIMESTAMP"]) >= since * 1_000_000
+                        ]
                     return {
                         "returncode": 0,
-                        "stdout": "\n".join(json.dumps(event) for event in events) + "\n",
+                        "stdout": "\n".join(json.dumps(event) for event in available) + "\n",
                     }
                 raise AssertionError(f"unexpected execution: {argv}")
 
@@ -1122,7 +1136,7 @@ class NativeNixOSResticProofTests(unittest.TestCase):
                 self.assertEqual(evidence["service_start_unix"], self.now - 90)
                 self.assertEqual(evidence["service_exit_unix"], self.now - 29)
                 self.assertEqual(len(seen), 2)
-                self.assertIn("--since", seen[1])
+                self.assertNotIn("--since", seen[1])
             else:
                 self.assertFalse(evidence["valid"])
 

@@ -1980,7 +1980,8 @@ def _nixos_completed_backup_from_persistent_journal(now: int) -> dict[str, Any] 
     journal = operator._run(
         ["/run/current-system/sw/bin/journalctl", "--system", "--no-pager",
          "--output=json", "-u", unit,
-         "--since", f"@{max(1, now - MAX_AGE_SECONDS)}",
+         # Do not prefilter by realtime: a newer boot can have an older clock.
+         # The latest 128 journal matches establish order before age checks.
          "--grep", r"^(Starting restic-backups-heim-pc\.service\.\.\.|Finished restic-backups-heim-pc\.service\.|snapshot [0-9a-f]{8,64} saved)$",
          "-n", "128"],
         cwd=operator.HOME, timeout_seconds=30, max_output_bytes=65536,
