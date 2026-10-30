@@ -25,6 +25,11 @@ BINDING_SCHEMA_VERSION = 1
 RESULT_KIND = "grabowski_decision_bound_review_result"
 RESULT_SCHEMA_VERSION = 1
 RESULT_PREFIX = "GRABOWSKI_DECISION_REVIEW_V1="
+# Match str.splitlines() after UTF-8 decoding with errors="replace", as used
+# by _parse_result_marker. Scan the raw bytes so marker budgets stay in bytes.
+_STDOUT_LINE_SEPARATOR_RE = re.compile(
+    rb"\r\n|[\n\r\v\f\x1c-\x1e]|\xc2\x85|\xe2\x80[\xa8\xa9]"
+)
 # Full scan (including late material REJECTs) is already bounded by all job
 # directories and aggregate metadata bytes; an extra global review-attempt
 # cap cannot safely terminate an unrelated PR before the full scan completes.
@@ -731,6 +736,7 @@ def _unbound_stdout_has_target_result(
         maybe_marker = True
         found = False
         read_size = 0
+        separator_carry = b""
 
         def exact_target_marker(candidate: bytearray) -> bool:
             if not candidate.startswith(prefix):
@@ -746,13 +752,23 @@ def _unbound_stdout_has_target_result(
             )
 
         while True:
-            chunk = os.read(fd, 65536)
-            if not chunk:
-                break
-            read_size += len(chunk)
+            raw_chunk = os.read(fd, 65536)
+            read_size += len(raw_chunk)
             if read_size > before.st_size:
                 raise ValueError("unbound stdout grew during inspection")
-            fragments = chunk.split(b"\n")
+            chunk = separator_carry + raw_chunk
+            separator_carry = b""
+            if raw_chunk:
+                # Retain only a possible unfinished CRLF/NEL/LS/PS boundary.
+                # At EOF, flush it unchanged: an incomplete UTF-8 sequence is
+                # ordinary data, while a trailing CR is itself a boundary.
+                if chunk.endswith(b"\xe2\x80"):
+                    separator_carry = chunk[-2:]
+                elif chunk.endswith((b"\r", b"\xc2", b"\xe2")):
+                    separator_carry = chunk[-1:]
+                if separator_carry:
+                    chunk = chunk[:-len(separator_carry)]
+            fragments = _STDOUT_LINE_SEPARATOR_RE.split(chunk)
             for index, fragment in enumerate(fragments):
                 if maybe_marker:
                     line.extend(fragment)
@@ -766,6 +782,8 @@ def _unbound_stdout_has_target_result(
                         found = True
                     line.clear()
                     maybe_marker = True
+            if not raw_chunk:
+                break
         if maybe_marker and exact_target_marker(line):
             found = True
         after = os.fstat(fd)
