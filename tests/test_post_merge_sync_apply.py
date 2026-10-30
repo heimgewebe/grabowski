@@ -2415,6 +2415,45 @@ class PostMergeSyncApplyTests(unittest.TestCase):
             self.assertIn(f"path:{repo}", result["resource_keys"])
             self.assertIn(f"path:{repo / '.git'}", result["resource_keys"])
 
+    def test_bureau_main_uses_contract_bounded_worktree_admin_ttl(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, remote, base, target = self.fixture(Path(tmp))
+            leases = LeaseHarness()
+            ttl_observed: list[int] = []
+            self.assertEqual(sync_apply.LEASE_TTL_SECONDS, sync_apply._lease_ttl_seconds(repo))
+
+            def bounded_acquire(
+                owner_id: str,
+                resource_keys: list[str],
+                *,
+                purpose: str,
+                ttl_seconds: int,
+                metadata: dict[str, object] | None = None,
+                _work_admission_mode: str = "normal",
+            ) -> dict[str, object]:
+                ttl_observed.append(ttl_seconds)
+                return leases.acquire(
+                    owner_id,
+                    resource_keys,
+                    purpose=purpose,
+                    ttl_seconds=ttl_seconds,
+                    metadata=metadata,
+                    _work_admission_mode=_work_admission_mode,
+                )
+
+            with (
+                patch.object(sync_apply.bureau_leases, "BUREAU_REPOSITORY_ROOT", repo),
+                patched_leases(leases),
+                patch.object(sync_apply.resources, "acquire_resources", bounded_acquire),
+            ):
+                result = self.apply(repo, remote, base, target)
+
+            self.assertEqual("synced", result["state"])
+            self.assertEqual(
+                [sync_apply.bureau_leases.MAX_EFFECT_GATE_TTL_SECONDS], ttl_observed
+            )
+            self.assertEqual(0, len(leases.live))
+
     def test_foreign_repository_guard_conflict_blocks_before_git_effect(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo, remote, base, target = self.fixture(Path(tmp))

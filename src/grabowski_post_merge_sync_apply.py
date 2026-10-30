@@ -7,8 +7,9 @@ import re
 import secrets
 from typing import Any, Callable
 
-import grabowski_resources as resources
+import grabowski_bureau_leases as bureau_leases
 import grabowski_physical_checkout as physical_checkout
+import grabowski_resources as resources
 
 
 CommandRunner = Callable[[Path, list[str]], dict[str, Any]]
@@ -20,6 +21,13 @@ PROTECTED_BRANCHES = frozenset({"main", "master"})
 REMOTE_RE = re.compile(r"[A-Za-z0-9._-]{1,128}\Z")
 SHA_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 LEASE_TTL_SECONDS = 900
+
+
+def _lease_ttl_seconds(repo: Path) -> int:
+    """Respect the Bureau worktree-admin maximum without reducing other repo leases."""
+    if repo == bureau_leases.BUREAU_REPOSITORY_ROOT:
+        return min(LEASE_TTL_SECONDS, bureau_leases.MAX_EFFECT_GATE_TTL_SECONDS)
+    return LEASE_TTL_SECONDS
 
 
 class PostMergeSyncApplyError(RuntimeError):
@@ -680,7 +688,7 @@ def apply(
                 f"exclusive protected post-merge fast-forward "
                 f"{target_branch}@{expected_remote_head[:12]}"
             ),
-            ttl_seconds=LEASE_TTL_SECONDS,
+            ttl_seconds=_lease_ttl_seconds(repo),
             metadata={"scope_manifest": scope_manifest},
             _work_admission_mode="convergence",
         )
