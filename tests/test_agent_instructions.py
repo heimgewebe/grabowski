@@ -259,6 +259,55 @@ class AgentInstructionsTests(unittest.TestCase):
         ):
             self.assertIn(phrase, authority)
 
+    def test_selective_repoground_rule_is_optional_git_first_and_freshness_bound(self) -> None:
+        rules = dict(grabowski_mcp.AGENT_INSTRUCTION_RULES)
+        text = rules["selective-repoground-retrieval"].lower()
+        for phrase in (
+            "known file/symbol",
+            "typed git/file read first",
+            "no repoground preflight",
+            "unknown callers",
+            "impacts/tests",
+            "history/cross-repo",
+            "bounded repoground query",
+            "fresh bundle",
+            "verify citations in git",
+            "stale/unavailable/low coverage",
+            "git fallback",
+            "optional",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, text)
+        self.assertEqual(
+            grabowski_mcp.mcp._mcp_server.instructions,
+            grabowski_mcp.AGENT_INSTRUCTIONS,
+        )
+        self.assertEqual(
+            grabowski_mcp.AGENT_INSTRUCTIONS,
+            grabowski_mcp._render_agent_instructions(),
+        )
+        self.assertLessEqual(grabowski_mcp.AGENT_INSTRUCTIONS_BYTES, 4096)
+
+    def test_selective_tool_choice_does_not_weaken_mutation_boundaries(self) -> None:
+        rules = dict(grabowski_mcp.AGENT_INSTRUCTION_RULES)
+        self.assertIn(
+            "authorized goal via existing semantically narrower typed operation",
+            rules["platform-filter-narrowing"],
+        )
+        self.assertIn("if available", rules["platform-filter-narrowing"])
+        self.assertIn(
+            "Merges require expected_head_sha",
+            rules["github-connector-first"],
+        )
+        self.assertIn(
+            "End only via operator-obligation-close",
+            rules["operator-obligation-lifecycle"],
+        )
+        self.assertIn(
+            "No action/merge/deploy/secret/retry authority",
+            rules["no-authority-escalation"],
+        )
+
     def test_contract_documentation_rule_numbers_are_sequential(self) -> None:
         contract = (ROOT / "docs" / "agent-facing-contract.md").read_text(encoding="utf-8")
         numbers = [

@@ -146,7 +146,116 @@ The status may become required only when all of the following are true:
 5. The selected supersession contract has been tested across queued, cancelled, failed-before-publication, superseded and runner-unavailable executions, with no stale green status remaining merge-authoritative contrary to that contract.
 6. The signer allowlist and default-branch evaluator are protected by the resulting gate.
 7. Key rotation and key-loss recovery have a tested, auditable path.
-8. Independent high-critical/platform review requirements remain separate.
+8. High-critical review **depth** and any explicitly requested additional independent review remain separately enforced; reviewer-provider availability never substitutes for review evidence.
+
+## Current source policy v5: task provenance is distinct from a signed assertion
+
+The v4 section below records the historical policy decision; it is **not** an
+active v5 admission format. On PR #1649, high-critical evidence now requires
+five authentic, ordered and substantive semantic review phases, each bound to
+repository, PR, base, head, diff, batch, isolated execution, full role output,
+source references and findings. A canonical SHA-256 or public status signature
+alone cannot establish the origin or content of a review, and five technical
+PASS tasks are **not** five semantic review results. The issuer must verify
+genuine, read-only review-role execution receipts before signing the private
+self-review audit; Captain and the atomic merge guard must independently
+revalidate the same producer/role evidence. Historical policy-v3/v4 audits do
+not authorize policy-v5 decisions.
+
+An independent external-provider review is **optional** unless explicitly
+required for the PR. A real, unresolved material finding or trusted review
+thread remains blocking regardless of whether the reviewer was optional.
+Authenticated pre-result provider unavailability never produces a PASS and
+cannot excuse one of the five mandatory substantive phases. The source now
+also defines a provider-independent first-party controller path:
+
+1. `grabowski_self_review_session_start` consumes the existing enrolled
+   connector's fresh signed-one-call assertion and binds one unrepeatable
+   session/nonce to the private stored plan and exact Git revision.
+2. `grabowski_self_review_source_read` reads immutable Git diff or source
+   ranges in bounded chunks (at most 1,000 lines and 256 KiB per call), returning
+   their actual bytes and recording signed server-observed read receipts. The
+   five-axis audit cannot PASS unless the union of observed chunks covers every
+   line of the canonical base/head diff, including changed-file headers.
+3. `grabowski_self_review_axis_submit` accepts no caller-selected issuer or
+   provider; only the authenticated primary Grabowski connector can initiate
+   this first-party route. Each axis must actually read the canonical diff and
+   source ranges supporting at least two distinct risk assessments. Material
+   or unresolved findings make the session fail closed. New inspections and
+   submissions expire with the session; fully signed completed review evidence
+   remains verifiable afterward.
+
+`Context.client_id`, request `_meta`, free-form CLI output, report hashes and
+technical task PASS output do not enter this authority path. A present but
+incomplete or rejected first-party session is authoritative and cannot fall
+through to a model-provider PASS. When no first-party session exists, the
+existing authentic V2 catalog-role path remains byte-for-byte the semantic
+fallback. The **legacy V2 model-role path** still requires its separate, origin-bound
+isolated technical task receipts. The **first-party direct path** instead
+authenticates the five actual controller review submissions and signed Git
+source-read receipts themselves: it does **not** depend on five Grabowski
+unittest jobs or an external provider. Genuine repository-specific tests and
+required CI remain independent checks; their absence is never made into an
+invented review PASS. The first-party path supports managed heimgewebe Git
+checkouts (including other repositories such as heim-pc), with a verified
+remote/common Git directory and exact base/head/source binding.
+
+Its operational sequence is `plan-firstparty --repo ... --pr ... --base ...
+--head ... --diff ...` in the installed producer, five authenticated MCP
+`session_start / source_read / axis_submit` flows, then
+`seal-firstparty --batch-id ...`. The `--diff` digest is the canonical
+GitHub PR diff identity; the separately attested local Git diff and its
+fully observed chunks have their own independent SHA-256. Captain and Gate
+reopen the same signed per-axis evidence, reject unresolved findings and
+compare the GitHub PR identity themselves. A complete signed review remains
+valid after the submission session expires.
+
+A source commit does not itself prove deployment of these tools or authorize
+Captain merge or R3 release; the serving runtime and its root-owned public
+signer allowlist must be activated and read back. Critical release source and
+recovery contracts remain unchanged pending their post-merge evidence.
+
+## PR self-review policy v4 (2026-10-26)
+
+The PR risk tier and the independent reviewer obligation are separate contracts.
+Even `high_critical` uses a substantive, diff-bound self-review as the default;
+the classification still increases the minimum review depth and enforces all
+existing file, head, base, diff, testing, security and CI checks. A particular
+PR may explicitly require an additional independent review, but its absence due
+to provider quota, authentication or transport is **not** an automatic default.
+`pr_review_gate.py --require-independent-review` is the explicit opt-in at the
+operator gate boundary. It requires real valid independent evidence and blocks
+rather than manufacturing a PASS when that evidence is missing or invalid.
+
+For every `high_critical` change, exactly **five distinct mandatory
+method passes** form the minimum substantive review: (1) contracts and
+correctness, (2) regression and compatibility, (3) tests and negative cases,
+(4) security, authority, data and concurrency, and (5) adversarial
+countercheck. The `review_iterations` must carry these five distinct ordered
+`axis` values (`contracts_correctness`, `regression_compatibility`,
+`tests_negative_cases`, `security_authority_concurrency`,
+`adversarial_countercheck`), non-boilerplate summaries and nonempty concrete
+`evidence_refs`. Repeated methods, missing details, or four passes BLOCK;
+external reviewer unavailability never substitutes for one of the five.
+The private audit retains the exact method axes and a SHA-256 over the
+individual review-iteration records; Captain revalidates both and the
+real head/base/diff binding before an atomic merge decision.
+
+Genuine material findings must be resolved or disproven, not waived by a generic
+`residual_risk.accepted`. PR-specific unresolved review threads and Captain
+authorization continue to be evaluated by Captain and the atomic merge guard;
+the standalone status gate does not confer merge authority.
+
+The signed public status and private audit bind policy version 4. Historic
+version 3 audits/statuses cannot authorize a new policy-v4 decision. Historical
+records remain immutable and available as evidence for the former policy.
+
+**Release safety:** An independent-review-required boolean is not a
+classification of critical *release source*. Do not deploy this policy change
+without the separately migrated explicit release-risk admission contract:
+post-merge source/CI, integrity, recovery evidence and Captain session authority
+remain mandatory for critical deployments. This source-only change does not
+authorize any release, merge or GitHub Ruleset bypass.
 
 ## Operational commands
 

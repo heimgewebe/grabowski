@@ -97,7 +97,9 @@ TASK_TERMINALIZATION_RECOVERY_CURSOR_METADATA_KEY = (
     "task_terminalization_recovery_cursor_v1"
 )
 TASK_TERMINALIZATION_RECOVERY_CURSOR_VERSION = 1
-GRABOWSKI_RUNTIME_PYTHON = operator.HOME / ".local/share/grabowski-mcp/.venv/bin/python"
+# Use the interpreter running this immutable Grabowski operator.
+# Retired /usr/bin/python3.10 venvs must not block the reserved executor on NixOS.
+GRABOWSKI_RUNTIME_PYTHON = Path(sys.executable)
 GRABOWSKI_REPOSITORY_SLUG = "heimgewebe/grabowski"
 MANAGED_BUILD_RESOLVER = (
     operator.HOME / ".local/lib/heim-pc/managed-build/scripts/managed_build.py"

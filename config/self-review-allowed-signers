@@ -1,0 +1,4 @@
+# Root-owned after Nix packaging: dedicated server execution provenance signer.
+# The private Ed25519 key is stored only on heim-pc, outside all repositories.
+# Signing namespace is distinct from review-evidence v2 and cannot cross-authorize.
+grabowski-review-gate@heimgewebe namespaces="self-review-phase@grabowski.heimgewebe" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPfrhjKahMhHpTplfB6sfHqPUYuC5KMIMPDoDTTjSHDs grabowski-selfreview-phase
