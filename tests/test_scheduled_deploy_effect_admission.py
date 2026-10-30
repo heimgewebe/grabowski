@@ -400,6 +400,79 @@ class ScheduledWorkerGitFilterTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "dirty"):
                 worker.verify_repository(repo, repo, "canonical-main", head)
 
+    def test_root_anchored_literal_cannot_launder_nested_file(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="worker-eol-anchor-") as dirname:
+            repo, _ = self.make_repo(Path(dirname))
+            nested = repo / "nested"
+            nested.mkdir()
+            target = nested / "notes.txt"
+            target.write_bytes(b"original\n")
+            (repo / ".gitattributes").write_text(
+                "/notes.txt text eol=crlf\n", encoding="utf-8"
+            )
+            self.git(repo, "add", ".gitattributes", "nested/notes.txt")
+            self.git(repo, "commit", "-qm", "Root anchored CRLF rule")
+            head = self.git(repo, "rev-parse", "HEAD")
+            self.git(repo, "update-ref", "refs/remotes/origin/main", head)
+            target.write_bytes(b"original\r\n")
+            (repo / ".git" / "info" / "attributes").write_text(
+                "nested/notes.txt text eol=crlf\n", encoding="utf-8"
+            )
+            self.assertNotEqual(
+                self.git(repo, "status", "--porcelain=v1", "--untracked-files=normal"), ""
+            )
+            with self.assertRaisesRegex(RuntimeError, "dirty"):
+                worker.verify_repository(repo, repo, "canonical-main", head)
+
+    def test_root_anchored_glob_cannot_launder_nested_file(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="worker-eol-anchor-glob-") as dirname:
+            repo, _ = self.make_repo(Path(dirname))
+            nested = repo / "nested"
+            nested.mkdir()
+            target = nested / "notes.txt"
+            target.write_bytes(b"original\n")
+            (repo / ".gitattributes").write_text(
+                "/*.txt text eol=crlf\n", encoding="utf-8"
+            )
+            self.git(repo, "add", ".gitattributes", "nested/notes.txt")
+            self.git(repo, "commit", "-qm", "Root anchored CRLF glob")
+            head = self.git(repo, "rev-parse", "HEAD")
+            self.git(repo, "update-ref", "refs/remotes/origin/main", head)
+            target.write_bytes(b"original\r\n")
+            (repo / ".git" / "info" / "attributes").write_text(
+                "nested/notes.txt text eol=crlf\n", encoding="utf-8"
+            )
+            self.assertNotEqual(
+                self.git(repo, "status", "--porcelain=v1", "--untracked-files=normal"), ""
+            )
+            with self.assertRaisesRegex(RuntimeError, "dirty"):
+                worker.verify_repository(repo, repo, "canonical-main", head)
+
+    def test_unknown_wildcard_macro_cannot_launder_crlf(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="worker-eol-wildcard-macro-") as dirname:
+            repo, _ = self.make_repo(Path(dirname))
+            nested = repo / "nested"
+            nested.mkdir()
+            target = nested / "notes.txt"
+            target.write_bytes(b"original\n")
+            (repo / ".gitattributes").write_text(
+                "*.txt text eol=crlf\n"
+                "**/*.txt binary\n", encoding="utf-8"
+            )
+            self.git(repo, "add", ".gitattributes", "nested/notes.txt")
+            self.git(repo, "commit", "-qm", "Nested glob macro overrides CRLF")
+            head = self.git(repo, "rev-parse", "HEAD")
+            self.git(repo, "update-ref", "refs/remotes/origin/main", head)
+            target.write_bytes(b"original\r\n")
+            (repo / ".git" / "info" / "attributes").write_text(
+                "nested/notes.txt text eol=crlf\n", encoding="utf-8"
+            )
+            self.assertNotEqual(
+                self.git(repo, "status", "--porcelain=v1", "--untracked-files=normal"), ""
+            )
+            with self.assertRaisesRegex(RuntimeError, "dirty"):
+                worker.verify_repository(repo, repo, "canonical-main", head)
+
     def test_committed_custom_macro_cannot_launder_crlf(self) -> None:
         with tempfile.TemporaryDirectory(prefix="worker-eol-custom-macro-") as dirname:
             repo, _ = self.make_repo(Path(dirname))

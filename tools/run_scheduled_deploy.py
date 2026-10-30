@@ -803,7 +803,8 @@ def _committed_crlf_attributes(
                 # A macro definition is not a pathname assignment; its
                 # invocation below is rejected unless explicitly modeled.
                 continue
-            if pattern.startswith(b"/"):
+            anchored = pattern.startswith(b"/")
+            if anchored:
                 pattern = pattern[1:]
             unsupported = False
             if b"/" in pattern:
@@ -815,18 +816,20 @@ def _committed_crlf_attributes(
             elif pattern.startswith(b"*.") and pattern.count(b"*") == 1 and not any(
                 ch in pattern for ch in (b"?", b"[", b"]", b"\\")
             ):
-                matched = basename.endswith(pattern[1:])
+                matched = basename.endswith(pattern[1:]) and (
+                    not anchored or b"/" not in relative
+                )
             elif pattern == b"*":
-                matched = True
+                matched = not anchored or b"/" not in relative
             elif all(ch not in pattern for ch in (b"*", b"?", b"[", b"]", b"\\")):
-                matched = pattern == basename
+                matched = pattern == (relative if anchored else basename)
             else:
                 unsupported = True
                 matched = False
-            if unsupported and any(
-                token.lstrip(b"-!").split(b"=", 1)[0] in fields
-                for token in tokens[1:]
-            ):
+            if unsupported:
+                # An unmodelled glob can apply arbitrary built-in or custom
+                # macros (such as "binary" -> -text). Conservatively reject
+                # CRLF normalization, even for tokens outside known fields.
                 return None
             if not matched:
                 continue
