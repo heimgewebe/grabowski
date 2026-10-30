@@ -1949,12 +1949,13 @@ def _assert_prior_first_party_material_findings_resolved(
             # Every historical session has now been signature/source verified.
             # A later independently signed resolution may clear earlier debt;
             # an earlier resolution cannot cancel a newly signed REJECT.
+            # Second-resolution timestamps cannot prove ordering within a tie.
             for identity, rejected_at in unresolved_latest.items():
                 axis, finding_id, severity = identity
                 current = current_axes.get(axis)
                 current_resolves = (
                     current is not None
-                    and current["submitted_at_unix"] >= rejected_at
+                    and current["submitted_at_unix"] > rejected_at
                     and any(
                         observed["id"] == finding_id
                         and observed["severity"] == severity
@@ -2033,11 +2034,16 @@ def submit_first_party_axis_review(
             report, axis=axis, reads=reads, binding=session["binding"],
             prior_observations=prior_observations,
         )
+        # A request may wait before acquiring this lock. Record its submission
+        # time under the publication lock, rather than at request arrival.
+        submitted_at = int(time.time()) if now_unix is None else now_unix
+        if not session["created_at_unix"] <= submitted_at <= session["expires_at_unix"]:
+            raise ReviewExecutionRejected("first-party session expired before axis publication")
         record = {
             "schema_version": 1, "kind": FIRST_PARTY_AXIS_KIND,
             "session_id": session_id, "binding_sha256": session["binding_sha256"],
             "axis": axis, "report": normalized, "report_sha256": _digest(normalized),
-            "issuer": authenticated, "submitted_at_unix": observed_at,
+            "issuer": authenticated, "submitted_at_unix": submitted_at,
         }
         axis_path = session_root / "axes" / (axis + ".json")
         if axis_path.exists():
@@ -2549,6 +2555,47 @@ def verified_semantic_review_passes(
         )
 
 
+def _task_review_repository(
+    reference: Any, binding: dict[str, Any], *, receipts: Path, signers: Path,
+) -> Path:
+    """Recover a First-Party worktree from a signed task receipt, never the audit."""
+    if (
+        not isinstance(reference, dict)
+        or not isinstance(reference.get("id"), str)
+        or ID.fullmatch(reference["id"]) is None
+    ):
+        raise ReviewExecutionRejected("self-review receipt identity invalid")
+    descriptor = _private_dir(receipts)
+    try:
+        material = _private_read(descriptor, reference["id"] + ".json", limit=MAX_RECEIPT)
+        signature = _private_read(descriptor, reference["id"] + ".sig", limit=16384)
+    finally:
+        os.close(descriptor)
+    if (
+        hashlib.sha256(material).hexdigest() != reference.get("receipt_sha256")
+        or hashlib.sha256(signature).hexdigest() != reference.get("signature_sha256")
+    ):
+        raise ReviewExecutionRejected("self-review private receipt bytes changed")
+    _check_signature(material, signature, signers)
+    record = _json_record(material)
+    if record.get("binding") != binding:
+        raise ReviewExecutionRejected("self-review signed binding mismatch")
+    if record.get("semantic_first_party") is None:
+        return Path.home() / "repos/grabowski"
+    worktree = record.get("worktree_path")
+    if (
+        not isinstance(worktree, str) or not worktree.startswith("/")
+        or ".." in Path(worktree).parts
+    ):
+        raise ReviewExecutionRejected("self-review signed worktree invalid")
+    from grabowski_self_review_producer import _managed_repository_identity
+
+    repository, _slug = _managed_repository_identity(
+        Path(worktree), expected_repo=binding["repo"],
+    )
+    return repository
+
+
 def _verify(
     audit: dict[str, Any],
     *,
@@ -2655,8 +2702,11 @@ def _verify(
                     "direct first-party audit proof differs from signed records"
                 )
         return
+    signer = _allowed_signers(signers, root_owned=root_owned_signers)
     if repository is None:
-        raise ReviewExecutionRejected("legacy self-review repository absent")
+        repository = _task_review_repository(
+            refs[0], semantic_binding, receipts=receipts, signers=signer,
+        )
     _assert_no_first_party_reject_for_legacy_review(
         semantic_binding, repository=repository, root=first_party_root,
         signers=signers, root_owned_signers=root_owned_signers,
@@ -2664,7 +2714,6 @@ def _verify(
     semantic_reviews = verified_semantic_review_passes(
         semantic_binding, repository=repository, axes_to_review=tuple(axes),
     )
-    signer = _allowed_signers(signers, root_owned=root_owned_signers)
     root_fd = _private_dir(receipts)
     seen_ids: set[str] = set()
     seen_tasks: set[str] = set()
@@ -2714,6 +2763,11 @@ def _verify(
                 expected_semantic.get("provenance_kind", "v2_model_role")
                 if isinstance(expected_semantic, dict) else None
             )
+            if (
+                semantic_kind == "first_party_authenticated_controller"
+                and record.get("worktree_path") != str(repository)
+            ):
+                raise ReviewExecutionRejected("self-review task crossed semantic worktree")
             semantic_field = (
                 "semantic_first_party"
                 if semantic_kind == "first_party_authenticated_controller"
@@ -2803,16 +2857,9 @@ def review_receipt_errors(
     no serialized audit field can select a signer, state root, or checkout.
     """
     try:
-        direct = (
-            isinstance(audit, dict)
-            and audit.get("review_origin") == FIRST_PARTY_AUDIT_ORIGIN
-        )
-        repository = _repository
-        if repository is None and not direct:
-            repository = Path.home() / "repos/grabowski"
         _verify(
             audit, receipts=_receipts, outcomes=OUTCOME_ROOT,
-            signers=_signers, repository=repository,
+            signers=_signers, repository=_repository,
             now_unix=int(time.time()) if _now_unix is None else _now_unix,
             root_owned_signers=_root_owned_signers,
             first_party_root=_first_party_root,

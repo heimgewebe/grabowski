@@ -974,11 +974,14 @@ def seal_review(
     phase_reports: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Production entrypoint: no caller-selected signer or evidence roots."""
+    worktree = plan.get("worktree") if isinstance(plan, dict) else None
+    if not isinstance(worktree, str) or not worktree.startswith("/"):
+        raise provenance.ReviewExecutionRejected("review source worktree invalid")
     return _seal_review(
         plan, task_ids, phase_reports,
         key=SIGNING_KEY, signers=SIGNERS, receipts=RECEIPTS,
         task_db=TASK_DB, outcomes=OUTCOMES, capture_root=CAPTURE_ROOT,
-        repository=CANONICAL_REPO, root_owned_signers=True,
+        repository=Path(worktree), root_owned_signers=True,
     )
 
 

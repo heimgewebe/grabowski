@@ -1048,6 +1048,7 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
         for number, axis in enumerate(review.REQUIRED_AXES, 1):
             self._submit_axis(started_a, axis, number, reject=number == 1)
 
+        self.now += 1  # Signed second-resolution timestamps must prove later ordering.
         plan_b = self._first_party_plan()
         started_b = self._start_plan(plan_b)
         for number, axis in enumerate(review.REQUIRED_AXES, 1):
@@ -1057,6 +1058,37 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
             )
         audit_b, receipts_b = self._seal_direct(plan_b)
         self.assertEqual([], self._receipt_errors(audit_b, receipts_b))
+
+    def test_same_second_resolution_cannot_clear_prior_signed_reject(self) -> None:
+        rejected = self._start_plan(self._first_party_plan())
+        self._submit_axis(rejected, review.REQUIRED_AXES[0], 1, reject=True)
+        plan = self._first_party_plan()
+        started = self._start_plan(plan)
+        for number, axis in enumerate(review.REQUIRED_AXES, 1):
+            self._submit_axis(
+                started, axis, number,
+                resolve_ids=("material-1",) if number == 1 else (),
+            )
+        with self.assertRaisesRegex(review.ReviewExecutionRejected, "previous signed material"):
+            self._seal_direct(plan)
+
+    def test_same_second_reject_invalidates_already_sealed_resolution(self) -> None:
+        plan = self._first_party_plan()
+        started = self._start_plan(plan)
+        for number, axis in enumerate(review.REQUIRED_AXES, 1):
+            self._submit_axis(
+                started, axis, number,
+                resolve_ids=("material-1",) if number == 1 else (),
+            )
+        audit, receipts = self._seal_direct(plan)
+        self.assertEqual([], self._receipt_errors(audit, receipts))
+
+        rejected = self._start_plan(self._first_party_plan())
+        self._submit_axis(rejected, review.REQUIRED_AXES[0], 1, reject=True)
+        self.assertTrue(
+            self._receipt_errors(audit, receipts),
+            "a signed REJECT must dominate a resolution with the same timestamp",
+        )
 
     def test_previous_signed_reject_is_scoped_to_original_revision(self) -> None:
         plan_a = self._first_party_plan()
