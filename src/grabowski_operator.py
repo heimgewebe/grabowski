@@ -3273,6 +3273,32 @@ def _install_deployment_admission_gate() -> None:
                 tool=tool,
                 transport_arguments=arguments,
             )
+            domain_original = original
+            if tool_name in {
+                "grabowski_self_review_session_start",
+                "grabowski_self_review_source_read",
+                "grabowski_self_review_axis_submit",
+            }:
+                # The outer gate already consumed this request's real MAC.
+                # Pass its server-owned proof through the actual worker call;
+                # a second inner consume would be classified as a replay.
+                if (
+                    not isinstance(transport_evidence, dict)
+                    or transport_evidence.get("state") != "consumed"
+                    or transport_evidence.get("transport_mode") != "signed-one-call-v1"
+                    or transport_evidence.get("tool_name") != tool_name
+                ):
+                    raise RuntimeError(
+                        "first-party review requires consumed signed ingress"
+                    )
+
+                async def first_party_domain_original(
+                    *inner_args: Any, **inner_kwargs: Any,
+                ) -> Any:
+                    with base._first_party_preconsumed_transport(transport_evidence):
+                        return await original(*inner_args, **inner_kwargs)
+
+                domain_original = first_party_domain_original
             (
                 admission_transport_evidence,
                 replay_reentry_runtime_sha256,
@@ -3372,7 +3398,7 @@ def _install_deployment_admission_gate() -> None:
                         call_extra_args = ()
                     worker_future = _submit_sync_tool_call(
                         call_runner,
-                        original,
+                        domain_original,
                         args,
                         kwargs,
                         *call_extra_args,
@@ -3527,7 +3553,7 @@ def _install_deployment_admission_gate() -> None:
                         )
                     raise
             try:
-                result = await original(*args, **kwargs)
+                result = await domain_original(*args, **kwargs)
                 _record_repoground_consultation(tool_name)
             except BaseException as error:
                 if effect_admission is not None:
@@ -8459,6 +8485,9 @@ def _start_job(
     systemd_argv = [
         "systemd-run",
         "--user",
+        # Generic jobs retain a finalization receipt before systemd collection.
+        # Reserved deployments use runner-owned finalization and must stay observable.
+        *(["--collect"] if finalization_expected_head is None else []),
         f"--description={_systemd_safe_description('job', unit, metadata['argv_sha256'])}",
         "--unit",
         unit,
@@ -8554,6 +8583,27 @@ def _start_job(
         # launcher can fail or time out after systemd created the unit.  Ask
         # systemd before claiming a definitive non-start.
         dispatch_readback = _unit_dispatch_readback(unit)
+        if finalization_expected_head is None and dispatch_readback["outcome"] == "not_started":
+            # --collect can unload an already completed unit before a failed
+            # launcher readback. Only a validated finalization proves start.
+            receipt = _finalization_receipt_result(unit, metadata)
+            if receipt.get("valid") is True:
+                dispatch_readback = {
+                    **dispatch_readback,
+                    "outcome": "started",
+                    "source": "validated-finalization-receipt",
+                    "receipt_sha256": receipt["receipt_sha256"],
+                }
+            else:
+                # --collect unloads both failed and successful short-lived jobs.
+                # Even a prompt nonzero launcher reply with a not-found unit
+                # cannot prove that no action ran. Avoid duplicate execution.
+                dispatch_readback = {
+                    **dispatch_readback,
+                    "outcome": "outcome_unknown",
+                    "source": "collect-mode-unloaded-or-never-started",
+                    "receipt_state": receipt.get("state"),
+                }
         message = result["stderr"] or result["stdout"] or "job launch failed"
         if dispatch_readback["outcome"] == "not_started":
             terminalization = {

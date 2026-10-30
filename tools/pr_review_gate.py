@@ -22,6 +22,9 @@ _SRC_DIR = Path(__file__).resolve().parents[1] / "src"
 if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
 
+from grabowski_self_review_execution import review_receipt_errors  # noqa: E402
+import grabowski_self_review_execution as review_provenance  # noqa: E402
+
 from grabowski_pr_diff import (  # noqa: E402
     canonicalize_github_pr_diff_identity,
     canonicalize_github_pr_diff_identity_v1,
@@ -204,6 +207,14 @@ REQUIRED_SELF_REVIEW_FOCUS = (
 SELF_REVIEW_DIFF_BYPASS_REASON = "legacy unit seam without live PR diff"
 SELF_REVIEW_AUDIT_KIND = "grabowski_self_review_audit"
 SELF_REVIEW_MAX_REQUIRED_ITERATIONS = 5
+REQUIRED_HIGH_CRITICAL_REVIEW_AXES = (
+    "contracts_correctness",
+    "regression_compatibility",
+    "tests_negative_cases",
+    "security_authority_concurrency",
+    "adversarial_countercheck",
+)
+MIN_SUBSTANTIVE_REVIEW_SUMMARY_CHARS = 36
 RISK_PATH_MARKERS = (
     "auth",
     "access",
@@ -239,6 +250,9 @@ RISK_PATH_PREFIXES = (
     "src/grabowski_merge_guard.py",
     "src/grabowski_decision_reviews.py",
     "src/grabowski_release_admission.py",
+    "src/grabowski_self_review_execution.py",
+    "src/grabowski_self_review_producer.py",
+    "config/self-review-allowed-signers",
     "tools/pr_review_gate.py",
 )
 DOCUMENTATION_PATH_PREFIXES = ("docs/", "documentation/")
@@ -1412,10 +1426,8 @@ def classify_complexity(
     large_documentation_change = docs_only and (changed_files > 15 or changed_lines > 500)
     if high_critical_reasons:
         review_tier = "high_critical"
-        minimum_self_review_iterations = min(
-            SELF_REVIEW_MAX_REQUIRED_ITERATIONS,
-            3 + min(2, len(high_critical_reasons)),
-        )
+        # Five distinct reviews, not merely four repeated summaries.
+        minimum_self_review_iterations = SELF_REVIEW_MAX_REQUIRED_ITERATIONS
     elif important_repo and not docs_only:
         review_tier = "important_repo"
         minimum_self_review_iterations = 3
@@ -1452,7 +1464,8 @@ def classify_complexity(
         "high_critical": bool(high_critical_reasons),
         "high_critical_reasons": high_critical_reasons,
         "external_review_required": False,
-        "independent_review_required": review_tier == "high_critical",
+        # Risk still controls review depth; reviewer independence is explicit opt-in.
+        "independent_review_required": False,
         "claude_cli_required": False,
         "self_review_required": True,
         "minimum_self_review_iterations": minimum_self_review_iterations,
@@ -3506,9 +3519,31 @@ def build_self_review_audit(
         "review_policy_version": REVIEW_POLICY_VERSION,
         "diff_sha256": _normalize_sha256(state.get("pr_diff_sha256")),
         "review_tier": complexity.get("review_tier"),
-        "independent_review_required": complexity.get("independent_review_required") is True,
+        "independent_review_required": review_sources.get("independent_review_required") is True,
         "minimum_review_iterations": complexity.get("minimum_self_review_iterations"),
         "actual_review_iterations": actual_iterations,
+        # The private audit retains method diversity without posting review
+        # prose or private evidence paths into the public CI status.
+        "review_pass_axes": [
+            item.get("axis") for item in iterations
+            if isinstance(item, dict) and isinstance(item.get("axis"), str)
+        ] if isinstance(iterations, list) else [],
+        "review_iterations": iterations if isinstance(iterations, list) else [],
+        **(
+            {
+                "review_batch_id": self_review.get("review_batch_id"),
+                "review_origin": self_review.get("review_origin"),
+                "review_pass_receipts": self_review.get("review_pass_receipts"),
+            }
+            if complexity.get("review_tier") == "high_critical"
+            and isinstance(self_review, dict) else {}
+        ),
+        "review_pass_evidence_sha256": hashlib.sha256(
+            json.dumps(
+                iterations if isinstance(iterations, list) else [],
+                sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+            ).encode("utf-8")
+        ).hexdigest(),
         "all_findings_triaged": (
             self_review.get("all_findings_triaged") is True
             if isinstance(self_review, dict) else False
@@ -4087,6 +4122,7 @@ def evaluate_review_gate(
     claude_evidence: dict[str, Any] | None = None,
     external_review_evidence: dict[str, Any] | None = None,
     external_review_artifact_root: Path | None = None,
+    require_independent_review: bool = False,
     policy_waiver: dict[str, Any] | None = None,
     expected_check_names: tuple[str, ...] = DEFAULT_EXPECTED_CHECK_NAMES,
 ) -> dict[str, Any]:
@@ -4206,6 +4242,38 @@ def evaluate_review_gate(
             ]
             if len(iteration_summaries) == len(iterations) and len(set(iteration_summaries)) != len(iteration_summaries):
                 self_review_failures.append("self-review iteration summaries must be distinct")
+            if complexity["review_tier"] == "high_critical":
+                observed_axes = [
+                    item.get("axis") if isinstance(item, dict) else None
+                    for item in iterations[:SELF_REVIEW_MAX_REQUIRED_ITERATIONS]
+                ]
+                if observed_axes != list(REQUIRED_HIGH_CRITICAL_REVIEW_AXES):
+                    self_review_failures.append(
+                        "high-critical review passes must cover five distinct axes in order: "
+                        + ", ".join(REQUIRED_HIGH_CRITICAL_REVIEW_AXES)
+                    )
+                for index, item in enumerate(iterations):
+                    if not isinstance(item, dict):
+                        continue
+                    summary = item.get("summary")
+                    if (
+                        not isinstance(summary, str)
+                        or len(" ".join(summary.split())) < MIN_SUBSTANTIVE_REVIEW_SUMMARY_CHARS
+                    ):
+                        self_review_failures.append(
+                            f"high-critical review_iteration {index} lacks a substantive summary"
+                        )
+                    evidence_refs = item.get("evidence_refs")
+                    if (
+                        not isinstance(evidence_refs, list) or not evidence_refs
+                        or any(
+                            not isinstance(ref, str) or len(ref.strip()) < 8
+                            for ref in evidence_refs
+                        )
+                    ):
+                        self_review_failures.append(
+                            f"high-critical review_iteration {index} lacks concrete evidence_refs"
+                        )
             first_iteration = iterations[0] if iterations and isinstance(iterations[0], dict) else None
             first_iteration_material = (
                 first_iteration.get("material_findings")
@@ -4240,8 +4308,57 @@ def evaluate_review_gate(
         remaining = _material_findings_remaining(self_review, self_review_failures)
         residual = self_review.get("residual_risk")
         accepted_residual = isinstance(residual, dict) and residual.get("accepted") is True and bool(residual.get("reason"))
-        if remaining is not None and remaining > 0 and not accepted_residual:
-            self_review_failures.append("material findings remain without accepted residual-risk reason")
+        # An accepted residual risk is not a terminal P1/P2 resolution.
+        if remaining is not None and remaining > 0:
+            self_review_failures.append(
+                "material findings remain; each must be resolved or disproven"
+            )
+        if complexity.get("review_tier") == "high_critical":
+            # Same server-issued, immutable execution receipts as Captain and
+            # the atomic merge guard. Caller text and hashes never suffice.
+            origin_audit = {
+                "repo": repo_name, "pr": pr.get("number"),
+                "base_sha": pr.get("baseRefOid"),
+                "head_sha": pr.get("headRefOid"),
+                "diff_sha256": _normalize_sha256(state.get("pr_diff_sha256")),
+                "review_batch_id": self_review.get("review_batch_id"),
+                "review_origin": self_review.get("review_origin"),
+                "review_iterations": self_review.get("review_iterations"),
+                "review_pass_receipts": self_review.get("review_pass_receipts"),
+            }
+            self_review_failures.extend(review_receipt_errors(origin_audit))
+        elif repo_name is not None and all((
+            type(pr.get("number")) is int,
+            isinstance(pr.get("baseRefOid"), str),
+            isinstance(pr.get("headRefOid"), str),
+            _normalize_sha256(state.get("pr_diff_sha256")) is not None,
+        )):
+            # Standard and elevated self-reviews need no five-axis PASS audit,
+            # but they may not silently discard a signed material REJECT from
+            # the same immutable PR revision. Reuse the authenticated registry
+            # predicate; absence of a signed session remains a valid legacy case.
+            binding = {
+                "repo": repo_name,
+                "pr": pr["number"],
+                "base_sha": pr["baseRefOid"],
+                "head_sha": pr["headRefOid"],
+                "diff_sha256": _normalize_sha256(state.get("pr_diff_sha256")),
+                "review_batch_id": "0" * 32,
+                "review_purpose": "pull_request",
+            }
+            try:
+                review_provenance._assert_no_first_party_reject_for_legacy_review(
+                    binding,
+                    repository=Path.home() / "repos" / repo_name.split("/")[-1],
+                    root=review_provenance.FIRST_PARTY_REVIEW_ROOT,
+                    signers=review_provenance.TRUSTED_SIGNERS,
+                    root_owned_signers=True,
+                )
+            except (review_provenance.ReviewExecutionRejected, OSError,
+                    ValueError, KeyError, TypeError):
+                self_review_failures.append(
+                    "signed first-party material review history unresolved or invalid"
+                )
     failures.extend(self_review_failures)
 
     claude = self_review.get("claude_review") if isinstance(self_review, dict) else None
@@ -4257,18 +4374,21 @@ def evaluate_review_gate(
     if isinstance(deprecated_external_review, dict):
         warnings.append("Deprecated self_review.external_review ignored; pass --external-review-evidence instead")
 
-    external_required = False
+    external_required = require_independent_review is True
     external_failures = _external_review_failures(
         state,
         pr,
         external_review,
-        required=False,
+        required=external_required,
         repo_name=repo_name,
         claude_cli_required=False,
         external_review_artifact_root=external_review_artifact_root,
     )
     for failure in external_failures:
-        warnings.append(f"Optional external review evidence invalid and ignored: {failure}")
+        if external_required:
+            failures.append(f"explicit independent review requirement: {failure}")
+        else:
+            warnings.append(f"Optional external review evidence invalid and ignored: {failure}")
 
     if not checks:
         failures.append("no status checks observed")
@@ -4365,7 +4485,7 @@ def evaluate_review_gate(
             "claude_cli_required": complexity["claude_cli_required"],
             "claude_cli_waived": claude_cli_waived,
             "external_review_required": external_required,
-            "independent_review_required": complexity["independent_review_required"],
+            "independent_review_required": external_required,
             "external_reviews_received": _external_review_count(external_review),
             "platform_review_required": platform_review_required,
             "platform_review_seen": platform_review_seen,
@@ -4444,6 +4564,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--self-review")
     parser.add_argument("--claude-evidence")
     parser.add_argument("--external-review-evidence")
+    parser.add_argument("--require-independent-review", action="store_true", help="Explicit additional requirement; never implied by high_critical risk")
     parser.add_argument("--policy-waiver")
     parser.add_argument("--write-external-review-packet")
     parser.add_argument("--write-self-review-template")
@@ -4483,6 +4604,7 @@ def main(argv: list[str] | None = None) -> int:
             self_review=self_review,
             claude_evidence=claude_evidence,
             external_review_evidence=external_review_evidence,
+            require_independent_review=args.require_independent_review,
             external_review_artifact_root=(
                 external_review_evidence_path.parent
                 if external_review_evidence_path is not None

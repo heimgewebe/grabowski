@@ -2948,6 +2948,7 @@ class OperatorContractTests(unittest.TestCase):
             self.assertEqual(invoked[separator + 1 :], operator.command_identity.systemd_escape_argv(command))
             self.assertNotIn("--expand-environment=no", invoked[:separator])
             self.assertIn("systemd-run", invoked)
+            self.assertEqual(invoked[:separator].count("--collect"), 1)
             self.assertEqual(invoked.count("--property=LimitCORE=0"), 1)
             self.assertNotIn("--property=LimitNOFILE=65536", invoked)
             self.assertNotIn("--property=UMask=0077", invoked)
@@ -3300,7 +3301,7 @@ class OperatorContractTests(unittest.TestCase):
                 "--expected-diff-sha256", "e" * 64,
                 "--expected-dirty", "false",
                 "--output", str(root / "shared-legacy-output.json"),
-                "--", "grok", "--model", "grok-4.6", "Review frozen revision",
+                "--", "grok", "--model", "grok-4.6", "-p", "Review frozen revision",
             ]
             launched = {
                 "returncode": 0,
@@ -3511,7 +3512,7 @@ class OperatorContractTests(unittest.TestCase):
             "terminated_unclear",
         )
 
-    def test_launch_failure_persists_failed_evidence_not_started(self) -> None:
+    def test_collected_fast_launch_failure_preserves_unknown_without_receipt(self) -> None:
         operator = _load_operator_module()
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -3544,18 +3545,20 @@ class OperatorContractTests(unittest.TestCase):
             ), patch.object(operator.uuid, "uuid4", return_value=fake_uuid), patch.object(
                 operator, "_run", side_effect=[launcher, launch_readback]
             ):
-                with self.assertRaisesRegex(RuntimeError, "systemd refused launch"):
+                with self.assertRaises(operator.JobDispatchUnknown) as caught:
                     operator.grabowski_job_start(["python3", "-c", "print(1)"], cwd=str(cwd))
+            self.assertEqual(caught.exception.dispatch_outcome, "outcome_unknown")
 
             metadata_path = jobs / "grabowski-job-bad1a0c00000" / "metadata.json"
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-            self.assertEqual(metadata["final_status"], "launch_failed")
-            self.assertEqual(metadata["terminalization_evidence"]["source"], "systemd-run-launch")
-            self.assertEqual(metadata["terminalization_evidence"]["final_status"], "launch_failed")
+            self.assertEqual(metadata["final_status"], "launch_outcome_unknown")
+            self.assertEqual(metadata["terminalization_evidence"]["source"], "systemd-run-launch-readback")
+            self.assertEqual(metadata["terminalization_evidence"]["final_status"], "launch_outcome_unknown")
             self.assertFalse(metadata["terminalization_evidence"]["systemd_visible"])
             self.assertEqual(metadata["launcher_evidence"]["returncode"], 1)
-            self.assertEqual(metadata["dispatch_outcome"], "not_started")
-            self.assertEqual(metadata["dispatch_readback"]["outcome"], "not_started")
+            self.assertEqual(metadata["dispatch_outcome"], "outcome_unknown")
+            self.assertEqual(metadata["dispatch_readback"]["outcome"], "outcome_unknown")
+            self.assertEqual(metadata["dispatch_readback"]["source"], "collect-mode-unloaded-or-never-started")
             self.assertNotEqual(metadata["final_status"], "started")
 
             systemctl = {
@@ -3577,9 +3580,16 @@ class OperatorContractTests(unittest.TestCase):
                 status = operator.grabowski_job_status("grabowski-job-bad1a0c00000")
 
             self.assertFalse(status["systemd_visible"])
-            self.assertEqual(status["final_status"], "launch_failed")
-            self.assertEqual(status["terminalization_evidence"]["source"], "systemd-run-launch")
-            self.assertEqual(status["notification_evidence"]["final_status_preserved"], "launch_failed")
+            # The unavailable unit and absent receipt never establish non-start.
+            # Keep that uncertainty when a later caller reads the job status.
+            self.assertEqual(status["final_status"], "missing_finalization_evidence")
+            self.assertEqual(status["terminalization_evidence"]["source"], "systemd-show")
+            self.assertFalse(status["terminalization_evidence"]["fallback_used"])
+            self.assertEqual(status["terminalization_evidence"]["receipt_state"], "missing_receipt")
+            self.assertEqual(
+                status["notification_evidence"]["final_status_preserved"],
+                "missing_finalization_evidence",
+            )
 
     def test_launcher_error_with_started_readback_is_a_started_job(self) -> None:
         operator = _load_operator_module()
@@ -3619,6 +3629,60 @@ class OperatorContractTests(unittest.TestCase):
                 "systemd-readback-after-launcher-error",
             )
             self.assertTrue(job["post_dispatch_warnings"])
+
+    def test_collected_launcher_timeout_uses_receipt_or_preserves_unknown(self) -> None:
+        operator = _load_operator_module()
+        for receipt_valid, timed_out in ((True, True), (True, False), (False, True), (False, False)):
+            with self.subTest(receipt_valid=receipt_valid, timed_out=timed_out), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                state, jobs, cwd = root / "state", root / "state/jobs", root / "cwd"
+                cwd.mkdir()
+                launcher = {
+                    "returncode": 1, "stdout": "", "stderr": "lost launcher reply",
+                    "argv": [], "argv_sha256": "0" * 64, "command": "systemd-run",
+                    "cwd": str(root), "timed_out": timed_out,
+                    "duration_seconds": 60.0 if timed_out else 0.01,
+                    "stdout_truncated": False, "stderr_truncated": False,
+                }
+                readback = {
+                    "returncode": 0,
+                    "stdout": "LoadState=not-found\nActiveState=inactive\n",
+                    "stderr": "", "timed_out": False,
+                }
+                receipt = {
+                    "valid": receipt_valid, "state": "valid" if receipt_valid else "missing_receipt",
+                    "receipt_sha256": "a" * 64,
+                }
+                with (
+                    patch.object(operator, "STATE_DIR", state),
+                    patch.object(operator, "JOBS_DIR", jobs),
+                    patch.object(operator.uuid, "uuid4", return_value=types.SimpleNamespace(
+                        hex="abcdef123456ffffffffffffffffffff")),
+                    patch.object(operator, "_run", side_effect=[launcher, readback]),
+                    patch.object(operator, "_finalization_receipt_result", return_value=receipt),
+                ):
+                    if receipt_valid:
+                        job = operator.grabowski_job_start(
+                            ["python3", "-c", "print(1)"], cwd=str(cwd)
+                        )
+                        self.assertEqual(job["dispatch_outcome"], "started")
+                        self.assertEqual(job["dispatch_readback"]["source"], "validated-finalization-receipt")
+                        self.assertEqual(job["dispatch_readback"]["receipt_sha256"], "a" * 64)
+                    else:
+                        with self.assertRaises(operator.JobDispatchUnknown):
+                            operator.grabowski_job_start(
+                                ["python3", "-c", "print(1)"], cwd=str(cwd)
+                            )
+                        metadata = json.loads(
+                            (jobs / "grabowski-job-abcdef123456" / "metadata.json").read_text(
+                                encoding="utf-8"
+                            )
+                        )
+                        self.assertEqual(metadata["dispatch_outcome"], "outcome_unknown")
+                        self.assertEqual(
+                            metadata["dispatch_readback"]["source"],
+                            "collect-mode-unloaded-or-never-started",
+                        )
 
     def test_launcher_error_with_unresolved_readback_is_outcome_unknown(self) -> None:
         operator = _load_operator_module()

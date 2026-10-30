@@ -397,7 +397,7 @@ class AuthoritativeCIReadTests(unittest.TestCase):
                     admission, "validate_independent_release_review", return_value=invalid,
                 ):
                     with self.assertRaisesRegex(
-                        admission.ReleaseAdmissionDenied, "authentic independent.*R3",
+                        admission.ReleaseAdmissionDenied, "authentic.*R3|authenticated.*R3",
                     ):
                         self.query(
                             pages, transition_review_pr=1452, transition_diff_sha256=DIFF,
@@ -1414,11 +1414,18 @@ class DecisionBoundReleaseReviewTests(unittest.TestCase):
 
     def test_valid_review_does_not_claim_captain(self):
         with (
+            # The mock review uses invented SHAs and tests only Captain authority.
+            # Signed history is exercised against real SSH receipts elsewhere.
+            patch.object(admission, "_assert_no_signed_first_party_release_reject"),
             patch.object(admission, "validate_independent_release_review", return_value={
                 "review_pr": 1452, "independent_pass_count": 1,
             }),
             patch.object(admission, "_fresh_github_checks", return_value={
                 "checks": [], "checks_sha256": "e" * 64,
+                "workflow": {
+                    "ci_policy_transition_required": False,
+                    "ci_policy_transition_review_binding_sha256": None,
+                },
             }),
         ):
             result = admission.validate_release(
@@ -1427,8 +1434,52 @@ class DecisionBoundReleaseReviewTests(unittest.TestCase):
                 diff_sha256=DIFF, review_pr=1452,
             )
         self.assertEqual("authenticated-post-merge-r3-ci", result["status"])
+        self.assertIs(result["critical_release_source"], True)
+        self.assertIs(result["independent_review_required"], True)
         self.assertIn("Captain runtime-deploy decision", result["does_not_establish"])
         self.assertIn("historical pre-merge review authorization", result["does_not_establish"])
+
+
+    def test_release_rejects_missing_ci_transition_workflow_origin(self):
+        with (
+            patch.object(admission, "validate_release_review", return_value={
+                "review_pr": 1452, "review_mode": "independent",
+                "review_binding_sha256": "a" * 64,
+            }),
+            patch.object(admission, "_fresh_github_checks", return_value={
+                "checks": [], "checks_sha256": "c" * 64,
+            }),
+        ):
+            with self.assertRaisesRegex(admission.ReleaseAdmissionDenied, "workflow origin missing"):
+                admission.validate_release(
+                    serving_head=SERVING, target_head=TARGET,
+                    serving_release_id="release-blue",
+                    serving_tree="1" * 40, target_tree="2" * 40,
+                    diff_sha256=DIFF, review_pr=1452,
+                )
+
+    def test_release_rejects_drifted_ci_transition_review_identity(self):
+        with (
+            patch.object(admission, "validate_release_review", return_value={
+                "review_pr": 1452, "review_mode": "server_self",
+                "review_binding_sha256": "a" * 64,
+                "signed_task_origin_proven": True,
+            }),
+            patch.object(admission, "_fresh_github_checks", return_value={
+                "checks": [], "checks_sha256": "c" * 64,
+                "workflow": {
+                    "ci_policy_transition_required": True,
+                    "ci_policy_transition_review_binding_sha256": "b" * 64,
+                },
+            }),
+        ):
+            with self.assertRaisesRegex(admission.ReleaseAdmissionDenied, "identity changed"):
+                admission.validate_release(
+                    serving_head=SERVING, target_head=TARGET,
+                    serving_release_id="release-blue",
+                    serving_tree="1" * 40, target_tree="2" * 40,
+                    diff_sha256=DIFF, review_pr=1452,
+                )
 
 
 class DirectSchedulerDenialTests(unittest.TestCase):
@@ -1484,6 +1535,31 @@ class DirectSchedulerDenialTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "Captain release action"):
                 deploy._require_release_source_admission(TARGET, release_review_pr=1452)
         self.assertEqual(2, read.call_count)
+
+    def test_critical_source_without_independent_flag_never_becomes_exempt(self):
+        import grabowski_self_deploy as deploy
+        # A future genuine self-review mode may no longer require an external
+        # provider. That may NEVER waive critical release Captain authority.
+        forged = {
+            "status": "authenticated-post-merge-r3-ci",
+            "critical_release_source": True,
+            "independent_review_required": False,
+            "target_head": TARGET,
+            "release_review_identity_sha256": "a" * 64,
+        }
+        with self.assertRaisesRegex(RuntimeError, "critical-source|Captain|critical review origin"):
+            deploy._claim_captain_schedule_effect(TARGET, forged)
+
+    def test_unknown_release_criticality_never_admits_effect(self):
+        import grabowski_self_deploy as deploy
+        record = {
+            "status": "already-serving-exact-source",
+            "independent_review_required": False,
+            "target_repo_head": TARGET,
+            "serving_repo_head": TARGET,
+        }
+        with self.assertRaisesRegex(RuntimeError, "critical-source|criticality"):
+            deploy._claim_captain_schedule_effect(TARGET, record)
 
     def test_captain_scoped_token_is_ephemeral_and_exact(self):
         import grabowski_self_deploy as deploy

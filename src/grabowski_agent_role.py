@@ -4,6 +4,7 @@ import argparse
 import fcntl
 import hashlib
 import json
+import re
 import os
 from pathlib import Path, PurePosixPath
 import stat
@@ -62,7 +63,7 @@ CLAUDE_REVIEW_SCHEMA = {
                 "properties": {
                     "severity": {"type": "string", "enum": ["P1", "P2", "P3"]},
                     "path": {"type": "string"},
-                    "line": {"type": "integer", "minimum": 1},
+                    "line": {"type": "integer"},
                     "evidence": {"type": "string"},
                     "impact": {"type": "string"},
                     "minimal_fix": {"type": "string"},
@@ -71,6 +72,69 @@ CLAUDE_REVIEW_SCHEMA = {
         },
     },
 }
+# Claude structured JSON does not support length/numeric/array-size constraints;
+# local role and provenance verifiers enforce the full bounded rules instead.
+# The ordinary independent-review output stays {verdict, findings}. A genuine
+# high-critical V2 semantic role may instead emit this complete, exact-bound
+# structured document. Every additional member is optional at the *generic*
+# provider schema boundary; the complete all-or-nothing document is checked
+# below, and its origin, references and risk analysis are checked again by the
+# server's pinned self-review verifier. Never treat extra prose as a PASS.
+CLAUDE_SEMANTIC_FIELDS = frozenset({
+    "schema_version", "kind", "repo", "pr", "base_sha", "head_sha",
+    "diff_sha256", "review_batch_id", "review_purpose", "axis",
+    "summary", "evidence_refs", "reviewed_risks",
+})
+_CLAUDE_SHA40_PATTERN = "^[a-f0-9]{40}$"
+_CLAUDE_SHA256_PATTERN = "^[a-f0-9]{64}$"
+_CLAUDE_ID_PATTERN = "^[a-f0-9]{32}$"
+_CLAUDE_REFS = {
+    "type": "array", "items": {"type": "string"},
+}
+CLAUDE_REVIEW_SCHEMA["properties"].update({
+    "schema_version": {"type": "integer", "enum": [1]},
+    "kind": {"type": "string", "enum": ["grabowski_semantic_self_review_v1"]},
+    "repo": {"type": "string"},
+    "pr": {"type": "integer"},
+    "base_sha": {"type": "string", "pattern": _CLAUDE_SHA40_PATTERN},
+    "head_sha": {"type": "string", "pattern": _CLAUDE_SHA40_PATTERN},
+    "diff_sha256": {"type": "string", "pattern": _CLAUDE_SHA256_PATTERN},
+    "review_batch_id": {"type": "string", "pattern": _CLAUDE_ID_PATTERN},
+    "review_purpose": {
+        "type": "string", "enum": ["pull_request", "post_merge_release"],
+    },
+    "axis": {
+        "type": "string", "enum": [
+            "contracts_correctness", "regression_compatibility",
+            "tests_negative_cases", "security_authority_concurrency",
+            "adversarial_countercheck", "additional_adversarial_probe",
+        ],
+    },
+    "summary": {"type": "string"},
+    "evidence_refs": _CLAUDE_REFS,
+    "reviewed_risks": {
+        "type": "array",
+        "items": {
+            "type": "object", "additionalProperties": False,
+            "required": ["risk", "assessment", "evidence_refs"],
+            "properties": {
+                "risk": {"type": "string"},
+                "assessment": {"type": "string"},
+                "evidence_refs": _CLAUDE_REFS,
+            },
+        },
+    },
+    "release_binding": {
+        "type": "object", "additionalProperties": False,
+        "required": ["serving_release_id", "serving_tree", "target_tree"],
+        "properties": {
+            "serving_release_id": {"type": "string"},
+            "serving_tree": {"type": "string", "pattern": _CLAUDE_SHA40_PATTERN},
+            "target_tree": {"type": "string", "pattern": _CLAUDE_SHA40_PATTERN},
+        },
+    },
+})
+
 REVIEW_ATTEMPT_UNIT = __import__("re").compile(r"^grabowski-job-[0-9a-f]{12}$")
 REVIEW_ATTEMPT_RECEIPT_NAME = "review-role-attempt.json"
 GROK_REVIEW_EVENT_TYPES = frozenset(
@@ -443,6 +507,9 @@ def _declared_virtualenv_binding(repo: Path, command: list[str]) -> tuple[list[t
     source_root = declared_root.resolve(strict=True)
     target_root = declared_root.absolute()
     if source_root == repo_root or source_root.is_relative_to(repo_root):
+        return [], []
+    # Nix store virtualenvs are already mounted read-only by the sandbox.
+    if source_root.is_relative_to(Path("/nix/store")) and target_root.is_relative_to(Path("/nix/store")):
         return [], []
     if source_root == Path("/") or source_root.is_relative_to(Path("/usr")):
         return [], []
@@ -1006,7 +1073,7 @@ def _claude_json_review_command(
         + diff_text
         + "\n--- END UNTRUSTED REVIEW INPUT "
         + diff_sha256
-        + " ---\n\nReturn only the structured review verdict and findings. "
+        + " ---\n\nReturn only the complete schema-conforming structured review object. "
           "PASS requires no actionable P1/P2 and an empty findings list. "
           "NEEDS_CHANGE/BLOCK require specific findings. Do not invoke any external tool."
     ).encode("utf-8")
@@ -1042,6 +1109,15 @@ def _review_sandbox_argv(
     review_diff: bytes,
     review_input_source: str = "committed_diff",
 ) -> tuple[list[str], str | None, bytes | None]:
+    from grabowski_self_review_producer import candidate_review_batch, verify_candidate_review_command
+    if candidate_review_batch(command) is not None:
+        document = verify_candidate_review_command(command, repository=repo)
+        # The trusted role verifies signed material; the ordinary read-only
+        # sandbox transports that exact verdict through its normal capture and
+        # role receipt path. No caller-provided document can select this path.
+        copier = [sys.executable, "-I", "-S", "-c",
+                  "import sys; sys.stdout.buffer.write(sys.stdin.buffer.read())"]
+        return sandbox_argv(repo, copier), None, canonical(document).encode("utf-8")
     executable_name = Path(command[0]).name
     if executable_name == "codex":
         normalized = _codex_review_command_for_headless_execution(command)
@@ -1091,19 +1167,39 @@ def _review_sandbox_argv(
     return sandbox, GROK_REVIEW_STREAM_CONTRACT, prompt_bytes
 
 
+class DuplicateReviewJSONKey(ValueError):
+    """Ambiguous reviewer or event JSON cannot be safely superseded."""
+
+
 def _terminal_json_object(text: str) -> dict[str, Any] | None:
     """Return the unique JSON object suffix of terminal assistant text."""
     stripped = text.rstrip()
     candidates: list[dict[str, Any]] = []
-    decoder = json.JSONDecoder()
+    decoder = json.JSONDecoder(object_pairs_hook=_unique_review_json_object)
     for index, character in enumerate(stripped):
         if character != "{":
             continue
         try:
             value, consumed = decoder.raw_decode(stripped[index:])
-        except json.JSONDecodeError:
+        except DuplicateReviewJSONKey:
+            # Never skip an earlier malformed material REJECT and accept a
+            # later apparently valid PASS from the same model output.
+            return None
+        except ValueError:
             continue
-        if stripped[index + consumed :].strip():
+        remaining = stripped[index + consumed :].strip()
+        # An earlier *complete* review verdict can contain material REJECT
+        # evidence. A later PASS in the same provider transcript may not
+        # supersede or silently discard it. Ordinary prose followed by one
+        # review object remains allowed, but multiple semantic decisions are
+        # an ambiguous and therefore inadmissible provider result.
+        if (
+            isinstance(value, dict)
+            and {"verdict", "findings"}.issubset(value)
+            and remaining
+        ):
+            return None
+        if remaining:
             continue
         if isinstance(value, dict):
             candidates.append(value)
@@ -1138,8 +1234,8 @@ def _extract_grok_stream_review_document(
         if not line:
             continue
         try:
-            event = json.loads(line)
-        except json.JSONDecodeError as exc:
+            event = json.loads(line, object_pairs_hook=_unique_review_json_object)
+        except ValueError as exc:
             return None, f"Grok review stream line {line_number} is invalid JSON: {exc}", metadata
         if not isinstance(event, dict) or not isinstance(event.get("type"), str):
             return None, f"Grok review stream line {line_number} is not a typed object", metadata
@@ -1198,6 +1294,90 @@ def _is_strictly_zero(value: Any) -> bool:
     return type(value) is int and value == 0
 
 
+def _valid_complete_claude_semantic_review(value: dict[str, Any]) -> bool:
+    """Shape-check model-generated V2 analysis before a role PASS.
+
+    This is not the substantive authority check: the protected producer must
+    later bind every source reference, full output, risk and revision to the
+    independently recorded server job origin.
+    """
+    purpose = value.get("review_purpose")
+    expected = CLAUDE_SEMANTIC_FIELDS | {"verdict", "findings"}
+    if purpose == "post_merge_release":
+        expected |= {"release_binding"}
+    if set(value) != expected:
+        return False
+    def valid_sha(key: str, length: int) -> bool:
+        item = value.get(key)
+        return isinstance(item, str) and re.fullmatch(
+            rf"[a-f0-9]{{{length}}}", item
+        ) is not None
+    def valid_refs(refs: Any) -> bool:
+        return (
+            isinstance(refs, list) and 1 <= len(refs) <= 64
+            and all(
+                isinstance(ref, str) and 8 <= len(ref) <= 1024
+                and not any(ord(c) < 32 or ord(c) == 127 for c in ref)
+                for ref in refs
+            )
+        )
+    risks = value.get("reviewed_risks")
+    if (
+        type(value.get("schema_version")) is not int
+        or value["schema_version"] != 1
+        or value.get("kind") != "grabowski_semantic_self_review_v1"
+        or not isinstance(value.get("repo"), str)
+        or re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", value["repo"]) is None
+        or type(value.get("pr")) is not int or value["pr"] < 1
+        or not valid_sha("base_sha", 40) or not valid_sha("head_sha", 40)
+        or not valid_sha("diff_sha256", 64)
+        or not valid_sha("review_batch_id", 32)
+        or purpose not in {"pull_request", "post_merge_release"}
+        or value.get("axis") not in CLAUDE_REVIEW_SCHEMA["properties"]["axis"]["enum"]
+        or not isinstance(value.get("summary"), str)
+        or not 160 <= len(" ".join(value["summary"].split())) <= 8192
+        or not valid_refs(value.get("evidence_refs"))
+        or not isinstance(risks, list) or not 2 <= len(risks) <= 16
+    ):
+        return False
+    if purpose == "post_merge_release":
+        release = value["release_binding"]
+        if (
+            not isinstance(release, dict)
+            or set(release) != {"serving_release_id", "serving_tree", "target_tree"}
+            or not isinstance(release["serving_release_id"], str)
+            or not release["serving_release_id"]
+            or any(
+                not isinstance(release[k], str)
+                or re.fullmatch(r"[a-f0-9]{40}", release[k]) is None
+                for k in ("serving_tree", "target_tree")
+            )
+        ):
+            return False
+    for item in risks:
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"risk", "assessment", "evidence_refs"}
+            or not isinstance(item["risk"], str)
+            or len(item["risk"].strip()) < 15
+            or not isinstance(item["assessment"], str)
+            or len(" ".join(item["assessment"].split())) < 80
+            or not valid_refs(item["evidence_refs"])
+        ):
+            return False
+    return True
+
+
+def _unique_review_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """Reject duplicate keys in reviewer events, verdicts and envelopes."""
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise DuplicateReviewJSONKey("duplicate reviewer JSON member")
+        result[key] = value
+    return result
+
+
 def _extract_claude_review_document(
     raw: bytes,
 ) -> tuple[bytes | None, str | None, dict[str, Any]]:
@@ -1208,8 +1388,11 @@ def _extract_claude_review_document(
         "review_provider_envelope_sha256": hashlib.sha256(raw).hexdigest(),
     }
     try:
-        envelope = json.loads(raw.decode("utf-8", errors="strict"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        envelope = json.loads(
+            raw.decode("utf-8", errors="strict"),
+            object_pairs_hook=_unique_review_json_object,
+        )
+    except (UnicodeDecodeError, ValueError) as exc:
         return None, f"Claude review result is not a valid JSON envelope: {exc}", metadata
     if (
         not isinstance(envelope, dict)
@@ -1295,7 +1478,14 @@ def _extract_claude_review_document(
     ):
         return None, "Claude review subagent evidence is missing or nonzero", metadata
     result = envelope.get("structured_output")
-    if not isinstance(result, dict) or set(result) != {"verdict", "findings"}:
+    basic_fields = {"verdict", "findings"}
+    if (
+        not isinstance(result, dict)
+        or (
+            set(result) != basic_fields
+            and not _valid_complete_claude_semantic_review(result)
+        )
+    ):
         return None, "Claude review structured_output has an invalid shape", metadata
     verdict = result["verdict"]
     findings = result["findings"]

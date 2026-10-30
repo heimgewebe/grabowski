@@ -301,10 +301,12 @@ class SubscriptionAwareRoutingTests(unittest.TestCase):
             self.routes["antigravity-gemini-pro-review-high"]["argv_prefix"],
             ["agy", "--model", "gemini-3.1-pro-high"],
         )
-        self.assertEqual(
-            self.routes["grok-4.6-review-high"]["argv_prefix"],
-            ["grok", "--model", "grok-4.6"],
-        )
+        for model in ("grok-4.6", "grok-4.7"):
+            with self.subTest(model=model):
+                prefix = self.routes[f"{model}-review-high"]["argv_prefix"]
+                self.assertEqual(prefix, ["grok", "--model", model, "-p"])
+                # One single-turn marker; the role runner must not append a second flag.
+                self.assertEqual(prefix.count("-p"), 1)
 
 
 if __name__ == "__main__":

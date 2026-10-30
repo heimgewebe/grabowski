@@ -8,7 +8,7 @@ StartLimitBurst=5
 [Service]
 Type=simple
 WorkingDirectory=%h
-ExecStart=%h/.local/share/grabowski-mcp/.venv/bin/python %h/.local/libexec/grabowski/grabowski_juno_openai_gateway.py --host 127.0.0.1 --port 18195 --token-file %h/.local/state/grabowski/juno-openai-gateway/token
+ExecStart=%h/.local/libexec/grabowski/grabowski_juno_runtime_launcher.py serve
 Restart=on-failure
 RestartSec=3
 TimeoutStartSec=20
@@ -16,8 +16,7 @@ TimeoutStopSec=20
 KillMode=mixed
 UMask=0077
 Environment=PYTHONUNBUFFERED=1
-Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
-Environment=PYTHONPATH=%h/.local/share/grabowski-mcp/inputs/src
+Environment=PATH=%h/.nix-profile/bin:%h/.local/bin:/run/current-system/sw/bin:/usr/local/bin:/usr/bin:/bin
 NoNewPrivileges=yes
 # The per-user manager needs a private user namespace before mount/device
 # sandboxing and capability reductions become available without host privilege.
@@ -31,7 +30,13 @@ ProtectSystem=strict
 ProtectHome=tmpfs
 BindReadOnlyPaths=%h/.local/share/grabowski-mcp
 BindReadOnlyPaths=%h/.local/bin
+# The canonical router also checks the Grok auth-file inode identity for state freshness.
+# Without the directory identity, even a Codex-only route appears stale.
+BindReadOnlyPaths=-%h/.grok
+BindReadOnlyPaths=-%h/.nix-profile
+BindReadOnlyPaths=-%h/.local/state/nix/profiles
 BindReadOnlyPaths=%h/.local/libexec/grabowski/grabowski_juno_openai_gateway.py
+BindReadOnlyPaths=%h/.local/libexec/grabowski/grabowski_juno_runtime_launcher.py
 BindReadOnlyPaths=%h/.local/state/grabowski/coding-agent-router
 BindReadOnlyPaths=%h/.local/state/grabowski/juno-openai-gateway
 BindPaths=%h/.codex
