@@ -88,11 +88,13 @@ AGENT_INSTRUCTION_RULES: tuple[tuple[str, str], ...] = (
     ),
     (
         "mutation-preconditions",
-        "Before a mutation, determine the target, expected result, validation, stop condition, and rollback.",
+        "Before mutation: target, expected result, validation, stop condition, "
+        "rollback."
     ),
     (
         "state-check-before-retry",
-        "After a transport, platform-filter, or policy failure, verify target state; do not repeat an unchanged call without state evidence.",
+        "Transport/platform-filter/policy failure: verify target state; do not "
+        "repeat an unchanged call without state evidence."
     ),
     (
         "pre-runtime-platform-denial",
@@ -100,15 +102,24 @@ AGENT_INSTRUCTION_RULES: tuple[tuple[str, str], ...] = (
     ),
     (
         "platform-filter-narrowing",
-        "After readback proves an upstream platform filter caused no effect, continue the authorized goal through an existing semantically narrower typed operation when available; do not weaken, disguise, bypass, or repackage the platform safeguard.",
+        "After readback proves upstream platform filter caused no effect, "
+        "continue authorized goal via existing semantically narrower typed "
+        "operation if available; do not weaken, disguise, bypass or repackage "
+        "safeguard."
     ),
     (
         "publication-pending-is-local",
-        "platform_publication_pending is operation-local: proceed if required tool/schema active; else seek fresh request-bound evidence.",
+        "platform_publication_pending is local: proceed if required tool/schema "
+        "active; else seek fresh request-bound evidence."
     ),
     (
         "transport-roundtrip-before-mutation",
-        "Mutations normally. Fresh shared_unlabeled challenge: grip_run transport-roundtrip action=execute with challenge_receipt_sha256, exact target_tool_name, exact unchanged target_arguments; retention=same-process optimization. Stable scope may action=ack then invoke unchanged target once. action=begin requires exact target_tool_name/target_arguments. Read back ambiguous effects before retry.",
+        "Fresh shared_unlabeled challenge: grip_run transport-roundtrip "
+        "action=execute with challenge_receipt_sha256, exact target_tool_name, "
+        "exact unchanged target_arguments; same-process optimization. Stable "
+        "scope may action=ack; unchanged target once. action=begin requires "
+        "exact target_tool_name/target_arguments. Read back ambiguous effects "
+        "before retry."
     ),
     (
         "typed-operation-preference",
@@ -116,23 +127,50 @@ AGENT_INSTRUCTION_RULES: tuple[tuple[str, str], ...] = (
     ),
     (
         "github-connector-first",
-        "GitHub PR reads and typed PR mutations: platform GitHub connector first; local gh only after observed connector unavailability or authorization failure. Never create GHA helper workflows, observer lanes, or coordination leases for local gh auth/keyring recovery. Merges require expected_head_sha, GitHub rulesets/branch protection, and read back state.",
+        "Platform GitHub connector first for GitHub PR reads and typed PR "
+        "mutations; local gh only on observed connector unavailability or "
+        "authorization failure. No GHA helper workflows, observer lanes or "
+        "coordination leases for local gh auth/keyring. Merges require "
+        "expected_head_sha, GitHub rulesets/branch protection; read back state."
     ),
     (
         "goal-fidelity-before-continuation",
-        "User outcome outranks strategy. Use minimum sufficient mechanism; persistent complexity requires proof of benefit. Compare a simpler path with fresh evidence; choose CONTINUE/CHANGE/PARK-STOP. A tool failure alone is not strategic evidence. Managed dirty checkout after ensure: continue only from exact lane/lifecycle/checkout evidence with fresh Git preimage; never reset/clean/stash merely to satisfy ensure.",
+        "User outcome first; minimum sufficient mechanism. Persistent "
+        "complexity: proof of benefit. Simpler path, fresh evidence: "
+        "CONTINUE/CHANGE/PARK-STOP. Tool failure not strategic evidence. "
+        "Managed dirty checkout: only exact lane/lifecycle/checkout evidence + "
+        "fresh Git preimage; never reset/clean/stash."
     ),
     (
         "operator-obligation-lifecycle",
-        "Nontrivial: grip_run operator-obligation-list+operator-obligation-open; before end operator-obligation-status. End only if operator-obligation-close completed/explicitly blocked/durably delegated, or operator-obligation-resolve defers/supersedes with continuation_required=false/work_complete=false. Resume with new obligation.",
+        "Nontrivial: grip_run "
+        "operator-obligation-list+operator-obligation-open; before end "
+        "operator-obligation-status. End only via operator-obligation-close "
+        "completed/explicitly blocked/durably delegated or "
+        "operator-obligation-resolve defers/supersedes with "
+        "continuation_required=false/work_complete=false. Resume with new "
+        "obligation."
     ),
     (
         "convergence-before-high-risk-closure",
-        "Bind risk-adaptive system_convergence_plan at admission when classified. Completion != systemic convergence. Before claim resolve required criticality; hard gate: hash-bound grip_run convergence-assess must be terminally_closed and receipt-bound. Nonterminal blocks only claim; no mutation authority.",
+        "At admission bind risk-adaptive system_convergence_plan if classified. "
+        "Completion != systemic convergence. For required criticality, "
+        "hash-bound grip_run convergence-assess must be terminally_closed and "
+        "receipt-bound before claim. Nonterminal blocks only claim; no mutation "
+        "authority."
     ),
     (
         "no-authority-escalation",
-        "No action/merge/deploy/secret/retry authority granted. Calls need reason+user_intent. report_outcome once as final tool call before every final answer; read-only/partial/failed/blocked included.",
+        "No action/merge/deploy/secret/retry authority. Calls: "
+        "reason+user_intent. report_outcome once final tool call before every "
+        "final answer; read-only/partial/failed/blocked."
+    ),
+    (
+        "selective-repoground-retrieval",
+        "Known file/symbol: typed Git/file read first; no RepoGround preflight. "
+        "Unknown callers, impacts/tests or history/cross-repo: bounded "
+        "RepoGround query on fresh bundle; verify citations in Git. "
+        "Stale/unavailable/low coverage: Git fallback; optional."
     ),
 )
 
