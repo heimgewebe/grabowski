@@ -1927,19 +1927,26 @@ def _assert_prior_first_party_material_findings_resolved(
                         raise ReviewExecutionRejected("previous signed review worktree invalid")
                     old_binding = _first_party_binding(candidate)
                     if "canonical_diff_sha256" not in session:
-                        # The legacy fallback must check the signed historical
-                        # checkout against ITS authenticated repository spelling.
-                        # The current caller may be a case alias of that origin.
+                        # Check the original signed Git repository spelling,
+                        # not a caller-supplied case alias. A frozen Candidate
+                        # may rotate its Test receipt without changing the
+                        # signed Writer patch: verify the CURRENT Candidate
+                        # source while keeping the historical Git origin.
+                        source_binding = (
+                            {**decisive, "repo": old_binding["repo"]}
+                            if old_binding["review_purpose"] == "frozen_candidate"
+                            else old_binding
+                        )
                         from grabowski_self_review_producer import _current_source
 
                         session["source_raw_diff_sha256"] = _current_source(
-                            historical_repository, old_binding,
+                            historical_repository, source_binding,
                         )
                         session["canonical_diff_sha256"] = hashlib.sha256(
-                            _first_party_diff(historical_repository, old_binding)
+                            _first_party_diff(historical_repository, source_binding)
                         ).hexdigest()
                         session["changed_paths"] = _first_party_changed_paths(
-                            historical_repository, old_binding,
+                            historical_repository, source_binding,
                         )
                     if (
                         old.get("schema_version") != 1
