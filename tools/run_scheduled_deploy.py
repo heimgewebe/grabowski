@@ -18,7 +18,7 @@ import sys
 import tempfile
 import time
 import zipimport
-from typing import Any
+from typing import Any, Iterator
 
 TOOLS_DIR = Path(__file__).resolve().parent
 if str(TOOLS_DIR) not in sys.path:
@@ -760,6 +760,127 @@ def _bounded_git_metadata(repo: Path, argv: list[str], environment: dict[str, st
     return stdout
 
 
+def _committed_crlf_rule_matches(
+    repo: Path,
+    environment: dict[str, str],
+    pathname: bytes,
+    committed_attrs: dict[bytes, tuple[bytes, bytes]],
+) -> bool:
+    """Require a matching explicit CRLF rule in a HEAD-pinned .gitattributes.
+
+    Git check-attr --cached ALSO considers mutable .git/info/attributes, so it
+    alone cannot authorize a content-changing normalization. Only strict
+    literal filename/path and *.extension patterns are admitted here.
+    Unsupported Git attribute patterns fail closed.
+    """
+    components = pathname.split(b"/")
+    attr_paths = [b".gitattributes"]
+    parent = b""
+    for part in components[:-1]:
+        parent = (parent + b"/" if parent else b"") + part
+        attr_paths.append(parent + b"/.gitattributes")
+    for attr_path in attr_paths:
+        item = committed_attrs.get(attr_path)
+        if not item or item[0] not in {b"100644", b"100755"}:
+            continue
+        attr_dir = attr_path.rpartition(b"/")[0]
+        relative = pathname[len(attr_dir) + 1:] if attr_dir else pathname
+        basename = relative.rpartition(b"/")[2]
+        contents = _bounded_git_metadata(
+            repo, ["cat-file", "blob", item[1].decode("ascii")], environment,
+        )
+        for line in contents.splitlines():
+            line = line.strip()
+            if not line or line.startswith(b"#"):
+                continue
+            tokens = line.split()
+            if len(tokens) < 2 or b"eol=crlf" not in tokens[1:]:
+                continue
+            pattern = tokens[0]
+            if pattern.startswith(b"/"):
+                pattern = pattern[1:]
+            if b"/" in pattern:
+                matched = pattern == relative
+            elif pattern.startswith(b"*.") and pattern.count(b"*") == 1:
+                matched = basename.endswith(pattern[1:])
+            elif all(ch not in pattern for ch in (b"*", b"?", b"[", b"]", b"\\")):
+                matched = pattern == basename
+            else:
+                matched = False
+            if matched:
+                return True
+    return False
+
+
+def _explicit_index_crlf_only(
+    repo: Path,
+    environment: dict[str, str],
+    pathname: bytes,
+    committed_attrs: dict[bytes, tuple[bytes, bytes]],
+) -> bool:
+    """Allow only explicit, HEAD-anchored, non-executable CRLF normalization."""
+    if not _committed_crlf_rule_matches(
+        repo, environment, pathname, committed_attrs,
+    ):
+        return False
+    fields = (b"text", b"eol", b"filter", b"ident", b"working-tree-encoding")
+    raw = _bounded_git_metadata(
+        repo,
+        ["check-attr", "--cached", "-z",
+         *(field.decode("ascii") for field in fields),
+         "--", os.fsdecode(pathname)],
+        environment,
+    )
+    parts = raw.split(b"\0")
+    if not parts or parts[-1] != b"" or len(parts) != len(fields) * 3 + 1:
+        return False
+    attributes: dict[bytes, bytes] = {}
+    for index in range(0, len(parts) - 1, 3):
+        name, attribute, value = parts[index:index + 3]
+        if name != pathname or attribute not in fields or attribute in attributes:
+            return False
+        attributes[attribute] = value
+    return (
+        len(attributes) == len(fields)
+        and attributes[b"eol"] == b"crlf"
+        and attributes[b"text"] in {b"set", b"unspecified"}
+        and attributes[b"filter"] in {b"unspecified", b"unset"}
+        and attributes[b"ident"] in {b"unspecified", b"unset"}
+        and attributes[b"working-tree-encoding"] in {b"unspecified", b"unset"}
+    )
+
+
+def _crlf_normalized_chunks(tracked: Any) -> Iterator[bytes]:
+    """Only CRLF -> LF; retain an incomplete CR across chunk boundaries."""
+    pending_cr = b""
+    while chunk := tracked.read(128 * 1024):
+        data = pending_cr + chunk
+        pending_cr = b"\r" if data.endswith(b"\r") else b""
+        if pending_cr:
+            data = data[:-1]
+        if data:
+            yield data.replace(b"\r\n", b"\n")
+    if pending_cr:
+        yield pending_cr
+
+
+def _explicit_crlf_blob_matches(tracked: Any, oid: bytes, before: os.stat_result) -> bool:
+    """Hash the same opened inode twice; bound memory and reject a raced read."""
+    normalized_size = sum(len(chunk) for chunk in _crlf_normalized_chunks(tracked))
+    tracked.seek(0)
+    digest = hashlib.sha1() if len(oid) == 40 else hashlib.sha256()
+    digest.update(b"blob " + str(normalized_size).encode("ascii") + b"\0")
+    for chunk in _crlf_normalized_chunks(tracked):
+        digest.update(chunk)
+    after = os.fstat(tracked.fileno())
+    return (
+        digest.hexdigest().encode("ascii") == oid
+        and (before.st_dev, before.st_ino, before.st_size,
+             before.st_mtime_ns, before.st_ctime_ns)
+        == (after.st_dev, after.st_ino, after.st_size,
+            after.st_mtime_ns, after.st_ctime_ns)
+    )
+
 def _repository_dirty_without_git_filters(
     repo: Path, environment: dict[str, str], expected_head: str,
 ) -> bool:
@@ -793,6 +914,10 @@ def _repository_dirty_without_git_filters(
     manifest = _bounded_git_metadata(
         repo, ["ls-files", "--stage", "-z"], environment,
     )
+    committed_attrs = {
+        path: value for path, value in expected.items()
+        if path == b".gitattributes" or path.endswith(b"/.gitattributes")
+    }
     for entry in manifest.split(b"\0"):
         if not entry:
             continue
@@ -811,6 +936,7 @@ def _repository_dirty_without_git_filters(
             if not parts or any(part in {b"", b".", b".."} for part in parts):
                 return True
             digest = hashlib.sha1() if len(oid) == 40 else hashlib.sha256()
+            normalized_match = False
             # Directory-descriptor walk forbids symlinked parent directories.
             parent_fd = os.open(repo, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
             try:
@@ -854,9 +980,18 @@ def _repository_dirty_without_git_filters(
                                 after.st_mtime_ns, after.st_ctime_ns)
                         ):
                             return True
+                        if digest.hexdigest().encode("ascii") != oid:
+                            if not _explicit_index_crlf_only(
+                                repo, environment, pathname, committed_attrs,
+                            ):
+                                return True
+                            tracked.seek(0)
+                            normalized_match = _explicit_crlf_blob_matches(
+                                tracked, oid, before
+                            )
             finally:
                 os.close(parent_fd)
-            if digest.hexdigest().encode("ascii") != oid:
+            if digest.hexdigest().encode("ascii") != oid and not normalized_match:
                 return True
         except (OSError, ValueError):
             return True

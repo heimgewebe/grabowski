@@ -238,6 +238,140 @@ class ScheduledWorkerGitFilterTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "dirty"):
                 worker.verify_repository(repo, repo, "canonical-main", head)
 
+    def test_explicit_index_crlf_is_clean_without_git_filter_execution(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="worker-crlf-safe-") as dirname:
+            root = Path(dirname)
+            repo, _ = self.make_repo(root)
+            tracked = repo / "tracked.txt"
+            (repo / ".gitattributes").write_text(
+                "tracked.txt text eol=crlf\n", encoding="utf-8"
+            )
+            self.git(repo, "add", ".gitattributes")
+            self.git(repo, "commit", "-qm", "Declare explicit CRLF text")
+            head = self.git(repo, "rev-parse", "HEAD")
+            self.git(repo, "update-ref", "refs/remotes/origin/main", head)
+            tracked.unlink()
+            self.git(repo, "checkout", "--", "tracked.txt")
+            self.assertIn(b"\r\n", tracked.read_bytes())
+            self.assertEqual(
+                self.git(repo, "status", "--porcelain=v1", "--untracked-files=normal"), ""
+            )
+            worker.verify_repository(repo, repo, "canonical-main", head)
+            tracked.write_bytes(b"modified\r\n")
+            with self.assertRaisesRegex(RuntimeError, "dirty"):
+                worker.verify_repository(repo, repo, "canonical-main", head)
+
+    def test_eol_only_index_attribute_is_clean_and_binary_remains_dirty(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="worker-eol-only-") as dirname:
+            root = Path(dirname)
+            repo, _ = self.make_repo(root)
+            tracked = repo / "tracked.txt"
+            (repo / ".gitattributes").write_text(
+                "tracked.txt eol=crlf\n", encoding="utf-8"
+            )
+            self.git(repo, "add", ".gitattributes")
+            self.git(repo, "commit", "-qm", "EOL implies text")
+            head = self.git(repo, "rev-parse", "HEAD")
+            self.git(repo, "update-ref", "refs/remotes/origin/main", head)
+            tracked.unlink()
+            self.git(repo, "checkout", "--", "tracked.txt")
+            worker.verify_repository(repo, repo, "canonical-main", head)
+            # No CRLF normalization may accept arbitrary changed binary content.
+            tracked.write_bytes(b"original\x00\r\n")
+            with self.assertRaisesRegex(RuntimeError, "dirty"):
+                worker.verify_repository(repo, repo, "canonical-main", head)
+
+    def test_crlf_streaming_preserves_pair_across_read_chunks(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="worker-eol-chunk-") as dirname:
+            root = Path(dirname)
+            repo, _ = self.make_repo(root)
+            tracked = repo / "tracked.txt"
+            original = b"X" * (128 * 1024 - 1) + b"\nlast\n"
+            tracked.write_bytes(original)
+            (repo / ".gitattributes").write_text(
+                "tracked.txt text eol=crlf\n", encoding="utf-8"
+            )
+            self.git(repo, "add", ".gitattributes", "tracked.txt")
+            self.git(repo, "commit", "-qm", "Force CRLF across read boundary")
+            head = self.git(repo, "rev-parse", "HEAD")
+            self.git(repo, "update-ref", "refs/remotes/origin/main", head)
+            tracked.unlink()
+            self.git(repo, "checkout", "--", "tracked.txt")
+            self.assertEqual(tracked.read_bytes()[128 * 1024 - 1:128 * 1024 + 1], b"\r\n")
+            worker.verify_repository(repo, repo, "canonical-main", head)
+
+    def test_mutable_info_attributes_cannot_launder_dirty_crlf(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="worker-eol-info-") as dirname:
+            repo, head = self.make_repo(Path(dirname))
+            (repo / ".git" / "info" / "attributes").write_text(
+                "tracked.txt text eol=crlf\n", encoding="utf-8"
+            )
+            (repo / "tracked.txt").write_bytes(b"original\r\n")
+            self.assertNotEqual(
+                self.git(repo, "status", "--porcelain=v1", "--untracked-files=normal"), ""
+            )
+            with self.assertRaisesRegex(RuntimeError, "dirty"):
+                worker.verify_repository(repo, repo, "canonical-main", head)
+
+    def test_committed_glob_crlf_is_clean_in_nested_checkout(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="worker-eol-glob-") as dirname:
+            repo, _ = self.make_repo(Path(dirname))
+            nested = repo / "nested"
+            nested.mkdir()
+            target = nested / "notes.txt"
+            target.write_bytes(b"first\nsecond\n")
+            (repo / ".gitattributes").write_text(
+                "*.txt text eol=crlf\n", encoding="utf-8"
+            )
+            self.git(repo, "add", ".gitattributes", "nested/notes.txt")
+            self.git(repo, "commit", "-qm", "Committed safe glob attributes")
+            head = self.git(repo, "rev-parse", "HEAD")
+            self.git(repo, "update-ref", "refs/remotes/origin/main", head)
+            target.unlink()
+            self.git(repo, "checkout", "--", "nested/notes.txt")
+            self.assertIn(b"\r\n", target.read_bytes())
+            worker.verify_repository(repo, repo, "canonical-main", head)
+
+    def test_unstaged_crlf_attribute_cannot_disguise_dirty_file(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="worker-eol-unindexed-") as dirname:
+            repo, head = self.make_repo(Path(dirname))
+            (repo / ".gitattributes").write_text(
+                "tracked.txt text eol=crlf\n", encoding="utf-8"
+            )
+            (repo / "tracked.txt").write_bytes(b"original\r\n")
+            with self.assertRaisesRegex(RuntimeError, "dirty"):
+                worker.verify_repository(repo, repo, "canonical-main", head)
+
+    def test_crlf_check_does_not_execute_late_registered_filter(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="worker-eol-race-") as dirname:
+            root = Path(dirname)
+            repo, _ = self.make_repo(root)
+            tracked = repo / "tracked.txt"
+            (repo / ".gitattributes").write_text(
+                "tracked.txt text eol=crlf\n", encoding="utf-8"
+            )
+            self.git(repo, "add", ".gitattributes")
+            self.git(repo, "commit", "-qm", "CRLF fixture")
+            head = self.git(repo, "rev-parse", "HEAD")
+            self.git(repo, "update-ref", "refs/remotes/origin/main", head)
+            tracked.unlink()
+            self.git(repo, "checkout", "--", "tracked.txt")
+            marker = root / "helper-executed"
+            original_audit = worker._reject_repository_git_filters
+
+            def install_late_filter(checkout: Path) -> None:
+                original_audit(checkout)
+                self.git(
+                    repo, "config", "filter.poison.clean",
+                    f"/bin/sh -c 'printf executed > {marker}; cat'",
+                )
+
+            with patch.object(
+                worker, "_reject_repository_git_filters", side_effect=install_late_filter
+            ):
+                worker.verify_repository(repo, repo, "canonical-main", head)
+            self.assertFalse(marker.exists(), "late filter executed during metadata read")
+
     def test_plain_repo_remains_eligible(self) -> None:
         with tempfile.TemporaryDirectory(prefix="worker-plain-filter-") as dirname:
             repo, head = self.make_repo(Path(dirname))
