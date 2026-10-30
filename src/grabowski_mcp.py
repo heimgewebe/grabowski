@@ -10200,13 +10200,16 @@ def _repoground_query_snippets(
                 # Graph callers/callees carry the source-indexed symbol nested.
                 # Only elevate its identity if it agrees with the hit path.
                 symbol_hit = hit
-                for nested_key in ("caller_symbol", "callee_symbol"):
-                    nested = hit.get(nested_key)
-                    if isinstance(nested, dict) and (
-                        not hit.get("path") or nested.get("path") == hit["path"]
-                    ):
-                        symbol_hit = nested
-                        break
+                nested_key = (
+                    "caller_symbol" if payload.get("route") == "callers"
+                    else "callee_symbol" if payload.get("route") == "callees"
+                    else None
+                )
+                nested = hit.get(nested_key) if nested_key is not None else None
+                if isinstance(nested, dict) and (
+                    not hit.get("path") or nested.get("path") == hit["path"]
+                ):
+                    symbol_hit = nested
                 path = hit.get("path") or symbol_hit.get("path")
                 first_line = symbol_hit.get("start_line")
                 last_line = symbol_hit.get("end_line")

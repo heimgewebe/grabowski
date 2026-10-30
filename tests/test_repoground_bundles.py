@@ -2249,6 +2249,7 @@ class RepoGroundContextBridgeToolTests(unittest.TestCase):
 
         # A conflicting nested source must never promote incorrect line evidence.
         mismatch = mcp._repoground_query_snippets({
+            "route": "callers",
             "navigation_hits": [{
                 "path": "src/real.py",
                 "caller_symbol": {
@@ -2260,6 +2261,35 @@ class RepoGroundContextBridgeToolTests(unittest.TestCase):
         self.assertEqual(mismatch["snippets"][0]["path"], "src/real.py")
         self.assertIsNone(mismatch["snippets"][0]["symbol"]["name"])
         self.assertIsNone(mismatch["snippets"][0]["line_range"]["start_line"])
+
+        # Contradictory nested candidates must be interpreted by the actual route,
+        # not by the order in which keys happened to be serialized.
+        ambiguous = mcp._repoground_query_snippets({
+            "route": "callees",
+            "navigation_hits": [{
+                "path": "src/real.py",
+                "caller_symbol": {
+                    "path": "src/real.py", "name": "wrong_caller",
+                    "start_line": 4, "end_line": 8,
+                },
+                "callee_symbol": {
+                    "path": "src/real.py", "id": "py:real",
+                    "name": "right_callee", "kind": "function",
+                    "start_line": 10, "end_line": 12,
+                },
+            }],
+        })
+        self.assertEqual(ambiguous["snippets"][0]["symbol"]["name"], "right_callee")
+        self.assertEqual(ambiguous["snippets"][0]["line_range"]["start_line"], 10)
+        self.assertEqual(ambiguous["snippets"][0]["chunk_id"], "py:real")
+        unbound = mcp._repoground_query_snippets({
+            "route": "other",
+            "navigation_hits": [{
+                "path": "src/real.py",
+                "caller_symbol": {"path": "src/real.py", "name": "not_promoted"},
+            }],
+        })
+        self.assertIsNone(unbound["snippets"][0]["symbol"]["name"])
 
     def test_agent_query_preserves_optional_structured_evidence(self) -> None:
         _repo, head = self._git_repo("demo-repo")
