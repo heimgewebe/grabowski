@@ -1025,6 +1025,54 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
         with self.assertRaisesRegex(review.ReviewExecutionRejected, "previous signed material"):
             self._seal_direct(plan)
 
+    def test_empty_signed_wrong_canonical_diff_session_cannot_poison_new_review(self) -> None:
+        # Real production regression: one valid issuer-signed START accidentally
+        # used the GitHub-PR identity as local canonical diff identity. It has
+        # zero review-axis receipts, hence no finding or REJECT to suppress.
+        old_plan = self._first_party_plan()
+        github_rendered_diff = b"GitHub PR rendered diff != local git raw diff"
+        old_plan["binding"]["diff_sha256"] = hashlib.sha256(
+            github_rendered_diff
+        ).hexdigest()
+        with mock.patch.object(
+            review, "_first_party_diff", return_value=github_rendered_diff
+        ):
+            old_session = self._start_plan(old_plan)
+        legacy_root = self.state / "sessions" / old_session["review_session_id"]
+        self.assertEqual([], list((legacy_root / "axes").iterdir()))
+        legacy = review._read_signed_record(
+            legacy_root / "session.json", signers=self.signers,
+            root_owned_signers=False,
+        )
+        self.assertNotEqual(
+            hashlib.sha256(review._first_party_diff(
+                self.repo, old_plan["binding"]
+            )).hexdigest(),
+            legacy["canonical_diff_sha256"],
+        )
+        self.assertEqual(
+            legacy["binding"]["diff_sha256"], legacy["canonical_diff_sha256"],
+            "historical defect confused GitHub patch identity with local raw diff",
+        )
+        self.assertEqual(
+            producer._current_source(self.repo, old_plan["binding"]),
+            legacy["source_raw_diff_sha256"],
+        )
+
+        plan = self._first_party_plan()
+        started = self._start_plan(plan)
+        for number, axis in enumerate(review.REQUIRED_AXES, start=1):
+            self._submit_axis(started, axis, number)
+        audit, receipts = self._seal_direct(plan)
+        self.assertEqual([], self._receipt_errors(audit, receipts))
+
+        # If the supposedly empty historical registry later acquires any axis
+        # entry, the exact same audit must fail closed, not silently skip it.
+        invalid_axis = legacy_root / "axes" / "contracts_correctness.json"
+        invalid_axis.write_text("{}", encoding="utf-8")
+        invalid_axis.chmod(0o600)
+        self.assertTrue(self._receipt_errors(audit, receipts))
+
     def test_prior_signed_material_reject_remains_blocking_across_batches(self) -> None:
         # No change to Git source, PR or canonical diff between batches.
         plan_a = self._first_party_plan()

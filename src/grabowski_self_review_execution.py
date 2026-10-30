@@ -1920,7 +1920,6 @@ def _assert_prior_first_party_material_findings_resolved(
                     if (
                         old.get("schema_version") != 1
                         or old.get("binding_sha256") != _digest(old_binding)
-                        or old.get("canonical_diff_sha256") != session["canonical_diff_sha256"]
                         or old.get("source_raw_diff_sha256") != (
                             _digest(old_binding["candidate_binding"])
                             if old_binding["review_purpose"] == "frozen_candidate"
@@ -1933,6 +1932,25 @@ def _assert_prior_first_party_material_findings_resolved(
                             )
                         )
                     ):
+                        raise ReviewExecutionRejected("previous same-revision session origin invalid")
+                    if old.get("canonical_diff_sha256") != session["canonical_diff_sha256"]:
+                        # A signed but never-reviewed PR session may accidentally
+                        # bind the *GitHub* patch hash as the local canonical diff.
+                        # It carries no review finding or REJECT debt if and only
+                        # if its private, authenticated axes directory is empty.
+                        # All other identity checks above still apply. Any axis
+                        # entry, including a malformed/unsigned one, fails closed.
+                        if (
+                            old_binding["review_purpose"] == "pull_request"
+                            and old.get("canonical_diff_sha256") == old_binding["diff_sha256"]
+                        ):
+                            axes_fd = _private_dir(historical_root / "axes")
+                            try:
+                                with os.scandir(axes_fd) as axis_entries:
+                                    if next(axis_entries, None) is None:
+                                        continue
+                            finally:
+                                os.close(axes_fd)
                         raise ReviewExecutionRejected("previous same-revision session origin invalid")
                     old_reads = _load_first_party_reads(
                         old, historical_root, signers=signers,
