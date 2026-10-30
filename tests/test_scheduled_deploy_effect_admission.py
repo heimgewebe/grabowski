@@ -379,6 +379,63 @@ class ScheduledWorkerGitFilterTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "dirty"):
                 worker.verify_repository(repo, repo, "canonical-main", head)
 
+    def test_committed_binary_macro_cannot_launder_crlf_from_info(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="worker-eol-binary-macro-") as dirname:
+            repo, _ = self.make_repo(Path(dirname))
+            (repo / ".gitattributes").write_text(
+                "*.txt text eol=crlf\n"
+                "tracked.txt binary\n", encoding="utf-8"
+            )
+            self.git(repo, "add", ".gitattributes")
+            self.git(repo, "commit", "-qm", "Built-in binary macro overrides text")
+            head = self.git(repo, "rev-parse", "HEAD")
+            self.git(repo, "update-ref", "refs/remotes/origin/main", head)
+            (repo / "tracked.txt").write_bytes(b"original\r\n")
+            (repo / ".git" / "info" / "attributes").write_text(
+                "tracked.txt text eol=crlf\n", encoding="utf-8"
+            )
+            self.assertNotEqual(
+                self.git(repo, "status", "--porcelain=v1", "--untracked-files=normal"), ""
+            )
+            with self.assertRaisesRegex(RuntimeError, "dirty"):
+                worker.verify_repository(repo, repo, "canonical-main", head)
+
+    def test_committed_custom_macro_cannot_launder_crlf(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="worker-eol-custom-macro-") as dirname:
+            repo, _ = self.make_repo(Path(dirname))
+            (repo / ".gitattributes").write_text(
+                "[attr]nottext -text eol=lf\n"
+                "*.txt text eol=crlf\n"
+                "tracked.txt nottext\n", encoding="utf-8"
+            )
+            self.git(repo, "add", ".gitattributes")
+            self.git(repo, "commit", "-qm", "Custom macro overrides text")
+            head = self.git(repo, "rev-parse", "HEAD")
+            self.git(repo, "update-ref", "refs/remotes/origin/main", head)
+            (repo / "tracked.txt").write_bytes(b"original\r\n")
+            (repo / ".git" / "info" / "attributes").write_text(
+                "tracked.txt text eol=crlf\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(RuntimeError, "dirty"):
+                worker.verify_repository(repo, repo, "canonical-main", head)
+
+    def test_unrelated_macro_definition_keeps_direct_crlf_rule_eligible(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="worker-eol-macro-decl-") as dirname:
+            repo, _ = self.make_repo(Path(dirname))
+            (repo / ".gitattributes").write_text(
+                "[attr]binary -text -diff -merge\n"
+                "tracked.txt text eol=crlf\n", encoding="utf-8"
+            )
+            self.git(repo, "add", ".gitattributes")
+            self.git(repo, "commit", "-qm", "Macro declaration not applied")
+            head = self.git(repo, "rev-parse", "HEAD")
+            self.git(repo, "update-ref", "refs/remotes/origin/main", head)
+            tracked = repo / "tracked.txt"
+            tracked.unlink()
+            self.git(repo, "checkout", "--", "tracked.txt")
+            self.assertIn(b"\r\n", tracked.read_bytes())
+            worker.verify_repository(repo, repo, "canonical-main", head)
+
     def test_last_matching_committed_crlf_rule_is_accepted(self) -> None:
         with tempfile.TemporaryDirectory(prefix="worker-eol-last-") as dirname:
             repo, _ = self.make_repo(Path(dirname))

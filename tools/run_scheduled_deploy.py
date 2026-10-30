@@ -799,6 +799,10 @@ def _committed_crlf_attributes(
             if len(tokens) < 2:
                 continue
             pattern = tokens[0]
+            if pattern.startswith(b"[attr]"):
+                # A macro definition is not a pathname assignment; its
+                # invocation below is rejected unless explicitly modeled.
+                continue
             if pattern.startswith(b"/"):
                 pattern = pattern[1:]
             unsupported = False
@@ -835,8 +839,12 @@ def _committed_crlf_attributes(
                     field, value = token.split(b"=", 1)
                 else:
                     field, value = token, b"set"
-                if field in fields:
-                    effective[field] = value
+                if field not in fields:
+                    # Custom and built-in attribute macros (e.g. "binary"
+                    # expanding to -text) may override conversion policy.
+                    # Never silently ignore an unmodeled matching token.
+                    return None
+                effective[field] = value
     if (
         effective.get(b"eol") != b"crlf"
         or effective.get(b"text", b"unspecified") not in {b"set", b"unspecified"}
