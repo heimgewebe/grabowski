@@ -1366,7 +1366,7 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
         authentic = review._assert_no_first_party_reject_for_legacy_review
 
         def inspect_original_signed_review(candidate: dict, **_options: object) -> None:
-            self.assertEqual(candidate["repo"], "heimgewebe/grabowski")
+            self.assertEqual(candidate["repo"].casefold(), "heimgewebe/grabowski")
             authentic(
                 candidate, repository=serving_checkout, root=self.state,
                 signers=self.signers, root_owned_signers=False,
@@ -1406,6 +1406,13 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
                     **binding, "repository": "Heimgewebe/grabowski",
                 }),
                 "case aliases of the signed owner must not bypass REJECT history",
+            )
+            self.assertEqual(
+                ["merge_guard_signed_first_party_material_reject_or_invalid_history"],
+                captain._signed_first_party_material_history_errors({
+                    **binding, "repository": "heimgewebe/Grabowski",
+                }),
+                "case aliases of signed repository names must not bypass REJECT history",
             )
 
             self.now += 1

@@ -1875,7 +1875,20 @@ def _assert_prior_first_party_material_findings_resolved(
                         "repo", "pr", "base_sha", "head_sha",
                         "review_purpose", "release_binding",
                     )
-                    if not all(candidate.get(k) == decisive.get(k) for k in revision_fields):
+                    # GitHub repository names are case-insensitive. Keep the
+                    # signed bytes untouched, but never skip a signed REJECT
+                    # merely because a caller used another name casing.
+                    candidate_repo = candidate.get("repo")
+                    decisive_repo = decisive.get("repo")
+                    if (
+                        not isinstance(candidate_repo, str)
+                        or not isinstance(decisive_repo, str)
+                        or candidate_repo.casefold() != decisive_repo.casefold()
+                        or any(
+                            candidate.get(k) != decisive.get(k)
+                            for k in revision_fields if k != "repo"
+                        )
+                    ):
                         continue
                     if decisive.get("review_purpose") == "frozen_candidate":
                         # A new signed Test receipt changes the full Candidate
