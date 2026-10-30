@@ -1983,6 +1983,7 @@ def _nixos_native_backup_service_fresh() -> dict[str, Any]:
         "backup_invocation_id": None, "snapshot_id": None,
         "error": "NixOS Restic service lacks bound backup snapshot evidence",
         "source": "nixos-system-restic-backup-completion",
+        "never_invoked_current_boot": False,
     }
     names = (
         "LoadState", "ActiveState", "Job", "Result", "ExecMainCode",
@@ -2007,6 +2008,22 @@ def _nixos_native_backup_service_fresh() -> dict[str, Any]:
     if set(fields) != set(names):
         return result
     result["exists"] = fields["LoadState"] == "loaded"
+    # systemd does not retain a completed oneshot's invocation across a reboot.
+    # This is a narrow classification, not backup success: a failed, running or
+    # attempted current-boot invocation must never use persisted fallback proof.
+    result["never_invoked_current_boot"] = (
+        result["exists"]
+        and fields["ActiveState"] == "inactive"
+        and fields["Job"] in {"", "0"}
+        and fields["Result"] == "success"
+        and fields["ExecMainCode"] == "0"
+        and fields["ExecMainStatus"] == "0"
+        and fields["InvocationID"] == ""
+        and fields["ExecMainStartTimestampMonotonic"] == "0"
+        and fields["ExecMainExitTimestampMonotonic"] == "0"
+        and fields["ExecMainStartTimestamp"] == ""
+        and fields["ExecMainExitTimestamp"] == ""
+    )
     if (not result["exists"] or fields["ActiveState"] != "inactive"
             or fields["Job"] not in {"", "0"}
             or fields["Result"] != "success" or fields["ExecMainCode"] != "1"
@@ -2146,13 +2163,51 @@ def _local_backup_freshness(
         and 0 <= now - snapshot_time <= MAX_AGE_SECONDS
         and abs((now - snapshot_time) - snapshot_age) <= 5
     )
+    previous_boot_proof = False
+    if (
+        not identity_bound
+        and completed.get("never_invoked_current_boot") is True
+        and server_source.get("valid") is True
+        and server_source.get("exists") is True
+        and server_source.get("snapshot_fresh") is True
+        and server_source.get("restore_probe_valid") is True
+        and server_source.get("repository_check_valid") is True
+        and server_source.get("target_matches_configured") is True
+        and isinstance(source_id, str)
+        and re.fullmatch(r"[0-9a-f]{8,64}", source_id) is not None
+        and type(snapshot_time) is int
+        and type(snapshot_age) is int
+        and 0 < snapshot_time <= now
+        and 0 <= snapshot_age <= MAX_AGE_SECONDS
+        and 0 <= now - snapshot_time <= MAX_AGE_SECONDS
+        and abs((now - snapshot_time) - snapshot_age) <= 5
+    ):
+        # The backup's trusted same-boot invocation was already checked before
+        # the root-owned, hash-bound canonical restore/repository proof was
+        # published. Reboots discard systemd's volatile invocation metadata, not
+        # that verified persisted proof. Do not allow this path if the unit ran,
+        # failed, is pending or is still running in the current boot.
+        canonical = _canonical_server_marker()
+        previous_boot_proof = (
+            _server_recovery_evidence_fresh(canonical)
+            and _source_publication_state(canonical, server_source)["current"] is True
+        )
     return {
         "path": server_source.get("path"), "exists": server_source.get("exists") is True,
-        "valid": identity_bound, "timestamp_unix": snapshot_time,
+        "valid": identity_bound or previous_boot_proof,
+        "timestamp_unix": snapshot_time,
         "age_seconds": snapshot_age, "source": "verified-nixos-native-restic",
+        "verification_mode": (
+            "same-boot-invocation" if identity_bound
+            else "persisted-root-proof" if previous_boot_proof
+            else "invalid"
+        ),
         "backup_invocation_id": completed.get("backup_invocation_id"),
         "snapshot_id": source_id,
-        "error": None if identity_bound else "NixOS recovery snapshot lacks matching completed backup invocation",
+        "error": (
+            None if identity_bound or previous_boot_proof
+            else "NixOS recovery snapshot lacks matching completed backup invocation"
+        ),
     }
 
 def recovery_status() -> dict[str, Any]:
