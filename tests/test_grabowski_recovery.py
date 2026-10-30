@@ -960,6 +960,126 @@ class NativeNixOSResticProofTests(unittest.TestCase):
             else:
                 self.assertIsNotNone(state["error"])
 
+    def test_nixos_backup_persisted_journal_rebinds_only_latest_completed_invocation(self) -> None:
+        """A reboot must not erase genuine proof or admit old/failed backups."""
+        unit = "restic-backups-heim-pc.service"
+        boot, invocation = "b" * 32, "a" * 32
+        start = (self.now - 90) * 1_000_000
+        saved = (self.now - 30) * 1_000_000
+        end = (self.now - 29) * 1_000_000
+
+        def manager(kind: str, timestamp: int, mono: int, **changes):
+            starting = kind == "start"
+            row = {
+                "_UID": "0", "_PID": "1", "_BOOT_ID": boot,
+                "_SYSTEMD_UNIT": "init.scope", "_TRANSPORT": "journal",
+                "UNIT": unit, "INVOCATION_ID": invocation,
+                "__REALTIME_TIMESTAMP": str(timestamp),
+                "__MONOTONIC_TIMESTAMP": str(mono),
+                "MESSAGE": (f"Starting {unit}..." if starting
+                            else f"Finished {unit}."),
+                "MESSAGE_ID": ("7d4958e842da4a758f6c1cdc7b36dcc5" if starting
+                               else "39f53479d3a045ac8e11786248231fbf"),
+            }
+            if not starting:
+                row.update({"JOB_TYPE": "start", "JOB_RESULT": "done"})
+            return {**row, **changes}
+
+        def snapshot(timestamp: int, mono: int, **changes):
+            return {
+                "_UID": "0", "_BOOT_ID": boot,
+                "_SYSTEMD_UNIT": unit, "_TRANSPORT": "stdout",
+                "_SYSTEMD_INVOCATION_ID": invocation,
+                "__REALTIME_TIMESTAMP": str(timestamp),
+                "__MONOTONIC_TIMESTAMP": str(mono),
+                "MESSAGE": "snapshot b4f49077 saved", **changes,
+            }
+
+        beginning = manager("start", start, 10_000_000)
+        save = snapshot(saved, 70_000_000)
+        finished = manager("finish", end, 71_000_000)
+        # Actual --grep/-n journalctl output was newest-first; order must
+        # be irrelevant and all records must agree in two clock domains.
+        clean = [finished, save, beginning]
+        new_start = manager(
+            "start", (self.now - 8) * 1_000_000, 92_000_000,
+            INVOCATION_ID="f" * 32,
+        )
+
+        def postboot(**changed):
+            fields = {
+                "LoadState": "loaded", "ActiveState": "inactive", "Job": "",
+                "Result": "success", "ExecMainCode": "0",
+                "ExecMainStatus": "0", "InvocationID": "",
+                "ExecMainStartTimestampMonotonic": "0",
+                "ExecMainExitTimestampMonotonic": "0",
+                "ExecMainStartTimestamp": "", "ExecMainExitTimestamp": "",
+            }
+            fields.update(changed)
+            return "\n".join(f"{k}={v}" for k, v in fields.items()) + "\n"
+
+        cases = (
+            ("reboot_success", clean, postboot(), True),
+            ("chronological_order", [beginning, save, finished], postboot(), True),
+            ("missing_start", [finished, save], postboot(), False),
+            ("missing_finish", [save, beginning], postboot(), False),
+            ("missing_snapshot", [finished, beginning], postboot(), False),
+            ("newer_incomplete_attempt", clean + [new_start], postboot(), False),
+            ("wrong_invocation", [finished, snapshot(saved, 70_000_000,
+                                        _SYSTEMD_INVOCATION_ID="c" * 32), beginning],
+             postboot(), False),
+            ("wrong_boot", [finished, snapshot(saved, 70_000_000,
+                                  _BOOT_ID="c" * 32), beginning], postboot(), False),
+            ("fake_systemd_pid", [manager("finish", end, 71_000_000,
+                                          _PID="123"), save, beginning],
+             postboot(), False),
+            ("bad_finish_job_result", [manager("finish", end, 71_000_000,
+                                               JOB_RESULT="failed"), save, beginning],
+             postboot(), False),
+            ("foreign_service", [finished, snapshot(saved, 70_000_000,
+                                           _SYSTEMD_UNIT="another.service"),
+                                 beginning], postboot(), False),
+            ("wrong_snapshot_clock", [finished,
+                                       snapshot(saved, 50_000_000),
+                                       beginning], postboot(), False),
+            ("duplicate_snapshot", clean + [save], postboot(), False),
+            ("stale", clean, postboot(), False, self.now + recovery.MAX_AGE_SECONDS + 1),
+            ("currently_failed", clean, postboot(Result="exit-code"), False),
+            ("pending_job", clean, postboot(Job="(1,restic-backups-heim-pc.service,start)"), False),
+            ("still_running", clean, postboot(ActiveState="activating"), False),
+            ("inconsistent_previous_metadata", clean,
+             postboot(ExecMainExitTimestampMonotonic="123"), False),
+        )
+        for row in cases:
+            label, events, unit_output, accepted = row[:4]
+            stamp = row[4] if len(row) == 5 else self.now
+            seen = []
+            def run(argv, **_):
+                seen.append(argv)
+                if argv[0].endswith("/systemctl"):
+                    return {"returncode": 0, "stdout": unit_output}
+                if argv[0].endswith("/journalctl"):
+                    return {
+                        "returncode": 0,
+                        "stdout": "\n".join(json.dumps(event) for event in events) + "\n",
+                    }
+                raise AssertionError(f"unexpected execution: {argv}")
+
+            with self.subTest(case=label), patch.object(
+                recovery.operator, "_run", side_effect=run
+            ), patch.object(recovery.time, "time", return_value=stamp):
+                evidence = recovery._nixos_native_backup_service_fresh()
+            self.assertEqual(evidence["valid"], accepted)
+            if accepted:
+                self.assertEqual(evidence["snapshot_id"], "b4f49077")
+                self.assertEqual(evidence["backup_invocation_id"], invocation)
+                self.assertEqual(evidence["service_start_unix"], self.now - 90)
+                self.assertEqual(evidence["service_exit_unix"], self.now - 29)
+                self.assertEqual(len(seen), 2)
+                self.assertIn("--since", seen[1])
+            else:
+                self.assertFalse(evidence["valid"])
+
     def test_nixos_source_requires_matching_backup_journal_snapshot_and_window(self) -> None:
         native = {
             "path": "systemd:restic-backups-heim-pc.service",
