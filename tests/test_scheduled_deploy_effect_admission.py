@@ -485,6 +485,38 @@ class ScheduledWorkerGitFilterTests(unittest.TestCase):
             self.assertIn(b"\r\n", tracked.read_bytes())
             worker.verify_repository(repo, repo, "canonical-main", head)
 
+    def test_committed_attrs_work_without_check_attr_source_option(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="worker-legacy-git-attrs-") as dirname:
+            repo, _ = self.make_repo(Path(dirname))
+            (repo / ".gitattributes").write_text(
+                "tracked.txt text eol=crlf\n", encoding="utf-8"
+            )
+            self.git(repo, "add", ".gitattributes")
+            self.git(repo, "commit", "-qm", "Native legacy-compatible CRLF")
+            head = self.git(repo, "rev-parse", "HEAD")
+            self.git(repo, "update-ref", "refs/remotes/origin/main", head)
+            tracked = repo / "tracked.txt"
+            tracked.unlink()
+            self.git(repo, "checkout", "--", "tracked.txt")
+            original_metadata = worker._bounded_git_metadata
+            observed = []
+
+            def reject_new_git_option(source, argv, environment):
+                self.assertNotIn(
+                    "--source", argv, "Git 2.34 does not support check-attr --source"
+                )
+                observed.append(tuple(argv))
+                return original_metadata(source, argv, environment)
+
+            with patch.object(
+                worker, "_bounded_git_metadata", side_effect=reject_new_git_option
+            ):
+                worker.verify_repository(repo, repo, "canonical-main", head)
+            self.assertTrue(
+                any("read-tree" in argv for argv in observed),
+                "pinned committed tree must populate isolated temporary index",
+            )
+
     def test_sha256_git_tree_crlf_source_remains_supported(self) -> None:
         with tempfile.TemporaryDirectory(prefix="worker-sha256-crlf-") as dirname:
             repo = Path(dirname) / "source"

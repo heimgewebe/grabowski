@@ -771,8 +771,8 @@ def _explicit_index_crlf_only(
 
     check-attr --cached in the source also reads .git/info/attributes, so it
     cannot authorize CRLF normalization on its own. A private temporary bare
-    repo with the verified source object database and --source=<exact HEAD>
-    evaluates the *whole* committed attribute grammar (macros, quoting and
+    repo with an index loaded from the exact HEAD tree evaluates the *whole*
+    committed attribute grammar (macros, quoting and
     precedence), without reading the source repo's mutable attribute layers
     or invoking Git content filters.
     """
@@ -807,10 +807,18 @@ def _explicit_index_crlf_only(
             **environment,
             "GIT_OBJECT_DIRECTORY": str(objects),
         }
+        # Git read-tree and check-attr --cached work on older Git versions
+        # that do not support check-attr --source. The temporary index comes
+        # exclusively from expected_head, not from the source worktree/index.
+        _bounded_git_metadata(
+            repo,
+            ["--git-dir", str(bare), "read-tree", expected_head],
+            pinned_environment,
+        )
         committed = _bounded_git_metadata(
             repo,
             ["--git-dir", str(bare), "check-attr",
-             "--source", expected_head, "-z", *argv],
+             "--cached", "-z", *argv],
             pinned_environment,
         )
 
