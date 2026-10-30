@@ -3273,6 +3273,32 @@ def _install_deployment_admission_gate() -> None:
                 tool=tool,
                 transport_arguments=arguments,
             )
+            domain_original = original
+            if tool_name in {
+                "grabowski_self_review_session_start",
+                "grabowski_self_review_source_read",
+                "grabowski_self_review_axis_submit",
+            }:
+                # The outer gate already consumed this request's real MAC.
+                # Pass its server-owned proof through the actual worker call;
+                # a second inner consume would be classified as a replay.
+                if (
+                    not isinstance(transport_evidence, dict)
+                    or transport_evidence.get("state") != "consumed"
+                    or transport_evidence.get("transport_mode") != "signed-one-call-v1"
+                    or transport_evidence.get("tool_name") != tool_name
+                ):
+                    raise RuntimeError(
+                        "first-party review requires consumed signed ingress"
+                    )
+
+                async def first_party_domain_original(
+                    *inner_args: Any, **inner_kwargs: Any,
+                ) -> Any:
+                    with base._first_party_preconsumed_transport(transport_evidence):
+                        return await original(*inner_args, **inner_kwargs)
+
+                domain_original = first_party_domain_original
             (
                 admission_transport_evidence,
                 replay_reentry_runtime_sha256,
@@ -3372,7 +3398,7 @@ def _install_deployment_admission_gate() -> None:
                         call_extra_args = ()
                     worker_future = _submit_sync_tool_call(
                         call_runner,
-                        original,
+                        domain_original,
                         args,
                         kwargs,
                         *call_extra_args,
@@ -3527,7 +3553,7 @@ def _install_deployment_admission_gate() -> None:
                         )
                     raise
             try:
-                result = await original(*args, **kwargs)
+                result = await domain_original(*args, **kwargs)
                 _record_repoground_consultation(tool_name)
             except BaseException as error:
                 if effect_admission is not None:

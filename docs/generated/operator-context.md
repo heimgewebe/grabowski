@@ -59,6 +59,9 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_destroy_path` | filesystem | no | high | Irreversibly remove one regular file or empty directory with a separate explicit capability. |
 | `grabowski_rollback_text` | audit | no | medium | Restore a quarantined preimage from an audited replace transaction. |
 | `grabowski_verify_audit` | audit | yes | low | Verify the tamper-evident write audit hash chain. |
+| `grabowski_self_review_session_start` | audit | no | medium | Start one signed-ingress-bound semantic review session for an immutable stored review plan. |
+| `grabowski_self_review_source_read` | audit | no | medium | Return and immutably persist exact Git diff or source bytes inspected for one semantic review axis. |
+| `grabowski_self_review_axis_submit` | audit | no | medium | Persist one substantive source-read-bound semantic axis verdict from the authenticated controller. |
 | `grabowski_audit_query` | audit | yes | low | Query bounded safe fields from a verified audit snapshot with explicit scan completeness. |
 | `grabowski_audit_trace` | audit | yes | low | Trace one exact audit anchor through bounded one-hop typed evidence correlations without claiming causality. |
 | `grabowski_audit_analyze` | audit | yes | low | Compute bounded-memory descriptive statistics from a verified audit snapshot with explicit approximation semantics. |
