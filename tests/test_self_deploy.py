@@ -414,12 +414,11 @@ class ReleaseSourceRawModeAdmissionTests(unittest.TestCase):
             self._raw("D", "100755", "000000", "tools/old.py")
         )
 
-    def test_plain_document_still_exempt(self) -> None:
-        admission = self._admit_preview(
+    def test_plain_document_also_requires_review(self) -> None:
+        # A regular docs/ Markdown file may still be executed by validation.
+        self._assert_review_required(
             self._raw("M", "100644", "100644", "docs/release.md")
         )
-        self.assertEqual("non-runtime-documentation", admission["status"])
-        self.assertIs(admission["independent_review_required"], False)
 
     def test_executable_source_with_plain_document_requires_review(self) -> None:
         self._assert_review_required(
@@ -471,6 +470,7 @@ class SelfDeployToolTests(unittest.TestCase):
                 ),
                 "target_repo_head": head,
                 "changed_path_count": 1,
+                "critical_release_source": False,
                 "independent_review_required": False,
             },
         )
@@ -591,7 +591,7 @@ class SelfDeployToolTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "private and owner-controlled"):
                 SELF_DEPLOY._read_deploy_index(jobs)
 
-    def test_index_bootstrap_excludes_terminal_self_deploy_jobs(self) -> None:
+    def test_index_bootstrap_retains_unproved_terminal_self_deploy_jobs(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             jobs = root / "jobs"
@@ -616,9 +616,14 @@ class SelfDeployToolTests(unittest.TestCase):
                 SELF_DEPLOY.operator,
                 "_read_job_metadata",
                 side_effect=lambda unit: metadata[unit],
+            ), patch.object(
+                SELF_DEPLOY.operator,
+                "grabowski_job_status",
+                return_value={"final_status": "completed",
+                              "finalization_receipt": {"valid": False}},
             ):
                 index = SELF_DEPLOY._bootstrap_deploy_index(jobs, repository)
-            self.assertEqual(index["units"], [running])
+            self.assertEqual(index["units"], [terminal, running])
 
     def test_bootstrap_retry_block_preserves_unpersisted_outcome_unknown(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -7222,7 +7227,7 @@ class SelfDeployToolTests(unittest.TestCase):
         self.assertEqual(job_dir.name, result["unit"])
         self.assertEqual("1" * 64, result["source_identity_sha256"])
 
-    def test_terminal_midcutover_resume_is_pruned_before_normal_deploy(self) -> None:
+    def test_terminal_midcutover_resume_without_lineage_blocks_normal_deploy(self) -> None:
         repo = Path("/home/alex/repos/grabowski")
         desired = SELF_DEPLOY._deploy_command(
             repo,
@@ -7259,10 +7264,9 @@ class SelfDeployToolTests(unittest.TestCase):
                 "grabowski_job_status",
                 return_value={"final_status": "succeeded"},
             ), patch.object(SELF_DEPLOY, "_write_deploy_index") as write_index:
-                self.assertIsNone(
+                with self.assertRaisesRegex(RuntimeError, "mid-cutover resume job has an uncertain"):
                     SELF_DEPLOY._matching_inflight_deploy_job(desired, repo)
-                )
-        write_index.assert_called_once_with(root, units=[], pending_unit=None)
+        write_index.assert_not_called()
 
     def test_running_midcutover_resume_blocks_normal_deploy(self) -> None:
         repo = Path("/home/alex/repos/grabowski")
@@ -8209,7 +8213,7 @@ class SelfDeployToolTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "not bound"):
                     SELF_DEPLOY._matching_inflight_deploy_job(desired, repo)
 
-    def test_terminal_legacy_job_without_receipt_allows_retry(self) -> None:
+    def test_terminal_legacy_job_without_receipt_blocks_retry(self) -> None:
         repo = Path("/home/alex/repos/grabowski")
         runner = repo / "tools/run_scheduled_deploy.py"
         desired = SELF_DEPLOY._deploy_command(repo, runner, "a" * 40, 8)
@@ -8227,7 +8231,8 @@ class SelfDeployToolTests(unittest.TestCase):
             ), patch.object(
                 SELF_DEPLOY.operator, "grabowski_job_status", return_value={"final_status": "succeeded"}
             ):
-                self.assertIsNone(SELF_DEPLOY._matching_inflight_deploy_job(desired, repo))
+                with self.assertRaisesRegex(RuntimeError, "uncertain non-reusable outcome"):
+                    SELF_DEPLOY._matching_inflight_deploy_job(desired, repo)
 
     def test_unclear_legacy_job_for_different_head_blocks(self) -> None:
         repo = Path("/home/alex/repos/grabowski")
@@ -8251,7 +8256,7 @@ class SelfDeployToolTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "uncertain non-reusable outcome"):
                     SELF_DEPLOY._matching_inflight_deploy_job(desired, repo)
 
-    def test_completed_finalized_job_allows_retry(self) -> None:
+    def test_unproven_completed_job_blocks_retry(self) -> None:
         repo = Path("/home/alex/repos/grabowski")
         runner = repo / "tools/run_scheduled_deploy.py"
         desired = SELF_DEPLOY._deploy_command(repo, runner, "a" * 40, 8)
@@ -8263,9 +8268,10 @@ class SelfDeployToolTests(unittest.TestCase):
             ), patch.object(
                 SELF_DEPLOY.operator, "grabowski_job_status", return_value={"final_status": "completed"}
             ):
-                self.assertIsNone(SELF_DEPLOY._matching_inflight_deploy_job(desired, repo))
+                with self.assertRaisesRegex(RuntimeError, "uncertain non-reusable outcome"):
+                    SELF_DEPLOY._matching_inflight_deploy_job(desired, repo)
 
-    def test_launch_failed_job_allows_retry(self) -> None:
+    def test_launch_failed_job_without_authentic_noeffect_proof_blocks_retry(self) -> None:
         repo = Path("/home/alex/repos/grabowski")
         runner = repo / "tools/run_scheduled_deploy.py"
         desired = SELF_DEPLOY._deploy_command(repo, runner, "a" * 40, 8)
@@ -8277,7 +8283,8 @@ class SelfDeployToolTests(unittest.TestCase):
             ), patch.object(
                 SELF_DEPLOY.operator, "grabowski_job_status", return_value={"final_status": "launch_failed"}
             ):
-                self.assertIsNone(SELF_DEPLOY._matching_inflight_deploy_job(desired, repo))
+                with self.assertRaisesRegex(RuntimeError, "uncertain non-reusable outcome"):
+                    SELF_DEPLOY._matching_inflight_deploy_job(desired, repo)
 
     def test_deploy_command_hash_uses_operator_hash_contract(self) -> None:
         repo = Path("/home/alex/repos/grabowski")
@@ -8740,6 +8747,66 @@ class HashedDeployToolingBindingTests(unittest.TestCase):
 
 
 class ScheduledDeployRunnerTests(unittest.TestCase):
+    def test_resume_only_signs_exact_persisted_receipt(self) -> None:
+        decision = {
+            "repo": "/tmp/repository",
+            "resume_target_head": "a" * 40,
+            "execution_head": "b" * 40,
+        }
+        receipt = {
+            "resumed_cutover_id": "bgc-pr1662-authentic",
+            "receipt_sha256": "c" * 64,
+        }
+        with patch.object(
+            RUNNER, "run_midcutover_resume",
+            return_value={
+                "outcome": "completed",
+                "receipt_persisted": True,
+                "receipt": receipt,
+            },
+        ), patch.object(RUNNER, "write_finalization_receipt") as write:
+            self.assertEqual(RUNNER.run_resume_only(
+                decision, binding={"expected_head": "b" * 40}
+            ), 0)
+        material = {
+            "schema_version": 1,
+            "kind": "grabowski_resolved_midcutover_prerequisite",
+            "resumed_cutover_id": receipt["resumed_cutover_id"],
+            "resume_receipt_sha256": receipt["receipt_sha256"],
+            "execution_head": "b" * 40,
+        }
+        write.assert_called_once_with(
+            {"expected_head": "b" * 40},
+            final_status="failed",
+            repo_head=None,
+            release_id=None,
+            failure_type=(
+                "MidCutoverPrerequisiteRecovered:"
+                + RUNNER.canonical_json_sha256(material)
+            ),
+            blue_green=None,
+        )
+
+    def test_resume_only_refuses_completed_unbound_receipt(self) -> None:
+        decision = {
+            "repo": "/tmp/repository",
+            "resume_target_head": "a" * 40,
+            "execution_head": "b" * 40,
+        }
+        with patch.object(
+            RUNNER, "run_midcutover_resume",
+            return_value={
+                "outcome": "completed",
+                "receipt_persisted": True,
+                "receipt": {"resumed_cutover_id": "bgc-wrong"},
+            },
+        ), patch.object(RUNNER, "write_finalization_receipt") as write:
+            with self.assertRaisesRegex(
+                RuntimeError, "completed prerequisite lacks exact persisted"
+            ):
+                RUNNER.run_resume_only(decision, binding={"expected_head": "b" * 40})
+        write.assert_not_called()
+
     def setUp(self) -> None:
         self._yaml_binding_patch = patch.object(
             RUNNER, "_bind_hashed_deploy_tooling_yaml", return_value=None
@@ -10261,7 +10328,7 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
             final_status="failed",
             repo_head=None,
             release_id=None,
-            failure_type="RuntimeError",
+            failure_type="PreRuntimeEffect:RuntimeError",
             blue_green=None,
         )
 
@@ -10600,6 +10667,15 @@ class BootstrapIndexRunnerRecognitionTests(unittest.TestCase):
     into the recovery it was meant to wait for.
     """
 
+    def setUp(self):
+        # Fake directory fixtures exercise the same streaming seam as scandir.
+        patcher = mock.patch.object(
+            SELF_DEPLOY, "_iter_bootstrap_job_entries",
+            side_effect=lambda root: iter(root.iterdir()),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def _bootstrap(self, jobs, *, final_status="running"):
         entries = [Path(f"/jobs/{unit}") for unit in jobs]
 
@@ -10623,6 +10699,11 @@ class BootstrapIndexRunnerRecognitionTests(unittest.TestCase):
             mock.patch.object(SELF_DEPLOY, "_write_deploy_index", side_effect=write),
             mock.patch.object(
                 SELF_DEPLOY, "_deploy_finalization_retry_block", return_value=False
+            ),
+            mock.patch.object(
+                SELF_DEPLOY.operator, "grabowski_job_status",
+                return_value={"final_status": final_status,
+                              "finalization_receipt": {"valid": False}},
             ),
             mock.patch.object(Path, "is_symlink", return_value=False),
             mock.patch.object(Path, "is_dir", return_value=True),
@@ -10654,7 +10735,7 @@ class BootstrapIndexRunnerRecognitionTests(unittest.TestCase):
         )
         self.assertEqual(written["units"], ["grabowski-job-bbbbbbbbbbbb"])
 
-    def test_terminal_resume_job_is_not_retained(self) -> None:
+    def test_terminal_resume_without_cutover_lineage_is_retained(self) -> None:
         written = self._bootstrap(
             {
                 "grabowski-job-cccccccccccc": self._argv(
@@ -10663,13 +10744,1521 @@ class BootstrapIndexRunnerRecognitionTests(unittest.TestCase):
             },
             final_status="completed",
         )
-        self.assertEqual(written["units"], [])
+        self.assertEqual(written["units"], ["grabowski-job-cccccccccccc"])
 
     def test_unrelated_job_is_ignored(self) -> None:
         written = self._bootstrap(
             {"grabowski-job-dddddddddddd": ["/usr/bin/python3", "/tmp/other.py"]}
         )
         self.assertEqual(written["units"], [])
+
+
+
+class CompleteBootstrapIndexCensusTests(unittest.TestCase):
+    """The first index bootstrap must inspect the whole registry, not 2,000 names."""
+
+    def setUp(self):
+        # Fake directory fixtures exercise the same streaming seam as scandir.
+        patcher = mock.patch.object(
+            SELF_DEPLOY, "_iter_bootstrap_job_entries",
+            side_effect=lambda root: iter(root.iterdir()),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def _ordinary():
+        return ["/usr/bin/python3", "/tmp/not-a-runtime-deployer.py"]
+
+    @staticmethod
+    def _runtime(runner):
+        return ["/usr/bin/python3", f"/home/alex/repos/grabowski/{runner}"]
+
+    def test_2050_terminal_unrelated_jobs_do_not_hide_late_live_deploy_and_resume(self) -> None:
+        ordinary = self._ordinary()
+        rows = {
+            f"grabowski-job-{n:012x}": {"argv": ordinary, "final_status": "completed"}
+            for n in range(2050)
+        }
+        deploy = "grabowski-job-fffffffffff0"
+        resume = "grabowski-job-fffffffffff1"
+        rows[deploy] = {"argv": self._runtime(SELF_DEPLOY.RUNNER_RELATIVE_PATH),
+                        "final_status": "running"}
+        rows[resume] = {"argv": self._runtime(SELF_DEPLOY.MIDCUTOVER_RESUME_RUNNER_RELATIVE_PATH),
+                        "final_status": "outcome_unknown"}
+        entries = [Path("/jobs") / key for key in rows]
+        root = mock.Mock()
+        root.iterdir.side_effect = lambda: iter(entries)
+        examined = []
+        def metadata(unit):
+            examined.append(unit)
+            return rows[unit]
+        with (
+            mock.patch.object(SELF_DEPLOY.operator, "_read_job_metadata", side_effect=metadata),
+            mock.patch.object(SELF_DEPLOY, "_deploy_finalization_retry_block", return_value=False),
+            mock.patch.object(Path, "is_symlink", return_value=False),
+            mock.patch.object(Path, "is_dir", return_value=True),
+        ):
+            result = SELF_DEPLOY._bootstrap_deploy_index(root, read_only=True)
+        self.assertEqual(len(examined), 2052)
+        self.assertEqual(set(examined), set(rows))
+        self.assertEqual(result["units"], [deploy, resume])
+
+    def test_changed_registry_during_bootstrap_fails_closed_without_writing_index(self) -> None:
+        original = [Path("/jobs/grabowski-job-000000000001")]
+        added = Path("/jobs/grabowski-job-000000000002")
+        root = mock.Mock()
+        root.iterdir.side_effect = [iter(original), iter([*original, added])]
+        with (
+            mock.patch.object(SELF_DEPLOY.operator, "_read_job_metadata",
+                              return_value={"argv": self._ordinary(), "final_status": "completed"}),
+            mock.patch.object(SELF_DEPLOY, "_write_deploy_index") as write,
+            mock.patch.object(Path, "is_symlink", return_value=False),
+            mock.patch.object(Path, "is_dir", return_value=True),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "changed during"):
+                SELF_DEPLOY._bootstrap_deploy_index(root)
+        write.assert_not_called()
+
+    def test_unreadable_late_job_still_blocks_full_bootstrap(self) -> None:
+        entries = [Path("/jobs") / f"grabowski-job-{n:012x}" for n in range(2051)]
+        root = mock.Mock()
+        root.iterdir.side_effect = lambda: iter(entries)
+        def metadata(unit):
+            if unit == entries[-1].name:
+                raise OSError("metadata unavailable")
+            return {"argv": self._ordinary(), "final_status": "completed"}
+        with (
+            mock.patch.object(SELF_DEPLOY.operator, "_read_job_metadata", side_effect=metadata),
+            mock.patch.object(SELF_DEPLOY, "_write_deploy_index") as write,
+            mock.patch.object(Path, "is_symlink", return_value=False),
+            mock.patch.object(Path, "is_dir", return_value=True),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "metadata is unreadable"):
+                SELF_DEPLOY._bootstrap_deploy_index(root)
+        write.assert_not_called()
+
+
+    def test_bootstrap_timeout_never_writes_a_partial_index(self) -> None:
+        root = mock.Mock()
+        path = Path("/jobs/grabowski-job-000000000001")
+        root.iterdir.side_effect = lambda: iter([path])
+        with (
+            mock.patch.object(SELF_DEPLOY.time, "monotonic", side_effect=[0.0, 0.0, 0.0, 99.0]),
+            mock.patch.object(SELF_DEPLOY.operator, "_read_job_metadata",
+                              return_value={"argv": self._ordinary(), "final_status": "completed"}),
+            mock.patch.object(SELF_DEPLOY, "_write_deploy_index") as write,
+            mock.patch.object(Path, "is_symlink", return_value=False),
+            mock.patch.object(Path, "is_dir", return_value=True),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "timed out"):
+                SELF_DEPLOY._bootstrap_deploy_index(root)
+        write.assert_not_called()
+
+    def test_entry_name_budget_is_checked_during_enumeration(self) -> None:
+        root = mock.Mock()
+        root.iterdir.side_effect = lambda: iter([
+            Path("/jobs/grabowski-job-000000000001"),
+        ])
+        with (
+            mock.patch.object(SELF_DEPLOY, "MAX_BOOTSTRAP_JOB_NAME_BYTES", 4),
+            mock.patch.object(SELF_DEPLOY.operator, "_read_job_metadata") as metadata,
+            mock.patch.object(SELF_DEPLOY, "_write_deploy_index") as write,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "name budget exceeded"):
+                SELF_DEPLOY._bootstrap_deploy_index(root)
+        metadata.assert_not_called()
+        write.assert_not_called()
+
+    def test_completed_deploy_with_outcome_unknown_finalization_remains_blocking(self) -> None:
+        unit = "grabowski-job-cccccccccccc"
+        root = mock.Mock()
+        root.iterdir.side_effect = lambda: iter([Path("/jobs") / unit])
+        with (
+            mock.patch.object(SELF_DEPLOY.operator, "_read_job_metadata",
+                              return_value={
+                                  "argv": self._runtime(SELF_DEPLOY.RUNNER_RELATIVE_PATH),
+                                  "final_status": "completed",
+                              }),
+            mock.patch.object(SELF_DEPLOY, "_deploy_finalization_retry_block", return_value=True),
+            mock.patch.object(Path, "is_symlink", return_value=False),
+            mock.patch.object(Path, "is_dir", return_value=True),
+        ):
+            result = SELF_DEPLOY._bootstrap_deploy_index(root, read_only=True)
+        self.assertEqual(result["units"], [unit])
+
+
+    def test_slow_metadata_aborts_inside_a_page_before_lock_starvation(self) -> None:
+        entries = [Path("/jobs") / f"grabowski-job-{n:012x}" for n in range(2051)]
+        root = mock.Mock()
+        root.iterdir.side_effect = lambda: iter(entries)
+        logical = [0.0]
+        examined = []
+        def metadata(unit):
+            examined.append(unit)
+            logical[0] += 0.2
+            return {"argv": self._ordinary(), "final_status": "completed"}
+        with (
+            mock.patch.object(SELF_DEPLOY.time, "monotonic", side_effect=lambda: logical[0]),
+            mock.patch.object(SELF_DEPLOY.operator, "_read_job_metadata", side_effect=metadata),
+            mock.patch.object(SELF_DEPLOY, "_write_deploy_index") as write,
+            mock.patch.object(Path, "is_symlink", return_value=False),
+            mock.patch.object(Path, "is_dir", return_value=True),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "census timed out"):
+                SELF_DEPLOY._bootstrap_deploy_index(root)
+        # The 75-second deadline must be enforced within a page, not after
+        # processing all 2,000 entries with a potentially held schedule lock.
+        self.assertLess(len(examined), 400)
+        write.assert_not_called()
+
+
+    def test_enumeration_timeout_includes_irrelevant_names(self):
+        root = mock.Mock()
+        entries = [Path("/jobs") / f"noise-{n}" for n in range(600)]
+        root.iterdir.return_value = entries
+        clock = [0.0]
+        seen = []
+        def slow():
+            for entry in entries:
+                clock[0] += 0.3
+                seen.append(entry)
+                yield entry
+        with (
+            mock.patch.object(SELF_DEPLOY, "_iter_bootstrap_job_entries", create=True,
+                              side_effect=lambda _root: slow()),
+            mock.patch.object(SELF_DEPLOY.time, "monotonic", side_effect=lambda: clock[0]),
+            mock.patch.object(SELF_DEPLOY, "_write_deploy_index") as write,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "census timed out"):
+                SELF_DEPLOY._bootstrap_deploy_index(root)
+        self.assertLess(len(seen), 300)
+        write.assert_not_called()
+
+class TerminalReceiptBootstrapIndexTests(unittest.TestCase):
+    """Persistent launch_submitted metadata is not a terminal job verdict."""
+
+    def setUp(self):
+        patcher = mock.patch.object(
+            SELF_DEPLOY, "_iter_bootstrap_job_entries",
+            side_effect=lambda root: iter(root.iterdir()),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def _runtime(runner):
+        repo = Path("/home/alex/repos/grabowski")
+        if runner == SELF_DEPLOY.MIDCUTOVER_RESUME_RUNNER_RELATIVE_PATH:
+            return SELF_DEPLOY._midcutover_resume_command(
+                repo, repo / runner, "a" * 40, "bgc-513-count",
+                "b" * 64,
+            )
+        return SELF_DEPLOY._deploy_command(repo, repo / runner, "a" * 40, 5)
+
+    @staticmethod
+    def _finished():
+        return {
+            "final_status": "succeeded",
+            "finalization_receipt": {
+                "valid": True, "state": "valid",
+                "final_status": "completed",
+                "expected_head": "a" * 40,
+                "receipt_sha256": "1" * 64,
+                "payload_sha256": "2" * 64,
+                "blind_retry_allowed": None,
+            },
+        }
+
+    def test_2565_historical_and_live_jobs_preserve_both_runners(self):
+        terminal = [f"grabowski-job-{n:012x}" for n in range(513)]
+        unrelated = [f"grabowski-job-{n + 600:012x}" for n in range(2050)]
+        deploy = "grabowski-job-ffffffffffe0"
+        resume = "grabowski-job-fffffffffff0"
+        # Active jobs are not assumed to occur at either edge of the registry.
+        names = [*unrelated[:1025], resume, *terminal, deploy, *unrelated[1025:]]
+        argv = self._runtime(SELF_DEPLOY.RUNNER_RELATIVE_PATH)
+        argv_hash = SELF_DEPLOY._deploy_command_sha256(argv)
+        repo = "/home/alex/repos/grabowski"
+        rows = {
+            unit: {
+                "unit": unit, "job_id": unit.removeprefix("grabowski-job-"),
+                "argv": argv, "argv_sha256": argv_hash, "cwd": repo,
+                "final_status": "launch_submitted",
+                "finalization_contract": {
+                    "kind": "grabowski_runtime_deploy_finalization",
+                    "unit": unit, "job_id": unit.removeprefix("grabowski-job-"),
+                    "argv_sha256": argv_hash, "expected_head": "a" * 40,
+                },
+            }
+            for unit in terminal
+        }
+        rows.update({
+            unit: {"argv": ["/usr/bin/python3", "/tmp/unrelated.py"],
+                   "final_status": "completed"}
+            for unit in unrelated
+        })
+        rows[resume] = {
+            "argv": self._runtime(SELF_DEPLOY.MIDCUTOVER_RESUME_RUNNER_RELATIVE_PATH),
+            "final_status": "launch_submitted",
+        }
+        rows[deploy] = {**rows[terminal[0]], "unit": deploy,
+                        "job_id": deploy.removeprefix("grabowski-job-"),
+                        "final_status": "running"}
+        statuses = {unit: self._finished() for unit in terminal}
+        statuses[resume] = {"final_status": "running", "finalization_receipt": {"valid": False}}
+        statuses[deploy] = {"final_status": "running", "finalization_receipt": {"valid": False}}
+        root = mock.Mock()
+        root.iterdir.side_effect = lambda: iter([Path("/jobs") / name for name in names])
+        with (
+            mock.patch.object(SELF_DEPLOY.operator, "_read_job_metadata", side_effect=lambda unit: rows[unit]),
+            mock.patch.object(SELF_DEPLOY.operator, "grabowski_job_status", side_effect=lambda unit: statuses[unit]) as read_status,
+            mock.patch.object(SELF_DEPLOY, "_deploy_finalization_retry_block", return_value=False),
+            mock.patch.object(Path, "is_symlink", return_value=False),
+            mock.patch.object(Path, "is_dir", return_value=True),
+        ):
+            result = SELF_DEPLOY._bootstrap_deploy_index(root, read_only=True)
+        self.assertEqual(result["units"], sorted([deploy, resume]))
+        self.assertEqual(read_status.call_count, 514)
+        # One full read to classify and a second full read to reject namespace drift.
+        self.assertEqual(root.iterdir.call_count, 2)
+
+    def test_unverified_terminal_status_is_still_blocking(self):
+        unit = "grabowski-job-cccccccccccc"
+        root = mock.Mock()
+        root.iterdir.side_effect = lambda: iter([Path("/jobs") / unit])
+        with (
+            mock.patch.object(SELF_DEPLOY.operator, "_read_job_metadata",
+                              return_value={"argv": self._runtime(SELF_DEPLOY.RUNNER_RELATIVE_PATH),
+                                            "final_status": "launch_submitted"}),
+            mock.patch.object(SELF_DEPLOY.operator, "grabowski_job_status",
+                              return_value={"final_status": "succeeded",
+                                            "finalization_receipt": {"valid": False}}),
+            mock.patch.object(SELF_DEPLOY, "_deploy_finalization_retry_block", return_value=False),
+            mock.patch.object(Path, "is_symlink", return_value=False),
+            mock.patch.object(Path, "is_dir", return_value=True),
+        ):
+            result = SELF_DEPLOY._bootstrap_deploy_index(root, read_only=True)
+        self.assertEqual(result["units"], [unit])
+
+    def test_unreadable_status_refuses_partial_index_write(self):
+        unit = "grabowski-job-cccccccccccc"
+        root = mock.Mock()
+        root.iterdir.side_effect = lambda: iter([Path("/jobs") / unit])
+        with (
+            mock.patch.object(SELF_DEPLOY.operator, "_read_job_metadata",
+                              return_value={"argv": self._runtime(SELF_DEPLOY.RUNNER_RELATIVE_PATH),
+                                            "final_status": "launch_submitted"}),
+            mock.patch.object(SELF_DEPLOY.operator, "grabowski_job_status",
+                              side_effect=OSError("systemd and receipt unreadable")),
+            mock.patch.object(SELF_DEPLOY, "_deploy_finalization_retry_block", return_value=False),
+            mock.patch.object(SELF_DEPLOY, "_write_deploy_index") as write,
+            mock.patch.object(Path, "is_symlink", return_value=False),
+            mock.patch.object(Path, "is_dir", return_value=True),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "status is unreadable"):
+                SELF_DEPLOY._bootstrap_deploy_index(root)
+        write.assert_not_called()
+
+    def test_slow_status_read_refuses_partial_index_write(self):
+        unit = "grabowski-job-cccccccccccc"
+        root = mock.Mock()
+        root.iterdir.side_effect = lambda: iter([Path("/jobs") / unit])
+        clock = [0.0]
+        def slow_status(_unit):
+            clock[0] += 76.0
+            return self._finished()
+        with (
+            mock.patch.object(SELF_DEPLOY.time, "monotonic", side_effect=lambda: clock[0]),
+            mock.patch.object(SELF_DEPLOY.operator, "_read_job_metadata",
+                              return_value={"argv": self._runtime(SELF_DEPLOY.RUNNER_RELATIVE_PATH),
+                                            "final_status": "launch_submitted"}),
+            mock.patch.object(SELF_DEPLOY.operator, "grabowski_job_status", side_effect=slow_status),
+            mock.patch.object(SELF_DEPLOY, "_deploy_finalization_retry_block", return_value=False),
+            mock.patch.object(SELF_DEPLOY, "_write_deploy_index") as write,
+            mock.patch.object(Path, "is_symlink", return_value=False),
+            mock.patch.object(Path, "is_dir", return_value=True),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "census timed out"):
+                SELF_DEPLOY._bootstrap_deploy_index(root)
+        write.assert_not_called()
+
+    def test_unknown_outcome_overrides_signed_terminal_status(self):
+        unit = "grabowski-job-cccccccccccc"
+        root = mock.Mock()
+        root.iterdir.side_effect = lambda: iter([Path("/jobs") / unit])
+        with (
+            mock.patch.object(SELF_DEPLOY.operator, "_read_job_metadata",
+                              return_value={"argv": self._runtime(SELF_DEPLOY.RUNNER_RELATIVE_PATH),
+                                            "final_status": "launch_submitted"}),
+            mock.patch.object(SELF_DEPLOY.operator, "grabowski_job_status",
+                              return_value=self._finished()),
+            mock.patch.object(SELF_DEPLOY, "_deploy_finalization_retry_block", return_value=True),
+            mock.patch.object(Path, "is_symlink", return_value=False),
+            mock.patch.object(Path, "is_dir", return_value=True),
+        ):
+            result = SELF_DEPLOY._bootstrap_deploy_index(root, read_only=True)
+        self.assertEqual(result["units"], [unit])
+
+
+class BootstrapP1TerminalProvenanceTests(unittest.TestCase):
+    """Terminal systemd status is not a release receipt for a runtime job."""
+
+    UNIT = "grabowski-job-abc123abc123"
+    REPOSITORY = Path("/home/alex/repos/grabowski")
+    HEAD = "a" * 40
+
+    def _deploy_argv(self):
+        return SELF_DEPLOY._deploy_command(
+            self.REPOSITORY,
+            self.REPOSITORY / SELF_DEPLOY.RUNNER_RELATIVE_PATH,
+            self.HEAD,
+            5,
+        )
+
+    def _resume_argv(self):
+        return SELF_DEPLOY._midcutover_resume_command(
+            self.REPOSITORY,
+            self.REPOSITORY / SELF_DEPLOY.MIDCUTOVER_RESUME_RUNNER_RELATIVE_PATH,
+            self.HEAD,
+            "bgc-terminal-proof",
+            "b" * 64,
+        )
+
+    def _bootstrap(self, argv, *, metadata_override=None, status_override=None):
+        metadata = {
+            "unit": self.UNIT,
+            "job_id": self.UNIT.removeprefix("grabowski-job-"),
+            "argv": argv,
+            "argv_sha256": SELF_DEPLOY._deploy_command_sha256(argv),
+            "cwd": str(self.REPOSITORY),
+            "final_status": "launch_submitted",
+        }
+        metadata.update(metadata_override or {})
+        status = {
+            "final_status": "succeeded",
+            "finalization_receipt": {"valid": True, "final_status": "succeeded"},
+        }
+        status.update(status_override or {})
+        entry = Path("/jobs") / self.UNIT
+        with (
+            mock.patch.object(SELF_DEPLOY, "_iter_bootstrap_job_entries",
+                              side_effect=lambda root: iter([entry])),
+            mock.patch.object(SELF_DEPLOY.operator, "_read_job_metadata",
+                              return_value=metadata),
+            mock.patch.object(SELF_DEPLOY.operator, "grabowski_job_status",
+                              return_value=status),
+            mock.patch.object(SELF_DEPLOY, "_deploy_finalization_retry_block",
+                              return_value=False),
+            mock.patch.object(Path, "is_symlink", return_value=False),
+            mock.patch.object(Path, "is_dir", return_value=True),
+        ):
+            return SELF_DEPLOY._bootstrap_deploy_index(
+                Path("/jobs"), read_only=True
+            )["units"]
+
+    def test_generic_terminal_receipt_cannot_release_runtime_deploy(self):
+        argv = self._deploy_argv()
+        self.assertEqual(
+            self._bootstrap(
+                argv,
+                metadata_override={
+                    "finalization_contract": {
+                        "kind": "grabowski_job_finalization",
+                        "unit": self.UNIT,
+                        "argv_sha256": SELF_DEPLOY._deploy_command_sha256(argv),
+                    },
+                },
+            ),
+            [self.UNIT],
+        )
+
+    def test_completed_systemd_resume_without_cutover_lineage_still_blocks(self):
+        self.assertEqual(self._bootstrap(self._resume_argv()), [self.UNIT])
+
+    def test_metadata_terminal_claim_without_runtime_receipt_still_blocks(self):
+        self.assertEqual(
+            self._bootstrap(
+                self._deploy_argv(),
+                metadata_override={"final_status": "completed"},
+                status_override={
+                    "final_status": "completed",
+                    "finalization_receipt": {"valid": False},
+                },
+            ),
+            [self.UNIT],
+        )
+
+
+class P1ActualRuntimeReceiptLineageTests(unittest.TestCase):
+    """Deployment terminal evidence and actual private completed cutover receipts."""
+
+    REPOSITORY = Path("/home/alex/repos/grabowski")
+    UNIT = "grabowski-job-0123456789ab"
+
+    def _meta(self, argv):
+        sha = SELF_DEPLOY._deploy_command_sha256(argv)
+        return {
+            "unit": self.UNIT,
+            "job_id": self.UNIT.removeprefix("grabowski-job-"),
+            "argv": argv,
+            "argv_sha256": sha,
+            "cwd": str(self.REPOSITORY),
+            "final_status": "launch_submitted",
+            "finalization_contract": {
+                "kind": "grabowski_runtime_deploy_finalization",
+                "unit": self.UNIT,
+                "job_id": self.UNIT.removeprefix("grabowski-job-"),
+                "argv_sha256": sha,
+                "expected_head": "a" * 40,
+            },
+        }
+
+    def _deploy(self):
+        return SELF_DEPLOY._deploy_command(
+            self.REPOSITORY, self.REPOSITORY / SELF_DEPLOY.RUNNER_RELATIVE_PATH,
+            "a" * 40, 8,
+        )
+
+    def _completed_deploy_status(self):
+        # Operator's canonical validator produces these fields only after
+        # reading the private contract/hash-bound runtime-deploy receipt.
+        return {
+            "final_status": "succeeded",
+            "finalization_receipt": {
+                "valid": True, "state": "valid",
+                "final_status": "completed", "expected_head": "a" * 40,
+                "receipt_sha256": "1" * 64, "payload_sha256": "2" * 64,
+                "blind_retry_allowed": None,
+            },
+        }
+
+    def test_completed_runtime_receipt_requires_all_canonical_bindings(self):
+        argv = self._deploy()
+        entry = Path("/jobs") / self.UNIT
+        metadata = self._meta(argv)
+        status = self._completed_deploy_status()
+        self.assertTrue(
+            SELF_DEPLOY._verified_runtime_terminal_receipt(entry, metadata, argv, status)
+        )
+        for field, wrong in (
+            ("unit", "grabowski-job-aaaaaaaaaaaa"),
+            ("job_id", "bad-job-id"),
+            ("argv_sha256", "0" * 64),
+            ("expected_head", "b" * 40),
+            ("kind", "grabowski_job_finalization"),
+        ):
+            with self.subTest(contract_field=field):
+                forged = {**metadata, "finalization_contract": dict(metadata["finalization_contract"])}
+                forged["finalization_contract"][field] = wrong
+                self.assertFalse(
+                    SELF_DEPLOY._verified_runtime_terminal_receipt(entry, forged, argv, status)
+                )
+        for field, wrong in (
+            ("valid", False), ("state", "invalid_receipt"),
+            ("final_status", "failed"), ("expected_head", "b" * 40),
+            ("receipt_sha256", "invalid"), ("payload_sha256", "invalid"),
+            ("blind_retry_allowed", False),
+        ):
+            with self.subTest(receipt_field=field):
+                forged_status = {
+                    **status,
+                    "finalization_receipt": {**status["finalization_receipt"], field: wrong},
+                }
+                self.assertFalse(
+                    SELF_DEPLOY._verified_runtime_terminal_receipt(entry, metadata, argv, forged_status)
+                )
+        self.assertFalse(
+            SELF_DEPLOY._verified_runtime_terminal_receipt(
+                entry, {**metadata, "argv_sha256": "3" * 64}, argv, status
+            )
+        )
+        self.assertFalse(
+            SELF_DEPLOY._verified_runtime_terminal_receipt(
+                entry, {**metadata, "final_status": "failed"}, argv, status
+            )
+        )
+        self.assertFalse(
+            SELF_DEPLOY._verified_runtime_terminal_receipt(
+                entry, metadata, argv, {**status, "final_status": "outcome_unknown"}
+            )
+        )
+
+    def test_actual_private_resume_receipt_lineage_authorizes_only_exact_binding(self):
+        # Reuse the canonical cutover/resume fixture builder. Unlike a mocked
+        # "valid=True" job exit, this writes and rereads real owner-only files,
+        # re-hashes receipts and validates the *full* resolved cutover lineage.
+        import test_midcutover_resume as fixture
+
+        cutover = fixture.cutover_receipt()
+        resumed = fixture.resume_receipt()
+        self.assertTrue(
+            SELF_DEPLOY.midcutover._lineage_resolved([cutover, resumed], cutover)
+        )
+        argv = SELF_DEPLOY._midcutover_resume_command(
+            self.REPOSITORY,
+            self.REPOSITORY / SELF_DEPLOY.MIDCUTOVER_RESUME_RUNNER_RELATIVE_PATH,
+            resumed["expected_head"],
+            resumed["resumed_cutover_id"],
+            resumed["resume_binding_sha256"],
+        )
+        metadata = self._meta(argv)
+        status = {"final_status": "succeeded"}
+        entry = Path("/jobs") / self.UNIT
+        original_loader = SELF_DEPLOY.midcutover.load_receipts
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.chmod(0o700)
+            cutover_file = root / f"{cutover['cutover_id']}.json"
+            resumed_file = root / f"{resumed['resume_id']}.json"
+            for path, receipt in ((cutover_file, cutover), (resumed_file, resumed)):
+                path.write_text(json.dumps(receipt), encoding="utf-8")
+                path.chmod(0o600)
+
+            def observed():
+                return original_loader(root)
+
+            loaded = observed()
+            self.assertEqual(loaded["unreadable"], [])
+            self.assertEqual(len(loaded["receipts"]), 2)
+            with mock.patch.object(SELF_DEPLOY.midcutover, "load_receipts", side_effect=observed):
+                self.assertTrue(
+                    SELF_DEPLOY._verified_runtime_terminal_receipt(
+                        entry, metadata, argv, status
+                    )
+                )
+                for field, wrong in (
+                    ("expected_head", "c" * 40),
+                    ("resume_binding_sha256", "c" * 64),
+                    ("cutover_id", "bgc-foreign-resume"),
+                ):
+                    with self.subTest(resume_argv=field):
+                        changed = list(argv)
+                        changed[{
+                            "expected_head": 5,
+                            "cutover_id": 7,
+                            "resume_binding_sha256": 9,
+                        }[field]] = wrong
+                        self.assertFalse(
+                            SELF_DEPLOY._verified_runtime_terminal_receipt(
+                                entry, self._meta(changed), changed, status
+                            )
+                        )
+                self.assertFalse(
+                    SELF_DEPLOY._verified_runtime_terminal_receipt(
+                        entry, metadata, argv, {"final_status": "outcome_unknown"}
+                    )
+                )
+
+                # The worker can exit successfully after an incomplete or
+                # unknown cutover. Even re-hashed, that never lifts the guard.
+                incomplete = dict(resumed)
+                incomplete["outcome"] = "outcome_unknown"
+                incomplete["phase"] = "outcome_unknown"
+                incomplete.pop("receipt_sha256")
+                incomplete["receipt_sha256"] = SELF_DEPLOY.midcutover.canonical_json_sha256(incomplete)
+                resumed_file.write_text(json.dumps(incomplete), encoding="utf-8")
+                self.assertFalse(
+                    SELF_DEPLOY._verified_runtime_terminal_receipt(
+                        entry, metadata, argv, status
+                    )
+                )
+                # Even a valid completed receipt plus a competing unreadable
+                # object is not a full trustworthy inventory.
+                resumed_file.write_text(json.dumps(resumed), encoding="utf-8")
+                extra = root / "incomplete.json"
+                extra.write_text("{", encoding="utf-8")
+                extra.chmod(0o600)
+                self.assertNotEqual(observed()["unreadable"], [])
+                self.assertFalse(
+                    SELF_DEPLOY._verified_runtime_terminal_receipt(
+                        entry, metadata, argv, status
+                    )
+                )
+
+
+    def test_authenticated_pre_effect_failure_retires_without_releasing_unknown(self):
+        argv = self._deploy()
+        with tempfile.TemporaryDirectory() as temporary:
+            entry = Path(temporary) / self.UNIT
+            entry.mkdir(mode=0o700)
+            metadata = self._meta(argv)
+            paths = {
+                "metadata": str(entry / "metadata.json"),
+                "stdout": str(entry / "stdout.log"),
+                "stderr": str(entry / "stderr.log"),
+                "finalization": str(entry / "finalization.json"),
+            }
+            metadata["finalization_contract"]["receipt_paths"] = paths
+            material = {
+                "schema_version": 1,
+                "kind": "grabowski_runtime_deploy_finalization",
+                "unit": self.UNIT,
+                "job_id": metadata["job_id"],
+                "argv_sha256": metadata["argv_sha256"],
+                "expected_head": "a" * 40,
+                "receipt_paths": paths,
+                "final_status": "failed",
+                "completion_status": "failed",
+                "repo_head": None,
+                "release_id": None,
+                "failure_type": "PreRuntimeEffect:RuntimeError",
+                "blue_green": None,
+            }
+            payload = {**material, "payload_sha256": SELF_DEPLOY._sha256_json(material)}
+            raw = json.dumps(payload, sort_keys=True).encode()
+            status = {
+                "final_status": "failed",
+                "finalization_receipt": {
+                    "valid": True, "state": "valid",
+                    "final_status": "failed",
+                    "expected_head": "a" * 40,
+                    "receipt_sha256": hashlib.sha256(raw).hexdigest(),
+                    "payload_sha256": payload["payload_sha256"],
+                    "blind_retry_allowed": None,
+                },
+            }
+            with mock.patch.object(
+                SELF_DEPLOY.operator, "_read_finalization_receipt_file",
+                return_value={"ok": True, "raw": raw, "bytes": len(raw)},
+                create=True,
+            ):
+                self.assertTrue(SELF_DEPLOY._verified_runtime_terminal_receipt(
+                    entry, metadata, argv, status
+                ))
+                self.assertFalse(SELF_DEPLOY._verified_runtime_terminal_receipt(
+                    entry, metadata, argv, {
+                        **status, "final_status": "outcome_unknown"
+                    }
+                ))
+                self.assertFalse(SELF_DEPLOY._verified_runtime_terminal_receipt(
+                    entry, metadata, argv, {
+                        **status,
+                        "finalization_receipt": {
+                            **status["finalization_receipt"],
+                            "receipt_sha256": "0" * 64,
+                        },
+                    }
+                ))
+                # Failed *after* starting a cutover is not no-effect evidence.
+                unsafe = {
+                    **material,
+                    "failure_type": "BlueGreenDeploymentIncomplete",
+                }
+                unsafe_payload = {
+                    **unsafe, "payload_sha256": SELF_DEPLOY._sha256_json(unsafe)
+                }
+                unsafe_raw = json.dumps(unsafe_payload, sort_keys=True).encode()
+                unsafe_status = {
+                    **status,
+                    "finalization_receipt": {
+                        **status["finalization_receipt"],
+                        "receipt_sha256": hashlib.sha256(unsafe_raw).hexdigest(),
+                        "payload_sha256": unsafe_payload["payload_sha256"],
+                    },
+                }
+                with mock.patch.object(
+                    SELF_DEPLOY.operator, "_read_finalization_receipt_file",
+                    return_value={"ok": True, "raw": unsafe_raw, "bytes": len(unsafe_raw)},
+                    create=True,
+                ):
+                    self.assertFalse(SELF_DEPLOY._verified_runtime_terminal_receipt(
+                        entry, metadata, argv, unsafe_status
+                    ))
+
+
+    def test_recovered_prerequisite_requires_authentic_completed_lineage(self):
+        # The deploy runner may finish successfully after recovering an older
+        # cutover, but this job has not deployed the requested new head.
+        # Only the exact signed failure type AND completed cutover evidence
+        # may retire this no-deploy prerequisite job.
+        import test_midcutover_resume as fixture
+
+        cutover = fixture.cutover_receipt()
+        resumed = fixture.resume_receipt()
+        self.assertTrue(SELF_DEPLOY.midcutover._lineage_resolved([resumed], cutover))
+        material = {
+            "schema_version": 1,
+            "kind": "grabowski_resolved_midcutover_prerequisite",
+            "resumed_cutover_id": resumed["resumed_cutover_id"],
+            "resume_receipt_sha256": resumed["receipt_sha256"],
+            "execution_head": "a" * 40,
+        }
+        exact_failure_type = (
+            "MidCutoverPrerequisiteRecovered:" + SELF_DEPLOY._sha256_json(material)
+        )
+        argv = self._deploy()
+        metadata = self._meta(argv)
+        status = {
+            "final_status": "succeeded",
+            "finalization_receipt": {
+                "valid": True,
+                "state": "valid",
+                "final_status": "failed",
+                "expected_head": "a" * 40,
+                "receipt_sha256": "1" * 64,
+                "payload_sha256": "2" * 64,
+                "blind_retry_allowed": None,
+            },
+        }
+        entry = Path("/jobs") / self.UNIT
+        with mock.patch.object(
+            SELF_DEPLOY, "_authenticated_failed_runtime_reason",
+            return_value=exact_failure_type,
+        ), mock.patch.object(
+            SELF_DEPLOY.midcutover, "load_receipts",
+            return_value={
+                "receipts": [cutover, resumed],
+                "present": True,
+                "unreadable": [],
+            },
+        ):
+            self.assertTrue(SELF_DEPLOY._verified_runtime_terminal_receipt(
+                entry, metadata, argv, status
+            ))
+        # The later unrelated unknown B stays open but must not revoke the
+        # independently completed and SHA-bound prerequisite recovery A.
+        foreign = fixture.cutover_receipt(
+            cutover_id="bgc-later-foreign-after-prerequisite",
+            outcome="outcome_unknown", phase="outcome_unknown",
+        )
+        receipts_with_foreign = [cutover, resumed, foreign]
+        self.assertTrue(SELF_DEPLOY.midcutover._lineage_resolved(
+            receipts_with_foreign, cutover
+        ))
+        self.assertEqual(
+            [foreign["cutover_id"]],
+            [item["cutover_id"] for item in
+             SELF_DEPLOY.midcutover.unresolved_post_switch_receipts(
+                 receipts_with_foreign
+             )],
+            "B is still a real unresolved cutover",
+        )
+        with mock.patch.object(
+            SELF_DEPLOY, "_authenticated_failed_runtime_reason",
+            return_value=exact_failure_type,
+        ), mock.patch.object(
+            SELF_DEPLOY.midcutover, "load_receipts",
+            return_value={
+                "receipts": receipts_with_foreign,
+                "present": True, "unreadable": [],
+            },
+        ):
+            self.assertTrue(
+                SELF_DEPLOY._verified_runtime_terminal_receipt(
+                    entry, metadata, argv, status
+                ),
+                "completed prerequisite A must stay terminal during unrelated B",
+            )
+        for evidence in (
+            {"receipts": [cutover], "present": True, "unreadable": []},
+            {
+                "receipts": [cutover, resumed],
+                "present": True,
+                "unreadable": [{"path": "/private/invalid", "error": "unreadable"}],
+            },
+            {"receipts": [], "present": False, "unreadable": []},
+        ):
+            with self.subTest(evidence=evidence["unreadable"] or len(evidence["receipts"])):
+                with mock.patch.object(
+                    SELF_DEPLOY, "_authenticated_failed_runtime_reason",
+                    return_value=exact_failure_type,
+                ), mock.patch.object(
+                    SELF_DEPLOY.midcutover, "load_receipts",
+                    return_value=evidence,
+                ):
+                    self.assertFalse(SELF_DEPLOY._verified_runtime_terminal_receipt(
+                        entry, metadata, argv, status
+                    ))
+        with mock.patch.object(
+            SELF_DEPLOY, "_authenticated_failed_runtime_reason",
+            return_value="MidCutoverPrerequisiteRecovered:" + "0" * 64,
+        ), mock.patch.object(
+            SELF_DEPLOY.midcutover, "load_receipts",
+            return_value={
+                "receipts": [cutover, resumed], "present": True, "unreadable": [],
+            },
+        ):
+            self.assertFalse(SELF_DEPLOY._verified_runtime_terminal_receipt(
+                entry, metadata, argv, status
+            ))
+        with mock.patch.object(
+            SELF_DEPLOY, "_authenticated_failed_runtime_reason",
+            return_value="MidCutoverResumeOutcomeUnknown",
+        ):
+            self.assertFalse(SELF_DEPLOY._verified_runtime_terminal_receipt(
+                entry, metadata, argv, status
+            ))
+
+
+    def test_unrelated_completed_cutover_cannot_release_legacy_resume_failure(self):
+        # A completed *other* recovery is not authority for this job.
+        import test_midcutover_resume as fixture
+        cutover = fixture.cutover_receipt()
+        resumed = fixture.resume_receipt()
+        self.assertTrue(SELF_DEPLOY.midcutover._lineage_resolved([resumed], cutover))
+        entry = Path("/jobs") / self.UNIT
+        argv = self._deploy()
+        status = {
+            "final_status": "succeeded",
+            "finalization_receipt": {
+                "valid": True, "state": "valid", "final_status": "failed",
+                "expected_head": "a" * 40,
+                "receipt_sha256": "1" * 64,
+                "payload_sha256": "2" * 64,
+            },
+        }
+        with mock.patch.object(
+            SELF_DEPLOY, "_authenticated_failed_runtime_reason",
+            return_value="MidCutoverPrerequisiteRecovered",
+        ), mock.patch.object(
+            SELF_DEPLOY.midcutover, "load_receipts",
+            return_value={
+                "receipts": [cutover, resumed], "present": True, "unreadable": [],
+            },
+        ):
+            self.assertFalse(SELF_DEPLOY._verified_runtime_terminal_receipt(
+                entry, self._meta(argv), argv, status
+            ))
+
+
+class PersistedUnknownCutoverHandoffSecurityTests(unittest.TestCase):
+    """Private persisted outcome_unknown proof opens only its exact resume."""
+
+    UNIT = "grabowski-job-00abc1234567"
+    REPO = Path("/home/alex/repos/grabowski")
+
+    def test_real_private_cutover_receipts_bound_to_one_failed_job(self):
+        import test_midcutover_resume as fixture
+
+        original = fixture.cutover_receipt()
+        resumed = fixture.resume_receipt()
+        binding = resumed["resume_binding"]
+        self.assertIsNotNone(
+            SELF_DEPLOY.midcutover._validated_resume_binding(binding)
+        )
+        command = SELF_DEPLOY._deploy_command(
+            self.REPO,
+            self.REPO / SELF_DEPLOY.RUNNER_RELATIVE_PATH,
+            fixture.HEAD_GREEN,
+            8,
+            source_identity_sha256=fixture.SOURCE_IDENTITY_SHA256,
+        )
+        fields = SELF_DEPLOY._deploy_command_fields(command)
+        self.assertIsNotNone(fields)
+        assert fields is not None
+        sha = SELF_DEPLOY._deploy_command_sha256(command)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs = root / "jobs"
+            cutovers = root / "cutovers"
+            jobs.mkdir(mode=0o700)
+            cutovers.mkdir(mode=0o700)
+            entry = jobs / self.UNIT
+            entry.mkdir(mode=0o700)
+            paths = {
+                name: str(entry / file)
+                for name, file in (
+                    ("metadata", "metadata.json"),
+                    ("stdout", "stdout.log"),
+                    ("stderr", "stderr.log"),
+                    ("finalization", "finalization.json"),
+                )
+            }
+            summary = RUNNER._blue_green_summary(
+                {
+                    "receipt": original,
+                    "receipt_persisted": True,
+                    "receipt_path": str(cutovers / (original["cutover_id"] + ".json")),
+                }
+            )
+            self.assertEqual(summary["outcome"], "outcome_unknown")
+            metadata = {
+                "unit": self.UNIT,
+                "job_id": self.UNIT.removeprefix("grabowski-job-"),
+                "argv": command,
+                "argv_sha256": sha,
+                "cwd": str(self.REPO),
+                "final_status": "launch_submitted",
+                "finalization_contract": {
+                    "kind": "grabowski_runtime_deploy_finalization",
+                    "unit": self.UNIT,
+                    "job_id": self.UNIT.removeprefix("grabowski-job-"),
+                    "argv_sha256": sha,
+                    "expected_head": fixture.HEAD_GREEN,
+                    "receipt_paths": paths,
+                },
+            }
+            material = {
+                "schema_version": 1,
+                "kind": "grabowski_runtime_deploy_finalization",
+                "unit": self.UNIT,
+                "job_id": metadata["job_id"],
+                "argv_sha256": sha,
+                "expected_head": fixture.HEAD_GREEN,
+                "receipt_paths": paths,
+                "final_status": "failed",
+                "completion_status": "failed",
+                "repo_head": None,
+                "release_id": None,
+                "failure_type": "BlueGreenDeploymentIncomplete",
+                "blue_green": summary,
+                "blue_green_receipt_sha256": original["receipt_sha256"],
+                "blind_retry_allowed": None,
+                "timestamp_unix": 1_000,
+            }
+            payload = {
+                **material,
+                "payload_sha256": SELF_DEPLOY._sha256_json(material),
+            }
+            raw = json.dumps(payload, sort_keys=True).encode()
+            status = {
+                "final_status": "failed",
+                "finalization_receipt": {
+                    "valid": True,
+                    "state": "valid",
+                    "final_status": "failed",
+                    "expected_head": fixture.HEAD_GREEN,
+                    "receipt_sha256": hashlib.sha256(raw).hexdigest(),
+                    "payload_sha256": payload["payload_sha256"],
+                    "blue_green_receipt_sha256": original["receipt_sha256"],
+                    "blind_retry_allowed": None,
+                },
+            }
+            cutover_path = cutovers / (original["cutover_id"] + ".json")
+            cutover_path.write_text(json.dumps(original), encoding="utf-8")
+            cutover_path.chmod(0o600)
+            real_loader = SELF_DEPLOY.midcutover.load_receipts
+
+            def current_receipts():
+                return real_loader(cutovers)
+
+            index = {"units": [self.UNIT], "pending_unit": None}
+            with (
+                mock.patch.object(SELF_DEPLOY.operator, "_jobs_root", return_value=jobs),
+                mock.patch.object(SELF_DEPLOY.operator, "_read_job_metadata", return_value=metadata),
+                mock.patch.object(SELF_DEPLOY.operator, "grabowski_job_status", return_value=status),
+                mock.patch.object(SELF_DEPLOY.operator, "_read_finalization_receipt_file",
+                                  return_value={"ok": True, "raw": raw, "bytes": len(raw)},
+                                  create=True),
+                mock.patch.object(SELF_DEPLOY, "_deploy_index", return_value=index),
+                mock.patch.object(SELF_DEPLOY.midcutover, "load_receipts",
+                                  side_effect=current_receipts),
+            ):
+                self.assertFalse(
+                    SELF_DEPLOY._verified_runtime_terminal_receipt(
+                        entry, metadata, command, status
+                    )
+                )
+                # The exact incomplete cutover is allowed ONLY for the resume
+                # gate; a normal deployment must continue seeing the index.
+                self.assertTrue(
+                    SELF_DEPLOY._indexed_failed_deploy_is_cutover_handoff(
+                        self.UNIT, binding
+                    )
+                )
+                with mock.patch.object(
+                    SELF_DEPLOY, "_deploy_index",
+                    return_value={"units": [self.UNIT], "pending_unit": self.UNIT},
+                ):
+                    self.assertFalse(
+                        SELF_DEPLOY._indexed_failed_deploy_is_cutover_handoff(
+                            self.UNIT, binding
+                        )
+                    )
+                wrong_binding = {**binding, "source_identity_sha256": "1" * 64}
+                self.assertFalse(
+                    SELF_DEPLOY._indexed_failed_deploy_is_cutover_handoff(
+                        self.UNIT, wrong_binding
+                    )
+                )
+                for key, wrong in (
+                    ("valid", False),
+                    ("final_status", "outcome_unknown"),
+                    ("blue_green_receipt_sha256", "2" * 64),
+                ):
+                    with self.subTest(finalization=key):
+                        changed = dict(status)
+                        changed["finalization_receipt"] = {
+                            **status["finalization_receipt"], key: wrong
+                        }
+                        with mock.patch.object(
+                            SELF_DEPLOY.operator, "grabowski_job_status",
+                            return_value=changed,
+                        ):
+                            self.assertFalse(
+                                SELF_DEPLOY._indexed_failed_deploy_is_cutover_handoff(
+                                    self.UNIT, binding
+                                )
+                            )
+                for contradictory_state in ("completed", "outcome_unknown"):
+                    with self.subTest(metadata_final_status=contradictory_state):
+                        changed_meta = {**metadata, "final_status": contradictory_state}
+                        self.assertFalse(
+                            SELF_DEPLOY._verified_runtime_terminal_receipt(
+                                entry, changed_meta, command, status
+                            )
+                        )
+                        with mock.patch.object(
+                            SELF_DEPLOY.operator, "_read_job_metadata",
+                            return_value=changed_meta,
+                        ):
+                            self.assertFalse(
+                                SELF_DEPLOY._indexed_failed_deploy_is_cutover_handoff(
+                                    self.UNIT, binding
+                                )
+                            )
+                # The recorded cutover must be authentic and complete before
+                # the former failed deploy is terminal for ordinary scheduling.
+                resumed_path = cutovers / (resumed["resume_id"] + ".json")
+                resumed_path.write_text(json.dumps(resumed), encoding="utf-8")
+                resumed_path.chmod(0o600)
+                self.assertTrue(
+                    SELF_DEPLOY._verified_runtime_terminal_receipt(
+                        entry, metadata, command, status
+                    )
+                )
+                self.assertFalse(
+                    SELF_DEPLOY._indexed_failed_deploy_is_cutover_handoff(
+                        self.UNIT, binding
+                    )
+                )
+                foreign = fixture.cutover_receipt(cutover_id="bgc-foreign-incomplete")
+                foreign_path = cutovers / (foreign["cutover_id"] + ".json")
+                foreign_path.write_text(json.dumps(foreign), encoding="utf-8")
+                foreign_path.chmod(0o600)
+                self.assertEqual(
+                    [foreign["cutover_id"]],
+                    [r["cutover_id"] for r in
+                     SELF_DEPLOY.midcutover.unresolved_post_switch_receipts(
+                         current_receipts()["receipts"]
+                     )],
+                    "foreign B must remain unresolved",
+                )
+                self.assertTrue(
+                    SELF_DEPLOY._verified_runtime_terminal_receipt(
+                        entry, metadata, command, status
+                    ),
+                    "authenticated resolved A must remain terminal while B is unresolved",
+                )
+                foreign_path.unlink()
+                # RED regression for a fully rolled-back, receipt-persisted
+                # failed deploy: it is finished, so ordinary scheduled
+                # deployments must not be blocked forever.
+                resumed_path.unlink()
+                rolled_back = fixture.cutover_receipt(
+                    outcome="rolled_back", phase="rolled_back", switched=False
+                )
+                rolled_back["recovery"] = {
+                    "action": "retry_from_clean_blue",
+                    "blue_preserved": True,
+                    "rollback": {"blue_preserved": True},
+                    "platform_publication_rollback": {
+                        "state": "no_prepared_request_effect"
+                    },
+                }
+                rolled_back["authoritative_readback"] = {
+                    "authoritative": True,
+                    "selector": {
+                        "selected_slot": "canonical",
+                        "release_id": fixture.BLUE_RELEASE,
+                        "repo_head": fixture.HEAD_BLUE,
+                    },
+                    "ingress": {
+                        "selected_slot": "canonical",
+                        "release_id": fixture.BLUE_RELEASE,
+                        "repo_head": fixture.HEAD_BLUE,
+                    },
+                }
+                rolled_back["authoritative_readback"]["readback_sha256"] = (
+                    SELF_DEPLOY._sha256_json(
+                        rolled_back["authoritative_readback"]
+                    )
+                )
+                rolled_back["receipt_sha256"] = SELF_DEPLOY._sha256_json({
+                    k: v for k, v in rolled_back.items()
+                    if k != "receipt_sha256"
+                })
+                cutover_path.write_text(json.dumps(rolled_back), encoding="utf-8")
+                rb_summary = RUNNER._blue_green_summary({
+                    "receipt": rolled_back,
+                    "receipt_persisted": True,
+                    "receipt_path": str(cutover_path),
+                })
+                rb_material = {
+                    **material,
+                    "blue_green": rb_summary,
+                    "blue_green_receipt_sha256": rolled_back["receipt_sha256"],
+                }
+                rb_payload = {
+                    **rb_material,
+                    "payload_sha256": SELF_DEPLOY._sha256_json(rb_material),
+                }
+                rb_raw = json.dumps(rb_payload, sort_keys=True).encode()
+                rb_status = {
+                    **status,
+                    "finalization_receipt": {
+                        **status["finalization_receipt"],
+                        "receipt_sha256": hashlib.sha256(rb_raw).hexdigest(),
+                        "payload_sha256": rb_payload["payload_sha256"],
+                        "blue_green_receipt_sha256": rolled_back["receipt_sha256"],
+                    },
+                }
+                with (
+                    mock.patch.object(
+                        SELF_DEPLOY.operator, "grabowski_job_status",
+                        return_value=rb_status,
+                    ),
+                    mock.patch.object(
+                        SELF_DEPLOY.operator, "_read_finalization_receipt_file",
+                        return_value={"ok": True, "raw": rb_raw, "bytes": len(rb_raw)},
+                        create=True,
+                    ),
+                ):
+                    self.assertTrue(
+                        SELF_DEPLOY._verified_runtime_terminal_receipt(
+                            entry, metadata, command, rb_status
+                        ),
+                        "authentic persisted rolled_back must retire the old job",
+                    )
+                    # Later unrelated B remains genuinely unresolved, but cannot
+                    # resurrect an already verified clean-blue rollback A.
+                    foreign = fixture.cutover_receipt(
+                        cutover_id="bgc-later-foreign-outcome-unknown",
+                        outcome="outcome_unknown", phase="outcome_unknown",
+                    )
+                    foreign_path = cutovers / (foreign["cutover_id"] + ".json")
+                    foreign_path.write_text(json.dumps(foreign), encoding="utf-8")
+                    foreign_path.chmod(0o600)
+                    unresolved = SELF_DEPLOY.midcutover.unresolved_post_switch_receipts(
+                        current_receipts()["receipts"]
+                    )
+                    self.assertEqual(
+                        [foreign["cutover_id"]],
+                        [receipt["cutover_id"] for receipt in unresolved],
+                        "later B must remain explicitly unresolved",
+                    )
+                    self.assertTrue(
+                        SELF_DEPLOY._verified_runtime_terminal_receipt(
+                            entry, metadata, command, rb_status
+                        ),
+                        "authenticated rolled-back A must stay terminal during B recovery",
+                    )
+                    foreign_path.unlink()
+                    self.assertFalse(
+                        SELF_DEPLOY._indexed_failed_deploy_is_cutover_handoff(
+                            self.UNIT, binding
+                        ),
+                        "rollback never authorizes a mid-cutover resume handoff",
+                    )
+
+
+    def test_actual_failed_pre_resume_stdout_must_bind_one_persisted_attempt(self):
+        import test_midcutover_resume as fixture
+        if str(ROOT / "tools") not in sys.path:
+            sys.path.insert(0, str(ROOT / "tools"))
+        import run_midcutover_resume as resume_runner
+
+        original = fixture.cutover_receipt()
+        failed = fixture.resume_receipt()
+        failed["outcome"] = "failed_pre_resume"
+        failed["phase"] = "failed_pre_resume"
+        failed["recovery"] = {
+            "action": "reclassify_and_retry_resume",
+            "blue_green_state_unchanged": True,
+            "fresh_classification_required": True,
+            "blind_retry_allowed": False,
+        }
+        for name in (
+            "snapshot_rebind", "pointer_promotion", "selector_switch",
+            "canonical_operator", "retirement", "final_routing",
+            "effect_terminalization",
+        ):
+            failed[name] = None
+        failed["receipt_sha256"] = SELF_DEPLOY._sha256_json({
+            k: v for k, v in failed.items() if k != "receipt_sha256"
+        })
+        binding = failed["resume_binding"]
+        self.assertIsNotNone(
+            SELF_DEPLOY.midcutover._validated_resume_binding(binding)
+        )
+
+        command = SELF_DEPLOY._midcutover_resume_command(
+            self.REPO, self.REPO / SELF_DEPLOY.MIDCUTOVER_RESUME_RUNNER_RELATIVE_PATH,
+            fixture.HEAD_GREEN, fixture.CUTOVER_ID, binding["binding_sha256"],
+        )
+        sha = SELF_DEPLOY._deploy_command_sha256(command)
+        unit = "grabowski-job-0987654321ab"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs = root / "jobs"
+            cutovers = root / "cutovers"
+            jobs.mkdir(mode=0o700)
+            cutovers.mkdir(mode=0o700)
+            entry = jobs / unit
+            entry.mkdir(mode=0o700)
+            for name, receipt in ((original["cutover_id"], original), (failed["resume_id"], failed)):
+                target = cutovers / f"{name}.json"
+                target.write_text(json.dumps(receipt), encoding="utf-8")
+                target.chmod(0o600)
+            resume_path = cutovers / f"{failed['resume_id']}.json"
+            summary = resume_runner._resume_summary({
+                "receipt": failed,
+                "receipt_persisted": True,
+                "receipt_path": str(resume_path),
+            })
+            sequence = [
+                {
+                    "timestamp_unix": 1001, "phase": "midcutover-resume-scheduled",
+                    "repo": str(self.REPO), "expected_head": fixture.HEAD_GREEN,
+                    "cutover_id": fixture.CUTOVER_ID,
+                    "resume_binding_sha256": binding["binding_sha256"],
+                },
+                {"timestamp_unix": 1002, "phase": "midcutover-resume-receipt", **summary},
+                {
+                    "timestamp_unix": 1003, "phase": "midcutover-resume-incomplete",
+                    "outcome": "failed_pre_resume",
+                },
+            ]
+            stdout = entry / "stdout.log"
+            stdout.write_text(
+                "".join(json.dumps(event, sort_keys=True) + "\n" for event in sequence),
+                encoding="utf-8",
+            )
+            stdout.chmod(0o600)
+            metadata = {
+                "unit": unit, "job_id": unit.removeprefix("grabowski-job-"),
+                "argv": command, "argv_sha256": sha, "cwd": str(self.REPO),
+                "final_status": "failed", "created_at_unix": 1000,
+            }
+            status = {"final_status": "failed"}
+            loader = SELF_DEPLOY.midcutover.load_receipts
+            def current():
+                return loader(cutovers)
+            with (
+                mock.patch.object(SELF_DEPLOY.operator, "_jobs_root", return_value=jobs),
+                mock.patch.object(SELF_DEPLOY.operator, "_read_job_metadata", return_value=metadata),
+                mock.patch.object(SELF_DEPLOY.operator, "grabowski_job_status", return_value=status),
+                mock.patch.object(SELF_DEPLOY, "_deploy_index",
+                                  return_value={"units": [unit], "pending_unit": None}),
+                mock.patch.object(SELF_DEPLOY.midcutover, "load_receipts", side_effect=current),
+            ):
+                self.assertFalse(
+                    SELF_DEPLOY._verified_runtime_terminal_receipt(
+                        entry, metadata, command, status
+                    ),
+                    "failed_pre_resume cannot be retired as a successful resume",
+                )
+                self.assertTrue(
+                    SELF_DEPLOY._indexed_failed_resume_is_noeffect_handoff(
+                        unit, binding
+                    ),
+                    "authentic persisted failed S0 attempt must yield to fresh same-cutover resume",
+                )
+                # Once a later *different* authenticated resume actually
+                # completes this lineage, the old proved no-effect failure
+                # must also retire from the ordinary deploy index.
+                completed = fixture.resume_receipt(
+                    resume_id="bgcr-final-clean-canonical"
+                )
+                completed_path = cutovers / f"{completed['resume_id']}.json"
+                completed_path.write_text(json.dumps(completed), encoding="utf-8")
+                completed_path.chmod(0o600)
+                self.assertTrue(
+                    SELF_DEPLOY.midcutover._lineage_resolved(
+                        [original, failed, completed], original
+                    )
+                )
+                self.assertTrue(
+                    SELF_DEPLOY._verified_runtime_terminal_receipt(
+                        entry, metadata, command, status
+                    ),
+                    "old signed failed S0 resume should retire once real lineage completed",
+                )
+                completed_path.unlink()
+                # Genuine second attempt has reached S0 and produced a
+                # nonterminal effectful receipt. The old effect-free S0 job
+                # must yield to a fresh later-phase classification.
+                progressed = fixture.resume_receipt(
+                    resume_id="bgcr-progressed-after-old-noeffect",
+                    resume_phase=SELF_DEPLOY.midcutover.PHASE_REBIND_SNAPSHOT,
+                )
+                progressed.update({
+                    "outcome": "outcome_unknown",
+                    "phase": "outcome_unknown",
+                    "snapshot_rebind": {
+                        "rebound": True, "receipt_sha256": "a1" * 32,
+                    },
+                    "recovery": {
+                        "action": "readback_active_runtime_and_recover",
+                        "automatic_rollback_forbidden": True,
+                        "blue_rollback_forbidden": True,
+                        "snapshot_rebind_applied": True,
+                        "fresh_classification_required": True,
+                        "blind_retry_allowed": False,
+                    },
+                })
+                progressed["receipt_sha256"] = SELF_DEPLOY._sha256_json({
+                    k: v for k, v in progressed.items() if k != "receipt_sha256"
+                })
+                progressed_path = cutovers / (progressed["resume_id"] + ".json")
+                progressed_path.write_text(json.dumps(progressed), encoding="utf-8")
+                progressed_path.chmod(0o600)
+                self.assertFalse(
+                    SELF_DEPLOY._verified_runtime_terminal_receipt(
+                        entry, metadata, command, status
+                    ),
+                    "later progressed attempt is not completed lineage",
+                )
+                for new_phase in SELF_DEPLOY.midcutover.RESUME_PHASES[1:]:
+                    with self.subTest(fresh_phase=new_phase):
+                        later_binding = fixture.resume_receipt(
+                            resume_phase=new_phase
+                        )["resume_binding"]
+                        self.assertTrue(
+                            SELF_DEPLOY._indexed_failed_resume_is_noeffect_handoff(
+                                unit, later_binding
+                            ),
+                            "an old effect-free S0 job must allow fresh S1-S4",
+                        )
+                for drift in (
+                    {"source_identity_sha256": "1" * 64},
+                    {"resume_phase": SELF_DEPLOY.midcutover.PHASE_PROMOTE_POINTER},
+                ):
+                    self.assertFalse(
+                        SELF_DEPLOY._indexed_failed_resume_is_noeffect_handoff(
+                            unit, {**binding, **drift}
+                        )
+                    )
+                with mock.patch.object(
+                    SELF_DEPLOY, "_deploy_index",
+                    return_value={"units": [unit], "pending_unit": unit},
+                ):
+                    self.assertFalse(
+                        SELF_DEPLOY._indexed_failed_resume_is_noeffect_handoff(
+                            unit, binding
+                        )
+                    )
+                stdout.write_text(
+                    json.dumps(sequence[0]) + "\n" + json.dumps(sequence[1]) + "\n",
+                    encoding="utf-8",
+                )
+                self.assertFalse(
+                    SELF_DEPLOY._indexed_failed_resume_is_noeffect_handoff(
+                        unit, binding
+                    ),
+                    "no actual failed terminal event means no trusted no-effect handoff",
+                )
+
+    def test_progressed_s0_failure_allows_only_fresh_s1_resume_and_later_terminal(self):
+        import test_midcutover_resume as fixture
+        if str(ROOT / "tools") not in sys.path:
+            sys.path.insert(0, str(ROOT / "tools"))
+        import run_midcutover_resume as resume_runner
+
+        original = fixture.cutover_receipt()
+        prior = fixture.resume_receipt(resume_phase=SELF_DEPLOY.midcutover.PHASE_REBIND_SNAPSHOT)
+        old_binding = prior["resume_binding"]
+        current_binding = fixture.resume_receipt(
+            resume_phase=SELF_DEPLOY.midcutover.PHASE_PROMOTE_POINTER
+        )["resume_binding"]
+        self.assertIsNotNone(SELF_DEPLOY.midcutover._validated_resume_binding(current_binding))
+        prior.update({
+            "outcome": "outcome_unknown", "phase": "outcome_unknown",
+            "snapshot_rebind": {"rebound": True, "receipt_sha256": "aa" * 32},
+            "recovery": {
+                "action": "readback_active_runtime_and_recover",
+                "automatic_rollback_forbidden": True,
+                "blue_rollback_forbidden": True,
+                "snapshot_rebind_applied": True,
+                "snapshot_binding_state": SELF_DEPLOY.midcutover.SNAPSHOT_BINDING_DONE,
+                "blind_retry_allowed": False,
+                "fresh_classification_required": True,
+            },
+        })
+        prior["receipt_sha256"] = SELF_DEPLOY._sha256_json({
+            k: v for k, v in prior.items() if k != "receipt_sha256"
+        })
+        command = SELF_DEPLOY._midcutover_resume_command(
+            self.REPO, self.REPO / SELF_DEPLOY.MIDCUTOVER_RESUME_RUNNER_RELATIVE_PATH,
+            fixture.HEAD_GREEN, fixture.CUTOVER_ID, old_binding["binding_sha256"],
+        )
+        unit = "grabowski-job-aabbcc445566"
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            jobs = root / "jobs"
+            cutovers = root / "cutovers"
+            jobs.mkdir(mode=0o700)
+            cutovers.mkdir(mode=0o700)
+            entry = jobs / unit
+            entry.mkdir(mode=0o700)
+            for filename, receipt in (
+                (original["cutover_id"], original),
+                (prior["resume_id"], prior),
+            ):
+                f = cutovers / (filename + ".json")
+                f.write_text(json.dumps(receipt), encoding="utf-8")
+                f.chmod(0o600)
+            receipt_path = cutovers / (prior["resume_id"] + ".json")
+            summary = resume_runner._resume_summary({
+                "receipt": prior, "receipt_path": str(receipt_path),
+                "receipt_persisted": True,
+            })
+            events = [
+                {"timestamp_unix": 1001, "phase": "midcutover-resume-scheduled",
+                 "repo": str(self.REPO), "expected_head": fixture.HEAD_GREEN,
+                 "cutover_id": fixture.CUTOVER_ID,
+                 "resume_binding_sha256": old_binding["binding_sha256"]},
+                {"timestamp_unix": 1002, "phase": "midcutover-resume-receipt", **summary},
+                {"timestamp_unix": 1003, "phase": "midcutover-resume-incomplete",
+                 "outcome": "outcome_unknown"},
+            ]
+            output = entry / "stdout.log"
+            output.write_text("".join(json.dumps(x)+"\n" for x in events), encoding="utf-8")
+            output.chmod(0o600)
+            metadata = {"unit": unit, "job_id": unit.removeprefix("grabowski-job-"),
+                        "argv": command, "argv_sha256": SELF_DEPLOY._deploy_command_sha256(command),
+                        "cwd": str(self.REPO), "final_status": "failed"}
+            status = {"final_status": "failed"}
+            loader = SELF_DEPLOY.midcutover.load_receipts
+            with (
+                mock.patch.object(SELF_DEPLOY.operator, "_jobs_root", return_value=jobs),
+                mock.patch.object(SELF_DEPLOY.operator, "_read_job_metadata", return_value=metadata),
+                mock.patch.object(SELF_DEPLOY.operator, "grabowski_job_status", return_value=status),
+                mock.patch.object(SELF_DEPLOY, "_deploy_index",
+                                  return_value={"units": [unit], "pending_unit": None}),
+                mock.patch.object(SELF_DEPLOY.midcutover, "load_receipts",
+                                  side_effect=lambda: loader(cutovers)),
+            ):
+                self.assertFalse(SELF_DEPLOY._verified_runtime_terminal_receipt(
+                    entry, metadata, command, status
+                ))
+                self.assertTrue(SELF_DEPLOY._indexed_failed_resume_is_noeffect_handoff(
+                    unit, current_binding
+                ), "freshly classified S1 continuation must not deadlock on authentic progressed S0")
+                self.assertFalse(SELF_DEPLOY._indexed_failed_resume_is_noeffect_handoff(
+                    unit, old_binding
+                ), "old S0 cannot blindly repeat after irreversible S0 progress")
+                invalid = dict(current_binding)
+                invalid["source_identity_sha256"] = "ab" * 32
+                self.assertFalse(SELF_DEPLOY._indexed_failed_resume_is_noeffect_handoff(
+                    unit, invalid
+                ))
+                # After an independent exact lineage completed, the failed
+                # progressed attempt must also retire from ordinary index.
+                later = fixture.resume_receipt(
+                    resume_id="bgcr-progressed-S1-then-final"
+                )
+                after = cutovers / (later["resume_id"] + ".json")
+                after.write_text(json.dumps(later), encoding="utf-8")
+                after.chmod(0o600)
+                self.assertTrue(SELF_DEPLOY._verified_runtime_terminal_receipt(
+                    entry, metadata, command, status
+                ))
+                after.unlink()
+
 
 
 class LegacyRedactedDeployIndexTests(unittest.TestCase):
@@ -10873,10 +12462,19 @@ class ReadbackRequiredAndAmbiguityTests(unittest.TestCase):
 
     def _classified(self, unit, *, status):
         """Run the real classifier against a realistic job status shape."""
+        argv_hash = SELF_DEPLOY._deploy_command_sha256(self.ARGV)
         metadata = {
+            "unit": unit,
+            "job_id": unit.removeprefix("grabowski-job-"),
             "argv": list(self.ARGV),
-            "argv_sha256": SELF_DEPLOY._deploy_command_sha256(self.ARGV),
+            "argv_sha256": argv_hash,
             "cwd": "/home/alex/repos/grabowski",
+            "final_status": "launch_submitted",
+            "finalization_contract": {
+                "kind": "grabowski_runtime_deploy_finalization",
+                "unit": unit, "job_id": unit.removeprefix("grabowski-job-"),
+                "argv_sha256": argv_hash, "expected_head": "a" * 40,
+            },
         }
         with (
             mock.patch.object(
@@ -10908,14 +12506,15 @@ class ReadbackRequiredAndAmbiguityTests(unittest.TestCase):
         self.assertFalse(classified["terminal"])
         self.assertFalse(classified["reusable"])
 
-    def test_terminal_unit_with_settled_receipt_is_terminal(self) -> None:
+    def test_terminal_unit_with_bound_runtime_receipt_is_terminal(self) -> None:
         classified = self._classified(
             "grabowski-job-bbbbbbbbbbbb",
             status={
                 "final_status": "succeeded",
                 "finalization_receipt": {
-                    "valid": True,
-                    "final_status": "completed",
+                    "valid": True, "state": "valid",
+                    "final_status": "completed", "expected_head": "a" * 40,
+                    "receipt_sha256": "1" * 64, "payload_sha256": "2" * 64,
                     "blind_retry_allowed": None,
                 },
             },

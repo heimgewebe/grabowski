@@ -83,7 +83,7 @@ class RuntimeDeployScheduleReceiptTests(unittest.TestCase):
             return_value=["not", "an", "object"],
         ), patch.object(
             real_deploy, "_require_release_source_admission",
-            return_value={"independent_review_required": False},
+            return_value={"status": "already-serving-exact-source", "critical_release_source": False, "independent_review_required": False, "serving_repo_head": "a" * 40, "target_repo_head": "a" * 40},
         ):
             result = grips._run_captain_runtime_deploy(action, {})
 
@@ -174,7 +174,7 @@ class RuntimeDeployScheduleReceiptTests(unittest.TestCase):
             return_value=[],
         ), patch.object(
             real_deploy, "_require_release_source_admission",
-            return_value={"independent_review_required": False},
+            return_value={"status": "already-serving-exact-source", "critical_release_source": False, "independent_review_required": False, "serving_repo_head": "a" * 40, "target_repo_head": "a" * 40},
         ):
             result = grips._run_captain_runtime_deploy(action, {})
 
@@ -345,7 +345,7 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
             "status": "non-runtime-documentation",
             "target_repo_head": expected,
             "serving_repo_head": "a"*40,
-            "independent_review_required": False,
+            "critical_release_source": False, "independent_review_required": False,
             "changed_path_count": 1,
         }
         for label, alternate, refusal in (
@@ -443,10 +443,12 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
                 ]),
             ):
                 if allowed:
-                    self.assertEqual(
-                        "non-runtime-documentation",
-                        deploy._require_release_source_admission("b"*40)["status"],
-                    )
+                    # Regular Git modes are not proof of inert validation input.
+                    with self.assertRaisesRegex(
+                        deploy.DeploySchedulePreEffectRefusal,
+                        "release review admission missing",
+                    ):
+                        deploy._require_release_source_admission("b" * 40)
                 else:
                     with self.assertRaises(deploy.DeploySchedulePreEffectRefusal):
                         deploy._require_release_source_admission("b"*40)
@@ -585,7 +587,7 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
                          side_effect=lambda head: deploy._require_release_source_admission(head)),
             patch.object(deploy, "_require_release_source_admission", return_value={
                 "status": "non-runtime-documentation",
-                "independent_review_required": False,
+                "critical_release_source": False, "independent_review_required": False,
                 "serving_repo_head": "a" * 40,
                 "target_repo_head": expected,
                 "changed_path_count": 1,
@@ -642,8 +644,11 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
                 side_effect=[self._git_success(""), self._git_success(self._raw_change('docs/guide.md'))],
             ),
         ):
-            record = deploy._require_release_source_admission("b" * 40)
-        self.assertEqual("non-runtime-documentation", record["status"])
+            with self.assertRaisesRegex(
+                deploy.DeploySchedulePreEffectRefusal,
+                "release review admission missing",
+            ):
+                deploy._require_release_source_admission("b" * 40)
 
     def test_missing_serving_process_provenance_blocks(self) -> None:
         import grabowski_self_deploy as deploy
@@ -683,7 +688,7 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
                 raise deploy.DeploySchedulePreEffectRefusal(
                     "release admission blocked: source ancestry is unproved"
                 )
-            return {"status": "non-runtime-documentation", "independent_review_required": False, "serving_repo_head": "a" * 40, "target_repo_head": expected, "changed_path_count": 1}
+            return {"status": "non-runtime-documentation", "critical_release_source": False, "independent_review_required": False, "serving_repo_head": "a" * 40, "target_repo_head": expected, "changed_path_count": 1}
 
         def fetch(head: str, snapshot: dict, *, local_mutation_tracker: dict) -> None:
             self.assertEqual(expected, head)
@@ -735,7 +740,7 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
                 raise deploy.DeploySchedulePreEffectRefusal(
                     "release admission blocked: source ancestry is unproved"
                 )
-            return {"status": "non-runtime-documentation", "independent_review_required": False, "serving_repo_head": "a" * 40, "target_repo_head": expected, "changed_path_count": 1}
+            return {"status": "non-runtime-documentation", "critical_release_source": False, "independent_review_required": False, "serving_repo_head": "a" * 40, "target_repo_head": expected, "changed_path_count": 1}
 
         @contextmanager
         def lock():
@@ -792,7 +797,6 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
             "target_head": expected,
             "target_object_present": False,
         }
-
         def acquire(_plan: dict, _head: str) -> dict:
             events.append("acquire")
             return {"leases": leases}
@@ -869,7 +873,7 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
                 raise deploy.DeploySchedulePreEffectRefusal(
                     "release admission blocked: source ancestry is unproved"
                 )
-            return {"status": "non-runtime-documentation", "independent_review_required": False, "serving_repo_head": "a" * 40, "target_repo_head": expected, "changed_path_count": 1}
+            return {"status": "non-runtime-documentation", "critical_release_source": False, "independent_review_required": False, "serving_repo_head": "a" * 40, "target_repo_head": expected, "changed_path_count": 1}
 
         def stop_before_effect(head: str) -> str:
             self.assertEqual(expected, head)
@@ -1750,7 +1754,7 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
                          return_value={"ready": True, "job_prefix": "grabowski-job-"}),
             patch.object(grips, "_runtime_deploy_self_schedule", side_effect=error),
             patch.object(real_deploy, "_require_release_source_admission",
-                         return_value={"independent_review_required": False}),
+                         return_value={"status": "already-serving-exact-source", "critical_release_source": False, "independent_review_required": False, "serving_repo_head": "b" * 40, "target_repo_head": "b" * 40}),
         ):
             result = grips._run_captain_runtime_deploy(action, {})
         self.assertTrue(result["mutation_outcome_unknown"])
@@ -1800,7 +1804,7 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
                          return_value={"ready": True, "job_prefix": "grabowski-job-"}),
             patch.object(grips, "_runtime_deploy_self_schedule", side_effect=denied),
             patch.object(real_deploy, "_require_release_source_admission",
-                         return_value={"independent_review_required": False}),
+                         return_value={"status": "already-serving-exact-source", "critical_release_source": False, "independent_review_required": False, "serving_repo_head": "b" * 40, "target_repo_head": "b" * 40}),
         ):
             typed = grips._run_captain_runtime_deploy(action, {})
         self.assertTrue(typed["pre_effect_refusal"])
@@ -1808,6 +1812,39 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
         self.assertTrue(typed["mutation_outcome_unknown"])
         self.assertFalse(typed["local_mutation_observed"])
         self.assertEqual(evidence, typed["local_mutation_uncertainty_evidence"])
+
+    def test_critical_source_false_reviewer_flag_never_starts_captain_deploy(self) -> None:
+        expected_head = "b" * 40
+        action = {
+            "action": "runtime-deploy",
+            "target": {"adapter": "grabowski-self", "service": "grabowski-mcp",
+                       "runtime_target": "heim-pc"},
+        }
+        # A critical source cannot use the obsolete independent-review false
+        # field to masquerade as noncritical before any preflight/effect.
+        for criticality in (True, None):
+            with (
+                self.subTest(criticality=criticality),
+                patch.object(grips, "_runtime_deploy_expected_head", return_value=expected_head),
+                patch.object(grips, "_runtime_deploy_delay_seconds", return_value=8),
+                patch.object(grips, "_runtime_deploy_source_parameters", return_value=(None, None)),
+                patch.object(grips, "_captain_runtime_deploy_target_errors", return_value=[]),
+                patch.object(grips, "_runtime_deploy_self_preflight") as preflight,
+                patch.object(grips, "_runtime_deploy_self_schedule") as schedule,
+                patch.object(real_deploy, "_require_release_source_admission", return_value={
+                    "status": "non-runtime-documentation",
+                    "critical_release_source": criticality,
+                    "independent_review_required": False,
+                    "target_repo_head": expected_head,
+                    "serving_repo_head": "a" * 40,
+                    "changed_path_count": 1,
+                }),
+            ):
+                result = grips._run_captain_runtime_deploy(action, {})
+            self.assertEqual(result["preflight_errors"], ["release_review_pr_required"])
+            self.assertFalse(result["execution_attempted"])
+            preflight.assert_not_called()
+            schedule.assert_not_called()
 
     def test_captain_admission_only_passes_explicit_bound_document_or_serving_proof(self) -> None:
         """A helper's arbitrary success-shaped return is never R3 authority."""
@@ -1819,20 +1856,22 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
             "serving_repo_head": serving,
             "target_repo_head": head,
             "changed_path_count": 1,
-            "independent_review_required": False,
+            "critical_release_source": False, "independent_review_required": False,
         }
         valid_serving = {
             "status": "already-serving-exact-source",
             "serving_repo_head": head,
             "target_repo_head": head,
-            "independent_review_required": False,
+            "critical_release_source": False, "independent_review_required": False,
         }
         cases = [
             ("valid-docs", valid_docs, True),
             ("valid-serving", valid_serving, True),
             ("empty", {}, False),
             ("unknown-status", {**valid_docs, "status": "provisional"}, False),
-            ("required-r3", {**valid_docs, "independent_review_required": True}, False),
+            ("required-r3", {**valid_docs, "critical_release_source": True, "independent_review_required": True}, False),
+            ("critical-false-review-flag", {**valid_docs, "critical_release_source": True, "independent_review_required": False}, False),
+            ("missing-source-criticality", {k: v for k, v in valid_docs.items() if k != "critical_release_source"}, False),
             ("missing-review-flag", {k:v for k,v in valid_docs.items()
                                      if k != "independent_review_required"}, False),
             ("target-spoof", {**valid_docs, "target_repo_head": "c"*40}, False),
@@ -2063,7 +2102,7 @@ class CaptainAcceptedActionOriginRegressionTests(unittest.TestCase):
 
     def test_valid_r3_alone_cannot_mint_captain_release_scope(self) -> None:
         reviewed = {
-            "independent_review_required": True,
+            "critical_release_source": True, "independent_review_required": True,
             "serving_head": "a" * 40,
             "serving_release_id": "serving-release",
             "release_review_identity_sha256": "f" * 64,
@@ -2079,7 +2118,7 @@ class CaptainAcceptedActionOriginRegressionTests(unittest.TestCase):
 
     def test_direct_runtime_executor_cannot_schedule_with_r3_but_no_captain_action(self) -> None:
         reviewed = {
-            "independent_review_required": True,
+            "critical_release_source": True, "independent_review_required": True,
             "serving_head": "a" * 40,
             "serving_release_id": "serving-release",
             "release_review_identity_sha256": "f" * 64,
@@ -2295,7 +2334,8 @@ class CaptainPositiveActionOriginTests(unittest.TestCase):
                     "checks": [{"name": "validate (3.10)", "id": 101},
                                {"name": "validate (3.12)", "id": 102}],
                     "workflow": {"id": 301891383, "path": ".github/workflows/validate.yml",
-                                 "head_sha": expected_head},
+                                 "head_sha": expected_head,
+                                 "ci_policy_transition_required": False},
                     "checks_sha256": "5" * 64,
                 },
             ) as real_ci_read,
@@ -2566,7 +2606,8 @@ class CaptainEffectClaimRegressionTests(unittest.TestCase):
         from contextvars import copy_context
 
         head = "b" * 40
-        review = {"independent_review_required": True,
+        review = {"status": "authenticated-post-merge-r3-ci",
+                  "critical_release_source": True, "independent_review_required": True,
                   "serving_head": "a" * 40,
                   "serving_release_id": "serving-release",
                   "release_review_identity_sha256": "f" * 64}
@@ -2651,7 +2692,7 @@ class CaptainEffectClaimRegressionTests(unittest.TestCase):
             "target_repo_head": head,
             "serving_repo_head": "a" * 40,
             "changed_path_count": 1,
-            "independent_review_required": False,
+            "critical_release_source": False, "independent_review_required": False,
         }
         drifted = {**initial, "serving_repo_head": "c" * 40}
         source_id = {
@@ -2696,7 +2737,7 @@ class CaptainEffectClaimRegressionTests(unittest.TestCase):
     def test_replay_refusal_precedes_public_main_and_rootbroker_effects(self) -> None:
         head = "b" * 40
         admission = {"status": "authenticated-post-merge-r3-ci",
-                     "independent_review_required": True, "target_head": head}
+                     "critical_release_source": True, "independent_review_required": True, "target_head": head}
         with (
             patch.object(real_deploy, "_require_release_source_admission",
                          return_value=admission),
@@ -2726,7 +2767,13 @@ class CaptainEffectClaimRegressionTests(unittest.TestCase):
 
     def test_real_documentation_exemption_needs_no_claim(self) -> None:
         real_deploy._claim_captain_schedule_effect(
-            "a" * 40, {"independent_review_required": False}
+            "a" * 40, {
+                "status": "already-serving-exact-source",
+                "critical_release_source": False,
+                "independent_review_required": False,
+                "serving_repo_head": "a" * 40,
+                "target_repo_head": "a" * 40,
+            },
         )
 
     def test_missing_or_malformed_review_pr_blocks_before_preflight(self) -> None:

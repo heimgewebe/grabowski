@@ -91,6 +91,189 @@ class PrReviewGateTargetMatrixTests(unittest.TestCase):
             self.assertEqual(result, ("Detect docs updates", "Core Guard Tests"))
             self.assertEqual(read_catalog.call_count, 2)
 
+    def test_kleinanzeiger_bootstrap_uses_all_six_real_customer_ci_checks(self) -> None:
+        # Renamed from mark-api; source/Wheel/Windows jobs are universal on
+        # real PR #219 and subsequent stacked customer PRs #220–#225.
+        expected = (
+            "verify", "verify-py313",
+            "installed-offline", "installed-offline-py313",
+            "windows-installed-py3.12", "windows-installed-py3.13",
+        )
+        with tempfile.TemporaryDirectory() as raw:
+            repo = Path(raw)
+            with mock.patch.object(
+                pr_review_gate, "_required_check_catalog_text_at_revision",
+                return_value=None,
+            ) as read_catalog, mock.patch.object(
+                pr_review_gate, "_workflow_text_at_revision",
+                side_effect=AssertionError("must not fall back to weaker workflow"),
+            ):
+                actual = pr_review_gate.expected_check_names_for_repo(
+                    repo, repo_name="alexdermohr/kleinanzeiger",
+                    head_sha="a" * 40, base_sha="b" * 40,
+                )
+            self.assertEqual(actual, expected)
+            self.assertEqual(read_catalog.call_count, 2)
+
+    def test_kleinanzeiger_unmerged_head_cannot_reduce_bootstrap_to_one_check(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            with mock.patch.object(
+                pr_review_gate, "_required_check_catalog_text_at_revision",
+                side_effect=[
+                    '{"schema_version":1,"required_checks":["verify"]}',
+                    None,
+                ],
+            ):
+                names = pr_review_gate.expected_check_names_for_repo(
+                    Path(raw), repo_name="alexdermohr/kleinanzeiger",
+                    head_sha="a" * 40, base_sha="b" * 40,
+                )
+        self.assertEqual(len(names), 6)
+        self.assertIn("windows-installed-py3.13", names)
+
+    def test_kleinanzeiger_missing_failed_skipped_or_renamed_check_blocks(self) -> None:
+        names = pr_review_gate.BOOTSTRAP_EXPECTED_CHECK_NAMES_BY_REPO[
+            "alexdermohr/kleinanzeiger"
+        ]
+        state = {
+            "repoName": "alexdermohr/kleinanzeiger",
+            "pr_diff_bypass": True,
+            "pr_diff_bypass_reason": "isolated required-check evaluator fixture",
+            "pr": {
+                "number": 219, "state": "OPEN", "isDraft": False,
+                "mergeStateStatus": "CLEAN", "mergeable": "MERGEABLE",
+                "headRefOid": "a" * 40, "baseRefOid": "b" * 40,
+                "changedFiles": 1, "additions": 1, "deletions": 0,
+                "files": [{"path": "docs/portfolio.md"}],
+                "reviews": [], "latestReviews": [], "comments": [],
+            },
+            "checks": [],
+            "reviewComments": [],
+        }
+        for target in names:
+            for kind in ("missing", "failure", "pending", "skipping", "renamed"):
+                with self.subTest(target=target, kind=kind):
+                    checks = [{"name": name, "bucket": "pass"} for name in names
+                              if name != target]
+                    if kind == "renamed":
+                        checks.append({"name": target+"-renamed", "bucket": "pass"})
+                    elif kind != "missing":
+                        checks.append({"name": target, "bucket": kind})
+                    state["checks"] = checks
+                    result = pr_review_gate.evaluate_review_gate(
+                        state, expected_check_names=names,
+                    )
+                    self.assertEqual(result["verdict"], "BLOCK")
+                    self.assertIn(
+                        "expected check(s) missing or non-green: " + target,
+                        result["failures"],
+                    )
+
+        state["checks"] = [{"name": name, "bucket": "pass"} for name in names]
+        fully_green = pr_review_gate.evaluate_review_gate(
+            state, expected_check_names=names,
+        )
+        self.assertFalse(any(
+            line.startswith("expected check(s) missing or non-green")
+            for line in fully_green["failures"]
+        ))
+
+    def test_nixer_bootstrap_requires_real_nixer_ci_on_missing_base_catalog(self) -> None:
+        # A green live check must not be accepted until its exact name is code-owned.
+        with tempfile.TemporaryDirectory() as raw:
+            repo = Path(raw)
+            with mock.patch.object(
+                pr_review_gate, "_required_check_catalog_text_at_revision",
+                return_value=None,
+            ) as read_catalog, mock.patch.object(
+                pr_review_gate, "_workflow_text_at_revision", return_value=None,
+            ):
+                result = pr_review_gate.expected_check_names_for_repo(
+                    repo,
+                    repo_name="heimgewebe/nixer",
+                    head_sha="a" * 40,
+                    base_sha="b" * 40,
+                )
+            self.assertEqual(result, ("nixer-ci",))
+            self.assertEqual(
+                read_catalog.call_args_list,
+                [
+                    mock.call(repo, "a" * 40, repo_name="heimgewebe/nixer"),
+                    mock.call(repo, "b" * 40, repo_name="heimgewebe/nixer"),
+                ],
+            )
+
+    def test_nixer_unmerged_head_catalog_cannot_replace_bootstrap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            repo = Path(raw)
+            head = '{"schema_version":1,"required_checks":["fake-green-check"]}'
+            with mock.patch.object(
+                pr_review_gate, "_required_check_catalog_text_at_revision",
+                side_effect=[head, None],
+            ), mock.patch.object(
+                pr_review_gate, "_workflow_text_at_revision", return_value=None,
+            ):
+                result = pr_review_gate.expected_check_names_for_repo(
+                    repo,
+                    repo_name="heimgewebe/nixer",
+                    head_sha="a" * 40,
+                    base_sha="b" * 40,
+                )
+            self.assertEqual(result, ("nixer-ci",))
+
+    def test_nixer_required_check_rejects_missing_renamed_failed_skipped_and_pending(self) -> None:
+        state = {
+            "repoName": "heimgewebe/nixer",
+            "pr_diff_bypass": True,
+            "pr_diff_bypass_reason": "isolated required-check evaluator fixture",
+            "pr": {
+                "number": 13,
+                "state": "OPEN",
+                "isDraft": False,
+                "mergeStateStatus": "CLEAN",
+                "mergeable": "MERGEABLE",
+                "headRefOid": "a" * 40,
+                "baseRefOid": "b" * 40,
+                "changedFiles": 1,
+                "additions": 1,
+                "deletions": 0,
+                "files": [{"path": "docs/note.md"}],
+                "reviews": [],
+                "latestReviews": [],
+                "comments": [],
+            },
+            "checks": [],
+            "reviewComments": [],
+        }
+        invalid_cases = (
+            [],
+            [{"name": "fake-green-check", "bucket": "pass"}],
+            [{"name": "nixer-ci", "bucket": "failure"}],
+            [{"name": "nixer-ci", "bucket": "skipping"}],
+            [{"name": "nixer-ci", "bucket": "pending"}],
+            [{"name": "nixer-ci", "bucket": "pass"}, {"name": "nixer-ci", "bucket": "failure"}],
+        )
+        for checks in invalid_cases:
+            with self.subTest(checks=checks):
+                state["checks"] = checks
+                result = pr_review_gate.evaluate_review_gate(
+                    state, expected_check_names=("nixer-ci",)
+                )
+                self.assertIn(
+                    "expected check(s) missing or non-green: nixer-ci",
+                    result["failures"],
+                )
+                self.assertEqual("BLOCK", result["verdict"])
+
+        state["checks"] = [{"name": "nixer-ci", "bucket": "pass"}]
+        accepted_check = pr_review_gate.evaluate_review_gate(
+            state, expected_check_names=("nixer-ci",)
+        )
+        self.assertNotIn(
+            "expected check(s) missing or non-green: nixer-ci",
+            accepted_check["failures"],
+        )
+
     def test_mitschreiber_bootstrap_applies_when_base_has_no_catalog(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             repo = Path(raw)
@@ -111,6 +294,7 @@ class PrReviewGateTargetMatrixTests(unittest.TestCase):
             "Hall-of-Memory/Hall-of-Memory": ("verify",),
             "alexdermohr/livia": ("quality",),
             "alexdermohr/mark-api": ("verify",),
+            "alexdermohr/kleinanzeiger": ("verify", "verify-py313", "installed-offline", "installed-offline-py313", "windows-installed-py3.12", "windows-installed-py3.13"),
             "heimgewebe/metarepo": ("ci (ubuntu-latest)", "ci (macos-latest)"),
             "heimgewebe/systemkatalog": ("Repository Contract", "Secret Scan"),
         }

@@ -187,7 +187,7 @@ class RepositoryContractTests(unittest.TestCase):
             ],
         )
         tools = set(contract["expected_tools"])
-        self.assertEqual(len(tools), 203)
+        self.assertEqual(len(tools), 206)
         self.assertIn("grabowski_operational_guidance", tools)
         self.assertIn("report_outcome", tools)
         self.assertNotIn("grabowski_agent_workspace_adopt", tools)
@@ -204,7 +204,7 @@ class RepositoryContractTests(unittest.TestCase):
         profiles = json.loads(
             (ROOT / "contracts" / "publication-profiles.v1.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(profiles["counts"], {"core": 25, "full": 203, "operator": 187})
+        self.assertEqual(profiles["counts"], {"core": 25, "full": 206, "operator": 190})
         self.assertNotIn("grabowski_task_reconcile", profiles["profiles"]["full"])
         self.assertNotIn("grabowski_task_reconcile", profiles["profiles"]["operator"])
         self.assertTrue(

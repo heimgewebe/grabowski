@@ -22,6 +22,9 @@ _SRC_DIR = Path(__file__).resolve().parents[1] / "src"
 if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
 
+from grabowski_self_review_execution import review_receipt_errors  # noqa: E402
+import grabowski_self_review_execution as review_provenance  # noqa: E402
+
 from grabowski_pr_diff import (  # noqa: E402
     canonicalize_github_pr_diff_identity,
     canonicalize_github_pr_diff_identity_v1,
@@ -113,8 +116,10 @@ BOOTSTRAP_EXPECTED_CHECK_NAMES_BY_REPO = {
     "hall-of-memory/hall-of-memory": ("verify",),
     "alexdermohr/livia": ("quality",),
     "alexdermohr/mark-api": ("verify",),
+    "alexdermohr/kleinanzeiger": ("verify", "verify-py313", "installed-offline", "installed-offline-py313", "windows-installed-py3.12", "windows-installed-py3.13"),
     "heimgewebe/metarepo": ("ci (ubuntu-latest)", "ci (macos-latest)"),
     "heimgewebe/mitschreiber": ("ci / reusable-ci",),
+    "heimgewebe/nixer": ("nixer-ci",),
     "heimgewebe/recovery-evidence-authority": ("security-selftest",),
     "heimgewebe/systemkatalog": ("Repository Contract", "Secret Scan"),
     "heimgewebe/weltgewebe": ("Detect docs updates", "Core Guard Tests"),
@@ -203,6 +208,14 @@ REQUIRED_SELF_REVIEW_FOCUS = (
 SELF_REVIEW_DIFF_BYPASS_REASON = "legacy unit seam without live PR diff"
 SELF_REVIEW_AUDIT_KIND = "grabowski_self_review_audit"
 SELF_REVIEW_MAX_REQUIRED_ITERATIONS = 5
+REQUIRED_HIGH_CRITICAL_REVIEW_AXES = (
+    "contracts_correctness",
+    "regression_compatibility",
+    "tests_negative_cases",
+    "security_authority_concurrency",
+    "adversarial_countercheck",
+)
+MIN_SUBSTANTIVE_REVIEW_SUMMARY_CHARS = 36
 RISK_PATH_MARKERS = (
     "auth",
     "access",
@@ -238,6 +251,9 @@ RISK_PATH_PREFIXES = (
     "src/grabowski_merge_guard.py",
     "src/grabowski_decision_reviews.py",
     "src/grabowski_release_admission.py",
+    "src/grabowski_self_review_execution.py",
+    "src/grabowski_self_review_producer.py",
+    "config/self-review-allowed-signers",
     "tools/pr_review_gate.py",
 )
 DOCUMENTATION_PATH_PREFIXES = ("docs/", "documentation/")
@@ -298,6 +314,13 @@ HIGH_CRITICAL_PATH_PREFIXES = (
     "scripts/migration",
     "tools/pr_review_gate.py",
 )
+HEIM_PC_NIX_SUPPLY_CHAIN_SOURCE_PATHS = frozenset((
+    "flake.lock",
+    "flake.nix",
+    "nixos/system/flake.nix",
+    "nixos/production/trust-contract-v1.json",
+))
+
 HIGH_CRITICAL_PATH_MARKERS = (
     "auth",
     "credential",
@@ -1026,9 +1049,39 @@ def _paths(pr: dict[str, Any]) -> list[str]:
     return paths
 
 
+def _security_review_paths(pr: dict[str, Any]) -> tuple[list[str], bool]:
+    """Include both sides of renames in risk classification, not file counts.
+
+    GitHub's changedFiles counts a rename once; its previousPath still
+    identifies authority that a renamed destination may have removed.
+    """
+    paths = _paths(pr)
+    missing_rename_source = False
+    raw_files = pr.get("files")
+    if not isinstance(raw_files, list):
+        return paths, missing_rename_source
+    for item in raw_files:
+        if not isinstance(item, dict):
+            continue
+        status = item.get("status")
+        if not isinstance(status, str) or status.strip().lower() != "renamed":
+            continue
+        previous = item.get("previousPath")
+        if previous is None:
+            previous = item.get("previous_filename")
+        if not isinstance(previous, str) or _normalized_review_path(previous) != previous:
+            missing_rename_source = True
+            continue
+        paths.append(previous)
+    return paths, missing_rename_source
+
+
 def _current_pr_paths_failures(pr: dict[str, Any]) -> tuple[list[str], list[str]]:
     paths = _paths(pr)
     failures: list[str] = []
+    _, missing_rename_source = _security_review_paths(pr)
+    if missing_rename_source:
+        failures.append("renamed source path is missing or invalid")
     if not paths:
         failures.append("current PR file list is missing or empty")
     changed_files = pr.get("changedFiles")
@@ -1056,20 +1109,114 @@ def _canonical_repo_slug(value: Any) -> str | None:
     return "/".join(parts).lower()
 
 
+def _recovery_authority_path_reason(path: str) -> str | None:
+    """Protect exact external attestation trust paths; never normalize away traversal."""
+    parts = path.split("/")
+    if (
+        path.startswith("/")
+        or "\\" in path
+        or "\x00" in path
+        or any(part in {"", ".", ".."} for part in parts)
+    ):
+        return f"high-critical recovery authority noncanonical changed path: {path}"
+    normalized = path.lower()
+    if normalized in {
+        "validator.py",
+        "ci_selftest.py",
+        "tests/test_validator.py",
+        "tests/test_ci_selftest.py",
+        "keys/allowed_signers",
+    } or normalized.startswith(("keys/", ".github/")):
+        return f"high-critical recovery authority trust path touched: {path}"
+    return None
+
+
+def _recovery_authority_reasons(
+    pr: dict[str, Any], repo_name: str | None,
+) -> list[str]:
+    """Require authenticated change type, including GraphQL rename identity."""
+    if repo_name != "heimgewebe/recovery-evidence-authority":
+        return []
+    raw = pr.get("files")
+    if not isinstance(raw, list) or not raw:
+        return ["high-critical recovery authority changed-file metadata unavailable"]
+    reasons: list[str] = []
+    changed_files = pr.get("changedFiles")
+    if type(changed_files) is not int or changed_files != len(raw):
+        reasons.append("high-critical recovery authority changed-file list incomplete")
+    seen_paths: set[str] = set()
+    for entry in raw:
+        if not isinstance(entry, dict):
+            reasons.append("high-critical recovery authority changed-file entry is untyped")
+            continue
+        current = entry.get("path") or entry.get("filename")
+        if not isinstance(current, str) or not current:
+            reasons.append("high-critical recovery authority changed path unavailable")
+        else:
+            if current in seen_paths:
+                reasons.append(f"high-critical recovery authority duplicate changed path: {current}")
+            seen_paths.add(current)
+            reason = _recovery_authority_path_reason(current)
+            if reason is not None:
+                reasons.append(reason)
+            elif not _is_documentation_path(current):
+                reasons.append(f"high-critical recovery authority code/config path touched: {current}")
+        # gh pr view --json files emits changeType (e.g. RENAMED), not the
+        # REST 'status' field. GraphQL does not provide the rename origin.
+        change_type = entry.get("changeType")
+        if change_type is None:
+            change_type = entry.get("status")
+        if not isinstance(change_type, str):
+            reasons.append("high-critical recovery authority change type unavailable")
+            continue
+        normalized_type = change_type.lower()
+        if normalized_type in {"added", "modified", "removed", "deleted"}:
+            continue
+        if normalized_type == "renamed":
+            previous = (
+                entry.get("previous_filename")
+                or entry.get("previousFilename")
+                or entry.get("previousPath")
+            )
+            if not isinstance(previous, str) or not previous:
+                reasons.append("high-critical recovery authority rename origin unavailable")
+            else:
+                reason = _recovery_authority_path_reason(previous)
+                if reason is not None:
+                    reasons.append(reason)
+                elif not _is_documentation_path(previous):
+                    reasons.append(f"high-critical recovery authority code/config rename origin: {previous}")
+            continue
+        reasons.append("high-critical recovery authority change type not trusted")
+    return reasons
+
+
+def _normalized_review_policy_path(path: str) -> str:
+    """Remove only literal './' segments; retain GitHub dot-directory identity.
+
+    str.lstrip("./") silently converts '.github/workflows' into
+    'github/workflows', bypassing the explicitly high-critical path list.
+    """
+    normalized = path.lower()
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized
+
+
 def _is_risk_path(path: str) -> bool:
-    normalized = path.lower().lstrip("./")
+    normalized = _normalized_review_policy_path(path)
     return any(normalized == prefix or normalized.startswith(prefix.rstrip("/") + "/") for prefix in RISK_PATH_PREFIXES) or any(marker in normalized for marker in RISK_PATH_MARKERS)
 
 
 def _is_policy_critical_path(path: str) -> bool:
-    normalized = path.lower().lstrip("./")
+    normalized = _normalized_review_policy_path(path)
     if normalized in POLICY_CRITICAL_PATHS:
         return True
     return any(normalized.startswith(prefix) for prefix in POLICY_CRITICAL_PREFIXES)
 
 
 def _is_documentation_path(path: str) -> bool:
-    normalized = path.lower().lstrip("./")
+    normalized = _normalized_review_policy_path(path)
     path_obj = Path(normalized)
     name = path_obj.name
     suffix = path_obj.suffix
@@ -1083,7 +1230,7 @@ def _is_documentation_path(path: str) -> bool:
 
 
 def _trivial_exempt_deny_reason(path: str, changed_lines: int) -> str | None:
-    normalized = path.lower().lstrip("./")
+    normalized = _normalized_review_policy_path(path)
     name = Path(normalized).name
     suffix = Path(normalized).suffix
     if changed_lines <= 0:
@@ -1098,8 +1245,104 @@ def _trivial_exempt_deny_reason(path: str, changed_lines: int) -> str | None:
     return None
 
 
+def _nixos_supply_chain_path_reason(path: str, repo_name: str | None) -> str | None:
+    """Protect exact Heim-PC production flake and input-trust source paths."""
+    if repo_name != "heimgewebe/heim-pc":
+        return None
+    normalized = path.lower()
+    # Strip only actual relative-directory prefixes, not all leading dots:
+    # a full-path lstrip("./") would also silently rewrite path aliases.
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    if normalized in HEIM_PC_NIX_SUPPLY_CHAIN_SOURCE_PATHS:
+        return f"high-critical NixOS supply-chain source path touched: {path}"
+    return None
+
+
+
+def _nixos_supply_chain_rename_reasons(
+    pr: dict[str, Any], repo_name: str | None,
+) -> list[str]:
+    """Fail closed on incomplete or contradictory Heim-PC Nix trust file metadata.
+
+    GraphQL exposes rename changeType without a reliable previousPath. Rename
+    sources must be authenticated separately; missing origins cannot be treated
+    as harmless documentation changes. Validate *all* supplied field aliases
+    rather than trusting whichever alias happens to come first.
+    """
+    if repo_name != "heimgewebe/heim-pc":
+        return []
+    entries = pr.get("files")
+    if not isinstance(entries, list) or not entries:
+        return ["high-critical NixOS supply-chain changed-file metadata unavailable"]
+    reasons: list[str] = []
+    count = pr.get("changedFiles")
+    if type(count) is not int or count != len(entries):
+        reasons.append("high-critical NixOS supply-chain changed-file list incomplete")
+    seen: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            reasons.append("high-critical NixOS supply-chain changed-file entry untyped")
+            continue
+
+        path_aliases = [entry[key] for key in ("path", "filename") if key in entry]
+        valid_paths = [
+            path for path in path_aliases
+            if isinstance(path, str) and bool(path.strip())
+        ]
+        if not path_aliases or len(valid_paths) != len(path_aliases):
+            reasons.append("high-critical NixOS supply-chain changed path unavailable")
+        if len(set(valid_paths)) > 1:
+            reasons.append("high-critical NixOS supply-chain changed path aliases conflict")
+        for current in valid_paths:
+            # Catch a protected destination obscured by a benign primary alias.
+            reason = _nixos_supply_chain_path_reason(current, repo_name)
+            if reason is not None:
+                reasons.append(reason)
+        # Repeated aliases within one entry are valid; only distinct file
+        # entries must not claim the same changed destination.
+        if valid_paths:
+            if valid_paths[0] in seen:
+                reasons.append("high-critical NixOS supply-chain duplicate changed path")
+            seen.add(valid_paths[0])
+
+        types = [entry[key] for key in ("changeType", "status") if key in entry]
+        if not types or any(not isinstance(kind, str) or not kind.strip() for kind in types):
+            reasons.append("high-critical NixOS supply-chain change type unavailable")
+            continue
+        types_normalized = [kind.lower() for kind in types]
+        if len(set(types_normalized)) != 1:
+            reasons.append("high-critical NixOS supply-chain change type aliases conflict")
+        change_type = types_normalized[0]
+
+        origin_fields = ("previous_filename", "previousFilename", "previousPath")
+        origins = [entry[key] for key in origin_fields if key in entry]
+        valid_origins = [
+            origin for origin in origins
+            if isinstance(origin, str) and bool(origin.strip())
+        ]
+        if len(valid_origins) != len(origins):
+            reasons.append("high-critical NixOS supply-chain rename origin invalid")
+        if len(set(valid_origins)) > 1:
+            reasons.append("high-critical NixOS supply-chain rename origin aliases conflict")
+        for origin in valid_origins:
+            reason = _nixos_supply_chain_path_reason(origin, repo_name)
+            if reason is not None:
+                reasons.append(reason)
+
+        if change_type in {"renamed", "copied"}:
+            if not valid_origins:
+                reasons.append("high-critical NixOS supply-chain rename origin unavailable")
+        elif change_type in {"added", "modified", "removed", "deleted", "changed"}:
+            if origins:
+                reasons.append("high-critical NixOS supply-chain unexpected rename origin")
+        else:
+            reasons.append("high-critical NixOS supply-chain change type untrusted")
+    return reasons
+
+
 def _high_critical_path_reason(path: str) -> str | None:
-    normalized = path.lower().lstrip("./")
+    normalized = _normalized_review_policy_path(path)
     if _is_policy_critical_path(normalized):
         return f"high-critical policy path touched: {path}"
     if any(normalized == prefix.rstrip("/") or normalized.startswith(prefix) for prefix in HIGH_CRITICAL_PATH_PREFIXES):
@@ -1133,20 +1376,30 @@ def classify_complexity(
 ) -> dict[str, Any]:
     changed_files = int(pr.get("changedFiles") or 0)
     changed_lines = int(pr.get("additions") or 0) + int(pr.get("deletions") or 0)
-    paths = _paths(pr)
-    docs_only = bool(paths) and all(_is_documentation_path(path) for path in paths)
-    very_small_uncomplicated = _is_very_small_uncomplicated_change(paths, changed_files, changed_lines)
+    paths, missing_rename_source = _security_review_paths(pr)
     normalized_repo = _canonical_repo_slug(repo_name)
+    recovery_reasons = _recovery_authority_reasons(pr, normalized_repo)
+    nix_supply_reasons = _nixos_supply_chain_rename_reasons(pr, normalized_repo)
+    docs_only = (
+        bool(paths) and not missing_rename_source and not recovery_reasons and not nix_supply_reasons
+        and all(_is_documentation_path(path) for path in paths)
+    )
+    very_small_uncomplicated = _is_very_small_uncomplicated_change(paths, changed_files, changed_lines)
     important_repo = normalized_repo in IMPORTANT_REPOS
 
-    high_critical_reasons: list[str] = []
+    high_critical_reasons: list[str] = [*recovery_reasons, *nix_supply_reasons]
+    if missing_rename_source:
+        high_critical_reasons.append("renamed source path is missing or invalid")
     if not docs_only:
         if changed_files > 15:
             high_critical_reasons.append("many files")
         if changed_lines > 500:
             high_critical_reasons.append("large diff")
         for path in paths:
-            reason = _high_critical_path_reason(path)
+            reason = (
+                _nixos_supply_chain_path_reason(path, normalized_repo)
+                or _high_critical_path_reason(path)
+            )
             if reason is not None:
                 high_critical_reasons.append(reason)
     if isinstance(self_review, dict):
@@ -1169,13 +1422,13 @@ def classify_complexity(
             high_critical_reasons.append("many material findings after first review")
 
     high_critical_reasons = list(dict.fromkeys(high_critical_reasons))
+    if high_critical_reasons:
+        very_small_uncomplicated = False
     large_documentation_change = docs_only and (changed_files > 15 or changed_lines > 500)
     if high_critical_reasons:
         review_tier = "high_critical"
-        minimum_self_review_iterations = min(
-            SELF_REVIEW_MAX_REQUIRED_ITERATIONS,
-            3 + min(2, len(high_critical_reasons)),
-        )
+        # Five distinct reviews, not merely four repeated summaries.
+        minimum_self_review_iterations = SELF_REVIEW_MAX_REQUIRED_ITERATIONS
     elif important_repo and not docs_only:
         review_tier = "important_repo"
         minimum_self_review_iterations = 3
@@ -1212,7 +1465,8 @@ def classify_complexity(
         "high_critical": bool(high_critical_reasons),
         "high_critical_reasons": high_critical_reasons,
         "external_review_required": False,
-        "independent_review_required": review_tier == "high_critical",
+        # Risk still controls review depth; reviewer independence is explicit opt-in.
+        "independent_review_required": False,
         "claude_cli_required": False,
         "self_review_required": True,
         "minimum_self_review_iterations": minimum_self_review_iterations,
@@ -1918,7 +2172,6 @@ def _legacy_external_finding_failures(external_review: dict[str, Any]) -> list[s
         if not isinstance(finding, dict) or not _terminal(finding):
             failures.append(f"external_review finding {index} is not terminally triaged")
     return failures
-
 
 def _external_review_count(external_review: Any) -> int | None:
     if not isinstance(external_review, dict):
@@ -3267,9 +3520,31 @@ def build_self_review_audit(
         "review_policy_version": REVIEW_POLICY_VERSION,
         "diff_sha256": _normalize_sha256(state.get("pr_diff_sha256")),
         "review_tier": complexity.get("review_tier"),
-        "independent_review_required": complexity.get("independent_review_required") is True,
+        "independent_review_required": review_sources.get("independent_review_required") is True,
         "minimum_review_iterations": complexity.get("minimum_self_review_iterations"),
         "actual_review_iterations": actual_iterations,
+        # The private audit retains method diversity without posting review
+        # prose or private evidence paths into the public CI status.
+        "review_pass_axes": [
+            item.get("axis") for item in iterations
+            if isinstance(item, dict) and isinstance(item.get("axis"), str)
+        ] if isinstance(iterations, list) else [],
+        "review_iterations": iterations if isinstance(iterations, list) else [],
+        **(
+            {
+                "review_batch_id": self_review.get("review_batch_id"),
+                "review_origin": self_review.get("review_origin"),
+                "review_pass_receipts": self_review.get("review_pass_receipts"),
+            }
+            if complexity.get("review_tier") == "high_critical"
+            and isinstance(self_review, dict) else {}
+        ),
+        "review_pass_evidence_sha256": hashlib.sha256(
+            json.dumps(
+                iterations if isinstance(iterations, list) else [],
+                sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+            ).encode("utf-8")
+        ).hexdigest(),
         "all_findings_triaged": (
             self_review.get("all_findings_triaged") is True
             if isinstance(self_review, dict) else False
@@ -3848,6 +4123,7 @@ def evaluate_review_gate(
     claude_evidence: dict[str, Any] | None = None,
     external_review_evidence: dict[str, Any] | None = None,
     external_review_artifact_root: Path | None = None,
+    require_independent_review: bool = False,
     policy_waiver: dict[str, Any] | None = None,
     expected_check_names: tuple[str, ...] = DEFAULT_EXPECTED_CHECK_NAMES,
 ) -> dict[str, Any]:
@@ -3967,6 +4243,38 @@ def evaluate_review_gate(
             ]
             if len(iteration_summaries) == len(iterations) and len(set(iteration_summaries)) != len(iteration_summaries):
                 self_review_failures.append("self-review iteration summaries must be distinct")
+            if complexity["review_tier"] == "high_critical":
+                observed_axes = [
+                    item.get("axis") if isinstance(item, dict) else None
+                    for item in iterations[:SELF_REVIEW_MAX_REQUIRED_ITERATIONS]
+                ]
+                if observed_axes != list(REQUIRED_HIGH_CRITICAL_REVIEW_AXES):
+                    self_review_failures.append(
+                        "high-critical review passes must cover five distinct axes in order: "
+                        + ", ".join(REQUIRED_HIGH_CRITICAL_REVIEW_AXES)
+                    )
+                for index, item in enumerate(iterations):
+                    if not isinstance(item, dict):
+                        continue
+                    summary = item.get("summary")
+                    if (
+                        not isinstance(summary, str)
+                        or len(" ".join(summary.split())) < MIN_SUBSTANTIVE_REVIEW_SUMMARY_CHARS
+                    ):
+                        self_review_failures.append(
+                            f"high-critical review_iteration {index} lacks a substantive summary"
+                        )
+                    evidence_refs = item.get("evidence_refs")
+                    if (
+                        not isinstance(evidence_refs, list) or not evidence_refs
+                        or any(
+                            not isinstance(ref, str) or len(ref.strip()) < 8
+                            for ref in evidence_refs
+                        )
+                    ):
+                        self_review_failures.append(
+                            f"high-critical review_iteration {index} lacks concrete evidence_refs"
+                        )
             first_iteration = iterations[0] if iterations and isinstance(iterations[0], dict) else None
             first_iteration_material = (
                 first_iteration.get("material_findings")
@@ -4001,8 +4309,57 @@ def evaluate_review_gate(
         remaining = _material_findings_remaining(self_review, self_review_failures)
         residual = self_review.get("residual_risk")
         accepted_residual = isinstance(residual, dict) and residual.get("accepted") is True and bool(residual.get("reason"))
-        if remaining is not None and remaining > 0 and not accepted_residual:
-            self_review_failures.append("material findings remain without accepted residual-risk reason")
+        # An accepted residual risk is not a terminal P1/P2 resolution.
+        if remaining is not None and remaining > 0:
+            self_review_failures.append(
+                "material findings remain; each must be resolved or disproven"
+            )
+        if complexity.get("review_tier") == "high_critical":
+            # Same server-issued, immutable execution receipts as Captain and
+            # the atomic merge guard. Caller text and hashes never suffice.
+            origin_audit = {
+                "repo": repo_name, "pr": pr.get("number"),
+                "base_sha": pr.get("baseRefOid"),
+                "head_sha": pr.get("headRefOid"),
+                "diff_sha256": _normalize_sha256(state.get("pr_diff_sha256")),
+                "review_batch_id": self_review.get("review_batch_id"),
+                "review_origin": self_review.get("review_origin"),
+                "review_iterations": self_review.get("review_iterations"),
+                "review_pass_receipts": self_review.get("review_pass_receipts"),
+            }
+            self_review_failures.extend(review_receipt_errors(origin_audit))
+        elif repo_name is not None and all((
+            type(pr.get("number")) is int,
+            isinstance(pr.get("baseRefOid"), str),
+            isinstance(pr.get("headRefOid"), str),
+            _normalize_sha256(state.get("pr_diff_sha256")) is not None,
+        )):
+            # Standard and elevated self-reviews need no five-axis PASS audit,
+            # but they may not silently discard a signed material REJECT from
+            # the same immutable PR revision. Reuse the authenticated registry
+            # predicate; absence of a signed session remains a valid legacy case.
+            binding = {
+                "repo": repo_name,
+                "pr": pr["number"],
+                "base_sha": pr["baseRefOid"],
+                "head_sha": pr["headRefOid"],
+                "diff_sha256": _normalize_sha256(state.get("pr_diff_sha256")),
+                "review_batch_id": "0" * 32,
+                "review_purpose": "pull_request",
+            }
+            try:
+                review_provenance._assert_no_first_party_reject_for_legacy_review(
+                    binding,
+                    repository=Path.home() / "repos" / repo_name.split("/")[-1],
+                    root=review_provenance.FIRST_PARTY_REVIEW_ROOT,
+                    signers=review_provenance.TRUSTED_SIGNERS,
+                    root_owned_signers=True,
+                )
+            except (review_provenance.ReviewExecutionRejected, OSError,
+                    ValueError, KeyError, TypeError):
+                self_review_failures.append(
+                    "signed first-party material review history unresolved or invalid"
+                )
     failures.extend(self_review_failures)
 
     claude = self_review.get("claude_review") if isinstance(self_review, dict) else None
@@ -4018,18 +4375,21 @@ def evaluate_review_gate(
     if isinstance(deprecated_external_review, dict):
         warnings.append("Deprecated self_review.external_review ignored; pass --external-review-evidence instead")
 
-    external_required = False
+    external_required = require_independent_review is True
     external_failures = _external_review_failures(
         state,
         pr,
         external_review,
-        required=False,
+        required=external_required,
         repo_name=repo_name,
         claude_cli_required=False,
         external_review_artifact_root=external_review_artifact_root,
     )
     for failure in external_failures:
-        warnings.append(f"Optional external review evidence invalid and ignored: {failure}")
+        if external_required:
+            failures.append(f"explicit independent review requirement: {failure}")
+        else:
+            warnings.append(f"Optional external review evidence invalid and ignored: {failure}")
 
     if not checks:
         failures.append("no status checks observed")
@@ -4127,7 +4487,7 @@ def evaluate_review_gate(
             "claude_cli_required": complexity["claude_cli_required"],
             "claude_cli_waived": claude_cli_waived,
             "external_review_required": external_required,
-            "independent_review_required": complexity["independent_review_required"],
+            "independent_review_required": external_required,
             "external_reviews_received": _external_review_count(external_review),
             "platform_review_required": platform_review_required,
             "platform_review_seen": platform_review_seen,
@@ -4206,6 +4566,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--self-review")
     parser.add_argument("--claude-evidence")
     parser.add_argument("--external-review-evidence")
+    parser.add_argument("--require-independent-review", action="store_true", help="Explicit additional requirement; never implied by high_critical risk")
     parser.add_argument("--policy-waiver")
     parser.add_argument("--write-external-review-packet")
     parser.add_argument("--write-self-review-template")
@@ -4245,6 +4606,7 @@ def main(argv: list[str] | None = None) -> int:
             self_review=self_review,
             claude_evidence=claude_evidence,
             external_review_evidence=external_review_evidence,
+            require_independent_review=args.require_independent_review,
             external_review_artifact_root=(
                 external_review_evidence_path.parent
                 if external_review_evidence_path is not None

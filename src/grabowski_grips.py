@@ -29,6 +29,7 @@ import grabowski_operator_obligation_evidence
 import grabowski_worktree_ensure
 import grabowski_merge_guard
 import grabowski_physical_checkout
+import grabowski_git_ssh
 
 Receipt = dict[str, Any]
 CommandRunner = Callable[[Path, list[str]], dict[str, Any]]
@@ -2011,9 +2012,46 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _git_transport_subcommand(arguments: list[str]) -> str | None:
+    """Extract only the Git verb; option values and operands are not verbs.
+
+    Unknown global options fail closed to the SSH-disabled local runner.
+    """
+    index = 0
+    no_value = frozenset({
+        "--no-optional-locks", "--no-pager", "--paginate", "-p", "-P",
+        "--no-replace-objects", "--literal-pathspecs", "--glob-pathspecs",
+        "--noglob-pathspecs", "--icase-pathspecs", "--no-lazy-fetch",
+    })
+    value_options = frozenset({
+        "-c", "-C", "--git-dir", "--work-tree", "--namespace", "--config-env",
+        "--exec-path", "--super-prefix",
+    })
+    assigned_options = (
+        "--git-dir=", "--work-tree=", "--namespace=", "--config-env=",
+        "--exec-path=", "--super-prefix=",
+    )
+    while index < len(arguments):
+        item = arguments[index]
+        if item in value_options:
+            index += 2
+            continue
+        if item in no_value or (
+            item.startswith(("-c", "-C")) and len(item) > 2
+        ) or item.startswith(assigned_options):
+            index += 1
+            continue
+        # A new/unknown Git switch is not grounds to expose writer credentials.
+        return None if item.startswith("-") else item
+    return None
+
+
 def _default_command_runner(repo: Path, argv: list[str]) -> dict[str, Any]:
-    command = ["git", "--no-optional-locks", "-C", str(repo), *argv]
+    command = [grabowski_git_ssh.trusted_git_cli_path(), "--no-optional-locks", "-C", str(repo), *argv]
     env = os.environ.copy()
+    # Purely local reads must not depend on any GitHub writer credential.
+    # Unknown/aliased operations remain SSH-disabled rather than falling back.
+    remote_ssh_operation = _git_transport_subcommand(argv) in {"push", "fetch", "pull", "clone", "ls-remote"}
     exact_deny = {
         "GIT_DIR",
         "GIT_WORK_TREE",
@@ -2054,7 +2092,11 @@ def _default_command_runner(repo: Path, argv: list[str]) -> dict[str, Any]:
             "GIT_PAGER": "cat",
             "PAGER": "cat",
             "GIT_ALLOW_PROTOCOL": "ssh",
-            "GIT_SSH_COMMAND": "/usr/bin/ssh -F /dev/null -oBatchMode=yes -oProxyCommand=none -oPermitLocalCommand=no -oClearAllForwardings=yes",
+            "GIT_SSH_COMMAND": (
+                grabowski_git_ssh.hardened_git_ssh_command()
+                if remote_ssh_operation
+                else "/__grabowski_ssh_transport_disabled__/ssh"
+            ),
             "GIT_SSH_VARIANT": "ssh",
             "GIT_ASKPASS": "/bin/false",
             "SSH_ASKPASS": "/bin/false",
@@ -2088,8 +2130,10 @@ def _default_command_runner(repo: Path, argv: list[str]) -> dict[str, Any]:
 
 
 def _default_github_runner(repo: Path, argv: list[str]) -> dict[str, Any]:
-    command = ["gh", *argv]
+    command = [grabowski_git_ssh.trusted_github_cli_path(), *argv]
     env = os.environ.copy()
+    # Prevent gh child Git/helpers from inheriting a caller-controlled PATH.
+    env["PATH"] = "/run/current-system/sw/bin:/usr/bin:/bin"
     for key in (
         "GIT_EXTERNAL_DIFF",
         "GIT_DIFF_OPTS",
@@ -2650,6 +2694,11 @@ def _self_review_audit_errors(
         errors.append("schema_version must be integer 1")
     if evidence.get("kind") != "grabowski_self_review_audit":
         errors.append("kind must be grabowski_self_review_audit")
+    version = evidence.get("review_policy_version")
+    if type(version) is not int or version != grabowski_merge_guard.REVIEW_POLICY_VERSION:
+        errors.append("review_policy_version is stale or invalid")
+    if type(evidence.get("independent_review_required")) is not bool:
+        errors.append("independent_review_required must be a boolean")
     if evidence.get("review_tier") not in {
         "documentation",
         "very_small",
@@ -2710,15 +2759,19 @@ def _self_review_audit_errors(
         errors.append("actual_review_iterations must be a positive integer")
     elif isinstance(minimum, int) and not isinstance(minimum, bool) and actual < minimum:
         errors.append("actual_review_iterations is below required minimum")
+    if evidence.get("review_tier") == "high_critical":
+        if type(minimum) is not int or minimum != 5 or type(actual) is not int or actual < 5:
+            errors.append("high-critical self-review depth must be at least 5")
+        errors.extend(
+            grabowski_merge_guard.high_critical_review_pass_evidence_errors(evidence)
+        )
     remaining = evidence.get("material_findings_remaining")
     if isinstance(remaining, bool) or not isinstance(remaining, int) or remaining < 0:
         errors.append("material_findings_remaining must be an integer >= 0")
     elif remaining > 0:
-        if evidence.get("residual_risk_accepted") is not True:
-            errors.append("material findings remain without accepted residual risk")
-        reason = evidence.get("residual_risk_reason")
-        if not isinstance(reason, str) or not reason.strip():
-            errors.append("accepted residual risk requires a reason")
+        errors.append(
+            "material findings remain; each must be resolved or disproven"
+        )
     if evidence.get("tuning_signal") != "observe":
         errors.append("tuning_signal must be observe for merge evidence")
     return errors
@@ -7456,6 +7509,30 @@ def _run_branch_publish(
         else ""
     )
     expected_upstream = f"{remote}/{branch}"
+    if not upstream:
+        # git push --set-upstream writes branch.* configuration even when the
+        # remote-tracking ref has not been locally fetched yet. The remote SHA
+        # has already been checked against expected_head above, so fall back
+        # only to exact local branch.remote + branch.merge config identities.
+        configured_remote = _git_optional(
+            repo=Path(orientation["root"]),
+            runner=runner,
+            argv=["config", "--get-all", f"branch.{branch}.remote"],
+        )
+        configured_merge = _git_optional(
+            repo=Path(orientation["root"]),
+            runner=runner,
+            argv=["config", "--get-all", f"branch.{branch}.merge"],
+        )
+        remote_values = str(configured_remote.get("stdout", "")).splitlines()
+        merge_values = str(configured_merge.get("stdout", "")).splitlines()
+        if (
+            int(configured_remote.get("returncode", 1)) == 0
+            and int(configured_merge.get("returncode", 1)) == 0
+            and remote_values == [remote]
+            and merge_values == [ref]
+        ):
+            upstream = expected_upstream
     if upstream != expected_upstream:
         _check(
             receipt,
@@ -9007,9 +9084,12 @@ def _agent_execution_source_request(
         raise GripPreflightError("novelty must be low, medium or high")
     risk_flags = _string_list_parameter(parameters, "risk_flags")
     verification_policy = parameters.get("verification_policy", "independent_review")
-    if verification_policy not in {"deterministic", "independent_review"}:
+    if verification_policy not in {
+        "deterministic", "self_review", "independent_review",
+    }:
         raise GripPreflightError(
-            "P5 one-shot verification_policy must be deterministic or independent_review"
+            "P5 one-shot verification_policy must be deterministic, self_review "
+            "or independent_review"
         )
     effect_profile = parameters.get("effect_profile", "candidate")
     if effect_profile not in {"candidate", "delivery"}:
@@ -9246,6 +9326,11 @@ def _agent_execution_source_request(
             prompt=str(review_prompt).strip(),
             role="review",
         )
+    elif verification_policy == "self_review":
+        # The controller owns the semantic verdict. This is a non-executable
+        # placeholder in the Workspace plan, NOT an executed role verdict.
+        # collect() must return a frozen-Candidate handoff without starting it.
+        review_argv = list(execution_plan.CONTROLLER_SELF_REVIEW_PENDING_ARGV)
     else:
         review_argv = [
             "python3",
@@ -9922,6 +10007,20 @@ def _run_agent_execution_happy_path(
     _check(receipt, "workspace-coordinator-bound", "pass", str(coordinated.get("state")))
     coordinator_state = coordinated.get("state")
     if coordinator_state == "pending":
+        if coordinated.get("reason") == "controller_self_review_pending":
+            # A controller review must be a real later source-bound action.
+            # Do not launch a background continuation that would re-run the
+            # same sentinel forever or claim technical tests are reviewer PASS.
+            return with_frontdoor({
+                "state": "controller_self_review_pending",
+                "integration_ready": False,
+                "workspace_id": workspace_id,
+                "coordinator": coordinated,
+                "continuation": None,
+                "reconcile_required": False,
+                "next_action": "controller_self_review_bound_candidate",
+                "receipt_status": "passed",
+            })
         continuation = _agent_execution_start_continuation(
             workspace,
             workspace_id=workspace_id,
@@ -13846,7 +13945,8 @@ def _captain_independent_review_gate(
                 and release.get("serving_head") != expected_head
                 and isinstance(release.get("serving_release_id"), str)
                 and bool(release["serving_release_id"])
-                and release.get("independent_review_required") is True
+                and release.get("critical_release_source") is True
+                and release_deploy._critical_release_review_origin_valid(release, expected_head)
                 and _is_hex_sha(
                     release.get("release_review_identity_sha256"), lengths=(64,)
                 )
@@ -13880,6 +13980,7 @@ def _captain_independent_review_gate(
             and _is_hex_sha(expected_head, lengths=(40,))
             and isinstance(release, dict)
             and release.get("target_repo_head") == expected_head
+            and release.get("critical_release_source") is False
             and release.get("independent_review_required") is False
         )
         bound_serving = (
@@ -13990,11 +14091,10 @@ def _captain_independent_review_gate(
         )
         pass_count = int(independent_summary["pass_count"])
         errors.extend(independent_summary["errors"])
-        raw_errors = reconciliation.get("errors", [])
-        if isinstance(raw_errors, list):
-            errors.extend(str(item) for item in raw_errors if isinstance(item, str))
-        else:
-            errors.append("independent_review_reconciliation_errors_invalid")
+        optional_review = grabowski_merge_guard.decision_review_blocking_errors(
+            reconciliation, independent_required=requirement["required"],
+        )
+        errors.extend(optional_review["errors"])
         if reconciliation_status not in {"settled", "not_applicable", "blocked"}:
             errors.append("independent_review_reconciliation_status_invalid")
     if requirement["required"] and (
@@ -14024,6 +14124,10 @@ def _captain_independent_review_gate(
             else "exact-request-digest"
         ),
         "settlement_stage": "captain-preflight-and-atomic-merge-guard",
+        "optional_review_unavailability": (
+            optional_review["ignored_unavailable"]
+            if isinstance(reconciliation, dict) else []
+        ),
         "errors": errors,
     }
     if errors:
@@ -14040,7 +14144,7 @@ def _captain_independent_review_gate(
             "provider-neutral independent review role evidence is settled for the exact PR/head/base; "
             "diff-identity aliases are authoritative only after live atomic-guard revalidation"
             if requirement["required"]
-            else "no independent-review floor applies and no decision-bound review debt is present"
+            else "no independent-review floor applies and no blocking decision-bound review debt remains"
         ),
         details,
     )
@@ -16721,9 +16825,14 @@ def _run_captain_runtime_deploy(
                 "authenticated review PR and Captain action"
             )
             return execution_result
-        if not isinstance(noncritical, dict) or noncritical.get(
-            "independent_review_required"
-        ) is not False:
+        if (
+            not isinstance(noncritical, dict)
+            or noncritical.get("critical_release_source") is not False
+            or noncritical.get("independent_review_required") is not False
+            or noncritical.get("status") not in {
+                "already-serving-exact-source", "non-runtime-documentation",
+            }
+        ):
             execution_result["preflight_errors"] = ["release_review_pr_required"]
             execution_result["verification_error"] = (
                 "runtime deploy refused: no proven noncritical source exemption"

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 import fcntl
 import hashlib
@@ -145,19 +145,48 @@ def inventory_readonly_sqlite(
     error_type: type[ChangedError],
     message: str = INVENTORY_CHANGED_MESSAGE,
     allow_wal_copy: bool = True,
+    allow_checkpointed_empty_wal: bool = False,
     max_copy_bytes: int | None = None,
 ) -> Iterator[sqlite3.Connection]:
     wal_path = Path(str(path) + "-wal")
     wal_present = wal_path.exists() or wal_path.is_symlink()
     shm_path = Path(str(path) + "-shm")
-    if not allow_wal_copy and (
+    if not allow_wal_copy and not allow_checkpointed_empty_wal and (
         wal_present or shm_path.exists() or shm_path.is_symlink()
     ):
-        raise _changed(
-            error_type,
-            "Strict read-only snapshot unavailable while SQLite WAL sidecars exist",
-        )
-    if not wal_present:
+        raise _changed(error_type, "Strict read-only snapshot unavailable while SQLite WAL sidecars exist")
+    # Explicit opt-in: a checkpointed, zero-length WAL contains no committed frames.  It can
+    # safely be ignored by the immutable reader, but ONLY if the database and
+    # every pre-existing sidecar retain their exact inode/stat identity through
+    # the observation.  Active/nonempty WAL still fails strict READ_ONLY.
+    empty_wal_identity: FileIdentity | None = None
+    shm_identity: FileIdentity | None = None
+    if not allow_wal_copy:
+        try:
+            if wal_present:
+                wal_status = os.lstat(wal_path)
+                if not stat.S_ISREG(wal_status.st_mode) or wal_status.st_size != 0:
+                    raise _changed(
+                        error_type,
+                        "Strict read-only snapshot unavailable while SQLite WAL sidecars exist",
+                    )
+                empty_wal_identity = status_identity(wal_status)
+            if shm_path.exists() or shm_path.is_symlink():
+                if empty_wal_identity is None:
+                    raise _changed(
+                        error_type,
+                        "Strict read-only snapshot unavailable while SQLite WAL sidecars exist",
+                    )
+                shm_status = os.lstat(shm_path)
+                if not stat.S_ISREG(shm_status.st_mode):
+                    raise _changed(
+                        error_type,
+                        "Strict read-only snapshot unavailable while SQLite WAL sidecars exist",
+                    )
+                shm_identity = status_identity(shm_status)
+        except OSError as exc:
+            raise _changed(error_type, message, cause=exc)
+    if not wal_present or empty_wal_identity is not None:
         before_identity = file_identity(path)
         connection = sqlite3.connect(
             path.absolute().as_uri() + "?mode=ro&immutable=1",
@@ -176,9 +205,19 @@ def inventory_readonly_sqlite(
                 error_type=error_type,
                 message=message,
             )
-            if wal_path.exists() or wal_path.is_symlink():
+            if empty_wal_identity is not None:
+                assert_identity(
+                    wal_path, empty_wal_identity,
+                    error_type=error_type, message=message,
+                )
+            elif wal_path.exists() or wal_path.is_symlink():
                 raise _changed(error_type, message)
-            if not allow_wal_copy and (shm_path.exists() or shm_path.is_symlink()):
+            if shm_identity is not None:
+                assert_identity(
+                    shm_path, shm_identity,
+                    error_type=error_type, message=message,
+                )
+            elif not allow_wal_copy and (shm_path.exists() or shm_path.is_symlink()):
                 raise _changed(error_type, message)
         return
 
@@ -300,10 +339,54 @@ def inventory_native_wal_readonly_sqlite(
         raise _changed(error_type, message, cause=exc)
     finally:
         if connection is not None:
-            try:
-                connection.rollback()
-            finally:
-                connection.close()
+            # The outer inventory scope can outlive individual legacy readers
+            # that explicitly close their handle. SQLite connection.close()
+            # safely releases a pinned read-only WAL transaction and is
+            # idempotent; rollback() on an already-closed handle would raise
+            # ProgrammingError and hide the actual observation result.
+            connection.close()
+
+
+@contextmanager
+def inventory_coherent_readonly_sqlite(
+    path: Path,
+    *,
+    temporary_prefix: str,
+    error_type: type[ChangedError],
+    message: str = INVENTORY_CHANGED_MESSAGE,
+    allow_checkpointed_empty_wal: bool = False,
+    wal_mutation_admission: Callable[[], None] | None = None,
+) -> Iterator[sqlite3.Connection]:
+    """Pin a live WAL image only after explicit mutation admission.
+
+    SQLite mode=ro may update existing SHM read marks. A genuinely read-only
+    caller must not open a native WAL reader without the operator's mutation
+    gate. Quiescent immutable reads remain write-free and ungated. Never make,
+    delete, copy or checkpoint sidecars; incomplete pairs still fail closed.
+    """
+    wal = Path(str(path) + "-wal")
+    shm = Path(str(path) + "-shm")
+    if (wal.exists() or wal.is_symlink()) and (shm.exists() or shm.is_symlink()):
+        if wal_mutation_admission is None:
+            raise PermissionError(
+                "Native SQLite WAL observation requires mutation admission "
+                "before SHM read-mark writes"
+            )
+        wal_mutation_admission()
+        with inventory_native_wal_readonly_sqlite(
+            path, error_type=error_type, message=message,
+        ) as connection:
+            yield connection
+    else:
+        with inventory_readonly_sqlite(
+            path,
+            temporary_prefix=temporary_prefix,
+            error_type=error_type,
+            message=message,
+            allow_wal_copy=False,
+            allow_checkpointed_empty_wal=allow_checkpointed_empty_wal,
+        ) as connection:
+            yield connection
 
 
 def sqlite_integrity(

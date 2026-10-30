@@ -51,6 +51,7 @@ sys.modules.update(
 try:
     import grabowski_mcp as base
     import grabowski_operator as operator
+    import grabowski_self_review_execution as review
     import grabowski_transport_assertion as assertion
     import grabowski_transport_roundtrip as roundtrip
 
@@ -2136,7 +2137,7 @@ class OperatorSignedTransportTests(unittest.TestCase):
         self.assertEqual(environment["GH_HOST"], "github.com")
         self.assertEqual(environment["GH_TOKEN"], "fixture-token")
         self.assertNotIn("GH_ENTERPRISE_TOKEN", environment)
-        self.assertEqual(environment["PATH"], "/usr/bin")
+        self.assertEqual(environment["PATH"], str(Path(operator._trusted_github_cli_path()).parent))
         self.assertEqual(environment["GH_PAGER"], "cat")
         self.assertEqual(environment["GH_PROMPT_DISABLED"], "1")
         for key in (
@@ -2641,7 +2642,7 @@ class OperatorSignedTransportTests(unittest.TestCase):
         self.assertEqual(
             run.call_args_list[2].args[0],
             [
-                "/usr/bin/git",
+                operator._trusted_git_cli_path(),
                 "-C",
                 str(ROOT),
                 "remote",
@@ -2678,7 +2679,7 @@ class OperatorSignedTransportTests(unittest.TestCase):
         self.assertEqual(
             run.call_args_list[2].args[0],
             [
-                "/usr/bin/git",
+                operator._trusted_git_cli_path(),
                 "-C",
                 str(ROOT),
                 "remote",
@@ -3235,6 +3236,81 @@ class OperatorSignedTransportTests(unittest.TestCase):
                     tool=tool,
                 )
         signed.assert_not_called()
+
+
+class FirstPartyReviewSignedOriginTests(unittest.TestCase):
+    def test_review_issuer_uses_real_connector_mac_not_spoofable_client_id(self) -> None:
+        token = "C" * 43
+        arguments = {"review_batch_id": "d" * 32}
+        body = json.dumps(
+            {
+                "jsonrpc": "2.0", "id": 91, "method": "tools/call",
+                "params": {
+                    "name": review.FIRST_PARTY_TOOL_START,
+                    "arguments": arguments,
+                },
+            },
+            ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")
+        now = int(__import__("time").time())
+        signed = ingress.signed_tool_headers(
+            token=token, body=body, session_id="first-party-controller",
+            runtime_binding_sha256=_runtime_sha256(), now_unix=now,
+        )
+        headers = {
+            base._TRANSPORT_CONNECTOR_CAPABILITY_HEADER: token,
+            base._TRANSPORT_MCP_SESSION_ID_HEADER: "first-party-controller",
+            base._TRANSPORT_INGRESS_VERSION_HEADER: assertion.ASSERTION_VERSION,
+            base._TRANSPORT_REQUEST_ID_HEADER: signed[ingress.REQUEST_ID_HEADER],
+            base._TRANSPORT_REQUEST_TIMESTAMP_HEADER: signed[
+                ingress.REQUEST_TIMESTAMP_HEADER
+            ],
+            base._TRANSPORT_REQUEST_AUDIENCE_HEADER: signed[
+                ingress.REQUEST_AUDIENCE_HEADER
+            ],
+            base._TRANSPORT_REQUEST_BODY_SHA256_HEADER: signed[
+                ingress.REQUEST_BODY_SHA256_HEADER
+            ],
+            base._TRANSPORT_RUNTIME_BINDING_SHA256_HEADER: signed[
+                ingress.RUNTIME_BINDING_SHA256_HEADER
+            ],
+            base._TRANSPORT_REQUEST_MAC_HEADER: signed[ingress.REQUEST_MAC_HEADER],
+        }
+        context = SimpleNamespace(request_context=SimpleNamespace(
+            request=SimpleNamespace(headers=headers),
+            client_id="caller-controlled-spoof",
+        ))
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            connectors = root / "connectors"
+            connectors.mkdir(mode=0o700)
+            token_path = connectors / "primary.token"
+            token_path.write_text(token, encoding="ascii")
+            token_path.chmod(0o600)
+            replay = root / "replay"
+            with (
+                mock.patch.object(
+                    base, "_TRANSPORT_CONNECTOR_IDENTITY_ROOT", connectors
+                ),
+                mock.patch.object(
+                    base, "_transport_roundtrip_runtime_binding",
+                    return_value=BINDING,
+                ),
+                mock.patch.object(base, "_transport_registered_tool_names", return_value={review.FIRST_PARTY_TOOL_START}),
+                mock.patch.object(assertion, "STATE_ROOT", replay),
+                mock.patch.object(assertion, "LOCK_PATH", replay / ".lock"),
+            ):
+                issuer = base._authenticated_self_review_issuer(
+                    context, tool_name=review.FIRST_PARTY_TOOL_START,
+                    arguments=arguments,
+                )
+        self.assertEqual("primary", issuer["connector_id"])
+        self.assertNotIn("client_id", issuer)
+        self.assertEqual(review.FIRST_PARTY_TOOL_START, issuer["tool_name"])
+        self.assertEqual(
+            assertion.canonical_arguments_sha256(arguments),
+            issuer["arguments_sha256"],
+        )
 
 
 if __name__ == "__main__":

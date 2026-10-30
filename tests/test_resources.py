@@ -59,6 +59,18 @@ class ResourceTests(unittest.TestCase):
         self.patch.stop()
         self.temporary.cleanup()
 
+    def test_bureau_runtime_exact_67_resources_fit_one_atomic_lease(self) -> None:
+        keys = ["path:" + str(self.root / ("stage-%03d" % i)) for i in range(67)]
+        self.assertEqual(67, len(resources.normalize_resource_keys(keys)))
+        owner = "operator:bureau-exact-67-resource-test"
+        resources.acquire_resources(owner, keys, purpose="Bureau exact bound set")
+        self.assertEqual(67, len(resources.list_resources(owner_id=owner)))
+        resources.release_resources(owner, keys)
+
+        excess = ["path:" + str(self.root / ("stage-%03d" % i)) for i in range(97)]
+        with self.assertRaisesRegex(ValueError, "at most 96 resource keys"):
+            resources.normalize_resource_keys(excess)
+
     def test_resource_writer_connections_are_closed_across_lease_lifecycle(self) -> None:
         # SQLite's connection context manager commits but does not close.
         # Hold references to every connection so garbage collection cannot
@@ -3298,6 +3310,166 @@ class ResourceTests(unittest.TestCase):
                 resources.ResourceLeaseExpired, "Resource lease has expired"
             ):
                 resources.renew_resources("owner-a", [key], ttl_seconds=60)
+
+    def test_work_lane_renewed_lease_restore_is_exact_and_aba_safe(self) -> None:
+        owner = "lane:" + "f" * 32
+        keys = ["component:renew-restore-a", "component:renew-restore-b"]
+        with patch.object(resources, "_now", return_value=100):
+            original = resources.acquire_resources(
+                owner, keys, purpose="restore fixture", ttl_seconds=60,
+            )["leases"]
+            foreign = resources.acquire_resources(
+                "operator:restore-foreign", ["component:restore-foreign"],
+                purpose="foreign", ttl_seconds=600,
+            )["leases"][0]
+        original_snapshots = [
+            resources._release_lease_snapshot(row) for row in original
+        ]
+        with patch.object(resources, "_now", return_value=110):
+            renewed = resources.renew_resources(
+                owner, keys, ttl_seconds=900,
+                expected_leases=original_snapshots,
+            )["leases"]
+        renewed_snapshots = [
+            resources._release_lease_snapshot(row) for row in renewed
+        ]
+        self.assertNotEqual(original_snapshots, renewed_snapshots)
+        with patch.object(resources, "_now", return_value=111):
+            restoration = resources.restore_renewed_work_lane_leases(
+                owner, keys,
+                expected_renewed_leases=renewed_snapshots,
+                original_leases=original_snapshots,
+            )
+        self.assertTrue(restoration["snapshot_guarded"])
+        self.assertEqual(original, restoration["restored"])
+        with patch.object(resources, "_now", return_value=111):
+            self.assertEqual(original, resources.list_resources(owner_id=owner))
+            self.assertEqual(foreign, resources.inspect_resource("component:restore-foreign"))
+        with patch.object(resources, "_now", return_value=112):
+            renewed_again = resources.renew_resources(
+                owner, keys, ttl_seconds=900,
+                expected_leases=original_snapshots,
+            )["leases"]
+        with patch.object(resources, "_now", return_value=115):
+            newer = resources.renew_resources(
+                owner, keys, ttl_seconds=900,
+                expected_leases=[
+                    resources._release_lease_snapshot(row) for row in renewed_again
+                ],
+            )["leases"]
+            with self.assertRaisesRegex(RuntimeError, "generation changed"):
+                resources.restore_renewed_work_lane_leases(
+                    owner, keys,
+                    expected_renewed_leases=[
+                        resources._release_lease_snapshot(row) for row in renewed_again
+                    ],
+                    original_leases=original_snapshots,
+                )
+        with patch.object(resources, "_now", return_value=115):
+            self.assertEqual(newer, resources.list_resources(owner_id=owner))
+        with self.assertRaisesRegex(PermissionError, "lane owner"):
+            resources.restore_renewed_work_lane_leases(
+                "operator:restore-foreign", keys,
+                expected_renewed_leases=renewed_snapshots,
+                original_leases=original_snapshots,
+            )
+
+    def test_work_lane_preserved_generation_is_not_renewed_across_batches(self) -> None:
+        owner = "lane:" + "a" * 32
+        key = "component:preserved-no-mutation"
+        with patch.object(resources, "_now", return_value=100):
+            original = resources.acquire_resources(
+                owner, [key], purpose="stable lane", ttl_seconds=60,
+            )
+        with patch.object(resources, "_now", return_value=110):
+            preserved = resources.acquire_resources(
+                owner, [key], purpose="stable lane", ttl_seconds=900,
+                _work_lane_no_renew_preserved=True,
+            )
+            observed = resources.inspect_resource(key)
+        self.assertEqual([key], preserved["preserved"])
+        self.assertEqual(original["leases"], preserved["leases"])
+        self.assertEqual(original["leases"][0], observed)
+        self.assertEqual(160, preserved["leases"][0]["expires_at_unix"])
+        with self.assertRaisesRegex(PermissionError, "requires a lane owner"):
+            resources.acquire_resources(
+                "operator:not-a-lane", [key], purpose="stable lane",
+                _work_lane_no_renew_preserved=True,
+            )
+        with self.assertRaisesRegex(ValueError, "must be boolean"):
+            resources.acquire_resources(
+                owner, [key], purpose="stable lane",
+                _work_lane_no_renew_preserved=1,
+            )
+
+    def test_work_lane_same_second_lease_aba_requires_new_generation(self) -> None:
+        owner = "lane:" + "c" * 32
+        key = "component:same-second-aba"
+        with patch.object(resources, "_now", return_value=100):
+            first = resources.acquire_resources(
+                owner, [key], purpose="same-second generation", ttl_seconds=120,
+            )
+            first_lease = first["leases"][0]
+            released = resources.release_resources(
+                owner, [key],
+                expected_leases=[resources._release_lease_snapshot(first_lease)],
+            )
+            self.assertEqual([key], [lease["resource_key"] for lease in released["released"]])
+            second = resources.acquire_resources(
+                owner, [key], purpose="same-second generation", ttl_seconds=120,
+            )
+            second_lease = second["leases"][0]
+            self.assertEqual(first_lease["acquired_at_unix"], second_lease["acquired_at_unix"])
+            self.assertEqual(first_lease["expires_at_unix"], second_lease["expires_at_unix"])
+            self.assertNotEqual(
+                first_lease["metadata_sha256"], second_lease["metadata_sha256"],
+                "same owner/second re-acquisition must have a fresh immutable generation",
+            )
+            preserved = resources.acquire_resources(
+                owner, [key], purpose="same-second generation", ttl_seconds=300,
+                _work_lane_no_renew_preserved=True,
+            )
+            self.assertEqual([key], preserved["preserved"])
+            self.assertEqual(second["leases"], preserved["leases"])
+
+    def test_owner_resource_keyset_inventory_is_complete_beyond_one_page(self) -> None:
+        owner = "lane:" + "b" * 32
+        keys = [f"component:keyset-{i:03d}" for i in range(70)]
+        resources.acquire_resources(owner, keys[:64], purpose="owner keyset")
+        resources.acquire_resources(owner, keys[64:], purpose="owner keyset")
+        resources.acquire_resources(
+            "operator:foreign-keyset", ["component:keyset-foreign"],
+            purpose="foreign",
+        )
+        found = []
+        cursor = None
+        for expected_count in (32, 32, 6):
+            kwargs = {"owner_id": owner, "limit": 32}
+            if cursor is not None:
+                kwargs["start_after_key"] = cursor
+            page = resources.list_resources(**kwargs)
+            self.assertEqual(expected_count, len(page))
+            found.extend(item["resource_key"] for item in page)
+            cursor = page[-1]["resource_key"]
+        self.assertEqual(keys, found)
+        self.assertEqual([], resources.list_resources(
+            owner_id=owner, limit=32, start_after_key=cursor,
+        ))
+        with self.assertRaisesRegex(ValueError, "start_after_key"):
+            resources.list_resources(owner_id=owner, start_after_key="bad\x00key")
+
+    def test_owner_keyset_cursor_accepts_native_8192_byte_resource_key(self) -> None:
+        owner = "operator:long-cursor-boundary"
+        resources.acquire_resources(
+            owner, ["component:long-cursor-present"], purpose="cursor bound test",
+        )
+        maximum = "path:/" + "x" * (8192 - len("path:/"))
+        self.assertEqual(8192, len(maximum.encode("utf-8")))
+        self.assertEqual([], resources.list_resources(
+            owner_id=owner, start_after_key=maximum,
+        ))
+        with self.assertRaisesRegex(ValueError, "start_after_key"):
+            resources.list_resources(owner_id=owner, start_after_key=maximum + "x")
 
     def test_live_same_owner_reentry_is_identity_bound_and_never_shortens(self) -> None:
         key = "component:same-owner-reentry"

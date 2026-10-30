@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -37,6 +38,27 @@ class OperatorContextTests(unittest.TestCase):
         self.assertIsNotNone(contract)
         self.assertNotIn("type_params=[]", contract)
         self.assertIn("FunctionDef(name='sample'", contract)
+
+    def test_ast_contract_keeps_empty_ast_call_fields_on_all_python_versions(self) -> None:
+        builder = self._builder_module()
+        node = builder.ast.parse("value = run()\n").body[0]
+        contract = builder._ast_contract(node)
+        self.assertIn("args=[]", contract)
+        self.assertIn("keywords=[]", contract)
+
+    def test_ast_contract_uses_show_empty_only_if_supported(self) -> None:
+        builder = self._builder_module()
+        node = builder.ast.parse("value = run()\n").body[0]
+        with mock.patch.object(builder.ast, "dump", wraps=builder.ast.dump) as call:
+            builder._ast_contract(node)
+        self.assertEqual(call.call_count, 1)
+        kwargs = call.call_args.kwargs
+        self.assertTrue(kwargs["annotate_fields"])
+        self.assertFalse(kwargs["include_attributes"])
+        if sys.version_info >= (3, 13):
+            self.assertIs(kwargs["show_empty"], True)
+        else:
+            self.assertNotIn("show_empty", kwargs)
 
     def test_semantic_source_digest_ignores_non_contract_function_bodies(self) -> None:
         builder = self._builder_module()

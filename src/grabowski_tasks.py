@@ -97,7 +97,9 @@ TASK_TERMINALIZATION_RECOVERY_CURSOR_METADATA_KEY = (
     "task_terminalization_recovery_cursor_v1"
 )
 TASK_TERMINALIZATION_RECOVERY_CURSOR_VERSION = 1
-GRABOWSKI_RUNTIME_PYTHON = operator.HOME / ".local/share/grabowski-mcp/.venv/bin/python"
+# Use the interpreter running this immutable Grabowski operator.
+# Retired /usr/bin/python3.10 venvs must not block the reserved executor on NixOS.
+GRABOWSKI_RUNTIME_PYTHON = Path(sys.executable)
 GRABOWSKI_REPOSITORY_SLUG = "heimgewebe/grabowski"
 MANAGED_BUILD_RESOLVER = (
     operator.HOME / ".local/lib/heim-pc/managed-build/scripts/managed_build.py"
@@ -1358,13 +1360,15 @@ class TaskSchemaInventoryChanged(RuntimeError):
 
 @contextmanager
 def _inventory_readonly_sqlite(
-    path: Path, *, allow_wal_copy: bool = True
+    path: Path, *, allow_wal_copy: bool = True,
+    allow_checkpointed_empty_wal: bool = False,
 ) -> Iterator[sqlite3.Connection]:
     with sqlite_store.inventory_readonly_sqlite(
         path,
         temporary_prefix="grabowski-task-schema-inventory-",
         error_type=TaskSchemaInventoryChanged,
         allow_wal_copy=allow_wal_copy,
+        allow_checkpointed_empty_wal=allow_checkpointed_empty_wal,
     ) as connection:
         yield connection
 
@@ -7623,15 +7627,24 @@ def _task_read_snapshot() -> Iterator[sqlite3.Connection]:
 
 @contextmanager
 def _task_readonly_snapshot() -> Iterator[sqlite3.Connection]:
-    """Read without filesystem writes; refuse active WAL sidecars fail-closed."""
+    """Read a pinned WAL or quiescent task snapshot without filesystem writes."""
     if TASK_DB.is_symlink() or not TASK_DB.is_file() or TASK_DB.stat().st_size == 0:
         raise RuntimeError("Task store cannot be observed without explicit initialization")
-    with _inventory_readonly_sqlite(TASK_DB, allow_wal_copy=False) as connection:
+    with sqlite_store.inventory_coherent_readonly_sqlite(
+        TASK_DB,
+        temporary_prefix="unused-task-readonly.",
+        error_type=TaskSchemaInventoryChanged,
+        allow_checkpointed_empty_wal=True,
+        wal_mutation_admission=lambda: operator._require_operator_mutation(
+            "durable_job"
+        ),
+    ) as connection:
         if _task_schema_version(connection) != TASK_CURRENT_SCHEMA_VERSION:
             raise RuntimeError("Task store requires an explicit schema migration")
         _validate_task_schema_current(connection)
         _task_reconcile_revision_contract(connection)
-        connection.execute("BEGIN DEFERRED")
+        if not connection.in_transaction:
+            connection.execute("BEGIN DEFERRED")
         try:
             yield connection
         finally:

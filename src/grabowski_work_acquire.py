@@ -42,7 +42,9 @@ WORK_SOURCE_KINDS = frozenset(
 MAX_WRITE_PATHS = 256
 MAX_WRITER_ARGV = 256
 MAX_WRITER_ARGUMENT_BYTES = 8192
-MAX_TERMINAL_OWNER_LEASES = 512
+MAX_TERMINAL_OWNER_LEASES = 512  # normalized acquisition manifest bound
+MAX_TERMINAL_OWNER_OBSERVED_LEASES = 4096  # terminal owner-wide inventory
+MAX_OWNER_LEASE_LIST_PAGE = 1000  # native resources.list_resources bound
 MAX_RESOURCE_RELEASE_BATCH = 64
 SUCCESSOR_HANDOFF_MIN_LEASE_REMAINING_SECONDS = 30
 DEFERRED_RESOURCE_RELEASE_CLOSEOUT_STATES = frozenset({"candidate_adopted"})
@@ -855,28 +857,46 @@ def _terminal_lane_resource_observation(
         raise TerminalLeaseConvergenceError(
             "terminal Work Lane resource key set is invalid"
         )
-    registered_resource_keys = resources.normalize_resource_keys(raw_keys)
-    leases = resources.list_resources(
-        owner_id=owner_id,
-        include_expired=False,
-        limit=MAX_TERMINAL_OWNER_LEASES,
-    )
-    if not isinstance(leases, list):
-        raise TerminalLeaseConvergenceError(
-            "terminal Work Lane owner lease observation is invalid"
+    registered_resource_keys = _normalize_lane_resource_keys(raw_keys)
+    # Terminal cleanup observes the *current owner*, not just the 512-key
+    # registration manifest. Keyset pages avoid silently truncating late leases.
+    snapshots: list[dict[str, Any]] = []
+    start_after_key: str | None = None
+    while len(snapshots) < MAX_TERMINAL_OWNER_OBSERVED_LEASES:
+        limit = min(
+            MAX_OWNER_LEASE_LIST_PAGE,
+            MAX_TERMINAL_OWNER_OBSERVED_LEASES - len(snapshots),
         )
+        kwargs: dict[str, Any] = {
+            "owner_id": owner_id, "include_expired": False, "limit": limit,
+        }
+        if start_after_key is not None:
+            kwargs["start_after_key"] = start_after_key
+        page = resources.list_resources(**kwargs)
+        if not isinstance(page, list) or len(page) > limit:
+            raise TerminalLeaseConvergenceError(
+                "terminal Work Lane owner lease observation is invalid"
+            )
+        page_snapshots = sorted(
+            (_lease_snapshot(lease, owner_id=owner_id) for lease in page),
+            key=lambda item: item["resource_key"],
+        )
+        for snapshot in page_snapshots:
+            key = snapshot["resource_key"]
+            if start_after_key is not None and key <= start_after_key:
+                raise TerminalLeaseConvergenceError(
+                    "terminal Work Lane owner lease inventory is not strictly ordered"
+                )
+            snapshots.append(snapshot)
+            start_after_key = key
+        if len(page) < limit:
+            break
     live_count = resources.count_resources(
         owner_id=owner_id, include_expired=False
     )
-    if live_count != len(leases):
+    if live_count != len(snapshots):
         raise TerminalLeaseConvergenceError(
             "terminal Work Lane owner lease inventory changed or exceeds bounded view"
-        )
-    snapshots = [_lease_snapshot(lease, owner_id=owner_id) for lease in leases]
-    snapshots.sort(key=lambda item: item["resource_key"])
-    if len({snapshot["resource_key"] for snapshot in snapshots}) != len(snapshots):
-        raise TerminalLeaseConvergenceError(
-            "terminal Work Lane owner lease observation contains duplicates"
         )
     return owner_id, registered_resource_keys, snapshots
 
@@ -987,7 +1007,7 @@ def _terminal_resource_key_list(
             or not value
             or value != value.strip()
             or "\x00" in value
-            or len(value.encode("utf-8")) > 4096
+            or len(value.encode("utf-8")) > 8192
         ):
             raise TerminalLeaseConvergenceError(f"{label} contains an invalid resource key")
         normalized.append(value)
@@ -1026,7 +1046,7 @@ def _terminal_resource_closeout_evidence(
         raise TerminalLeaseConvergenceError(
             "terminal Work Lane registered resource keys are invalid"
         )
-    registered = resources.normalize_resource_keys(raw_registered)
+    registered = _normalize_lane_resource_keys(raw_registered)
     released_raw = raw.get("released_resource_keys")
     released = _terminal_resource_key_list(
         released_raw,
@@ -1124,7 +1144,7 @@ def _build_terminal_resource_closeout_evidence(
         raise TerminalLeaseConvergenceError(
             "terminal Work Lane registered resource keys are invalid"
         )
-    registered = resources.normalize_resource_keys(raw_registered)
+    registered = _normalize_lane_resource_keys(raw_registered)
     released_raw = result.get("released_resource_keys")
     released = _terminal_resource_key_list(
         released_raw,
@@ -2318,7 +2338,7 @@ def _normalize(
             "scoped_writer_runtime_seconds must be between 120 and 86400"
         )
     required = [f"path:{target}", f"repo:{repo}:branch:{branch}"]
-    resource_keys = resources.normalize_resource_keys(
+    resource_keys = _normalize_lane_resource_keys(
         [*requested, *path_resources, *required]
     )
     identity = {
@@ -3141,8 +3161,21 @@ def _continuation_preimage(
         return result
 
 
+def _normalize_lane_resource_keys(values: list[str]) -> list[str]:
+    """Normalize a bounded whole-lane manifest; atomic resource calls stay <=64."""
+    # Raw input stays finite, but the lease limit applies after deduplication.
+    if not isinstance(values, list) or len(values) > MAX_TERMINAL_OWNER_LEASES * 2:
+        raise ValueError("Work Lane raw resource_keys exceed bounded input")
+    normalized = sorted({resources.normalize_resource_key(key) for key in values})
+    if not normalized:
+        raise ValueError("at least one resource key is required")
+    if len(normalized) > MAX_TERMINAL_OWNER_LEASES:
+        raise ValueError("Work Lane normalized resource_keys exceed bounded manifest")
+    return normalized
+
+
 def _resource_acquisition_plan(resource_keys: list[str]) -> list[dict[str, Any]]:
-    keys = resources.normalize_resource_keys(resource_keys)
+    keys = _normalize_lane_resource_keys(resource_keys)
     bureau_keys = resources.bureau_leases.bureau_resource_keys(keys)
     if (
         not isinstance(bureau_keys, list)
@@ -3154,14 +3187,25 @@ def _resource_acquisition_plan(resource_keys: list[str]) -> list[dict[str, Any]]
     bureau_keys = sorted(bureau_keys)
     bureau_key_set = set(bureau_keys)
     standard_keys = [key for key in keys if key not in bureau_key_set]
-    return [
-        {"contract_group": contract_group, "resource_keys": group_keys}
-        for contract_group, group_keys in (
-            ("bureau", bureau_keys),
-            ("standard", standard_keys),
-        )
-        if group_keys
-    ]
+    # Repository cardinality is global to the Work Lane. Without this
+    # guard separate 64-key groups could each grant one repository authority.
+    if sum(key.startswith("repo:") for key in standard_keys) > 1:
+        raise ValueError("repository leases must be acquired one repository at a time")
+    # Bureau gate combinations are one indivisible contract.  Splitting them
+    # could separate mutually exclusive merge and worktree-admin authorities.
+    if len(bureau_keys) > MAX_RESOURCE_RELEASE_BATCH:
+        raise ValueError("Bureau partition exceeds the single atomic 64-key contract")
+    plan: list[dict[str, Any]] = []
+    if bureau_keys:
+        plan.append({"contract_group": "bureau", "resource_keys": bureau_keys})
+    # Standard resources may be grouped only under the same bounded lane owner;
+    # all verified receipts are required before any worktree/writer effect.
+    for offset in range(0, len(standard_keys), MAX_RESOURCE_RELEASE_BATCH):
+        plan.append({
+            "contract_group": "standard",
+            "resource_keys": standard_keys[offset:offset + MAX_RESOURCE_RELEASE_BATCH],
+        })
+    return plan
 
 
 def _lease_snapshot(lease: Any, *, owner_id: str) -> dict[str, Any]:
@@ -3280,8 +3324,13 @@ def _acquisition_bundle(
         ],
         "acquisitions": [acquisition["receipt"] for acquisition in acquisitions],
         "resource_classes": {
-            acquisition["contract_group"]: list(acquisition["resource_keys"])
-            for acquisition in acquisitions
+            group: sorted(
+                key for acquisition in acquisitions
+                if acquisition["contract_group"] == group
+                for key in acquisition["resource_keys"]
+            )
+            for group in ("bureau", "standard")
+            if any(acquisition["contract_group"] == group for acquisition in acquisitions)
         },
     }
 
@@ -3295,6 +3344,67 @@ def _group_evidence_fields(
         "acquisition_plan": plan,
         "lease_acquisition_groups": acquisitions,
     }
+
+
+def _verify_multibatch_live_lease_generations(
+    *, owner_id: str, required_keys: list[str],
+    acquisitions: list[dict[str, Any]], inventory_fn: Callable[..., Any],
+) -> None:
+    """Prove every acquired lease remains current before delegated effects."""
+    expected: dict[str, dict[str, Any]] = {}
+    for group in acquisitions:
+        for row in group["receipt"]["leases"]:
+            snapshot = _lease_snapshot(row, owner_id=owner_id)
+            key = snapshot["resource_key"]
+            if key in expected:
+                raise LeaseAcquisitionOutcomeUnknown("duplicate lease in batch receipts")
+            expected[key] = snapshot
+    if sorted(expected) != required_keys:
+        raise LeaseAcquisitionOutcomeUnknown("multi-batch lease receipts are incomplete")
+    observed: dict[str, dict[str, Any]] = {}
+    start_after_key: str | None = None
+    while True:
+        remaining = MAX_TERMINAL_OWNER_OBSERVED_LEASES - len(observed)
+        # Probe one extra row at the hard owner bound: exactly 4096 valid
+        # generations are allowed, but a truncated 4097th must fail closed.
+        limit = min(MAX_OWNER_LEASE_LIST_PAGE, max(1, remaining))
+        kwargs: dict[str, Any] = {
+            "owner_id": owner_id, "include_expired": False, "limit": limit,
+        }
+        if start_after_key is not None:
+            kwargs["start_after_key"] = start_after_key
+        page = inventory_fn(**kwargs)
+        if not isinstance(page, list) or len(page) > limit:
+            raise LeaseAcquisitionOutcomeUnknown("live owner lease page is invalid")
+        if remaining == 0:
+            if page:
+                raise LeaseAcquisitionOutcomeUnknown(
+                    "live owner lease inventory exceeds bounded view"
+                )
+            break
+        page_snapshots = sorted(
+            (_lease_snapshot(row, owner_id=owner_id) for row in page),
+            key=lambda item: item["resource_key"],
+        )
+        for snapshot in page_snapshots:
+            key = snapshot["resource_key"]
+            if (start_after_key is not None and key <= start_after_key) or key in observed:
+                raise LeaseAcquisitionOutcomeUnknown(
+                    "live owner lease inventory contains duplicate or unordered keys"
+                )
+            observed[key] = snapshot
+            start_after_key = key
+        if len(page) < limit:
+            break
+    now = int(time.time())
+    for key, snapshot in expected.items():
+        if (
+            observed.get(key) != snapshot
+            or snapshot["expires_at_unix"] <= now + 30
+        ):
+            raise LeaseAcquisitionOutcomeUnknown(
+                "multi-batch lease missing, changed, or too near expiry"
+            )
 
 
 def _definite_acquisition_failure(exc: Exception) -> bool:
@@ -3340,6 +3450,124 @@ def _verified_release_receipt(
     return receipt
 
 
+def _renew_preserved_multibatch_acquisitions(
+    *,
+    owner_id: str,
+    ttl_seconds: int,
+    plan: list[dict[str, Any]],
+    acquisitions: list[dict[str, Any]],
+    renew_resources_fn: Callable[..., dict[str, Any]],
+    receipt_path: Path,
+    base_record: dict[str, Any],
+) -> None:
+    """Renew preserved groups only after every native acquisition succeeded.
+
+    Every renew is bounded by the original <=64-key atomic contract, guarded
+    against the exact acquisition snapshots, and journaled before dispatch.
+    A lost renewal reply is never interpreted as a harmless pre-effect error.
+    """
+    for group_index, acquisition in enumerate(acquisitions):
+        preserved = sorted(acquisition["receipt"]["preserved"])
+        if not preserved:
+            continue
+        old_leases = {
+            row["resource_key"]: _lease_snapshot(row, owner_id=owner_id)
+            for row in acquisition["receipt"]["leases"]
+        }
+        if all(
+            old_leases[key]["expires_at_unix"] >= int(time.time()) + ttl_seconds
+            for key in preserved
+        ):
+            continue
+        # Only the inherited lease needs more lifetime. Renewing every group
+        # key also mutates freshly acquired generations without necessity.
+        keys = preserved
+        originals = [old_leases[key] for key in keys]
+        _write_state(
+            receipt_path,
+            {
+                **base_record,
+                "state": "acquiring",
+                "decision": "HARD_BLOCK",
+                "lease_receipt": _acquisition_bundle(owner_id, plan, acquisitions),
+                **_group_evidence_fields(plan, acquisitions),
+                "acquisition": {
+                    "state": "preserved_renewal_in_flight",
+                    "group_index": group_index,
+                    "contract_group": acquisition["contract_group"],
+                    "resource_keys": keys,
+                    "expected_leases": originals,
+                },
+                "next_action": "reconcile_lease_renewal_before_retry",
+            },
+        )
+        # A nonterminal error or lost response remains outcome_unknown; the
+        # durable in-flight record prohibits a blind retry of any effect.
+        renewal = renew_resources_fn(
+            owner_id, keys, ttl_seconds=ttl_seconds, expected_leases=originals,
+        )
+        if (
+            not isinstance(renewal, dict)
+            or renewal.get("owner_id") != owner_id
+            or renewal.get("snapshot_guarded") is not True
+            or not isinstance(renewal.get("leases"), list)
+        ):
+            raise LeaseAcquisitionOutcomeUnknown("preserved renewal receipt is invalid")
+        current = sorted(
+            (_lease_snapshot(row, owner_id=owner_id) for row in renewal["leases"]),
+            key=lambda row: row["resource_key"],
+        )
+        if [row["resource_key"] for row in current] != keys:
+            raise LeaseAcquisitionOutcomeUnknown("preserved renewal keys changed")
+        for before, after in zip(originals, current):
+            if (
+                before["resource_key"] != after["resource_key"]
+                or before["acquired_at_unix"] != after["acquired_at_unix"]
+                or before["metadata_sha256"] != after["metadata_sha256"]
+                or before["expires_at_unix"] > after["expires_at_unix"]
+                or before["updated_at_unix"] > after["updated_at_unix"]
+                or after["expires_at_unix"] < int(time.time()) + ttl_seconds - 3
+            ):
+                raise LeaseAcquisitionOutcomeUnknown(
+                    "preserved renewal changed generation or did not extend TTL"
+                )
+        previous_rows = {
+            row["resource_key"]: row for row in acquisition["receipt"]["leases"]
+        }
+        current_by_key = {row["resource_key"]: row for row in renewal["leases"]}
+        current_snapshots = {row["resource_key"]: row for row in current}
+        acquisition["preserved_renewal"] = {
+            "original_leases": originals,
+            "current_leases": current,
+            "renewal_receipt": renewal,
+        }
+        # Keep freshly acquired generations and their compensation snapshots
+        # unchanged. Only preserved rows have a new successful CAS snapshot.
+        acquisition["receipt"] = {
+            **acquisition["receipt"],
+            "leases": [
+                current_by_key.get(key, previous_rows[key])
+                for key in acquisition["resource_keys"]
+            ],
+        }
+        _write_state(
+            receipt_path,
+            {
+                **base_record,
+                "state": "acquiring",
+                "lease_receipt": _acquisition_bundle(owner_id, plan, acquisitions),
+                **_group_evidence_fields(plan, acquisitions),
+                "acquisition": {
+                    "state": "preserved_group_renewed",
+                    "group_index": group_index,
+                    "contract_group": acquisition["contract_group"],
+                    "resource_keys": keys,
+                },
+                "next_action": "verify_multibatch_leases_before_worktree",
+            },
+        )
+
+
 def _compensate_acquisitions(
     *,
     owner_id: str,
@@ -3351,6 +3579,7 @@ def _compensate_acquisitions(
     lease_receipt: dict[str, Any],
 ) -> tuple[dict[str, Any], bool]:
     released_groups: list[dict[str, Any]] = []
+    restored_preserved_groups: list[dict[str, Any]] = []
     preserved_keys = sorted(
         {
             key
@@ -3359,6 +3588,68 @@ def _compensate_acquisitions(
         }
     )
     for acquisition in reversed(acquisitions):
+        renewal = acquisition.get("preserved_renewal")
+        if renewal is not None:
+            before = list(renewal["original_leases"])
+            current = list(renewal["current_leases"])
+            keys = [row["resource_key"] for row in before]
+            in_flight = {
+                "state": "preserved_restore_in_flight",
+                "contract_group": acquisition["contract_group"],
+                "resource_keys": keys,
+                "original_leases": before,
+                "expected_renewed_leases": current,
+                "released_groups": released_groups,
+                "restored_preserved_groups": restored_preserved_groups,
+                "preserved_resource_keys": preserved_keys,
+            }
+            _write_state(
+                receipt_path,
+                {
+                    **base_record,
+                    "state": "compensating",
+                    "decision": "HARD_BLOCK",
+                    "lease_receipt": lease_receipt,
+                    **_group_evidence_fields(plan, acquisitions),
+                    "compensation": in_flight,
+                    "next_action": "complete_guarded_preserved_lease_restore",
+                },
+            )
+            try:
+                restored = resources.restore_renewed_work_lane_leases(
+                    owner_id, keys,
+                    expected_renewed_leases=current,
+                    original_leases=before,
+                )
+                if (
+                    not isinstance(restored, dict)
+                    or restored.get("owner_id") != owner_id
+                    or restored.get("snapshot_guarded") is not True
+                    or not isinstance(restored.get("restored"), list)
+                    or [
+                        _lease_snapshot(row, owner_id=owner_id)
+                        for row in restored["restored"]
+                    ] != before
+                ):
+                    raise LeaseCompensationOutcomeUnknown(
+                        "preserved owner lease restoration receipt is invalid"
+                    )
+            except Exception as exc:
+                return (
+                    {
+                        **in_flight,
+                        "state": "outcome_unknown",
+                        "error_class": type(exc).__name__,
+                        "error": str(exc)[:2048],
+                    },
+                    False,
+                )
+            restored_preserved_groups.append({
+                "contract_group": acquisition["contract_group"],
+                "original_leases": before,
+                "expected_renewed_leases": current,
+                "restore_receipt": restored,
+            })
         expected_leases = list(acquisition["attempt_lease_snapshots"])
         if not expected_leases:
             continue
@@ -3369,6 +3660,7 @@ def _compensate_acquisitions(
             "resource_keys": resource_keys,
             "expected_leases": expected_leases,
             "released_groups": released_groups,
+            "restored_preserved_groups": restored_preserved_groups,
             "preserved_resource_keys": preserved_keys,
         }
         _write_state(
@@ -3423,6 +3715,7 @@ def _compensate_acquisitions(
             "snapshot_guarded": True,
             "released": released,
             "released_groups": released_groups,
+            "restored_preserved_groups": restored_preserved_groups,
             "preserved_resource_keys": preserved_keys,
         },
         True,
@@ -3435,6 +3728,8 @@ def acquire_work(
     acquire_resources_fn: Callable[..., dict[str, Any]] = resources.acquire_resources,
     release_resources_fn: Callable[..., dict[str, Any]] = resources.release_resources,
     inspect_resource_fn: Callable[[str], dict[str, Any] | None] = resources.inspect_resource,
+    lease_inventory_fn: Callable[..., list[dict[str, Any]]] | None = None,
+    renew_resources_fn: Callable[..., dict[str, Any]] = resources.renew_resources,
     ensure_worktree_fn: Callable[..., dict[str, Any]] = worktree_ensure.ensure_worktree,
     runner: Callable[[Path, list[str]], dict[str, Any]] = _git_runner,
     start_writer_fn: Callable[..., dict[str, Any]] = _start_scoped_writer,
@@ -3451,6 +3746,9 @@ def acquire_work(
         raise ValueError(f"source_kind must be one of {allowed}")
     lifecycle_source = _lifecycle_source(inputs)
     acquisition_plan = _resource_acquisition_plan(inputs["resource_keys"])
+    inventory_fn = resources.list_resources if lease_inventory_fn is None else lease_inventory_fn
+    if not callable(inventory_fn):
+        raise TypeError("lease_inventory_fn must be callable")
     with _lane_lock(lane_id) as receipt_path:
         existing = _read_state(receipt_path)
         if existing is not None and existing.get("inputs_sha256") != inputs_sha256:
@@ -3603,6 +3901,10 @@ def acquire_work(
                     purpose=inputs["purpose"],
                     ttl_seconds=inputs["ttl_seconds"],
                     metadata=metadata,
+                    **(
+                        {"_work_lane_no_renew_preserved": True}
+                        if len(acquisition_plan) > 1 else {}
+                    ),
                 )
                 acquisition = _acquisition_evidence(
                     group,
@@ -3720,6 +4022,55 @@ def acquire_work(
                     ),
                 },
             )
+        if len(acquisition_plan) > 1:
+            try:
+                _renew_preserved_multibatch_acquisitions(
+                    owner_id=inputs["lease_owner_id"],
+                    ttl_seconds=inputs["ttl_seconds"],
+                    plan=acquisition_plan,
+                    acquisitions=acquisitions,
+                    renew_resources_fn=renew_resources_fn,
+                    receipt_path=receipt_path,
+                    base_record=base_record,
+                )
+            except Exception as exc:
+                # A native renew may have committed before a lost response.
+                # The durable in-flight record and exact snapshots are retained;
+                # never claim rollback or start a writer on an ambiguous outcome.
+                lease_receipt = _acquisition_bundle(
+                    inputs["lease_owner_id"], acquisition_plan, acquisitions
+                )
+                # The preceding durable record may be the only evidence of a
+                # committed renewal whose reply was lost. Do not overwrite
+                # that exact in-flight snapshot when fencing the lane.
+                renewal_journal = _read_state(receipt_path)
+                if (
+                    renewal_journal is None
+                    or not isinstance(renewal_journal.get("acquisition"), dict)
+                ):
+                    raise LeaseAcquisitionOutcomeUnknown(
+                        "preserved renewal journal cannot be recovered"
+                    ) from exc
+                record = _write_state(
+                    receipt_path,
+                    {
+                        **base_record,
+                        "state": "outcome_unknown",
+                        "decision": "HARD_BLOCK",
+                        "lease_receipt": lease_receipt,
+                        **_group_evidence_fields(acquisition_plan, acquisitions),
+                        "acquisition": renewal_journal["acquisition"],
+                        "error_class": "MULTIBATCH_PRESERVED_RENEWAL_UNKNOWN",
+                        "error": str(exc)[:2048],
+                        "leases_acquired": None,
+                        "next_action": "reconcile_lease_renewal_before_retry",
+                    },
+                )
+                return {
+                    **record,
+                    "durable_receipt_path": str(receipt_path),
+                    "replayed": existing is not None,
+                }
         acquired = _acquisition_bundle(
             inputs["lease_owner_id"], acquisition_plan, acquisitions
         )
@@ -3835,6 +4186,18 @@ def acquire_work(
                 "durable_receipt_path": str(receipt_path),
                 "replayed": existing is not None,
             }
+
+        if len(acquisition_plan) > 1:
+            try:
+                _verify_multibatch_live_lease_generations(
+                    owner_id=inputs["lease_owner_id"],
+                    required_keys=inputs["resource_keys"],
+                    acquisitions=acquisitions, inventory_fn=inventory_fn,
+                )
+            except Exception as exc:
+                return continuation_conflict(
+                    exc, None, error_class="MULTIBATCH_LEASE_READBACK_DENIED",
+                )
 
         writer_liveness: dict[str, Any] | None = None
         if existing_writer_job is not None:
@@ -4041,6 +4404,17 @@ def acquire_work(
                     "job_receipt_sha256": writer_job.get("receipt_sha256"),
                 }
             elif writer_argv is not None:
+                if len(acquisition_plan) > 1:
+                    try:
+                        _verify_multibatch_live_lease_generations(
+                            owner_id=inputs["lease_owner_id"],
+                            required_keys=inputs["resource_keys"],
+                            acquisitions=acquisitions, inventory_fn=inventory_fn,
+                        )
+                    except Exception as exc:
+                        return continuation_conflict(
+                            exc, output, error_class="MULTIBATCH_WRITER_LEASE_DENIED",
+                        )
                 try:
                     with _continuation_authorization_guard(continuation_preimage):
                         _write_state(
