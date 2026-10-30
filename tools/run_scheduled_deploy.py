@@ -817,7 +817,8 @@ def _explicit_index_crlf_only(
         )
         committed = _bounded_git_metadata(
             repo,
-            ["--git-dir", str(bare), "check-attr",
+            ["-c", "core.attributesFile=/dev/null",
+             "--git-dir", str(bare), "check-attr",
              "--cached", "-z", *argv],
             pinned_environment,
         )

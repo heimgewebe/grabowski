@@ -261,6 +261,39 @@ class ScheduledWorkerGitFilterTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "dirty"):
                 worker.verify_repository(repo, repo, "canonical-main", head)
 
+    def test_mutable_global_attributes_cannot_launder_uncommitted_crlf(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="worker-global-attrs-") as dirname:
+            root = Path(dirname)
+            repo, _ = self.make_repo(root)
+            # A committed, unrelated attribute makes the HEAD-policy path run.
+            (repo / ".gitattributes").write_text(
+                "unrelated.txt text eol=lf\n", encoding="utf-8"
+            )
+            self.git(repo, "add", ".gitattributes")
+            self.git(repo, "commit", "-qm", "Commit unrelated attribute")
+            head = self.git(repo, "rev-parse", "HEAD")
+            self.git(repo, "update-ref", "refs/remotes/origin/main", head)
+            (repo / "tracked.txt").write_bytes(b"original\r\n")
+            self.assertNotEqual(
+                self.git(repo, "status", "--porcelain=v1", "--untracked-files=normal"), ""
+            )
+            fake_home = root / "untrusted-home"
+            attributes = fake_home / ".config" / "git" / "attributes"
+            attributes.parent.mkdir(parents=True)
+            attributes.write_text(
+                "tracked.txt text eol=crlf\n", encoding="utf-8"
+            )
+            # Git's default attribute file remains effective despite
+            # GIT_CONFIG_GLOBAL=/dev/null, unless explicitly disabled.
+            with (
+                patch.object(
+                    worker.pwd, "getpwuid",
+                    return_value=SimpleNamespace(pw_dir=str(fake_home)),
+                ),
+                self.assertRaisesRegex(RuntimeError, "dirty"),
+            ):
+                worker.verify_repository(repo, repo, "canonical-main", head)
+
     def test_auto_crlf_checkout_clean_without_filter_execution(self) -> None:
         with tempfile.TemporaryDirectory(prefix="worker-auto-crlf-") as dirname:
             repo, _ = self.make_repo(Path(dirname))
