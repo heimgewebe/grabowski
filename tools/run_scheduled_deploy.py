@@ -760,139 +760,80 @@ def _bounded_git_metadata(repo: Path, argv: list[str], environment: dict[str, st
     return stdout
 
 
-def _committed_crlf_attributes(
-    repo: Path,
-    environment: dict[str, str],
-    pathname: bytes,
-    committed_attrs: dict[bytes, tuple[bytes, bytes]],
-) -> dict[bytes, bytes] | None:
-    """Resolve narrow HEAD-pinned rules in declaration/ancestor order.
-
-    The last matching assignment for each field wins, as in Git attributes.
-    Never use .git/info/attributes as evidence for content normalization.
-    Only literal, *.extension and exact relative-path patterns are supported;
-    an unknown potentially affecting pattern is a conservative denial.
-    """
-    fields = {b"text", b"eol", b"filter", b"ident", b"working-tree-encoding"}
-    components = pathname.split(b"/")
-    attr_paths = [b".gitattributes"]
-    parent = b""
-    for part in components[:-1]:
-        parent = (parent + b"/" if parent else b"") + part
-        attr_paths.append(parent + b"/.gitattributes")
-    effective: dict[bytes, bytes] = {}
-    for attr_path in attr_paths:
-        item = committed_attrs.get(attr_path)
-        if not item or item[0] not in {b"100644", b"100755"}:
-            continue
-        attr_dir = attr_path.rpartition(b"/")[0]
-        relative = pathname[len(attr_dir) + 1:] if attr_dir else pathname
-        basename = relative.rpartition(b"/")[2]
-        contents = _bounded_git_metadata(
-            repo, ["cat-file", "blob", item[1].decode("ascii")], environment,
-        )
-        for line in contents.splitlines():
-            line = line.strip()
-            if not line or line.startswith(b"#"):
-                continue
-            tokens = line.split()
-            if len(tokens) < 2:
-                continue
-            pattern = tokens[0]
-            if pattern.startswith(b"[attr]"):
-                # A macro definition is not a pathname assignment; its
-                # invocation below is rejected unless explicitly modeled.
-                continue
-            anchored = pattern.startswith(b"/")
-            if anchored:
-                pattern = pattern[1:]
-            unsupported = False
-            if b"/" in pattern:
-                if any(ch in pattern for ch in (b"*", b"?", b"[", b"]", b"\\")):
-                    unsupported = True
-                    matched = False
-                else:
-                    matched = pattern == relative
-            elif pattern.startswith(b"*.") and pattern.count(b"*") == 1 and not any(
-                ch in pattern for ch in (b"?", b"[", b"]", b"\\")
-            ):
-                matched = basename.endswith(pattern[1:]) and (
-                    not anchored or b"/" not in relative
-                )
-            elif pattern == b"*":
-                matched = not anchored or b"/" not in relative
-            elif all(ch not in pattern for ch in (b"*", b"?", b"[", b"]", b"\\")):
-                matched = pattern == (relative if anchored else basename)
-            else:
-                unsupported = True
-                matched = False
-            if unsupported:
-                # An unmodelled glob can apply arbitrary built-in or custom
-                # macros (such as "binary" -> -text). Conservatively reject
-                # CRLF normalization, even for tokens outside known fields.
-                return None
-            if not matched:
-                continue
-            for token in tokens[1:]:
-                if token.startswith(b"-"):
-                    field, value = token[1:], b"unset"
-                elif token.startswith(b"!"):
-                    field, value = token[1:], b"unspecified"
-                elif b"=" in token:
-                    field, value = token.split(b"=", 1)
-                else:
-                    field, value = token, b"set"
-                if field not in fields:
-                    # Custom and built-in attribute macros (e.g. "binary"
-                    # expanding to -text) may override conversion policy.
-                    # Never silently ignore an unmodeled matching token.
-                    return None
-                effective[field] = value
-    if (
-        effective.get(b"eol") != b"crlf"
-        or effective.get(b"text", b"unspecified") not in {b"set", b"unspecified"}
-        or any(effective.get(field, b"unspecified") not in {b"unset", b"unspecified"}
-               for field in (b"filter", b"ident", b"working-tree-encoding"))
-    ):
-        return None
-    return effective
-
-
 def _explicit_index_crlf_only(
     repo: Path,
     environment: dict[str, str],
     pathname: bytes,
     committed_attrs: dict[bytes, tuple[bytes, bytes]],
+    expected_head: str,
 ) -> bool:
-    """Allow CRLF only if indexed Git attributes agree with pinned HEAD rules."""
-    committed = _committed_crlf_attributes(
-        repo, environment, pathname, committed_attrs,
-    )
-    if committed is None:
+    """Use native Git rules from HEAD, never mutable source info/attributes.
+
+    check-attr --cached in the source also reads .git/info/attributes, so it
+    cannot authorize CRLF normalization on its own. A private temporary bare
+    repo with the verified source object database and --source=<exact HEAD>
+    evaluates the *whole* committed attribute grammar (macros, quoting and
+    precedence), without reading the source repo's mutable attribute layers
+    or invoking Git content filters.
+    """
+    if not committed_attrs:
         return False
     fields = (b"text", b"eol", b"filter", b"ident", b"working-tree-encoding")
-    raw = _bounded_git_metadata(
-        repo,
-        ["check-attr", "--cached", "-z",
-         *(field.decode("ascii") for field in fields),
-         "--", os.fsdecode(pathname)],
-        environment,
+    argv = [
+        *(field.decode("ascii") for field in fields),
+        "--", os.fsdecode(pathname),
+    ]
+    effective = _bounded_git_metadata(
+        repo, ["check-attr", "--cached", "-z", *argv], environment,
     )
-    parts = raw.split(b"\0")
-    if not parts or parts[-1] != b"" or len(parts) != len(fields) * 3 + 1:
-        return False
-    attributes: dict[bytes, bytes] = {}
-    for index in range(0, len(parts) - 1, 3):
-        name, attribute, value = parts[index:index + 3]
-        if name != pathname or attribute not in fields or attribute in attributes:
-            return False
-        attributes[attribute] = value
-    return (
-        len(attributes) == len(fields)
-        and all(
-            attributes[field] == committed.get(field, b"unspecified")
-            for field in fields
+
+    with tempfile.TemporaryDirectory(prefix="grabowski-head-attrs-") as root:
+        tmp = Path(root)
+        templates = tmp / "empty-template"
+        templates.mkdir(mode=0o700)
+        bare = tmp / "isolated.git"
+        _bounded_git_metadata(
+            repo,
+            ["init", "--bare", "--quiet",
+             *(["--object-format=sha256"] if len(expected_head) == 64 else []),
+             "--template", str(templates), str(bare)],
+            environment,
         )
+        # A linked worktree's gitdir differs from its canonical object store.
+        objects = (_git_common_directory(repo) / "objects").resolve(strict=True)
+        if not objects.is_dir():
+            return False
+        pinned_environment = {
+            **environment,
+            "GIT_OBJECT_DIRECTORY": str(objects),
+        }
+        committed = _bounded_git_metadata(
+            repo,
+            ["--git-dir", str(bare), "check-attr",
+             "--source", expected_head, "-z", *argv],
+            pinned_environment,
+        )
+
+    def decode(raw: bytes) -> dict[bytes, bytes] | None:
+        parts = raw.split(b"\0")
+        if not parts or parts[-1] != b"" or len(parts) != len(fields) * 3 + 1:
+            return None
+        parsed: dict[bytes, bytes] = {}
+        for index in range(0, len(parts) - 1, 3):
+            path, attr, value = parts[index:index + 3]
+            if path != pathname or attr not in fields or attr in parsed:
+                return None
+            parsed[attr] = value
+        return parsed if len(parsed) == len(fields) else None
+
+    from_head = decode(committed)
+    from_source = decode(effective)
+    return (
+        from_head is not None and from_head == from_source
+        and from_head[b"eol"] == b"crlf"
+        and from_head[b"text"] in {b"set", b"unspecified"}
+        and all(from_head[attr] in {b"unset", b"unspecified"}
+                for attr in (b"filter", b"ident", b"working-tree-encoding"))
     )
 
 
@@ -1029,6 +970,7 @@ def _repository_dirty_without_git_filters(
                         if digest.hexdigest().encode("ascii") != oid:
                             if not _explicit_index_crlf_only(
                                 repo, environment, pathname, committed_attrs,
+                                expected_head,
                             ):
                                 return True
                             tracked.seek(0)

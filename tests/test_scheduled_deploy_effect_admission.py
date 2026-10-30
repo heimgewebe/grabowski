@@ -448,6 +448,82 @@ class ScheduledWorkerGitFilterTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "dirty"):
                 worker.verify_repository(repo, repo, "canonical-main", head)
 
+    def test_quoted_committed_override_cannot_be_replaced_by_info(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="worker-quoted-override-") as dirname:
+            repo, _ = self.make_repo(Path(dirname))
+            (repo / ".gitattributes").write_text(
+                '*.txt text eol=crlf\n'
+                '"tracked.txt" -text eol=lf\n', encoding="utf-8"
+            )
+            self.git(repo, "add", ".gitattributes")
+            self.git(repo, "commit", "-qm", "Quoted pathname overrides CRLF")
+            head = self.git(repo, "rev-parse", "HEAD")
+            self.git(repo, "update-ref", "refs/remotes/origin/main", head)
+            (repo / "tracked.txt").write_bytes(b"original\r\n")
+            (repo / ".git" / "info" / "attributes").write_text(
+                "tracked.txt text eol=crlf\n", encoding="utf-8"
+            )
+            self.assertNotEqual(
+                self.git(repo, "status", "--porcelain=v1", "--untracked-files=normal"), ""
+            )
+            with self.assertRaisesRegex(RuntimeError, "dirty"):
+                worker.verify_repository(repo, repo, "canonical-main", head)
+
+    def test_quoted_committed_crlf_rule_remains_eligible(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="worker-quoted-clean-") as dirname:
+            repo, _ = self.make_repo(Path(dirname))
+            (repo / ".gitattributes").write_text(
+                '"tracked.txt" text eol=crlf\n', encoding="utf-8"
+            )
+            self.git(repo, "add", ".gitattributes")
+            self.git(repo, "commit", "-qm", "Quoted CRLF declaration")
+            head = self.git(repo, "rev-parse", "HEAD")
+            self.git(repo, "update-ref", "refs/remotes/origin/main", head)
+            tracked = repo / "tracked.txt"
+            tracked.unlink()
+            self.git(repo, "checkout", "--", "tracked.txt")
+            self.assertIn(b"\r\n", tracked.read_bytes())
+            worker.verify_repository(repo, repo, "canonical-main", head)
+
+    def test_sha256_git_tree_crlf_source_remains_supported(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="worker-sha256-crlf-") as dirname:
+            repo = Path(dirname) / "source"
+            repo.mkdir()
+            self.git(repo, "init", "-q", "-b", "main", "--object-format=sha256")
+            self.git(repo, "config", "user.name", "SHA256 Fixture")
+            self.git(repo, "config", "user.email", "sha256@invalid.example")
+            (repo / "tracked.txt").write_bytes(b"original\n")
+            (repo / ".gitattributes").write_text(
+                "tracked.txt text eol=crlf\n", encoding="utf-8"
+            )
+            self.git(repo, "add", ".gitattributes", "tracked.txt")
+            self.git(repo, "commit", "-qm", "SHA256 CRLF initial")
+            head = self.git(repo, "rev-parse", "HEAD")
+            self.assertEqual(len(head), 64)
+            self.git(repo, "update-ref", "refs/remotes/origin/main", head)
+            tracked = repo / "tracked.txt"
+            tracked.unlink()
+            self.git(repo, "checkout", "--", "tracked.txt")
+            self.assertIn(b"\r\n", tracked.read_bytes())
+            worker.verify_repository(repo, repo, "canonical-main", head)
+
+    def test_committed_attribute_macro_can_enable_clean_crlf(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="worker-macro-clean-") as dirname:
+            repo, _ = self.make_repo(Path(dirname))
+            (repo / ".gitattributes").write_text(
+                "[attr]windows text eol=crlf\n"
+                "tracked.txt windows\n", encoding="utf-8"
+            )
+            self.git(repo, "add", ".gitattributes")
+            self.git(repo, "commit", "-qm", "Commit named CRLF macro")
+            head = self.git(repo, "rev-parse", "HEAD")
+            self.git(repo, "update-ref", "refs/remotes/origin/main", head)
+            tracked = repo / "tracked.txt"
+            tracked.unlink()
+            self.git(repo, "checkout", "--", "tracked.txt")
+            self.assertIn(b"\r\n", tracked.read_bytes())
+            worker.verify_repository(repo, repo, "canonical-main", head)
+
     def test_unknown_wildcard_macro_cannot_launder_crlf(self) -> None:
         with tempfile.TemporaryDirectory(prefix="worker-eol-wildcard-macro-") as dirname:
             repo, _ = self.make_repo(Path(dirname))
