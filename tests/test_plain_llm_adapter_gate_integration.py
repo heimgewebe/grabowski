@@ -83,10 +83,18 @@ def _self_review(diff_sha256: str) -> dict[str, object]:
         "review_iterations": [
             {
                 "n": n,
-                "summary": f"distinct review pass {n}",
+                "axis": gate.REQUIRED_HIGH_CRITICAL_REVIEW_AXES[n - 1],
+                "summary": (
+                    f"Validated {gate.REQUIRED_HIGH_CRITICAL_REVIEW_AXES[n - 1]} "
+                    f"for the exact diff, generated packet and provider adapter "
+                    f"using positive and negative provenance checks."
+                ),
+                "evidence_refs": [
+                    f"tests/test_plain_llm_adapter_gate_integration.py:axis-{n}-fixture"
+                ],
                 "material_findings": 0,
             }
-            for n in range(1, 5)
+            for n in range(1, 6)
         ],
         "all_findings_triaged": True,
         "findings": [],
@@ -183,12 +191,16 @@ class PlainLlmAdapterGateIntegrationTests(unittest.TestCase):
                     max_prompt_bytes=100_000,
                 )
 
-            result = gate.evaluate_review_gate(
-                state,
-                self_review=_self_review(state["pr_diff_sha256"]),
-                external_review_evidence=evidence,
-                external_review_artifact_root=root,
-            )
+            # This integration tests provider packet reconstruction. The
+            # server-owned five-pass signer is exercised independently in the
+            # self-review provenance suites, never forged in this fixture.
+            with mock.patch.object(gate, "review_receipt_errors", return_value=[]):
+                result = gate.evaluate_review_gate(
+                    state,
+                    self_review=_self_review(state["pr_diff_sha256"]),
+                    external_review_evidence=evidence,
+                    external_review_artifact_root=root,
+                )
             self.assertEqual(result["verdict"], "PASS")
             warnings = "\n".join(result["warnings"])
             self.assertNotIn(

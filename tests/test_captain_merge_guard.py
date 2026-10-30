@@ -8,6 +8,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor
 import types
 import unittest
 from unittest import mock
@@ -43,6 +45,127 @@ if "mcp" not in sys.modules:
 
 import grabowski_merge_guard as merge_guard  # noqa: E402
 import grabowski_resources as resources  # noqa: E402
+
+
+class FirstPartyMergeLockTests(unittest.TestCase):
+    def test_final_merge_evidence_window_blocks_late_signed_reject(self) -> None:
+        # A signed review writer needs the exclusive receipt lock. Captain's
+        # final source check and external merge dispatch must pin a shared
+        # lock over the entire decision window, not just the readback.
+        import grabowski_self_review_execution as source
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder) / "first-party-state"
+            fd = source._first_party_lock(root)
+            source._release_first_party_lock(fd)
+            with mock.patch.object(source, "FIRST_PARTY_REVIEW_ROOT", root):
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    with merge_guard._first_party_merge_signer_snapshot_guard({
+                        "review_origin": source.FIRST_PARTY_AUDIT_ORIGIN,
+                    }):
+                        started = threading.Event()
+                        def signer():
+                            started.set()
+                            signed = source._first_party_lock(root)
+                            try:
+                                return "exclusive-signer-admitted"
+                            finally:
+                                source._release_first_party_lock(signed)
+                        future = pool.submit(signer)
+                        self.assertTrue(started.wait(2))
+                        self.assertFalse(future.done(), "a material REJECT could be signed during merge dispatch")
+                    self.assertEqual(future.result(timeout=3), "exclusive-signer-admitted")
+
+    def test_legacy_high_critical_merge_cannot_skip_new_signed_reject(self) -> None:
+        # Legacy V2 audits ALSO check first-party historical REJECTs, so their
+        # final merge dispatch must serialize with authentic receipt writers.
+        import grabowski_self_review_execution as source
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder) / "first-party-not-yet-initialized"
+            with mock.patch.object(source, "FIRST_PARTY_REVIEW_ROOT", root):
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    with merge_guard._first_party_merge_signer_snapshot_guard({
+                        "review_tier": "high_critical",
+                    }):
+                        self.assertTrue((root / ".lock").is_file())
+                        started = threading.Event()
+                        def submit_material_reject():
+                            started.set()
+                            fd = source._first_party_lock(root)
+                            try:
+                                return "late-signed-reject-serialized"
+                            finally:
+                                source._release_first_party_lock(fd)
+                        future = pool.submit(submit_material_reject)
+                        self.assertTrue(started.wait(2))
+                        from concurrent.futures import TimeoutError as FutureTimeout
+                        with self.assertRaises(FutureTimeout):
+                            future.result(timeout=0.15)
+                    self.assertEqual(future.result(timeout=3), "late-signed-reject-serialized")
+
+    def test_standard_tier_merge_serializes_late_signed_reject(self) -> None:
+        # A standard packet cannot replace a signed REJECT during the
+        # Captain revalidation-and-merge window either.
+        import grabowski_self_review_execution as source
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder) / "first-party-standard-tier"
+            with mock.patch.object(source, "FIRST_PARTY_REVIEW_ROOT", root):
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    with merge_guard._first_party_merge_signer_snapshot_guard({
+                        "review_tier": "standard",
+                    }):
+                        self.assertTrue((root / ".lock").is_file())
+                        started = threading.Event()
+
+                        def submit_material_reject():
+                            started.set()
+                            fd = source._first_party_lock(root)
+                            try:
+                                return "signed-reject-serialized"
+                            finally:
+                                source._release_first_party_lock(fd)
+
+                        future = pool.submit(submit_material_reject)
+                        self.assertTrue(started.wait(2))
+                        from concurrent.futures import TimeoutError as FutureTimeout
+                        with self.assertRaises(FutureTimeout):
+                            future.result(timeout=0.15)
+                    self.assertEqual(future.result(timeout=3), "signed-reject-serialized")
+
+    def test_every_other_review_tier_serializes_late_signed_reject(self) -> None:
+        import grabowski_self_review_execution as source
+        from concurrent.futures import TimeoutError as FutureTimeout
+
+        for tier in ("important_repo", "documentation", "very_small"):
+            with self.subTest(tier=tier), tempfile.TemporaryDirectory() as folder:
+                root = Path(folder) / "first-party-" / tier
+                with mock.patch.object(source, "FIRST_PARTY_REVIEW_ROOT", root):
+                    with ThreadPoolExecutor(max_workers=1) as pool:
+                        with merge_guard._first_party_merge_signer_snapshot_guard({
+                            "review_tier": tier,
+                        }):
+                            self.assertTrue(
+                                (root / ".lock").is_file(),
+                                f"{tier} must pin the signed history before merge",
+                            )
+                            started = threading.Event()
+
+                            def submit_reject():
+                                started.set()
+                                fd = source._first_party_lock(root)
+                                try:
+                                    return "serialized"
+                                finally:
+                                    source._release_first_party_lock(fd)
+
+                            future = pool.submit(submit_reject)
+                            self.assertTrue(started.wait(2))
+                            with self.assertRaises(FutureTimeout):
+                                future.result(timeout=0.15)
+                        self.assertEqual("serialized", future.result(timeout=3))
+
+    def test_non_first_party_merge_review_does_not_require_private_signer_root(self) -> None:
+        with merge_guard._first_party_merge_signer_snapshot_guard({}):
+            pass
 
 
 class _PagedFilesGh:
@@ -182,6 +305,287 @@ def _large_git_repo(
     _git(repo, "commit", "-q", "-m", "large release")
     head_sha = _git(repo, "rev-parse", "HEAD")
     return temporary, repo, base_sha, head_sha, paths
+
+
+def _five_material_review_passes() -> list[dict[str, object]]:
+    return [
+        {
+            "n": n,
+            "axis": axis,
+            "summary": (
+                f"Verified contract and failure semantics for methodology {axis} "
+                f"against the test fixtures and exact diff in pass {n}."
+            ),
+            "evidence_refs": [f"tests/test_captain_merge_guard.py:method-{n}-negative"],
+            "material_findings": 0,
+        }
+        for n, axis in enumerate(merge_guard.HIGH_CRITICAL_REVIEW_AXES, start=1)
+    ]
+
+
+class RiskScaledIndependentReviewContractTests(unittest.TestCase):
+    @staticmethod
+    def _request(**overrides: object) -> dict[str, object]:
+        passes = _five_material_review_passes()
+        review: dict[str, object] = {
+            "review_iterations": passes,
+            "review_policy_version": merge_guard.REVIEW_POLICY_VERSION,
+            "review_tier": "high_critical",
+            "independent_review_required": False,
+            "minimum_review_iterations": 5,
+            "actual_review_iterations": 5,
+            "review_pass_axes": list(merge_guard.HIGH_CRITICAL_REVIEW_AXES),
+            "review_pass_evidence_sha256": hashlib.sha256(
+                json.dumps(
+                    passes, sort_keys=True, separators=(",", ":"),
+                    ensure_ascii=False,
+                ).encode("utf-8")
+            ).hexdigest(),
+        }
+        result: dict[str, object] = {"review_evidence": review}
+        result.update(overrides)
+        return result
+
+    def test_r3_valid_self_review_does_not_automatically_need_an_external_provider(self) -> None:
+        # This test isolates optional-provider semantics. The signed task
+        # origin is verified in test_self_review_execution and the next test.
+        with mock.patch("grabowski_self_review_execution.review_receipt_errors", return_value=[]):
+            requirement = merge_guard.independent_review_requirement(self._request())
+        self.assertFalse(requirement["required"])
+        self.assertTrue(requirement["high_critical_risk"])
+        self.assertEqual(requirement["errors"], [])
+
+    def test_formally_valid_but_unexecuted_highcritical_reports_are_blocked(self) -> None:
+        untrusted = merge_guard.independent_review_requirement(self._request())
+        self.assertIn(
+            "high_critical_server_review_provenance_invalid:ReviewExecutionRejected",
+            untrusted["errors"],
+        )
+
+    def test_fabricated_digest_without_reports_is_blocked(self) -> None:
+        request = self._request()
+        request["review_evidence"].pop("review_iterations")
+        failures = merge_guard.independent_review_requirement(request)["errors"]
+        self.assertIn("high_critical_review_pass_records_missing_or_invalid", failures)
+
+    def test_tampered_or_boilerplate_report_is_blocked(self) -> None:
+        request = self._request()
+        passes = request["review_evidence"]["review_iterations"]
+        passes[0]["summary"] = "PASS"
+        failures = merge_guard.independent_review_requirement(request)["errors"]
+        self.assertIn("high_critical_review_pass_summary_invalid", failures)
+        self.assertIn("high_critical_review_pass_evidence_digest_invalid", failures)
+
+    def test_independent_review_remains_explicit_per_pr_opt_in(self) -> None:
+        requirement = merge_guard.independent_review_requirement(
+            self._request(independent_review_required=True)
+        )
+        self.assertTrue(requirement["required"])
+        self.assertTrue(requirement["explicitly_required"])
+        self.assertFalse(requirement["high_critical_floor"])
+
+    def test_v4_cannot_satisfy_v5_captain_even_with_valid_depth(self) -> None:
+        old = self._request()
+        old["review_evidence"]["review_policy_version"] = 4
+        self.assertIn(
+            "review_policy_version_stale_or_invalid",
+            merge_guard.independent_review_requirement(old)["errors"],
+        )
+
+    def test_critical_four_passes_cannot_replace_the_required_five(self) -> None:
+        review = self._request()
+        review["review_evidence"]["minimum_review_iterations"] = 4
+        review["review_evidence"]["actual_review_iterations"] = 4
+        self.assertIn(
+            "high_critical_self_review_depth_invalid",
+            merge_guard.independent_review_requirement(review)["errors"],
+        )
+
+    def test_critical_duplicate_or_absent_review_axes_are_blocking(self) -> None:
+        review = self._request()
+        review["review_evidence"]["review_pass_axes"] = [
+            "contracts_correctness" for _ in range(5)
+        ]
+        self.assertIn(
+            "high_critical_review_axes_invalid",
+            merge_guard.independent_review_requirement(review)["errors"],
+        )
+        review["review_evidence"]["review_pass_axes"] = list(merge_guard.HIGH_CRITICAL_REVIEW_AXES)
+        review["review_evidence"].pop("review_pass_evidence_sha256")
+        self.assertIn(
+            "high_critical_review_pass_evidence_digest_invalid",
+            merge_guard.independent_review_requirement(review)["errors"],
+        )
+
+    def test_valid_sixth_adversarial_pass_is_not_rejected(self) -> None:
+        request = self._request()
+        evidence = request["review_evidence"]
+        extra = {
+            "n": 6,
+            "axis": "additional_adversarial_pass",
+            "summary": (
+                "Additional adversarial review confirms the negative case and "
+                "regression evidence for the protected merge-policy boundary."
+            ),
+            "evidence_refs": ["tests/test_captain_merge_guard.py:extra-pass-negative"],
+            "material_findings": 0,
+        }
+        evidence["review_iterations"].append(extra)
+        evidence["review_pass_axes"].append(extra["axis"])
+        evidence["actual_review_iterations"] = 6
+        evidence["review_pass_evidence_sha256"] = hashlib.sha256(
+            json.dumps(
+                evidence["review_iterations"],
+                sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+            ).encode("utf-8")
+        ).hexdigest()
+        with mock.patch("grabowski_self_review_execution.review_receipt_errors", return_value=[]):
+            self.assertEqual(
+                merge_guard.independent_review_requirement(request)["errors"], []
+            )
+
+    def test_critical_self_review_below_four_passes_remains_invalid(self) -> None:
+        weak = self._request()
+        weak["review_evidence"]["minimum_review_iterations"] = 3
+        weak["review_evidence"]["actual_review_iterations"] = 3
+        self.assertIn(
+            "high_critical_self_review_depth_invalid",
+            merge_guard.independent_review_requirement(weak)["errors"],
+        )
+
+    @staticmethod
+    def _infra_only_reconciliation() -> dict[str, object]:
+        import grabowski_decision_reviews as decisions
+        unit = "grabowski-job-aaaaaaaaaaaa"
+        attempt = {
+            "unit": unit, "slot": "independent-reviewer",
+            "origin_sha256": "1" * 64,
+            "terminal": True, "terminal_status": "launch_failed",
+            "classification": "infrastructure_error",
+            "stdout_tail_sha256": None,
+            "review_role_receipt_sha256": None,
+            "pre_result_quota_failure_verified": False,
+            "review_role_verified": False,
+            "review_route_verified": False,
+            "independence_verified": False,
+            "verdict": None, "material_findings": None,
+            "result_sha256": None, "diff_identity_deferred": False,
+        }
+        return {
+            "status": "blocked", "attempt_count": 1,
+            "slot_count": 1,
+            "slots": [{
+                "slot": "independent-reviewer", "attempt_count": 1,
+                "pass_count": 0, "independent_pass_count": 0,
+                "material_reject_count": 0, "infrastructure_error_count": 1,
+                "unresolved_count": 0,
+                "units_sha256": decisions.sha256_json([unit]),
+            }],
+            "attempts": [attempt], "attempts_sha256": decisions.sha256_json([attempt]),
+            "errors": [
+                "decision_review_slot_without_pass:independent-reviewer",
+                f"decision_review_infrastructure_not_superseded:independent-reviewer:{unit}",
+            ],
+        }
+
+    def test_optional_authenticated_pre_result_outage_does_not_block_captain(self) -> None:
+        info = merge_guard.decision_review_blocking_errors(
+            self._infra_only_reconciliation(), independent_required=False
+        )
+        self.assertEqual(info["errors"], [])
+        self.assertEqual(len(info["ignored_unavailable"]), 2)
+        self.assertEqual(info["status"], "optional_unavailable")
+
+    def test_legacy_successful_job_without_result_cannot_be_ignored(self) -> None:
+        proof = self._infra_only_reconciliation()
+        attempt = proof["attempts"][0]
+        attempt["terminal_status"] = "succeeded"
+        attempt["stdout_tail_sha256"] = "a" * 64
+        outcome = merge_guard.decision_review_blocking_errors(
+            proof, independent_required=False
+        )
+        self.assertEqual(outcome["ignored_unavailable"], [])
+        self.assertEqual(outcome["errors"], proof["errors"])
+
+    def test_legacy_failed_job_without_result_cannot_be_ignored(self) -> None:
+        proof = self._infra_only_reconciliation()
+        proof["attempts"][0]["terminal_status"] = "failed"
+        outcome = merge_guard.decision_review_blocking_errors(
+            proof, independent_required=False
+        )
+        self.assertEqual(outcome["ignored_unavailable"], [])
+        self.assertEqual(outcome["errors"], proof["errors"])
+
+    def test_claimed_quota_without_authenticated_role_receipt_stays_blocked(self) -> None:
+        proof = self._infra_only_reconciliation()
+        attempt = proof["attempts"][0]
+        attempt["terminal_status"] = "failed"
+        attempt["pre_result_quota_failure_verified"] = True
+        outcome = merge_guard.decision_review_blocking_errors(
+            proof, independent_required=False
+        )
+        self.assertEqual(outcome["ignored_unavailable"], [])
+        self.assertEqual(outcome["errors"], proof["errors"])
+
+    def test_verified_v2_pre_result_quota_is_optional_but_never_pass(self) -> None:
+        proof = self._infra_only_reconciliation()
+        attempt = proof["attempts"][0]
+        attempt.update({
+            "terminal_status": "failed",
+            "pre_result_quota_failure_verified": True,
+            "review_role_verified": True,
+            "review_route_verified": True,
+            "independence_verified": True,
+            "review_role_receipt_sha256": "c" * 64,
+        })
+        outcome = merge_guard.decision_review_blocking_errors(
+            proof, independent_required=False
+        )
+        self.assertEqual(outcome["errors"], [])
+        self.assertEqual(outcome["status"], "optional_unavailable")
+        self.assertEqual(outcome["ignored_unavailable"], proof["errors"])
+
+    def test_explicit_independent_review_keeps_transport_failure_blocking(self) -> None:
+        info = merge_guard.decision_review_blocking_errors(
+            self._infra_only_reconciliation(), independent_required=True
+        )
+        self.assertEqual(len(info["errors"]), 2)
+        self.assertEqual(info["ignored_unavailable"], [])
+
+    def test_optional_outage_never_suppresses_material_reject(self) -> None:
+        proof = self._infra_only_reconciliation()
+        proof["errors"].append(
+            "decision_review_material_reject:independent-reviewer:grabowski-job-bbbbbbbbbbbb"
+        )
+        info = merge_guard.decision_review_blocking_errors(
+            proof, independent_required=False
+        )
+        self.assertTrue(any("material_reject" in x for x in info["errors"]))
+
+    def test_optional_outage_never_suppresses_ambiguous_result(self) -> None:
+        proof = self._infra_only_reconciliation()
+        proof["attempts"][0]["classification"] = "invalid_result"
+        info = merge_guard.decision_review_blocking_errors(
+            proof, independent_required=False
+        )
+        self.assertIn("decision_review_slot_without_pass:independent-reviewer", info["errors"])
+        self.assertEqual(info["ignored_unavailable"], [])
+
+    def test_optional_outage_requires_actual_attempt_evidence(self) -> None:
+        proof = self._infra_only_reconciliation()
+        proof["attempts"] = []
+        info = merge_guard.decision_review_blocking_errors(
+            proof, independent_required=False
+        )
+        self.assertNotEqual(info["errors"], [])
+
+    def test_provider_flag_cannot_hide_malformed_self_review(self) -> None:
+        missing = self._request()
+        del missing["review_evidence"]["independent_review_required"]
+        self.assertIn(
+            "independent_review_policy_invalid",
+            merge_guard.independent_review_requirement(missing)["errors"],
+        )
 
 
 class CaptainLargePrMergeGuardTests(unittest.TestCase):

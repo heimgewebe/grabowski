@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import importlib.util
+import tempfile
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 HEAD = "a" * 40
@@ -88,6 +90,18 @@ def _has_failure(result: dict[str, object], needle: str) -> bool:
 
 
 class SelfReviewDiffBindingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # Synthetic legacy examples cannot depend on signed production sessions.
+        # Real signature and REJECT verification is exercised separately.
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        history = patch.object(
+            gate.review_provenance, "FIRST_PARTY_REVIEW_ROOT",
+            Path(tmp.name) / "no-first-party-sessions",
+        )
+        history.start()
+        self.addCleanup(history.stop)
+
     def test_matching_self_review_diff_hash_passes(self) -> None:
         result = gate.evaluate_review_gate(_state(), self_review=_self_review())
         self.assertEqual(result["verdict"], "PASS")
