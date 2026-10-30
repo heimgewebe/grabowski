@@ -333,6 +333,45 @@
     },
     {
       "category": "audit",
+      "description": "Start a stored-plan review, or derive a frozen Candidate with workspace_id and an empty batch ID.",
+      "effects": [
+        "private-review-session-create"
+      ],
+      "id": "grabowski_self_review_session_start",
+      "purpose": "Start one signed-ingress-bound semantic review session for an immutable stored review plan.",
+      "read_only": false,
+      "reversibility": "new-review-batch",
+      "risk_class": "medium",
+      "tool": "grabowski_self_review_session_start"
+    },
+    {
+      "category": "audit",
+      "description": "Read and persist exact immutable Git bytes for one semantic axis.",
+      "effects": [
+        "private-source-read-receipt-create"
+      ],
+      "id": "grabowski_self_review_source_read",
+      "purpose": "Return and immutably persist exact Git diff or source bytes inspected for one semantic review axis.",
+      "read_only": false,
+      "reversibility": "new-review-batch",
+      "risk_class": "medium",
+      "tool": "grabowski_self_review_source_read"
+    },
+    {
+      "category": "audit",
+      "description": "Persist a substantive axis verdict; report={\"finalize\": true} seals a five-axis Candidate handoff.",
+      "effects": [
+        "private-semantic-review-receipt-create"
+      ],
+      "id": "grabowski_self_review_axis_submit",
+      "purpose": "Persist one substantive source-read-bound semantic axis verdict from the authenticated controller.",
+      "read_only": false,
+      "reversibility": "new-review-batch",
+      "risk_class": "medium",
+      "tool": "grabowski_self_review_axis_submit"
+    },
+    {
+      "category": "audit",
       "description": "Query the verified audit chain through a bounded evidence projection.",
       "effects": [],
       "id": "grabowski_audit_query",
@@ -2938,6 +2977,9 @@
       "grabowski_destroy_path",
       "grabowski_rollback_text",
       "grabowski_verify_audit",
+      "grabowski_self_review_session_start",
+      "grabowski_self_review_source_read",
+      "grabowski_self_review_axis_submit",
       "grabowski_audit_query",
       "grabowski_audit_trace",
       "grabowski_audit_analyze",
@@ -3139,6 +3181,11 @@
         "kind": "python_module",
         "launcher_module": "grabowski_agent_workspace",
         "spawned_module": "grabowski_agent_role"
+      },
+      {
+        "kind": "python_module",
+        "launcher_module": "grabowski_self_review_producer",
+        "spawned_module": "grabowski_self_review_producer"
       },
       {
         "kind": "python_module",
@@ -3387,6 +3434,14 @@
       {
         "module": "grabowski_release_admission",
         "source": "src/grabowski_release_admission.py"
+      },
+      {
+        "module": "grabowski_self_review_execution",
+        "source": "src/grabowski_self_review_execution.py"
+      },
+      {
+        "module": "grabowski_self_review_producer",
+        "source": "src/grabowski_self_review_producer.py"
       },
       {
         "module": "grabowski_self_deploy",
@@ -3702,7 +3757,7 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "ed2614ea2680d0e7bb87ebd7b5de69295fc66a0f8152a350b9121993b456c39f"
+      "sha256": "e894771c674ecb89d8261217bf5350beaf370fad28b150e053a11ac5221c4811"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -3710,7 +3765,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "650f923c4cfbb4a70dc4e2162e642460bffffb7b9eefab031e07e8b65dbb542c"
+      "sha256": "23851f3e6deab58099ba689712a5f85d688077427a45c6dde9da9466ababac75"
     },
     "runtime_source_digest_contract": "mcp-tool-surface-v1",
     "runtime_sources": {
@@ -3787,7 +3842,7 @@
       "src/grabowski_lifecycle_projection.py": "d96605f48290074d80a86815063144eb4c98df7dc16338eef1e3f11530c4c114",
       "src/grabowski_lifecycle_read_surface.py": "ed8a123c80751204ccb095ce1b5ef77b15310e9aed4b555167a60c4a3d51f467",
       "src/grabowski_managed_cargo.py": "153723e0299cf9b1c624cd342ebf73daf9e05b71c695babba4ed1ed2ca59497e",
-      "src/grabowski_mcp.py": "5075c4ab823b5669a7f8d3908c11a0c94f6ad80e2d23a0348d242b6bcd4ac0cf",
+      "src/grabowski_mcp.py": "0418e6e176a4857cdcc91e97e28b244c403d4e3ffa9fd936485a1469697f31d7",
       "src/grabowski_merge_authority.py": "5bfe922272e0a294a20066f140c453c8f613b077aaca39eb01c0bf2f6c985f28",
       "src/grabowski_merge_delivery.py": "6f11c5c7c49efdba215a2c7c49563f8c43ebd798de9ff915408a837b11dc5064",
       "src/grabowski_merge_delivery_surface.py": "97bf36785d928c7070a1e294d7b510d126cb06f63e6f26f62d5130c96e3a8b5e",
@@ -3829,6 +3884,8 @@
       "src/grabowski_runtime_contract.py": "4528ec08c1019a2b773a7e05250f4842ca2403d1c9171b19ef98a63c6e588054",
       "src/grabowski_runtime_extensions.py": "4bbaabe4120acc6879297e85d3664c69193fe0a9850e48522d1839b7844b2297",
       "src/grabowski_self_deploy.py": "1c2bd7e9800a1d98fa8d4f456dd33759b66c3d6b4523e63012a31684c86c3db1",
+      "src/grabowski_self_review_execution.py": "385f343b023982111b68dc3cd197e727753120c798c5a7340e5862fad9c3260c",
+      "src/grabowski_self_review_producer.py": "410aca53488069ea0b863632714e13032c7f8b5750e3422a22b05f6fa74e5735",
       "src/grabowski_serving_process.py": "6976c47f932c693f5b7a25e43354e31c3f300e48e4ec7284c66c3b6007cc7160",
       "src/grabowski_sqlite_store.py": "efad0f7cb515e6ab005edf3cbe596b5a4fbe8c097fa7c4361c46d344f9a7ec84",
       "src/grabowski_system_map.py": "cdb1aae6cce14f049160dd0ddadc29234bdc053a29b3c251a6f879079cc90cc3",

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, closing
 import json
 import os
 from pathlib import Path
@@ -128,7 +128,7 @@ class WorktreeEnsureTests(unittest.TestCase):
 
     def _record_live_writer_lease(self, checkout_path: Path) -> None:
         now = int(time.time())
-        with checkouts.resources._database() as connection:
+        with closing(checkouts.resources._database()) as connection, connection:
             connection.execute(
                 "INSERT INTO leases(resource_key, owner_id, purpose, "
                 "acquired_at_unix, updated_at_unix, expires_at_unix, "
