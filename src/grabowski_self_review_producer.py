@@ -438,13 +438,37 @@ def verify_workspace_candidate_review(manifest: dict[str, Any]) -> None:
         if manifest.get("commands", {}).get("review") == list(workspace.CONTROLLER_SELF_REVIEW_PENDING_ARGV):
             assert_candidate_review_history(manifest["workspace_id"])
         return
-    command = candidate_review_command(batch)
+    if not isinstance(batch, str) or provenance.ID.fullmatch(batch) is None:
+        raise provenance.ReviewExecutionRejected("Candidate review batch invalid")
+    task_id = manifest.get("tasks", {}).get("review")
+    recorded_argv = _candidate_recorded_task_argv(task_id, module="grabowski_agent_role")
+    # Admission of a new command remains tied to the current runtime. A
+    # completed role instead carries its original interpreter in the private
+    # task DB and terminal outcome, just like the frozen Writer/Test roles.
+    command = [recorded_argv[0], "-m", "grabowski_self_review_producer", "verify-candidate", batch]
     if workspace._expected_role_argv_sha256(manifest, "review") != workspace._sha256_json(command):
         raise provenance.ReviewExecutionRejected("Candidate review role command drift")
+    frozen = manifest.get("frozen_writer")
+    if not isinstance(frozen, dict):
+        raise provenance.ReviewExecutionRejected("frozen Candidate unavailable")
+    expected_argv = workspace._role_task_argv(
+        manifest, "review", frozen["writer_head"], frozen["diff_sha256"], frozen["dirty"],
+        command=command,
+        output_path=workspace._role_receipt_path(
+            manifest, "review", attempt=workspace._role_final_attempt(manifest, "review"),
+        ),
+        python_executable=recorded_argv[0],
+    )
+    if recorded_argv != expected_argv:
+        raise provenance.ReviewExecutionRejected("Candidate review task wrapper/command drift")
+    repository = Path(manifest["writer_worktree"])
+    _candidate_task_evidence(task_id, workspace._task_argv_sha256(recorded_argv), repository)
     plan = _load_plan(batch)
     if plan["binding"]["candidate_binding"]["workspace_id"] != manifest["workspace_id"]:
         raise provenance.ReviewExecutionRejected("Candidate review workspace replay")
-    verify_candidate_review_command(command, repository=Path(manifest["writer_worktree"]))
+    if Path(plan["worktree"]).resolve(strict=True) != repository.resolve(strict=True):
+        raise provenance.ReviewExecutionRejected("Candidate verifier repository mismatch")
+    provenance.verified_first_party_candidate_handoff(plan)
 
 
 def _binding(value: Any) -> dict[str, Any]:

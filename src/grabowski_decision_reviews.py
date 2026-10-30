@@ -293,7 +293,6 @@ def _historical_nix_review_role_origin_matches(
         if (
             not stat.S_ISREG(module_info.st_mode)
             or module_info.st_uid != _NIX_REVIEW_OWNER_UID
-            or module_info.st_nlink != 1
             or not 0 < module_info.st_size <= MAX_REVIEW_ROLE_MODULE_BYTES
             or stat.S_IMODE(module_info.st_mode) & 0o222
             or module.resolve(strict=True) != module

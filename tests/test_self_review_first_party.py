@@ -230,12 +230,13 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
             self.addCleanup(patcher.stop)
         return producer.plan_frozen_candidate_review(manifest["workspace_id"])
 
-    def _finalize_candidate(self, plan: dict, started: dict) -> dict:
+    def _finalize_candidate(self, plan: dict, started: dict, *, reason: str | None = None) -> dict:
         return review.finalize_first_party_candidate(
             started["review_session_id"], started["session_nonce"],
             self._issuer(review.FIRST_PARTY_TOOL_SUBMIT, {
                 "review_session_id": started["review_session_id"], "session_nonce": started["session_nonce"],
                 "report": {"finalize": True},
+                **({"reason": reason} if reason is not None else {}),
             }),
             root=self.state, key=self.key, signers=self.signers,
             root_owned_signers=False, now_unix=self.now,
@@ -255,12 +256,13 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
             refs = [f"{self.source_path}:L1-L4", f"{self.source_path}:{self.base}:L1-L4"]
             self._submit(started, self._report(axis, number, refs, reject=reject and number == 1))
 
-    def _submit(self, started: dict, report: dict) -> dict:
+    def _submit(self, started: dict, report: dict, *, reason: str | None = None) -> dict:
         return review.submit_first_party_axis_review(
             started["review_session_id"], started["session_nonce"], report,
             self._issuer(review.FIRST_PARTY_TOOL_SUBMIT, {
                 "review_session_id": started["review_session_id"], "session_nonce": started["session_nonce"],
                 "report": report,
+                **({"reason": reason} if reason is not None else {}),
             }),
             root=self.state, key=self.key, signers=self.signers,
             root_owned_signers=False, now_unix=self.now,
@@ -401,7 +403,7 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
         )
         self.assertGreater(signed_path.stat().st_size, review.MAX_RECEIPT)
         self.assertLessEqual(
-            signed_path.stat().st_size, review.MAX_CANDIDATE_FINALIZED_RECEIPT,
+            len(review._canonical(finalized)), review.MAX_CANDIDATE_FINALIZED_RECEIPT,
         )
         self.assertEqual({"verdict": "PASS", "findings": []}, self._verify_candidate(plan))
         with self.assertRaisesRegex(review.ReviewExecutionRejected, "over budget"):
@@ -476,6 +478,12 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
         self.assertEqual("PASS", self._verify_candidate(plan)["verdict"])
 
     def test_candidate_handoff_runs_role_capture_collect_and_close(self) -> None:
+        self._candidate_role_capture_collect_and_close(runtime_switch=False)
+
+    def test_completed_candidate_review_survives_runtime_switch_at_collect_and_close(self) -> None:
+        self._candidate_role_capture_collect_and_close(runtime_switch=True)
+
+    def _candidate_role_capture_collect_and_close(self, *, runtime_switch: bool) -> None:
         from test_agent_workspace import passing_toolchain_preflight, friction, role
         plan = self._candidate_plan()
         started = self._start_plan(plan)
@@ -492,8 +500,41 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
             public_review.update({"task_id": "c" * 24, "host": kwargs["host"], "attempt": 1,
                                   "resume_policy": "never", "cwd": kwargs["cwd"],
                                   "argv_sha256": workspace._task_argv_sha256(kwargs["argv"]),
-                                  "state": "completed", "terminal": True})
+                                  "state": "running", "terminal": False})
             return {"task": public_review}
+
+        def complete_review_task():
+            task_id = public_review["task_id"]
+            argv = launched[0]
+            argv_json = json.dumps(argv, ensure_ascii=False, separators=(",", ":"))
+            argv_sha256 = workspace._task_argv_sha256(argv)
+            self.assertEqual(public_review["argv_sha256"], argv_sha256)
+            unit = f"grabowski-task-{task_id}-a1.service"
+            outcome = {
+                "task_id": task_id, "state": "completed", "unit": unit,
+                "argv_sha256": argv_sha256, "attempt": 1,
+                "execution_backend": "systemd-user", "systemd_scope": "user",
+                "observation": {"state": "completed", "properties": {
+                    "Result": "success", "ExecMainStatus": "0",
+                }},
+            }
+            outcome["receipt_sha256"] = review._digest(outcome)
+            path = producer.OUTCOMES / (task_id + ".json")
+            self.assertFalse(path.exists())
+            path.write_bytes(review._canonical(outcome))
+            path.chmod(0o600)
+            connection = sqlite3.connect(producer.TASK_DB)
+            try:
+                with connection:
+                    connection.execute(
+                        "INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                        (task_id, public_review["host"], public_review["cwd"], argv_json,
+                         argv_sha256, unit, "completed", 1, outcome["receipt_sha256"],
+                         "systemd-user", "user"),
+                    )
+            finally:
+                connection.close()
+            public_review.update({"state": "completed", "terminal": True})
 
         def task_public(task_id, **kwargs):
             if task_id == "c" * 24:
@@ -525,6 +566,54 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
                 mock.patch.object(role, "runtime_sandbox_argv", side_effect=lambda argv: argv),
             ):
                 self.assertEqual(0, role.main(launched[0][3:]))
+            complete_review_task()
+            manifest = workspace._manifest(self.candidate_manifest["workspace_id"])
+            producer.verify_workspace_candidate_review(manifest)
+            if runtime_switch:
+                next_python = "/nix/store/" + "f" * 32 + "-new-reviewer/bin/python3"
+                runtime = mock.patch.object(sys, "executable", next_python)
+                runtime.start()
+                self.addCleanup(runtime.stop)
+                self.assertIsNone(producer.candidate_review_batch(command),
+                                  "new dispatch still requires the current runtime")
+                producer.verify_workspace_candidate_review(manifest)
+                for field in ("batch", "task", "attempt", "workspace", "repository", "command_hash"):
+                    altered = copy.deepcopy(manifest)
+                    if field == "batch":
+                        altered["first_party_candidate_review_batch"] = "0" * 32
+                    elif field == "task":
+                        altered["tasks"]["review"] = altered["tasks"]["tests"]
+                    elif field == "attempt":
+                        altered["role_final_attempt"]["review"] += 1
+                    elif field == "workspace":
+                        altered["workspace_id"] = "0" * 32
+                    elif field == "repository":
+                        altered["writer_worktree"] = str(self.root)
+                    else:
+                        altered["role_retries"]["review"]["attempts"][-1]["new_command_sha256"] = "0" * 64
+                    with self.subTest(binding=field):
+                        with self.assertRaises((review.ReviewExecutionRejected, workspace.AgentWorkspaceError)):
+                            producer.verify_workspace_candidate_review(altered)
+                altered_argv = list(launched[0])
+                altered_argv[altered_argv.index("--output") + 1] += ".foreign"
+                connection = sqlite3.connect(producer.TASK_DB)
+                try:
+                    with connection:
+                        connection.execute(
+                            "UPDATE tasks SET argv_json=?, argv_sha256=? WHERE task_id=?",
+                            (json.dumps(altered_argv, ensure_ascii=False, separators=(",", ":")),
+                             workspace._task_argv_sha256(altered_argv), public_review["task_id"]),
+                        )
+                    with self.assertRaisesRegex(review.ReviewExecutionRejected, "wrapper/command drift"):
+                        producer.verify_workspace_candidate_review(manifest)
+                    with connection:
+                        connection.execute(
+                            "UPDATE tasks SET argv_json=?, argv_sha256=? WHERE task_id=?",
+                            (json.dumps(launched[0], ensure_ascii=False, separators=(",", ":")),
+                             workspace._task_argv_sha256(launched[0]), public_review["task_id"]),
+                        )
+                finally:
+                    connection.close()
             collected = workspace.grabowski_agent_workspace_collect(self.candidate_manifest["workspace_id"])
             self.assertEqual("complete", collected["state"], collected)
             self.assertEqual("PASS", collected["result"]["verification_summary"]["outcome"])
@@ -646,7 +735,10 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
         self._complete_candidate(plan, started)
         self._finalize_candidate(plan, started)
         axes = self.state / "sessions" / started["review_session_id"] / "axes"
-        next(axes.glob("*.sig")).unlink()
+        path = next(axes.glob("*.json"))
+        envelope = json.loads(path.read_bytes())
+        del envelope["signature"]
+        path.write_bytes(review._canonical(envelope))
         with self.assertRaises((review.ReviewExecutionRejected, FileNotFoundError)):
             self._verify_candidate(plan)
 

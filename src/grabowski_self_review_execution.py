@@ -11,6 +11,7 @@ the PR under review.  Missing deployment of that trust root is a hard BLOCK.
 from __future__ import annotations
 
 import hashlib
+import ctypes
 import fcntl
 import json
 import os
@@ -53,6 +54,8 @@ SHA256 = re.compile(r"[a-f0-9]{64}\Z")
 ID = re.compile(r"[a-f0-9]{32}\Z")
 REF = re.compile(r"(?P<path>[A-Za-z0-9_.@+/-]+)(?::(?P<source_revision>[a-f0-9]{40}))?:L(?P<start>[1-9][0-9]{0,6})(?:-L(?P<end>[1-9][0-9]{0,6}))?\Z")
 MAX_RECEIPT = 16384
+MAX_RECORD_SIGNATURE = 16384
+SIGNED_RECORD_ENVELOPE_KIND = "grabowski_signed_record_envelope_v1"
 # Five substantial, independently signed axes plus a frozen Writer/Test origin
 # can exceed the ordinary single-record limit without adding untrusted data.
 MAX_CANDIDATE_FINALIZED_RECEIPT = 32768
@@ -904,21 +907,67 @@ def _sign_server_record(material: bytes, *, key: Path, signers: Path) -> bytes:
     return result.stdout
 
 
+def _rename_private_record(parent_fd: int, staged: str, destination: str) -> None:
+    # Keep the standalone signature verifier independent of the MCP operator.
+    # Linux renameat2(RENAME_NOREPLACE) publishes once without a hardlink window.
+    try:
+        rename = ctypes.CDLL(None, use_errno=True).renameat2
+    except AttributeError as exc:
+        raise ReviewExecutionRejected("atomic record publication unavailable") from exc
+    rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    rename.restype = ctypes.c_int
+    if rename(parent_fd, os.fsencode(staged), parent_fd, os.fsencode(destination), 1) != 0:
+        error = ctypes.get_errno()
+        raise ReviewExecutionRejected("first-party record publication failed") from OSError(error, os.strerror(error))
+
+
+def _publish_private_record(path: Path, data: bytes) -> None:
+    """Publish a complete signed record without replacing an existing one."""
+
+    parent_fd = _private_dir(path.parent)
+    staged = ".signed-record-stage-" + secrets.token_hex(16)
+    try:
+        descriptor = os.open(
+            staged, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600, dir_fd=parent_fd,
+        )
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        # A hardlink-based publish would leave st_nlink == 2 after a crash.
+        # Rename also keeps unfinished staging files outside the *.json history.
+        _rename_private_record(parent_fd, staged, path.name)
+        os.fsync(parent_fd)
+    finally:
+        try:
+            os.unlink(staged, dir_fd=parent_fd)
+        except FileNotFoundError:
+            pass
+        finally:
+            os.close(parent_fd)
+
+
 def _write_signed_record(
     path: Path, record: dict[str, Any], *, key: Path, signers: Path,
-    max_bytes: int = MAX_RECEIPT,
+    max_bytes: int = MAX_RECEIPT, atomic: bool = False,
 ) -> tuple[str, str]:
     material = _canonical(record)
     if len(material) > max_bytes:
         raise ReviewExecutionRejected("first-party review receipt over budget")
     signature = _sign_server_record(material, key=key, signers=signers)
-    _create_private_bytes(path, material)
-    try:
+    if atomic:
+        if len(signature) > MAX_RECORD_SIGNATURE:
+            raise ReviewExecutionRejected("first-party record signature over budget")
+        _publish_private_record(path, _canonical({
+            "kind": SIGNED_RECORD_ENVELOPE_KIND,
+            "record": record, "signature": signature.decode("ascii"),
+        }))
+    else:
+        # Session creation still publishes its complete staged directory.
+        # Retain the existing JSON/SIG layout for its batch-index bindings.
+        _create_private_bytes(path, material)
         _create_private_bytes(path.with_suffix(".sig"), signature)
-    except Exception:
-        # The unsigned JSON is fail-closed and cannot be accepted.  Do not
-        # overwrite or silently reuse it on a later request.
-        raise
     return hashlib.sha256(material).hexdigest(), hashlib.sha256(signature).hexdigest()
 
 
@@ -928,10 +977,28 @@ def _read_signed_record(
 ) -> dict[str, Any]:
     parent_fd = _private_dir(path.parent)
     try:
-        material = _private_read(parent_fd, path.name, limit=max_bytes)
-        signature = _private_read(
-            parent_fd, path.with_suffix(".sig").name, limit=16384,
+        material = _private_read(
+            parent_fd, path.name, limit=max_bytes + 2 * MAX_RECORD_SIGNATURE + 256,
         )
+        stored = _json_record(material)
+        if stored.get("kind") == SIGNED_RECORD_ENVELOPE_KIND:
+            if (
+                set(stored) != {"kind", "record", "signature"}
+                or not isinstance(stored["record"], dict)
+                or not isinstance(stored["signature"], str)
+                or not stored["signature"].isascii()
+                or not 0 < len(stored["signature"]) <= MAX_RECORD_SIGNATURE
+            ):
+                raise ReviewExecutionRejected("first-party signed record envelope invalid")
+            material = _canonical(stored["record"])
+            signature = stored["signature"].encode("ascii")
+        else:
+            # Incomplete legacy pairs remain fail-closed, including old REJECTs.
+            signature = _private_read(
+                parent_fd, path.with_suffix(".sig").name, limit=MAX_RECORD_SIGNATURE,
+            )
+        if len(material) > max_bytes:
+            raise ReviewExecutionRejected("first-party review receipt over budget")
     finally:
         os.close(parent_fd)
     _check_signature(
@@ -1377,6 +1444,7 @@ def record_first_party_source_read(
         _create_private_bytes(reads / (read_id + ".data"), data)
         _write_signed_record(
             reads / (read_id + ".json"), record, key=key, signers=signers,
+            atomic=True,
         )
     finally:
         _release_first_party_lock(lock)
@@ -1705,7 +1773,7 @@ def finalize_first_party_candidate(
         _assert_first_party_source_current(session)
         _write_signed_record(
             session_root / "finalized.json", record, key=key, signers=signers,
-            max_bytes=MAX_CANDIDATE_FINALIZED_RECEIPT,
+            max_bytes=MAX_CANDIDATE_FINALIZED_RECEIPT, atomic=True,
         )
     finally:
         _release_first_party_lock(lock)
@@ -1976,6 +2044,7 @@ def submit_first_party_axis_review(
             raise ReviewExecutionRejected("first-party axis review duplicated")
         receipt_sha256, _signature_sha256 = _write_signed_record(
             axis_path, record, key=key, signers=signers,
+            atomic=True,
         )
     finally:
         _release_first_party_lock(lock)

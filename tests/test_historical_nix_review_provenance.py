@@ -74,6 +74,22 @@ class HistoricalNixReviewOriginTests(unittest.TestCase):
         self.assertTrue(self._accepted())
         self.assertFalse(self._accepted(digest="0" * 64))
 
+    def _optimise_module(self) -> None:
+        links = self.store / ".links"
+        links.mkdir()
+        os.link(self.module, links / self.digest)
+        self.assertEqual(2, self.module.stat().st_nlink)
+
+    def test_optimised_store_hardlink_preserves_integrity_checks(self) -> None:
+        self._optimise_module()
+        self.assertTrue(self._accepted())
+        self.assertFalse(self._accepted(digest="0" * 64))
+        self.module.chmod(0o644)
+        self.assertFalse(self._accepted())
+        self.module.chmod(0o444)
+        with mock.patch.object(reviews, "_NIX_REVIEW_OWNER_UID", os.getuid() + 1):
+            self.assertFalse(self._accepted())
+
     def test_current_release_path_is_not_a_trust_shortcut(self) -> None:
         # A syntactically valid interpreter is insufficient without a pinned
         # module inside the *same* immutable operator source package.
@@ -109,6 +125,13 @@ class HistoricalNixReviewOriginTests(unittest.TestCase):
         self.assertFalse(self._accepted())
 
     def test_full_historical_provenance_uses_the_trusted_nix_origin(self) -> None:
+        self._assert_full_historical_provenance()
+
+    def test_full_historical_provenance_survives_nix_store_optimise(self) -> None:
+        self._optimise_module()
+        self._assert_full_historical_provenance()
+
+    def _assert_full_historical_provenance(self) -> None:
         jobs = Path(self.temporary.name) / "jobs"
         jobs.mkdir()
         directory = fixtures.make_job(
