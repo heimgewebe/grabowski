@@ -96,26 +96,39 @@ class SignedHistoryCaseAliasBoundaryTests(unittest.TestCase):
 
     def test_unicode_aliases_fail_at_captain_entry_before_signed_lookup(self) -> None:
         import grabowski_merge_guard as captain
+        from unittest import mock
 
         f = self.fixture
         plan = f._first_party_plan()
+        # Never rely on the developer's production review registry. The guard
+        # intentionally returns [] if no signed session registry exists.
+        # Create a real, SSH-signed fixture REJECT and explicitly bind it.
+        started = f._start_plan(plan)
+        f._submit_axis(started, fixtures.review.REQUIRED_AXES[0], 1, reject=True)
+        self.assertTrue((f.state / "sessions" / started["review_session_id"] / "session.json").is_file())
         binding = {
             "repository": "heimgewebe/grabowski", "pull_request": 1649,
             "base_sha": f.base, "head_sha": f.head,
             "diff_sha256": plan["binding"]["diff_sha256"],
         }
-        for alias in (
-            "heimgewebe/Grabow\u017fki",  # Unicode long-s casefolds to ASCII 's'
-            "Heimgewebe/Grabow\u017fki",
-            "heimgewebe/grabo\u00dfki",  # sharp-s casefold expands to 'ss'
-            "heimgewebe/grabo\ufb01ki", # Unicode fi ligature
-        ):
+        with mock.patch.object(fixtures.review, "FIRST_PARTY_REVIEW_ROOT", f.state):
+            for alias in (
+                "heimgewebe/Grabow\u017fki",  # Unicode long-s casefolds to ASCII 's'
+                "Heimgewebe/Grabow\u017fki",
+                "heimgewebe/grabo\u00dfki",  # sharp-s casefold expands to 'ss'
+                "heimgewebe/grabo\ufb01ki",  # Unicode fi ligature
+            ):
+                self.assertEqual(
+                    ["merge_guard_signed_first_party_history_binding_invalid"],
+                    captain._signed_first_party_material_history_errors({
+                        **binding, "repository": alias,
+                    }),
+                    f"non-ASCII repository alias must fail closed: {alias!r}",
+                )
             self.assertEqual(
-                ["merge_guard_signed_first_party_history_binding_invalid"],
-                captain._signed_first_party_material_history_errors({
-                    **binding, "repository": alias,
-                }),
-                f"non-ASCII repository alias must fail closed: {alias!r}",
+                ["merge_guard_signed_first_party_material_reject_or_invalid_history"],
+                captain._signed_first_party_material_history_errors(binding),
+                "The same signed fixture must still block its canonical repository",
             )
 
 
