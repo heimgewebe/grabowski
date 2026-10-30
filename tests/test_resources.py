@@ -59,6 +59,18 @@ class ResourceTests(unittest.TestCase):
         self.patch.stop()
         self.temporary.cleanup()
 
+    def test_bureau_runtime_exact_67_resources_fit_one_atomic_lease(self) -> None:
+        keys = ["path:" + str(self.root / ("stage-%03d" % i)) for i in range(67)]
+        self.assertEqual(67, len(resources.normalize_resource_keys(keys)))
+        owner = "operator:bureau-exact-67-resource-test"
+        resources.acquire_resources(owner, keys, purpose="Bureau exact bound set")
+        self.assertEqual(67, len(resources.list_resources(owner_id=owner)))
+        resources.release_resources(owner, keys)
+
+        excess = ["path:" + str(self.root / ("stage-%03d" % i)) for i in range(97)]
+        with self.assertRaisesRegex(ValueError, "at most 96 resource keys"):
+            resources.normalize_resource_keys(excess)
+
     def test_resource_writer_connections_are_closed_across_lease_lifecycle(self) -> None:
         # SQLite's connection context manager commits but does not close.
         # Hold references to every connection so garbage collection cannot
