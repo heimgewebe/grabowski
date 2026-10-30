@@ -1399,6 +1399,13 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
                 }),
                 "invalid repository identities must still be rejected",
             )
+            self.assertEqual(
+                ["merge_guard_signed_first_party_material_reject_or_invalid_history"],
+                captain._signed_first_party_material_history_errors({
+                    **binding, "repository": "Heimgewebe/grabowski",
+                }),
+                "case aliases of the signed owner must not bypass REJECT history",
+            )
 
             self.now += 1
             resolution = self._start_plan(self._first_party_plan())

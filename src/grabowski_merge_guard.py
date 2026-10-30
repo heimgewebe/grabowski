@@ -93,7 +93,7 @@ def _signed_first_party_material_history_errors(bindings: dict[str, Any]) -> lis
     # The signed first-party producer accepts only heimgewebe/* identities.
     # Other GitHub owners cannot have valid receipts in this registry, so
     # treating their PRs as malformed would incorrectly block Captain merges.
-    if not repo.startswith("heimgewebe/"):
+    if not repo.lower().startswith("heimgewebe/"):
         return []
     binding = {
         "repo": repo,
