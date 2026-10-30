@@ -1880,10 +1880,21 @@ def _assert_prior_first_party_material_findings_resolved(
                     # merely because a caller used another name casing.
                     candidate_repo = candidate.get("repo")
                     decisive_repo = decisive.get("repo")
+                    # Reject malformed signed history before comparing repos.
+                    # Both GitHub slugs and first-party signer bindings use
+                    # ASCII identifiers; Unicode casefold can merge distinct
+                    # names (e.g. long-s and s), so compare ASCII lower only.
                     if (
                         not isinstance(candidate_repo, str)
+                        or re.fullmatch(r"heimgewebe/[A-Za-z0-9_.-]+", candidate_repo) is None
                         or not isinstance(decisive_repo, str)
-                        or candidate_repo.casefold() != decisive_repo.casefold()
+                        or re.fullmatch(r"heimgewebe/[A-Za-z0-9_.-]+", decisive_repo) is None
+                    ):
+                        raise ReviewExecutionRejected(
+                            "previous signed session repository identity invalid"
+                        )
+                    if (
+                        candidate_repo.lower() != decisive_repo.lower()
                         or any(
                             candidate.get(k) != decisive.get(k)
                             for k in revision_fields if k != "repo"
