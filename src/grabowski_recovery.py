@@ -2009,6 +2009,27 @@ def _nixos_completed_backup_from_persistent_journal(now: int) -> dict[str, Any] 
             timestamp, monotonic = int(ts), int(mono)
             if not (0 < timestamp <= (now + 1) * 1_000_000 and monotonic > 0):
                 return None
+            # Realtime sorting is unsafe after clock rollback. A journal
+            # cursor preserves sequence within one journal identity.
+            cursor_identity = None
+            raw_cursor = event.get("__CURSOR")
+            if raw_cursor is not None:
+                if not isinstance(raw_cursor, str):
+                    return None
+                cursor_match = re.fullmatch(
+                    r"s=([0-9a-f]{32});i=([0-9a-f]{1,16});"
+                    r"b=([0-9a-f]{32});m=([0-9a-f]{1,16});"
+                    r"t=([0-9a-f]{1,16});x=[0-9a-f]{1,16}",
+                    raw_cursor,
+                )
+                if (cursor_match is None
+                        or cursor_match.group(3) != boot
+                        or int(cursor_match.group(4), 16) != monotonic
+                        or int(cursor_match.group(5), 16) != timestamp):
+                    return None
+                cursor_identity = (
+                    cursor_match.group(1), int(cursor_match.group(2), 16)
+                )
             message = event.get("MESSAGE")
             if message == f"Starting {unit}...":
                 kind, message_id = "start", "7d4958e842da4a758f6c1cdc7b36dcc5"
@@ -2045,17 +2066,25 @@ def _nixos_completed_backup_from_persistent_journal(now: int) -> dict[str, Any] 
             events.append({
                 "kind": kind, "boot": boot, "invocation": invocation,
                 "timestamp": timestamp, "monotonic": monotonic,
-                "message": message,
+                "cursor_identity": cursor_identity, "message": message,
             })
     except (ValueError, TypeError, OverflowError):
         return None
-    # journalctl --grep -n may return newest-first: use measured timestamps.
-    starts = sorted(
-        (event for event in events if event["kind"] == "start"),
-        key=lambda event: event["timestamp"],
-    )
+    # journalctl --grep -n may return newest-first. Within one boot
+    # use monotonic time; across boots require a shared, verified journal
+    # sequence identity rather than wall-clock recency.
+    starts = [event for event in events if event["kind"] == "start"]
     if not starts:
         return None
+    if len({event["boot"] for event in starts}) > 1:
+        identities = [event["cursor_identity"] for event in events]
+        if (any(value is None for value in identities)
+                or len({value[0] for value in identities}) != 1
+                or len({value[1] for value in identities}) != len(identities)):
+            return None
+        starts.sort(key=lambda event: event["cursor_identity"][1])
+    else:
+        starts.sort(key=lambda event: event["monotonic"])
     last = starts[-1]
     bound = [
         event for event in events
@@ -2068,6 +2097,12 @@ def _nixos_completed_backup_from_persistent_journal(now: int) -> dict[str, Any] 
             or len([event for event in bound if event["kind"] == "start"]) != 1):
         return None
     end, snapshot = finished[0], saved[0]
+    if all(event["cursor_identity"] is not None for event in bound):
+        if (len({event["cursor_identity"][0] for event in bound}) != 1
+                or not (last["cursor_identity"][1]
+                        < snapshot["cursor_identity"][1]
+                        < end["cursor_identity"][1])):
+            return None
     if not (
         last["timestamp"] <= snapshot["timestamp"] <= end["timestamp"]
         and last["monotonic"] <= snapshot["monotonic"] <= end["monotonic"]

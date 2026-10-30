@@ -1006,6 +1006,29 @@ class NativeNixOSResticProofTests(unittest.TestCase):
             INVOCATION_ID="f" * 32,
         )
 
+        def with_cursor(row, number):
+            """Bind an authentic journald sequence to both measured clocks."""
+            item = dict(row)
+            item["__CURSOR"] = (
+                f"s={'d' * 32};i={number:x};b={item['_BOOT_ID']};"
+                f"m={int(item['__MONOTONIC_TIMESTAMP']):x};"
+                f"t={int(item['__REALTIME_TIMESTAMP']):x};x={'e' * 16}"
+            )
+            return item
+
+        cursor_clean = [
+            with_cursor(finished, 12), with_cursor(save, 11),
+            with_cursor(beginning, 10),
+        ]
+        newer_clock_rollback = manager(
+            "start", (self.now - 120) * 1_000_000, 1_000_000,
+            _BOOT_ID="c" * 32, INVOCATION_ID="f" * 32,
+        )
+        prior_boot_start = with_cursor(manager(
+            "start", (self.now - 130) * 1_000_000, 1_000_000,
+            _BOOT_ID="c" * 32, INVOCATION_ID="f" * 32,
+        ), 9)
+
         def postboot(**changed):
             fields = {
                 "LoadState": "loaded", "ActiveState": "inactive", "Job": "",
@@ -1025,6 +1048,29 @@ class NativeNixOSResticProofTests(unittest.TestCase):
             ("missing_finish", [save, beginning], postboot(), False),
             ("missing_snapshot", [finished, beginning], postboot(), False),
             ("newer_incomplete_attempt", clean + [new_start], postboot(), False),
+            # Realtime can move backward in the same boot; monotonic is decisive.
+            ("sameboot_clock_rollback_incomplete", clean + [manager(
+                "start", (self.now - 120) * 1_000_000, 92_000_000,
+                INVOCATION_ID="f" * 32,
+            )], postboot(), False),
+            # Across boots, no global comparison is safe without bound cursor
+            # sequences. A later failed invocation must not rehabilitate an
+            # older snapshot solely because its realtime timestamp is higher.
+            ("crossboot_no_cursor_ambiguous",
+             clean + [newer_clock_rollback], postboot(), False),
+            ("crossboot_later_failed_cursor",
+             cursor_clean + [with_cursor(newer_clock_rollback, 13)],
+             postboot(), False),
+            ("crossboot_older_incomplete_cursor",
+             cursor_clean + [prior_boot_start], postboot(), True),
+            ("crossboot_duplicate_journal_index",
+             cursor_clean + [with_cursor(newer_clock_rollback, 10)],
+             postboot(), False),
+            ("crossboot_foreign_sequence_id",
+             cursor_clean + [dict(prior_boot_start,
+                 __CURSOR=prior_boot_start["__CURSOR"].replace(
+                     f"s={'d' * 32}", f"s={'a' * 32}"
+                 ))], postboot(), False),
             ("wrong_invocation", [finished, snapshot(saved, 70_000_000,
                                         _SYSTEMD_INVOCATION_ID="c" * 32), beginning],
              postboot(), False),
