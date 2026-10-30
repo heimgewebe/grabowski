@@ -633,6 +633,22 @@ def _trusted_nix_vendor_elf_runtime(nix_store: Path) -> tuple[Path, Path]:
     return loader, libraries
 
 
+def _trusted_nixos_ca_bundle(
+    nix_store: Path | None,
+    source: Path = Path("/etc/ssl/certs/ca-certificates.crt"),
+) -> Path | None:
+    """Expose the host trust store only when it resolves inside the trusted Nix store."""
+    if nix_store is None:
+        return None
+    try:
+        candidate = source.resolve(strict=True)
+        if candidate.is_relative_to(nix_store) and candidate.is_file():
+            return candidate
+    except OSError:
+        pass
+    return None
+
+
 def _bind_file(arguments: list[str], source: str, target: str | None = None) -> None:
     path = Path(source)
     if path.is_file() and not path.is_symlink():
@@ -1132,6 +1148,11 @@ def minimal_sandbox_argv(
         arguments.extend(["--setenv", key, value])
     if nix_elf_runtime is not None:
         arguments.extend(["--setenv", "LD_LIBRARY_PATH", str(nix_elf_runtime[1])])
+    # NixOS symlinks its CA bundle into /nix/store. /etc/ssl/certs alone
+    # does not expose that bundle in a read-only bubblewrap namespace.
+    ca_bundle = _trusted_nixos_ca_bundle(nix_store)
+    if ca_bundle is not None:
+        arguments.extend(["--setenv", "SSL_CERT_FILE", str(ca_bundle)])
     arguments.extend(
         [
             "--chdir",
