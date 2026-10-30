@@ -1004,7 +1004,7 @@ def _repository_dirty_without_git_filters(
                         before = os.fstat(tracked.fileno())
                         if (
                             not stat.S_ISREG(before.st_mode)
-                            or bool(before.st_mode & 0o111) != (mode == b"100755")
+                            or bool(before.st_mode & stat.S_IXUSR) != (mode == b"100755")
                         ):
                             return True
                         digest.update(

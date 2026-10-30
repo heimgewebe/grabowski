@@ -204,6 +204,32 @@ class ScheduledWorkerGitFilterTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "dirty"):
                 worker.verify_repository(repo, repo, "canonical-main", head)
 
+    def test_git_executable_mode_is_owner_bit_not_any_execute_bit(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="worker-git-execmode-") as dirname:
+            repo, head = self.make_repo(Path(dirname))
+            tracked = repo / "tracked.txt"
+            # Git mode 100644 depends on the owner execute bit, not on other-x.
+            tracked.chmod(0o645)
+            self.assertEqual(
+                "", self.git(repo, "status", "--porcelain=v1", "--untracked-files=normal")
+            )
+            worker.verify_repository(repo, repo, "canonical-main", head)
+            # Make HEAD genuinely executable. Owner-x loss changes Git 100755
+            # into 100644 even if other-x remains set (0645).
+            tracked.chmod(0o755)
+            self.git(repo, "add", "tracked.txt")
+            self.git(repo, "commit", "-qm", "Commit executable tracked file")
+            head = self.git(repo, "rev-parse", "HEAD")
+            self.git(repo, "update-ref", "refs/remotes/origin/main", head)
+            worker.verify_repository(repo, repo, "canonical-main", head)
+            tracked.chmod(0o645)
+            self.assertIn(
+                "M tracked.txt",
+                self.git(repo, "status", "--porcelain=v1", "--untracked-files=normal"),
+            )
+            with self.assertRaisesRegex(RuntimeError, "dirty"):
+                worker.verify_repository(repo, repo, "canonical-main", head)
+
     def test_tracked_fifo_cannot_block_raw_worktree_verification(self) -> None:
         with tempfile.TemporaryDirectory(prefix="worker-raw-fifo-") as dirname:
             repo, head = self.make_repo(Path(dirname))
