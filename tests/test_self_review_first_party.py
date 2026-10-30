@@ -1366,6 +1366,7 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
         authentic = review._assert_no_first_party_reject_for_legacy_review
 
         def inspect_original_signed_review(candidate: dict, **_options: object) -> None:
+            self.assertEqual(candidate["repo"], "heimgewebe/grabowski")
             authentic(
                 candidate, repository=serving_checkout, root=self.state,
                 signers=self.signers, root_owned_signers=False,

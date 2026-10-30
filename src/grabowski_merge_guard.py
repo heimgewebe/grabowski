@@ -95,6 +95,9 @@ def _signed_first_party_material_history_errors(bindings: dict[str, Any]) -> lis
     # treating their PRs as malformed would incorrectly block Captain merges.
     if not repo.lower().startswith("heimgewebe/"):
         return []
+    # GitHub owner/repository names are case-insensitive. A mixed-case alias
+    # must select the same immutable signed REJECT history as the canonical ID.
+    repo = repo.lower()
     binding = {
         "repo": repo,
         "pr": bindings.get("pull_request"),
