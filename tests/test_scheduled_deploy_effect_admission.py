@@ -261,6 +261,49 @@ class ScheduledWorkerGitFilterTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "dirty"):
                 worker.verify_repository(repo, repo, "canonical-main", head)
 
+    def test_legacy_crlf_attribute_honors_disabled_conversion(self) -> None:
+        # Actual Git checkout truth, not assuming a manual byte rewrite is clean.
+        # With committed '-crlf eol=crlf', Git checks out LF, so substituting
+        # CRLF is dirty even though 'text' reports 'unspecified'.
+        for policy, expected_checkout in (
+            ("-crlf eol=crlf", b"original\n"),
+            ("crlf eol=crlf", b"original\r\n"),
+            ("eol=crlf", b"original\r\n"),
+            ("text -crlf eol=crlf", b"original\r\n"),
+        ):
+            with self.subTest(policy=policy), tempfile.TemporaryDirectory(
+                prefix="worker-legacy-crlf-"
+            ) as dirname:
+                repo, _ = self.make_repo(Path(dirname))
+                tracked = repo / "tracked.txt"
+                (repo / ".gitattributes").write_text(
+                    f"tracked.txt {policy}\n", encoding="utf-8"
+                )
+                self.git(repo, "add", ".gitattributes")
+                self.git(repo, "commit", "-qm", "Commit legacy CRLF attribute policy")
+                head = self.git(repo, "rev-parse", "HEAD")
+                self.git(repo, "update-ref", "refs/remotes/origin/main", head)
+                tracked.unlink()
+                self.git(repo, "checkout", "--", "tracked.txt")
+                self.assertEqual(expected_checkout, tracked.read_bytes())
+                self.assertEqual(
+                    "", self.git(
+                        repo, "status", "--porcelain=v1", "--untracked-files=normal"
+                    ),
+                )
+                worker.verify_repository(repo, repo, "canonical-main", head)
+                if policy.startswith("-crlf "):
+                    tracked.write_bytes(b"original\r\n")
+                    self.assertIn(
+                        "M tracked.txt",
+                        self.git(
+                            repo, "status", "--porcelain=v1",
+                            "--untracked-files=normal",
+                        ),
+                    )
+                    with self.assertRaisesRegex(RuntimeError, "dirty"):
+                        worker.verify_repository(repo, repo, "canonical-main", head)
+
     def test_mutable_global_attributes_cannot_launder_uncommitted_crlf(self) -> None:
         with tempfile.TemporaryDirectory(prefix="worker-global-attrs-") as dirname:
             root = Path(dirname)

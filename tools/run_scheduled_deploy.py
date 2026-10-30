@@ -778,7 +778,9 @@ def _explicit_index_crlf_only(
     """
     if not committed_attrs:
         return None
-    fields = (b"text", b"eol", b"filter", b"ident", b"working-tree-encoding")
+    # Legacy 'crlf' remains semantically relevant when 'text' is unspecified.
+    # Read it from both indexes: mutable attributes cannot grant normalization.
+    fields = (b"text", b"crlf", b"eol", b"filter", b"ident", b"working-tree-encoding")
     argv = [
         *(field.decode("ascii") for field in fields),
         "--", os.fsdecode(pathname),
@@ -841,6 +843,12 @@ def _explicit_index_crlf_only(
         from_head is not None and from_head == from_source
         and from_head[b"eol"] == b"crlf"
         and from_head[b"text"] in {b"set", b"unspecified", b"auto"}
+        # With modern text unspecified, legacy '-crlf' or 'crlf=input'
+        # disables this CRLF->LF exception even when eol=crlf is declared.
+        and (
+            from_head[b"text"] != b"unspecified"
+            or from_head[b"crlf"] in {b"set", b"unspecified"}
+        )
         and all(from_head[attr] in {b"unset", b"unspecified"}
                 for attr in (b"filter", b"ident", b"working-tree-encoding"))
     ):
