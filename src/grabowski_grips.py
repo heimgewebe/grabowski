@@ -2694,6 +2694,11 @@ def _self_review_audit_errors(
         errors.append("schema_version must be integer 1")
     if evidence.get("kind") != "grabowski_self_review_audit":
         errors.append("kind must be grabowski_self_review_audit")
+    version = evidence.get("review_policy_version")
+    if type(version) is not int or version != grabowski_merge_guard.REVIEW_POLICY_VERSION:
+        errors.append("review_policy_version is stale or invalid")
+    if type(evidence.get("independent_review_required")) is not bool:
+        errors.append("independent_review_required must be a boolean")
     if evidence.get("review_tier") not in {
         "documentation",
         "very_small",
@@ -2754,15 +2759,19 @@ def _self_review_audit_errors(
         errors.append("actual_review_iterations must be a positive integer")
     elif isinstance(minimum, int) and not isinstance(minimum, bool) and actual < minimum:
         errors.append("actual_review_iterations is below required minimum")
+    if evidence.get("review_tier") == "high_critical":
+        if type(minimum) is not int or minimum != 5 or type(actual) is not int or actual < 5:
+            errors.append("high-critical self-review depth must be at least 5")
+        errors.extend(
+            grabowski_merge_guard.high_critical_review_pass_evidence_errors(evidence)
+        )
     remaining = evidence.get("material_findings_remaining")
     if isinstance(remaining, bool) or not isinstance(remaining, int) or remaining < 0:
         errors.append("material_findings_remaining must be an integer >= 0")
     elif remaining > 0:
-        if evidence.get("residual_risk_accepted") is not True:
-            errors.append("material findings remain without accepted residual risk")
-        reason = evidence.get("residual_risk_reason")
-        if not isinstance(reason, str) or not reason.strip():
-            errors.append("accepted residual risk requires a reason")
+        errors.append(
+            "material findings remain; each must be resolved or disproven"
+        )
     if evidence.get("tuning_signal") != "observe":
         errors.append("tuning_signal must be observe for merge evidence")
     return errors
@@ -9075,9 +9084,12 @@ def _agent_execution_source_request(
         raise GripPreflightError("novelty must be low, medium or high")
     risk_flags = _string_list_parameter(parameters, "risk_flags")
     verification_policy = parameters.get("verification_policy", "independent_review")
-    if verification_policy not in {"deterministic", "independent_review"}:
+    if verification_policy not in {
+        "deterministic", "self_review", "independent_review",
+    }:
         raise GripPreflightError(
-            "P5 one-shot verification_policy must be deterministic or independent_review"
+            "P5 one-shot verification_policy must be deterministic, self_review "
+            "or independent_review"
         )
     effect_profile = parameters.get("effect_profile", "candidate")
     if effect_profile not in {"candidate", "delivery"}:
@@ -9314,6 +9326,11 @@ def _agent_execution_source_request(
             prompt=str(review_prompt).strip(),
             role="review",
         )
+    elif verification_policy == "self_review":
+        # The controller owns the semantic verdict. This is a non-executable
+        # placeholder in the Workspace plan, NOT an executed role verdict.
+        # collect() must return a frozen-Candidate handoff without starting it.
+        review_argv = list(execution_plan.CONTROLLER_SELF_REVIEW_PENDING_ARGV)
     else:
         review_argv = [
             "python3",
@@ -9990,6 +10007,20 @@ def _run_agent_execution_happy_path(
     _check(receipt, "workspace-coordinator-bound", "pass", str(coordinated.get("state")))
     coordinator_state = coordinated.get("state")
     if coordinator_state == "pending":
+        if coordinated.get("reason") == "controller_self_review_pending":
+            # A controller review must be a real later source-bound action.
+            # Do not launch a background continuation that would re-run the
+            # same sentinel forever or claim technical tests are reviewer PASS.
+            return with_frontdoor({
+                "state": "controller_self_review_pending",
+                "integration_ready": False,
+                "workspace_id": workspace_id,
+                "coordinator": coordinated,
+                "continuation": None,
+                "reconcile_required": False,
+                "next_action": "controller_self_review_bound_candidate",
+                "receipt_status": "passed",
+            })
         continuation = _agent_execution_start_continuation(
             workspace,
             workspace_id=workspace_id,
@@ -13914,7 +13945,8 @@ def _captain_independent_review_gate(
                 and release.get("serving_head") != expected_head
                 and isinstance(release.get("serving_release_id"), str)
                 and bool(release["serving_release_id"])
-                and release.get("independent_review_required") is True
+                and release.get("critical_release_source") is True
+                and release_deploy._critical_release_review_origin_valid(release, expected_head)
                 and _is_hex_sha(
                     release.get("release_review_identity_sha256"), lengths=(64,)
                 )
@@ -13948,6 +13980,7 @@ def _captain_independent_review_gate(
             and _is_hex_sha(expected_head, lengths=(40,))
             and isinstance(release, dict)
             and release.get("target_repo_head") == expected_head
+            and release.get("critical_release_source") is False
             and release.get("independent_review_required") is False
         )
         bound_serving = (
@@ -14058,11 +14091,10 @@ def _captain_independent_review_gate(
         )
         pass_count = int(independent_summary["pass_count"])
         errors.extend(independent_summary["errors"])
-        raw_errors = reconciliation.get("errors", [])
-        if isinstance(raw_errors, list):
-            errors.extend(str(item) for item in raw_errors if isinstance(item, str))
-        else:
-            errors.append("independent_review_reconciliation_errors_invalid")
+        optional_review = grabowski_merge_guard.decision_review_blocking_errors(
+            reconciliation, independent_required=requirement["required"],
+        )
+        errors.extend(optional_review["errors"])
         if reconciliation_status not in {"settled", "not_applicable", "blocked"}:
             errors.append("independent_review_reconciliation_status_invalid")
     if requirement["required"] and (
@@ -14092,6 +14124,10 @@ def _captain_independent_review_gate(
             else "exact-request-digest"
         ),
         "settlement_stage": "captain-preflight-and-atomic-merge-guard",
+        "optional_review_unavailability": (
+            optional_review["ignored_unavailable"]
+            if isinstance(reconciliation, dict) else []
+        ),
         "errors": errors,
     }
     if errors:
@@ -14108,7 +14144,7 @@ def _captain_independent_review_gate(
             "provider-neutral independent review role evidence is settled for the exact PR/head/base; "
             "diff-identity aliases are authoritative only after live atomic-guard revalidation"
             if requirement["required"]
-            else "no independent-review floor applies and no decision-bound review debt is present"
+            else "no independent-review floor applies and no blocking decision-bound review debt remains"
         ),
         details,
     )
@@ -16789,9 +16825,14 @@ def _run_captain_runtime_deploy(
                 "authenticated review PR and Captain action"
             )
             return execution_result
-        if not isinstance(noncritical, dict) or noncritical.get(
-            "independent_review_required"
-        ) is not False:
+        if (
+            not isinstance(noncritical, dict)
+            or noncritical.get("critical_release_source") is not False
+            or noncritical.get("independent_review_required") is not False
+            or noncritical.get("status") not in {
+                "already-serving-exact-source", "non-runtime-documentation",
+            }
+        ):
             execution_result["preflight_errors"] = ["release_review_pr_required"]
             execution_result["verification_error"] = (
                 "runtime deploy refused: no proven noncritical source exemption"

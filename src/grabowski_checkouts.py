@@ -7311,19 +7311,81 @@ def grabowski_checkout_retain(
     until = _retention_until(retention_until_unix)
     retain_purpose = _purpose(purpose)
     _require_retention_owner(record["checkout_key"], owner)
-    lease = _acquire_checkout_resources(
-        owner_id=owner,
-        repo_common_dir=common_dir,
-        checkout_path=checkout,
-        purpose=f"retain linked checkout: {retain_purpose}",
-        retention_until_unix=until,
-        metadata={
-            "checkout_path": str(checkout),
-            "repo": str(top_level),
-            "head": expected_head,
-            "branch": expected_branch,
-        },
+    # A Work Lane already holds the checkout and branch leases. The generic
+    # short-lived checkout-op owner must not steal or require releasing them.
+    # Extend only the same active lifecycle under its exact source and owner;
+    # never turn a stale lease, foreign checkout or completed binding into work.
+    lane_binding = (
+        _strict_lifecycle_binding(record["checkout_key"])
+        if re.fullmatch(r"lane:[0-9a-f]{32}", owner) else None
     )
+    same_lane_renewal = lane_binding is not None and lane_binding.get("owner_id") == owner
+    renewed_lifecycle = None
+    if same_lane_renewal:
+        assert lane_binding is not None
+        previous = _retention_records([record["checkout_key"]]).get(record["checkout_key"])
+        if (
+            lane_binding.get("phase") != "active"
+            or lane_binding.get("repo_common_dir") != str(common_dir)
+            or lane_binding.get("repo_path") != str(top_level)
+            or lane_binding.get("checkout_path") != str(checkout)
+            or lane_binding.get("expected_head") != expected_head
+            or lane_binding.get("expected_branch") != expected_branch
+            or lane_binding.get("purpose") != retain_purpose
+            or not isinstance(previous, dict)
+            or previous.get("owner_id") != owner
+            or previous.get("checkout_path") != str(checkout)
+            or previous.get("expected_head") != expected_head
+            or previous.get("expected_branch") != expected_branch
+            or until <= max(
+                int(previous.get("retention_until_unix") or 0),
+                int(lane_binding.get("retention_until_unix") or 0),
+            )
+        ):
+            raise PermissionError("same-lane checkout retention identity or monotonicity invalid")
+        keys = [
+            resources.normalize_resource_key(f"path:{checkout}"),
+            resources.normalize_resource_key(f"repo:{top_level}:branch:{record['branch']}"),
+        ]
+        held = []
+        for key in keys:
+            current = resources.inspect_resource(key)
+            if (
+                not isinstance(current, dict)
+                or current.get("owner_id") != owner
+                or type(current.get("expires_at_unix")) is not int
+                or current["expires_at_unix"] <= _now()
+            ):
+                raise PermissionError("same-lane checkout renewal requires live exact owner leases")
+            held.append(current)
+        renewed_lifecycle = _reserve_checkout_lifecycle(
+            repo_common_dir=common_dir,
+            repo_path=top_level,
+            checkout_path=checkout,
+            owner_id=owner,
+            purpose=retain_purpose,
+            source_kind=lane_binding["source"]["kind"],
+            source_id=lane_binding["source"]["id"],
+            artifact_class=lane_binding["artifact_class"],
+            retention_until_unix=until,
+            expected_head=expected_head,
+            expected_branch=expected_branch,
+        )
+        lease = {"owner_id": owner, "leases": held, "reused_lane_owner": True}
+    else:
+        lease = _acquire_checkout_resources(
+            owner_id=owner,
+            repo_common_dir=common_dir,
+            checkout_path=checkout,
+            purpose=f"retain linked checkout: {retain_purpose}",
+            retention_until_unix=until,
+            metadata={
+                "checkout_path": str(checkout),
+                "repo": str(top_level),
+                "head": expected_head,
+                "branch": expected_branch,
+            },
+        )
     try:
         retention = _upsert_retention(
             checkout_key=record["checkout_key"],
@@ -7337,7 +7399,10 @@ def grabowski_checkout_retain(
             expected_branch=expected_branch,
         )
     finally:
-        lease_release = _release_checkout_resources(lease)
+        lease_release = (
+            {"released": [], "owner_id": owner, "preserved_lane_leases": True}
+            if same_lane_renewal else _release_checkout_resources(lease)
+        )
     audit = {
         "timestamp_unix": _now(),
         "operation": "checkout-retain",
@@ -7351,7 +7416,11 @@ def grabowski_checkout_retain(
         "resource_keys": [item["resource_key"] for item in lease["leases"]],
     }
     base._append_audit(audit)
-    return {"retention": retention, "lease": lease, "lease_release": lease_release, "audit": audit}
+    return {
+        "retention": retention, "lease": lease, "lease_release": lease_release,
+        "audit": audit,
+        **({"lifecycle": renewed_lifecycle} if renewed_lifecycle is not None else {}),
+    }
 
 
 def _terminal_detached_archive_transition(

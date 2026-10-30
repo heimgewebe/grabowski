@@ -286,6 +286,7 @@ class Pr1366CurrentHeadReviewRegressions(unittest.TestCase):
                 "status": "already-serving-exact-source",
                 "serving_repo_head": expected,
                 "target_repo_head": expected,
+                "critical_release_source": False,
                 "independent_review_required": False,
             },
         ), patch.object(
@@ -449,6 +450,7 @@ class Pr1366CurrentHeadReviewRegressions(unittest.TestCase):
                 "status": "already-serving-exact-source",
                 "serving_repo_head": expected,
                 "target_repo_head": expected,
+                "critical_release_source": False,
                 "independent_review_required": False,
             },
         ), patch.object(
@@ -563,7 +565,7 @@ class Pr1366CurrentHeadReviewRegressions(unittest.TestCase):
 
         with self.subTest(failure="source-readback"), patch.object(
             real_deploy, "_require_release_source_admission",
-            return_value={"status": "non-runtime-documentation", "serving_repo_head": "a" * 40, "target_repo_head": CAPTAIN_HEAD, "changed_path_count": 1, "independent_review_required": False},
+            return_value={"status": "non-runtime-documentation", "serving_repo_head": "a" * 40, "target_repo_head": CAPTAIN_HEAD, "changed_path_count": 1, "critical_release_source": False, "independent_review_required": False},
         ), patch.object(
             grips, "_runtime_deploy_self_preflight", return_value=preflight
         ), patch.object(
@@ -589,7 +591,7 @@ class Pr1366CurrentHeadReviewRegressions(unittest.TestCase):
         }
         with self.subTest(failure="schedule-validation"), patch.object(
             real_deploy, "_require_release_source_admission",
-            return_value={"status": "non-runtime-documentation", "serving_repo_head": "a" * 40, "target_repo_head": CAPTAIN_HEAD, "changed_path_count": 1, "independent_review_required": False},
+            return_value={"status": "non-runtime-documentation", "serving_repo_head": "a" * 40, "target_repo_head": CAPTAIN_HEAD, "changed_path_count": 1, "critical_release_source": False, "independent_review_required": False},
         ), patch.object(
             grips, "_runtime_deploy_self_preflight", return_value=preflight
         ), patch.object(
@@ -1110,6 +1112,7 @@ class Pr1366CurrentHeadReviewRegressions(unittest.TestCase):
                 "status": "already-serving-exact-source",
                 "serving_repo_head": expected,
                 "target_repo_head": expected,
+                "critical_release_source": False,
                 "independent_review_required": False,
             },
         ), patch.object(

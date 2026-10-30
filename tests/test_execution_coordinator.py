@@ -97,6 +97,25 @@ class ExecutionCoordinatorTests(unittest.TestCase):
             "result_sha256": "c" * 64,
         }
 
+    def test_unperformed_controller_review_is_pending_not_terminal_block(self) -> None:
+        status = self.status()
+        with mock.patch.object(
+            coordinator.workspace, "grabowski_agent_workspace_collect",
+            return_value={
+                "state": "controller_self_review_pending",
+                "candidate_id": "c" * 64,
+                "receipt_status": "passed",
+                "next_action": "controller_self_review_bound_candidate",
+            },
+        ):
+            result = coordinator._collect_effect(
+                "gaw-self-review", polls=1, actions=[], status=status,
+            )
+        self.assertEqual(result["state"], "pending")
+        self.assertEqual(result["reason"], "controller_self_review_pending")
+        self.assertFalse(result["adoption_performed"])
+        self.assertFalse(result["publication_performed"])
+
     def test_closed_workspace_reduces_without_irrelevant_task_shape(self) -> None:
         decision = coordinator.reduce_status(
             {
