@@ -261,6 +261,114 @@ class ScheduledWorkerGitFilterTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "dirty"):
                 worker.verify_repository(repo, repo, "canonical-main", head)
 
+    def test_auto_crlf_checkout_clean_without_filter_execution(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="worker-auto-crlf-") as dirname:
+            repo, _ = self.make_repo(Path(dirname))
+            tracked = repo / "tracked.txt"
+            (repo / ".gitattributes").write_text(
+                "*.txt text=auto eol=crlf\n", encoding="utf-8"
+            )
+            self.git(repo, "add", ".gitattributes")
+            self.git(repo, "commit", "-qm", "Declare auto CRLF text")
+            head = self.git(repo, "rev-parse", "HEAD")
+            self.git(repo, "update-ref", "refs/remotes/origin/main", head)
+            tracked.unlink()
+            self.git(repo, "checkout", "--", "tracked.txt")
+            self.assertEqual(tracked.read_bytes(), b"original\r\n")
+            self.assertEqual(
+                self.git(repo, "status", "--porcelain=v1", "--untracked-files=normal"), ""
+            )
+            worker.verify_repository(repo, repo, "canonical-main", head)
+            tracked.write_bytes(b"changed\r\n")
+            with self.assertRaisesRegex(RuntimeError, "dirty"):
+                worker.verify_repository(repo, repo, "canonical-main", head)
+
+    def test_auto_binary_crlf_change_cannot_be_laundered(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="worker-auto-binary-") as dirname:
+            repo, _ = self.make_repo(Path(dirname))
+            tracked = repo / "tracked.txt"
+            tracked.write_bytes(b"original\x00\n")
+            (repo / ".gitattributes").write_text(
+                "*.txt text=auto eol=crlf\n", encoding="utf-8"
+            )
+            self.git(repo, "add", ".gitattributes", "tracked.txt")
+            self.git(repo, "commit", "-qm", "Commit auto binary source")
+            head = self.git(repo, "rev-parse", "HEAD")
+            self.git(repo, "update-ref", "refs/remotes/origin/main", head)
+            tracked.unlink()
+            self.git(repo, "checkout", "--", "tracked.txt")
+            self.assertEqual(tracked.read_bytes(), b"original\x00\n")
+            tracked.write_bytes(b"original\x00\r\n")
+            self.assertNotEqual(
+                self.git(repo, "status", "--porcelain=v1", "--untracked-files=normal"), ""
+            )
+            with self.assertRaisesRegex(RuntimeError, "dirty"):
+                worker.verify_repository(repo, repo, "canonical-main", head)
+
+    def test_auto_control_byte_binary_change_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="worker-auto-control-") as dirname:
+            repo, _ = self.make_repo(Path(dirname))
+            tracked = repo / "tracked.txt"
+            tracked.write_bytes(b"original\x01\n")
+            (repo / ".gitattributes").write_text(
+                "*.txt text=auto eol=crlf\n", encoding="utf-8"
+            )
+            self.git(repo, "add", ".gitattributes", "tracked.txt")
+            self.git(repo, "commit", "-qm", "Commit auto control-byte binary source")
+            head = self.git(repo, "rev-parse", "HEAD")
+            self.git(repo, "update-ref", "refs/remotes/origin/main", head)
+            tracked.unlink()
+            self.git(repo, "checkout", "--", "tracked.txt")
+            self.assertEqual(tracked.read_bytes(), b"original\x01\n")
+            tracked.write_bytes(b"original\x01\r\n")
+            self.assertNotEqual(
+                self.git(repo, "status", "--porcelain=v1", "--untracked-files=normal"), ""
+            )
+            with self.assertRaisesRegex(RuntimeError, "dirty"):
+                worker.verify_repository(repo, repo, "canonical-main", head)
+
+    def test_auto_bare_cr_binary_change_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="worker-auto-barecr-") as dirname:
+            repo, _ = self.make_repo(Path(dirname))
+            tracked = repo / "tracked.txt"
+            tracked.write_bytes(b"original\rlast\n")
+            (repo / ".gitattributes").write_text(
+                "*.txt text=auto eol=crlf\n", encoding="utf-8"
+            )
+            self.git(repo, "add", ".gitattributes", "tracked.txt")
+            self.git(repo, "commit", "-qm", "Commit auto bare-CR binary source")
+            head = self.git(repo, "rev-parse", "HEAD")
+            self.git(repo, "update-ref", "refs/remotes/origin/main", head)
+            tracked.unlink()
+            self.git(repo, "checkout", "--", "tracked.txt")
+            self.assertEqual(tracked.read_bytes(), b"original\rlast\n")
+            tracked.write_bytes(b"original\rlast\r\n")
+            self.assertNotEqual(
+                self.git(repo, "status", "--porcelain=v1", "--untracked-files=normal"), ""
+            )
+            with self.assertRaisesRegex(RuntimeError, "dirty"):
+                worker.verify_repository(repo, repo, "canonical-main", head)
+
+    def test_auto_printable_ratio_allows_real_text_with_control_byte(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="worker-auto-text-ratio-") as dirname:
+            repo, _ = self.make_repo(Path(dirname))
+            tracked = repo / "tracked.txt"
+            tracked.write_bytes(b"x" * 300 + b"\x01\n")
+            (repo / ".gitattributes").write_text(
+                "*.txt text=auto eol=crlf\n", encoding="utf-8"
+            )
+            self.git(repo, "add", ".gitattributes", "tracked.txt")
+            self.git(repo, "commit", "-qm", "Commit mostly-text auto CRLF source")
+            head = self.git(repo, "rev-parse", "HEAD")
+            self.git(repo, "update-ref", "refs/remotes/origin/main", head)
+            tracked.unlink()
+            self.git(repo, "checkout", "--", "tracked.txt")
+            self.assertEqual(tracked.read_bytes(), b"x" * 300 + b"\x01\r\n")
+            self.assertEqual(
+                self.git(repo, "status", "--porcelain=v1", "--untracked-files=normal"), ""
+            )
+            worker.verify_repository(repo, repo, "canonical-main", head)
+
     def test_eol_only_index_attribute_is_clean_and_binary_remains_dirty(self) -> None:
         with tempfile.TemporaryDirectory(prefix="worker-eol-only-") as dirname:
             root = Path(dirname)

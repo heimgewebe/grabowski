@@ -766,8 +766,8 @@ def _explicit_index_crlf_only(
     pathname: bytes,
     committed_attrs: dict[bytes, tuple[bytes, bytes]],
     expected_head: str,
-) -> bool:
-    """Use native Git rules from HEAD, never mutable source info/attributes.
+) -> bytes | None:
+    """Return the exact committed text attribute policy, never mutable overrides.
 
     check-attr --cached in the source also reads .git/info/attributes, so it
     cannot authorize CRLF normalization on its own. A private temporary bare
@@ -777,7 +777,7 @@ def _explicit_index_crlf_only(
     or invoking Git content filters.
     """
     if not committed_attrs:
-        return False
+        return None
     fields = (b"text", b"eol", b"filter", b"ident", b"working-tree-encoding")
     argv = [
         *(field.decode("ascii") for field in fields),
@@ -836,13 +836,15 @@ def _explicit_index_crlf_only(
 
     from_head = decode(committed)
     from_source = decode(effective)
-    return (
+    if (
         from_head is not None and from_head == from_source
         and from_head[b"eol"] == b"crlf"
-        and from_head[b"text"] in {b"set", b"unspecified"}
+        and from_head[b"text"] in {b"set", b"unspecified", b"auto"}
         and all(from_head[attr] in {b"unset", b"unspecified"}
                 for attr in (b"filter", b"ident", b"working-tree-encoding"))
-    )
+    ):
+        return from_head[b"text"]
+    return None
 
 
 def _crlf_normalized_chunks(tracked: Any) -> Iterator[bytes]:
@@ -859,8 +861,45 @@ def _crlf_normalized_chunks(tracked: Any) -> Iterator[bytes]:
         yield pending_cr
 
 
-def _explicit_crlf_blob_matches(tracked: Any, oid: bytes, before: os.stat_result) -> bool:
-    """Hash the same opened inode twice; bound memory and reject a raced read."""
+def _auto_crlf_text_eligible(tracked: Any) -> bool:
+    """Conservatively mirror Git convert.c binary detection, streaming only raw bytes.
+
+    A committed text=auto rule is not permission to normalize binary data.
+    Bare CR, NUL and a high control-byte ratio mean Git would leave bytes
+    unconverted; accept only text that Git can convert without a filter.
+    """
+    printable = 0
+    nonprintable = 0
+    carry = b""
+    last_byte = None
+    # Git counts these as nonprintable; BS, HT, ESC, FF count printable.
+    controls = bytes(c for c in range(1, 32) if c not in (8, 9, 10, 12, 13, 27))
+    while chunk := tracked.read(128 * 1024):
+        last_byte = chunk[-1]
+        data = carry + chunk
+        carry = b"\r" if data.endswith(b"\r") else b""
+        if carry:
+            data = data[:-1]
+        if b"\x00" in data or b"\r" in data.replace(b"\r\n", b""):
+            return False
+        bad = data.count(b"\x7f") + sum(data.count(bytes((c,))) for c in controls)
+        nonprintable += bad
+        printable += len(data) - data.count(b"\r") - data.count(b"\n") - bad
+    if carry:
+        return False
+    # Git's gather_stats excludes a final DOS EOF (CTRL-Z) from the ratio.
+    if last_byte == 26:
+        nonprintable -= 1
+    return (printable >> 7) >= nonprintable
+
+
+def _explicit_crlf_blob_matches(
+    tracked: Any, oid: bytes, before: os.stat_result, *, automatic_text: bool = False,
+) -> bool:
+    """Hash opened inode; text=auto must first prove Git-compatible text bytes."""
+    if automatic_text and not _auto_crlf_text_eligible(tracked):
+        return False
+    tracked.seek(0)
     normalized_size = sum(len(chunk) for chunk in _crlf_normalized_chunks(tracked))
     tracked.seek(0)
     digest = hashlib.sha1() if len(oid) == 40 else hashlib.sha256()
@@ -976,14 +1015,16 @@ def _repository_dirty_without_git_filters(
                         ):
                             return True
                         if digest.hexdigest().encode("ascii") != oid:
-                            if not _explicit_index_crlf_only(
+                            text_policy = _explicit_index_crlf_only(
                                 repo, environment, pathname, committed_attrs,
                                 expected_head,
-                            ):
+                            )
+                            if text_policy is None:
                                 return True
                             tracked.seek(0)
                             normalized_match = _explicit_crlf_blob_matches(
-                                tracked, oid, before
+                                tracked, oid, before,
+                                automatic_text=text_policy == b"auto",
                             )
             finally:
                 os.close(parent_fd)
