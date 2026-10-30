@@ -1980,11 +1980,15 @@ def _nixos_completed_backup_from_persistent_journal(now: int) -> dict[str, Any] 
     journal = operator._run(
         ["/run/current-system/sw/bin/journalctl", "--system", "--no-pager",
          "--output=json", "-u", unit,
+         # Only required journal fields; --lines remains capped at 128.
+         "--output-fields=__CURSOR,__REALTIME_TIMESTAMP,__MONOTONIC_TIMESTAMP,"
+         "_BOOT_ID,_UID,_PID,_SYSTEMD_UNIT,_TRANSPORT,UNIT,INVOCATION_ID,"
+         "_SYSTEMD_INVOCATION_ID,MESSAGE,MESSAGE_ID,JOB_RESULT,JOB_TYPE",
          # Do not prefilter by realtime: a newer boot can have an older clock.
          # The latest 128 journal matches establish order before age checks.
          "--grep", r"^(Starting restic-backups-heim-pc\.service\.\.\.|Finished restic-backups-heim-pc\.service\.|snapshot [0-9a-f]{8,64} saved)$",
          "-n", "128"],
-        cwd=operator.HOME, timeout_seconds=30, max_output_bytes=65536,
+        cwd=operator.HOME, timeout_seconds=30, max_output_bytes=256 * 1024,
     )
     if (journal.get("returncode") != 0 or journal.get("stdout_truncated")
             or not isinstance(journal.get("stdout"), str)):

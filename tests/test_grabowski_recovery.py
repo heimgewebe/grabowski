@@ -1029,6 +1029,17 @@ class NativeNixOSResticProofTests(unittest.TestCase):
             _BOOT_ID="c" * 32, INVOCATION_ID="f" * 32,
         ), 9)
 
+        # 125 preceding root-owned, correctly shaped service records with
+        # irrelevant journal metadata fill a valid 128-record history.
+        historical_noise = [
+            manager(
+                "start", (self.now - 400 + n) * 1_000_000, n + 1,
+                INVOCATION_ID=f"{n + 1:032x}",
+                SYSLOG_IDENTIFIER="x" * 600,
+            )
+            for n in range(125)
+        ]
+
         def postboot(**changed):
             fields = {
                 "LoadState": "loaded", "ActiveState": "inactive", "Job": "",
@@ -1044,6 +1055,7 @@ class NativeNixOSResticProofTests(unittest.TestCase):
         cases = (
             ("reboot_success", clean, postboot(), True),
             ("chronological_order", [beginning, save, finished], postboot(), True),
+            ("full_128_entry_journal", historical_noise + cursor_clean, postboot(), True),
             ("missing_start", [finished, save], postboot(), False),
             ("missing_finish", [save, beginning], postboot(), False),
             ("missing_snapshot", [finished, beginning], postboot(), False),
@@ -1105,7 +1117,7 @@ class NativeNixOSResticProofTests(unittest.TestCase):
             label, events, unit_output, accepted = row[:4]
             stamp = row[4] if len(row) == 5 else self.now
             seen = []
-            def run(argv, **_):
+            def run(argv, **kwargs):
                 seen.append(argv)
                 if argv[0].endswith("/systemctl"):
                     return {"returncode": 0, "stdout": unit_output}
@@ -1119,9 +1131,26 @@ class NativeNixOSResticProofTests(unittest.TestCase):
                             event for event in events
                             if int(event["__REALTIME_TIMESTAMP"]) >= since * 1_000_000
                         ]
+                    # Model journalctl output-fields and the fixed _run capture
+                    # budget; extra metadata must not exhaust a valid history.
+                    fields = next(
+                        (arg.split("=", 1)[1] for arg in argv
+                         if arg.startswith("--output-fields=")),
+                        None,
+                    )
+                    if fields is not None:
+                        allowed = set(fields.split(","))
+                        available = [
+                            {key: value for key, value in event.items()
+                             if key in allowed or key.startswith("__")}
+                            for event in available
+                        ]
+                    payload = "\n".join(json.dumps(event) for event in available) + "\n"
+                    limit = kwargs.get("max_output_bytes", 65_536)
                     return {
                         "returncode": 0,
-                        "stdout": "\n".join(json.dumps(event) for event in available) + "\n",
+                        "stdout": payload[:limit],
+                        "stdout_truncated": len(payload.encode("utf-8")) > limit,
                     }
                 raise AssertionError(f"unexpected execution: {argv}")
 
