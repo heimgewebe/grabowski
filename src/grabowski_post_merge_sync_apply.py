@@ -656,7 +656,11 @@ def apply(
     )
     resource_keys = resources.normalize_resource_keys(
         [
-            f"repo:{repo}",
+            (
+                bureau_leases.BUREAU_WORKTREE_ADMIN_KEY
+                if repo == bureau_leases.BUREAU_REPOSITORY_ROOT
+                else f"repo:{repo}"
+            ),
             f"path:{repo}",
             f"path:{identity['git_common_dir']}",
             *_physical_checkout_resource_keys(initial_physical),

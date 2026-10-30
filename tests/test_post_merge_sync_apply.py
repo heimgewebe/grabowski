@@ -2443,6 +2443,11 @@ class PostMergeSyncApplyTests(unittest.TestCase):
 
             with (
                 patch.object(sync_apply.bureau_leases, "BUREAU_REPOSITORY_ROOT", repo),
+                patch.object(
+                    sync_apply.bureau_leases,
+                    "BUREAU_WORKTREE_ADMIN_KEY",
+                    f"path:{repo / '.bureau-scopes' / 'worktree-admin'}",
+                ),
                 patched_leases(leases),
                 patch.object(sync_apply.resources, "acquire_resources", bounded_acquire),
             ):
@@ -2451,6 +2456,11 @@ class PostMergeSyncApplyTests(unittest.TestCase):
             self.assertEqual("synced", result["state"])
             self.assertEqual(
                 [sync_apply.bureau_leases.MAX_EFFECT_GATE_TTL_SECONDS], ttl_observed
+            )
+            self.assertNotIn(f"repo:{repo}", result["resource_keys"])
+            self.assertIn(
+                f"path:{repo / '.bureau-scopes' / 'worktree-admin'}",
+                result["resource_keys"],
             )
             self.assertEqual(0, len(leases.live))
 
