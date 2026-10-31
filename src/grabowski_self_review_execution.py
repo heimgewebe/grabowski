@@ -2070,7 +2070,31 @@ def _assert_prior_first_party_material_findings_resolved(
                         "repo", "pr", "base_sha", "head_sha",
                         "review_purpose", "release_binding",
                     )
-                    if not all(candidate.get(k) == decisive.get(k) for k in revision_fields):
+                    # GitHub repository names are case-insensitive. Keep the
+                    # signed bytes untouched, but never skip a signed REJECT
+                    # merely because a caller used another name casing.
+                    candidate_repo = candidate.get("repo")
+                    decisive_repo = decisive.get("repo")
+                    # Reject malformed signed history before comparing repos.
+                    # Both GitHub slugs and first-party signer bindings use
+                    # ASCII identifiers; Unicode casefold can merge distinct
+                    # names (e.g. long-s and s), so compare ASCII lower only.
+                    if (
+                        not isinstance(candidate_repo, str)
+                        or re.fullmatch(r"heimgewebe/[A-Za-z0-9_.-]+", candidate_repo) is None
+                        or not isinstance(decisive_repo, str)
+                        or re.fullmatch(r"heimgewebe/[A-Za-z0-9_.-]+", decisive_repo) is None
+                    ):
+                        raise ReviewExecutionRejected(
+                            "previous signed session repository identity invalid"
+                        )
+                    if (
+                        candidate_repo.lower() != decisive_repo.lower()
+                        or any(
+                            candidate.get(k) != decisive.get(k)
+                            for k in revision_fields if k != "repo"
+                        )
+                    ):
                         continue
                     if decisive.get("review_purpose") == "frozen_candidate":
                         # A new signed Test receipt changes the full Candidate
@@ -2096,22 +2120,29 @@ def _assert_prior_first_party_material_findings_resolved(
                     )
                     if legacy_history_only and not isinstance(old.get("worktree"), str):
                         raise ReviewExecutionRejected("previous signed review worktree invalid")
+                    old_binding = _first_party_binding(candidate)
                     if "canonical_diff_sha256" not in session:
-                        # The legacy fallback has no current first-party batch.
-                        # Inspect the signed registry first: unrelated history
-                        # must not require the target revision to be checked out.
+                        # Check the original signed Git repository spelling,
+                        # not a caller-supplied case alias. A frozen Candidate
+                        # may rotate its Test receipt without changing the
+                        # signed Writer patch: verify the CURRENT Candidate
+                        # source while keeping the historical Git origin.
+                        source_binding = (
+                            {**decisive, "repo": old_binding["repo"]}
+                            if old_binding["review_purpose"] == "frozen_candidate"
+                            else old_binding
+                        )
                         from grabowski_self_review_producer import _current_source
 
                         session["source_raw_diff_sha256"] = _current_source(
-                            historical_repository, decisive,
+                            historical_repository, source_binding,
                         )
                         session["canonical_diff_sha256"] = hashlib.sha256(
-                            _first_party_diff(historical_repository, decisive)
+                            _first_party_diff(historical_repository, source_binding)
                         ).hexdigest()
                         session["changed_paths"] = _first_party_changed_paths(
-                            historical_repository, decisive,
+                            historical_repository, source_binding,
                         )
-                    old_binding = _first_party_binding(candidate)
                     if (
                         old.get("schema_version") != 1
                         or old.get("binding_sha256") != _digest(old_binding)
