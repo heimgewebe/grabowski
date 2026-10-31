@@ -31,7 +31,9 @@ concurrency:
       || inputs.pr
       || github.run_id
     }}
-  cancel-in-progress: true
+  # Review comments must not cancel the required current-head PR check.
+  # Each run reads the live PR revision and publishes a bound status.
+  cancel-in-progress: false
 
 jobs:
   settle:

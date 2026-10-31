@@ -186,14 +186,17 @@ class CodexReviewSettlementWorkflowTests(unittest.TestCase):
             self.text,
         )
 
-    def test_concurrency_is_bound_to_pull_request_without_bot_special_case(self) -> None:
+    def test_concurrency_keeps_head_check_alive_during_provider_comment(self) -> None:
         concurrency = self.text.split("concurrency:\n", 1)[1].split("\njobs:\n", 1)[0]
         self.assertIn("github.event.pull_request.number", concurrency)
         self.assertIn("github.event.issue.number", concurrency)
         self.assertIn("inputs.pr", concurrency)
         self.assertIn("github.run_id", concurrency)
         self.assertNotIn("github.event.comment.user.login", concurrency)
-        self.assertIn("cancel-in-progress: true", concurrency)
+        # An issue_comment on the same PR must not cancel the source-bound
+        # pull_request_target check before it publishes a terminal status.
+        self.assertIn("cancel-in-progress: false", concurrency)
+        self.assertNotIn("cancel-in-progress: true", concurrency)
 
     def test_bootstrap_without_default_branch_evaluator_fails_explicitly(self) -> None:
         evaluate_section = self.text.split(
