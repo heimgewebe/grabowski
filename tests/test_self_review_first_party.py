@@ -2184,6 +2184,62 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
         )
         self.assertEqual(set(review.REQUIRED_AXES), set(verified))
 
+
+    def test_single_600k_generated_diff_line_remains_fully_signed_and_covered(self) -> None:
+        generated = self.repo / "src" / "large-generated-line.json"
+        generated.write_text('{"payload":"' + ("x" * 600_000) + '"}\n', encoding="utf-8")
+        self._git("add", "src/large-generated-line.json")
+        self._git("commit", "-qm", "add one large immutable generated source line")
+        self.head = self._git("rev-parse", "HEAD").strip()
+        plan = self._first_party_plan()
+        started = self._start_plan(plan)
+        lines = review._first_party_diff(self.repo, plan["binding"]).decode("utf-8").splitlines(keepends=True)
+        largest_line = max(len(line.encode("utf-8")) for line in lines)
+        self.assertGreater(largest_line, 256 * 1024)
+        self.assertLess(largest_line, review.FIRST_PARTY_MAX_READ_BYTES)
+        largest_line_number = max(
+            range(1, len(lines) + 1), key=lambda n: len(lines[n - 1].encode("utf-8"))
+        )
+        # Failed signed read consumes its request ID; positive call must differ.
+        with mock.patch.object(review, "FIRST_PARTY_MAX_READ_BYTES", 256 * 1024):
+            with self.assertRaisesRegex(review.ReviewExecutionRejected, "canonical diff chunk over budget"):
+                self._read(
+                    started, review.REQUIRED_AXES[0], "diff", "", "head",
+                    largest_line_number, largest_line_number,
+                )
+        complete = self._read(started, review.REQUIRED_AXES[0], "diff", "", "head", 1, len(lines))
+        self.assertEqual(len(lines), complete["diff_total_lines"])
+        self.assertEqual(
+            hashlib.sha256("".join(lines).encode("utf-8")).hexdigest(),
+            complete["content_sha256"],
+        )
+        for number, axis in enumerate(review.REQUIRED_AXES, start=1):
+            self._submit_axis(started, axis, number, full_diff=False)
+        audit, receipts = self._seal_direct(plan)
+        self.assertEqual([], self._receipt_errors(audit, receipts))
+
+
+    def test_generated_diff_line_above_new_budget_remains_unreadable(self) -> None:
+        generated = self.repo / "src" / "overlarge-generated-line.json"
+        generated.write_text(
+            '{"payload":"' + ("x" * (review.FIRST_PARTY_MAX_READ_BYTES + 1)) + '"}\n',
+            encoding="utf-8",
+        )
+        self._git("add", "src/overlarge-generated-line.json")
+        self._git("commit", "-qm", "add over-budget generated source line")
+        self.head = self._git("rev-parse", "HEAD").strip()
+        plan = self._first_party_plan()
+        started = self._start_plan(plan)
+        lines = review._first_party_diff(self.repo, plan["binding"]).decode("utf-8").splitlines(keepends=True)
+        large_line_number = max(range(1, len(lines) + 1), key=lambda i: len(lines[i - 1].encode("utf-8")))
+        self.assertGreater(len(lines[large_line_number - 1].encode("utf-8")), review.FIRST_PARTY_MAX_READ_BYTES)
+        with self.assertRaisesRegex(review.ReviewExecutionRejected, "canonical diff chunk over budget"):
+            self._read(
+                started, review.REQUIRED_AXES[0], "diff", "", "head",
+                large_line_number, large_line_number,
+            )
+        self.assertFalse(list((self.state / "sessions" / started["review_session_id"] / "reads").glob("*.json")))
+
     def test_authenticated_self_review_mcp_mutations_require_operator_gate(self) -> None:
         # Even an enrolled connector cannot persist a signed review while
         # the operator mutation blockade or audit-integrity gate is denying.
