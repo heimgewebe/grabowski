@@ -2241,8 +2241,31 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
         self.assertFalse(list((self.state / "sessions" / started["review_session_id"] / "reads").glob("*.json")))
 
 
+    def test_signed_read_wire_budget_without_optional_mcp_sdk(self) -> None:
+        payload = {
+            "status": "source_read_recorded",
+            "content": "x" * 600_000,
+            "read_id": "a" * 32,
+            "content_sha256": hashlib.sha256(b"x" * 600_000).hexdigest(),
+        }
+        # CI has only a deliberately stubbed MCP module. The signer must
+        # still validate real single-copy source bytes independently of SDK.
+        self.assertIsNone(review.first_party_source_read_wire_budget_validate(payload))
+        legacy_duplicate = json.dumps(
+            {"content": [payload], "structuredContent": payload},
+            ensure_ascii=False, separators=(",", ":"),
+        )
+        self.assertGreater(len(legacy_duplicate.encode("utf-8")), review.MAX_OUTPUT)
+        with self.assertRaisesRegex(review.ReviewExecutionRejected, "transport budget"):
+            review.first_party_source_read_wire_budget_validate({
+                **payload, "content": "\x01" * 200_000,
+            })
+
     def test_mcp_signed_read_600k_uses_one_transport_copy(self) -> None:
-        from mcp.types import CallToolResult
+        try:
+            from mcp.types import CallToolResult, TextContent
+        except ImportError:
+            self.skipTest("Real MCP SDK unavailable; signer wire-size gate is tested without it")
         import grabowski_mcp as server
 
         payload = {
