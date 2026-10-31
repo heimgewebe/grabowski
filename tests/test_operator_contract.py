@@ -5146,7 +5146,7 @@ class OperatorContractTests(unittest.TestCase):
             )
             with patch.object(operator, "_require_operator_mutation", return_value=None):
                 with self.assertRaisesRegex(
-                    PermissionError, "expected_preimage_sha256 is required"
+                    PermissionError, "Git -c configuration is not an inert override"
                 ):
                     operator.grabowski_git(
                         str(repo),
@@ -6144,6 +6144,123 @@ class OperatorContractTests(unittest.TestCase):
                 ["push", "origin", "HEAD:refs/heads/feature"],
                 repo,
             )
+
+    def test_git_global_config_rejects_executable_helper_overrides(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            operator.subprocess.run(
+                ["git", "init", "-q", "-b", "feature", str(repo)], check=True
+            )
+            hostile = (
+                "core.hooksPath=/tmp/untrusted-hooks",
+                "filter.attacker.clean=sh -c 'echo EXECUTED'",
+                "filter.attacker.process=sh -c 'echo EXECUTED'",
+                "core.fsmonitor=/tmp/untrusted-fsmonitor",
+                "diff.external=/tmp/untrusted-diff",
+                "diff.attacker.command=/tmp/untrusted-driver",
+                "core.editor=/tmp/untrusted-editor",
+                "gpg.program=/tmp/untrusted-signer",
+                "credential.helper=!sh -c 'echo EXECUTED'",
+            )
+            for config in hostile:
+                with self.subTest(config=config):
+                    with self.assertRaisesRegex(
+                        PermissionError, "Git -c configuration is not an inert override"
+                    ):
+                        operator._guard_git(
+                            ["-c", config, "commit", "-m", "unsafe"], repo
+                        )
+            for config in (
+                "core.pager=cat", "core.hooksPath=/dev/null",
+                "core.fsmonitor=false", "commit.gpgSign=false",
+            ):
+                with self.subTest(inert=config):
+                    operator._guard_git(
+                        ["-c", config, "status"], repo
+                    )
+
+    def test_grabowski_git_exact_preimage_commit_disables_hooks_and_signing(self) -> None:
+        operator = _load_operator_module()
+        import grabowski_resources as resources
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            operator.subprocess.run(
+                ["git", "init", "-q", "-b", "feature", str(repo)], check=True
+            )
+            for key, value in (
+                ("user.name", "Grabowski Test"),
+                ("user.email", "grabowski@example.invalid"),
+            ):
+                operator.subprocess.run(
+                    ["git", "-C", str(repo), "config", key, value], check=True
+                )
+            tracked = repo / "tracked.txt"
+            tracked.write_text("base\n", encoding="utf-8")
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "add", "tracked.txt"], check=True
+            )
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "commit", "-qm", "base"], check=True
+            )
+            tracked.write_text("new reviewed content\n", encoding="utf-8")
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "add", "tracked.txt"], check=True
+            )
+            hooks = root / "hooks"
+            hooks.mkdir()
+            hook_marker = root / "precommit-executed"
+            hook = hooks / "pre-commit"
+            hook.write_text(
+                "#!/bin/sh\ntouch " + str(hook_marker) + "\n", encoding="utf-8"
+            )
+            hook.chmod(0o700)
+            signer_marker = root / "signer-executed"
+            signer = root / "signer"
+            signer.write_text(
+                "#!/bin/sh\ntouch " + str(signer_marker) + "\nexit 1\n",
+                encoding="utf-8",
+            )
+            signer.chmod(0o700)
+            for key, value in (
+                ("core.hooksPath", str(hooks)),
+                ("commit.gpgSign", "true"),
+                ("gpg.program", str(signer)),
+            ):
+                operator.subprocess.run(
+                    ["git", "-C", str(repo), "config", key, value], check=True
+                )
+            expected = operator._git_branch_preimage(repo)["preimage_sha256"]
+            attempt = {
+                "schema_version": 1,
+                "owner_id": "operator:exact-preimage-no-hooks",
+                "operation_id": "commit-exact-preimage-guard",
+                "attempt_id": "attempt-1",
+                "branch": "feature",
+                "expected_preimage_sha256": expected,
+            }
+            with (
+                patch.object(resources, "RESOURCE_DB", root / "resources.sqlite3"),
+                patch.object(operator, "_require_operator_mutation", return_value=None),
+                patch.object(operator, "_append_effect_audit", return_value="a" * 64),
+            ):
+                result = operator.grabowski_git(
+                    str(repo), ["commit", "-m", "verified without helpers"],
+                    branch_attempt=attempt,
+                )
+            self.assertEqual(result["returncode"], 0, result.get("stderr"))
+            self.assertEqual(result["branch_mutation"]["status"], "completed")
+            self.assertFalse(hook_marker.exists(), "untrusted pre-commit hook executed")
+            self.assertFalse(signer_marker.exists(), "untrusted signing helper executed")
+            self.assertIn("core.hooksPath=/dev/null", result["argv"])
+            self.assertIn("core.fsmonitor=false", result["argv"])
+            self.assertIn("commit.gpgSign=false", result["argv"])
+            committed = operator.subprocess.check_output(
+                ["git", "-C", str(repo), "show", "HEAD:tracked.txt"]
+            )
+            self.assertEqual(committed, b"new reviewed content\n")
 
     def test_privileged_reference_has_expiry_replay_policy_and_bound_hash(self) -> None:
         operator = _load_operator_module()

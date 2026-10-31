@@ -8055,6 +8055,30 @@ def _guard_git(arguments: list[str], repo: Path) -> None:
 
     subcommand, command_arguments, configurations = _split_git_invocation(arguments)
     _reject_git_alias_configuration(configurations)
+    # A caller-supplied Git -c comes after our root-owned Git settings and can
+    # override them at the actual effect (hooks, filters, fsmonitor, signing,
+    # credential or diff helpers). Admit only explicitly inert assignments.
+    inert_config = {
+        "core.pager": "cat",
+        "pager.status": "false",
+        "pager.diff": "false",
+        "pager.log": "false",
+        "pager.show": "false",
+        "core.hookspath": "/dev/null",
+        "core.fsmonitor": "false",
+        "core.editor": "/dev/null",
+        "commit.gpgsign": "false",
+        "diff.external": "",
+        "diff.trustexitcode": "false",
+        "advice.graftfiledeprecated": "false",
+    }
+    for key, value in configurations:
+        if key in {"user.name", "user.email"} and value.strip() and len(value) <= 256:
+            continue
+        if key not in inert_config or value.casefold() != inert_config[key]:
+            raise PermissionError(
+                "Git -c configuration is not an inert override: " + key
+            )
     if subcommand in GIT_REMOTE_WRITE_BYPASS_SUBCOMMANDS:
         raise PermissionError(
             f"Direct Git remote-write subcommand is blocked; use push: {subcommand}"
@@ -9093,7 +9117,19 @@ def grabowski_git(
         ]
         environment = _git_push_environment()
     else:
-        command_prefix = [_trusted_git_cli_path(), "-C", str(path)]
+        # Every local mutation, including a commit with an explicit CAS
+        # preimage, must disable executable repo hooks, fsmonitor and signing
+        # at Git spawn; the JIT-only fallback below was insufficient.
+        command_prefix = [
+            _trusted_git_cli_path(),
+            "-c", "core.hooksPath=/dev/null",
+            "-c", "core.fsmonitor=false",
+            "-c", "commit.gpgSign=false",
+            "-c", "core.editor=/dev/null",
+            "-c", "diff.external=",
+            "-c", "diff.trustExitCode=false",
+            "-C", str(path),
+        ]
         environment = _git_environment()
     if read_shape is None:
         command = _validate_argv([*command_prefix, *arguments], cwd=path)
