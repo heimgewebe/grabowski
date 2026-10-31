@@ -1031,7 +1031,7 @@ def _first_party_binding(value: Any) -> dict[str, Any]:
     if (
         set(value) != expected
         or not isinstance(value.get("repo"), str)
-        or re.fullmatch(r"heimgewebe/[A-Za-z0-9_.-]+", value["repo"]) is None
+        or re.fullmatch(r"(?:heimgewebe/[A-Za-z0-9_.-]+|alexdermohr/kleinanzeiger)", value["repo"]) is None
         or type(value.get("pr")) is not int or (value["pr"] != 0 if frozen else value["pr"] <= 0)
         or any(
             not isinstance(value.get(name), str)
