@@ -1668,7 +1668,7 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
         authentic = review._assert_no_first_party_reject_for_legacy_review
 
         def inspect_original_signed_review(candidate: dict, **_options: object) -> None:
-            self.assertEqual(candidate["repo"].casefold(), "heimgewebe/grabowski")
+            self.assertIn(candidate["repo"].casefold(), {"heimgewebe/grabowski", "alexdermohr/machtverflechtungen"})
             authentic(
                 candidate, repository=serving_checkout, root=self.state,
                 signers=self.signers, root_owned_signers=False,
@@ -1693,7 +1693,7 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
                 [], captain._signed_first_party_material_history_errors({
                     **binding, "repository": "alexdermohr/machtverflechtungen",
                 }),
-                "a heimgewebe-only signed review cannot apply to another GitHub owner",
+                "an unrelated signed Heimgewebe REJECT cannot contaminate a supported research owner",
             )
             self.assertEqual(
                 ["merge_guard_signed_first_party_history_binding_invalid"],
@@ -1841,6 +1841,68 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
             "previous signed session repository identity invalid",
         ):
             self._seal_direct(current)
+
+    def test_captain_research_owner_uses_authentic_signed_reject_history(self) -> None:
+        import grabowski_merge_guard as captain
+
+        original_repo = self.repo
+        research = self.root / "machtverflechtungen"
+        self._git("clone", "--quiet", "--no-hardlinks", str(original_repo), str(research))
+        self.repo = research
+        self._git(
+            "remote", "set-url", "origin",
+            "git@github.com:alexdermohr/machtverflechtungen.git",
+        )
+        plan = self._first_party_plan()
+        rejected = self._start_plan(plan)
+        self._submit_axis(rejected, review.REQUIRED_AXES[0], 1, reject=True)
+        binding = {
+            "repository": "alexdermohr/machtverflechtungen",
+            "pull_request": plan["binding"]["pr"],
+            "base_sha": self.base,
+            "head_sha": self.head,
+            "diff_sha256": plan["binding"]["diff_sha256"],
+        }
+        authentic = review._assert_no_first_party_reject_for_legacy_review
+
+        def actual_signed_history(candidate: dict, **_options: object) -> None:
+            authentic(
+                candidate, repository=research, root=self.state,
+                signers=self.signers, root_owned_signers=False,
+            )
+
+        with (
+            mock.patch.object(review, "FIRST_PARTY_REVIEW_ROOT", self.state),
+            mock.patch.object(
+                review, "_assert_no_first_party_reject_for_legacy_review",
+                side_effect=actual_signed_history,
+            ),
+        ):
+            expected_reject = [
+                "merge_guard_signed_first_party_material_reject_or_invalid_history"
+            ]
+            self.assertEqual(
+                expected_reject,
+                captain._signed_first_party_material_history_errors(binding),
+            )
+            # GitHub owner/repo ASCII case aliases cannot erase a signed REJECT.
+            self.assertEqual(
+                expected_reject,
+                captain._signed_first_party_material_history_errors({
+                    **binding, "repository": "AlexDerMohr/Machtverflechtungen",
+                }),
+            )
+            # Different PRs and unsupported GitHub owners remain independent.
+            self.assertEqual(
+                [], captain._signed_first_party_material_history_errors({
+                    **binding, "pull_request": binding["pull_request"] + 1,
+                }),
+            )
+            self.assertEqual(
+                [], captain._signed_first_party_material_history_errors({
+                    **binding, "repository": "elsewhere/machtverflechtungen",
+                }),
+            )
 
     def test_signed_reject_survives_equivalent_diff_identity(self) -> None:
         original = self._first_party_plan()

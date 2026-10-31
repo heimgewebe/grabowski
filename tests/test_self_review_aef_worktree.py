@@ -288,6 +288,45 @@ class SelfReviewAefWorktreeTests(unittest.TestCase):
         with self.assertRaisesRegex(self.review.ReviewExecutionRejected, "binding invalid"):
             self.review._first_party_binding(invalid)
 
+    def test_exact_machtverflechtungen_repository_can_use_signed_review(self) -> None:
+        canonical = self._clone(self.root / "machtverflechtungen", "machtverflechtungen")
+        expected = "alexdermohr/machtverflechtungen"
+        binding = {
+            "repo": expected, "pr": 184, "base_sha": "a" * 40,
+            "head_sha": "b" * 40, "diff_sha256": "c" * 64,
+            "review_batch_id": "d" * 32, "review_purpose": "pull_request",
+        }
+        self.assertEqual(expected, self.review._first_party_binding(binding)["repo"])
+        for remote in (
+            "git@github.com:alexdermohr/machtverflechtungen.git",
+            "https://github.com/alexdermohr/machtverflechtungen.git",
+            "ssh://git@github.com/alexdermohr/machtverflechtungen.git",
+        ):
+            with self.subTest(remote=remote):
+                self._git(canonical, "remote", "set-url", "origin", remote)
+                self.assertEqual(
+                    (canonical, expected),
+                    producer._managed_repository_identity(canonical, expected_repo=expected),
+                )
+        for bad_remote in (
+            "git@github.com:unrelated/machtverflechtungen.git",
+            "git@github.com:alexdermohr/other.git",
+            "git@github.com:alexdermohr/Machtverflechtungen.git",
+        ):
+            with self.subTest(remote=bad_remote):
+                self._git(canonical, "remote", "set-url", "origin", bad_remote)
+                with self.assertRaisesRegex(self.review.ReviewExecutionRejected, "origin invalid"):
+                    producer._managed_repository_identity(canonical)
+        for bad_identity in (
+            "alexdermohr/another",
+            "wrongowner/machtverflechtungen",
+            "alexdermohr/Machtverflechtungen",
+            "alexdermohr/machtverflechtungen/extra",
+        ):
+            with self.subTest(repo=bad_identity):
+                with self.assertRaisesRegex(self.review.ReviewExecutionRejected, "binding invalid"):
+                    self.review._first_party_binding(dict(binding, repo=bad_identity))
+
     def test_aef_path_does_not_override_origin_or_expected_repository(self) -> None:
         frontdoor = self._frontdoor(self.canonical)
         target = self._linked(self.canonical, Path(frontdoor["target_path"]))
