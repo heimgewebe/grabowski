@@ -74,7 +74,10 @@ FIRST_PARTY_MAX_DIFF_BYTES = 32 * 1024 * 1024
 FIRST_PARTY_MAX_CHANGED_PATHS = 4096
 # Only signed session inventories may exceed the standard per-record cap.
 FIRST_PARTY_MAX_SESSION_BYTES = 512 * 1024
-FIRST_PARTY_MAX_READ_BYTES = 256 * 1024
+# Valid signed diffs contain generated JSON/JS lines larger than 256 KiB.
+# Bound one read below the 1 MiB response ceiling; retain the strict
+# 1000-line range limit, exact-byte signed receipts and full-diff coverage.
+FIRST_PARTY_MAX_READ_BYTES = 768 * 1024
 FIRST_PARTY_MAX_READ_LINES = 1000
 FIRST_PARTY_SESSION_KIND = "grabowski_first_party_semantic_review_session_v1"
 FIRST_PARTY_READ_KIND = "grabowski_first_party_semantic_source_read_v1"
