@@ -34,6 +34,7 @@ import grabowski_lifecycle_effect_plan as lifecycle_effect_plan
 import grabowski_physical_checkout as physical_checkout
 import grabowski_work_acquire as work_acquire
 from grabowski_agent_sandbox import safe_git_environment
+from grabowski_git_ssh import trusted_git_cli_path
 try:
     import grabowski_operator_core as operator
 except ModuleNotFoundError:
@@ -4782,11 +4783,145 @@ def _require_adoption_lane_authority(manifest: dict[str, Any]) -> dict[str, Any]
     return {"lane_binding": lane_binding, "controller_actor": controller_actor}
 
 
+def _adoption_path_raw_entry(worktree: Path, item: str) -> tuple[Any, ...]:
+    """Fingerprint one path without following directory links or Git filters."""
+    relative = PurePosixPath(item)
+    if (
+        not relative.parts or relative.is_absolute()
+        or ".." in relative.parts or relative.as_posix() != item
+    ):
+        raise AgentWorkspaceError("candidate adoption path escapes worktree")
+    directory_flags = (
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    root_fd = current_fd = -1
+    try:
+        root_fd = os.open(worktree, directory_flags)
+        current_fd = root_fd
+        for component in relative.parts[:-1]:
+            try:
+                next_fd = os.open(component, directory_flags, dir_fd=current_fd)
+            except FileNotFoundError:
+                return (item, "absent")
+            except NotADirectoryError as exc:
+                # A former tracked directory may legitimately become a regular
+                # file. Its old descendants are then absent, not unsafe.
+                # Symlinked ancestors remain forbidden, including TOCTOU
+                # replacement between opening and classification.
+                try:
+                    ancestor = os.stat(
+                        component, dir_fd=current_fd, follow_symlinks=False,
+                    )
+                except OSError as probe_exc:
+                    raise AgentWorkspaceError(
+                        "candidate adoption path ancestor changed"
+                    ) from probe_exc
+                if stat.S_ISREG(ancestor.st_mode):
+                    return (item, "absent")
+                raise AgentWorkspaceError(
+                    "candidate adoption path ancestor is not a directory"
+                ) from exc
+            if current_fd != root_fd:
+                os.close(current_fd)
+            current_fd = next_fd
+        try:
+            before = os.stat(relative.parts[-1], dir_fd=current_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return (item, "absent")
+        identity_fields = (
+            "st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns"
+        )
+        if stat.S_ISREG(before.st_mode):
+            flags = (
+                os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_NONBLOCK", 0)
+            )
+            file_fd = os.open(relative.parts[-1], flags, dir_fd=current_fd)
+            try:
+                opened = os.fstat(file_fd)
+                if any(
+                    getattr(before, key) != getattr(opened, key)
+                    for key in identity_fields
+                ):
+                    raise AgentWorkspaceError("candidate adoption file changed before read")
+                digest = hashlib.sha256()
+                total = 0
+                while chunk := os.read(file_fd, 1024 * 1024):
+                    total += len(chunk)
+                    digest.update(chunk)
+                finished = os.fstat(file_fd)
+            finally:
+                os.close(file_fd)
+            if total != before.st_size or any(
+                getattr(before, key) != getattr(finished, key)
+                for key in identity_fields
+            ):
+                raise AgentWorkspaceError("candidate adoption file changed while hashing")
+            fingerprint = digest.hexdigest()
+            kind = "file"
+        elif stat.S_ISLNK(before.st_mode):
+            fingerprint = os.readlink(relative.parts[-1], dir_fd=current_fd)
+            kind = "symlink"
+        elif stat.S_ISDIR(before.st_mode):
+            fingerprint = ""
+            kind = "directory"
+        else:
+            raise AgentWorkspaceError("candidate adoption tracked entry is unsafe")
+        after = os.stat(relative.parts[-1], dir_fd=current_fd, follow_symlinks=False)
+        if any(
+            getattr(before, key) != getattr(after, key) for key in identity_fields
+        ):
+            raise AgentWorkspaceError("candidate adoption path changed during read")
+        return (
+            item, kind, stat.S_IMODE(after.st_mode), after.st_size, fingerprint
+        )
+    except AgentWorkspaceError:
+        raise
+    except OSError as exc:
+        raise AgentWorkspaceError("candidate adoption path is unreadable") from exc
+    finally:
+        if current_fd >= 0 and current_fd != root_fd:
+            os.close(current_fd)
+        if root_fd >= 0:
+            os.close(root_fd)
+
+
+def _adoption_worktree_raw_fingerprint(worktree: Path, changed_paths: list[str]) -> str:
+    """Bind every HEAD-tracked path plus Candidate paths without Git content filters.
+
+    The previous staging check inspected all tracked paths through git diff, not
+    just changed_paths. Check every original tracked entry before and after
+    staging to retain that out-of-scope drift protection.
+    """
+    if not isinstance(changed_paths, list) or not 0 < len(changed_paths) <= MAX_PATHS:
+        raise AgentWorkspaceError("candidate adoption path set is invalid")
+    tracked = _checked_bytes(
+        worktree,
+        ["git", "ls-tree", "-r", "-z", "--name-only", "HEAD"],
+        label="candidate adoption immutable tracked path inventory",
+    )
+    raw = bytes(tracked["stdout"])
+    if len(raw) > MAX_PATCH_BYTES:
+        raise AgentWorkspaceError("candidate adoption tracked inventory exceeds bound")
+    all_paths = {os.fsdecode(item) for item in raw.split(b"\x00") if item}
+    all_paths.update(changed_paths)
+    if len(all_paths) > 100_000:
+        raise AgentWorkspaceError("candidate adoption tracked inventory exceeds path bound")
+    return _sha256_json([
+        _adoption_path_raw_entry(worktree, item) for item in sorted(all_paths)
+    ])
+
+
 def _adoption_candidate_snapshot(
     manifest: dict[str, Any],
     collection: dict[str, Any],
     candidate: dict[str, Any],
 ) -> dict[str, Any]:
+    worktree = Path(str(manifest["writer_worktree"]))
+    before_raw_sha256 = _adoption_worktree_raw_fingerprint(
+        worktree, collection.get("changed_paths")
+    )
     snapshot = _git_snapshot(manifest, _run)
     if (
         snapshot.get("writer_head") != candidate.get("base_head")
@@ -4827,6 +4962,12 @@ def _adoption_candidate_snapshot(
         or writer_receipt.get("receipt_sha256") != collection.get("writer_receipt_sha256")
     ):
         raise AgentWorkspaceError("Candidate writer evidence drifted")
+    after_raw_sha256 = _adoption_worktree_raw_fingerprint(
+        worktree, snapshot["changed_paths"]
+    )
+    if after_raw_sha256 != before_raw_sha256:
+        raise AgentWorkspaceError("Candidate worktree changed during snapshot")
+    snapshot["stage_worktree_sha256"] = before_raw_sha256
     return snapshot
 
 
@@ -4886,10 +5027,10 @@ def _candidate_patch_tree_sha(
                 raise AgentWorkspaceError(f"{label} failed: {detail[:2000]}")
             return completed.stdout.strip()
 
-        run_index(["git", "read-tree", base_head], label="Candidate patch base tree")
+        run_index([trusted_git_cli_path(), "read-tree", base_head], label="Candidate patch base tree")
         run_index(
             [
-                "git",
+                trusted_git_cli_path(),
                 "apply",
                 "--cached",
                 "--binary",
@@ -4899,7 +5040,7 @@ def _candidate_patch_tree_sha(
             ],
             label="Candidate patch isolated apply",
         )
-        tree = run_index(["git", "write-tree"], label="Candidate patch tree").lower()
+        tree = run_index([trusted_git_cli_path(), "write-tree"], label="Candidate patch tree").lower()
     if SHA40_RE.fullmatch(tree) is None:
         raise AgentWorkspaceError("immutable Candidate patch tree identity is invalid")
     return tree
@@ -4909,6 +5050,8 @@ def _stage_candidate_for_adoption(
     manifest: dict[str, Any],
     collection: dict[str, Any],
     candidate: dict[str, Any],
+    *,
+    expected_worktree_sha256: str,
 ) -> str:
     worktree = Path(str(manifest["writer_worktree"]))
     base_head = str(manifest["expected_base_head"])
@@ -4922,12 +5065,46 @@ def _stage_candidate_for_adoption(
         ["git", "reset", "--mixed", "--quiet", base_head],
         label="candidate adoption index reset",
     )
-    _checked(
-        _run,
-        worktree,
-        ["git", "--literal-pathspecs", "add", "--all", "--", *[str(path) for path in changed_paths]],
-        label="candidate adoption stage",
-    )
+    # Stage the already frozen patch bytes, never the mutable worktree through
+    # git add: repository clean/process filters may be installed after review.
+    writer_result = collection.get("writer_result")
+    if (
+        not isinstance(writer_result, dict)
+        or writer_result.get("type") != "patch"
+        or not _verify_patch_artifact(
+            writer_result, expected_path=_writer_patch_path(manifest)
+        )
+    ):
+        raise AgentWorkspaceError("immutable Candidate patch artifact is invalid")
+    try:
+        patch_bytes = Path(str(writer_result["path"])).read_bytes()
+    except OSError as exc:
+        raise AgentWorkspaceError("immutable Candidate patch is unreadable") from exc
+    if (
+        len(patch_bytes) > MAX_PATCH_BYTES
+        or hashlib.sha256(patch_bytes).hexdigest() != candidate.get("patch_sha256")
+    ):
+        raise AgentWorkspaceError("immutable Candidate patch bytes drifted")
+    try:
+        applied = subprocess.run(
+            [trusted_git_cli_path(), "-C", str(worktree), "apply", "--cached",
+             "--binary", "--whitespace=nowarn", "-"],
+            input=patch_bytes,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=120,
+            check=False,
+            env=safe_git_environment(),
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise AgentWorkspaceError("candidate adoption cached patch stage unavailable") from exc
+    if applied.returncode != 0 or applied.stdout or applied.stderr:
+        detail = (applied.stderr or applied.stdout or b"Git apply failed").decode(
+            "utf-8", errors="replace"
+        ).strip()
+        raise AgentWorkspaceError(
+            f"candidate adoption cached patch stage failed: {detail[:2000]}"
+        )
     staged = _checked_bytes(
         worktree,
         ["git", "diff", "--cached", "--name-only", "-z", "--no-renames"],
@@ -4940,18 +5117,30 @@ def _stage_candidate_for_adoption(
     )
     if observed_paths != sorted(str(path) for path in changed_paths):
         raise AgentWorkspaceError("staged Candidate path set differs from collection")
-    unstaged = _checked_bytes(
-        worktree,
-        ["git", "diff", "--name-only", "-z", "--no-renames"],
-        label="candidate adoption unstaged paths",
-    )
+    # Git diff against the worktree may invoke a late clean filter when index
+    # timestamps are racy. Compare actual bytes to the pre-effect frozen
+    # snapshot instead; the index tree remains verified independently below.
     untracked = _checked_bytes(
         worktree,
         ["git", "ls-files", "--others", "--exclude-standard", "-z"],
         label="candidate adoption untracked paths",
     )
-    if bytes(unstaged["stdout"]) or bytes(untracked["stdout"]):
+    if bytes(untracked["stdout"]):
         raise AgentWorkspaceError("Candidate could not be fully staged for adoption")
+    observed_worktree_sha256 = _adoption_worktree_raw_fingerprint(
+        worktree, changed_paths
+    )
+    if (
+        not isinstance(expected_worktree_sha256, str)
+        or SHA256_RE.fullmatch(expected_worktree_sha256) is None
+        or observed_worktree_sha256 != expected_worktree_sha256
+    ):
+        restore = _run(worktree, ["git", "reset", "--mixed", "--quiet", base_head])
+        if restore.get("returncode") != 0:
+            raise AgentWorkspaceError(
+                "staged Candidate worktree drifted and index restoration failed"
+            )
+        raise AgentWorkspaceError("staged Candidate worktree differs from frozen snapshot")
     tree = str(
         _checked(_run, worktree, ["git", "write-tree"], label="candidate adoption tree").get(
             "stdout", ""
@@ -8950,8 +9139,11 @@ def grabowski_agent_workspace_adopt(
                 )
         if intent is None:
             _require_live_lane_binding(manifest, _run)
-            _adoption_candidate_snapshot(manifest, collection, candidate)
-            git_tree_sha = _stage_candidate_for_adoption(manifest, collection, candidate)
+            live_snapshot = _adoption_candidate_snapshot(manifest, collection, candidate)
+            git_tree_sha = _stage_candidate_for_adoption(
+                manifest, collection, candidate,
+                expected_worktree_sha256=live_snapshot["stage_worktree_sha256"],
+            )
             commit_sha = _create_adoption_commit_object(
                 manifest,
                 candidate_id=candidate["candidate_id"],
@@ -9022,8 +9214,11 @@ def grabowski_agent_workspace_adopt(
                 ["git", "reset", "--mixed", "--quiet", base_head],
                 label="candidate adoption reconcile index reset",
             )
-            _adoption_candidate_snapshot(manifest, collection, candidate)
-            observed_tree = _stage_candidate_for_adoption(manifest, collection, candidate)
+            live_snapshot = _adoption_candidate_snapshot(manifest, collection, candidate)
+            observed_tree = _stage_candidate_for_adoption(
+                manifest, collection, candidate,
+                expected_worktree_sha256=live_snapshot["stage_worktree_sha256"],
+            )
             if observed_tree != intent.get("expected_git_tree_sha"):
                 return {
                     "workspace_id": identifier,

@@ -1111,6 +1111,137 @@ class AgentWorkspaceTests(unittest.TestCase):
         )
 
 
+    def test_lane_candidate_staging_does_not_execute_late_clean_filter(self) -> None:
+        """A post-freeze repository clean filter must not execute during adoption."""
+        _lane, manifest, collection, candidate, _closed = self.closed_lane_candidate_fixture()
+        marker = self.root / "executed-clean-filter"
+        attr_raw = run(self.git.writer, "git", "rev-parse", "--git-path", "info/attributes")
+        attributes = Path(attr_raw)
+        if not attributes.is_absolute():
+            attributes = self.git.writer / attributes
+        attributes.parent.mkdir(parents=True, exist_ok=True)
+        attributes.write_text("src/app.py filter=adoption_probe\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "config", "--local", "filter.adoption_probe.clean",
+             f"sh -c 'touch {marker}; cat'"],
+            cwd=self.git.writer, check=True, capture_output=True,
+        )
+        self.assertEqual(
+            run(self.git.writer, "git", "check-attr", "filter", "--", "src/app.py"),
+            "src/app.py: filter: adoption_probe",
+        )
+        tree = workspace._stage_candidate_for_adoption(
+            manifest, collection, candidate,
+            expected_worktree_sha256=workspace._adoption_worktree_raw_fingerprint(
+                self.git.writer, collection["changed_paths"]
+            ),
+        )
+        self.assertEqual(
+            tree, workspace._candidate_patch_tree_sha(manifest, collection, candidate),
+            "candidate index must still match the frozen patch tree",
+        )
+        self.assertFalse(
+            marker.exists(), "candidate adoption executed an untrusted Git clean filter",
+        )
+
+    def test_lane_candidate_adoption_blocks_outside_tracked_drift_before_commit(self) -> None:
+        """Later tracked edits outside the Candidate must not advance the branch."""
+        _lane, manifest, collection, candidate, _closed = self.closed_lane_candidate_fixture()
+        before_head = run(self.git.writer, "git", "rev-parse", "HEAD")
+        real_snapshot = workspace._adoption_candidate_snapshot
+
+        def mutate_other_tracked_file(manifest_value, collection_value, candidate_value):
+            snapshot = real_snapshot(manifest_value, collection_value, candidate_value)
+            (self.git.writer / "tests" / "test_app.py").write_text(
+                "def test_unsafe(): assert False\n", encoding="utf-8"
+            )
+            return snapshot
+
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(
+                workspace, "_adoption_candidate_snapshot",
+                side_effect=mutate_other_tracked_file,
+            ),
+            self.assertRaisesRegex(
+                workspace.AgentWorkspaceError,
+                "staged Candidate worktree differs from frozen snapshot",
+            ),
+        ):
+            workspace.grabowski_agent_workspace_adopt(
+                manifest["workspace_id"],
+                candidate["candidate_id"],
+                collection["result_sha256"],
+            )
+        self.assertEqual(run(self.git.writer, "git", "rev-parse", "HEAD"), before_head)
+        self.assertFalse(workspace._adoption_receipt_paths(manifest)["receipt"].exists())
+
+    def test_candidate_raw_fingerprint_rejects_symlinked_parent(self) -> None:
+        """A tracked path must not be read through a rewritten directory link."""
+        self.git.add_writer()
+        source = self.git.writer / "src"
+        (source / "app.py").unlink()
+        source.rmdir()
+        outside = self.root / "outside-parent"
+        outside.mkdir()
+        (outside / "app.py").write_text("value = 1\n", encoding="utf-8")
+        source.symlink_to(outside, target_is_directory=True)
+        with self.assertRaisesRegex(
+            workspace.AgentWorkspaceError, "candidate adoption path ancestor is not a directory",
+        ):
+            workspace._adoption_worktree_raw_fingerprint(
+                self.git.writer, ["src/app.py"]
+            )
+
+    def test_candidate_snapshot_rejects_race_before_raw_baseline(self) -> None:
+        """Changes after the source diff must not become a trusted raw baseline."""
+        _lane, manifest, collection, candidate, _closed = self.closed_lane_candidate_fixture()
+        real_git_snapshot = workspace._git_snapshot
+
+        def mutate_after_git_diff(manifest_value, runner):
+            snapshot = real_git_snapshot(manifest_value, runner)
+            (self.git.writer / "src" / "app.py").write_text(
+                "replaced_after_git_diff = True\n", encoding="utf-8"
+            )
+            return snapshot
+
+        with (
+            mock.patch.object(
+                workspace, "_git_snapshot", side_effect=mutate_after_git_diff,
+            ),
+            self.assertRaisesRegex(
+                workspace.AgentWorkspaceError,
+                "Candidate worktree changed during snapshot",
+            ),
+        ):
+            workspace._adoption_candidate_snapshot(manifest, collection, candidate)
+        self.assertEqual(run(self.git.writer, "git", "rev-parse", "HEAD"), self.git.base)
+
+    def test_candidate_raw_fingerprint_allows_directory_to_file_replacement(self) -> None:
+        """Tracked descendants can be absent when their parent becomes a file."""
+        pkg = self.git.repo / "src" / "pkg"
+        pkg.mkdir()
+        (pkg / "a.py").write_text("value = 1\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "add", "src/pkg/a.py"], cwd=self.git.repo,
+            check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "tracked nested source"], cwd=self.git.repo,
+            check=True, capture_output=True,
+        )
+        self.git.base = run(self.git.repo, "git", "rev-parse", "HEAD")
+        self.git.add_writer()
+        (self.git.writer / "src" / "pkg" / "a.py").unlink()
+        (self.git.writer / "src" / "pkg").rmdir()
+        (self.git.writer / "src" / "pkg").write_text(
+            "regular file replacement\n", encoding="utf-8"
+        )
+        fingerprint = workspace._adoption_worktree_raw_fingerprint(
+            self.git.writer, ["src/pkg", "src/pkg/a.py"]
+        )
+        self.assertRegex(fingerprint, r"^[a-f0-9]{64}$")
+
     def test_lane_candidate_adoption_rejects_staged_content_drift_after_freeze(self) -> None:
         _lane, manifest, collection, candidate, _closed = self.closed_lane_candidate_fixture()
         before_head = run(self.git.writer, "git", "rev-parse", "HEAD")
@@ -1138,7 +1269,7 @@ class AgentWorkspaceTests(unittest.TestCase):
             ),
             self.assertRaisesRegex(
                 workspace.AgentWorkspaceError,
-                "staged Candidate tree differs from immutable Candidate patch",
+                "staged Candidate worktree differs from frozen snapshot",
             ),
         ):
             workspace.grabowski_agent_workspace_adopt(
