@@ -1040,6 +1040,33 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
             maximum=review.FIRST_PARTY_MAX_DIFF_BYTES,
         )
 
+    def test_legacy_short_prefixes_signed_five_axis(self) -> None:
+        for width in (4, 5, 6):
+            with self.subTest(width=width):
+                legacy = self._legacy_abbreviated_diff(width)
+                with mock.patch.object(review, "_first_party_diff", return_value=legacy):
+                    plan = self._first_party_plan()
+                    started = self._start_plan(plan)
+                    for number, axis in enumerate(review.REQUIRED_AXES, 1):
+                        self._submit_axis(started, axis, number)
+                audit, receipts = self._seal_direct(plan)
+                self.assertEqual([], self._receipt_errors(audit, receipts))
+
+    def test_legacy_short_prefix_partial_reject_blocks(self) -> None:
+        legacy = self._legacy_abbreviated_diff(4)
+        with mock.patch.object(review, "_first_party_diff", return_value=legacy):
+            old_plan = self._first_party_plan()
+            old = self._start_plan(old_plan)
+            self._submit_axis(old, review.REQUIRED_AXES[0], 1, reject=True)
+        current = self._first_party_plan()
+        session = self._start_plan(current)
+        for number, axis in enumerate(review.REQUIRED_AXES, 1):
+            self._submit_axis(session, axis, number)
+        with self.assertRaisesRegex(
+            review.ReviewExecutionRejected, "previous signed material",
+        ):
+            self._seal_direct(current)
+
     def test_legacy_abbrev_pass_remains_signed_and_verified_after_full_index(self) -> None:
         stable = review._first_party_diff(
             self.repo, {"base_sha": self.base, "head_sha": self.head},

@@ -1125,7 +1125,7 @@ _FIRST_PARTY_FULL_INDEX_RE = re.compile(
 
 
 _FIRST_PARTY_LEGACY_INDEX_RE = re.compile(
-    rb"index ([a-f0-9]{7,64})\.\.([a-f0-9]{7,64})( [0-7]{6})?(\r?)"
+    rb"index ([a-f0-9]{4,64})\.\.([a-f0-9]{4,64})( [0-7]{6})?(\r?)"
 )
 
 
@@ -1268,7 +1268,7 @@ def _first_party_signed_diff(
     # A partially completed historical REJECT may not have read every line.
     # Recreate only bounded real Git legacy displays, verify their exact signed
     # digest, and otherwise BLOCK (never ignore the old material decision).
-    for width in range(7, 15):
+    for width in range(4, 15):
         rendered = _git_read(
             repository,
             ["diff", "--no-ext-diff", "--no-textconv", "--no-renames",
@@ -1280,7 +1280,7 @@ def _first_party_signed_diff(
             return rendered
 
     # Preserve a bounded fallback for historical explicit uniform widths.
-    for width in range(7, 64):
+    for width in range(4, 64):
         shortened = _FIRST_PARTY_FULL_INDEX_RE.sub(
             lambda match: (
                 b"index " + match.group(1)[:width] + b".."
