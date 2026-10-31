@@ -1111,6 +1111,39 @@ class AgentWorkspaceTests(unittest.TestCase):
         )
 
 
+    def test_lane_candidate_staging_does_not_execute_late_clean_filter(self) -> None:
+        """A post-freeze repository clean filter must not execute during adoption."""
+        _lane, manifest, collection, candidate, _closed = self.closed_lane_candidate_fixture()
+        marker = self.root / "executed-clean-filter"
+        attr_raw = run(self.git.writer, "git", "rev-parse", "--git-path", "info/attributes")
+        attributes = Path(attr_raw)
+        if not attributes.is_absolute():
+            attributes = self.git.writer / attributes
+        attributes.parent.mkdir(parents=True, exist_ok=True)
+        attributes.write_text("src/app.py filter=adoption_probe\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "config", "--local", "filter.adoption_probe.clean",
+             f"sh -c 'touch {marker}; cat'"],
+            cwd=self.git.writer, check=True, capture_output=True,
+        )
+        self.assertEqual(
+            run(self.git.writer, "git", "check-attr", "filter", "--", "src/app.py"),
+            "src/app.py: filter: adoption_probe",
+        )
+        tree = workspace._stage_candidate_for_adoption(
+            manifest, collection, candidate,
+            expected_worktree_sha256=workspace._adoption_worktree_raw_fingerprint(
+                self.git.writer, collection["changed_paths"]
+            ),
+        )
+        self.assertEqual(
+            tree, workspace._candidate_patch_tree_sha(manifest, collection, candidate),
+            "candidate index must still match the frozen patch tree",
+        )
+        self.assertFalse(
+            marker.exists(), "candidate adoption executed an untrusted Git clean filter",
+        )
+
     def test_lane_candidate_adoption_rejects_staged_content_drift_after_freeze(self) -> None:
         _lane, manifest, collection, candidate, _closed = self.closed_lane_candidate_fixture()
         before_head = run(self.git.writer, "git", "rev-parse", "HEAD")
@@ -1138,7 +1171,7 @@ class AgentWorkspaceTests(unittest.TestCase):
             ),
             self.assertRaisesRegex(
                 workspace.AgentWorkspaceError,
-                "staged Candidate tree differs from immutable Candidate patch",
+                "staged Candidate worktree differs from frozen snapshot",
             ),
         ):
             workspace.grabowski_agent_workspace_adopt(
