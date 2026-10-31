@@ -11782,6 +11782,30 @@ class GripResultReadbackTests(unittest.TestCase):
                 grips.read_grip_result_readback(result["receipt_sha256"])
 
 
+
+class BrowserTextReceiptRedactionTests(unittest.TestCase):
+    def test_browser_text_value_never_enters_offline_guessable_grip_hash(self) -> None:
+        spec = grips.GRIP_SPECS["browser-semantic-act"]
+        base = {"worker_id": "12345678901234567890", "action_kind": "fill_text"}
+        first = grips._new_receipt(spec, {**base, "text_value": "private-text-one"})
+        second = grips._new_receipt(spec, {**base, "text_value": "private-text-two"})
+        self.assertEqual(first["parameters_sha256"], second["parameters_sha256"])
+        other = grips._new_receipt(spec, {**base, "worker_id": "22222222222222222222", "text_value": "private-text-one"})
+        self.assertNotEqual(first["parameters_sha256"], other["parameters_sha256"])
+
+    def test_blocked_and_nested_grip_receipts_keep_text_unguessable(self) -> None:
+        for name, make in (
+            ("browser-semantic-act", lambda text: {"text_value": text}),
+            ("mechanic-loop", lambda text: {"actions": [{"parameters": {"text_value": text}}]}),
+            ("unexposed-grip", lambda text: {"text_value": text}),
+        ):
+            with self.subTest(name=name):
+                a = grips.grip_run(name, make("short-private-one"), profile="operator", allow_mutation=False)
+                b = grips.grip_run(name, make("short-private-two"), profile="operator", allow_mutation=False)
+                self.assertEqual(a["receipt"]["parameters_sha256"], b["receipt"]["parameters_sha256"])
+                self.assertNotIn("short-private-one", json.dumps(a))
+
+
 if __name__ == "__main__":
     unittest.main()
 
