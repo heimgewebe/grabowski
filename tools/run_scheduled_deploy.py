@@ -7,6 +7,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import pwd
 from pathlib import Path
 import re
 import selectors
@@ -17,7 +18,7 @@ import sys
 import tempfile
 import time
 import zipimport
-from typing import Any
+from typing import Any, Iterator
 
 TOOLS_DIR = Path(__file__).resolve().parent
 if str(TOOLS_DIR) not in sys.path:
@@ -607,9 +608,50 @@ def assert_not_repoground_managed_source(repo: Path) -> None:
         )
 
 
+def _trusted_git_binary() -> str:
+    """Select root-managed Git on classic Linux or NixOS, never ambient PATH."""
+    candidates = (Path("/usr/bin/git"), Path("/run/current-system/sw/bin/git"))
+    for candidate in candidates:
+        if not os.path.lexists(candidate):
+            continue
+        try:
+            original = candidate.lstat()
+            if candidate == candidates[0] and not stat.S_ISREG(original.st_mode):
+                # On NixOS the classic spelling may be a root-managed alias.
+                # Execute the separately authenticated canonical system Git,
+                # never an executable resolved from the mutable alias.
+                if not stat.S_ISLNK(original.st_mode) or not os.path.lexists(candidates[1]):
+                    raise RuntimeError("classic system Git must be a regular file or trusted NixOS alias")
+                legacy_target = candidate.resolve(strict=True)
+                nix_target = candidates[1].resolve(strict=True)
+                if legacy_target != nix_target or not nix_target.is_relative_to(Path("/nix/store")):
+                    raise RuntimeError("legacy Git alias does not match trusted NixOS system Git")
+                candidate = candidates[1]
+            resolved = candidate.resolve(strict=True)
+            if candidate == candidates[1] and not resolved.is_relative_to(Path("/nix/store")):
+                raise RuntimeError("NixOS Git must resolve inside the immutable Nix store")
+            for node in (candidate, *candidate.parents, resolved, *resolved.parents):
+                info = node.lstat()
+                if info.st_uid != 0:
+                    raise RuntimeError("trusted Git path is not root-owned")
+                if stat.S_ISLNK(info.st_mode):
+                    continue  # The checked root-owned parent controls link replacement.
+                if info.st_mode & 0o022 and not (
+                    node == Path("/nix/store") and info.st_mode & stat.S_ISVTX
+                ):
+                    raise RuntimeError("trusted Git path is writable")
+            actual = resolved.stat()
+            if not stat.S_ISREG(actual.st_mode) or not os.access(resolved, os.X_OK):
+                raise RuntimeError("trusted Git executable is not a runnable regular file")
+        except OSError as exc:
+            raise RuntimeError("trusted system Git path cannot be verified") from exc
+        return str(candidate)
+    raise RuntimeError("no trusted system Git executable is installed")
+
+
 def _git_prefix(repo: Path) -> list[str]:
     return [
-        "git",
+        _trusted_git_binary(),
         "-c",
         "core.hooksPath=/dev/null",
         "-c",
@@ -621,10 +663,67 @@ def _git_prefix(repo: Path) -> list[str]:
     ]
 
 
+def _verified_git_environment() -> dict[str, str]:
+    """Isolate Git identity/config and executable search at the verification effect."""
+    try:
+        home = pwd.getpwuid(os.geteuid()).pw_dir
+    except (KeyError, OSError) as exc:
+        raise RuntimeError("verified Git account home unavailable") from exc
+    if not os.path.isabs(home) or not os.path.isdir(home):
+        raise RuntimeError("verified Git account home invalid")
+    return {
+        "HOME": home,
+        "PATH": "/usr/bin:/bin",
+        "LC_ALL": "C",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_ATTR_NOSYSTEM": "1",
+    }
+
+
+def _reject_repository_git_filters(repo: Path) -> None:
+    """Reject executable filters as source policy, not as an effect-time guard.
+
+    The separate worktree verifier never executes Git's content-conversion
+    machinery, even if configuration changes after this audit.
+    """
+    try:
+        process = subprocess.Popen(
+            [
+                *_git_prefix(repo),
+                "config", "--includes", "--get-regexp",
+                r"^filter\..*\.(clean|smudge|process|required)$",
+            ],
+            cwd=repo,
+            env=_verified_git_environment(),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        stdout, stderr, timed_out, stdout_truncated, stderr_truncated = (
+            read_limited_process_pipes(
+                process, timeout_seconds=10, max_output_bytes=MAX_CAPTURE_BYTES
+            )
+        )
+    except OSError as exc:
+        raise RuntimeError("source repository Git filter audit unavailable") from exc
+    if timed_out or stdout_truncated or stderr_truncated:
+        raise RuntimeError("source repository Git filter audit unavailable")
+    if process.returncode == 0:
+        raise RuntimeError("source repository has executable Git filter configuration")
+    if process.returncode != 1 or stdout or stderr:
+        raise RuntimeError("source repository Git filter audit unavailable")
+
+
 def _git_common_directory(repo: Path) -> Path:
     raw = run_capture(
         [*_git_prefix(repo), "rev-parse", "--git-common-dir"],
         cwd=repo,
+        environment=_verified_git_environment(),
     )
     candidate = Path(raw)
     if not candidate.is_absolute():
@@ -635,6 +734,314 @@ def _git_common_directory(repo: Path) -> Path:
     if resolved != candidate or not resolved.is_dir():
         raise RuntimeError("git common directory must be an exact real directory")
     return resolved
+
+
+def _bounded_git_metadata(repo: Path, argv: list[str], environment: dict[str, str]) -> bytes:
+    """Read bounded Git index/tree listings without worktree content conversion."""
+    try:
+        process = subprocess.Popen(
+            [*_git_prefix(repo), *argv],
+            cwd=repo,
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        stdout, _stderr, timed_out, stdout_truncated, stderr_truncated = (
+            read_limited_process_pipes(
+                process, timeout_seconds=30, max_output_bytes=MAX_MANIFEST_BYTES
+            )
+        )
+    except OSError as exc:
+        raise RuntimeError("Git repository metadata unavailable") from exc
+    if timed_out or stdout_truncated or stderr_truncated or process.returncode != 0:
+        raise RuntimeError("Git repository metadata unavailable")
+    return stdout
+
+
+def _explicit_index_crlf_only(
+    repo: Path,
+    environment: dict[str, str],
+    pathname: bytes,
+    committed_attrs: dict[bytes, tuple[bytes, bytes]],
+    expected_head: str,
+) -> bytes | None:
+    """Return the exact committed text attribute policy, never mutable overrides.
+
+    check-attr --cached in the source also reads .git/info/attributes, so it
+    cannot authorize CRLF normalization on its own. A private temporary bare
+    repo with an index loaded from the exact HEAD tree evaluates the *whole*
+    committed attribute grammar (macros, quoting and
+    precedence), without reading the source repo's mutable attribute layers
+    or invoking Git content filters.
+    """
+    if not committed_attrs:
+        return None
+    # Legacy 'crlf' remains semantically relevant when 'text' is unspecified.
+    # Read it from both indexes: mutable attributes cannot grant normalization.
+    fields = (b"text", b"crlf", b"eol", b"filter", b"ident", b"working-tree-encoding")
+    argv = [
+        *(field.decode("ascii") for field in fields),
+        "--", os.fsdecode(pathname),
+    ]
+    effective = _bounded_git_metadata(
+        repo, ["check-attr", "--cached", "-z", *argv], environment,
+    )
+
+    with tempfile.TemporaryDirectory(prefix="grabowski-head-attrs-") as root:
+        tmp = Path(root)
+        templates = tmp / "empty-template"
+        templates.mkdir(mode=0o700)
+        bare = tmp / "isolated.git"
+        _bounded_git_metadata(
+            repo,
+            ["init", "--bare", "--quiet",
+             *(["--object-format=sha256"] if len(expected_head) == 64 else []),
+             "--template", str(templates), str(bare)],
+            environment,
+        )
+        # A linked worktree's gitdir differs from its canonical object store.
+        objects = (_git_common_directory(repo) / "objects").resolve(strict=True)
+        if not objects.is_dir():
+            return False
+        pinned_environment = {
+            **environment,
+            "GIT_OBJECT_DIRECTORY": str(objects),
+        }
+        # Git read-tree and check-attr --cached work on older Git versions
+        # that do not support check-attr --source. The temporary index comes
+        # exclusively from expected_head, not from the source worktree/index.
+        _bounded_git_metadata(
+            repo,
+            ["--git-dir", str(bare), "read-tree", expected_head],
+            pinned_environment,
+        )
+        committed = _bounded_git_metadata(
+            repo,
+            ["-c", "core.attributesFile=/dev/null",
+             "--git-dir", str(bare), "check-attr",
+             "--cached", "-z", *argv],
+            pinned_environment,
+        )
+
+    def decode(raw: bytes) -> dict[bytes, bytes] | None:
+        parts = raw.split(b"\0")
+        if not parts or parts[-1] != b"" or len(parts) != len(fields) * 3 + 1:
+            return None
+        parsed: dict[bytes, bytes] = {}
+        for index in range(0, len(parts) - 1, 3):
+            path, attr, value = parts[index:index + 3]
+            if path != pathname or attr not in fields or attr in parsed:
+                return None
+            parsed[attr] = value
+        return parsed if len(parsed) == len(fields) else None
+
+    from_head = decode(committed)
+    from_source = decode(effective)
+    if (
+        from_head is not None and from_head == from_source
+        and from_head[b"eol"] == b"crlf"
+        and from_head[b"text"] in {b"set", b"unspecified", b"auto"}
+        # With modern text unspecified, legacy '-crlf' or 'crlf=input'
+        # disables this CRLF->LF exception even when eol=crlf is declared.
+        and (
+            from_head[b"text"] != b"unspecified"
+            or from_head[b"crlf"] in {b"set", b"unspecified"}
+        )
+        and all(from_head[attr] in {b"unset", b"unspecified"}
+                for attr in (b"filter", b"ident", b"working-tree-encoding"))
+    ):
+        return from_head[b"text"]
+    return None
+
+
+def _crlf_normalized_chunks(tracked: Any) -> Iterator[bytes]:
+    """Only CRLF -> LF; retain an incomplete CR across chunk boundaries."""
+    pending_cr = b""
+    while chunk := tracked.read(128 * 1024):
+        data = pending_cr + chunk
+        pending_cr = b"\r" if data.endswith(b"\r") else b""
+        if pending_cr:
+            data = data[:-1]
+        if data:
+            yield data.replace(b"\r\n", b"\n")
+    if pending_cr:
+        yield pending_cr
+
+
+def _auto_crlf_text_eligible(tracked: Any) -> bool:
+    """Conservatively mirror Git convert.c binary detection, streaming only raw bytes.
+
+    A committed text=auto rule is not permission to normalize binary data.
+    Bare CR, NUL and a high control-byte ratio mean Git would leave bytes
+    unconverted; accept only text that Git can convert without a filter.
+    """
+    printable = 0
+    nonprintable = 0
+    carry = b""
+    last_byte = None
+    # Git counts these as nonprintable; BS, HT, ESC, FF count printable.
+    controls = bytes(c for c in range(1, 32) if c not in (8, 9, 10, 12, 13, 27))
+    while chunk := tracked.read(128 * 1024):
+        last_byte = chunk[-1]
+        data = carry + chunk
+        carry = b"\r" if data.endswith(b"\r") else b""
+        if carry:
+            data = data[:-1]
+        if b"\x00" in data or b"\r" in data.replace(b"\r\n", b""):
+            return False
+        bad = data.count(b"\x7f") + sum(data.count(bytes((c,))) for c in controls)
+        nonprintable += bad
+        printable += len(data) - data.count(b"\r") - data.count(b"\n") - bad
+    if carry:
+        return False
+    # Git's gather_stats excludes a final DOS EOF (CTRL-Z) from the ratio.
+    if last_byte == 26:
+        nonprintable -= 1
+    return (printable >> 7) >= nonprintable
+
+
+def _explicit_crlf_blob_matches(
+    tracked: Any, oid: bytes, before: os.stat_result, *, automatic_text: bool = False,
+) -> bool:
+    """Hash opened inode; text=auto must first prove Git-compatible text bytes."""
+    if automatic_text and not _auto_crlf_text_eligible(tracked):
+        return False
+    tracked.seek(0)
+    normalized_size = sum(len(chunk) for chunk in _crlf_normalized_chunks(tracked))
+    tracked.seek(0)
+    digest = hashlib.sha1() if len(oid) == 40 else hashlib.sha256()
+    digest.update(b"blob " + str(normalized_size).encode("ascii") + b"\0")
+    for chunk in _crlf_normalized_chunks(tracked):
+        digest.update(chunk)
+    after = os.fstat(tracked.fileno())
+    return (
+        digest.hexdigest().encode("ascii") == oid
+        and (before.st_dev, before.st_ino, before.st_size,
+             before.st_mtime_ns, before.st_ctime_ns)
+        == (after.st_dev, after.st_ino, after.st_size,
+            after.st_mtime_ns, after.st_ctime_ns)
+    )
+
+def _repository_dirty_without_git_filters(
+    repo: Path, environment: dict[str, str], expected_head: str,
+) -> bool:
+    """Check HEAD/index/worktree without asking Git to convert file contents.
+
+    Git status, diff-files and even ls-files -m can execute repo-configured
+    clean filters when index timestamps are racy. A config precheck cannot
+    make those later effects safe against concurrent writers. Instead, list
+    only Git index metadata and compare raw file blobs in Python.
+    """
+    tree = _bounded_git_metadata(
+        repo, ["ls-tree", "-r", "-z", expected_head], environment,
+    )
+    expected: dict[bytes, tuple[bytes, bytes]] = {}
+    for entry in tree.split(b"\0"):
+        if not entry:
+            continue
+        try:
+            metadata, pathname = entry.split(b"\t", 1)
+            mode, kind, oid = metadata.split()
+            if kind not in {b"blob", b"commit"} or pathname in expected:
+                return True
+            expected[pathname] = mode, oid
+        except ValueError:
+            return True
+    if _bounded_git_metadata(
+        repo, ["ls-files", "--others", "--exclude-standard", "--directory", "--no-empty-directory", "-z"],
+        environment,
+    ):
+        return True
+    manifest = _bounded_git_metadata(
+        repo, ["ls-files", "--stage", "-z"], environment,
+    )
+    committed_attrs = {
+        path: value for path, value in expected.items()
+        if path == b".gitattributes" or path.endswith(b"/.gitattributes")
+    }
+    for entry in manifest.split(b"\0"):
+        if not entry:
+            continue
+        try:
+            metadata, pathname = entry.split(b"\t", 1)
+            mode, oid, stage = metadata.split()
+            if expected.pop(pathname, None) != (mode, oid):
+                return True
+            if (
+                stage != b"0" or mode not in {b"100644", b"100755", b"120000"}
+                or len(oid) not in {40, 64}
+                or not re.fullmatch(rb"[0-9a-f]+", oid)
+            ):
+                return True
+            parts = pathname.split(b"/")
+            if not parts or any(part in {b"", b".", b".."} for part in parts):
+                return True
+            digest = hashlib.sha1() if len(oid) == 40 else hashlib.sha256()
+            normalized_match = False
+            # Directory-descriptor walk forbids symlinked parent directories.
+            parent_fd = os.open(repo, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+            try:
+                for part in parts[:-1]:
+                    next_fd = os.open(
+                        part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                        dir_fd=parent_fd,
+                    )
+                    os.close(parent_fd)
+                    parent_fd = next_fd
+                if mode == b"120000":
+                    link = os.readlink(parts[-1], dir_fd=parent_fd)
+                    raw = os.fsencode(link)
+                    digest.update(b"blob " + str(len(raw)).encode("ascii") + b"\0")
+                    digest.update(raw)
+                else:
+                    file_fd = os.open(
+                        parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                        dir_fd=parent_fd,
+                    )
+                    with os.fdopen(file_fd, "rb") as tracked:
+                        before = os.fstat(tracked.fileno())
+                        if (
+                            not stat.S_ISREG(before.st_mode)
+                            or bool(before.st_mode & stat.S_IXUSR) != (mode == b"100755")
+                        ):
+                            return True
+                        digest.update(
+                            b"blob " + str(before.st_size).encode("ascii") + b"\0"
+                        )
+                        total = 0
+                        while chunk := tracked.read(128 * 1024):
+                            total += len(chunk)
+                            digest.update(chunk)
+                        after = os.fstat(tracked.fileno())
+                        if (
+                            total != before.st_size
+                            or (before.st_dev, before.st_ino, before.st_size,
+                                before.st_mtime_ns, before.st_ctime_ns)
+                            != (after.st_dev, after.st_ino, after.st_size,
+                                after.st_mtime_ns, after.st_ctime_ns)
+                        ):
+                            return True
+                        if digest.hexdigest().encode("ascii") != oid:
+                            text_policy = _explicit_index_crlf_only(
+                                repo, environment, pathname, committed_attrs,
+                                expected_head,
+                            )
+                            if text_policy is None:
+                                return True
+                            tracked.seek(0)
+                            normalized_match = _explicit_crlf_blob_matches(
+                                tracked, oid, before,
+                                automatic_text=text_policy == b"auto",
+                            )
+            finally:
+                os.close(parent_fd)
+            if digest.hexdigest().encode("ascii") != oid and not normalized_match:
+                return True
+        except (OSError, ValueError):
+            return True
+    return bool(expected)
 
 
 def verify_repository(
@@ -659,21 +1066,27 @@ def verify_repository(
     )
     if source_common != canonical_common:
         raise RuntimeError("source repository does not share the canonical Git common directory")
+    _reject_repository_git_filters(source)
+    if source != canonical:
+        _reject_repository_git_filters(canonical)
     expected_kind = "canonical-main" if source == canonical else "detached-worktree"
     if source_kind != expected_kind:
         raise RuntimeError(
             f"source kind drift: expected {expected_kind}, found {source_kind}"
         )
     git_prefix = _git_prefix(source)
-    head = run_capture([*git_prefix, "rev-parse", "--verify", "HEAD"], cwd=source)
-    branch = run_capture([*git_prefix, "rev-parse", "--abbrev-ref", "HEAD"], cwd=source)
+    environment = _verified_git_environment()
+    head = run_capture(
+        [*git_prefix, "rev-parse", "--verify", "HEAD"],
+        cwd=source, environment=environment,
+    )
+    branch = run_capture(
+        [*git_prefix, "rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=source, environment=environment,
+    )
     origin_main = run_capture(
         [*git_prefix, "rev-parse", "--verify", "refs/remotes/origin/main"],
-        cwd=source,
-    )
-    status = run_capture(
-        [*git_prefix, "status", "--porcelain=v1", "--untracked-files=normal"],
-        cwd=source,
+        cwd=source, environment=environment,
     )
     if head != expected_head:
         raise RuntimeError(f"HEAD drift: expected {expected_head}, found {head}")
@@ -684,7 +1097,7 @@ def verify_repository(
         )
     if origin_main != expected_head:
         raise RuntimeError(f"origin/main drift: expected {expected_head}, found {origin_main}")
-    if status:
+    if _repository_dirty_without_git_filters(source, environment, expected_head):
         raise RuntimeError("source repository is dirty")
 
 
