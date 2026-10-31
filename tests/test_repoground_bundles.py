@@ -820,7 +820,15 @@ class RepoGroundBundleToolTests(unittest.TestCase):
         self.assertEqual(publication_missing["reason"], "no_bundle_found")
 
     def test_invalid_repo_name_is_rejected(self) -> None:
-        for repo in ("../demo", "/demo", "heimgewebe/", "heimgewebe/demo/extra"):
+        description = mcp.repoground_bundle_discover.__doc__ or ""
+        self.assertIn("repository identity, not a filesystem path", description)
+        self.assertIn("heimgewebe/repoground", description)
+        self.assertIn("heimgewebe__repoground", description)
+        self.assertIn("never builds bundles", description)
+        for repo in (
+            "../demo", "/demo", "heimgewebe/", "heimgewebe/demo/extra",
+            "/tmp/repoground",
+        ):
             with self.subTest(repo=repo), self.assertRaises(ValueError):
                 mcp.repoground_bundle_discover(repo=repo)
 
