@@ -24,6 +24,7 @@ SPEC.loader.exec_module(RETENTION)
 # Production always refuses unsafe job effects until a privileged
 # root/index transaction actually exists; never patch this reference.
 PRODUCTION_JOB_RETENTION_AUTHORITY = RETENTION._protected_job_retention_authority
+PRODUCTION_RECEIPT_RETENTION_AUTHORITY = RETENTION._protected_retention_receipt_authority
 
 
 class RuntimeRetentionTests(unittest.TestCase):
@@ -36,6 +37,13 @@ class RuntimeRetentionTests(unittest.TestCase):
         )
         self._simulated_protected_authority = grant.start()
         self.addCleanup(grant.stop)
+        # Positive reset/archive fixtures also simulate an independently
+        # protected receipt finalization authority. Production never has it.
+        receipt_grant = patch.object(
+            RETENTION, "_protected_retention_receipt_authority", return_value=True
+        )
+        self._simulated_protected_receipt_authority = receipt_grant.start()
+        self.addCleanup(receipt_grant.stop)
 
     def _task_db(self, path: Path, unit: str, state: str) -> Path:
         connection = sqlite3.connect(path)
@@ -993,6 +1001,105 @@ class RuntimeRetentionTests(unittest.TestCase):
                 for item in plan["blocked"]
             ))
             self.assertEqual(stderr.read_bytes(), original)
+
+    def test_fifo_and_sparse_oversized_logs_allow_safe_archive_apply(self) -> None:
+        # The historical #1593 FIFO and both oversize streams are preserved.
+        # Neither may consume the bounded safe-job archive/reset budget.
+        for shape in ("fifo-stderr", "oversized-stderr", "oversized-stdout"):
+            with self.subTest(shape=shape):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    jobs = root / "jobs"
+                    bad_name = "grabowski-job-000000000001"
+                    safe_name = "grabowski-job-000000000002"
+                    bad_unit, safe_unit = bad_name + ".service", safe_name + ".service"
+                    bad = self._job(jobs, bad_name, 100)
+                    self._job(jobs, safe_name, 101)
+                    log = bad / ("stdout.log" if shape == "oversized-stdout" else "stderr.log")
+                    if shape == "fifo-stderr":
+                        log.unlink()
+                        os.mkfifo(log, mode=0o600)
+                    else:
+                        with log.open("r+b") as stream:
+                            stream.truncate(RETENTION.MAX_ARCHIVE_FILE_BYTES + 1)
+                    before = log.stat(follow_symlinks=False)
+                    metadata_before = (bad / "metadata.json").read_bytes()
+                    bad_identity = bad.stat()
+                    original_open = os.open
+
+                    def forbid_fifo_open(path, flags, *args, **kwargs):
+                        # Turn even an O_NONBLOCK FIFO open into a fast test failure.
+                        if shape == "fifo-stderr" and os.fspath(path).endswith("stderr.log"):
+                            fd = kwargs.get("dir_fd")
+                            parent = os.fstat(fd) if fd is not None else None
+                            if os.fspath(path) == str(log) or (
+                                parent is not None
+                                and (parent.st_dev, parent.st_ino)
+                                == (bad_identity.st_dev, bad_identity.st_ino)
+                            ):
+                                raise AssertionError("historical FIFO must never be opened")
+                        return original_open(path, flags, *args, **kwargs)
+
+                    states = {unit: self._state(unit) for unit in (bad_unit, safe_unit)}
+                    fake_deploy = types.ModuleType("grabowski_self_deploy")
+                    fake_deploy.DEPLOY_INDEX_FILENAME = "runtime-deploy-index.json"
+                    fake_deploy._deploy_schedule_lock = lambda: nullcontext()
+                    fake_deploy._read_deploy_index = lambda _root: None
+                    fake_deploy._write_deploy_index = Mock()
+                    fake_base = types.ModuleType("grabowski_mcp")
+                    fake_base._append_audit = Mock()
+                    fake_base._require_mutations_enabled = Mock()
+                    fake_base._require_capability = Mock()
+                    reset = Mock(return_value=Mock(returncode=0, stderr=""))
+                    with (
+                        patch.object(RETENTION.os, "open", side_effect=forbid_fifo_open),
+                        patch.dict("sys.modules", {
+                            "grabowski_self_deploy": fake_deploy,
+                            "grabowski_mcp": fake_base,
+                        }),
+                        patch.object(RETENTION, "_run", reset),
+                        patch.object(RETENTION, "_systemd_unit_states", return_value=states),
+                    ):
+                        plan = RETENTION.build_plan(
+                            minimum_job_age_seconds=50, max_archive_jobs=1, now=1000,
+                            jobs_root=jobs, archive_root=root / "archive",
+                            receipt_root=root / "receipts", task_db=root / "missing.sqlite3",
+                            failed_units=[bad_unit, safe_unit], unit_states=states,
+                        )
+                        self.assertEqual(
+                            [row["unit"] for row in plan["archive_jobs"]], [safe_unit]
+                        )
+                        self.assertEqual(plan["reset_failed_units"], [safe_unit])
+                        self.assertTrue(any(
+                            row["unit"] == bad_unit for row in plan["blocked"]
+                        ))
+                        result = RETENTION.apply_plan(
+                            plan, expected_plan_sha256=plan["plan_sha256"]
+                        )
+                    self.assertEqual(result["status"], "degraded")
+                    self.assertFalse(result["completed"])
+                    self.assertTrue(result["mutated"])
+                    self.assertTrue(any(
+                        row["unit"] == bad_unit for row in result["preserved_blocked_units"]
+                    ))
+                    self.assertEqual((bad / "metadata.json").read_bytes(), metadata_before)
+                    after = log.stat(follow_symlinks=False)
+                    self.assertEqual(
+                        (after.st_dev, after.st_ino, after.st_mode, after.st_size),
+                        (before.st_dev, before.st_ino, before.st_mode, before.st_size),
+                    )
+                    if shape == "fifo-stderr":
+                        self.assertTrue(log.is_fifo())
+                    else:
+                        self.assertEqual(after.st_size, RETENTION.MAX_ARCHIVE_FILE_BYTES + 1)
+                    self.assertFalse((root / "archive" / bad_name).exists())
+                    self.assertTrue(
+                        (root / "archive" / safe_name / "archive-manifest.json").is_file()
+                    )
+                    self.assertTrue(Path(result["receipt_path"]).is_file())
+                    reset.assert_called_once_with(
+                        ["systemctl", "--user", "reset-failed", safe_unit]
+                    )
 
     def test_archive_manifest_symlink_swap_cannot_read_foreign_files(self) -> None:
         # Reproduce an exact timing race: the source directory is exchanged
@@ -3978,6 +4085,28 @@ class RuntimeRetentionTests(unittest.TestCase):
             for number in range(4):
                 self.assertTrue((jobs / f"grabowski-job-{number + 1:012x}").is_dir())
 
+    def test_authorized_failed_unit_scan_excludes_own_retention_service(self) -> None:
+        # The failed retention producer is never its own reset candidate,
+        # even under hypothetical separately authorized job retention.
+        task_unit = "grabowski-task-" + "f" * 24 + "-a1.service"
+        job_unit = "grabowski-job-000000000001.service"
+        own_service = "grabowski-runtime-retention.service"
+        output = "\n".join(
+            f"{unit} loaded failed failed evidence"
+            for unit in (own_service, task_unit, job_unit)
+        ) + "\n"
+        with patch.object(
+            RETENTION, "_run",
+            return_value=Mock(returncode=0, stdout=output, stderr=""),
+        ) as runner:
+            self.assertEqual(
+                RETENTION._failed_units(job_authority=True),
+                sorted([task_unit, job_unit]),
+            )
+        runner.assert_called_once_with([
+            "systemctl", "--user", "--failed", "--no-legend", "--plain",
+        ])
+
     def test_untrusted_failed_unit_discovery_excludes_job_units_server_side(self) -> None:
         self._simulated_protected_authority.return_value = False
         task_unit = "grabowski-task-" + "f" * 24 + "-a1.service"
@@ -4251,6 +4380,147 @@ class RuntimeRetentionTests(unittest.TestCase):
                         + str(index) + ".tmp"
                     )).exists()
                 )
+
+    def test_receipt_temp_race_after_reset_cannot_leave_unreceipted_effect(self) -> None:
+        # Inject a same-UID temp-capacity race after the preflight but during
+        # the mocked external reset. An actual reset must never be followed by
+        # an unreceipted failure to publish the terminal evidence.
+        self._simulated_protected_authority.return_value = False
+        self._simulated_protected_receipt_authority.return_value = False
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs, archive, receipts = root / "jobs", root / "archive", root / "receipts"
+            for directory in (jobs, archive, receipts):
+                directory.mkdir(mode=0o700)
+            task_unit = "grabowski-task-" + "e" * 24 + "-a1.service"
+            task_db = self._task_db(root / "tasks.sqlite3", task_unit, "failed")
+            plan = RETENTION.build_plan(
+                minimum_job_age_seconds=50, now=1000,
+                jobs_root=jobs, archive_root=archive, receipt_root=receipts,
+                task_db=task_db, failed_units=[task_unit], unit_states={},
+            )
+            deploy = types.ModuleType("grabowski_self_deploy")
+            deploy.DEPLOY_INDEX_FILENAME = "runtime-deploy-index.json"
+            deploy._deploy_schedule_lock = lambda: nullcontext()
+            base = types.ModuleType("grabowski_mcp")
+            base._append_audit = Mock()
+            base._require_mutations_enabled = Mock()
+            base._require_capability = Mock()
+            resets = []
+
+            def inject_after_reset(argv):
+                if argv == ["systemctl", "--user", "reset-failed", task_unit]:
+                    resets.append(argv)
+                    for index in range(1, 4):
+                        (receipts / (
+                            "." + plan["plan_sha256"] + ".json.1."
+                            + str(index) + ".tmp"
+                        )).write_text("")
+                return Mock(returncode=0, stdout="", stderr="")
+
+            result = None
+            with (
+                patch.dict("sys.modules", {
+                    "grabowski_self_deploy": deploy, "grabowski_mcp": base,
+                }),
+                patch.object(RETENTION, "_run", side_effect=inject_after_reset),
+                patch.object(RETENTION, "MAX_RETAINED_JSON_TEMPS", 3),
+            ):
+                try:
+                    result = RETENTION.apply_plan(
+                        plan, expected_plan_sha256=plan["plan_sha256"]
+                    )
+                except RuntimeError:
+                    pass
+            # A future protected reservation may complete the reset, but a
+            # bare preflight alone cannot justify an unreceipted reset.
+            self.assertTrue(
+                not resets or (
+                    result is not None
+                    and bool(result.get("completed"))
+                    and Path(result["receipt_path"]).is_file()
+                ),
+                "external task reset completed without durable final receipt",
+            )
+
+    def test_missing_receipt_authority_blocks_reset_on_stale_plan(self) -> None:
+        # A preexisting/forged plan cannot make task or worker resets eligible
+        # after protected receipt authority has been withdrawn.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs, archive, receipts = root / "jobs", root / "archive", root / "receipts"
+            for directory in (jobs, archive, receipts):
+                directory.mkdir(mode=0o700)
+            unit = "grabowski-task-" + "b" * 24 + "-a1.service"
+            task_db = self._task_db(root / "tasks.sqlite3", unit, "failed")
+            plan = RETENTION.build_plan(
+                minimum_job_age_seconds=50, now=1000,
+                jobs_root=jobs, archive_root=archive, receipt_root=receipts,
+                task_db=task_db, failed_units=[unit], unit_states={},
+            )
+            self.assertEqual(plan["reset_failed_units"], [unit])
+            self._simulated_protected_receipt_authority.return_value = False
+            reset = Mock()
+            with patch.object(RETENTION, "_run", reset):
+                with self.assertRaisesRegex(
+                    RuntimeError, "protected receipt publication authority"
+                ):
+                    RETENTION.apply_plan(
+                        plan, expected_plan_sha256=plan["plan_sha256"]
+                    )
+            reset.assert_not_called()
+            self.assertEqual(list(receipts.iterdir()), [])
+
+    def test_unprotected_receipt_planner_preserves_terminal_task_state(self) -> None:
+        self._simulated_protected_authority.return_value = False
+        self._simulated_protected_receipt_authority.return_value = False
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs, archive, receipts = root / "jobs", root / "archive", root / "receipts"
+            for directory in (jobs, archive, receipts):
+                directory.mkdir(mode=0o700)
+            unit = "grabowski-task-" + "c" * 24 + "-a1.service"
+            task_db = self._task_db(root / "tasks.sqlite3", unit, "failed")
+            plan = RETENTION.build_plan(
+                minimum_job_age_seconds=50, now=1000,
+                jobs_root=jobs, archive_root=archive, receipt_root=receipts,
+                task_db=task_db, failed_units=[unit], unit_states={},
+            )
+            self.assertEqual(plan["reset_failed_units"], [])
+            self.assertEqual(plan["archive_jobs"], [])
+            self.assertTrue(any(
+                row["unit"] == unit and "protected receipt authority" in row["reason"]
+                for row in plan["blocked"]
+            ))
+
+    def test_production_has_no_receipt_effect_authority(self) -> None:
+        self.assertIs(PRODUCTION_RECEIPT_RETENTION_AUTHORITY(), False)
+
+    def test_receipt_temp_capacity_scan_restarts_advanced_directory_cursor(self) -> None:
+        # The plan may have scanned the same pinned directory FD earlier.
+        # Its existing offset must not hide failed receipt temp evidence.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for index in range(1, 4):
+                (root / f".sample.json.1.{index}.tmp").write_text("")
+            descriptor = os.open(
+                root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+            )
+            try:
+                os.lseek(descriptor, 10, os.SEEK_SET)
+                with patch.object(RETENTION, "MAX_RETAINED_JSON_TEMPS", 3):
+                    with self.assertRaisesRegex(
+                        RuntimeError, "retained atomic temp bound exceeded"
+                    ):
+                        RETENTION._archive_require_json_temp_capacity(
+                            descriptor, target_basename="sample.json"
+                        )
+            finally:
+                os.close(descriptor)
+            self.assertEqual(
+                sorted(item.name for item in root.iterdir()),
+                [f".sample.json.1.{index}.tmp" for index in range(1, 4)],
+            )
 
     def test_systemd_retention_requires_preprovisioned_receipt_root(self) -> None:
         unit = (
