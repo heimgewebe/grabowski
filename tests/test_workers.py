@@ -4693,8 +4693,12 @@ globalThis.fetch = async () => ({
         link_source = source[link_start:link_end]
         self.assertNotIn("this.href", link_source)
         self.assertNotIn("Runtime.callFunctionOn", link_source)
-        self.assertNotIn("this.click()", source)
-        self.assertNotIn("dispatchEvent(new MouseEvent", source)
+        link_section = source[
+            source.index("} else if (request.op === 'activate')"):
+            source.index("} else if (request.op === 'scroll_into_view')")
+        ]
+        self.assertNotIn("this.click()", link_section)
+        self.assertNotIn("dispatchEvent(new MouseEvent", link_section)
 
     def test_browser_semantic_navigate_requires_a_conservative_target(self) -> None:
         snapshot_id = workers.BROWSER_SNAPSHOT_ID_PREFIX + "a" * 64
@@ -6426,6 +6430,124 @@ globalThis.fetch = async () => ({
                     expected_state=expected,
                     expected_element=element,
                 )
+
+
+    def test_browser_semantic_ui_intents_validate_text_before_io(self) -> None:
+        element = workers.BROWSER_ELEMENT_ID_PREFIX + "a" * 64
+        for value in (None, "", "A" * 2049, "hidden\x00character", 100):
+            with self.subTest(value=str(value)[:15]), self.assertRaises(ValueError):
+                workers._browser_intent(
+                    "fill_text", element_id=element,
+                    navigation_target=None, text_value=value,
+                )
+        allowed = workers._browser_intent(
+            "fill_text", element_id=element,
+            navigation_target=None, text_value="Test entry",
+        )
+        self.assertEqual(allowed["effect_class"], "local_ui")
+        self.assertEqual(allowed["text_value"], "Test entry")
+        for action in ("click_button", "press_enter", "navigate", "activate"):
+            with self.subTest(action=action), self.assertRaises(ValueError):
+                workers._browser_intent(
+                    action, element_id=None if action == "navigate" else element,
+                    navigation_target="https://example.org/" if action == "navigate" else None,
+                    text_value="must not accept",
+                )
+        catalog = workers._browser_semantic_catalog()["intents"]
+        self.assertTrue(catalog["fill_text"]["requires_text_value"])
+        self.assertEqual(catalog["click_button"]["effect_class"], "network_navigation")
+        self.assertFalse(catalog["press_enter"]["requires_text_value"])
+
+    def test_browser_semantic_fill_text_binds_secret_to_worker_hmac_without_echo(self) -> None:
+        worker = self._running_browser(port=9761)
+        text = "unique-nonpublic-example-no-echo"
+        before = self._semantic_state_payload(elements=[{
+            "backend_node_id": "201",
+            "role": "textbox",
+            "name": "Todo entry",
+        }])
+        with patch.object(workers, "_observe", return_value=self._running_observation()), patch.object(
+            workers, "_run_node_browser_semantic", return_value=before,
+        ):
+            observed = workers.browser_semantic_observe(worker["worker_id"])
+        with patch.object(workers.operator, "_require_operator_capability"), patch.object(
+            workers.operator, "_require_operator_mutation",
+        ), patch.object(workers, "_observe", return_value=self._running_observation()), patch.object(
+            workers, "_run_node_browser_semantic", side_effect=[before, before],
+        ) as run, patch.object(workers.base, "_append_audit_with_digest",
+                        side_effect=["a" * 64, "b" * 64]) as audit:
+            result_payload = workers.grabowski_browser_worker_semantic(
+                worker["worker_id"], "act",
+                snapshot_id=observed["snapshot_id"], action_kind="fill_text",
+                element_id=observed["elements"][0]["element_id"],
+                text_value=text,
+            )
+        self.assertTrue(result_payload["ok"])
+        self.assertEqual(result_payload["effect_class"], "local_ui")
+        self.assertRegex(result_payload["target_hmac_sha256"], r"^[0-9a-f]{64}$")
+        private = run.call_args_list[1].args[1]
+        self.assertEqual(private["text_value"], text)
+        self.assertEqual(private["op"], "fill_text")
+        serialized = json.dumps(result_payload) + json.dumps(
+            [call.args[0] for call in audit.call_args_list]
+        )
+        self.assertNotIn(text, serialized)
+        self.assertNotIn('"text_value"', serialized)
+        self.assertFalse(result_payload["retry_readback"]["retry_authorized"])
+
+    def test_browser_semantic_button_and_enter_require_right_role_and_readback(self) -> None:
+        cases = (("click_button", "button"), ("press_enter", "textbox"))
+        for index, (action, role) in enumerate(cases):
+            with self.subTest(action=action):
+                worker = self._running_browser(port=9763 + index)
+                before = self._semantic_state_payload(elements=[{
+                    "backend_node_id": "201", "role": role, "name": "Input",
+                }])
+                after = self._semantic_state_payload(title="Changed", elements=[{
+                    "backend_node_id": "202", "role": "heading", "name": "Result",
+                }])
+                with patch.object(workers, "_observe", return_value=self._running_observation()), patch.object(
+                    workers, "_run_node_browser_semantic", return_value=before,
+                ):
+                    observed = workers.browser_semantic_observe(worker["worker_id"])
+                with patch.object(workers.operator, "_require_operator_capability"), patch.object(
+                    workers.operator, "_require_operator_mutation",
+                ), patch.object(workers, "_observe", return_value=self._running_observation()), patch.object(
+                    workers, "_run_node_browser_semantic", side_effect=[before, after],
+                ) as run, patch.object(workers.base, "_append_audit_with_digest",
+                                side_effect=["a" * 64, "b" * 64]):
+                    outcome = workers.grabowski_browser_worker_semantic(
+                        worker["worker_id"], "act", snapshot_id=observed["snapshot_id"],
+                        action_kind=action, element_id=observed["elements"][0]["element_id"],
+                    )
+                self.assertTrue(outcome["ok"])
+                self.assertEqual(outcome["effect_state"], "observed")
+                self.assertNotEqual(outcome["post_action_snapshot_id"], observed["snapshot_id"])
+                self.assertEqual(run.call_args_list[1].args[1]["op"], action)
+                with patch.object(workers.operator, "_require_operator_capability"), patch.object(
+                    workers.operator, "_require_operator_mutation",
+                ), patch.object(workers, "_observe", return_value=self._running_observation()), patch.object(
+                    workers, "_run_node_browser_semantic", return_value=before,
+                ) as fail_run, patch.object(workers.base, "_append_audit_with_digest", return_value="a" * 64):
+                    wrong = workers.grabowski_browser_worker_semantic(
+                        worker["worker_id"], "act", snapshot_id=observed["snapshot_id"],
+                        action_kind="fill_text" if role == "button" else "click_button",
+                        element_id=observed["elements"][0]["element_id"],
+                        **({"text_value": "hello"} if role == "button" else {}),
+                    )
+                self.assertFalse(wrong["ok"])
+                self.assertEqual(wrong["result_code"], "element_contract")
+                self.assertEqual(fail_run.call_count, 1)
+
+    def test_browser_semantic_ui_node_keeps_roles_and_effects_private(self) -> None:
+        source = workers.BROWSER_SEMANTIC_NODE_SOURCE
+        self.assertIn("['click_button', 'fill_text', 'press_enter']", source)
+        self.assertIn("verifyElementImmediately(expectedElement)", source)
+        self.assertIn("Input.insertText", source)
+        self.assertIn("Input.dispatchKeyEvent", source)
+        self.assertIn("request.text_value", source)
+        self.assertIn("Runtime.releaseObject", source)
+        self.assertNotIn("document.querySelector", source)
 
 
 if __name__ == "__main__":

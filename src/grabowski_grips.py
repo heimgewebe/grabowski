@@ -4475,6 +4475,7 @@ _BROWSER_SEMANTIC_ACT_FIELDS = frozenset(
         "action_kind",
         "element_id",
         "navigation_target",
+        "text_value",
         "timeout_seconds",
     }
 )
@@ -4504,6 +4505,8 @@ def _browser_semantic_gateway_call(
             kwargs["element_id"] = parameters["element_id"]
         if "navigation_target" in parameters:
             kwargs["navigation_target"] = parameters["navigation_target"]
+        if "text_value" in parameters:
+            kwargs["text_value"] = parameters["text_value"]
     output = workers.browser_semantic_gateway(
         parameters["worker_id"], operation, **kwargs
     )

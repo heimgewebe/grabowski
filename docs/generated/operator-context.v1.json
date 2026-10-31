@@ -3900,7 +3900,7 @@
       "src/grabowski_work_acquire.py": "293f005639ae814c3093d05ca78689a8c3168495bf5832805228244a81c388d9",
       "src/grabowski_work_admission.py": "5c7529ac26df8ae698d59dbac8267dc1065711b9579274267e9a661e55748c2a",
       "src/grabowski_worker_process.py": "36b8bef1785e9e41c4a8a041b95cc69f3686c881680a89ac6680f2074f5919c0",
-      "src/grabowski_workers.py": "c5a2d443f7ace2f0f2a967b21a5b9dd9875ef2460145ea599668fc817f898a2e",
+      "src/grabowski_workers.py": "a8fa8f49e6030a88acc270840be3cba4a1a39682ba8fbad933b7ce3c28eda1ad",
       "src/grabowski_worktree_ensure.py": "4b16010a5209e0b1ca02633eee2ce14da9fe1ff989fc04110995a3bc62abaff0"
     }
   }

@@ -2705,6 +2705,25 @@ BROWSER_ACTION_CATALOG: dict[str, dict[str, Any]] = {
         "requires_navigation_target": True,
     },
     "scroll_into_view": {"effect_class": "local_ui", "requires_element": True},
+    "click_button": {
+        "effect_class": "network_navigation",
+        "requires_element": True,
+        "required_element_role": "button",
+        "required_adapter_family": "cdp",
+    },
+    "fill_text": {
+        "effect_class": "local_ui",
+        "requires_element": True,
+        "required_element_role": "textbox",
+        "required_adapter_family": "cdp",
+        "requires_text_value": True,
+    },
+    "press_enter": {
+        "effect_class": "network_navigation",
+        "requires_element": True,
+        "required_element_role": "textbox",
+        "required_adapter_family": "cdp",
+    },
     "activate": {
         "effect_class": "network_navigation",
         "requires_element": True,
@@ -4151,6 +4170,72 @@ try {
     }
     const state = await readState();
     emit({schema_version: 1, ok: true, result_code: 'ok', state}, 0);
+  } else if (['click_button', 'fill_text', 'press_enter'].includes(request.op)) {
+    const before = await readState();
+    if (!sameState(before, request.expected_state)) throw new Error('stale-snapshot');
+    const expectedElement = request.expected_element;
+    const expectedRole = request.op === 'click_button' ? 'button' : 'textbox';
+    const selected = before.elements.find((element) =>
+      expectedElement && element.backend_node_id === expectedElement.backend_node_id &&
+      element.role === expectedElement.role && element.name === expectedElement.name
+    );
+    if (!selected || expectedElement.role !== expectedRole) throw new Error('element-contract');
+    const objectId = await verifyElementImmediately(expectedElement);
+    try {
+      const ready = await call('Runtime.callFunctionOn', {
+        objectId,
+        functionDeclaration: "function (action) {if (!this || !this.isConnected) return false; const tag=String(this.localName||'').toLowerCase(); const type=String(this.getAttribute('type')||'').toLowerCase(); if (this.disabled || this.closest('[inert]')) return false; if (action==='click_button') return tag==='button'||(tag==='input'&&['button','submit','reset'].includes(type))||this.getAttribute('role')==='button'; const editable=tag==='textarea'||(tag==='input'&&['','text','search','email','url','tel'].includes(type)); if(!editable||this.readOnly) return false; this.focus(); if (document.activeElement!==this) return false; if(action==='fill_text') this.select(); return true;}",
+        arguments: [{value: request.op}],
+        returnByValue: true,
+        awaitPromise: false,
+      });
+      if (ready.exceptionDetails || !ready.result || ready.result.value !== true) {
+        throw new Error('element-contract');
+      }
+      if (request.op === 'click_button') {
+        const effect = await call('Runtime.callFunctionOn', {
+          objectId,
+          functionDeclaration: "function () {if(!this || !this.isConnected || this.disabled)return false; this.click(); return true;}",
+          returnByValue: true,
+          awaitPromise: false,
+        });
+        if (effect.exceptionDetails || !effect.result || effect.result.value !== true) {
+          throw new Error('protocol');
+        }
+      } else if (request.op === 'fill_text') {
+        if (typeof request.text_value !== 'string' ||
+            !request.text_value || Buffer.byteLength(request.text_value,'utf8') > 2048 ||
+            request.text_value.includes('\u0000')) throw new Error('element-contract');
+        await call('Input.insertText', {text: request.text_value});
+        const verified = await call('Runtime.callFunctionOn', {
+          objectId,
+          functionDeclaration: "function (expected) {return !!this && this.isConnected && this.value === expected;}",
+          arguments: [{value: request.text_value}],
+          returnByValue: true,
+          awaitPromise: false,
+        });
+        if (verified.exceptionDetails || !verified.result || verified.result.value !== true) {
+          throw new Error('protocol');
+        }
+      } else {
+        await call('Input.dispatchKeyEvent', {type:'keyDown',key:'Enter',code:'Enter',
+          windowsVirtualKeyCode:13,nativeVirtualKeyCode:13});
+        await call('Input.dispatchKeyEvent', {type:'keyUp',key:'Enter',code:'Enter',
+          windowsVirtualKeyCode:13,nativeVirtualKeyCode:13});
+      }
+    } finally {
+      try {await call('Runtime.releaseObject', {objectId});} catch {}
+    }
+    let state = await readState();
+    if (request.op !== 'fill_text') {
+      const deadline = Date.now() + Math.min(request.timeout_ms, 6000);
+      while (sameState(before, state) && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        state = await readState();
+      }
+      if (sameState(before, state)) throw new Error('navigation-uncorrelated');
+    }
+    emit({schema_version:1,ok:true,result_code:'ok',state},0);
   } else if (request.op === 'submit_maulwurfx_proposal_e2e') {
     const before = await readState();
     if (!sameState(before, request.expected_state)) throw new Error('stale-snapshot');
@@ -4688,6 +4773,10 @@ class ChromeCDPAdapter(CDPAdapter):
                 "op": intent["action_kind"],
                 "expected_state": expected_state,
                 "expected_element": expected_element,
+                **(
+                    {"text_value": intent["text_value"]}
+                    if intent.get("text_value") is not None else {}
+                ),
             }
         )
         if payload["ok"] is not True or not isinstance(payload.get("state"), dict):
@@ -5036,6 +5125,14 @@ def _browser_navigation_target_digest(
     )
 
 
+def _browser_text_value_digest(worker_id: str, text_value: str, handle_key: bytes) -> str:
+    """Audit-bind an input without publishing its plaintext or an offline dictionary hash."""
+    return _browser_mac(
+        "", handle_key,
+        {"purpose": "browser-text-value-v1", "worker_id": worker_id, "text_value": text_value},
+    )
+
+
 def _is_browser_element_id(value: Any) -> bool:
     return (
         isinstance(value, str)
@@ -5098,6 +5195,7 @@ def _browser_intent(
     *,
     element_id: str | None,
     navigation_target: str | None,
+    text_value: str | None = None,
 ) -> dict[str, Any]:
     """Internal BrowserIntent: abstract action kind, never a CDP method or selector."""
     if not isinstance(action_kind, str):
@@ -5118,12 +5216,22 @@ def _browser_intent(
         raise ValueError(
             f"browser action {action_kind!r} does not accept a navigation_target"
         )
+    if spec.get("requires_text_value") is True:
+        if (
+            not isinstance(text_value, str) or not text_value
+            or len(text_value.encode("utf-8")) > 2048
+            or "\x00" in text_value
+        ):
+            raise ValueError("fill_text requires non-empty bounded text without NUL")
+    elif text_value is not None:
+        raise ValueError(f"browser action {action_kind!r} does not accept text_value")
     return {
         "schema_version": 1,
         "action_kind": action_kind,
         "effect_class": spec["effect_class"],
         "element_id": element_id,
         "navigation_target": navigation_target,
+        "text_value": text_value,
     }
 
 
@@ -5170,7 +5278,10 @@ def _browser_action(
                 worker_id, intent["navigation_target"], handle_key
             )
             if intent["navigation_target"] is not None
-            else None
+            else (
+                _browser_text_value_digest(worker_id, intent["text_value"], handle_key)
+                if intent["text_value"] is not None else None
+            )
         ),
     }
 
@@ -5255,6 +5366,7 @@ def browser_semantic_act(
     *,
     element_id: str | None = None,
     navigation_target: str | None = None,
+    text_value: str | None = None,
     timeout_seconds: int = 10,
 ) -> dict[str, Any]:
     """Execute a state-bound BrowserAction and return an authoritative outcome.
@@ -5274,6 +5386,7 @@ def browser_semantic_act(
         action_kind,
         element_id=element_id,
         navigation_target=navigation_target,
+        text_value=text_value,
     )
     record = _browser_semantic_preflight(identifier)
     handle_key = _browser_semantic_handle_key(record)
@@ -5522,6 +5635,7 @@ def _browser_semantic_catalog() -> dict[str, Any]:
                 "requires_bound_navigation_target": spec.get(
                     "requires_bound_navigation_target", False
                 ),
+                "requires_text_value": spec.get("requires_text_value", False),
                 "fixed_server_payload_sha256": spec.get(
                     "fixed_server_payload_sha256"
                 ),
@@ -5708,6 +5822,7 @@ def browser_semantic_gateway(
     action_kind: str | None = None,
     element_id: str | None = None,
     navigation_target: str | None = None,
+    text_value: str | None = None,
     timeout_seconds: int = 10,
 ) -> dict[str, Any]:
     """Dispatch one bounded semantic operation with content-free audit records."""
@@ -5720,7 +5835,7 @@ def browser_semantic_gateway(
     if operation == "observe":
         if any(
             value is not None
-            for value in (snapshot_id, action_kind, element_id, navigation_target)
+            for value in (snapshot_id, action_kind, element_id, navigation_target, text_value)
         ):
             raise ValueError(
                 "observe does not accept snapshot, action, element or navigation targets"
@@ -5808,6 +5923,7 @@ def browser_semantic_gateway(
         action_kind,
         element_id=element_id,
         navigation_target=navigation_target,
+        text_value=text_value,
     )
     effect_class = intent["effect_class"]
     target_hmac_sha256 = None
@@ -5824,7 +5940,13 @@ def browser_semantic_gateway(
                     _browser_semantic_handle_key(_row(identifier)),
                 )
                 if intent["navigation_target"] is not None
-                else None
+                else (
+                    _browser_text_value_digest(
+                        identifier, intent["text_value"],
+                        _browser_semantic_handle_key(_row(identifier)),
+                    )
+                    if intent["text_value"] is not None else None
+                )
             )
         except _BrowserSemanticFreshWorkerRequired:
             result = _browser_semantic_public_result(
@@ -5891,6 +6013,7 @@ def browser_semantic_gateway(
             action_kind,
             element_id=element_id,
             navigation_target=navigation_target,
+            text_value=text_value,
             timeout_seconds=timeout_seconds,
         )
     except _BrowserSemanticFreshWorkerRequired:
@@ -6821,6 +6944,7 @@ def grabowski_browser_worker_semantic(
     action_kind: str | None = None,
     element_id: str | None = None,
     navigation_target: str | None = None,
+    text_value: str | None = None,
     timeout_seconds: int = 10,
 ) -> dict[str, Any]:
     """Observe or act through semantic snapshot and element handles only.
@@ -6840,6 +6964,7 @@ def grabowski_browser_worker_semantic(
         action_kind=action_kind,
         element_id=element_id,
         navigation_target=navigation_target,
+        text_value=text_value,
         timeout_seconds=timeout_seconds,
     )
 
