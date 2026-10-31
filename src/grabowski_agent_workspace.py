@@ -4783,59 +4783,116 @@ def _require_adoption_lane_authority(manifest: dict[str, Any]) -> dict[str, Any]
     return {"lane_binding": lane_binding, "controller_actor": controller_actor}
 
 
-def _adoption_worktree_raw_fingerprint(worktree: Path, changed_paths: list[str]) -> str:
-    """Hash changed worktree bytes without asking Git to run clean filters.
-
-    The input snapshot is bound after live Candidate validation and checked again
-    after cached patch staging. The digest is local to one adoption attempt.
-    """
-    if not isinstance(changed_paths, list) or not 0 < len(changed_paths) <= MAX_PATHS:
-        raise AgentWorkspaceError("candidate adoption path set is invalid")
-    result: list[tuple[Any, ...]] = []
-    for item in changed_paths:
-        if not isinstance(item, str):
-            raise AgentWorkspaceError("candidate adoption path is invalid")
-        relative = PurePosixPath(item)
-        if (
-            relative.is_absolute() or not relative.parts
-            or ".." in relative.parts or relative.as_posix() != item
-        ):
-            raise AgentWorkspaceError("candidate adoption path escapes worktree")
-        candidate_path = worktree.joinpath(*relative.parts)
-        try:
-            before = candidate_path.lstat()
-        except FileNotFoundError:
-            result.append((item, "absent"))
-            continue
-        except OSError as exc:
-            raise AgentWorkspaceError("candidate adoption worktree is unreadable") from exc
-        if stat.S_ISREG(before.st_mode):
-            fingerprint = _source_file_sha256(candidate_path)
-            kind = "file"
-            if fingerprint is None:
-                raise AgentWorkspaceError("candidate adoption worktree file is unstable")
-        elif stat.S_ISLNK(before.st_mode):
+def _adoption_path_raw_entry(worktree: Path, item: str) -> tuple[Any, ...]:
+    """Fingerprint one path without following directory links or Git filters."""
+    relative = PurePosixPath(item)
+    if (
+        not relative.parts or relative.is_absolute()
+        or ".." in relative.parts or relative.as_posix() != item
+    ):
+        raise AgentWorkspaceError("candidate adoption path escapes worktree")
+    directory_flags = (
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    root_fd = current_fd = -1
+    try:
+        root_fd = os.open(worktree, directory_flags)
+        current_fd = root_fd
+        for component in relative.parts[:-1]:
             try:
-                fingerprint = os.readlink(candidate_path)
-            except OSError as exc:
-                raise AgentWorkspaceError("candidate adoption worktree link is unstable") from exc
+                next_fd = os.open(component, directory_flags, dir_fd=current_fd)
+            except FileNotFoundError:
+                return (item, "absent")
+            if current_fd != root_fd:
+                os.close(current_fd)
+            current_fd = next_fd
+        try:
+            before = os.stat(relative.parts[-1], dir_fd=current_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return (item, "absent")
+        identity_fields = (
+            "st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns"
+        )
+        if stat.S_ISREG(before.st_mode):
+            flags = (
+                os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_NONBLOCK", 0)
+            )
+            file_fd = os.open(relative.parts[-1], flags, dir_fd=current_fd)
+            try:
+                opened = os.fstat(file_fd)
+                if any(
+                    getattr(before, key) != getattr(opened, key)
+                    for key in identity_fields
+                ):
+                    raise AgentWorkspaceError("candidate adoption file changed before read")
+                digest = hashlib.sha256()
+                total = 0
+                while chunk := os.read(file_fd, 1024 * 1024):
+                    total += len(chunk)
+                    digest.update(chunk)
+                finished = os.fstat(file_fd)
+            finally:
+                os.close(file_fd)
+            if total != before.st_size or any(
+                getattr(before, key) != getattr(finished, key)
+                for key in identity_fields
+            ):
+                raise AgentWorkspaceError("candidate adoption file changed while hashing")
+            fingerprint = digest.hexdigest()
+            kind = "file"
+        elif stat.S_ISLNK(before.st_mode):
+            fingerprint = os.readlink(relative.parts[-1], dir_fd=current_fd)
             kind = "symlink"
         elif stat.S_ISDIR(before.st_mode):
             fingerprint = ""
             kind = "directory"
         else:
-            raise AgentWorkspaceError("candidate adoption worktree path is unsafe")
-        try:
-            after = candidate_path.lstat()
-        except OSError as exc:
-            raise AgentWorkspaceError("candidate adoption worktree changed during read") from exc
-        stable_fields = (
-            "st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns"
+            raise AgentWorkspaceError("candidate adoption tracked entry is unsafe")
+        after = os.stat(relative.parts[-1], dir_fd=current_fd, follow_symlinks=False)
+        if any(
+            getattr(before, key) != getattr(after, key) for key in identity_fields
+        ):
+            raise AgentWorkspaceError("candidate adoption path changed during read")
+        return (
+            item, kind, stat.S_IMODE(after.st_mode), after.st_size, fingerprint
         )
-        if any(getattr(before, field) != getattr(after, field) for field in stable_fields):
-            raise AgentWorkspaceError("candidate adoption worktree changed during hash")
-        result.append((item, kind, stat.S_IMODE(after.st_mode), after.st_size, fingerprint))
-    return _sha256_json(result)
+    except AgentWorkspaceError:
+        raise
+    except OSError as exc:
+        raise AgentWorkspaceError("candidate adoption path is unreadable") from exc
+    finally:
+        if current_fd >= 0 and current_fd != root_fd:
+            os.close(current_fd)
+        if root_fd >= 0:
+            os.close(root_fd)
+
+
+def _adoption_worktree_raw_fingerprint(worktree: Path, changed_paths: list[str]) -> str:
+    """Bind every HEAD-tracked path plus Candidate paths without Git content filters.
+
+    The previous staging check inspected all tracked paths through git diff, not
+    just changed_paths. Check every original tracked entry before and after
+    staging to retain that out-of-scope drift protection.
+    """
+    if not isinstance(changed_paths, list) or not 0 < len(changed_paths) <= MAX_PATHS:
+        raise AgentWorkspaceError("candidate adoption path set is invalid")
+    tracked = _checked_bytes(
+        worktree,
+        ["git", "ls-tree", "-r", "-z", "--name-only", "HEAD"],
+        label="candidate adoption immutable tracked path inventory",
+    )
+    raw = bytes(tracked["stdout"])
+    if len(raw) > MAX_PATCH_BYTES:
+        raise AgentWorkspaceError("candidate adoption tracked inventory exceeds bound")
+    all_paths = {os.fsdecode(item) for item in raw.split(b"\x00") if item}
+    all_paths.update(changed_paths)
+    if len(all_paths) > 100_000:
+        raise AgentWorkspaceError("candidate adoption tracked inventory exceeds path bound")
+    return _sha256_json([
+        _adoption_path_raw_entry(worktree, item) for item in sorted(all_paths)
+    ])
 
 
 def _adoption_candidate_snapshot(

@@ -1144,6 +1144,55 @@ class AgentWorkspaceTests(unittest.TestCase):
             marker.exists(), "candidate adoption executed an untrusted Git clean filter",
         )
 
+    def test_lane_candidate_adoption_blocks_outside_tracked_drift_before_commit(self) -> None:
+        """Later tracked edits outside the Candidate must not advance the branch."""
+        _lane, manifest, collection, candidate, _closed = self.closed_lane_candidate_fixture()
+        before_head = run(self.git.writer, "git", "rev-parse", "HEAD")
+        real_snapshot = workspace._adoption_candidate_snapshot
+
+        def mutate_other_tracked_file(manifest_value, collection_value, candidate_value):
+            snapshot = real_snapshot(manifest_value, collection_value, candidate_value)
+            (self.git.writer / "tests" / "test_app.py").write_text(
+                "def test_unsafe(): assert False\n", encoding="utf-8"
+            )
+            return snapshot
+
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(
+                workspace, "_adoption_candidate_snapshot",
+                side_effect=mutate_other_tracked_file,
+            ),
+            self.assertRaisesRegex(
+                workspace.AgentWorkspaceError,
+                "staged Candidate worktree differs from frozen snapshot",
+            ),
+        ):
+            workspace.grabowski_agent_workspace_adopt(
+                manifest["workspace_id"],
+                candidate["candidate_id"],
+                collection["result_sha256"],
+            )
+        self.assertEqual(run(self.git.writer, "git", "rev-parse", "HEAD"), before_head)
+        self.assertFalse(workspace._adoption_receipt_paths(manifest)["receipt"].exists())
+
+    def test_candidate_raw_fingerprint_rejects_symlinked_parent(self) -> None:
+        """A tracked path must not be read through a rewritten directory link."""
+        self.git.add_writer()
+        source = self.git.writer / "src"
+        (source / "app.py").unlink()
+        source.rmdir()
+        outside = self.root / "outside-parent"
+        outside.mkdir()
+        (outside / "app.py").write_text("value = 1\n", encoding="utf-8")
+        source.symlink_to(outside, target_is_directory=True)
+        with self.assertRaisesRegex(
+            workspace.AgentWorkspaceError, "candidate adoption path is unreadable",
+        ):
+            workspace._adoption_worktree_raw_fingerprint(
+                self.git.writer, ["src/app.py"]
+            )
+
     def test_lane_candidate_adoption_rejects_staged_content_drift_after_freeze(self) -> None:
         _lane, manifest, collection, candidate, _closed = self.closed_lane_candidate_fixture()
         before_head = run(self.git.writer, "git", "rev-parse", "HEAD")
