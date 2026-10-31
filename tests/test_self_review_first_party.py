@@ -1366,6 +1366,7 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
         authentic = review._assert_no_first_party_reject_for_legacy_review
 
         def inspect_original_signed_review(candidate: dict, **_options: object) -> None:
+            self.assertEqual(candidate["repo"].casefold(), "heimgewebe/grabowski")
             authentic(
                 candidate, repository=serving_checkout, root=self.state,
                 signers=self.signers, root_owned_signers=False,
@@ -1386,6 +1387,53 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
                 }),
                 "a signed REJECT must not bleed into another PR identity",
             )
+            self.assertEqual(
+                [], captain._signed_first_party_material_history_errors({
+                    **binding, "repository": "alexdermohr/machtverflechtungen",
+                }),
+                "a heimgewebe-only signed review cannot apply to another GitHub owner",
+            )
+            self.assertEqual(
+                ["merge_guard_signed_first_party_history_binding_invalid"],
+                captain._signed_first_party_material_history_errors({
+                    **binding, "repository": "../invalid/name",
+                }),
+                "invalid repository identities must still be rejected",
+            )
+            self.assertEqual(
+                ["merge_guard_signed_first_party_material_reject_or_invalid_history"],
+                captain._signed_first_party_material_history_errors({
+                    **binding, "repository": "Heimgewebe/grabowski",
+                }),
+                "case aliases of the signed owner must not bypass REJECT history",
+            )
+            self.assertEqual(
+                ["merge_guard_signed_first_party_material_reject_or_invalid_history"],
+                captain._signed_first_party_material_history_errors({
+                    **binding, "repository": "heimgewebe/Grabowski",
+                }),
+                "case aliases of signed repository names must not bypass REJECT history",
+            )
+
+            for malformed in (
+                "", "heimgewebe/", "heimgewebe//grabowski",
+                "heimgewebe/grabowski/extra", "heimgewebe/grabowski ",
+                None, 42, [], {},
+            ):
+                self.assertEqual(
+                    ["merge_guard_signed_first_party_history_binding_invalid"],
+                    captain._signed_first_party_material_history_errors({
+                        **binding, "repository": malformed,
+                    }),
+                    "malformed or untyped repository identities must fail closed",
+                )
+            self.assertEqual(
+                ["merge_guard_signed_first_party_material_reject_or_invalid_history"],
+                captain._signed_first_party_material_history_errors({
+                    **binding, "repository": "HEIMGEWEBE/Grabowski",
+                }),
+                "mixed-case owner and repository aliases retain the signed REJECT",
+            )
 
             self.now += 1
             resolution = self._start_plan(self._first_party_plan())
@@ -1396,6 +1444,101 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
                 [], captain._signed_first_party_material_history_errors(binding),
                 "a genuinely later signed resolution must clear the exact finding",
             )
+            for alias in ("heimgewebe/Grabowski", "Heimgewebe/grabowski", "HEIMGEWEBE/Grabowski"):
+                self.assertEqual(
+                    [], captain._signed_first_party_material_history_errors({
+                        **binding, "repository": alias,
+                    }),
+                    "a signed resolution must also clear the same GitHub repository under case aliases",
+                )
+
+    def test_signed_mixed_case_historical_repository_reject_and_resolution(self) -> None:
+        # The original record is genuinely signed for a managed mixed-case
+        # repository, not rewritten after signing to manufacture a match.
+        lower = self.repo
+        upper = self.root / "Grabowski"
+        lower.rename(upper)
+        self.repo = upper
+        self._git("remote", "set-url", "origin", "git@github.com:heimgewebe/Grabowski.git")
+        historical = self._first_party_plan()
+        self.assertEqual("heimgewebe/Grabowski", historical["binding"]["repo"])
+        started = self._start_plan(historical)
+        self._submit_axis(started, review.REQUIRED_AXES[0], 1, reject=True)
+        signed = review._read_signed_record(
+            self.state / "sessions" / started["review_session_id"] / "session.json",
+            signers=self.signers, root_owned_signers=False,
+        )
+        self.assertEqual("heimgewebe/Grabowski", signed["binding"]["repo"])
+
+        self._git("remote", "set-url", "origin", "git@github.com:heimgewebe/grabowski.git")
+        upper.rename(lower)
+        self.repo = lower
+        same_revision = self._first_party_plan()
+        self.assertEqual("heimgewebe/grabowski", same_revision["binding"]["repo"])
+        newer = self._start_plan(same_revision)
+        for number, axis in enumerate(review.REQUIRED_AXES, 1):
+            self._submit_axis(newer, axis, number)
+        with self.assertRaisesRegex(review.ReviewExecutionRejected, "previous signed material"):
+            self._seal_direct(same_revision)
+
+        # The same real historic REJECT cannot bleed across PR identity.
+        separate_pr = producer.plan_first_party_review(
+            repo=self.repo, pr=1650, base_sha=self.base, head_sha=self.head,
+            diff_sha256=same_revision["binding"]["diff_sha256"],
+        )
+        other = self._start_plan(separate_pr)
+        for number, axis in enumerate(review.REQUIRED_AXES, 1):
+            self._submit_axis(other, axis, number)
+        other_audit, other_receipts = self._seal_direct(separate_pr)
+        self.assertEqual([], self._receipt_errors(other_audit, other_receipts))
+
+        # Only a later, actually signed resolution clears that exact PR.
+        self.now += 1
+        resolved_plan = self._first_party_plan()
+        resolved = self._start_plan(resolved_plan)
+        for number, axis in enumerate(review.REQUIRED_AXES, 1):
+            self._submit_axis(
+                resolved, axis, number,
+                resolve_ids=("material-1",) if number == 1 else (),
+            )
+        audit, receipts = self._seal_direct(resolved_plan)
+        self.assertEqual([], self._receipt_errors(audit, receipts))
+
+    def test_signed_unicode_historical_repository_is_invalid(self) -> None:
+        # The old record is signed by the real fixture key, not injected via
+        # an untrusted mock. Unicode long-s casefolds to ASCII "s" in Python,
+        # but GitHub repo identity and the signed producer are ASCII-only.
+        historical = self._first_party_plan()
+        started = self._start_plan(historical)
+        path = self.state / "sessions" / started["review_session_id"] / "session.json"
+        old = review._read_signed_record(
+            path, signers=self.signers, root_owned_signers=False,
+        )
+        old["binding"]["repo"] = "heimgewebe/grabow\u017fki"
+        old["binding_sha256"] = review._digest(old["binding"])
+        path.unlink()
+        path.with_suffix(".sig").unlink()
+        review._write_signed_record(
+            path, old, key=self.key, signers=self.signers,
+        )
+        signed = review._read_signed_record(
+            path, signers=self.signers, root_owned_signers=False,
+        )
+        self.assertEqual("heimgewebe/grabow\u017fki", signed["binding"]["repo"])
+        self.assertEqual(
+            "heimgewebe/grabowski", signed["binding"]["repo"].casefold(),
+            "the crafted signed history must exercise an actual Unicode-fold collision",
+        )
+
+        current = self._first_party_plan()
+        later = self._start_plan(current)
+        for number, axis in enumerate(review.REQUIRED_AXES, 1):
+            self._submit_axis(later, axis, number)
+        with self.assertRaisesRegex(
+            review.ReviewExecutionRejected,
+            "previous signed session repository identity invalid",
+        ):
+            self._seal_direct(current)
 
     def test_signed_reject_survives_equivalent_diff_identity(self) -> None:
         original = self._first_party_plan()

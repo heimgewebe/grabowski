@@ -10197,7 +10197,22 @@ def _repoground_query_snippets(
         navigation_hits = _repoground_list_of_dicts(payload.get("navigation_hits"))
         if navigation_hits:
             for ordinal, hit in enumerate(navigation_hits[:max_snippets]):
-                path = hit.get("path")
+                # Graph callers/callees carry the source-indexed symbol nested.
+                # Only elevate its identity if it agrees with the hit path.
+                symbol_hit = hit
+                nested_key = (
+                    "caller_symbol" if payload.get("route") == "callers"
+                    else "callee_symbol" if payload.get("route") == "callees"
+                    else None
+                )
+                nested = hit.get(nested_key) if nested_key is not None else None
+                if isinstance(nested, dict) and (
+                    not hit.get("path") or nested.get("path") == hit["path"]
+                ):
+                    symbol_hit = nested
+                path = hit.get("path") or symbol_hit.get("path")
+                first_line = symbol_hit.get("start_line")
+                last_line = symbol_hit.get("end_line")
                 source_range = (
                     dict(hit["source_range"])
                     if isinstance(hit.get("source_range"), dict)
@@ -10206,8 +10221,8 @@ def _repoground_query_snippets(
                 if source_range is None and isinstance(path, str) and path:
                     source_range = {
                         "file_path": path,
-                        "start_line": hit.get("start_line"),
-                        "end_line": hit.get("end_line"),
+                        "start_line": first_line,
+                        "end_line": last_line,
                     }
                 elif source_range is not None and "file_path" not in source_range:
                     source_range["file_path"] = path
@@ -10215,14 +10230,14 @@ def _repoground_query_snippets(
                     {
                         "ordinal": ordinal,
                         "path": path,
-                        "chunk_id": hit.get("id"),
+                        "chunk_id": symbol_hit.get("id"),
                         "score": None,
                         "text_excerpt": None,
                         "range_ref": None,
                         "source_range": source_range,
                         "line_range": {
-                            "start_line": hit.get("start_line"),
-                            "end_line": hit.get("end_line"),
+                            "start_line": first_line,
+                            "end_line": last_line,
                         },
                         "citation_id": None,
                         "citation_status": None,
@@ -10234,10 +10249,10 @@ def _repoground_query_snippets(
                         "live_repo_address": None,
                         "live_repo_address_status": None,
                         "symbol": {
-                            "kind": hit.get("kind"),
-                            "name": hit.get("name"),
-                            "qualified_name": hit.get("qualified_name"),
-                            "range_ref": hit.get("range_ref"),
+                            "kind": symbol_hit.get("kind"),
+                            "name": symbol_hit.get("name"),
+                            "qualified_name": symbol_hit.get("qualified_name"),
+                            "range_ref": symbol_hit.get("range_ref"),
                         },
                     }
                 )
