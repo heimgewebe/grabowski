@@ -39,7 +39,7 @@ CANONICAL_REPO = Path.home() / "repos/grabowski"
 SHA = re.compile(r"[a-f0-9]{40}\Z")
 HEX64 = re.compile(r"[a-f0-9]{64}\Z")
 TASK = re.compile(r"[a-f0-9]{24}\Z")
-SUPPORTED_REPO = re.compile(r"heimgewebe/(?P<name>[A-Za-z0-9_.-]+)\Z")
+SUPPORTED_REPO = re.compile(r"(?:heimgewebe/(?P<name>[A-Za-z0-9_.-]+)|alexdermohr/(?P<product_name>kleinanzeiger|machtverflechtungen))\Z")
 METHODS = provenance.REQUIRED_AXES
 
 
@@ -110,14 +110,14 @@ def _managed_repository_identity(
     ).decode().strip()
     match = re.fullmatch(
         r"(?:git@github\.com:|ssh://git@github\.com/|https://github\.com/)"
-        r"(?P<slug>heimgewebe/[A-Za-z0-9_.-]+)\.git",
+        r"(?P<slug>(?:heimgewebe/[A-Za-z0-9_.-]+|alexdermohr/(?:kleinanzeiger|machtverflechtungen)))\.git",
         remote,
     )
     slug = match["slug"] if match is not None else None
     supported = SUPPORTED_REPO.fullmatch(slug or "")
     if (
         supported is None
-        or supported["name"] != repository_name
+        or (supported["name"] or supported["product_name"]) != repository_name
         or (expected_repo is not None and slug != expected_repo)
     ):
         raise provenance.ReviewExecutionRejected("review source repository origin invalid")
