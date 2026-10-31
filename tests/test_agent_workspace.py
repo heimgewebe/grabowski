@@ -1193,6 +1193,55 @@ class AgentWorkspaceTests(unittest.TestCase):
                 self.git.writer, ["src/app.py"]
             )
 
+    def test_candidate_raw_fingerprint_rejects_initialized_submodule(self) -> None:
+        """Gitlinks must not bypass raw fingerprint validation."""
+        source = self.root / "module-source"
+        subprocess.run(
+            ["git", "init", "-b", "main", str(source)],
+            check=True, capture_output=True,
+        )
+        for key, value in (("user.name", "Test"), ("user.email", "test@example.invalid")):
+            subprocess.run(
+                ["git", "config", key, value],
+                cwd=source, check=True, capture_output=True,
+            )
+        (source / "inside.py").write_text("value = 1\n", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=source, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "submodule base"],
+            cwd=source, check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-c", "protocol.file.allow=always", "submodule", "add",
+             str(source), "deps/module"],
+            cwd=self.git.repo, check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-am", "register gitlink"],
+            cwd=self.git.repo, check=True, capture_output=True,
+        )
+        self.git.base = run(self.git.repo, "git", "rev-parse", "HEAD")
+        self.git.add_writer()
+        subprocess.run(
+            ["git", "-c", "protocol.file.allow=always", "submodule", "update", "--init"],
+            cwd=self.git.writer, check=True, capture_output=True,
+        )
+        # A gitlink stores only a commit ID; raw directory metadata cannot
+        # attest to initialized submodule contents. Reject both clean and
+        # dirty submodules until content-verified adoption is supported.
+        for dirty in (False, True):
+            if dirty:
+                (self.git.writer / "deps" / "module" / "inside.py").write_text(
+                    "value = 2\n", encoding="utf-8"
+                )
+            with self.assertRaisesRegex(
+                workspace.AgentWorkspaceError,
+                "candidate adoption submodule requires verified content support",
+            ):
+                workspace._adoption_worktree_raw_fingerprint(
+                    self.git.writer, ["src/app.py"]
+                )
+
     def test_candidate_snapshot_rejects_race_before_raw_baseline(self) -> None:
         """Changes after the source diff must not become a trusted raw baseline."""
         _lane, manifest, collection, candidate, _closed = self.closed_lane_candidate_fixture()

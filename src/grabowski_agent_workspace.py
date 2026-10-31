@@ -4898,13 +4898,29 @@ def _adoption_worktree_raw_fingerprint(worktree: Path, changed_paths: list[str])
         raise AgentWorkspaceError("candidate adoption path set is invalid")
     tracked = _checked_bytes(
         worktree,
-        ["git", "ls-tree", "-r", "-z", "--name-only", "HEAD"],
+        ["git", "ls-tree", "-r", "-z", "HEAD"],
         label="candidate adoption immutable tracked path inventory",
     )
     raw = bytes(tracked["stdout"])
     if len(raw) > MAX_PATCH_BYTES:
         raise AgentWorkspaceError("candidate adoption tracked inventory exceeds bound")
-    all_paths = {os.fsdecode(item) for item in raw.split(b"\x00") if item}
+    all_paths: set[str] = set()
+    for entry in raw.split(b"\x00"):
+        if not entry:
+            continue
+        identity, separator, name = entry.partition(b"\t")
+        if not separator or not name:
+            raise AgentWorkspaceError("candidate adoption tracked inventory is invalid")
+        # A gitlink tracks only a commit, not the dirty files inside a checked
+        # out submodule. The raw path fingerprint cannot prove those bytes and
+        # a worktree Git diff may execute locally configured clean filters.
+        # Reject this unsupported source type rather than silently treating
+        # its directory size as evidence of clean content.
+        if identity.startswith(b"160000 commit "):
+            raise AgentWorkspaceError(
+                "candidate adoption submodule requires verified content support"
+            )
+        all_paths.add(os.fsdecode(name))
     all_paths.update(changed_paths)
     if len(all_paths) > 100_000:
         raise AgentWorkspaceError("candidate adoption tracked inventory exceeds path bound")
