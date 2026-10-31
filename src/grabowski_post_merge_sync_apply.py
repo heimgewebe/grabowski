@@ -10,6 +10,7 @@ from typing import Any, Callable
 import grabowski_bureau_leases as bureau_leases
 import grabowski_physical_checkout as physical_checkout
 import grabowski_resources as resources
+import grabowski_work_admission as work_admission
 
 
 CommandRunner = Callable[[Path, list[str]], dict[str, Any]]
@@ -28,6 +29,40 @@ def _lease_ttl_seconds(repo: Path) -> int:
     if repo == bureau_leases.BUREAU_REPOSITORY_ROOT:
         return min(LEASE_TTL_SECONDS, bureau_leases.MAX_EFFECT_GATE_TTL_SECONDS)
     return LEASE_TTL_SECONDS
+
+
+def _require_bureau_work_admission(
+    repo: Path, owner_id: str, scope_manifest: dict[str, Any]
+) -> None:
+    """Preserve the convergence admission formerly enforced by the broad repo lease."""
+    assessment = work_admission.require_repository_admission(
+        mode="convergence",
+        repo=str(repo),
+        owner_id=owner_id,
+        operation="broad_repository_lease",
+        requested_scope=scope_manifest,
+    )
+    if not isinstance(assessment, dict):
+        raise RuntimeError("work admission assessor returned invalid evidence")
+    decision = assessment.get("decision")
+    blockers = assessment.get("blockers")
+    terminal_convergence_only = (
+        decision == "converge_first"
+        and isinstance(blockers, list)
+        and bool(blockers)
+        and all(
+            isinstance(item, dict)
+            and item.get("code")
+            in {"foreign-lifecycle-owner", "worktree-convergence-required"}
+            and item.get("state")
+            in work_admission.FOREIGN_LIFECYCLE_OWNER_CONVERGENCE_STATES
+            for item in blockers
+        )
+    )
+    if decision != "allow" and not terminal_convergence_only:
+        raise work_admission.WorkAdmissionBlocked(assessment)
+    if assessment.get("read_only") is not True:
+        raise RuntimeError("work admission assessor did not return read-only evidence")
 
 
 class PostMergeSyncApplyError(RuntimeError):
@@ -685,6 +720,8 @@ def apply(
         "shared_gates": ["repository-worktree-admin"],
     }
     try:
+        if repo == bureau_leases.BUREAU_REPOSITORY_ROOT:
+            _require_bureau_work_admission(repo, owner_id, scope_manifest)
         acquisition = resources.acquire_resources(
             owner_id,
             resource_keys,
