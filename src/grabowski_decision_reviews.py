@@ -1624,13 +1624,10 @@ def _normalize_review_role_provenance(
     )
     historical_nix = False
     if not ((current_runner or legacy_runner) and (current_module or legacy_module)):
-        historical_nix = (
-            _historical_nix_review_role_matches(
-                recorded_runner_python, recorded_module_path, recorded_module_sha256,
-            )
-            or _historical_nix_review_role_origin_matches(
-                recorded_runner_python, recorded_module_path, recorded_module_sha256,
-            )
+        # A root-owned Nix store output is not proof of root-installed host
+        # authority: the legacy path-only predicate bypassed the generation check.
+        historical_nix = _historical_nix_review_role_matches(
+            recorded_runner_python, recorded_module_path, recorded_module_sha256,
         )
     runner_python_matches = current_runner or legacy_runner or historical_nix
     module_identity_matches = current_module or legacy_module or historical_nix

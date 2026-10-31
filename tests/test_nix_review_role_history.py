@@ -63,6 +63,63 @@ class NixReviewerHistoryTests(unittest.TestCase):
         ):
             self.assertFalse(self.accepted())
 
+    def test_legacy_store_origin_cannot_bypass_missing_installed_generation(self) -> None:
+        import json
+        import test_decision_reviews as fixtures
+
+        with tempfile.TemporaryDirectory() as directory:
+            jobs = Path(directory) / "jobs"
+            jobs.mkdir()
+            job = fixtures.make_job(
+                jobs, suffix="a00000001673", slot="independent-reviewer",
+                terminal_status="succeeded", review_result=None, review_role=True,
+            )
+            metadata = json.loads((job / "metadata.json").read_text())
+            provenance = dict(metadata["scope"]["decision_review_provenance"])
+            provenance["runner_python"] = str(self.runner)
+            provenance["runner_module_path"] = str(self.module)
+            provenance["runner_module_sha256"] = self.sha
+            provenance["provenance_sha256"] = reviews.sha256_json({
+                key: value for key, value in provenance.items()
+                if key != "provenance_sha256"
+            })
+            binding = reviews.normalize_binding(fixtures.binding("independent-reviewer"))
+            # The old origin helper positively trusts this immutable-looking
+            # source tree even when root has NEVER installed its NixOS package.
+            folders = [
+                self.package, self.package / "bin", self.package / "lib",
+                self.module.parent.parent, self.module.parent,
+            ]
+            previous = [(path, path.stat().st_mode & 0o777) for path in folders]
+            try:
+                for path in folders:
+                    path.chmod(0o555)
+                self.assertTrue(reviews._historical_nix_review_role_origin_matches(
+                    str(self.runner), str(self.module), self.sha
+                ))
+                with mock.patch.object(
+                    reviews, "_historical_nix_deployed_generation_contains",
+                    return_value=False,
+                ):
+                    self.assertFalse(self.accepted())
+                    with self.assertRaisesRegex(ValueError, "binding mismatch"):
+                        reviews._normalize_review_role_provenance(
+                            provenance, binding, cwd="/tmp/review",
+                        )
+                with mock.patch.object(
+                    reviews, "_historical_nix_deployed_generation_contains",
+                    return_value=True,
+                ):
+                    self.assertEqual(
+                        reviews._normalize_review_role_provenance(
+                            provenance, binding, cwd="/tmp/review",
+                        ),
+                        provenance,
+                    )
+            finally:
+                for path, mode in reversed(previous):
+                    path.chmod(mode)
+
     def test_same_store_output_with_recorded_module_sha_is_accepted(self) -> None:
         self.assertTrue(self.accepted())
 
