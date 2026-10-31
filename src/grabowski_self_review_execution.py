@@ -53,6 +53,7 @@ SHA40 = re.compile(r"[a-f0-9]{40}\Z")
 SHA256 = re.compile(r"[a-f0-9]{64}\Z")
 ID = re.compile(r"[a-f0-9]{32}\Z")
 REF = re.compile(r"(?P<path>[A-Za-z0-9_.@+/-]+)(?::(?P<source_revision>[a-f0-9]{40}))?:L(?P<start>[1-9][0-9]{0,6})(?:-L(?P<end>[1-9][0-9]{0,6}))?\Z")
+FIRST_PARTY_ALLOWED_REPO = re.compile(r"(?:heimgewebe/[A-Za-z0-9_.-]+|alexdermohr/kleinanzeiger)\Z")
 MAX_RECEIPT = 16384
 MAX_RECORD_SIGNATURE = 16384
 SIGNED_RECORD_ENVELOPE_KIND = "grabowski_signed_record_envelope_v1"
@@ -1031,7 +1032,7 @@ def _first_party_binding(value: Any) -> dict[str, Any]:
     if (
         set(value) != expected
         or not isinstance(value.get("repo"), str)
-        or re.fullmatch(r"heimgewebe/[A-Za-z0-9_.-]+", value["repo"]) is None
+        or FIRST_PARTY_ALLOWED_REPO.fullmatch(value["repo"]) is None
         or type(value.get("pr")) is not int or (value["pr"] != 0 if frozen else value["pr"] <= 0)
         or any(
             not isinstance(value.get(name), str)
@@ -2087,9 +2088,9 @@ def _assert_prior_first_party_material_findings_resolved(
                     # names (e.g. long-s and s), so compare ASCII lower only.
                     if (
                         not isinstance(candidate_repo, str)
-                        or re.fullmatch(r"heimgewebe/[A-Za-z0-9_.-]+", candidate_repo) is None
+                        or FIRST_PARTY_ALLOWED_REPO.fullmatch(candidate_repo) is None
                         or not isinstance(decisive_repo, str)
-                        or re.fullmatch(r"heimgewebe/[A-Za-z0-9_.-]+", decisive_repo) is None
+                        or FIRST_PARTY_ALLOWED_REPO.fullmatch(decisive_repo) is None
                     ):
                         raise ReviewExecutionRejected(
                             "previous signed session repository identity invalid"
