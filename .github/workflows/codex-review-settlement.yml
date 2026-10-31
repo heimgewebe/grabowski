@@ -31,7 +31,10 @@ concurrency:
       || inputs.pr
       || github.run_id
     }}
-  cancel-in-progress: true
+  # Queue all source-head and review events for this PR in publication order.
+  # Prevent both in-progress cancellation and replacement of pending runs.
+  cancel-in-progress: false
+  queue: max
 
 jobs:
   settle:

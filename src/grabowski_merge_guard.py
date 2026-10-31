@@ -88,8 +88,17 @@ def _signed_first_party_material_history_errors(bindings: dict[str, Any]) -> lis
     if not registry.exists():
         return []
     repo = bindings.get("repository")
-    if not isinstance(repo, str) or re.fullmatch(r"heimgewebe/[A-Za-z0-9_.-]+", repo) is None:
+    if not isinstance(repo, str) or re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo) is None:
         return ["merge_guard_signed_first_party_history_binding_invalid"]
+    # Only GitHub origins supported by the signed FirstParty producer may
+    # carry authenticated REJECT history. Never bypass this check for an
+    # explicitly admitted product or research repo. Canonicalize ASCII
+    # GitHub case aliases before the historical signed-record comparison.
+    owner, _, name = repo.partition("/")
+    normalized = ("heimgewebe/" + name) if owner.lower() == "heimgewebe" else repo.lower()
+    if provenance.FIRST_PARTY_ALLOWED_REPO.fullmatch(normalized) is None:
+        return []
+    repo = normalized
     binding = {
         "repo": repo,
         "pr": bindings.get("pull_request"),
