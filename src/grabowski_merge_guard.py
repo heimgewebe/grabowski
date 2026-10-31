@@ -95,6 +95,9 @@ def _signed_first_party_material_history_errors(bindings: dict[str, Any]) -> lis
     # treating their PRs as malformed would incorrectly block Captain merges.
     if not repo.lower().startswith("heimgewebe/"):
         return []
+    # Preserve the signed repository name; normalize only the managed owner.
+    # History matching case-folds both subjects after authenticating signatures.
+    repo = "heimgewebe/" + repo.split("/", 1)[1]
     binding = {
         "repo": repo,
         "pr": bindings.get("pull_request"),
