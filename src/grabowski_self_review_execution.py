@@ -1108,13 +1108,190 @@ def _first_party_diff(repository: Path, binding: dict[str, Any]) -> bytes:
         repository,
         [
             "diff", "--no-ext-diff", "--no-textconv", "--no-renames",
-            "--ignore-submodules=none", "--unified=3",
+            "--ignore-submodules=none", "--unified=3", "--full-index",
             binding["base_sha"], binding["head_sha"], "--",
         ],
         maximum=FIRST_PARTY_MAX_DIFF_BYTES,
         timeout=60,
     )
 
+
+# Git automatically extends abbreviated blob indexes as new objects appear,
+# even when the reviewed Base and Head commits are identical. New sessions
+# pin the complete indexes; historical signed renderings remain verifiable.
+_FIRST_PARTY_FULL_INDEX_RE = re.compile(
+    rb"(?m)^index ([a-f0-9]{40,64})\.\.([a-f0-9]{40,64})( [0-7]{6})?(\r?)$"
+)
+
+
+_FIRST_PARTY_LEGACY_INDEX_RE = re.compile(
+    rb"index ([a-f0-9]{7,64})\.\.([a-f0-9]{7,64})( [0-7]{6})?(\r?)"
+)
+
+
+def _first_party_diff_from_signed_reads(
+    full: bytes, session: dict[str, Any], *,
+    session_root: Path, signers: Path, root_owned_signers: bool,
+) -> bytes | None:
+    """Recover exact legacy Git display only from authenticated complete reads.
+
+    Each persisted diff chunk was actually returned to the controller and its
+    SHA is inside a separately signed read receipt. A partial review cannot
+    invent unread lines, and an old abbreviated blob must prefix the complete
+    immutable Git object ID on that exact line.
+    """
+    try:
+        lines = [part.encode("utf-8") for part in full.decode("utf-8").splitlines(keepends=True)]
+    except UnicodeError as exc:
+        raise ReviewExecutionRejected("first-party historical diff not text") from exc
+    reads_root = session_root / "reads"
+    fd = _private_dir(reads_root)
+    try:
+        with os.scandir(fd) as entries:
+            names = sorted(entry.name for entry in entries)
+    finally:
+        os.close(fd)
+    if len(names) > 8192:
+        raise ReviewExecutionRejected("first-party historical read registry over budget")
+    original: list[bytes | None] = [None] * len(lines)
+    observed = False
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        read_id = name[:-5]
+        if FIRST_PARTY_READ_ID_RE.fullmatch(read_id) is None:
+            raise ReviewExecutionRejected("first-party historical read id invalid")
+        record = _read_signed_record(
+            reads_root / name, signers=signers,
+            root_owned_signers=root_owned_signers,
+        )
+        if record.get("read_kind") != "diff":
+            continue
+        issuer = _validate_first_party_issuer(
+            record.get("issuer"), expected_tool=FIRST_PARTY_TOOL_READ,
+        )
+        first, last = record.get("start_line"), record.get("end_line")
+        if (
+            record.get("schema_version") != 1
+            or record.get("kind") != FIRST_PARTY_READ_KIND
+            or record.get("read_id") != read_id
+            or record.get("session_id") != session["session_id"]
+            or record.get("binding_sha256") != session["binding_sha256"]
+            or record.get("axis") not in REQUIRED_AXES
+            or _first_party_principal(issuer) != session["issuer_principal"]
+            or record.get("path") != ""
+            or record.get("revision") != "head"
+            or record.get("source_ref") is not None
+            or type(first) is not int or type(last) is not int
+            or not 1 <= first <= last <= len(lines)
+            or last - first + 1 > FIRST_PARTY_MAX_READ_LINES
+            or type(record.get("observed_at_unix")) is not int
+            or not session["created_at_unix"] <= record["observed_at_unix"] <= session["expires_at_unix"]
+        ):
+            raise ReviewExecutionRejected("first-party historical signed diff read invalid")
+        data_fd = _private_dir(reads_root)
+        try:
+            data = _private_read(
+                data_fd, read_id + ".data",
+                limit=FIRST_PARTY_MAX_READ_BYTES, allow_empty=False,
+            )
+        finally:
+            os.close(data_fd)
+        try:
+            parts = [part.encode("utf-8") for part in data.decode("utf-8").splitlines(keepends=True)]
+        except UnicodeError as exc:
+            raise ReviewExecutionRejected("first-party historical signed diff not text") from exc
+        if (
+            record.get("data_bytes") != len(data)
+            or record.get("data_sha256") != hashlib.sha256(data).hexdigest()
+            or len(parts) != last - first + 1
+        ):
+            raise ReviewExecutionRejected("first-party historical signed diff data invalid")
+        observed = True
+        for index, item in enumerate(parts, first - 1):
+            if original[index] is not None and original[index] != item:
+                raise ReviewExecutionRejected("first-party historical signed diff reads disagree")
+            original[index] = item
+    if not observed or any(part is None for part in original):
+        return None  # Incomplete signed history is never promoted to PASS.
+    candidate = b"".join(part for part in original if part is not None)
+    if hashlib.sha256(candidate).hexdigest() != session["canonical_diff_sha256"]:
+        raise ReviewExecutionRejected("first-party historical signed diff digest mismatch")
+    for current, past in zip(lines, original):
+        if current == past:
+            continue
+        assert past is not None
+        if current.endswith(b"\n") != past.endswith(b"\n"):
+            raise ReviewExecutionRejected("first-party historical diff line changed")
+        complete = _FIRST_PARTY_FULL_INDEX_RE.fullmatch(current.rstrip(b"\n"))
+        abbreviated = _FIRST_PARTY_LEGACY_INDEX_RE.fullmatch(past.rstrip(b"\n"))
+        if (
+            complete is None or abbreviated is None
+            or complete.group(3) != abbreviated.group(3)
+            or complete.group(4) != abbreviated.group(4)
+            or not complete.group(1).startswith(abbreviated.group(1))
+            or not complete.group(2).startswith(abbreviated.group(2))
+        ):
+            raise ReviewExecutionRejected("first-party historical Git source line changed")
+    return candidate
+
+
+def _first_party_signed_diff(
+    repository: Path, session: dict[str, Any], *,
+    session_root: Path | None = None,
+    signers: Path | None = None,
+    root_owned_signers: bool = True,
+) -> bytes:
+    full = _first_party_diff(repository, session["binding"])
+    expected = session.get("canonical_diff_sha256")
+    if not isinstance(expected, str) or SHA256.fullmatch(expected) is None:
+        raise ReviewExecutionRejected("first-party canonical diff identity invalid")
+    if hashlib.sha256(full).hexdigest() == expected:
+        return full
+
+    if session["binding"].get("review_purpose") not in {
+        "pull_request", "post_merge_release",
+    } or _FIRST_PARTY_FULL_INDEX_RE.search(full) is None:
+        raise ReviewExecutionRejected("first-party canonical diff drift")
+
+    # An older fully inspected session carries the actual authenticated bytes.
+    # Their per-blob abbreviations may differ within the same historical Git
+    # display, or grow later as unrelated objects enter the repository.
+    if session_root is not None and signers is not None:
+        saved = _first_party_diff_from_signed_reads(
+            full, session, session_root=session_root, signers=signers,
+            root_owned_signers=root_owned_signers,
+        )
+        if saved is not None:
+            return saved
+
+    # A partially completed historical REJECT may not have read every line.
+    # Recreate only bounded real Git legacy displays, verify their exact signed
+    # digest, and otherwise BLOCK (never ignore the old material decision).
+    for width in range(7, 15):
+        rendered = _git_read(
+            repository,
+            ["diff", "--no-ext-diff", "--no-textconv", "--no-renames",
+             "--ignore-submodules=none", "--unified=3", f"--abbrev={width}",
+             session["binding"]["base_sha"], session["binding"]["head_sha"], "--"],
+            maximum=FIRST_PARTY_MAX_DIFF_BYTES, timeout=15,
+        )
+        if hashlib.sha256(rendered).hexdigest() == expected:
+            return rendered
+
+    # Preserve a bounded fallback for historical explicit uniform widths.
+    for width in range(7, 64):
+        shortened = _FIRST_PARTY_FULL_INDEX_RE.sub(
+            lambda match: (
+                b"index " + match.group(1)[:width] + b".."
+                + match.group(2)[:width] + (match.group(3) or b"")
+                + (match.group(4) or b"")
+            ),
+            full,
+        )
+        if shortened != full and hashlib.sha256(shortened).hexdigest() == expected:
+            return shortened
+    raise ReviewExecutionRejected("first-party canonical diff drift")
 
 def _first_party_changed_paths(
     repository: Path, binding: dict[str, Any],
@@ -1343,15 +1520,21 @@ def _load_first_party_session(
     return record, session_root
 
 
-def _assert_first_party_source_current(session: dict[str, Any]) -> Path:
+def _assert_first_party_source_current(
+    session: dict[str, Any], *,
+    session_root: Path | None = None,
+    signers: Path | None = None,
+    root_owned_signers: bool = True,
+) -> Path:
     binding = session["binding"]
     worktree = Path(session["worktree"])
     from grabowski_self_review_producer import _current_source
     if _current_source(worktree, binding) != session["source_raw_diff_sha256"]:
         raise ReviewExecutionRejected("first-party review source revision drift")
-    diff = _first_party_diff(worktree, binding)
-    if hashlib.sha256(diff).hexdigest() != session["canonical_diff_sha256"]:
-        raise ReviewExecutionRejected("first-party canonical diff drift")
+    _first_party_signed_diff(
+        worktree, session, session_root=session_root, signers=signers,
+        root_owned_signers=root_owned_signers,
+    )
     return worktree
 
 
@@ -1387,7 +1570,10 @@ def record_first_party_source_read(
     signers = _allowed_signers(signers, root_owned=root_owned_signers)
     if axis not in REQUIRED_AXES:
         raise ReviewExecutionRejected("first-party source read axis invalid")
-    worktree = _assert_first_party_source_current(session)
+    worktree = _assert_first_party_source_current(
+        session, session_root=session_root, signers=signers,
+        root_owned_signers=root_owned_signers,
+    )
     binding = session["binding"]
     source_ref: str | None = None
     diff_total_lines: int | None = None
@@ -1400,7 +1586,10 @@ def record_first_party_source_read(
         ):
             raise ReviewExecutionRejected("first-party canonical diff read shape invalid")
         try:
-            lines = _first_party_diff(worktree, binding).decode("utf-8").splitlines(keepends=True)
+            lines = _first_party_signed_diff(
+                worktree, session, session_root=session_root, signers=signers,
+                root_owned_signers=root_owned_signers,
+            ).decode("utf-8").splitlines(keepends=True)
         except UnicodeError as exc:
             raise ReviewExecutionRejected("first-party canonical diff is not reviewable text") from exc
         diff_total_lines = len(lines)
@@ -1448,7 +1637,10 @@ def record_first_party_source_read(
     }
     lock = _first_party_lock(root)
     try:
-        _assert_first_party_source_current(session)
+        _assert_first_party_source_current(
+            session, session_root=session_root, signers=signers,
+            root_owned_signers=root_owned_signers,
+        )
         reads = session_root / "reads"
         _create_private_bytes(reads / (read_id + ".data"), data)
         _write_signed_record(
@@ -1524,7 +1716,10 @@ def _load_first_party_reads(
             raise ReviewExecutionRejected("first-party persisted source read changed")
         if record["read_kind"] == "diff":
             try:
-                complete_diff = _first_party_diff(repository, session["binding"])
+                complete_diff = _first_party_signed_diff(
+                    repository, session, session_root=session_root,
+                    signers=signers, root_owned_signers=root_owned_signers,
+                )
                 lines = complete_diff.decode("utf-8").splitlines(keepends=True)
             except UnicodeError as exc:
                 raise ReviewExecutionRejected("first-party canonical diff not text") from exc
@@ -1934,30 +2129,39 @@ def _assert_prior_first_party_material_findings_resolved(
                     ):
                         raise ReviewExecutionRejected("previous same-revision session origin invalid")
                     if old.get("canonical_diff_sha256") != session["canonical_diff_sha256"]:
-                        # A signed but never-reviewed PR session may accidentally
+                        # Historical signed REJECTs may use legitimate older
+                        # Git blob index abbreviations. Verify their EXACT old
+                        # bytes against the same fixed protected source first.
+                        try:
+                            _first_party_signed_diff(
+                                historical_repository, old,
+                                session_root=historical_root, signers=signers,
+                                root_owned_signers=root_owned_signers,
+                            )
+                        except ReviewExecutionRejected:
+                            # A signed but never-reviewed PR session may accidentally
                         # bind the *GitHub* patch hash as the local canonical diff.
                         # It carries no review finding or REJECT debt if and only
                         # if its private, authenticated axes directory is empty.
                         # All other identity checks above still apply. Any axis
                         # entry, including a malformed/unsigned one, fails closed.
-                        if (
-                            old_binding["review_purpose"] == "pull_request"
-                            and old.get("canonical_diff_sha256") == old_binding["diff_sha256"]
-                        ):
-                            # Both signed-semantic and source-read registries
-                            # must be truly empty: tampered or unsigned read
-                            # sidecars are not silently ignored.
-                            for category in ("axes", "reads"):
-                                evidence_fd = _private_dir(historical_root / category)
-                                try:
-                                    with os.scandir(evidence_fd) as entries:
-                                        if next(entries, None) is not None:
-                                            break
-                                finally:
-                                    os.close(evidence_fd)
-                            else:
-                                continue
-                        raise ReviewExecutionRejected("previous same-revision session origin invalid")
+                            if (
+                                old_binding["review_purpose"] == "pull_request"
+                                and old.get("canonical_diff_sha256") == old_binding["diff_sha256"]
+                            ):
+                                # Only an otherwise valid, signed old START
+                                # with no source reads or semantic axes is inert.
+                                for category in ("axes", "reads"):
+                                    evidence_fd = _private_dir(historical_root / category)
+                                    try:
+                                        with os.scandir(evidence_fd) as entries:
+                                            if next(entries, None) is not None:
+                                                break
+                                    finally:
+                                        os.close(evidence_fd)
+                                else:
+                                    continue
+                            raise ReviewExecutionRejected("previous same-revision session origin invalid")
                     old_reads = _load_first_party_reads(
                         old, historical_root, signers=signers,
                         root_owned_signers=root_owned_signers, repository=historical_repository,
@@ -2044,7 +2248,10 @@ def submit_first_party_axis_review(
     signers = _allowed_signers(signers, root_owned=root_owned_signers)
     lock = _first_party_lock(root)
     try:
-        worktree = _assert_first_party_source_current(session)
+        worktree = _assert_first_party_source_current(
+            session, session_root=session_root, signers=signers,
+            root_owned_signers=root_owned_signers,
+        )
         reads = _load_first_party_reads(
             session, session_root, signers=signers,
             root_owned_signers=root_owned_signers, repository=worktree,
@@ -2201,9 +2408,10 @@ def verified_first_party_semantic_review_passes(
         or hashlib.sha256(signature).hexdigest() != index["session_signature_sha256"]
     ):
         raise ReviewExecutionRejected("first-party indexed session bytes changed")
-    diff = _first_party_diff(repository, expected)
-    if hashlib.sha256(diff).hexdigest() != session.get("canonical_diff_sha256"):
-        raise ReviewExecutionRejected("first-party verified Git diff changed")
+    diff = _first_party_signed_diff(
+        repository, session, session_root=session_path.parent,
+        signers=signers, root_owned_signers=root_owned_signers,
+    )
     observed_at = int(time.time()) if now_unix is None else now_unix
     # Session expiry prevents new source reads/submissions, not the later
     # verification of completed signed reviews. Signed timestamps of all
@@ -2274,7 +2482,10 @@ def verified_first_party_semantic_review_passes(
                 "canonical_diff_sha256": session["canonical_diff_sha256"],
             },
         }
-    _assert_first_party_source_current(session)
+    _assert_first_party_source_current(
+        session, session_root=session_root, signers=signers,
+        root_owned_signers=root_owned_signers,
+    )
     return accepted
 
 
