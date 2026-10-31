@@ -2415,6 +2415,164 @@ class PostMergeSyncApplyTests(unittest.TestCase):
             self.assertIn(f"path:{repo}", result["resource_keys"])
             self.assertIn(f"path:{repo / '.git'}", result["resource_keys"])
 
+    def test_bureau_worktree_admin_keeps_convergence_admission(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, remote, base, target = self.fixture(Path(tmp))
+            leases = LeaseHarness()
+            rejected = {
+                "decision": "blocked",
+                "read_only": True,
+                "blockers": [{"code": "inventory-unavailable"}],
+            }
+            with (
+                patch.object(sync_apply.bureau_leases, "BUREAU_REPOSITORY_ROOT", repo),
+                patch.object(
+                    sync_apply.bureau_leases,
+                    "BUREAU_WORKTREE_ADMIN_KEY",
+                    f"path:{repo / '.bureau-scopes' / 'worktree-admin'}",
+                ),
+                patched_leases(leases),
+                patch.object(
+                    sync_apply.resources.work_admission,
+                    "require_repository_admission",
+                    side_effect=(
+                        sync_apply.resources.work_admission.WorkAdmissionBlocked(rejected)
+                    ),
+                ) as admission,
+            ):
+                result = self.apply(repo, remote, base, target)
+
+            self.assertEqual("lease_acquisition_blocked", result["state"])
+            self.assertFalse(result["effect_started"])
+            self.assertFalse(result["retry_authorized"])
+            self.assertEqual(0, leases.acquire_calls)
+            admission.assert_called_once()
+            kwargs = admission.call_args.kwargs
+            self.assertEqual("convergence", kwargs["mode"])
+            self.assertEqual("broad_repository_lease", kwargs["operation"])
+            self.assertEqual(str(repo), kwargs["repo"])
+            self.assertEqual("main", kwargs["requested_scope"]["branch"])
+            self.assertEqual(base, git_stdout(repo, "rev-parse", "HEAD"))
+            self.assertEqual("", git_stdout(repo, "status", "--porcelain"))
+
+    def test_bureau_worktree_admin_rejects_non_read_only_admission(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, remote, base, target = self.fixture(Path(tmp))
+            leases = LeaseHarness()
+            with (
+                patch.object(sync_apply.bureau_leases, "BUREAU_REPOSITORY_ROOT", repo),
+                patch.object(
+                    sync_apply.bureau_leases,
+                    "BUREAU_WORKTREE_ADMIN_KEY",
+                    f"path:{repo / '.bureau-scopes' / 'worktree-admin'}",
+                ),
+                patched_leases(leases),
+                patch.object(
+                    sync_apply.resources.work_admission,
+                    "require_repository_admission",
+                    return_value={"decision": "allow", "read_only": False},
+                ) as admission,
+            ):
+                result = self.apply(repo, remote, base, target)
+            self.assertEqual("lease_acquisition_blocked", result["state"])
+            self.assertEqual("RuntimeError", result["error_class"])
+            self.assertFalse(result["effect_started"])
+            self.assertEqual(0, leases.acquire_calls)
+            admission.assert_called_once()
+            self.assertEqual(base, git_stdout(repo, "rev-parse", "HEAD"))
+
+    def test_bureau_worktree_admin_accepts_terminal_convergence_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, remote, base, target = self.fixture(Path(tmp))
+            leases = LeaseHarness()
+            admission_states = (
+                sync_apply.resources.work_admission.FOREIGN_LIFECYCLE_OWNER_CONVERGENCE_STATES
+            )
+            allowed_state = next(iter(admission_states))
+            assessment = {
+                "decision": "converge_first",
+                "read_only": True,
+                "blockers": [
+                    {"code": "foreign-lifecycle-owner", "state": allowed_state}
+                ],
+            }
+            with (
+                patch.object(sync_apply.bureau_leases, "BUREAU_REPOSITORY_ROOT", repo),
+                patch.object(
+                    sync_apply.bureau_leases,
+                    "BUREAU_WORKTREE_ADMIN_KEY",
+                    f"path:{repo / '.bureau-scopes' / 'worktree-admin'}",
+                ),
+                patched_leases(leases),
+                patch.object(
+                    sync_apply.resources.work_admission,
+                    "require_repository_admission",
+                    return_value=assessment,
+                ) as admission,
+            ):
+                result = self.apply(repo, remote, base, target)
+            self.assertEqual("synced", result["state"])
+            self.assertEqual(0, len(leases.live))
+            admission.assert_called_once()
+            self.assertEqual(target, git_stdout(repo, "rev-parse", "HEAD"))
+
+    def test_bureau_main_uses_contract_bounded_worktree_admin_ttl(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, remote, base, target = self.fixture(Path(tmp))
+            leases = LeaseHarness()
+            ttl_observed: list[int] = []
+            self.assertEqual(sync_apply.LEASE_TTL_SECONDS, sync_apply._lease_ttl_seconds(repo))
+
+            def bounded_acquire(
+                owner_id: str,
+                resource_keys: list[str],
+                *,
+                purpose: str,
+                ttl_seconds: int,
+                metadata: dict[str, object] | None = None,
+                _work_admission_mode: str = "normal",
+            ) -> dict[str, object]:
+                ttl_observed.append(ttl_seconds)
+                return leases.acquire(
+                    owner_id,
+                    resource_keys,
+                    purpose=purpose,
+                    ttl_seconds=ttl_seconds,
+                    metadata=metadata,
+                    _work_admission_mode=_work_admission_mode,
+                )
+
+            with (
+                patch.object(sync_apply.bureau_leases, "BUREAU_REPOSITORY_ROOT", repo),
+                patch.object(
+                    sync_apply.bureau_leases,
+                    "BUREAU_WORKTREE_ADMIN_KEY",
+                    f"path:{repo / '.bureau-scopes' / 'worktree-admin'}",
+                ),
+                patched_leases(leases),
+                patch.object(sync_apply.resources, "acquire_resources", bounded_acquire),
+                patch.object(
+                    sync_apply.resources.work_admission,
+                    "require_repository_admission",
+                    return_value={"decision": "allow", "read_only": True},
+                ) as admission,
+            ):
+                result = self.apply(repo, remote, base, target)
+
+            self.assertEqual("synced", result["state"])
+            admission.assert_called_once()
+            self.assertEqual("convergence", admission.call_args.kwargs["mode"])
+            self.assertEqual(str(repo), admission.call_args.kwargs["repo"])
+            self.assertEqual(
+                [sync_apply.bureau_leases.MAX_EFFECT_GATE_TTL_SECONDS], ttl_observed
+            )
+            self.assertNotIn(f"repo:{repo}", result["resource_keys"])
+            self.assertIn(
+                f"path:{repo / '.bureau-scopes' / 'worktree-admin'}",
+                result["resource_keys"],
+            )
+            self.assertEqual(0, len(leases.live))
+
     def test_foreign_repository_guard_conflict_blocks_before_git_effect(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo, remote, base, target = self.fixture(Path(tmp))
