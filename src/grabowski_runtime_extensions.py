@@ -531,10 +531,15 @@ def _effective_browser_operator_contract(contract: dict[str, Any]) -> dict[str, 
         metadata = executable.stat()
     except (OSError, RuntimeError):
         return browser_contract
+    if not stat.S_ISREG(metadata.st_mode) or not os.access(executable, os.X_OK):
+        return browser_contract
+    # Resolve the same browser channel as the worker, only when needed.
+    from grabowski_workers import _browser_adapter_policy
+
+    adapter = _browser_adapter_policy(executable, require_supported=False)
     if (
-        executable.name not in {"chrome", "google-chrome", "google-chrome-stable"}
-        or not stat.S_ISREG(metadata.st_mode)
-        or not os.access(executable, os.X_OK)
+        adapter.get("family") != "chrome-stable"
+        or adapter.get("selection_role") != "canonical-operator"
     ):
         return browser_contract
     return {
