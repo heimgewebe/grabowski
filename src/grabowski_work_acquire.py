@@ -3356,6 +3356,7 @@ def _native_owner_inventory_pagination_guard(
         # Test-injected inventories retain their caller-defined semantics.
         yield inventory_fn
         return
+    operator._require_operator_mutation("resource_lease")
     flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(resources.RESOURCE_DB, flags)
     try:

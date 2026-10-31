@@ -643,6 +643,37 @@ class WorkAcquireTests(unittest.TestCase):
                 self.assertGreaterEqual(len(observed_pages), 2)
                 self.assertEqual(live[999]["resource_key"], observed_pages[1][1])
 
+    def test_native_owner_inventory_denial_happens_before_sqlite_wal_open(self) -> None:
+        # SQLite mode=ro may still create WAL/SHM or write SHM reader marks.
+        # The existing resource-lease kill switch must precede any native open.
+        self.state.mkdir(parents=True, exist_ok=True)
+        database = self.state / "native-admission-wal.sqlite3"
+        with sqlite3.connect(database) as connection:
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("CREATE TABLE probe (value INTEGER)")
+        connection.close()
+        wal = Path(str(database) + "-wal")
+        shm = Path(str(database) + "-shm")
+        self.assertFalse(wal.exists())
+        self.assertFalse(shm.exists())
+
+        with (
+            patch.object(work_acquire.resources, "RESOURCE_DB", database),
+            patch.object(
+                work_acquire.operator, "_require_operator_mutation",
+                side_effect=PermissionError("resource_lease blocked"),
+            ) as require_admission,
+        ):
+            with self.assertRaisesRegex(PermissionError, "resource_lease blocked"):
+                with work_acquire._native_owner_inventory_pagination_guard(
+                    work_acquire.resources.list_resources
+                ):
+                    self.fail("native inventory must not open before admission")
+
+        require_admission.assert_called_once_with("resource_lease")
+        self.assertFalse(wal.exists(), "denied read created SQLite WAL")
+        self.assertFalse(shm.exists(), "denied read created SQLite SHM")
+
     def test_multibatch_native_sqlite_rejects_cross_page_generation_replacement(self) -> None:
         owner = "lane:" + "c" * 32
         required = ["component:snapshot-0000", "component:snapshot-1000"]
