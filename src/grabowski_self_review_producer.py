@@ -39,7 +39,7 @@ CANONICAL_REPO = Path.home() / "repos/grabowski"
 SHA = re.compile(r"[a-f0-9]{40}\Z")
 HEX64 = re.compile(r"[a-f0-9]{64}\Z")
 TASK = re.compile(r"[a-f0-9]{24}\Z")
-SUPPORTED_REPO = re.compile(r"(?:heimgewebe/(?P<name>[A-Za-z0-9_.-]+)|alexdermohr/(?P<product_name>kleinanzeiger))\Z")
+SUPPORTED_REPO = re.compile(r"(?:heimgewebe/(?P<name>[A-Za-z0-9_.-]+)|alexdermohr/(?P<product_name>kleinanzeiger|machtverflechtungen))\Z")
 METHODS = provenance.REQUIRED_AXES
 
 
@@ -110,7 +110,7 @@ def _managed_repository_identity(
     ).decode().strip()
     match = re.fullmatch(
         r"(?:git@github\.com:|ssh://git@github\.com/|https://github\.com/)"
-        r"(?P<slug>(?:heimgewebe/[A-Za-z0-9_.-]+|alexdermohr/kleinanzeiger))\.git",
+        r"(?P<slug>(?:heimgewebe/[A-Za-z0-9_.-]+|alexdermohr/(?:kleinanzeiger|machtverflechtungen)))\.git",
         remote,
     )
     slug = match["slug"] if match is not None else None

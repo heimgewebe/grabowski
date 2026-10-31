@@ -90,14 +90,15 @@ def _signed_first_party_material_history_errors(bindings: dict[str, Any]) -> lis
     repo = bindings.get("repository")
     if not isinstance(repo, str) or re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo) is None:
         return ["merge_guard_signed_first_party_history_binding_invalid"]
-    # The signed first-party producer accepts only heimgewebe/* identities.
-    # Other GitHub owners cannot have valid receipts in this registry, so
-    # treating their PRs as malformed would incorrectly block Captain merges.
-    if not repo.lower().startswith("heimgewebe/"):
+    # Only GitHub origins supported by the signed FirstParty producer may
+    # carry authenticated REJECT history. Never bypass this check for an
+    # explicitly admitted product or research repo. Canonicalize ASCII
+    # GitHub case aliases before the historical signed-record comparison.
+    owner, _, name = repo.partition("/")
+    normalized = ("heimgewebe/" + name) if owner.lower() == "heimgewebe" else repo.lower()
+    if provenance.FIRST_PARTY_ALLOWED_REPO.fullmatch(normalized) is None:
         return []
-    # Preserve the signed repository name; normalize only the managed owner.
-    # History matching case-folds both subjects after authenticating signatures.
-    repo = "heimgewebe/" + repo.split("/", 1)[1]
+    repo = normalized
     binding = {
         "repo": repo,
         "pr": bindings.get("pull_request"),
