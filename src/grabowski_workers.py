@@ -4184,7 +4184,7 @@ try {
     try {
       const ready = await call('Runtime.callFunctionOn', {
         objectId,
-        functionDeclaration: "function (action) {if (!this || !this.isConnected) return false; const tag=String(this.localName||'').toLowerCase(); const type=String(this.getAttribute('type')||'').toLowerCase(); if (this.disabled || this.closest('[inert]')) return false; if (action==='click_button') return tag==='button'||(tag==='input'&&['button','submit','reset'].includes(type))||this.getAttribute('role')==='button'; const editable=tag==='textarea'||(tag==='input'&&['','text','search','email','url','tel'].includes(type)); if(!editable||this.readOnly) return false; this.focus(); if (document.activeElement!==this) return false; if(action==='fill_text') this.select(); return true;}",
+        functionDeclaration: "function (action) {if (!this || !this.isConnected) return false; const tag=String(this.localName||'').toLowerCase(); const type=String(this.getAttribute('type')||'').toLowerCase(); if (this.disabled || this.closest('[inert]')) return false; if (action==='click_button') return tag==='button'||(tag==='input'&&['button','submit','reset'].includes(type))||this.getAttribute('role')==='button'; const editable=tag==='textarea'||(tag==='input'&&['','text','search','email','url','tel'].includes(type)); if(!editable||this.readOnly) return false; this.focus(); const root=this.getRootNode(); const active=(root && 'activeElement' in root) ? root.activeElement : document.activeElement; if (active!==this) return false; if(action==='fill_text') this.select(); return true;}",
         arguments: [{value: request.op}],
         returnByValue: true,
         awaitPromise: false,

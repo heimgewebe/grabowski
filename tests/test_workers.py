@@ -6547,6 +6547,8 @@ globalThis.fetch = async () => ({
         self.assertIn("Input.dispatchKeyEvent", source)
         self.assertIn("request.text_value", source)
         self.assertIn("Runtime.releaseObject", source)
+        self.assertIn("root.activeElement", source)
+        self.assertIn("this.getRootNode()", source)
         self.assertNotIn("document.querySelector", source)
 
 
