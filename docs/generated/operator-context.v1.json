@@ -416,7 +416,7 @@
     },
     {
       "category": "knowledge",
-      "description": "Discover healthy RepoGround bundles from one deterministic publication catalog.",
+      "description": "Discover healthy RepoGround bundles by repository identity, not a filesystem path.\n\nThe optional 'repo' filter is a name such as 'repoground',\n'heimgewebe/repoground', or 'heimgewebe__repoground'.\nDo not pass '/tmp/repoground' or another local checkout path.\nOmit 'repo' to list the publication catalog; this tool never builds bundles.",
       "effects": [],
       "id": "repoground_bundle_discover",
       "purpose": "Discover current RepoGround bundles from the canonical publication catalog.",
@@ -3842,7 +3842,7 @@
       "src/grabowski_lifecycle_projection.py": "d96605f48290074d80a86815063144eb4c98df7dc16338eef1e3f11530c4c114",
       "src/grabowski_lifecycle_read_surface.py": "ed8a123c80751204ccb095ce1b5ef77b15310e9aed4b555167a60c4a3d51f467",
       "src/grabowski_managed_cargo.py": "153723e0299cf9b1c624cd342ebf73daf9e05b71c695babba4ed1ed2ca59497e",
-      "src/grabowski_mcp.py": "0418e6e176a4857cdcc91e97e28b244c403d4e3ffa9fd936485a1469697f31d7",
+      "src/grabowski_mcp.py": "66eff77f5cec5a92ccb2a6f3398773565e3bb704ceb8b62fce62ad7fd295ae19",
       "src/grabowski_merge_authority.py": "5bfe922272e0a294a20066f140c453c8f613b077aaca39eb01c0bf2f6c985f28",
       "src/grabowski_merge_delivery.py": "6f11c5c7c49efdba215a2c7c49563f8c43ebd798de9ff915408a837b11dc5064",
       "src/grabowski_merge_delivery_surface.py": "97bf36785d928c7070a1e294d7b510d126cb06f63e6f26f62d5130c96e3a8b5e",
