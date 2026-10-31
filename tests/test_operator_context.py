@@ -669,6 +669,91 @@ print(json.dumps(runtime.resolve_host_capability({intent!r}), sort_keys=True))
         )
         self.assertEqual(contract["module"], "grabowski_operator")
 
+    @staticmethod
+    def _runtime_browser_contract_resolver_for_test():
+        # Exercise the pure helper without importing the live MCP/DB services.
+        import ast
+        import stat
+
+        path = ROOT / "src" / "grabowski_runtime_extensions.py"
+        source = path.read_text(encoding="utf-8")
+        functions = [
+            node for node in ast.parse(source).body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_effective_browser_operator_contract"
+        ]
+        assert len(functions) == 1
+        namespace = {"os": os, "Path": Path, "stat": stat, "Any": object}
+        program = ast.fix_missing_locations(
+            ast.Module(body=functions, type_ignores=[])
+        )
+        exec(compile(program, str(path), "exec"), namespace)
+        return namespace["_effective_browser_operator_contract"]
+
+    def test_browser_context_resolves_single_live_allowlisted_chrome(self) -> None:
+        resolve = self._runtime_browser_contract_resolver_for_test()
+        manifest = {"browser_operator_default": {
+            "authority": "grabowski",
+            "canonical_browser": {
+                "family": "chrome-stable",
+                "executable": "/opt/google/chrome/google-chrome",
+            },
+        }}
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / "chrome"
+            binary.write_text("#!/bin/sh\n", encoding="utf-8")
+            binary.chmod(0o755)
+            with mock.patch.dict(os.environ, {
+                "GRABOWSKI_BROWSER_EXECUTABLES": str(binary),
+            }):
+                effective = resolve(manifest)
+        self.assertEqual(effective["canonical_browser"]["executable"], str(binary))
+        self.assertEqual(
+            manifest["browser_operator_default"]["canonical_browser"]["executable"],
+            "/opt/google/chrome/google-chrome",
+        )
+        self.assertIsNot(effective, manifest["browser_operator_default"])
+        self.assertEqual(effective["authority"], "grabowski")
+        runtime = (
+            ROOT / "src" / "grabowski_runtime_extensions.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "browser_operator_contract = _effective_browser_operator_contract(contract)",
+            runtime,
+        )
+
+    def test_browser_context_rejects_ambiguous_missing_or_foreign_defaults(self) -> None:
+        resolve = self._runtime_browser_contract_resolver_for_test()
+        original = {"canonical_browser": {
+            "family": "chrome-stable",
+            "executable": "/opt/google/chrome/google-chrome",
+        }}
+        manifest = {"browser_operator_default": original}
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / "chrome"
+            binary.write_text("#!/bin/sh\n", encoding="utf-8")
+            binary.chmod(0o755)
+            foreign = Path(directory) / "python3"
+            foreign.write_text("#!/bin/sh\n", encoding="utf-8")
+            foreign.chmod(0o755)
+            for value in (
+                "",
+                str(binary) + os.pathsep + str(foreign),
+                "chrome",
+                str(foreign),
+                str(Path(directory) / "missing" / "chrome"),
+            ):
+                with self.subTest(value=value), mock.patch.dict(os.environ, {
+                    "GRABOWSKI_BROWSER_EXECUTABLES": value,
+                }):
+                    self.assertIs(resolve(manifest), original)
+            binary.chmod(0o644)
+            with mock.patch.dict(os.environ, {
+                "GRABOWSKI_BROWSER_EXECUTABLES": str(binary),
+            }):
+                self.assertIs(resolve(manifest), original)
+        self.assertIsNone(resolve({}))
+
 
 if __name__ == "__main__":
     unittest.main()

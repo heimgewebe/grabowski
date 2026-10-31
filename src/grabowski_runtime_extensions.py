@@ -505,6 +505,44 @@ def _validate_branch_name(repo: Path, branch: str) -> str:
     return branch
 
 
+def _effective_browser_operator_contract(contract: dict[str, Any]) -> dict[str, Any] | None:
+    """Project one runnable Chrome default, without changing the signed contract.
+
+    Worker admission is still governed by the exact process allowlist. Never
+    choose an executable when that allowlist is absent or ambiguous.
+    """
+    browser_contract = contract.get("browser_operator_default")
+    if not isinstance(browser_contract, dict):
+        return None
+    browser = browser_contract.get("canonical_browser")
+    if not isinstance(browser, dict) or browser.get("family") != "chrome-stable":
+        return browser_contract
+    candidates = [
+        item for item in os.environ.get("GRABOWSKI_BROWSER_EXECUTABLES", "").split(os.pathsep)
+        if item
+    ]
+    if len(candidates) != 1:
+        return browser_contract
+    path = Path(candidates[0]).expanduser()
+    if not path.is_absolute():
+        return browser_contract
+    try:
+        executable = path.resolve(strict=True)
+        metadata = executable.stat()
+    except (OSError, RuntimeError):
+        return browser_contract
+    if (
+        executable.name not in {"chrome", "google-chrome", "google-chrome-stable"}
+        or not stat.S_ISREG(metadata.st_mode)
+        or not os.access(executable, os.X_OK)
+    ):
+        return browser_contract
+    return {
+        **browser_contract,
+        "canonical_browser": {**browser, "executable": str(executable)},
+    }
+
+
 @mcp.tool(name="grabowski_context", annotations=READ_ONLY)
 def grabowski_context(
     profile: str = "concise",
@@ -518,9 +556,7 @@ def grabowski_context(
         raise ValueError(f"profile must be one of {sorted(capabilities.PROFILE_CATEGORIES)}")
     snapshot = _runtime_contract_snapshot()
     contract = snapshot["contract"]
-    browser_operator_contract = contract.get("browser_operator_default")
-    if not isinstance(browser_operator_contract, dict):
-        browser_operator_contract = None
+    browser_operator_contract = _effective_browser_operator_contract(contract)
     expected_tools = contract.get("expected_tools", [])
     if not isinstance(expected_tools, list):
         expected_tools = []
