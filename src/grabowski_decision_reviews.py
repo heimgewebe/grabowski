@@ -1901,7 +1901,7 @@ def _proven_claude_auth_failure_before_review(
 def _proven_grok_quota_failure_before_review(
     receipt: dict[str, Any], provenance: dict[str, Any]
 ) -> bool:
-    """Recognize only the authenticated, three-event, pre-result xAI 402.
+    """Recognize exact authenticated, three-event, pre-result xAI quota failures.
 
     Recognition is *not* a review decision. It keeps the failed job in history
     and requires a later real independent PASS from the same provider slot.
@@ -1913,7 +1913,9 @@ def _proven_grok_quota_failure_before_review(
         provenance.get("schema_version") != 2
         or not isinstance(route, dict)
         or route.get("provider_family") != "xai"
-        or route.get("route_id") != "grok-4.6-review-high"
+        or route.get("route_id") not in {
+            "grok-4.6-review-high", "grok-4.7-review-high",
+        }
         or receipt.get("verdict") != "INVALID"
         or receipt.get("findings") != []
         or receipt.get("failure_classification") != "invalid_review_output"
@@ -1989,15 +1991,36 @@ def _proven_grok_quota_failure_before_review(
     ):
         return False
 
-    error_message = (
-        "API error (status 402 Payment Required): "
-        "Grok Build usage balance exhausted"
-    )
-    wrapped = (
-        'Internal error: {\n  "message": "' + error_message
-        + '",\n  "http_status": 402\n}'
-    )
-    if stderr != "Error: " + wrapped + "\n":
+    route_id = route["route_id"]
+    if route_id == "grok-4.6-review-high":
+        error_message = (
+            "API error (status 402 Payment Required): "
+            "Grok Build usage balance exhausted"
+        )
+        wrapped = (
+            'Internal error: {\n  "message": "' + error_message
+            + '",\n  "http_status": 402\n}'
+        )
+        error_event = {"type": "error", "message": wrapped}
+        expected_stderr = "Error: " + wrapped + "\n"
+    else:
+        # Grok 4.7's observed *pre-model* free-tier exhaustion: exactly
+        # two available-command events followed by one error event.
+        # Bind the provider's cwd to the authenticated review role origin;
+        # a different path or arbitrary quota prose is never sufficient.
+        observed_cwd = provenance.get("repository")
+        if not isinstance(observed_cwd, str) or not Path(observed_cwd).is_absolute():
+            return False
+        quota_message = (
+            "You’ve reached your free Grok Build usage limit for now. "
+            "Get SuperGrok for much higher limits, or try again later: "
+            "https://grok.com/supergrok?referrer=grok-build"
+        )
+        error_event = {
+            "type": "error", "message": quota_message, "cwd": observed_cwd,
+        }
+        expected_stderr = "Error: " + quota_message + "\n"
+    if stderr != expected_stderr:
         return False
     # No silent duplicate JSON member, Unicode alias, partial/truncated stream,
     # embedded prose, usage, tool event or end_turn can masquerade as zero work.
@@ -2035,7 +2058,7 @@ def _proven_grok_quota_failure_before_review(
         events == [
             {"type": "available_commands", "tools": [], "commands": commands},
             {"type": "available_commands", "tools": [], "commands": commands},
-            {"type": "error", "message": wrapped},
+            error_event,
         ]
         for commands in known_commands
     )

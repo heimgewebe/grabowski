@@ -9152,7 +9152,13 @@ def _repoground_git(
 def repoground_bundle_discover(
     repo: str | None = None, max_candidates: int = 20
 ) -> dict[str, Any]:
-    """Discover healthy RepoGround bundles from one deterministic publication catalog."""
+    """Discover healthy RepoGround bundles by repository identity, not a filesystem path.
+
+    The optional 'repo' filter is a name such as 'repoground',
+    'heimgewebe/repoground', or 'heimgewebe__repoground'.
+    Do not pass '/tmp/repoground' or another local checkout path.
+    Omit 'repo' to list the publication catalog; this tool never builds bundles.
+    """
     _require_capability("bundle_registry")
     if not isinstance(max_candidates, int) or not 1 <= max_candidates <= 100:
         raise ValueError("max_candidates must be between 1 and 100")
