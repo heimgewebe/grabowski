@@ -1187,11 +1187,60 @@ class AgentWorkspaceTests(unittest.TestCase):
         (outside / "app.py").write_text("value = 1\n", encoding="utf-8")
         source.symlink_to(outside, target_is_directory=True)
         with self.assertRaisesRegex(
-            workspace.AgentWorkspaceError, "candidate adoption path is unreadable",
+            workspace.AgentWorkspaceError, "candidate adoption path ancestor is not a directory",
         ):
             workspace._adoption_worktree_raw_fingerprint(
                 self.git.writer, ["src/app.py"]
             )
+
+    def test_candidate_snapshot_rejects_race_before_raw_baseline(self) -> None:
+        """Changes after the source diff must not become a trusted raw baseline."""
+        _lane, manifest, collection, candidate, _closed = self.closed_lane_candidate_fixture()
+        real_git_snapshot = workspace._git_snapshot
+
+        def mutate_after_git_diff(manifest_value, runner):
+            snapshot = real_git_snapshot(manifest_value, runner)
+            (self.git.writer / "src" / "app.py").write_text(
+                "replaced_after_git_diff = True\n", encoding="utf-8"
+            )
+            return snapshot
+
+        with (
+            mock.patch.object(
+                workspace, "_git_snapshot", side_effect=mutate_after_git_diff,
+            ),
+            self.assertRaisesRegex(
+                workspace.AgentWorkspaceError,
+                "Candidate worktree changed during snapshot",
+            ),
+        ):
+            workspace._adoption_candidate_snapshot(manifest, collection, candidate)
+        self.assertEqual(run(self.git.writer, "git", "rev-parse", "HEAD"), self.git.base)
+
+    def test_candidate_raw_fingerprint_allows_directory_to_file_replacement(self) -> None:
+        """Tracked descendants can be absent when their parent becomes a file."""
+        pkg = self.git.repo / "src" / "pkg"
+        pkg.mkdir()
+        (pkg / "a.py").write_text("value = 1\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "add", "src/pkg/a.py"], cwd=self.git.repo,
+            check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "tracked nested source"], cwd=self.git.repo,
+            check=True, capture_output=True,
+        )
+        self.git.base = run(self.git.repo, "git", "rev-parse", "HEAD")
+        self.git.add_writer()
+        (self.git.writer / "src" / "pkg" / "a.py").unlink()
+        (self.git.writer / "src" / "pkg").rmdir()
+        (self.git.writer / "src" / "pkg").write_text(
+            "regular file replacement\n", encoding="utf-8"
+        )
+        fingerprint = workspace._adoption_worktree_raw_fingerprint(
+            self.git.writer, ["src/pkg", "src/pkg/a.py"]
+        )
+        self.assertRegex(fingerprint, r"^[a-f0-9]{64}$")
 
     def test_lane_candidate_adoption_rejects_staged_content_drift_after_freeze(self) -> None:
         _lane, manifest, collection, candidate, _closed = self.closed_lane_candidate_fixture()

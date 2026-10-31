@@ -4804,6 +4804,24 @@ def _adoption_path_raw_entry(worktree: Path, item: str) -> tuple[Any, ...]:
                 next_fd = os.open(component, directory_flags, dir_fd=current_fd)
             except FileNotFoundError:
                 return (item, "absent")
+            except NotADirectoryError as exc:
+                # A former tracked directory may legitimately become a regular
+                # file. Its old descendants are then absent, not unsafe.
+                # Symlinked ancestors remain forbidden, including TOCTOU
+                # replacement between opening and classification.
+                try:
+                    ancestor = os.stat(
+                        component, dir_fd=current_fd, follow_symlinks=False,
+                    )
+                except OSError as probe_exc:
+                    raise AgentWorkspaceError(
+                        "candidate adoption path ancestor changed"
+                    ) from probe_exc
+                if stat.S_ISREG(ancestor.st_mode):
+                    return (item, "absent")
+                raise AgentWorkspaceError(
+                    "candidate adoption path ancestor is not a directory"
+                ) from exc
             if current_fd != root_fd:
                 os.close(current_fd)
             current_fd = next_fd
@@ -4900,6 +4918,10 @@ def _adoption_candidate_snapshot(
     collection: dict[str, Any],
     candidate: dict[str, Any],
 ) -> dict[str, Any]:
+    worktree = Path(str(manifest["writer_worktree"]))
+    before_raw_sha256 = _adoption_worktree_raw_fingerprint(
+        worktree, collection.get("changed_paths")
+    )
     snapshot = _git_snapshot(manifest, _run)
     if (
         snapshot.get("writer_head") != candidate.get("base_head")
@@ -4940,9 +4962,12 @@ def _adoption_candidate_snapshot(
         or writer_receipt.get("receipt_sha256") != collection.get("writer_receipt_sha256")
     ):
         raise AgentWorkspaceError("Candidate writer evidence drifted")
-    snapshot["stage_worktree_sha256"] = _adoption_worktree_raw_fingerprint(
-        Path(str(manifest["writer_worktree"])), snapshot["changed_paths"]
+    after_raw_sha256 = _adoption_worktree_raw_fingerprint(
+        worktree, snapshot["changed_paths"]
     )
+    if after_raw_sha256 != before_raw_sha256:
+        raise AgentWorkspaceError("Candidate worktree changed during snapshot")
+    snapshot["stage_worktree_sha256"] = before_raw_sha256
     return snapshot
 
 
