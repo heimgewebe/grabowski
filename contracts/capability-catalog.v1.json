@@ -356,7 +356,7 @@
     },
     {
       "category": "knowledge",
-      "description": "Discover healthy RepoGround bundles from one deterministic publication catalog.",
+      "description": "Discover healthy RepoGround bundles by repository identity, not a filesystem path.\n\nThe optional 'repo' filter is a name such as 'repoground',\n'heimgewebe/repoground', or 'heimgewebe__repoground'.\nDo not pass '/tmp/repoground' or another local checkout path.\nOmit 'repo' to list the publication catalog; this tool never builds bundles.",
       "effects": [],
       "id": "repoground_bundle_discover",
       "purpose": "Discover current RepoGround bundles from the canonical publication catalog.",

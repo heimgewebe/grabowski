@@ -107,6 +107,75 @@ class SelfReviewDiffBindingTests(unittest.TestCase):
         self.assertEqual(result["verdict"], "PASS")
         self.assertTrue(result["review_sources"]["self_review_diff_bound"])
 
+    def test_foreign_repo_ignores_unrelated_signed_heimgewebe_history(self) -> None:
+        state = _state()
+        state["repoName"] = "alexdermohr/machtverflechtungen"
+        review = _self_review()
+        review["repo"] = state["repoName"]
+        # A real global signed history root may exist, but this repository
+        # cannot have a first-party Heimgewebe binding to validate.
+        with patch.object(
+            gate.review_provenance, "_assert_no_first_party_reject_for_legacy_review",
+            side_effect=ValueError("foreign owner cannot be a first-party subject"),
+        ) as history:
+            result = gate.evaluate_review_gate(state, self_review=review)
+        self.assertEqual(result["verdict"], "PASS", result["failures"])
+        history.assert_not_called()
+
+    def test_mixed_case_foreign_owner_still_ignores_heimgewebe_history(self) -> None:
+        state = _state()
+        state["repoName"] = "AlexDerMohr/Machtverflechtungen"
+        review = _self_review()
+        review["repo"] = state["repoName"]
+        with patch.object(
+            gate.review_provenance, "_assert_no_first_party_reject_for_legacy_review",
+            side_effect=ValueError("unrelated signed Heimgewebe history"),
+        ) as history:
+            result = gate.evaluate_review_gate(state, self_review=review)
+        self.assertEqual(result["verdict"], "PASS", result["failures"])
+        history.assert_not_called()
+
+    def test_mixed_case_managed_owner_still_enforces_signed_reject(self) -> None:
+        state = _state()
+        state["repoName"] = "HeiMGeWeBe/Grabowski"
+        review = _self_review()
+        review["repo"] = state["repoName"]
+        with patch.object(
+            gate.review_provenance, "_assert_no_first_party_reject_for_legacy_review",
+            side_effect=gate.review_provenance.ReviewExecutionRejected("signed material REJECT"),
+        ) as history:
+            result = gate.evaluate_review_gate(state, self_review=review)
+        self.assertEqual(result["verdict"], "BLOCK", result["failures"])
+        self.assertTrue(_has_failure(result, "signed first-party material review history unresolved or invalid"))
+        history.assert_called_once()
+
+    def test_unicode_repository_alias_is_rejected_before_history_scope(self) -> None:
+        state = _state()
+        state["repoName"] = "heiMGewebe/Grabowſki"
+        review = _self_review()
+        review["repo"] = state["repoName"]
+        with patch.object(
+            gate.review_provenance, "_assert_no_first_party_reject_for_legacy_review",
+            side_effect=AssertionError("invalid Unicode must not bind history"),
+        ) as history:
+            result = gate.evaluate_review_gate(state, self_review=review)
+        self.assertEqual(result["verdict"], "BLOCK", result["failures"])
+        history.assert_not_called()
+        self.assertTrue(_has_failure(result, "repository identity could not be canonicalized"))
+
+    def test_managed_repo_signed_reject_still_blocks_standard_review(self) -> None:
+        with patch.object(
+            gate.review_provenance, "_assert_no_first_party_reject_for_legacy_review",
+            side_effect=gate.review_provenance.ReviewExecutionRejected("material REJECT"),
+        ) as history:
+            result = gate.evaluate_review_gate(_state(), self_review=_self_review())
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(
+            _has_failure(result, "signed first-party material review history unresolved or invalid"),
+            result["failures"],
+        )
+        history.assert_called_once()
+
     def test_self_review_base_sha_mismatch_blocks(self) -> None:
         review = _self_review()
         review["base_sha"] = "d" * 40
