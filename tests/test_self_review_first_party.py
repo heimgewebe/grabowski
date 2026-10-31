@@ -987,6 +987,42 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
         audit, receipts = self._seal_direct(plan)
         self.assertEqual([], self._receipt_errors(audit, receipts))
 
+    def test_signed_mixed_repository_history_keeps_reviews_independent(self) -> None:
+        plan = self._first_party_plan()
+        started = self._start_plan(plan)
+        current_path = self.state / "sessions" / started["review_session_id"] / "session.json"
+        current = review._read_signed_record(
+            current_path, signers=self.signers, root_owned_signers=False,
+        )
+        # This unrelated, genuinely signed product session must be recognized
+        # before filtering, not treated as corrupt heimgewebe-only history.
+        product = copy.deepcopy(current)
+        product["session_id"] = "f" * 32
+        product["binding"]["repo"] = "alexdermohr/kleinanzeiger"
+        product["binding"]["pr"] += 1
+        product["binding_sha256"] = review._digest(product["binding"])
+        product_dir = self.state / "sessions" / product["session_id"]
+        product_dir.mkdir(mode=0o700)
+        review._write_signed_record(
+            product_dir / "session.json", product, key=self.key, signers=self.signers,
+        )
+        for number, axis in enumerate(review.REQUIRED_AXES, 1):
+            self._submit_axis(started, axis, number)
+        audit, receipts = self._seal_direct(plan)
+        self.assertEqual([], self._receipt_errors(audit, receipts))
+
+        # Conversely, a product review must not be poisoned by prior genuine
+        # heimgewebe sessions. This directly exercises the historical identity
+        # predicate; the separate origin tests cover product checkout admission.
+        decisive_product = copy.deepcopy(current)
+        decisive_product["session_id"] = "e" * 32
+        decisive_product["binding"]["repo"] = "alexdermohr/kleinanzeiger"
+        decisive_product["binding"]["pr"] += 2
+        review._assert_prior_first_party_material_findings_resolved(
+            decisive_product, {}, root=self.state, repository=self.repo,
+            signers=self.signers, root_owned_signers=False,
+        )
+
     def test_history_over_2048_authentic_unrelated_sessions(self) -> None:
         plan = self._first_party_plan()
         started = self._start_plan(plan)
