@@ -1142,6 +1142,19 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
                 signers=self.signers, root_owned_signers=False,
             )
         self.assertEqual(legacy, recovered)
+        # The registered five signed diff reads must be checked using one
+        # historical diff reconstruction per verifier pass, not N times.
+        with mock.patch.object(
+            review, "_first_party_signed_diff", wraps=review._first_party_signed_diff,
+        ) as recover_once:
+            persisted = review._load_first_party_reads(
+                session, session_root, signers=self.signers,
+                root_owned_signers=False, repository=self.repo,
+            )
+        self.assertGreaterEqual(
+            sum(item["read_kind"] == "diff" for item in persisted), 5,
+        )
+        self.assertEqual(1, recover_once.call_count)
         self.assertEqual([], self._receipt_errors(old_audit, old_receipts))
 
         # A fresh signed review must keep the prior genuine full-read receipt.

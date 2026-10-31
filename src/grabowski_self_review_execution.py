@@ -1671,6 +1671,9 @@ def _load_first_party_reads(
     validation_fd = _private_dir(reads_root)
     os.close(validation_fd)  # Validation only; per-record reads reopen safely.
     records: list[dict[str, Any]] = []
+    # Cache only within this verification: every signed chunk is still checked.
+    diff_lines: list[str] | None = None
+    diff_sha256: str | None = None
     request_ids: set[str] = {session["start_issuer"]["request_id"]}
     for path in sorted(reads_root.glob("*.json")):
         if FIRST_PARTY_READ_ID_RE.fullmatch(path.stem) is None:
@@ -1715,14 +1718,17 @@ def _load_first_party_reads(
         ):
             raise ReviewExecutionRejected("first-party persisted source read changed")
         if record["read_kind"] == "diff":
-            try:
-                complete_diff = _first_party_signed_diff(
-                    repository, session, session_root=session_root,
-                    signers=signers, root_owned_signers=root_owned_signers,
-                )
-                lines = complete_diff.decode("utf-8").splitlines(keepends=True)
-            except UnicodeError as exc:
-                raise ReviewExecutionRejected("first-party canonical diff not text") from exc
+            if diff_lines is None:
+                try:
+                    complete_diff = _first_party_signed_diff(
+                        repository, session, session_root=session_root,
+                        signers=signers, root_owned_signers=root_owned_signers,
+                    )
+                    diff_lines = complete_diff.decode("utf-8").splitlines(keepends=True)
+                except UnicodeError as exc:
+                    raise ReviewExecutionRejected("first-party canonical diff not text") from exc
+                diff_sha256 = hashlib.sha256(complete_diff).hexdigest()
+            lines = diff_lines
             first, last = record["start_line"], record["end_line"]
             if (
                 record["path"] != "" or record["revision"] != "head"
@@ -1730,7 +1736,7 @@ def _load_first_party_reads(
                 or first < 1 or last < first or last > len(lines)
                 or last - first + 1 > FIRST_PARTY_MAX_READ_LINES
                 or record["source_ref"] is not None
-                or hashlib.sha256(complete_diff).hexdigest() != session["canonical_diff_sha256"]
+                or diff_sha256 != session["canonical_diff_sha256"]
                 or data != "".join(lines[first - 1:last]).encode("utf-8")
                 or len(data) > FIRST_PARTY_MAX_READ_BYTES
             ):
