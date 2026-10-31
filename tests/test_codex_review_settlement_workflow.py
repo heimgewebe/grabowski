@@ -186,19 +186,20 @@ class CodexReviewSettlementWorkflowTests(unittest.TestCase):
             self.text,
         )
 
-    def test_concurrency_isolates_pr_head_from_review_event_classes(self) -> None:
+    def test_concurrency_serializes_all_pr_review_events_without_dropping_pending(self) -> None:
         concurrency = self.text.split("concurrency:\n", 1)[1].split("\njobs:\n", 1)[0]
         self.assertIn("github.event.pull_request.number", concurrency)
         self.assertIn("github.event.issue.number", concurrency)
         self.assertIn("inputs.pr", concurrency)
         self.assertIn("github.run_id", concurrency)
         self.assertNotIn("github.event.comment.user.login", concurrency)
-        # A newer review comment must not cancel or evict the queued/running
-        # source-bound pull_request_target check. Event classes use distinct
-        # concurrency groups; same-event supersession stays supported.
-        self.assertIn("}}-${{ github.event_name }}", concurrency)
-        self.assertIn("cancel-in-progress: true", concurrency)
-        self.assertNotIn("cancel-in-progress: false", concurrency)
+        # Serialize source-head and feedback events on the same PR so a stale
+        # success cannot publish after a newer review's failure. GitHub queue:max
+        # retains pending events instead of replacing the single pending slot.
+        self.assertNotIn("github.event_name", concurrency)
+        self.assertIn("cancel-in-progress: false", concurrency)
+        self.assertIn("queue: max", concurrency)
+        self.assertNotIn("cancel-in-progress: true", concurrency)
 
     def test_bootstrap_without_default_branch_evaluator_fails_explicitly(self) -> None:
         evaluate_section = self.text.split(

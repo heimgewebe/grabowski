@@ -30,10 +30,11 @@ concurrency:
       || github.event.issue.number
       || inputs.pr
       || github.run_id
-    }}-${{ github.event_name }}
-  # Distinct event classes cannot cancel or evict a queued PR-head check.
-  # Within an event class, newer evidence still supersedes stale work.
-  cancel-in-progress: true
+    }}
+  # Queue all source-head and review events for this PR in publication order.
+  # Prevent both in-progress cancellation and replacement of pending runs.
+  cancel-in-progress: false
+  queue: max
 
 jobs:
   settle:
