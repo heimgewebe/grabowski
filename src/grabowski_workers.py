@@ -3861,6 +3861,36 @@ async function readLinkNavigationBinding(backendNodeId, baseUrl) {
   return target ? {target, sha256: sha256Text(target)} : null;
 }
 
+async function readButtonInteractionState(backendNodeId, properties) {
+  const state = {};
+  // Prefer AX properties; some Chrome pages omit pressed on <a role="button">.
+  if (Array.isArray(properties)) {
+    for (const key of ['pressed', 'expanded']) {
+      const property = properties.find((item) => item && item.name === key);
+      const value = property && property.value ? property.value.value : null;
+      if (value === true || value === false) state[key] = value;
+      else if (key === 'pressed' && value === 'mixed') state[key] = 'mixed';
+    }
+  }
+  // Use only two fixed ARIA attributes, never arbitrary node attributes or text.
+  try {
+    const result = await call('DOM.describeNode', {backendNodeId, depth:0, pierce:false});
+    const attributes = result && result.node && Array.isArray(result.node.attributes)
+      ? result.node.attributes : [];
+    for (let i = 0; i + 1 < attributes.length && i < 128; i += 2) {
+      const key = String(attributes[i]).toLowerCase();
+      if (key !== 'aria-pressed' && key !== 'aria-expanded') continue;
+      const value = String(attributes[i + 1]).toLowerCase();
+      const field = key === 'aria-pressed' ? 'pressed' : 'expanded';
+      if (value === 'true' || value === 'false') state[field] = value === 'true';
+      else if (field === 'pressed' && value === 'mixed') state[field] = 'mixed';
+    }
+  } catch {
+    // Unavailable DOM metadata must not create a guessed state.
+  }
+  return state;
+}
+
 async function readElements() {
   const tree = await call('Accessibility.getFullAXTree');
   const elements = [];
@@ -3890,11 +3920,16 @@ async function readElements() {
       node.name && node.name.value,
       observedSnapshotProvider
     );
+    // Track only bounded semantic toggle states, never DOM attributes or text.
+    // They affect private snapshot identity but are not returned as raw state to callers.
+    const interactionState = role === 'button'
+      ? await readButtonInteractionState(node.backendDOMNodeId, node.properties) : {};
     elements.push({
       backend_node_id: String(node.backendDOMNodeId),
       role,
       name: naming.ok ? naming.name : '',
       navigation_target_sha256: navigationTargetSha256,
+      ...(Object.keys(interactionState).length ? {interaction_state: interactionState} : {}),
     });
   }
   return elements;
@@ -3957,7 +3992,9 @@ function sameElements(left, right) {
       element.backend_node_id === expected.backend_node_id &&
       element.role === expected.role &&
       element.name === expected.name &&
-      element.navigation_target_sha256 === expected.navigation_target_sha256;
+      element.navigation_target_sha256 === expected.navigation_target_sha256 &&
+      JSON.stringify(element.interaction_state || null) ===
+        JSON.stringify(expected.interaction_state || null);
   });
 }
 
@@ -4541,6 +4578,15 @@ def _bounded_browser_elements(raw: Any) -> list[dict[str, Any]]:
             r"[0-9a-f]{64}", navigation_target_sha256
         ) is None:
             navigation_target_sha256 = None
+        # AX state exists only on buttons, with fixed keys and scalar bounded
+        # values; no arbitrary page content enters private snapshot identity.
+        raw_interaction = entry.get("interaction_state")
+        interaction_state: dict[str, bool | str] = {}
+        if role == "button" and isinstance(raw_interaction, dict):
+            for key in ("pressed", "expanded"):
+                value = raw_interaction.get(key)
+                if type(value) is bool or (key == "pressed" and value == "mixed"):
+                    interaction_state[key] = value
         seen_backend_ids.add(backend_node_id)
         bounded.append(
             {
@@ -4550,6 +4596,7 @@ def _bounded_browser_elements(raw: Any) -> list[dict[str, Any]]:
                     entry.get("name"), BROWSER_ELEMENT_NAME_MAX
                 ),
                 "navigation_target_sha256": navigation_target_sha256,
+                **({"interaction_state": interaction_state} if interaction_state else {}),
             }
         )
     return bounded

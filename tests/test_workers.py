@@ -6552,5 +6552,62 @@ globalThis.fetch = async () => ({
         self.assertNotIn("document.querySelector", source)
 
 
+    def test_semantic_toggle_button_state_changes_private_snapshot_identity(self) -> None:
+        """ARIA-only toggle effects must give a new snapshot, without public raw state."""
+        before_raw = [{
+            "backend_node_id": "201", "role": "button", "name": "Mute",
+            "navigation_target_sha256": None,
+            "interaction_state": {"pressed": False, "expanded": False, "alien": "secret"},
+        }]
+        after_raw = [{**before_raw[0], "interaction_state": {
+            "pressed": True, "expanded": False, "alien": "secret",
+        }}]
+        before_elements = workers._bounded_browser_elements(before_raw)
+        after_elements = workers._bounded_browser_elements(after_raw)
+        self.assertEqual(before_elements[0]["interaction_state"], {
+            "pressed": False, "expanded": False,
+        })
+        self.assertEqual(after_elements[0]["interaction_state"], {
+            "pressed": True, "expanded": False,
+        })
+        self.assertNotIn("alien", str(before_elements))
+        base = self._semantic_state_payload(elements=before_elements)["state"]
+        updated = {**base, "elements": after_elements}
+        key = b"toggle-probe-key" * 3
+        before = workers._browser_observation("0" * 20, base, key)
+        after = workers._browser_observation("0" * 20, updated, key)
+        self.assertNotEqual(before["snapshot_id"], after["snapshot_id"])
+        self.assertNotEqual(before["elements"][0]["element_id"], after["elements"][0]["element_id"])
+        self.assertEqual(before["elements"][0]["role"], "button")
+        self.assertEqual(before["elements"][0]["name"], "Mute")
+        self.assertNotIn("interaction_state", before["elements"][0])
+        self.assertNotIn("interaction_state", after["elements"][0])
+
+    def test_semantic_toggle_state_is_bounded_and_compared_by_cdp(self) -> None:
+        raw = [{
+            "backend_node_id": "101", "role": "button", "name": "Mute",
+            "interaction_state": {"pressed": "mixed", "expanded": True},
+        }, {
+            "backend_node_id": "102", "role": "textbox", "name": "Name",
+            "interaction_state": {"pressed": True, "expanded": True},
+        }, {
+            "backend_node_id": "103", "role": "button", "name": "Other",
+            "interaction_state": {"pressed": "invalid", "expanded": "true"},
+        }]
+        bounded = workers._bounded_browser_elements(raw)
+        self.assertEqual(bounded[0]["interaction_state"], {"pressed": "mixed", "expanded": True})
+        self.assertNotIn("interaction_state", bounded[1])
+        self.assertNotIn("interaction_state", bounded[2])
+        node = workers.BROWSER_SEMANTIC_NODE_SOURCE
+        self.assertIn("Array.isArray(properties)", node)
+        self.assertIn("['pressed', 'expanded']", node)
+        self.assertIn("readButtonInteractionState(node.backendDOMNodeId, node.properties)", node)
+        self.assertIn("aria-pressed", node)
+        self.assertIn("aria-expanded", node)
+        self.assertIn("DOM.describeNode", node)
+        self.assertIn("JSON.stringify(element.interaction_state || null)", node)
+        self.assertIn("JSON.stringify(expected.interaction_state || null)", node)
+
+
 if __name__ == "__main__":
     unittest.main()
