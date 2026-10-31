@@ -7417,9 +7417,20 @@ def grabowski_self_review_source_read(
         ctx, tool_name=self_review_execution.FIRST_PARTY_TOOL_READ,
         arguments=arguments,
     )
-    return self_review_execution.record_first_party_source_read(
+    result = self_review_execution.record_first_party_source_read(
         review_session_id, session_nonce, axis, read_kind,
         path, revision, start_line, end_line, issuer,
+    )
+    # FastMCP 1.30 otherwise emits the same large dict twice.  Retain the
+    # declared dict output schema in structuredContent and one short text note.
+    from mcp.types import CallToolResult, TextContent
+
+    return CallToolResult(
+        content=[TextContent(
+            type="text",
+            text=self_review_execution.FIRST_PARTY_MCP_BRIEF_TEXT,
+        )],
+        structuredContent=result,
     )
 
 
