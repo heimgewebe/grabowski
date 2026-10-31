@@ -164,7 +164,11 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
         else:
             # A clean frozen patch already has immutable committed source.
             # Keep the existing dirty-workspace freezer's contract unchanged.
-            payload = review._first_party_diff(candidate, {"base_sha": self.base, "head_sha": self.head})
+            payload = producer.provenance._git_read(
+                candidate,
+                ["diff", "--binary", "--no-ext-diff", "--no-textconv", self.base, "--"],
+                maximum=workspace.MAX_PATCH_BYTES,
+            )
             path = workspace._writer_patch_path(manifest)
             size, sha = workspace._atomic_bounded_chunks(path, [payload], max_bytes=workspace.MAX_PATCH_BYTES)
             patch = {"type": "patch", "path": str(path), "sha256": sha, "bytes": size, "applies_to": self.base}
@@ -1024,6 +1028,268 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
         self._submit_axis(rejected, review.REQUIRED_AXES[0], 1, reject=True)
         with self.assertRaisesRegex(review.ReviewExecutionRejected, "previous signed material"):
             self._seal_direct(plan)
+
+    def _legacy_abbreviated_diff(self, width: int) -> bytes:
+        return review._git_read(
+            self.repo,
+            [
+                "diff", "--no-ext-diff", "--no-textconv", "--no-renames",
+                "--ignore-submodules=none", "--unified=3", f"--abbrev={width}",
+                self.base, self.head, "--",
+            ],
+            maximum=review.FIRST_PARTY_MAX_DIFF_BYTES,
+        )
+
+    def test_legacy_short_prefixes_signed_five_axis(self) -> None:
+        for width in (4, 5, 6):
+            with self.subTest(width=width):
+                legacy = self._legacy_abbreviated_diff(width)
+                with mock.patch.object(review, "_first_party_diff", return_value=legacy):
+                    plan = self._first_party_plan()
+                    started = self._start_plan(plan)
+                    for number, axis in enumerate(review.REQUIRED_AXES, 1):
+                        self._submit_axis(started, axis, number)
+                audit, receipts = self._seal_direct(plan)
+                self.assertEqual([], self._receipt_errors(audit, receipts))
+
+    def test_legacy_short_prefix_partial_reject_blocks(self) -> None:
+        legacy = self._legacy_abbreviated_diff(4)
+        with mock.patch.object(review, "_first_party_diff", return_value=legacy):
+            old_plan = self._first_party_plan()
+            old = self._start_plan(old_plan)
+            self._submit_axis(old, review.REQUIRED_AXES[0], 1, reject=True)
+        current = self._first_party_plan()
+        session = self._start_plan(current)
+        for number, axis in enumerate(review.REQUIRED_AXES, 1):
+            self._submit_axis(session, axis, number)
+        with self.assertRaisesRegex(
+            review.ReviewExecutionRejected, "previous signed material",
+        ):
+            self._seal_direct(current)
+
+    def test_legacy_abbrev_pass_remains_signed_and_verified_after_full_index(self) -> None:
+        stable = review._first_party_diff(
+            self.repo, {"base_sha": self.base, "head_sha": self.head},
+        )
+        abbreviated = self._legacy_abbreviated_diff(10)
+        self.assertNotEqual(stable, abbreviated)
+        self.assertEqual(
+            abbreviated,
+            review._first_party_signed_diff(
+                self.repo, {
+                    "binding": {"review_purpose": "pull_request", "base_sha": self.base,
+                                "head_sha": self.head},
+                    "canonical_diff_sha256": hashlib.sha256(abbreviated).hexdigest(),
+                },
+            ),
+        )
+        with mock.patch.object(review, "_first_party_diff", return_value=abbreviated):
+            old_plan = self._first_party_plan()
+            started = self._start_plan(old_plan)
+            for number, axis in enumerate(review.REQUIRED_AXES, 1):
+                self._submit_axis(started, axis, number)
+            old_audit, old_receipts = self._seal_direct(old_plan)
+
+        # The old exact signed source reads must remain valid on the new
+        # pinned FULL-index renderer, without rewriting any old receipt.
+        self.assertEqual([], self._receipt_errors(old_audit, old_receipts))
+        new_plan = self._first_party_plan()
+        new_start = self._start_plan(new_plan)
+        for number, axis in enumerate(review.REQUIRED_AXES, 1):
+            self._submit_axis(new_start, axis, number)
+        new_audit, new_receipts = self._seal_direct(new_plan)
+        self.assertEqual([], self._receipt_errors(new_audit, new_receipts))
+
+        # Unrelated object growth cannot change the new full-index source.
+        other = self.repo / "unrelated-object"
+        other.write_text("not part of either reviewed commit", encoding="utf-8")
+        self._git("hash-object", "-w", "--", "unrelated-object")
+        self.assertEqual(
+            hashlib.sha256(stable).hexdigest(),
+            hashlib.sha256(review._first_party_diff(
+                self.repo, new_plan["binding"],
+            )).hexdigest(),
+        )
+
+    def test_signed_legacy_mixed_index_widths_survive_full_index_and_reject_tampering(self) -> None:
+        # Real SHA-1 collision in the first seven hex digits, not a mock PASS:
+        # Git uses 8 characters for this file and 7 for the other file.
+        collision = self.repo / "src" / "collision.py"
+        collision.write_bytes(b"unique-blob-00000506\n")
+        self._git("add", "src/collision.py")
+        self._git("commit", "-qm", "collision base")
+        self.base = self._git("rev-parse", "HEAD").strip()
+        collision.write_bytes(b"unique-blob-00005938\n")
+        ordinary = self.repo / self.source_path
+        ordinary.write_bytes(
+            ordinary.read_bytes() + "EXTRA_HEAD = 79\nNEL_BREAK\u0085SECOND = 80\n".encode("utf-8")
+        )
+        self._git("add", "src/collision.py", self.source_path)
+        self._git("commit", "-qm", "collision head")
+        self.head = self._git("rev-parse", "HEAD").strip()
+        legacy = self._legacy_abbreviated_diff(7)
+        rendered_indexes = [
+            line for line in legacy.decode("utf-8").splitlines()
+            if line.startswith("index ")
+        ]
+        self.assertEqual(2, len(rendered_indexes))
+        self.assertIn("index 53bb2227..53bb2222 100644", rendered_indexes)
+        self.assertTrue(any(
+            len(line.split()[1].split("..")[0]) == 7
+            and len(line.split()[1].split("..")[1]) == 7
+            for line in rendered_indexes
+        ))
+        complete = review._first_party_diff(
+            self.repo, {"base_sha": self.base, "head_sha": self.head},
+        )
+        self.assertNotEqual(legacy, complete)
+
+        with mock.patch.object(review, "_first_party_diff", return_value=legacy):
+            old_plan = self._first_party_plan()
+            started = self._start_plan(old_plan)
+            self._complete_candidate(old_plan, started)
+            old_audit, old_receipts = self._seal_direct(old_plan)
+
+        session_root = self.state / "sessions" / started["review_session_id"]
+        session = review._read_signed_record(
+            session_root / "session.json", signers=self.signers,
+            root_owned_signers=False,
+        )
+        self.assertIn("\u0085".encode("utf-8"), legacy)
+        original_git_read = review._git_read
+
+        def forbid_untrusted_redisplay(repo, arguments, **kwargs):
+            if any(item.startswith("--abbrev=") for item in arguments):
+                raise AssertionError("signed chunks must not need mutable Git abbreviation width")
+            return original_git_read(repo, arguments, **kwargs)
+
+        with mock.patch.object(review, "_git_read", side_effect=forbid_untrusted_redisplay):
+            recovered = review._first_party_signed_diff(
+                self.repo, session, session_root=session_root,
+                signers=self.signers, root_owned_signers=False,
+            )
+        self.assertEqual(legacy, recovered)
+        # The registered five signed diff reads must be checked using one
+        # historical diff reconstruction per verifier pass, not N times.
+        with mock.patch.object(
+            review, "_first_party_signed_diff", wraps=review._first_party_signed_diff,
+        ) as recover_once:
+            persisted = review._load_first_party_reads(
+                session, session_root, signers=self.signers,
+                root_owned_signers=False, repository=self.repo,
+            )
+        self.assertGreaterEqual(
+            sum(item["read_kind"] == "diff" for item in persisted), 5,
+        )
+        self.assertEqual(1, recover_once.call_count)
+        self.assertEqual([], self._receipt_errors(old_audit, old_receipts))
+
+        # A fresh signed review must keep the prior genuine full-read receipt.
+        current = self._first_party_plan()
+        current_start = self._start_plan(current)
+        self._complete_candidate(current, current_start)
+        current_audit, current_receipts = self._seal_direct(current)
+        self.assertEqual([], self._receipt_errors(current_audit, current_receipts))
+
+        # Corrupt a signed data sidecar: recomputation must never hide the
+        # mismatch behind a re-rendered Git diff or manufacture a PASS.
+        signed_diff = next(
+            item for item in sorted(session_root.joinpath("reads").glob("*.json"))
+            if review._read_signed_record(
+                item, signers=self.signers, root_owned_signers=False,
+            )["read_kind"] == "diff"
+        )
+        first_data = signed_diff.with_suffix(".data")
+        first_data.write_bytes(first_data.read_bytes() + b"tampering")
+        with self.assertRaises(review.ReviewExecutionRejected):
+            review._first_party_signed_diff(
+                self.repo, session, session_root=session_root,
+                signers=self.signers, root_owned_signers=False,
+            )
+
+    def test_legacy_abbrev_material_reject_still_blocks_full_index_review(self) -> None:
+        abbreviated = self._legacy_abbreviated_diff(9)
+        self.assertNotEqual(
+            abbreviated, review._first_party_diff(
+                self.repo, {"base_sha": self.base, "head_sha": self.head},
+            ),
+        )
+        with mock.patch.object(review, "_first_party_diff", return_value=abbreviated):
+            old_plan = self._first_party_plan()
+            old_start = self._start_plan(old_plan)
+            self._submit_axis(
+                old_start, review.REQUIRED_AXES[0], 1, reject=True,
+            )
+
+        # Complete old signed data and material REJECT travel through exact
+        # historical Git bytes, not through a synthetic empty-session skip.
+        new_plan = self._first_party_plan()
+        new_start = self._start_plan(new_plan)
+        for number, axis in enumerate(review.REQUIRED_AXES, 1):
+            self._submit_axis(new_start, axis, number)
+        with self.assertRaisesRegex(
+            review.ReviewExecutionRejected, "previous signed material",
+        ):
+            self._seal_direct(new_plan)
+
+    def test_empty_signed_wrong_canonical_diff_session_cannot_poison_new_review(self) -> None:
+        # Real production regression: one valid issuer-signed START accidentally
+        # used the GitHub-PR identity as local canonical diff identity. It has
+        # zero review-axis receipts, hence no finding or REJECT to suppress.
+        old_plan = self._first_party_plan()
+        github_rendered_diff = b"GitHub PR rendered diff != local git raw diff"
+        old_plan["binding"]["diff_sha256"] = hashlib.sha256(
+            github_rendered_diff
+        ).hexdigest()
+        with mock.patch.object(
+            review, "_first_party_diff", return_value=github_rendered_diff
+        ):
+            old_session = self._start_plan(old_plan)
+        legacy_root = self.state / "sessions" / old_session["review_session_id"]
+        self.assertEqual([], list((legacy_root / "axes").iterdir()))
+        legacy = review._read_signed_record(
+            legacy_root / "session.json", signers=self.signers,
+            root_owned_signers=False,
+        )
+        self.assertNotEqual(
+            hashlib.sha256(review._first_party_diff(
+                self.repo, old_plan["binding"]
+            )).hexdigest(),
+            legacy["canonical_diff_sha256"],
+        )
+        self.assertEqual(
+            legacy["binding"]["diff_sha256"], legacy["canonical_diff_sha256"],
+            "historical defect confused GitHub patch identity with local raw diff",
+        )
+        self.assertEqual(
+            producer._current_source(self.repo, old_plan["binding"]),
+            legacy["source_raw_diff_sha256"],
+        )
+
+        plan = self._first_party_plan()
+        started = self._start_plan(plan)
+        for number, axis in enumerate(review.REQUIRED_AXES, start=1):
+            self._submit_axis(started, axis, number)
+        audit, receipts = self._seal_direct(plan)
+        self.assertEqual([], self._receipt_errors(audit, receipts))
+
+        # If the supposedly empty historical registry later acquires any axis
+        # entry, the exact same audit must fail closed, not silently skip it.
+        invalid_axis = legacy_root / "axes" / "contracts_correctness.json"
+        invalid_axis.write_text("{}", encoding="utf-8")
+        invalid_axis.chmod(0o600)
+        self.assertTrue(self._receipt_errors(audit, receipts))
+        invalid_axis.unlink()
+
+        # A malformed/unsigned READ sidecar is also not an empty inert session.
+        # The old axis-only exception silently accepted this adversarial case.
+        invalid_read = legacy_root / "reads" / ("a" * 32 + ".json")
+        invalid_read.write_text("{}", encoding="utf-8")
+        invalid_read.chmod(0o600)
+        self.assertTrue(
+            self._receipt_errors(audit, receipts),
+            "malformed old read record must remain fail-closed",
+        )
 
     def test_prior_signed_material_reject_remains_blocking_across_batches(self) -> None:
         # No change to Git source, PR or canonical diff between batches.
