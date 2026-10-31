@@ -30,10 +30,10 @@ concurrency:
       || github.event.issue.number
       || inputs.pr
       || github.run_id
-    }}
-  # Review comments must not cancel the required current-head PR check.
-  # Each run reads the live PR revision and publishes a bound status.
-  cancel-in-progress: false
+    }}-${{ github.event_name }}
+  # Distinct event classes cannot cancel or evict a queued PR-head check.
+  # Within an event class, newer evidence still supersedes stale work.
+  cancel-in-progress: true
 
 jobs:
   settle:
