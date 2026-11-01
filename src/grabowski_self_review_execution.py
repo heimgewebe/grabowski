@@ -70,8 +70,8 @@ FIRST_PARTY_REVIEW_ROOT = (
     Path.home() / ".local/state/grabowski/first-party-self-reviews"
 )
 FIRST_PARTY_SESSION_TTL_SECONDS = 24 * 60 * 60
-FIRST_PARTY_MAX_DIFF_BYTES = 32 * 1024 * 1024
-FIRST_PARTY_MAX_CHANGED_PATHS = 4096
+FIRST_PARTY_MAX_DIFF_BYTES = 36 * 1024 * 1024
+FIRST_PARTY_MAX_CHANGED_PATHS = 4608
 # Only signed session inventories may exceed the standard per-record cap.
 FIRST_PARTY_MAX_SESSION_BYTES = 512 * 1024
 # Valid signed diffs contain generated JSON/JS lines larger than 256 KiB.
