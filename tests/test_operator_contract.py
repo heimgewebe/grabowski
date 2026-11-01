@@ -6227,6 +6227,8 @@ class OperatorContractTests(unittest.TestCase):
                 ["diff"],
                 ["diff", "--ext-diff"],
                 ["diff", "--ext-diff", "--", "tracked.txt"],
+                ["diff", "--end-of-options", "HEAD"],
+                ["diff", "--ext-diff", "--end-of-options", "HEAD"],
             ):
                 with self.subTest(arguments=arguments):
                     marker.unlink(missing_ok=True)
@@ -6239,6 +6241,20 @@ class OperatorContractTests(unittest.TestCase):
                     self.assertFalse(marker.exists(), "external Git diff helper executed")
                     self.assertIn("--no-ext-diff", result["argv"])
                     self.assertIn("--no-textconv", result["argv"])
+
+            # --end-of-options stops option parsing even without a -- pathspec.
+            # Both history commands must still receive their safe flags before it.
+            for subcommand in ("log", "show"):
+                with self.subTest(subcommand=subcommand):
+                    marker.unlink(missing_ok=True)
+                    with patch.object(
+                        operator, "_require_operator_mutation", return_value=None
+                    ):
+                        result = operator.grabowski_git(
+                            str(repo), [subcommand, "--end-of-options", "HEAD"]
+                        )
+                    self.assertEqual(result["returncode"], 0, result.get("stderr"))
+                    self.assertFalse(marker.exists(), "history external helper executed")
 
             # Git textconv is a second executable helper mechanism. A
             # caller --textconv must not override the operator's final guard.

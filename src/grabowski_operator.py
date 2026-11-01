@@ -9142,11 +9142,11 @@ def grabowski_git(
             subcommand_index = len(arguments) - len(_command_arguments) - 1
             # A caller-supplied --ext-diff/--textconv otherwise overrides an
             # earlier safe option. Put the denial *after* their options but
-            # before Git's literal pathspec separator, if present.
+            # before either Git end-of-options or literal pathspec marker.
             safe_option_index = next(
                 (
                     i for i in range(subcommand_index + 1, len(guarded_arguments))
-                    if guarded_arguments[i] == "--"
+                    if guarded_arguments[i] in {"--", "--end-of-options"}
                 ),
                 len(guarded_arguments),
             )
