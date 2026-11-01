@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 from collections.abc import Iterator
-from contextlib import closing, contextmanager, nullcontext
+from contextlib import ExitStack, closing, contextmanager, nullcontext
 from datetime import datetime, timezone
 import fcntl
 import functools
@@ -7630,15 +7630,34 @@ def _task_readonly_snapshot() -> Iterator[sqlite3.Connection]:
     """Read a pinned WAL or quiescent task snapshot without filesystem writes."""
     if TASK_DB.is_symlink() or not TASK_DB.is_file() or TASK_DB.stat().st_size == 0:
         raise RuntimeError("Task store cannot be observed without explicit initialization")
-    with sqlite_store.inventory_coherent_readonly_sqlite(
-        TASK_DB,
-        temporary_prefix="unused-task-readonly.",
-        error_type=TaskSchemaInventoryChanged,
-        allow_checkpointed_empty_wal=True,
-        wal_mutation_admission=lambda: operator._require_operator_mutation(
-            "durable_job"
-        ),
-    ) as connection:
+    # A normal SQLite checkpoint can unlink -wal/-shm between the reader's
+    # preflight and first lstat. Retry only that exact entry race, against a
+    # fresh admission and inode check; never retry an entered transaction.
+    with ExitStack() as snapshot:
+        for attempt in range(3):
+            try:
+                connection = snapshot.enter_context(
+                    sqlite_store.inventory_coherent_readonly_sqlite(
+                        TASK_DB,
+                        temporary_prefix="unused-task-readonly.",
+                        error_type=TaskSchemaInventoryChanged,
+                        allow_checkpointed_empty_wal=True,
+                        wal_mutation_admission=lambda: operator._require_operator_mutation(
+                            "durable_job"
+                        ),
+                    )
+                )
+                break
+            except TaskSchemaInventoryChanged as exc:
+                missing = exc.__cause__
+                if (
+                    attempt == 2
+                    or not isinstance(missing, FileNotFoundError)
+                    or missing.filename not in {
+                        str(TASK_DB) + "-wal", str(TASK_DB) + "-shm",
+                    }
+                ):
+                    raise
         if _task_schema_version(connection) != TASK_CURRENT_SCHEMA_VERSION:
             raise RuntimeError("Task store requires an explicit schema migration")
         _validate_task_schema_current(connection)
