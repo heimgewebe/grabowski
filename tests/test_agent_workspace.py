@@ -1170,6 +1170,46 @@ class AgentWorkspaceTests(unittest.TestCase):
         ))
         self.assertFalse(marker.exists(), "Candidate snapshot launched an untrusted clean filter")
 
+    def test_collection_and_adoption_share_inert_filter_identity(self) -> None:
+        """A pre-freeze clean filter must not run or alter the frozen diff."""
+        manifest = self.manifest()
+        source = self.git.writer / "src" / "app.py"
+        source.write_text("new_value = 'lowercase'\n", encoding="utf-8")
+        marker = self.root / "executed-collection-clean-filter"
+        attr_raw = run(
+            self.git.writer, "git", "rev-parse", "--git-path", "info/attributes",
+        )
+        attributes = Path(attr_raw)
+        if not attributes.is_absolute():
+            attributes = self.git.writer / attributes
+        attributes.parent.mkdir(parents=True, exist_ok=True)
+        attributes.write_text("src/app.py filter=collection_probe\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "config", "--local", "filter.collection_probe.clean",
+             f"sh -c 'touch {marker}; tr a-z A-Z'"],
+            cwd=self.git.writer, check=True, capture_output=True,
+        )
+        self.assertEqual(
+            run(self.git.writer, "git", "check-attr", "filter", "--", "src/app.py"),
+            "src/app.py: filter: collection_probe",
+        )
+
+        collected = workspace._git_snapshot(manifest, workspace._run)
+        self.assertTrue(collected["dirty"])
+        self.assertIn("src/app.py", collected["changed_paths"])
+        self.assertFalse(marker.exists(), "collection launched a mutable clean filter")
+        adopted = workspace._git_snapshot(
+            manifest, workspace._run,
+            byte_reader=workspace._candidate_snapshot_checked_bytes,
+        )
+        self.assertEqual(collected["diff_sha256"], adopted["diff_sha256"])
+        self.assertEqual(collected["changed_paths"], adopted["changed_paths"])
+        writer_patch = workspace._materialize_writer_patch(
+            manifest, collected, workspace._run,
+        )
+        self.assertEqual(writer_patch["type"], "patch")
+        self.assertFalse(marker.exists(), "collection patch materializer ran a filter")
+
     def test_lane_candidate_adoption_blocks_outside_tracked_drift_before_commit(self) -> None:
         """Later tracked edits outside the Candidate must not advance the branch."""
         _lane, manifest, collection, candidate, _closed = self.closed_lane_candidate_fixture()

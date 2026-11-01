@@ -3843,7 +3843,14 @@ def _git_snapshot(
     manifest: dict[str, Any], runner: CommandRunner,
     *, byte_reader: Callable[..., dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    read_bytes = _checked_bytes if byte_reader is None else byte_reader
+    # Collection, frozen readback and adoption must hash the same inert Git
+    # representation. A mutable clean filter must not execute at collection.
+    if byte_reader is not None:
+        read_bytes = byte_reader
+    elif runner is _run:
+        read_bytes = _candidate_snapshot_checked_bytes
+    else:
+        read_bytes = _checked_bytes
     worktree = Path(str(manifest["writer_worktree"]))
     repo = Path(str(manifest["repository"]))
     base_head = str(manifest["expected_base_head"])
@@ -3996,7 +4003,7 @@ def _materialize_writer_patch(
         raise AgentWorkspaceError("writer patch requested for a non-patch result")
     worktree = Path(str(manifest["writer_worktree"]))
     base_head = str(manifest["expected_base_head"])
-    tracked = _checked_bytes(
+    tracked = _candidate_snapshot_checked_bytes(
         worktree,
         ["git", "diff", "--binary", "--no-ext-diff", "--no-textconv", base_head, "--"],
         label="writer full tracked patch",
