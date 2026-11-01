@@ -7271,8 +7271,11 @@ GIT_ENVIRONMENT_EXACT_DENY = frozenset(
 
 def _git_environment() -> dict[str, str]:
     environment = _safe_environment()
+    # Any inherited GIT_* can redirect scope, attributes, helpers, editor or
+    # transport after our preflight. Reintroduce only server-owned overrides;
+    # push separately binds its authenticated SSH identity below.
     for key in tuple(environment):
-        if key in GIT_ENVIRONMENT_EXACT_DENY or key.startswith("GIT_CONFIG_"):
+        if key.startswith("GIT_"):
             environment.pop(key, None)
     environment["GIT_TERMINAL_PROMPT"] = "0"
     environment["GCM_INTERACTIVE"] = "never"
@@ -8055,6 +8058,29 @@ def _guard_git(arguments: list[str], repo: Path) -> None:
 
     subcommand, command_arguments, configurations = _split_git_invocation(arguments)
     _reject_git_alias_configuration(configurations)
+    # A caller-supplied Git -c comes after our root-owned Git settings and can
+    # override them at the actual effect (hooks, filters, fsmonitor, signing,
+    # credential or diff helpers). Admit only explicitly inert assignments.
+    inert_config = {
+        "core.pager": "cat",
+        "pager.status": "false",
+        "pager.diff": "false",
+        "pager.log": "false",
+        "pager.show": "false",
+        "core.hookspath": "/dev/null",
+        "core.fsmonitor": "false",
+        "core.editor": "/dev/null",
+        "commit.gpgsign": "false",
+        "diff.trustexitcode": "false",
+        "advice.graftfiledeprecated": "false",
+    }
+    for key, value in configurations:
+        if key in {"user.name", "user.email"} and value.strip() and len(value) <= 256:
+            continue
+        if key not in inert_config or value.casefold() != inert_config[key]:
+            raise PermissionError(
+                "Git -c configuration is not an inert override: " + key
+            )
     if subcommand in GIT_REMOTE_WRITE_BYPASS_SUBCOMMANDS:
         raise PermissionError(
             f"Direct Git remote-write subcommand is blocked; use push: {subcommand}"
@@ -9093,10 +9119,73 @@ def grabowski_git(
         ]
         environment = _git_push_environment()
     else:
-        command_prefix = [_trusted_git_cli_path(), "-C", str(path)]
+        # Every local mutation, including a commit with an explicit CAS
+        # preimage, must disable executable repo hooks, fsmonitor and signing
+        # at Git spawn; the JIT-only fallback below was insufficient.
+        command_prefix = [
+            _trusted_git_cli_path(),
+            "-c", "core.hooksPath=/dev/null",
+            "-c", "core.fsmonitor=false",
+            "-c", "commit.gpgSign=false",
+            "-c", "core.editor=/dev/null",
+            "-c", "diff.trustExitCode=false",
+            "-C", str(path),
+        ]
         environment = _git_environment()
     if read_shape is None:
-        command = _validate_argv([*command_prefix, *arguments], cwd=path)
+        # diff.external= is NOT a safe disabled state: Git attempts to
+        # execute the empty string. Disable diff drivers with Git's actual
+        # --no-ext-diff/--no-textconv flags on diff-producing invocations,
+        # before any user path separator, without changing caller pathspecs.
+        guarded_arguments = list(arguments)
+        if subcommand in {"diff", "log", "show"}:
+            subcommand_index = len(arguments) - len(_command_arguments) - 1
+            # Git allows implicit paths without '--'. Put safe flags before
+            # all operands, then drop caller helper-enabling options. Preserve
+            # literal path arguments after '--' or '--end-of-options'.
+            source_options = guarded_arguments[subcommand_index + 1:]
+            options_ended = False
+            needs_value = False
+            # Git consumes the following token as data for these options.
+            # A literal '--textconv' used as --grep's value must not be
+            # silently deleted (that would change the reviewed log result).
+            value_options = {
+                "--grep", "--author", "--committer", "--format", "--encoding",
+                "--since", "--until", "--after", "--before", "--date",
+                "--max-count", "--skip", "--diff-filter", "--find-object",
+                "--word-diff-regex", "--line-prefix", "--src-prefix",
+                "--dst-prefix", "--output-indicator-new",
+                "--output-indicator-old", "--output-indicator-context",
+                "-S", "-G", "-I", "-n",
+            }
+            if subcommand == "diff":
+                # Unlike log/show, Git diff parses these helper-shaped tokens
+                # as options, *not* values (confirmed by executable-marker
+                # probes on the deployed NixOS Git). Do not preserve an
+                # executable --ext-diff/--textconv after any of them.
+                value_options -= {
+                    "--grep", "--author", "--committer", "--encoding",
+                    "--word-diff-regex", "--line-prefix", "--src-prefix",
+                    "--dst-prefix", "-S", "-G", "-I",
+                }
+            safe_options: list[str] = []
+            for item in source_options:
+                if needs_value:
+                    safe_options.append(item)
+                    needs_value = False
+                    continue
+                if item in {"--", "--end-of-options"}:
+                    options_ended = True
+                if not options_ended and item in {"--ext-diff", "--textconv"}:
+                    continue
+                safe_options.append(item)
+                if not options_ended and item in value_options:
+                    needs_value = True
+            guarded_arguments = [
+                *guarded_arguments[:subcommand_index + 1],
+                "--no-ext-diff", "--no-textconv", *safe_options,
+            ]
+        command = _validate_argv([*command_prefix, *guarded_arguments], cwd=path)
 
     branch_context: dict[str, Any] | None = None
     if subcommand in GIT_LOCAL_BRANCH_MUTATION_SUBCOMMANDS:
