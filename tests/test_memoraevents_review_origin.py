@@ -26,10 +26,13 @@ class MemoraeventsReviewOriginTests(unittest.TestCase):
         accepted = "Hall-of-Memory/memoraevents"
         self.assertIsNotNone(producer.SUPPORTED_REPO.fullmatch(accepted))
         self.assertIsNotNone(review.FIRST_PARTY_ALLOWED_REPO.fullmatch(accepted))
+        # The PR gate normalizes GitHub repository identity to lowercase.
+        canonical_gate_slug = "hall-of-memory/memoraevents"
+        self.assertIsNone(producer.SUPPORTED_REPO.fullmatch(canonical_gate_slug))
+        self.assertIsNotNone(review.FIRST_PARTY_ALLOWED_REPO.fullmatch(canonical_gate_slug))
         for rejected in (
             "Hall-of-Memory/other",
             "Hall-of-Memory/memoraevents-copy",
-            "hall-of-memory/memoraevents",
             "Other/memoraevents",
             "Hall-of-Memory/memoraevents/extra",
             "Hall-of-Memory/memoraevents.git",
@@ -46,6 +49,10 @@ class MemoraeventsReviewOriginTests(unittest.TestCase):
         }
         self.assertEqual(binding, review._first_party_binding(binding))
         self.assertEqual(binding, producer._binding(binding))
+        gate_binding = {**binding, "repo": canonical_gate_slug}
+        self.assertEqual(gate_binding, review._first_party_binding(gate_binding))
+        with self.assertRaisesRegex(review.ReviewExecutionRejected, "source identity invalid"):
+            producer._binding(gate_binding)
         with self.assertRaisesRegex(review.ReviewExecutionRejected, "binding invalid"):
             review._first_party_binding({**binding, "repo": "Hall-of-Memory/other"})
 
