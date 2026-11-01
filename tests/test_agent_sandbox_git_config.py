@@ -153,6 +153,119 @@ class AgentSandboxGitConfigTests(unittest.TestCase):
             self.assertEqual(positive.returncode, 0, positive.stderr)
             self.assertEqual(positive.stdout.strip(), ".git")
 
+    def test_sealed_snapshot_filter_preserves_ignore_without_creating_host_attributes(self) -> None:
+        """A hostile tracked attribute cannot start a clean filter in status/diff."""
+        with tempfile.TemporaryDirectory(prefix="git-filter-effect-") as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            for key, value in (
+                ("user.name", "Snapshot Test"),
+                ("user.email", "snapshot@example.invalid"),
+            ):
+                subprocess.run(
+                    ["git", "config", key, value], cwd=repo, check=True,
+                    capture_output=True,
+                )
+            (repo / "src").mkdir()
+            tracked = repo / "src/app.py"
+            tracked.write_text("old\n", encoding="utf-8")
+            (repo / ".gitattributes").write_text(
+                "src/app.py filter=late\n", encoding="utf-8",
+            )
+            subprocess.run(
+                ["git", "add", "src/app.py", ".gitattributes"],
+                cwd=repo, check=True, capture_output=True,
+            )
+            subprocess.run(
+                ["git", "commit", "-qm", "baseline"],
+                cwd=repo, check=True, capture_output=True,
+            )
+            info = repo / ".git/info"
+            attributes = info / "attributes"
+            self.assertFalse(attributes.exists())
+            exclude = info / "exclude"
+            exclude.write_text("*.ignored\n", encoding="utf-8")
+            original_exclude = exclude.read_bytes()
+            (repo / "secret.ignored").write_text("private\n", encoding="utf-8")
+            (repo / "visible.txt").write_text("untracked\n", encoding="utf-8")
+            marker = root / "executed"
+            subprocess.run(
+                ["git", "config", "--local", "filter.late.clean",
+                 f"sh -c 'touch {marker}; cat'"],
+                cwd=repo, check=True, capture_output=True,
+            )
+            tracked.write_text("new contents\n", encoding="utf-8")
+            diff_args = ["git", "diff", "--no-ext-diff", "--no-textconv", "HEAD"]
+            control = subprocess.run(
+                diff_args, cwd=repo, capture_output=True, check=True,
+            )
+            self.assertTrue(marker.exists(), "control must execute hostile filter")
+            marker.unlink()
+            with sandbox.safe_git_snapshot_filter_effect(repo, diff_args) as (
+                command, environment, descriptors
+            ):
+                observed = subprocess.run(
+                    command, cwd=repo, env=environment,
+                    pass_fds=descriptors, capture_output=True, check=True,
+                )
+            self.assertEqual(observed.stdout, control.stdout)
+            self.assertFalse(marker.exists(), "sealed Git filter override was bypassed")
+            self.assertFalse(attributes.exists(), "sandbox mutated host info/attributes")
+            with sandbox.safe_git_snapshot_filter_effect(
+                repo, ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+            ) as (command, environment, descriptors):
+                status = subprocess.run(
+                    command, cwd=repo, env=environment,
+                    pass_fds=descriptors, capture_output=True, check=True,
+                )
+            self.assertIn(b"?? visible.txt\x00", status.stdout)
+            self.assertNotIn(b"secret.ignored", status.stdout)
+            self.assertEqual(exclude.read_bytes(), original_exclude)
+            self.assertFalse(marker.exists())
+            self.assertFalse(attributes.exists(), "host attributes created by bubblewrap")
+
+            # An empty diff.external is an attempted executable, not an inert
+            # setting. The sealed snapshot must keep real diff functionality
+            # while preventing repository-selected external diff helpers.
+            diff_helper = root / "diff-helper"
+            diff_marker = root / "external-diff-executed"
+            diff_helper.write_text(
+                "#!/bin/sh\ntouch " + str(diff_marker) + "\nexit 1\n",
+                encoding="utf-8",
+            )
+            diff_helper.chmod(0o700)
+            subprocess.run(
+                ["git", "config", "--local", "diff.external", str(diff_helper)],
+                cwd=repo, check=True, capture_output=True,
+            )
+            external_control = subprocess.run(
+                ["git", "diff", "HEAD"], cwd=repo, capture_output=True,
+            )
+            self.assertNotEqual(external_control.returncode, 0)
+            self.assertTrue(diff_marker.exists(), "external diff control did not trigger")
+            diff_marker.unlink()
+            marker.unlink(missing_ok=True)
+            for arguments in (
+                ["git", "diff", "HEAD"],
+                ["git", "diff", "--ext-diff", "--end-of-options", "HEAD"],
+            ):
+                with self.subTest(arguments=arguments):
+                    with sandbox.safe_git_snapshot_filter_effect(
+                        repo, arguments
+                    ) as (command, environment, descriptors):
+                        protected = subprocess.run(
+                            command, cwd=repo, env=environment,
+                            pass_fds=descriptors, capture_output=True,
+                        )
+                    self.assertEqual(protected.returncode, 0, protected.stderr)
+                    self.assertIn(b"new contents", protected.stdout)
+                    self.assertFalse(diff_marker.exists())
+                    self.assertFalse(marker.exists(), "clean filter escaped sealed attributes")
+                    self.assertFalse(attributes.exists(), "host attributes were created")
+
+
 
 if __name__ == "__main__":
     unittest.main()

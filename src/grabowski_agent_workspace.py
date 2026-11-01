@@ -33,7 +33,7 @@ import grabowski_lifecycle_collectors as lifecycle_collectors
 import grabowski_lifecycle_effect_plan as lifecycle_effect_plan
 import grabowski_physical_checkout as physical_checkout
 import grabowski_work_acquire as work_acquire
-from grabowski_agent_sandbox import safe_git_environment
+from grabowski_agent_sandbox import safe_git_environment, safe_git_snapshot_filter_effect
 from grabowski_git_ssh import trusted_git_cli_path
 try:
     import grabowski_operator_core as operator
@@ -1515,6 +1515,36 @@ def _checked_bytes(cwd: Path, argv: list[str], *, label: str) -> dict[str, Any]:
         raise AgentWorkspaceActionError(f"{label} failed: {detail[:2000]}")
     return result
 
+
+
+def _candidate_snapshot_checked_bytes(
+    cwd: Path, argv: list[str], *, label: str,
+) -> dict[str, Any]:
+    """Run effectful snapshot Git reads with filters masked in the child."""
+    if argv[:2] not in (["git", "status"], ["git", "diff"]):
+        return _checked_bytes(cwd, argv, label=label)
+    try:
+        with safe_git_snapshot_filter_effect(cwd, argv) as (command, environment, fds):
+            completed = subprocess.run(
+                command, cwd=cwd, env=environment, pass_fds=fds,
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, timeout=120, check=False,
+            )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise AgentWorkspaceActionError(
+            f"{label} Git filter effect isolation unavailable"
+        ) from exc
+    result = {
+        "returncode": completed.returncode,
+        "stdout": completed.stdout,
+        "stderr": completed.stderr,
+    }
+    if completed.returncode:
+        detail = (completed.stderr or completed.stdout or label.encode()).decode(
+            "utf-8", errors="replace"
+        ).strip()
+        raise AgentWorkspaceActionError(f"{label} failed: {detail[:2000]}")
+    return result
 
 def _repo_top(runner: CommandRunner, repo: Path) -> Path:
     result = _checked(runner, repo, ["git", "rev-parse", "--show-toplevel"], label="git top-level")
@@ -3809,7 +3839,11 @@ def _integration_probe(
         }
 
 
-def _git_snapshot(manifest: dict[str, Any], runner: CommandRunner) -> dict[str, Any]:
+def _git_snapshot(
+    manifest: dict[str, Any], runner: CommandRunner,
+    *, byte_reader: Callable[..., dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    read_bytes = _checked_bytes if byte_reader is None else byte_reader
     worktree = Path(str(manifest["writer_worktree"]))
     repo = Path(str(manifest["repository"]))
     base_head = str(manifest["expected_base_head"])
@@ -3820,33 +3854,33 @@ def _git_snapshot(manifest: dict[str, Any], runner: CommandRunner) -> dict[str, 
         runner, worktree, ["git", "branch", "--show-current"], label="writer branch"
     )
     branch = str(branch_result.get("stdout", "")).strip()
-    status_result = _checked_bytes(
+    status_result = read_bytes(
         worktree,
         ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
         label="writer status",
     )
     status_lines = [os.fsdecode(item) for item in bytes(status_result["stdout"]).split(b"\x00") if item]
-    committed_diff = _checked_bytes(
+    committed_diff = read_bytes(
         worktree,
         ["git", "diff", "--binary", "--no-ext-diff", "--no-textconv", f"{base_head}...{head}"],
         label="committed diff",
     )
-    working_diff = _checked_bytes(
+    working_diff = read_bytes(
         worktree,
         ["git", "diff", "--binary", "--no-ext-diff", "--no-textconv", "HEAD"],
         label="working diff",
     )
-    changed_result = _checked_bytes(
+    changed_result = read_bytes(
         worktree,
         ["git", "diff", "--name-only", "-z", "--no-renames", f"{base_head}...{head}"],
         label="changed paths",
     )
-    working_changed = _checked_bytes(
+    working_changed = read_bytes(
         worktree,
         ["git", "diff", "--name-only", "-z", "--no-renames", "HEAD"],
         label="working changed paths",
     )
-    untracked_result = _checked_bytes(
+    untracked_result = read_bytes(
         worktree,
         ["git", "ls-files", "--others", "--exclude-standard", "-z"],
         label="untracked files",
@@ -4938,7 +4972,9 @@ def _adoption_candidate_snapshot(
     before_raw_sha256 = _adoption_worktree_raw_fingerprint(
         worktree, collection.get("changed_paths")
     )
-    snapshot = _git_snapshot(manifest, _run)
+    snapshot = _git_snapshot(
+        manifest, _run, byte_reader=_candidate_snapshot_checked_bytes,
+    )
     if (
         snapshot.get("writer_head") != candidate.get("base_head")
         or snapshot.get("writer_branch") != manifest.get("writer_branch")
