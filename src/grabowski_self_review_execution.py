@@ -74,7 +74,10 @@ FIRST_PARTY_MAX_DIFF_BYTES = 32 * 1024 * 1024
 FIRST_PARTY_MAX_CHANGED_PATHS = 4096
 # Only signed session inventories may exceed the standard per-record cap.
 FIRST_PARTY_MAX_SESSION_BYTES = 512 * 1024
-FIRST_PARTY_MAX_READ_BYTES = 256 * 1024
+# Valid signed diffs contain generated JSON/JS lines larger than 256 KiB.
+# Bound one read below the 1 MiB response ceiling; retain the strict
+# 1000-line range limit, exact-byte signed receipts and full-diff coverage.
+FIRST_PARTY_MAX_READ_BYTES = 768 * 1024
 FIRST_PARTY_MAX_READ_LINES = 1000
 FIRST_PARTY_SESSION_KIND = "grabowski_first_party_semantic_review_session_v1"
 FIRST_PARTY_READ_KIND = "grabowski_first_party_semantic_source_read_v1"
@@ -90,6 +93,33 @@ FIRST_PARTY_READ_ID_RE = re.compile(r"[a-f0-9]{32}\Z")
 
 class ReviewExecutionRejected(ValueError):
     pass
+
+
+# Bound the complete MCP response, including JSON escaping, before a signed
+# read is persisted.  FastMCP otherwise serializes a dict twice (content and
+# structuredContent); the typed result below keeps one canonical source copy.
+FIRST_PARTY_MCP_ENVELOPE_RESERVE_BYTES = 4096
+
+
+FIRST_PARTY_MCP_BRIEF_TEXT = (
+    "Signed source read recorded; exact bytes are in structuredContent.content."
+)
+
+
+def first_party_source_read_wire_budget_validate(payload: dict[str, Any]) -> None:
+    # Match the typed single-copy CallToolResult wire envelope without importing
+    # the MCP SDK into the signing/trust-root process. Some recovery paths run
+    # this verifier with a deliberately stubbed MCP transport.
+    envelope = {
+        "content": [{"type": "text", "text": FIRST_PARTY_MCP_BRIEF_TEXT}],
+        "structuredContent": payload,
+        "isError": False,
+    }
+    serialized_bytes = len(json.dumps(
+        envelope, ensure_ascii=False, separators=(",", ":"), allow_nan=False,
+    ).encode("utf-8"))
+    if serialized_bytes + FIRST_PARTY_MCP_ENVELOPE_RESERVE_BYTES > MAX_OUTPUT:
+        raise ReviewExecutionRejected("first-party signed source read transport budget exceeded")
 
 
 def _canonical(value: Any) -> bytes:
@@ -1638,6 +1668,21 @@ def record_first_party_source_read(
         "data_bytes": len(data), "issuer": authenticated,
         "observed_at_unix": observed_at,
     }
+    result = {
+        "status": "source_read_recorded", "review_session_id": session_id,
+        "axis": axis, "read_id": read_id, "read_kind": read_kind,
+        "source_ref": source_ref, "content": data.decode("utf-8"),
+        "content_sha256": record["data_sha256"],
+        **(
+            {"diff_total_lines": diff_total_lines,
+             "canonical_diff_sha256": session["canonical_diff_sha256"]}
+            if read_kind == "diff" else {}
+        ),
+        "does_not_establish": ["semantic_review", "axis_verdict", "review_pass"],
+    }
+    # Must pass the exact typed MCP wire budget before signing anything: an
+    # undelivered read may never count toward full signed diff coverage.
+    first_party_source_read_wire_budget_validate(result)
     lock = _first_party_lock(root)
     try:
         _assert_first_party_source_current(
@@ -1652,18 +1697,7 @@ def record_first_party_source_read(
         )
     finally:
         _release_first_party_lock(lock)
-    return {
-        "status": "source_read_recorded", "review_session_id": session_id,
-        "axis": axis, "read_id": read_id, "read_kind": read_kind,
-        "source_ref": source_ref, "content": data.decode("utf-8"),
-        "content_sha256": record["data_sha256"],
-        **(
-            {"diff_total_lines": diff_total_lines,
-             "canonical_diff_sha256": session["canonical_diff_sha256"]}
-            if read_kind == "diff" else {}
-        ),
-        "does_not_establish": ["semantic_review", "axis_verdict", "review_pass"],
-    }
+    return result
 
 
 def _load_first_party_reads(
