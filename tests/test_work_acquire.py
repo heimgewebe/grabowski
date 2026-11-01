@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import inspect
 import json
 import os
@@ -642,6 +642,126 @@ class WorkAcquireTests(unittest.TestCase):
                 self.assertEqual(1000, len(live[:1000]))
                 self.assertGreaterEqual(len(observed_pages), 2)
                 self.assertEqual(live[999]["resource_key"], observed_pages[1][1])
+
+    def test_native_owner_inventory_denial_happens_before_sqlite_wal_open(self) -> None:
+        # SQLite mode=ro may still create WAL/SHM or write SHM reader marks.
+        # The existing resource-lease kill switch must precede any native open.
+        self.state.mkdir(parents=True, exist_ok=True)
+        database = self.state / "native-admission-wal.sqlite3"
+        with sqlite3.connect(database) as connection:
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("CREATE TABLE probe (value INTEGER)")
+        connection.close()
+        wal = Path(str(database) + "-wal")
+        shm = Path(str(database) + "-shm")
+        self.assertFalse(wal.exists())
+        self.assertFalse(shm.exists())
+
+        with (
+            patch.object(work_acquire.resources, "RESOURCE_DB", database),
+            patch.object(
+                work_acquire.operator, "_require_operator_mutation",
+                side_effect=PermissionError("resource_lease blocked"),
+            ) as require_admission,
+        ):
+            with self.assertRaisesRegex(PermissionError, "resource_lease blocked"):
+                with work_acquire._native_owner_inventory_pagination_guard(
+                    work_acquire.resources.list_resources
+                ):
+                    self.fail("native inventory must not open before admission")
+
+        require_admission.assert_called_once_with("resource_lease")
+        self.assertFalse(wal.exists(), "denied read created SQLite WAL")
+        self.assertFalse(shm.exists(), "denied read created SQLite SHM")
+
+    def test_multibatch_native_sqlite_rejects_cross_page_generation_replacement(self) -> None:
+        owner = "lane:" + "c" * 32
+        required = ["component:snapshot-0000", "component:snapshot-1000"]
+        keys = [f"component:snapshot-{i:04d}" for i in range(1001)]
+        with patch.object(
+            work_acquire.resources, "RESOURCE_DB",
+            self.state / "multibatch-generation-race.sqlite3",
+        ):
+            for start in range(0, len(keys), 64):
+                work_acquire.resources.acquire_resources(
+                    owner, keys[start:start + 64],
+                    purpose="native owner snapshot race regression",
+                    ttl_seconds=3600,
+                )
+            rogue_path = self.state / "rogue-observer.sqlite3"
+            with sqlite3.connect(rogue_path) as rogue:
+                rogue.execute("CREATE TABLE decoy (id INTEGER)")
+
+            for observer_redirected in (False, True):
+                with self.subTest(observer_redirected=observer_redirected):
+                    originals = [
+                        work_acquire.resources.inspect_resource(key)
+                        for key in required
+                    ]
+                    pages = []
+                    native_guard = work_acquire._native_owner_inventory_pagination_guard
+
+                    @contextmanager
+                    def racing_guard(inventory_fn):
+                        # The redirected variant simulates the original P1:
+                        # a separate observer is opened on DB B while all owner
+                        # pages and lease mutations still use original DB A.
+                        with ExitStack() as stack:
+                            if observer_redirected:
+                                with patch.object(
+                                    work_acquire.resources,
+                                    "_connect_existing_resource_database",
+                                    side_effect=lambda: sqlite3.connect(rogue_path),
+                                ):
+                                    native_page = stack.enter_context(
+                                        native_guard(inventory_fn),
+                                    )
+                            else:
+                                native_page = stack.enter_context(
+                                    native_guard(inventory_fn),
+                                )
+                            # Legacy guard yields None and reads A via inventory_fn.
+                            # Fixed guard yields an FD-bound reader pinned to A.
+                            reader = native_page or inventory_fn
+
+                            def inject_after_first_page(**kwargs):
+                                page = reader(**kwargs)
+                                pages.append(len(page))
+                                if len(pages) == 1:
+                                    old = work_acquire.resources.inspect_resource(
+                                        required[0],
+                                    )
+                                    work_acquire.resources.release_resources(
+                                        owner, [required[0]],
+                                        expected_leases=[old],
+                                    )
+                                    new = work_acquire.resources.acquire_resources(
+                                        owner, [required[0]],
+                                        purpose="same-owner replacement generation",
+                                        ttl_seconds=3600,
+                                    )["leases"][0]
+                                    self.assertNotEqual(
+                                        old["metadata_sha256"],
+                                        new["metadata_sha256"],
+                                    )
+                                return page
+
+                            yield inject_after_first_page
+
+                    with patch.object(
+                        work_acquire, "_native_owner_inventory_pagination_guard",
+                        side_effect=racing_guard,
+                    ):
+                        with self.assertRaisesRegex(
+                            work_acquire.LeaseAcquisitionOutcomeUnknown,
+                            "inventory changed during pagination",
+                        ):
+                            work_acquire._verify_multibatch_live_lease_generations(
+                                owner_id=owner, required_keys=required,
+                                acquisitions=[{"receipt": {"leases": originals}}],
+                                inventory_fn=work_acquire.resources.list_resources,
+                            )
+                    self.assertEqual([1000, 1], pages)
 
     def test_multibatch_readback_pages_after_full_8192_byte_key(self) -> None:
         owner = "lane:" + "e" * 32
