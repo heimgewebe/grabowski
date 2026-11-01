@@ -6,7 +6,9 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+import subprocess
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -54,6 +56,356 @@ def base_state(*, path: str = "src/grabowski_grips.py") -> dict:
         "reviews": connection([], hasPreviousPage=False),
         "reviewThreads": connection([], hasNextPage=False),
     }
+
+
+class PinnedRenameEvidenceRegressionTests(unittest.TestCase):
+    def _compare(self, *, filename="docs/ci.md",
+                 previous=".github/workflows/ci.yml",
+                 status="renamed", base=BASE, head=HEAD):
+        item = {"filename": filename, "status": status}
+        if previous is not None:
+            item["previous_filename"] = previous
+        return {
+            "base_commit": {"sha": base},
+            "commits": [{"sha": head}],
+            "files": [item],
+            "total_commits": 1,
+        }
+
+    def test_critical_workflow_rename_out_of_github_requires_high_critical(self):
+        pr = base_state(path="docs/ci.md")
+        compare = self._compare()
+        with mock.patch.object(settlement, "_run_json", return_value=compare) as read:
+            files = settlement._revision_bound_rename_files(ROOT, REPOSITORY, pr)
+        self.assertIn(f"{BASE}...{HEAD}", " ".join(read.call_args.args[1]))
+        self.assertEqual(files, [{
+            "path": "docs/ci.md",
+            "status": "renamed",
+            "previousPath": ".github/workflows/ci.yml",
+        }])
+        pr["files"] = connection(files, hasNextPage=False)
+        decision = settlement._policy(pr, REPOSITORY, explicitly_required=False)
+        self.assertTrue(decision["external_review_required"])
+        self.assertEqual("high_critical", decision["review_tier"])
+
+    def test_benign_documentation_rename_keeps_documentation_policy(self):
+        pr = base_state(path="docs/new.md")
+        compare = self._compare(filename="docs/new.md", previous="docs/old.md")
+        with mock.patch.object(settlement, "_run_json", return_value=compare):
+            pr["files"] = connection(
+                settlement._revision_bound_rename_files(ROOT, REPOSITORY, pr),
+                hasNextPage=False,
+            )
+        decision = settlement._policy(pr, REPOSITORY, explicitly_required=False)
+        self.assertEqual("documentation", decision["review_tier"])
+        self.assertFalse(decision["external_review_required"])
+
+    def test_immutable_head_or_base_drift_rejects_aba_file_evidence(self):
+        pr = base_state(path="docs/ci.md")
+        for kwargs in ({"head": "c" * 40}, {"base": "d" * 40}):
+            with self.subTest(kwargs=kwargs), mock.patch.object(
+                settlement, "_run_json", return_value=self._compare(**kwargs)
+            ):
+                with self.assertRaises(settlement.SettlementError):
+                    settlement._revision_bound_rename_files(ROOT, REPOSITORY, pr)
+
+
+    def test_unpaged_compare_commit_cap_keeps_last_head(self):
+        # GitHub's unpaginated Compare response returns at most 250 commits
+        # but keeps the *latest* compared head in the final entry even when
+        # total_commits is larger. Pagination changes that contract.
+        # Primary: docs.github.com/en/rest/commits/commits#compare-two-commits
+        pr = base_state(path="docs/ci.md")
+        for last, accepted in ((HEAD, True), ("e" * 40, False)):
+            comparison = {
+                **self._compare(),
+                "total_commits": 350,
+                "commits": [{"sha": "d" * 40} for _ in range(249)]
+                           + [{"sha": last}],
+            }
+            with self.subTest(last=last), mock.patch.object(
+                settlement, "_run_json", return_value=comparison
+            ) as read:
+                if accepted:
+                    files = settlement._revision_bound_rename_files(
+                        ROOT, REPOSITORY, pr
+                    )
+                    self.assertEqual(files[0]["previousPath"],
+                                     ".github/workflows/ci.yml")
+                else:
+                    with self.assertRaises(settlement.SettlementError):
+                        settlement._revision_bound_rename_files(
+                            ROOT, REPOSITORY, pr
+                        )
+                self.assertEqual(read.call_args.args[1][-1],
+                                 f"repos/{REPOSITORY}/compare/{BASE}...{HEAD}")
+
+    def test_partial_or_malformed_pinned_rename_metadata_fails_closed(self):
+        pr = base_state(path="docs/ci.md")
+        cases = [
+            {**self._compare(), "files": []},
+            self._compare(previous=None),
+            self._compare(filename="docs/another.md"),
+            self._compare(status="copied", previous=None),
+            self._compare(status="unrecognized"),
+            {**self._compare(), "commits": []},
+        ]
+        for comparison in cases:
+            with self.subTest(comparison=comparison), mock.patch.object(
+                settlement, "_run_json", return_value=comparison
+            ):
+                with self.assertRaises(settlement.SettlementError):
+                    settlement._revision_bound_rename_files(ROOT, REPOSITORY, pr)
+
+    def test_live_state_promotes_pinned_rename_source_before_policy(self):
+        pr = base_state(path="docs/ci.md")
+        payload = {"data": {"repository": {"pullRequest": pr}}}
+        bound_files = [{
+            "path": "docs/ci.md", "status": "renamed",
+            "previousPath": ".github/workflows/ci.yml",
+        }]
+        with (
+            mock.patch.object(settlement, "_run_json", return_value=payload),
+            mock.patch.object(settlement, "_collect_files",
+                              return_value=pr["files"]),
+            mock.patch.object(settlement, "_collect_comments",
+                              return_value=pr["comments"]),
+            mock.patch.object(settlement, "_collect_reviews",
+                              return_value=pr["reviews"]),
+            mock.patch.object(settlement, "_collect_review_threads",
+                              return_value=pr["reviewThreads"]),
+            mock.patch.object(settlement.subprocess, "run", return_value=mock.Mock(
+                returncode=0, stdout=b"diff --git a/docs/ci.md b/docs/ci.md\n",
+                stderr=b"",
+            )),
+            mock.patch.object(settlement, "_revision_bound_rename_files",
+                              return_value=bound_files) as pinned,
+        ):
+            observed = settlement._live_state(ROOT, REPOSITORY, PR)
+        pinned.assert_called_once()
+        self.assertEqual(observed["files"]["nodes"], bound_files)
+        self.assertTrue(settlement._policy(
+            observed, REPOSITORY, explicitly_required=False
+        )["external_review_required"])
+
+
+    def test_live_state_binds_critical_rename_when_destination_already_requires_review(self):
+        destination = "src/grabowski_grips.py"
+        pr = base_state(path=destination)
+        original_classify = settlement.pr_review_gate.classify_complexity
+
+        def already_review_required(*args, **kwargs):
+            return {**original_classify(*args, **kwargs),
+                    "external_review_required": True}
+
+        payload = {"data": {"repository": {"pullRequest": pr}}}
+        bound_files = [{
+            "path": destination, "status": "renamed",
+            "previousPath": ".github/workflows/ci.yml",
+        }]
+        with (
+            mock.patch.object(settlement.pr_review_gate, "classify_complexity",
+                              side_effect=already_review_required),
+            mock.patch.object(settlement, "_run_json", return_value=payload),
+            mock.patch.object(settlement, "_collect_files",
+                              return_value=pr["files"]),
+            mock.patch.object(settlement, "_collect_comments",
+                              return_value=pr["comments"]),
+            mock.patch.object(settlement, "_collect_reviews",
+                              return_value=pr["reviews"]),
+            mock.patch.object(settlement, "_collect_review_threads",
+                              return_value=pr["reviewThreads"]),
+            mock.patch.object(settlement.subprocess, "run", return_value=mock.Mock(
+                returncode=0, stdout=b"diff --git a/src/grabowski_grips.py b/src/grabowski_grips.py\n",
+                stderr=b"",
+            )),
+            mock.patch.object(settlement, "_revision_bound_rename_files",
+                              return_value=bound_files) as pinned,
+        ):
+            observed = settlement._live_state(ROOT, REPOSITORY, PR)
+        pinned.assert_called_once()
+        self.assertEqual(bound_files, observed["files"]["nodes"])
+        self.assertEqual("high_critical", settlement._policy(
+            observed, REPOSITORY, explicitly_required=False
+        )["review_tier"])
+
+
+    def test_pinned_raw_diff_rejects_transient_aba_pr_diff(self):
+        # The GraphQL head and immutable rename metadata describe commit A.
+        # A temporary A->B->A ref movement can make mutable gh pr diff
+        # return B while the eventual PR HEAD is again A.
+        pr = base_state(path="docs/ci.md")
+        payload = {"data": {"repository": {"pullRequest": pr}}}
+        evidence = [{
+            "path": "docs/ci.md",
+            "status": "renamed",
+            "previousPath": ".github/workflows/ci.yml",
+        }]
+        transient = b"diff --git a/docs/ci.md b/docs/ci.md\n+version-B\n"
+        pinned = b"diff --git a/docs/ci.md b/docs/ci.md\n+version-A\n"
+        with (
+            mock.patch.object(settlement, "_run_json", return_value=payload),
+            mock.patch.object(settlement, "_collect_files", return_value=pr["files"]),
+            mock.patch.object(settlement, "_collect_comments", return_value=pr["comments"]),
+            mock.patch.object(settlement, "_collect_reviews", return_value=pr["reviews"]),
+            mock.patch.object(settlement, "_collect_review_threads",
+                              return_value=pr["reviewThreads"]),
+            mock.patch.object(settlement, "_revision_bound_rename_files",
+                              return_value=evidence),
+            mock.patch.object(settlement.subprocess, "run", side_effect=[
+                mock.Mock(returncode=0, stdout=transient, stderr=b""),
+                mock.Mock(returncode=0, stdout=pinned, stderr=b""),
+            ]) as read,
+        ):
+            with self.assertRaisesRegex(
+                settlement.SettlementError, "revision-bound.*diff"
+            ):
+                settlement._live_state(ROOT, REPOSITORY, PR)
+        self.assertEqual(read.call_count, 2)
+        self.assertIn(f"{BASE}...{HEAD}", " ".join(read.call_args.args[0]))
+
+
+    def test_pinned_diff_accepts_canonical_equivalent_rendering(self):
+        """Different OID abbreviations and hunk labels are not source drift."""
+        pr = base_state(path="docs/ci.md")
+        payload = {"data": {"repository": {"pullRequest": pr}}}
+        pinned_files = [{"path": "docs/ci.md", "status": "modified"}]
+        raw = (
+            b"diff --git a/docs/ci.md b/docs/ci.md\n"
+            b"index 1234567..7654321 100644\n"
+            b"--- a/docs/ci.md\n+++ b/docs/ci.md\n"
+            b"@@ -1 +1 @@ original context\n-old\n+new\n"
+        )
+        pinned = (
+            b"diff --git a/docs/ci.md b/docs/ci.md\n"
+            b"index 123456789abc..7654321abcdef 100644\n"
+            b"--- a/docs/ci.md\n+++ b/docs/ci.md\n"
+            b"@@ -1 +1 @@\n-old\n+new\n"
+        )
+        self.assertNotEqual(raw, pinned)
+        digest = settlement.pr_review_gate.github_pr_diff_identity_sha256
+        self.assertEqual(digest(raw), digest(pinned))
+        with (
+            mock.patch.object(settlement, "_run_json", return_value=payload),
+            mock.patch.object(settlement, "_collect_files", return_value=pr["files"]),
+            mock.patch.object(settlement, "_collect_comments", return_value=pr["comments"]),
+            mock.patch.object(settlement, "_collect_reviews", return_value=pr["reviews"]),
+            mock.patch.object(settlement, "_collect_review_threads", return_value=pr["reviewThreads"]),
+            mock.patch.object(settlement, "_revision_bound_rename_files", return_value=pinned_files),
+            mock.patch.object(settlement.subprocess, "run", side_effect=[
+                mock.Mock(returncode=0, stdout=raw, stderr=b""),
+                mock.Mock(returncode=0, stdout=pinned, stderr=b""),
+            ]),
+        ):
+            observed = settlement._live_state(ROOT, REPOSITORY, PR)
+        self.assertEqual(observed["diff_sha256"], digest(raw))
+
+
+    def test_historical_anchor_real_git_dag_changes_critical_rename_identity(self):
+        """Git objects demonstrate anchor-dependent rename origin, not GitHub PR choice."""
+        with tempfile.TemporaryDirectory(prefix="grabowski-pr-base-dag-") as tmp:
+            repo = Path(tmp)
+
+            def git(*args: str) -> str:
+                result = subprocess.run(
+                    ["git", "-c", "user.name=Fixture",
+                     "-c", "user.email=fixture@example.invalid", *args],
+                    cwd=repo, check=True, capture_output=True, text=True,
+                    timeout=20,
+                )
+                return result.stdout.strip()
+
+            git("init", "-q")
+            workflow = repo / ".github/workflows/ci.yml"
+            workflow.parent.mkdir(parents=True)
+            workflow.write_text("a\nb\nc\nd\ne\nf\n", encoding="utf-8")
+            git("add", ".")
+            git("commit", "-qm", "initial critical workflow")
+            origin = git("rev-parse", "HEAD")
+
+            docs = repo / "docs/ci.md"
+            docs.parent.mkdir(parents=True)
+            git("mv", ".github/workflows/ci.yml", "docs/ci.md")
+            git("commit", "-qm", "feature rename")
+            first_feature = git("rev-parse", "HEAD")
+            git("branch", "feature")
+            git("switch", "-qc", "base-after-rename")
+            (repo / "README.md").write_text("advance base\n", encoding="utf-8")
+            git("add", "README.md")
+            git("commit", "-qm", "base advanced")
+            advanced_base = git("rev-parse", "HEAD")
+
+            git("switch", "-q", "feature")
+            docs.write_text("a\nb\nc\nd\ne\nf\nfeature\n", encoding="utf-8")
+            git("add", "docs/ci.md")
+            git("commit", "-qm", "feature change")
+            head = git("rev-parse", "HEAD")
+
+            self.assertEqual(first_feature, git("merge-base", advanced_base, head))
+            old_anchor = git("diff", "--name-status", "--find-renames=40%",
+                             origin, head)
+            new_anchor = git("diff", "--name-status", "--find-renames=40%",
+                             first_feature, head)
+            self.assertRegex(
+                old_anchor,
+                r"^R\d+\s+\.github/workflows/ci\.yml\s+docs/ci\.md$",
+            )
+            self.assertEqual("M\tdocs/ci.md", new_anchor)
+
+    def test_historical_pr_rename_vs_same_path_compare_stays_fail_closed(self):
+        """Same destination/count cannot make PR and pinned Compare diff equivalent."""
+        pr = base_state(path="docs/ci.md")
+        gql = {"data": {"repository": {"pullRequest": pr}}}
+        # The PR uses a historical anchor with a critical workflow rename.
+        pr_diff = (
+            b"diff --git a/.github/workflows/ci.yml b/docs/ci.md\n"
+            b"similarity index 60%\n"
+            b"rename from .github/workflows/ci.yml\n"
+            b"rename to docs/ci.md\n"
+            b"--- a/.github/workflows/ci.yml\n"
+            b"+++ b/docs/ci.md\n"
+            b"@@ -1 +1 @@\n-workflow: true\n+text: true\n"
+        )
+        # A later valid Compare anchor sees the same destination as modified.
+        compare_diff = (
+            b"diff --git a/docs/ci.md b/docs/ci.md\n"
+            b"--- a/docs/ci.md\n+++ b/docs/ci.md\n"
+            b"@@ -1 +1 @@\n-old text\n+new text\n"
+        )
+        self.assertNotEqual(
+            settlement.pr_review_gate.github_pr_diff_identity_sha256(pr_diff),
+            settlement.pr_review_gate.github_pr_diff_identity_sha256(compare_diff),
+        )
+        with (
+            mock.patch.object(settlement, "_run_json", side_effect=[
+                gql, self._compare(filename="docs/ci.md",
+                                   previous=None, status="modified"),
+            ]) as api,
+            mock.patch.object(settlement, "_collect_files",
+                              return_value=pr["files"]),
+            mock.patch.object(settlement, "_collect_comments",
+                              return_value=pr["comments"]),
+            mock.patch.object(settlement, "_collect_reviews",
+                              return_value=pr["reviews"]),
+            mock.patch.object(settlement, "_collect_review_threads",
+                              return_value=pr["reviewThreads"]),
+            mock.patch.object(settlement.subprocess, "run", side_effect=[
+                mock.Mock(returncode=0, stdout=pr_diff, stderr=b""),
+                mock.Mock(returncode=0, stdout=compare_diff, stderr=b""),
+            ]) as diff_read,
+            mock.patch.object(settlement.pr_review_gate, "classify_complexity",
+                              side_effect=AssertionError("unsafe classification")),
+        ):
+            with self.assertRaisesRegex(
+                settlement.SettlementError, r"merge-base.*pr-base-converge"
+            ):
+                settlement._live_state(ROOT, REPOSITORY, PR)
+        self.assertEqual(2, api.call_count)
+        self.assertEqual(2, diff_read.call_count)
+        self.assertEqual(
+            f"repos/{REPOSITORY}/compare/{BASE}...{HEAD}",
+            api.call_args.args[1][-1],
+        )
 
 
 def request_comment(
@@ -1886,6 +2238,12 @@ class CodexReviewLiveLineLimitTests(unittest.TestCase):
             del repo
             if argv[:3] == ["gh", "api", "graphql"]:
                 return deepcopy(pr_payload)
+            if argv == ["gh", "api", f"repos/{REPOSITORY}/compare/{BASE}...{HEAD}"]:
+                return {
+                    "base_commit": {"sha": BASE},
+                    "commits": [{"sha": HEAD}],
+                    "files": [{"filename": "assets/a.js", "status": "modified"}],
+                }
             if argv[:3] == ["gh", "pr", "view"]:
                 result = {key: state[key] for key in ("headRefOid", "baseRefOid", "changedFiles")}
                 if refreshed_head is not None:
@@ -1934,6 +2292,140 @@ class CodexReviewLiveLineLimitTests(unittest.TestCase):
     def test_codex_generic_provider_error_remains_fail_closed(self) -> None:
         with self.assertRaisesRegex(settlement.SettlementError, "cannot read current PR diff"):
             self._live(diagnostic=b"HTTP 406: gateway overloaded")
+
+
+    def test_codex_line_limit_rejects_unversioned_rename_or_copy_metadata(self) -> None:
+        """File-path set equality cannot authenticate a rename/copy source pair."""
+        diagnostic = (
+            b"HTTP 406: Sorry, the diff exceeded the maximum number of lines (20000)"
+        )
+        state = base_state(path="docs/ci.md")
+        del state["diff_sha256"]
+        payload = {"data": {"repository": {"pullRequest": state}}}
+
+        def fake_json(_repo: Path, argv: list[str]):
+            if argv[:3] == ["gh", "api", "graphql"]:
+                return deepcopy(payload)
+            if argv[:3] == ["gh", "pr", "view"]:
+                return {
+                    key: state[key]
+                    for key in ("headRefOid", "baseRefOid", "changedFiles")
+                }
+            raise AssertionError(argv)
+
+        for kind in ("renamed", "copied"):
+            with self.subTest(kind=kind):
+                rest = [{
+                    "path": "docs/ci.md",
+                    "status": kind,
+                    "previousPath": ".github/workflows/ci.yml",
+                }]
+                with (
+                    mock.patch.object(settlement, "_run_json", side_effect=fake_json),
+                    mock.patch.object(settlement.subprocess, "run", return_value=mock.Mock(
+                        returncode=1, stdout=b"", stderr=diagnostic,
+                    )),
+                    mock.patch.object(
+                        settlement.pr_review_gate, "_load_pull_file_evidence",
+                        return_value=rest,
+                    ),
+                    mock.patch.object(
+                        settlement.pr_review_gate, "_local_bound_pr_diff_bytes",
+                        return_value=b"bound local Git diff",
+                    ) as binder,
+                ):
+                    with self.assertRaisesRegex(
+                        settlement.SettlementError, "rename|copy|provenance"
+                    ):
+                        settlement._live_state(ROOT, REPOSITORY, PR)
+                    binder.assert_not_called()
+
+
+    def test_line_limit_uses_pinned_rename_source_when_rest_omits_status(self) -> None:
+        """Mutable REST 'added' must not hide a source trusted by immutable Compare."""
+        diagnostic = b"HTTP 406: Sorry, the diff exceeded the maximum number of lines (20000)"
+        state = base_state(path="docs/ci.md")
+        del state["diff_sha256"]
+        payload = {"data": {"repository": {"pullRequest": state}}}
+        pinned = [{
+            "path": "docs/ci.md", "status": "renamed",
+            "previousPath": ".github/workflows/ci.yml",
+        }]
+
+        def fake_json(_repo: Path, argv: list[str]):
+            if argv[:3] == ["gh", "api", "graphql"]:
+                return deepcopy(payload)
+            if argv[:3] == ["gh", "pr", "view"]:
+                return {
+                    field: state[field]
+                    for field in ("headRefOid", "baseRefOid", "changedFiles")
+                }
+            raise AssertionError(argv)
+
+        def verified_local_diff(_repo: Path, view: dict) -> bytes:
+            self.assertEqual(view["files"], pinned)
+            return b"immutable Git-diff bytes"
+
+        with (
+            mock.patch.object(settlement, "_run_json", side_effect=fake_json),
+            mock.patch.object(settlement.subprocess, "run", return_value=mock.Mock(
+                returncode=1, stdout=b"", stderr=diagnostic,
+            )),
+            mock.patch.object(
+                settlement.pr_review_gate, "_load_pull_file_evidence",
+                return_value=[{"path": "docs/ci.md", "status": "added"}],
+            ),
+            mock.patch.object(
+                settlement, "_revision_bound_rename_files", return_value=pinned,
+            ) as compare,
+            mock.patch.object(
+                settlement.pr_review_gate, "_local_bound_pr_diff_bytes",
+                side_effect=verified_local_diff,
+            ),
+        ):
+            result = settlement._live_state(ROOT, REPOSITORY, PR)
+        compare.assert_called_once()
+        self.assertEqual(result["files"]["nodes"], pinned)
+
+    def test_line_limit_fails_closed_when_immutable_rename_evidence_is_unavailable(self) -> None:
+        """An apparently benign REST status cannot bypass an unavailable pinned Compare."""
+        diagnostic = b"HTTP 406: Sorry, the diff exceeded the maximum number of lines (20000)"
+        state = base_state(path="docs/ci.md")
+        del state["diff_sha256"]
+        payload = {"data": {"repository": {"pullRequest": state}}}
+
+        def fake_json(_repo: Path, argv: list[str]):
+            if argv[:3] == ["gh", "api", "graphql"]:
+                return deepcopy(payload)
+            if argv[:3] == ["gh", "pr", "view"]:
+                return {
+                    field: state[field]
+                    for field in ("headRefOid", "baseRefOid", "changedFiles")
+                }
+            raise AssertionError(argv)
+
+        with (
+            mock.patch.object(settlement, "_run_json", side_effect=fake_json),
+            mock.patch.object(settlement.subprocess, "run", return_value=mock.Mock(
+                returncode=1, stdout=b"", stderr=diagnostic,
+            )),
+            mock.patch.object(
+                settlement.pr_review_gate, "_load_pull_file_evidence",
+                return_value=[{"path": "docs/ci.md", "status": "added"}],
+            ),
+            mock.patch.object(
+                settlement, "_revision_bound_rename_files",
+                side_effect=settlement.SettlementError("immutable compare unavailable"),
+            ),
+            mock.patch.object(
+                settlement.pr_review_gate, "_local_bound_pr_diff_bytes",
+            ) as binder,
+        ):
+            with self.assertRaisesRegex(
+                settlement.SettlementError, "immutable compare unavailable"
+            ):
+                settlement._live_state(ROOT, REPOSITORY, PR)
+            binder.assert_not_called()
 
 
 if __name__ == "__main__":
