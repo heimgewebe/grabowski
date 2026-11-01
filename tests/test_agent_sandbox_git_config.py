@@ -266,6 +266,93 @@ class AgentSandboxGitConfigTests(unittest.TestCase):
                     self.assertFalse(attributes.exists(), "host attributes were created")
 
 
+    def test_sealed_snapshot_preserves_nonfilter_info_attributes(self) -> None:
+        """The original info/attributes -diff must survive filter suppression."""
+        with tempfile.TemporaryDirectory(prefix="git-info-attributes-") as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            for key, value in (("user.name", "Test"), ("user.email", "t@example.invalid")):
+                subprocess.run(
+                    ["git", "config", key, value], cwd=repo, check=True, capture_output=True,
+                )
+            tracked = repo / "file.txt"
+            tracked.write_text("before\n", encoding="utf-8")
+            subprocess.run(["git", "add", "file.txt"], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-qm", "base"], cwd=repo, check=True)
+            attributes = repo / ".git" / "info" / "attributes"
+            attributes.write_bytes(b"file.txt -diff filter=late\n")
+            original_attributes = attributes.read_bytes()
+            marker = root / "executed"
+            subprocess.run(
+                ["git", "config", "filter.late.clean", f"sh -c 'touch {marker}; cat'"],
+                cwd=repo, check=True,
+            )
+            tracked.write_text("after\n", encoding="utf-8")
+            command = ["git", "diff", "--binary", "--no-ext-diff", "--no-textconv", "HEAD"]
+            control = subprocess.run(command, cwd=repo, capture_output=True, check=True)
+            self.assertTrue(marker.exists(), "RED filter control did not execute")
+            marker.unlink()
+            with sandbox.safe_git_snapshot_filter_effect(
+                repo, command
+            ) as (argv, environment, descriptors):
+                guarded = subprocess.run(
+                    argv, cwd=repo, env=environment, pass_fds=descriptors,
+                    capture_output=True, check=True,
+                )
+            self.assertEqual(guarded.stdout, control.stdout)
+            self.assertFalse(marker.exists())
+            self.assertEqual(attributes.read_bytes(), original_attributes)
+
+    def test_sealed_snapshot_supports_missing_info_directory_without_host_write(self) -> None:
+        """Optional Git info must be created only inside the child namespace."""
+        with tempfile.TemporaryDirectory(prefix="git-info-absent-") as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            for key, value in (("user.name", "Test"), ("user.email", "t@example.invalid")):
+                subprocess.run(
+                    ["git", "config", key, value], cwd=repo, check=True, capture_output=True,
+                )
+            tracked = repo / "file.txt"
+            tracked.write_text("base\n", encoding="utf-8")
+            (repo / ".gitattributes").write_text(
+                "file.txt filter=late\n", encoding="utf-8"
+            )
+            subprocess.run(
+                ["git", "add", "file.txt", ".gitattributes"], cwd=repo, check=True,
+            )
+            subprocess.run(["git", "commit", "-qm", "base"], cwd=repo, check=True)
+            info = repo / ".git" / "info"
+            for item in info.iterdir():
+                self.assertTrue(item.is_file() and not item.is_symlink())
+                item.unlink()
+            info.rmdir()
+            self.assertFalse(info.exists())
+            marker = root / "executed"
+            subprocess.run(
+                ["git", "config", "filter.late.clean", f"sh -c 'touch {marker}; cat'"],
+                cwd=repo, check=True,
+            )
+            tracked.write_text("changed\n", encoding="utf-8")
+            control = subprocess.run(
+                ["git", "diff", "HEAD"], cwd=repo, capture_output=True, check=True,
+            )
+            self.assertTrue(marker.exists(), "RED filter control did not execute")
+            marker.unlink()
+            with sandbox.safe_git_snapshot_filter_effect(
+                repo, ["git", "diff", "HEAD"]
+            ) as (argv, environment, descriptors):
+                guarded = subprocess.run(
+                    argv, cwd=repo, env=environment, pass_fds=descriptors,
+                    capture_output=True, check=True,
+                )
+            self.assertEqual(guarded.stdout, control.stdout)
+            self.assertFalse(marker.exists())
+            self.assertFalse(info.exists(), "Git info directory was created on the host")
+
 
 if __name__ == "__main__":
     unittest.main()

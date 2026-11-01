@@ -537,9 +537,11 @@ def safe_git_snapshot_filter_effect(
     admin = git_path("--absolute-git-dir")
     attributes = git_path("--path-format=absolute", "--git-path", "info/attributes")
     info = attributes.parent
+    common = info.parent
     if (
         not admin.is_dir() or admin.is_symlink()
-        or not info.is_dir() or info.is_symlink()
+        or not common.is_dir() or common.is_symlink()
+        or info.is_symlink() or (info.exists() and not info.is_dir())
         or attributes.name != "attributes"
     ):
         raise AgentSandboxError("snapshot Git info directory is invalid")
@@ -548,19 +550,48 @@ def safe_git_snapshot_filter_effect(
     # administrative location and worktree for the actual effectful Git process.
     env["GIT_DIR"] = str(admin)
     env["GIT_WORK_TREE"] = str(root)
-    preserves: list[str] = []
-    for name in ("exclude", "sparse-checkout"):
-        original = info / name
-        if original.is_symlink():
-            raise AgentSandboxError("snapshot Git info contains a symlink")
-        if original.exists():
-            if not original.is_file():
-                raise AgentSandboxError("snapshot Git info contains a special entry")
-            preserves.append(str(original))
+    # Retain every original info attribute except the Git filter effect.
+    # The final higher-precedence rule neutralizes filter names without
+    # changing -diff, linguist, export-ignore or custom non-filter metadata.
+    original_attributes = b""
+    if attributes.is_symlink():
+        raise AgentSandboxError("snapshot Git info attributes is a symlink")
+    if attributes.exists():
+        before = os.stat(attributes, follow_symlinks=False)
+        if not stat.S_ISREG(before.st_mode) or before.st_size > 1024 * 1024:
+            raise AgentSandboxError("snapshot Git info attributes is unsafe")
+        try:
+            source_fd = os.open(
+                attributes, os.O_RDONLY | os.O_CLOEXEC
+                | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+            )
+            try:
+                opened = os.fstat(source_fd)
+                original_attributes = os.read(source_fd, 1024 * 1024 + 1)
+                closed = os.fstat(source_fd)
+            finally:
+                os.close(source_fd)
+        except OSError as exc:
+            raise AgentSandboxError("snapshot Git info attributes unreadable") from exc
+        stable = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+        after = os.stat(attributes, follow_symlinks=False)
+        if (
+            len(original_attributes) != before.st_size
+            or any(
+                getattr(a, field) != getattr(before, field)
+                for a in (opened, closed, after) for field in stable
+            )
+        ):
+            raise AgentSandboxError("snapshot Git info attributes changed")
+    protected_attributes = (
+        original_attributes
+        + (b"\n" if original_attributes and not original_attributes.endswith(b"\n") else b"")
+        + b"* -filter\n"
+    )
 
     fd = os.memfd_create("grabowski-git-inert-attributes", os.MFD_ALLOW_SEALING)
     try:
-        os.write(fd, b"* -filter\n")
+        os.write(fd, protected_attributes)
         os.lseek(fd, 0, os.SEEK_SET)
         fcntl.fcntl(
             fd, fcntl.F_ADD_SEALS,
@@ -570,10 +601,13 @@ def safe_git_snapshot_filter_effect(
         command = [
             str(require_bwrap()), "--die-with-parent",
             "--bind", "/", "/", "--dev-bind", "/dev", "/dev",
-            "--tmpfs", str(info),
+            # Copy-on-write the original common Git admin directory in the
+            # child only. This keeps info/exclude and sparse-checkout intact
+            # and permits creating a missing info directory without any host
+            # filesystem mutation.
+            "--overlay-src", str(common), "--tmp-overlay", str(common),
+            "--dir", str(info),
         ]
-        for original in preserves:
-            command.extend(("--ro-bind", original, original))
         git_arguments = list(argv[1:])
         if git_arguments[0] == "diff":
             # Git interprets diff.external= as an empty *executable*, not as
