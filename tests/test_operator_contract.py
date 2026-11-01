@@ -6261,6 +6261,25 @@ class OperatorContractTests(unittest.TestCase):
                     self.assertEqual(result["returncode"], 0, result.get("stderr"))
                     self.assertFalse(marker.exists(), "history external helper executed")
 
+            # An option classified as consuming the next token must really
+            # consume it. Git log -U and Git diff --grep do not; a later
+            # --ext-diff must not become executable helper authority.
+            for arguments in (
+                ["log", "-p", "-U", "--ext-diff", "HEAD"],
+                ["show", "-U", "--ext-diff", "HEAD"],
+                ["diff", "--grep", "--ext-diff", "HEAD"],
+                ["diff", "-I", "--ext-diff", "HEAD"],
+            ):
+                with self.subTest(ambiguous_value=arguments):
+                    marker.unlink(missing_ok=True)
+                    with patch.object(
+                        operator, "_require_operator_mutation", return_value=None
+                    ):
+                        operator.grabowski_git(str(repo), arguments)
+                    self.assertFalse(
+                        marker.exists(), "ambiguous Git option activated an external helper"
+                    )
+
             # Git textconv is a second executable helper mechanism. A
             # caller --textconv must not override the operator's final guard.
             operator.subprocess.run(
@@ -6291,6 +6310,50 @@ class OperatorContractTests(unittest.TestCase):
             )
             self.assertFalse(textconv_marker.exists(), "Git textconv helper executed")
             self.assertIn("changed-on-disk", textconv_diff["stdout"])
+
+    def test_git_helper_like_option_values_preserve_log_search_semantics(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            operator.subprocess.run(
+                ["git", "init", "-q", "-b", "feature", str(repo)], check=True
+            )
+            for key, value in (
+                ("user.name", "Grabowski Test"),
+                ("user.email", "grabowski@example.invalid"),
+            ):
+                operator.subprocess.run(
+                    ["git", "-C", str(repo), "config", key, value], check=True
+                )
+            (repo / "file.txt").write_text("baseline\n", encoding="utf-8")
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "add", "file.txt"], check=True
+            )
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "commit", "-qm", "commit mentions -1"],
+                check=True,
+            )
+            for arguments in (
+                ["log", "--grep", "--textconv", "-1", "--format=%s"],
+                ["log", "--grep", "--ext-diff", "-1", "--format=%s"],
+                ["log", "--author", "--textconv", "-1", "--format=%s"],
+                ["log", "--committer", "--ext-diff", "-1", "--format=%s"],
+                ["log", "-p", "-S", "--ext-diff", "-1", "--format=%s"],
+                ["log", "-p", "-G", "--textconv", "-1", "--format=%s"],
+            ):
+                with self.subTest(arguments=arguments):
+                    expected = operator.subprocess.run(
+                        ["git", "-C", str(repo), *arguments],
+                        capture_output=True, text=True, check=True,
+                    )
+                    with patch.object(
+                        operator, "_require_operator_mutation", return_value=None
+                    ):
+                        actual = operator.grabowski_git(str(repo), arguments)
+                    self.assertEqual(actual["returncode"], 0, actual.get("stderr"))
+                    self.assertEqual(actual["stdout"], expected.stdout)
+                    literal = "--ext-diff" if "--ext-diff" in arguments else "--textconv"
+                    self.assertIn(literal, actual["argv"])
 
     def test_grabowski_git_exact_preimage_commit_disables_hooks_and_signing(self) -> None:
         operator = _load_operator_module()

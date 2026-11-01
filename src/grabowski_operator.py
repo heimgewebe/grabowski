@@ -9145,13 +9145,42 @@ def grabowski_git(
             # literal path arguments after '--' or '--end-of-options'.
             source_options = guarded_arguments[subcommand_index + 1:]
             options_ended = False
+            needs_value = False
+            # Git consumes the following token as data for these options.
+            # A literal '--textconv' used as --grep's value must not be
+            # silently deleted (that would change the reviewed log result).
+            value_options = {
+                "--grep", "--author", "--committer", "--format", "--encoding",
+                "--since", "--until", "--after", "--before", "--date",
+                "--max-count", "--skip", "--diff-filter", "--find-object",
+                "--word-diff-regex", "--line-prefix", "--src-prefix",
+                "--dst-prefix", "--output-indicator-new",
+                "--output-indicator-old", "--output-indicator-context",
+                "-S", "-G", "-I", "-n",
+            }
+            if subcommand == "diff":
+                # Unlike log/show, Git diff parses these helper-shaped tokens
+                # as options, *not* values (confirmed by executable-marker
+                # probes on the deployed NixOS Git). Do not preserve an
+                # executable --ext-diff/--textconv after any of them.
+                value_options -= {
+                    "--grep", "--author", "--committer", "--encoding",
+                    "--word-diff-regex", "--line-prefix", "--src-prefix",
+                    "--dst-prefix", "-S", "-G", "-I",
+                }
             safe_options: list[str] = []
             for item in source_options:
+                if needs_value:
+                    safe_options.append(item)
+                    needs_value = False
+                    continue
                 if item in {"--", "--end-of-options"}:
                     options_ended = True
                 if not options_ended and item in {"--ext-diff", "--textconv"}:
                     continue
                 safe_options.append(item)
+                if not options_ended and item in value_options:
+                    needs_value = True
             guarded_arguments = [
                 *guarded_arguments[:subcommand_index + 1],
                 "--no-ext-diff", "--no-textconv", *safe_options,
