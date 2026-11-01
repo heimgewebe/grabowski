@@ -2171,7 +2171,7 @@ def _merge_guard_legacy_local_review_diff_identity(
                 repo_path,
                 [
                     "-c", "diff.noprefix=false", "-c", "core.abbrev=auto",
-                    "diff", "--no-ext-diff", "--no-textconv", "--no-renames",
+                    "diff", "--no-ext-diff", "--no-textconv", "--no-color", "--no-renames",
                     "--ignore-submodules=none", "--unified=3", "--full-index",
                     base_sha, head_sha, "--",
                 ],

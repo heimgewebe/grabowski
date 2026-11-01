@@ -1084,6 +1084,15 @@ class CaptainLargePrMergeGuardTests(unittest.TestCase):
             ])
             signed = hashlib.sha256(firstparty).hexdigest()
             self.assertNotEqual(signed, hashlib.sha256(provider).hexdigest())
+            # Repo-local color configuration must not change signed diff bytes.
+            _git(repo, "config", "color.ui", "always")
+            colored = subprocess.check_output([
+                "git", "-C", str(repo), "diff", "--no-ext-diff",
+                "--no-textconv", "--no-renames", "--ignore-submodules=none",
+                "--unified=3", "--full-index", base, head, "--",
+            ])
+            self.assertIn(b"\x1b[", colored)
+
             self.assertEqual(
                 merge_guard.github_pr_diff_identity_sha256(firstparty),
                 merge_guard.github_pr_diff_identity_sha256(provider),
