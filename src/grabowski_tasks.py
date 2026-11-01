@@ -13527,7 +13527,7 @@ def grabowski_task_reconcile(auto_resume: bool = False) -> dict[str, Any]:
     return _task_reconcile_after_guard(auto_resume)
 
 
-def grabowski_task_list(
+def _grabowski_task_list_once(
     limit: int = DEFAULT_TASK_LIST_LIMIT,
     state: str | None = None,
     view: str = "minimal",
@@ -13858,6 +13858,52 @@ def grabowski_task_list(
             "does_not_establish",
         ),
     )
+
+
+def grabowski_task_list(
+    limit: int = DEFAULT_TASK_LIST_LIMIT,
+    state: str | None = None,
+    view: str = "minimal",
+    cursor: str | None = None,
+    fields: list[str] | None = None,
+    schema_only: bool = False,
+    *,
+    read_only: bool = False,
+) -> dict[str, Any]:
+    """Retry a complete read-only task list if a WAL checkpoint invalidated its snapshot.
+
+    A WAL/SHM sidecar may appear while the immutable snapshot is closing,
+    *after* all SQL queries. The caller must discard that result and open a
+    fresh validated transaction, never accept a partially trusted page.
+    Mutable and schema-only requests retain their existing single execution.
+    """
+    if read_only is not True or schema_only:
+        return _grabowski_task_list_once(
+            limit, state, view, cursor, fields, schema_only, read_only=read_only,
+        )
+    for attempt in range(3):
+        try:
+            return _grabowski_task_list_once(
+                limit, state, view, cursor, fields, schema_only, read_only=True,
+            )
+        except TaskSchemaInventoryChanged as exc:
+            missing = exc.__cause__
+            # No-cause inventory drift may be a sidecar created on close.
+            # Only actual missing WAL/SHM filenames may retry on entry.
+            if (
+                attempt == 2
+                or (
+                    missing is not None
+                    and (
+                        not isinstance(missing, FileNotFoundError)
+                        or missing.filename not in {
+                            str(TASK_DB) + "-wal", str(TASK_DB) + "-shm",
+                        }
+                    )
+                )
+            ):
+                raise
+    raise AssertionError("bounded task-list snapshot retry ended unexpectedly")
 
 
 @mcp.tool(name="grabowski_task_start", annotations=MUTATING)
