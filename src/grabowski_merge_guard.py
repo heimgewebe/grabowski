@@ -2162,6 +2162,33 @@ def _merge_guard_legacy_local_review_diff_identity(
         local_digest = hashlib.sha256(local_diff).hexdigest()
         local_canonical_digest = github_pr_diff_identity_sha256(local_diff)
         provider_canonical_digest = github_pr_diff_identity_sha256(provider_diff)
+        # First-party reviews sign full-index BASE..HEAD committed bytes.
+        # GitHub abbreviates index OIDs. Accept this second representation
+        # only when the exact source commits, changed paths and provider
+        # hunks have already been proven identical.
+        if local_digest != expected_sha256 and local_canonical_digest == provider_canonical_digest:
+            full_result = _merge_guard_local_git_bytes(
+                repo_path,
+                [
+                    "-c", "diff.noprefix=false", "-c", "core.abbrev=auto",
+                    "diff", "--no-ext-diff", "--no-textconv", "--no-renames",
+                    "--ignore-submodules=none", "--unified=3", "--full-index",
+                    base_sha, head_sha, "--",
+                ],
+                timeout=60,
+            )
+            full_diff = full_result["stdout_bytes"]
+            if (
+                full_result["returncode"] == 0
+                and 0 < len(full_diff) <= _MERGE_GUARD_MAX_DIFF_BYTES
+                and not _merge_guard_diff_contains_binary_metadata(full_diff)
+                and hashlib.sha256(full_diff).hexdigest() == expected_sha256
+                and github_pr_diff_identity_sha256(full_diff) == provider_canonical_digest
+            ):
+                local_diff = full_diff
+                local_digest = expected_sha256
+                local_canonical_digest = provider_canonical_digest
+                evidence["proof_format"] = "first-party-full-index"
         evidence.update({
             "local_raw_sha256": local_digest,
             "local_canonical_sha256": local_canonical_digest,
