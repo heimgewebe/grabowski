@@ -352,6 +352,21 @@ class AgentSandboxGitConfigTests(unittest.TestCase):
             self.assertEqual(guarded.stdout, control.stdout)
             self.assertFalse(marker.exists())
             self.assertFalse(info.exists(), "Git info directory was created on the host")
+            # Ubuntu 24.04 ships an older Bubblewrap without --overlay-src.
+            # Verify the actual command uses only legacy supported mounts.
+            self.assertNotIn("--overlay-src", argv)
+            self.assertNotIn("--tmp-overlay", argv)
+            self.assertIn("--tmpfs", argv)
+            with sandbox.safe_git_snapshot_filter_effect(
+                repo, ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"]
+            ) as (status_argv, environment, descriptors):
+                status = subprocess.run(
+                    status_argv, cwd=repo, env=environment, pass_fds=descriptors,
+                    capture_output=True, check=True,
+                )
+            self.assertIn(b" M file.txt\x00", status.stdout)
+            self.assertFalse(marker.exists(), "status executed a clean filter")
+            self.assertFalse(info.exists(), "status created the missing host info dir")
 
 
 if __name__ == "__main__":

@@ -601,13 +601,42 @@ def safe_git_snapshot_filter_effect(
         command = [
             str(require_bwrap()), "--die-with-parent",
             "--bind", "/", "/", "--dev-bind", "/dev", "/dev",
-            # Copy-on-write the original common Git admin directory in the
-            # child only. This keeps info/exclude and sparse-checkout intact
-            # and permits creating a missing info directory without any host
-            # filesystem mutation.
-            "--overlay-src", str(common), "--tmp-overlay", str(common),
-            "--dir", str(info),
         ]
+        # Ubuntu's distro bubblewrap predates --overlay-src; relying on it
+        # made every Candidate snapshot fail in the required Python CI.
+        # Both paths below use old, supported mounts and write only to the
+        # child namespace. Retain all original info entries except attributes.
+        if info.is_dir():
+            command.extend(("--tmpfs", str(info)))
+            originals = sorted(info.iterdir())
+            if len(originals) > 256:
+                raise AgentSandboxError("snapshot Git info directory exceeds bound")
+            for original in originals:
+                if original.name == "attributes":
+                    continue
+                if original.is_symlink() or not (
+                    original.is_file() or original.is_dir()
+                ):
+                    raise AgentSandboxError("snapshot Git info entry is unsafe")
+                command.extend(("--ro-bind", str(original), str(original)))
+        else:
+            # Git can legitimately have no info directory. Mount a private
+            # empty common-admin directory, then restore its original entries
+            # read-only so Git can still find HEAD, refs, objects and index.
+            # No mkdir on the host; a missing info path exists only in tmpfs.
+            command.extend(("--tmpfs", str(common)))
+            originals = sorted(common.iterdir())
+            if len(originals) > 256:
+                raise AgentSandboxError("snapshot Git admin directory exceeds bound")
+            for original in originals:
+                if original.name == "info":
+                    continue
+                if original.is_symlink() or not (
+                    original.is_file() or original.is_dir()
+                ):
+                    raise AgentSandboxError("snapshot Git admin entry is unsafe")
+                command.extend(("--ro-bind", str(original), str(original)))
+            command.extend(("--dir", str(info)))
         git_arguments = list(argv[1:])
         if git_arguments[0] == "diff":
             # Git interprets diff.external= as an empty *executable*, not as
