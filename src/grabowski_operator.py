@@ -7271,8 +7271,11 @@ GIT_ENVIRONMENT_EXACT_DENY = frozenset(
 
 def _git_environment() -> dict[str, str]:
     environment = _safe_environment()
+    # Any inherited GIT_* can redirect scope, attributes, helpers, editor or
+    # transport after our preflight. Reintroduce only server-owned overrides;
+    # push separately binds its authenticated SSH identity below.
     for key in tuple(environment):
-        if key in GIT_ENVIRONMENT_EXACT_DENY or key.startswith("GIT_CONFIG_"):
+        if key.startswith("GIT_"):
             environment.pop(key, None)
     environment["GIT_TERMINAL_PROMPT"] = "0"
     environment["GCM_INTERACTIVE"] = "never"
@@ -8068,7 +8071,6 @@ def _guard_git(arguments: list[str], repo: Path) -> None:
         "core.fsmonitor": "false",
         "core.editor": "/dev/null",
         "commit.gpgsign": "false",
-        "diff.external": "",
         "diff.trustexitcode": "false",
         "advice.graftfiledeprecated": "false",
     }
@@ -9126,13 +9128,32 @@ def grabowski_git(
             "-c", "core.fsmonitor=false",
             "-c", "commit.gpgSign=false",
             "-c", "core.editor=/dev/null",
-            "-c", "diff.external=",
             "-c", "diff.trustExitCode=false",
             "-C", str(path),
         ]
         environment = _git_environment()
     if read_shape is None:
-        command = _validate_argv([*command_prefix, *arguments], cwd=path)
+        # diff.external= is NOT a safe disabled state: Git attempts to
+        # execute the empty string. Disable diff drivers with Git's actual
+        # --no-ext-diff/--no-textconv flags on diff-producing invocations,
+        # before any user path separator, without changing caller pathspecs.
+        guarded_arguments = list(arguments)
+        if subcommand in {"diff", "log", "show"}:
+            subcommand_index = len(arguments) - len(_command_arguments) - 1
+            # A caller-supplied --ext-diff/--textconv otherwise overrides an
+            # earlier safe option. Put the denial *after* their options but
+            # before Git's literal pathspec separator, if present.
+            safe_option_index = next(
+                (
+                    i for i in range(subcommand_index + 1, len(guarded_arguments))
+                    if guarded_arguments[i] == "--"
+                ),
+                len(guarded_arguments),
+            )
+            guarded_arguments[safe_option_index:safe_option_index] = [
+                "--no-ext-diff", "--no-textconv",
+            ]
+        command = _validate_argv([*command_prefix, *guarded_arguments], cwd=path)
 
     branch_context: dict[str, Any] | None = None
     if subcommand in GIT_LOCAL_BRANCH_MUTATION_SUBCOMMANDS:

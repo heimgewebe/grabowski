@@ -4798,13 +4798,20 @@ class OperatorContractTests(unittest.TestCase):
             "GIT_CONFIG_COUNT": "1",
             "GIT_CONFIG_KEY_0": "remote.origin.push",
             "GIT_CONFIG_VALUE_0": "+HEAD:refs/heads/main",
+            "GIT_EXTERNAL_DIFF": "/tmp/untrusted-external-diff",
+            "GIT_EDITOR": "/tmp/untrusted-editor",
+            "GIT_SEQUENCE_EDITOR": "/tmp/untrusted-sequence-editor",
+            "GIT_SSH_COMMAND": "/tmp/untrusted-ssh",
+            "GIT_CONFIG_GLOBAL": "/tmp/foreign-gitconfig",
+            "GIT_DIFF_OPTS": "--unified=0",
         }
+        inherited_keys = tuple(injected)
         with patch.object(operator, "_safe_environment", return_value=injected):
             environment = operator._git_environment()
         self.assertEqual(environment["PATH"], "/usr/bin")
         self.assertEqual(environment["SSH_AUTH_SOCK"], "/run/user/1000/agent")
-        for key in injected:
-            if key.startswith("GIT_CONFIG_") or key in operator.GIT_ENVIRONMENT_EXACT_DENY:
+        for key in inherited_keys:
+            if key.startswith("GIT_"):
                 self.assertNotIn(key, environment)
         self.assertEqual(environment["GIT_TERMINAL_PROMPT"], "0")
         self.assertEqual(environment["GCM_INTERACTIVE"], "never")
@@ -6158,6 +6165,7 @@ class OperatorContractTests(unittest.TestCase):
                 "filter.attacker.process=sh -c 'echo EXECUTED'",
                 "core.fsmonitor=/tmp/untrusted-fsmonitor",
                 "diff.external=/tmp/untrusted-diff",
+                "diff.external=",
                 "diff.attacker.command=/tmp/untrusted-driver",
                 "core.editor=/tmp/untrusted-editor",
                 "gpg.program=/tmp/untrusted-signer",
@@ -6179,6 +6187,89 @@ class OperatorContractTests(unittest.TestCase):
                     operator._guard_git(
                         ["-c", config, "status"], repo
                     )
+
+    def test_generic_git_diff_disables_external_helper_without_empty_executable(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            operator.subprocess.run(
+                ["git", "init", "-q", "-b", "feature", str(repo)], check=True
+            )
+            for key, value in (
+                ("user.name", "Grabowski Test"),
+                ("user.email", "grabowski@example.invalid"),
+            ):
+                operator.subprocess.run(
+                    ["git", "-C", str(repo), "config", key, value], check=True
+                )
+            tracked = repo / "tracked.txt"
+            tracked.write_text("base\n", encoding="utf-8")
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "add", "tracked.txt"], check=True
+            )
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "commit", "-qm", "base"], check=True
+            )
+            marker = root / "external-diff-executed"
+            helper = root / "external-diff"
+            helper.write_text(
+                "#!/bin/sh\ntouch " + str(marker) + "\nexit 1\n",
+                encoding="utf-8",
+            )
+            helper.chmod(0o700)
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "config", "diff.external", str(helper)],
+                check=True,
+            )
+            tracked.write_text("changed-on-disk\n", encoding="utf-8")
+            for arguments in (
+                ["diff"],
+                ["diff", "--ext-diff"],
+                ["diff", "--ext-diff", "--", "tracked.txt"],
+            ):
+                with self.subTest(arguments=arguments):
+                    marker.unlink(missing_ok=True)
+                    with patch.object(
+                        operator, "_require_operator_mutation", return_value=None
+                    ):
+                        result = operator.grabowski_git(str(repo), arguments)
+                    self.assertEqual(result["returncode"], 0, result.get("stderr"))
+                    self.assertIn("changed-on-disk", result["stdout"])
+                    self.assertFalse(marker.exists(), "external Git diff helper executed")
+                    self.assertIn("--no-ext-diff", result["argv"])
+                    self.assertIn("--no-textconv", result["argv"])
+
+            # Git textconv is a second executable helper mechanism. A
+            # caller --textconv must not override the operator's final guard.
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "config", "--unset", "diff.external"],
+                check=True,
+            )
+            attributes = repo / ".git" / "info" / "attributes"
+            attributes.write_text("tracked.txt diff=attack\n", encoding="utf-8")
+            textconv_marker = root / "textconv-executed"
+            textconv = root / "textconv"
+            textconv.write_text(
+                "#!/bin/sh\ntouch " + str(textconv_marker) + "\ncat \"$1\"\n",
+                encoding="utf-8",
+            )
+            textconv.chmod(0o700)
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "config", "diff.attack.textconv", str(textconv)],
+                check=True,
+            )
+            with patch.object(
+                operator, "_require_operator_mutation", return_value=None
+            ):
+                textconv_diff = operator.grabowski_git(
+                    str(repo), ["diff", "--textconv", "--", "tracked.txt"]
+                )
+            self.assertEqual(
+                textconv_diff["returncode"], 0, textconv_diff.get("stderr")
+            )
+            self.assertFalse(textconv_marker.exists(), "Git textconv helper executed")
+            self.assertIn("changed-on-disk", textconv_diff["stdout"])
 
     def test_grabowski_git_exact_preimage_commit_disables_hooks_and_signing(self) -> None:
         operator = _load_operator_module()
