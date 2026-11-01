@@ -6227,6 +6227,8 @@ class OperatorContractTests(unittest.TestCase):
                 ["diff"],
                 ["diff", "--ext-diff"],
                 ["diff", "--ext-diff", "--", "tracked.txt"],
+                ["diff", "tracked.txt"],
+                ["diff", "--ext-diff", "tracked.txt"],
                 ["diff", "--end-of-options", "HEAD"],
                 ["diff", "--ext-diff", "--end-of-options", "HEAD"],
             ):
@@ -6244,15 +6246,18 @@ class OperatorContractTests(unittest.TestCase):
 
             # --end-of-options stops option parsing even without a -- pathspec.
             # Both history commands must still receive their safe flags before it.
-            for subcommand in ("log", "show"):
-                with self.subTest(subcommand=subcommand):
+            for arguments in (
+                ["log", "--end-of-options", "HEAD"],
+                ["show", "--end-of-options", "HEAD"],
+                ["log", "--follow", "tracked.txt"],
+                ["show", "HEAD:tracked.txt"],
+            ):
+                with self.subTest(arguments=arguments):
                     marker.unlink(missing_ok=True)
                     with patch.object(
                         operator, "_require_operator_mutation", return_value=None
                     ):
-                        result = operator.grabowski_git(
-                            str(repo), [subcommand, "--end-of-options", "HEAD"]
-                        )
+                        result = operator.grabowski_git(str(repo), arguments)
                     self.assertEqual(result["returncode"], 0, result.get("stderr"))
                     self.assertFalse(marker.exists(), "history external helper executed")
 

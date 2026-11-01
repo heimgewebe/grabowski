@@ -9140,18 +9140,21 @@ def grabowski_git(
         guarded_arguments = list(arguments)
         if subcommand in {"diff", "log", "show"}:
             subcommand_index = len(arguments) - len(_command_arguments) - 1
-            # A caller-supplied --ext-diff/--textconv otherwise overrides an
-            # earlier safe option. Put the denial *after* their options but
-            # before either Git end-of-options or literal pathspec marker.
-            safe_option_index = next(
-                (
-                    i for i in range(subcommand_index + 1, len(guarded_arguments))
-                    if guarded_arguments[i] in {"--", "--end-of-options"}
-                ),
-                len(guarded_arguments),
-            )
-            guarded_arguments[safe_option_index:safe_option_index] = [
-                "--no-ext-diff", "--no-textconv",
+            # Git allows implicit paths without '--'. Put safe flags before
+            # all operands, then drop caller helper-enabling options. Preserve
+            # literal path arguments after '--' or '--end-of-options'.
+            source_options = guarded_arguments[subcommand_index + 1:]
+            options_ended = False
+            safe_options: list[str] = []
+            for item in source_options:
+                if item in {"--", "--end-of-options"}:
+                    options_ended = True
+                if not options_ended and item in {"--ext-diff", "--textconv"}:
+                    continue
+                safe_options.append(item)
+            guarded_arguments = [
+                *guarded_arguments[:subcommand_index + 1],
+                "--no-ext-diff", "--no-textconv", *safe_options,
             ]
         command = _validate_argv([*command_prefix, *guarded_arguments], cwd=path)
 
