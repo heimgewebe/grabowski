@@ -61,7 +61,7 @@ FIRST_PARTY_ALLOWED_REPO = re.compile(
 # signed session from another well-formed ASCII GitHub repo cannot invalidate
 # every current PR review merely because the current allowlist has changed.
 FIRST_PARTY_SIGNED_HISTORY_REPO = re.compile(
-    r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*\Z"
+    r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9_.-]+\Z"
 )
 MAX_RECEIPT = 16384
 MAX_RECORD_SIGNATURE = 16384

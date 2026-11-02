@@ -1028,6 +1028,9 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
             ("alexdermohr/machtverflechtungen", "d" * 32),
             ("Hall-of-Memory/memoraevents", "c" * 32),
             ("former-owner/retired-reviewed-repo", "b" * 32),
+            ("heimgewebe/.github", "9" * 32),
+            ("heimgewebe/_internal", "8" * 32),
+            ("heimgewebe/-private", "7" * 32),
         ):
             product = copy.deepcopy(current)
             product["session_id"] = identity
