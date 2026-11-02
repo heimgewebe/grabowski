@@ -6377,6 +6377,156 @@ def grabowski_checkout_binding_terminal_apply(
 
 
 
+def _expired_same_lane_catchup_evidence(
+    *,
+    record: dict[str, Any],
+    lifecycle: dict[str, Any],
+    retention: dict[str, Any],
+    owner_id: str,
+    observed_at_unix: int,
+    ignored_lease_owner_ids: Iterable[str] = (),
+) -> dict[str, Any]:
+    """Prove a uniquely bound, clean, unpublished same-lane catchup after expiry.
+
+    Expiry never establishes terminality or transferable ownership. The original
+    Work Lane, its original physical checkout and its exact resource manifest
+    are mandatory evidence, not hints reconstructed from a Git branch name.
+    """
+    source = lifecycle.get("source")
+    lane_id = source.get("id") if isinstance(source, dict) else None
+    if (
+        not isinstance(source, dict)
+        or source.get("kind") != "work_lane"
+        or not isinstance(lane_id, str)
+        or re.fullmatch(r"[0-9a-f]{32}", lane_id) is None
+        or owner_id != f"lane:{lane_id}"
+        or retention.get("owner_id") != owner_id
+        or retention.get("expected_head") != record.get("head")
+        or lifecycle.get("expected_head") == record.get("head")
+        or lifecycle.get("expected_branch") != record.get("branch")
+        or retention.get("expected_branch") != record.get("branch")
+        or lifecycle.get("retention_until_unix", 0) > observed_at_unix
+        or retention.get("retention_until_unix", 0) > observed_at_unix
+    ):
+        raise RuntimeError("expired catchup requires exact same-owner Work Lane ancestry")
+
+    import grabowski_work_acquire as work_acquire
+    import grabowski_physical_checkout as physical_checkout
+
+    inputs = work_acquire._stored_lane_inputs(lane_id)
+    with work_acquire._lane_lock(lane_id) as receipt_path:
+        lane = work_acquire._read_state(receipt_path)
+    if (
+        not isinstance(lane, dict)
+        or lane.get("state") != "ready"
+        or lane.get("decision") not in {"ISOLATE_AND_EXECUTE", "CONTINUE_EXISTING"}
+        or lane.get("terminal_closeout") is not None
+        or lane.get("terminal_closeout_pending") is not None
+        or lane.get("writer_job") is not None
+        or lane.get("writer_start") is not None
+        or lane.get("inputs_sha256") != work_acquire._sha(inputs)
+        or inputs.get("lease_owner_id") != owner_id
+        or inputs.get("repo") != record.get("repo_path")
+        or inputs.get("target_path") != record.get("path")
+        or inputs.get("branch") != record.get("branch")
+        or inputs.get("base_head") != lifecycle.get("expected_head")
+        or work_acquire._lifecycle_source(inputs) != source
+    ):
+        raise RuntimeError("expired catchup has no exact active source-lane authority")
+
+    worktree_receipt = lane.get("worktree_receipt")
+    original_lifecycle = (
+        worktree_receipt.get("lifecycle")
+        if isinstance(worktree_receipt, dict) else None
+    )
+    original_physical = (
+        original_lifecycle.get("physical_checkout")
+        if isinstance(original_lifecycle, dict) else None
+    )
+    if (
+        not isinstance(worktree_receipt, dict)
+        or worktree_receipt.get("result_state") not in {"CREATED", "ALREADY_CORRECT"}
+        or not isinstance(original_lifecycle, dict)
+        or original_lifecycle.get("checkout_key") != record.get("checkout_key")
+        or original_lifecycle.get("owner_id") != owner_id
+        or original_lifecycle.get("checkout_path") != record.get("path")
+        or original_lifecycle.get("expected_head") != lifecycle.get("expected_head")
+        or original_lifecycle.get("expected_branch") != record.get("branch")
+        or not isinstance(original_physical, dict)
+    ):
+        raise RuntimeError("expired catchup original checkout receipt is incomplete")
+    try:
+        physical = physical_checkout.verify_physical_checkout_identity(original_physical)
+        physical_transition = "exact"
+    except physical_checkout.PhysicalCheckoutIdentityError:
+        # Following a genuine filesystem remount, Linux may renumber st_dev
+        # without changing any of the three Git-linked inodes or paths.
+        # This narrowly handles uniform device renumbering, not arbitrary
+        # relocated, replaced or identity-ambiguous checkouts.
+        physical = physical_checkout.capture_physical_checkout_identity(record["path"])
+        nodes = ("root", "git_dir", "common_dir")
+        old_devices = {original_physical[node]["device"] for node in nodes}
+        new_devices = {physical[node]["device"] for node in nodes}
+        if (
+            len(old_devices) != 1
+            or len(new_devices) != 1
+            or old_devices == new_devices
+            or any(
+                original_physical[node]["path"] != physical[node]["path"]
+                or original_physical[node]["inode"] != physical[node]["inode"]
+                for node in nodes
+            )
+        ):
+            raise RuntimeError("expired catchup physical checkout identity drifted")
+        physical_transition = "uniform_device_renumber"
+
+    keys = resources.normalize_resource_keys(inputs.get("resource_keys", []))
+    expected_keys = {
+        resources.normalize_resource_key(f"path:{record['path']}"),
+        resources.normalize_resource_key(
+            f"repo:{record['repo_path']}:branch:{record['branch']}"
+        ),
+    }
+    if not expected_keys.issubset(keys):
+        raise RuntimeError("expired catchup lane has no exact checkout and branch claims")
+    if _active_checkout_operation_uncertainties(
+        [*keys, resources.normalize_resource_key(f"path:{record['repo_common_dir']}")]
+    ):
+        raise RuntimeError("expired catchup has unresolved checkout-effect fences")
+    ignored = set(ignored_lease_owner_ids)
+    for key in keys:
+        active = resources.inspect_resource(key)
+        if active is not None and (
+            active.get("owner_id") != owner_id or owner_id not in ignored
+        ):
+            raise RuntimeError("expired catchup lease is active or owned by another writer")
+
+    return {
+        "lane_id": lane_id,
+        "lane_receipt_sha256": lane["receipt_sha256"],
+        "worktree_receipt_sha256": worktree_receipt.get("durable_receipt_sha256"),
+        "physical_identity_sha256": physical["physical_identity_sha256"],
+        "original_physical_identity_sha256": original_physical["physical_identity_sha256"],
+        "physical_identity_transition": physical_transition,
+        "resource_keys": keys,
+        "lease_purpose": inputs["purpose"],
+        "lease_ttl_seconds": inputs["ttl_seconds"],
+        "lease_metadata": {
+            "schema_version": 1,
+            "kind": work_acquire.LANE_KIND,
+            "lane_id": lane_id,
+            "controller_actor": inputs["controller"]["actor"],
+            "controller_role": "controller",
+            "scoped_writer_actor": None,
+            "source": inputs["source"],
+            "lifecycle_source": source,
+            "repo": inputs["repo"],
+            "branch": inputs["branch"],
+            "target_path": inputs["target_path"],
+        },
+        "retention_until_unix": observed_at_unix + 12 * 3600,
+    }
+
 def _binding_identity_rebind_state(
     *,
     repo: str,
@@ -6465,8 +6615,7 @@ def _binding_identity_rebind_state(
         raise RuntimeError(
             "Checkout identity rebind is unavailable after archive creation"
         )
-    if retention["retention_until_unix"] <= observed_at_unix:
-        raise RuntimeError("Checkout retention expired before identity rebind")
+    expired_retention = retention["retention_until_unix"] <= observed_at_unix
     static_identity = {
         "checkout_key": record["checkout_key"],
         "repo_common_dir": str(common_dir),
@@ -6578,10 +6727,27 @@ def _binding_identity_rebind_state(
             "Checkout identity rebind requires exactly one supported identity drift mode"
         )
 
+    expired_lane_recovery = None
+    if expired_retention:
+        if (
+            rebind_mode != "lifecycle_catchup"
+            or drift_reasons != ["binding-retention-head-mismatch"]
+        ):
+            raise RuntimeError("Checkout retention expired before identity rebind")
+        expired_lane_recovery = _expired_same_lane_catchup_evidence(
+            record=record,
+            lifecycle=lifecycle,
+            retention=retention,
+            owner_id=owner,
+            observed_at_unix=observed_at_unix,
+            ignored_lease_owner_ids=ignored_lease_owner_ids,
+        )
+        rebind_mode = "expired_same_lane_lifecycle_catchup"
+
     remote = _remote_secured_observation(
         record, verify_github_pull_ref=True
     )
-    if remote.get("remote_secured") is not True:
+    if remote.get("remote_secured") is not True and expired_lane_recovery is None:
         raise RuntimeError(
             "Checkout identity rebind requires the current head to be remote-secured"
         )
@@ -6608,6 +6774,7 @@ def _binding_identity_rebind_state(
         "retention_sha256": _sha256_json(retention),
         "allowed_drift_reasons": drift_reasons,
         "head_lineage": head_lineage,
+        **({"expired_lane_recovery": expired_lane_recovery} if expired_lane_recovery is not None else {}),
         "remote": remote,
         "coordination": coordination,
         "target_identity": {
@@ -6686,6 +6853,213 @@ def grabowski_checkout_binding_identity_rebind_preview(
     )
 
 
+def _apply_expired_same_lane_rebind(
+    planned: dict[str, Any], *, owner_id: str
+) -> dict[str, Any]:
+    """One same-owner, CAS-protected recovery; preserve the original writer lane.
+
+    Reacquire only the original lane's exact path and branch claims. Database
+    preimages and original source receipt are checked again while those claims
+    are held. A post-commit audit error retains the owner leases for readback.
+    """
+    import grabowski_work_acquire as work_acquire
+
+    recovery = planned["expired_lane_recovery"]
+    owner = _owner(owner_id)
+    checkout_key = planned["checkout"]["checkout_key"]
+    keys = resources.normalize_resource_keys(recovery["resource_keys"])
+    new_until = int(recovery["retention_until_unix"])
+    if new_until <= _now() + 600:
+        raise RuntimeError("expired same-lane recovery retention window is no longer sufficient")
+
+    acquired = resources.acquire_resources(
+        owner,
+        keys,
+        purpose=recovery["lease_purpose"],
+        ttl_seconds=int(recovery["lease_ttl_seconds"]),
+        metadata=recovery["lease_metadata"],
+    )
+    lease_snapshots = [
+        {field: item[field] for field in resources.LEASE_SNAPSHOT_KEYS}
+        for item in acquired["leases"]
+    ]
+    committed = False
+    try:
+        if sorted(item["resource_key"] for item in acquired["leases"]) != keys:
+            raise RuntimeError("expired same-lane recovery did not acquire exact lane claims")
+        current = _binding_identity_rebind_state_for_key(
+            checkout_key,
+            observed_at_unix=planned["observed_at_unix"],
+            ignored_lease_owner_ids=[owner],
+        )
+        if current["snapshot_sha256"] != planned["snapshot_sha256"]:
+            raise RuntimeError("expired same-lane recovery snapshot changed after lease acquisition")
+        if current.get("rebind_mode") != "expired_same_lane_lifecycle_catchup":
+            raise RuntimeError("expired same-lane recovery mode changed")
+        with work_acquire._lane_lock(recovery["lane_id"]) as receipt_path:
+            lane = work_acquire._read_state(receipt_path)
+            if (
+                not isinstance(lane, dict)
+                or lane.get("receipt_sha256") != recovery["lane_receipt_sha256"]
+                or lane.get("state") != "ready"
+                or lane.get("terminal_closeout") is not None
+                or lane.get("terminal_closeout_pending") is not None
+            ):
+                raise RuntimeError("expired same-lane source receipt changed before commit")
+            applied_at = _now()
+            with _operation_lock(), closing(_database()) as connection, connection:
+                connection.execute("BEGIN IMMEDIATE")
+                lifecycle_row = connection.execute(
+                    "SELECT * FROM lifecycle_bindings WHERE checkout_key=?",
+                    (checkout_key,),
+                ).fetchone()
+                retention_row = connection.execute(
+                    "SELECT * FROM retention WHERE checkout_key=?",
+                    (checkout_key,),
+                ).fetchone()
+                if lifecycle_row is None or retention_row is None:
+                    raise RuntimeError("expired same-lane recovery preimages disappeared")
+                lifecycle_before = _lifecycle_public(lifecycle_row)
+                retention_before = _retention_public(retention_row)
+                if (
+                    _sha256_json(lifecycle_before) != planned["lifecycle_sha256"]
+                    or _sha256_json(retention_before) != planned["retention_sha256"]
+                    or lifecycle_before["owner_id"] != owner
+                    or retention_before["owner_id"] != owner
+                    or lifecycle_before["phase"] != "active"
+                ):
+                    raise RuntimeError("expired same-lane recovery database preimage drifted")
+                lifecycle_stamp = max(applied_at, lifecycle_before["updated_at_unix"] + 1)
+                retention_stamp = max(applied_at, retention_before["updated_at_unix"] + 1)
+                new_head = planned["target_identity"]["expected_head"]
+                new_branch = planned["target_identity"]["expected_branch"]
+                changed_lifecycle = connection.execute(
+                    "UPDATE lifecycle_bindings SET expected_head=?, retention_until_unix=?, "
+                    "updated_at_unix=? WHERE checkout_key=? AND owner_id=? AND phase='active' "
+                    "AND expected_head=? AND expected_branch=? AND updated_at_unix=?",
+                    (
+                        new_head, new_until, lifecycle_stamp, checkout_key, owner,
+                        lifecycle_before["expected_head"], new_branch,
+                        lifecycle_before["updated_at_unix"],
+                    ),
+                )
+                changed_retention = connection.execute(
+                    "UPDATE retention SET retention_until_unix=?, updated_at_unix=? "
+                    "WHERE checkout_key=? AND owner_id=? AND expected_head=? "
+                    "AND expected_branch=? AND updated_at_unix=?",
+                    (
+                        new_until, retention_stamp, checkout_key, owner,
+                        retention_before["expected_head"], new_branch,
+                        retention_before["updated_at_unix"],
+                    ),
+                )
+                if changed_lifecycle.rowcount != 1 or changed_retention.rowcount != 1:
+                    raise RuntimeError("expired same-lane recovery lost exact database CAS")
+                connection.commit()
+                # From this point the owner claims must survive any readback,
+                # audit, or connection-close failure until exact reconciliation.
+                committed = True
+                after_lifecycle_row = connection.execute(
+                    "SELECT * FROM lifecycle_bindings WHERE checkout_key=?",
+                    (checkout_key,),
+                ).fetchone()
+                after_retention_row = connection.execute(
+                    "SELECT * FROM retention WHERE checkout_key=?",
+                    (checkout_key,),
+                ).fetchone()
+        if after_lifecycle_row is None or after_retention_row is None:
+            raise RuntimeError("expired same-lane recovery post-state is missing")
+        after_lifecycle = _lifecycle_public(after_lifecycle_row)
+        after_retention = _retention_public(after_retention_row)
+        for item in (after_lifecycle, after_retention):
+            if (
+                item["owner_id"] != owner
+                or item["expected_head"] != planned["checkout"]["head"]
+                or item["expected_branch"] != planned["checkout"]["branch"]
+                or item["retention_until_unix"] != new_until
+            ):
+                raise RuntimeError("expired same-lane recovery post-state did not converge")
+
+        _, _, checkout = _worktree_for_path(
+            Path(planned["checkout"]["repo_path"]),
+            Path(planned["checkout"]["checkout_path"]),
+        )
+        _require_clean_linked(checkout)
+        _require_expected(
+            checkout,
+            planned["checkout"]["head"],
+            planned["checkout"]["branch"],
+        )
+        audit = {
+            "schema_version": 1,
+            "kind": "checkout-binding-identity-rebind",
+            "operation": "checkout-binding-identity-rebind",
+            "timestamp_unix": _now(),
+            "checkout_key": checkout_key,
+            "owner_id": owner,
+            "rebind_mode": "expired_same_lane_lifecycle_catchup",
+            "lane_id": recovery["lane_id"],
+            "lane_receipt_sha256": recovery["lane_receipt_sha256"],
+            "physical_identity_sha256": recovery["physical_identity_sha256"],
+            "original_physical_identity_sha256": recovery["original_physical_identity_sha256"],
+            "physical_identity_transition": recovery["physical_identity_transition"],
+            "snapshot_sha256": planned["snapshot_sha256"],
+            "before_head": lifecycle_before["expected_head"],
+            "after_head": after_lifecycle["expected_head"],
+            "before_retention_until_unix": retention_before["retention_until_unix"],
+            "after_retention_until_unix": new_until,
+            "effects": [
+                "lifecycle_expected_identity_update",
+                "lifecycle_retention_extension",
+                "retention_extension",
+                "original_lane_resource_reacquisition",
+            ],
+            "remote_secured_refs": planned["remote"]["remote_secured_refs"],
+            "checkout_preserved": True,
+            "owner_preserved": True,
+        }
+        try:
+            base._append_audit(audit)
+        except Exception as exc:
+            raise RuntimeError(
+                "expired same-lane recovery committed without audit; authoritative readback required"
+            ) from exc
+        return {
+            "schema_version": 1,
+            "kind": "checkout_binding_identity_rebind_result",
+            "status": "applied",
+            "rebind_mode": "expired_same_lane_lifecycle_catchup",
+            "snapshot_sha256": planned["snapshot_sha256"],
+            "target_identity": planned["target_identity"],
+            "before": {
+                "lifecycle": lifecycle_before,
+                "retention": retention_before,
+            },
+            "after": {
+                "lifecycle": after_lifecycle,
+                "retention": after_retention,
+            },
+            "audit": audit,
+            "lease": acquired,
+            "lease_release": {
+                "owner_id": owner,
+                "released": [],
+                "preserved_original_lane_leases": True,
+            },
+            "does_not_establish": planned["does_not_establish"],
+        }
+    except Exception:
+        if not committed:
+            try:
+                resources.release_resources(
+                    owner, keys, force=False, expected_leases=lease_snapshots
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "expired same-lane recovery precommit lease compensation unknown; readback required"
+                ) from exc
+        raise
+
 def _binding_identity_rebind_apply(
     *,
     checkout_key: str,
@@ -6719,6 +7093,8 @@ def _binding_identity_rebind_apply(
         raise RuntimeError("Checkout identity rebind snapshot changed")
     if confirmation != planned["confirmation"]:
         raise PermissionError("Checkout identity rebind confirmation mismatch")
+    if planned["rebind_mode"] == "expired_same_lane_lifecycle_catchup":
+        return _apply_expired_same_lane_rebind(planned, owner_id=owner)
     if int(planned["retention"]["retention_until_unix"]) <= _now():
         raise RuntimeError("Checkout retention expired before identity rebind apply")
 
