@@ -52,7 +52,7 @@ TRUSTED_SIGNERS = (
 SHA40 = re.compile(r"[a-f0-9]{40}\Z")
 SHA256 = re.compile(r"[a-f0-9]{64}\Z")
 ID = re.compile(r"[a-f0-9]{32}\Z")
-REF = re.compile(r"(?P<path>[A-Za-z0-9_.@+/-]+)(?::(?P<source_revision>[a-f0-9]{40}))?:L(?P<start>[1-9][0-9]{0,6})(?:-L(?P<end>[1-9][0-9]{0,6}))?\Z")
+REF = re.compile(r"(?P<path>[A-Za-z0-9_.@+/\[\]-]+)(?::(?P<source_revision>[a-f0-9]{40}))?:L(?P<start>[1-9][0-9]{0,6})(?:-L(?P<end>[1-9][0-9]{0,6}))?\Z")
 FIRST_PARTY_ALLOWED_REPO = re.compile(
     r"(?:heimgewebe/[A-Za-z0-9_.-]+|alexdermohr/(?:kleinanzeiger|machtverflechtungen)|(?:Hall-of-Memory|hall-of-memory)/memoraevents)\Z"
 )
@@ -432,7 +432,7 @@ def trusted_phase_source(
         "    if not all(re.fullmatch(rb'[0-9a-f]{40}',oid) for oid in (old_sha,new_sha)):sys.exit(85)\n"
         "    try:status=raw_status.decode('ascii');path=fields[pos+1].decode('utf-8')\n"
         "    except UnicodeError:sys.exit(85)\n"
-        "    if status not in ('A','D','M','T') or not re.fullmatch(r'[A-Za-z0-9_.@+/-]{1,512}',path) or '..' in path.split('/') or path in seen_changed:sys.exit(87)\n"
+        "    if status not in ('A','D','M','T') or not re.fullmatch(r'[A-Za-z0-9_.@+/\\[\\]-]{1,512}',path) or '..' in path.split('/') or path in seen_changed:sys.exit(87)\n"
         "    if (status=='A' and old_mode!=b'000000') or (status=='D' and new_mode!=b'000000') or (status in ('M','T') and (old_mode==b'000000' or new_mode==b'000000')):sys.exit(87)\n"
         "    changed.append((status,path));seen_changed.add(path)\n"
         "if not changed or len(changed)>256:sys.exit(86)\n"
@@ -1352,7 +1352,7 @@ def _first_party_changed_paths(
         or len(paths) != len(set(paths))
         or any(
             not path or len(path) > 512 or ".." in Path(path).parts
-            or re.fullmatch(r"[A-Za-z0-9_.@+/-]+", path) is None
+            or re.fullmatch(r"[A-Za-z0-9_.@+/\[\]-]+", path) is None
             for path in paths
         )
     ):
