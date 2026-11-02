@@ -11934,6 +11934,183 @@ class TaskTests(unittest.TestCase):
         )
         recovery.assert_not_called()
 
+    def test_readonly_snapshot_retries_wal_removed_during_entry(self) -> None:
+        with tasks._database_connection():
+            pass
+        original = tasks.sqlite_store.inventory_coherent_readonly_sqlite
+        attempts = []
+
+        @contextmanager
+        def checkpoint_once(*args, **kwargs):
+            attempts.append(1)
+            if len(attempts) == 1:
+                try:
+                    raise FileNotFoundError(2, "WAL checkpoint", str(tasks.TASK_DB) + "-wal")
+                except FileNotFoundError as missing:
+                    raise tasks.TaskSchemaInventoryChanged("moving WAL") from missing
+            with original(*args, **kwargs) as connection:
+                yield connection
+
+        with patch.object(
+            tasks.sqlite_store, "inventory_coherent_readonly_sqlite",
+            side_effect=checkpoint_once,
+        ):
+            with tasks._task_readonly_snapshot() as reader:
+                self.assertEqual(
+                    tasks.TASK_CURRENT_SCHEMA_VERSION,
+                    tasks._task_schema_version(reader),
+                )
+        self.assertEqual(2, len(attempts))
+
+    def test_readonly_snapshot_checkpoint_retry_is_bounded_and_fail_closed(self) -> None:
+        with tasks._database_connection():
+            pass
+
+        def missing_on_enter(filename):
+            @contextmanager
+            def changed(*args, **kwargs):
+                try:
+                    raise FileNotFoundError(2, "file vanished", str(filename))
+                except FileNotFoundError as missing:
+                    raise tasks.TaskSchemaInventoryChanged("moving WAL") from missing
+                yield
+            return changed
+
+        for filename, expected_attempts in (
+            (str(tasks.TASK_DB) + "-wal", 3),
+            (str(tasks.TASK_DB) + "-shm", 3),
+            (str(tasks.TASK_DB), 1),
+        ):
+            with self.subTest(filename=filename), patch.object(
+                tasks.sqlite_store, "inventory_coherent_readonly_sqlite",
+                side_effect=missing_on_enter(filename),
+            ) as observed:
+                with self.assertRaises(tasks.TaskSchemaInventoryChanged):
+                    with tasks._task_readonly_snapshot():
+                        pass
+                self.assertEqual(expected_attempts, observed.call_count)
+
+    def test_readonly_snapshot_never_retries_after_transaction_entry(self) -> None:
+        with tasks._database_connection():
+            pass
+        original = tasks.sqlite_store.inventory_coherent_readonly_sqlite
+
+        @contextmanager
+        def observed(*args, **kwargs):
+            with original(*args, **kwargs) as connection:
+                yield connection
+
+        with patch.object(
+            tasks.sqlite_store, "inventory_coherent_readonly_sqlite",
+            side_effect=observed,
+        ) as calls:
+            with self.assertRaises(tasks.TaskSchemaInventoryChanged):
+                with tasks._task_readonly_snapshot() as reader:
+                    reader.execute("SELECT 1 FROM tasks LIMIT 1").fetchone()
+                    try:
+                        raise FileNotFoundError(2, "checkpoint", str(tasks.TASK_DB) + "-wal")
+                    except FileNotFoundError as missing:
+                        raise tasks.TaskSchemaInventoryChanged("moving WAL") from missing
+        self.assertEqual(1, calls.call_count)
+
+    def test_task_list_readonly_retries_invalidated_wal_snapshot_at_exit(self) -> None:
+        task = self._start()["task"]
+        original = tasks._task_readonly_snapshot
+        attempts = []
+
+        @contextmanager
+        def snapshot_with_one_checkpoint():
+            attempts.append(1)
+            with original() as connection:
+                yield connection
+            if len(attempts) == 1:
+                # A quiescent, immutable read was rendered invalid when a
+                # new WAL appeared before its final sidecar check.
+                raise tasks.TaskSchemaInventoryChanged("WAL appeared on snapshot exit")
+
+        with patch.object(tasks, "_task_readonly_snapshot", snapshot_with_one_checkpoint):
+            result = tasks.grabowski_task_list(state="running", read_only=True)
+        self.assertEqual([task["task_id"]], [row["task_id"] for row in result["tasks"]])
+        self.assertEqual(2, len(attempts))
+        self.assertTrue(result["read_only_snapshot"])
+        self.assertFalse(result["reconciliation_performed"])
+
+    def test_task_list_readonly_wal_exit_retry_is_bounded_and_fail_closed(self) -> None:
+        self._start()
+        original = tasks._task_readonly_snapshot
+        attempts = []
+
+        @contextmanager
+        def invalidated_on_every_exit():
+            attempts.append(1)
+            with original() as connection:
+                yield connection
+            raise tasks.TaskSchemaInventoryChanged("WAL appeared on snapshot exit")
+
+        with patch.object(tasks, "_task_readonly_snapshot", invalidated_on_every_exit):
+            with self.assertRaises(tasks.TaskSchemaInventoryChanged):
+                tasks.grabowski_task_list(state="running", read_only=True)
+        self.assertEqual(3, len(attempts))
+
+    def test_task_list_readonly_retries_sidecar_entry_but_not_main_file(self) -> None:
+        self._start()
+        original = tasks._task_readonly_snapshot
+
+        def missing_snapshot(filename, *, once):
+            attempts = []
+
+            @contextmanager
+            def snapshot():
+                attempts.append(1)
+                if not once or len(attempts) == 1:
+                    try:
+                        raise FileNotFoundError(2, "checkpoint", filename)
+                    except FileNotFoundError as missing:
+                        raise tasks.TaskSchemaInventoryChanged("moving WAL") from missing
+                with original() as connection:
+                    yield connection
+
+            return snapshot, attempts
+
+        for suffix, retries in (("-wal", 2), ("-shm", 2), ("", 1)):
+            snapshot, attempts = missing_snapshot(
+                str(tasks.TASK_DB) + suffix, once=bool(suffix),
+            )
+            with self.subTest(suffix=suffix), patch.object(
+                tasks, "_task_readonly_snapshot", snapshot,
+            ):
+                if suffix:
+                    self.assertEqual(
+                        1, tasks.grabowski_task_list(state="running", read_only=True)["count"],
+                    )
+                else:
+                    with self.assertRaises(tasks.TaskSchemaInventoryChanged):
+                        tasks.grabowski_task_list(state="running", read_only=True)
+                self.assertEqual(retries, len(attempts))
+
+    def test_task_list_readonly_does_not_retry_mutations_schema_or_permissions(self) -> None:
+        def fail_invalid_inventory(*args, **kwargs):
+            raise tasks.TaskSchemaInventoryChanged("churn")
+
+        for options in (
+            {"read_only": False},
+            {"read_only": True, "schema_only": True},
+        ):
+            with self.subTest(options=options), patch.object(
+                tasks, "_grabowski_task_list_once", side_effect=fail_invalid_inventory,
+            ) as operation:
+                with self.assertRaises(tasks.TaskSchemaInventoryChanged):
+                    tasks.grabowski_task_list(**options)
+                operation.assert_called_once()
+
+        for problem in (PermissionError("denied"), RuntimeError("bad schema")):
+            with self.subTest(problem=type(problem).__name__), patch.object(
+                tasks, "_grabowski_task_list_once", side_effect=problem,
+            ) as operation:
+                with self.assertRaises(type(problem)):
+                    tasks.grabowski_task_list(read_only=True)
+                operation.assert_called_once()
+
     def test_task_schema_only_inventory_reports_migration_without_mutation(self) -> None:
         self._create_task_schema_version("2")
         before = self.database.read_bytes()

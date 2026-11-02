@@ -1049,6 +1049,81 @@ class CaptainLargePrMergeGuardTests(unittest.TestCase):
                 runner.receipt["local_review_diff_equivalence"]["canonical_hunks_match"]
             )
 
+    def test_first_party_full_index_diff_requires_exact_hunks_and_bound_commits(self) -> None:
+        # Authenticated first-party reviews sign --full-index Git diff bytes.
+        # GitHub's display abbreviates index OIDs, but committed paths and
+        # hunks must still be proven equal under one exact base/head pair.
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            _git(repo, "init", "-q")
+            _git(repo, "config", "user.email", "captain-test@example.invalid")
+            _git(repo, "config", "user.name", "Captain Test")
+            source = repo / "app.py"
+            source.write_text(
+                "def run():\n" + "".join(f"    x_{n} = {n}\n" for n in range(24))
+                + "    return x_7\n", encoding="utf-8",
+            )
+            _git(repo, "add", "app.py")
+            _git(repo, "commit", "-q", "-m", "base")
+            base = _git(repo, "rev-parse", "HEAD")
+            source.write_text(
+                source.read_text(encoding="utf-8").replace("x_11 = 11", "x_11 = 123"),
+                encoding="utf-8",
+            )
+            _git(repo, "add", "app.py")
+            _git(repo, "commit", "-q", "-m", "head")
+            head = _git(repo, "rev-parse", "HEAD")
+            firstparty = subprocess.check_output([
+                "git", "-C", str(repo), "diff", "--no-ext-diff",
+                "--no-textconv", "--no-renames", "--ignore-submodules=none",
+                "--unified=3", "--full-index", base, head, "--",
+            ])
+            provider = subprocess.check_output([
+                "git", "-C", str(repo), "diff", "--binary", "--no-ext-diff",
+                "--no-textconv", f"{base}...{head}",
+            ])
+            signed = hashlib.sha256(firstparty).hexdigest()
+            self.assertNotEqual(signed, hashlib.sha256(provider).hexdigest())
+            # Repo-local color configuration must not change signed diff bytes.
+            _git(repo, "config", "color.ui", "always")
+            colored = subprocess.check_output([
+                "git", "-C", str(repo), "diff", "--no-ext-diff",
+                "--no-textconv", "--no-renames", "--ignore-submodules=none",
+                "--unified=3", "--full-index", base, head, "--",
+            ])
+            self.assertIn(b"\x1b[", colored)
+
+            self.assertEqual(
+                merge_guard.github_pr_diff_identity_sha256(firstparty),
+                merge_guard.github_pr_diff_identity_sha256(provider),
+            )
+            expected = {
+                "base_sha": base, "head_sha": head,
+                "expected_sha256": signed, "provider_diff": provider,
+                "changed_paths": ["app.py"],
+            }
+            passed, evidence = merge_guard._merge_guard_legacy_local_review_diff_identity(
+                repo, **expected,
+            )
+            self.assertTrue(passed, evidence)
+            self.assertEqual(evidence["status"], "proven")
+            self.assertEqual(evidence["local_raw_sha256"], signed)
+            self.assertEqual(evidence["proof_format"], "first-party-full-index")
+            for label, changed in (
+                ("wrong hash", {"expected_sha256": "f" * 64}),
+                ("wrong path", {"changed_paths": ["other.py"]}),
+                ("tampered provider", {"provider_diff": provider.replace(
+                    b"+    x_11 = 123", b"+    x_11 = 999"
+                )}),
+                ("missing head", {"head_sha": "c" * 40}),
+            ):
+                with self.subTest(label=label):
+                    rejected, detail = merge_guard._merge_guard_legacy_local_review_diff_identity(
+                        repo, **{**expected, **changed},
+                    )
+                    self.assertFalse(rejected, detail)
+                    self.assertEqual(detail["status"], "not_proven")
+
     def test_legacy_review_accepts_diverged_base_with_exact_three_dot_patch(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
