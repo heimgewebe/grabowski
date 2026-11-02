@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
+import fcntl
 import hashlib
 import json
 import os
@@ -12,7 +14,7 @@ import stat
 import subprocess
 import sys
 import tempfile
-from typing import Iterable
+from typing import Iterable, Iterator
 
 BWRAP = Path(os.environ.get("GRABOWSKI_BWRAP_BIN", "/usr/bin/bwrap"))
 TAIL_BYTES = 12000
@@ -493,6 +495,169 @@ def safe_git_environment(base: dict[str, str] | None = None) -> dict[str, str]:
     environment.update(_git_command_environment())
     return environment
 
+
+
+@contextmanager
+def safe_git_snapshot_filter_effect(
+    worktree: Path, argv: list[str],
+) -> Iterator[tuple[list[str], dict[str, str], tuple[int, ...]]]:
+    """Mask mutable Git filters at the exact worktree status/diff effect.
+
+    Git may run a clean/process filter while refreshing a racy worktree index.
+    This sealed, higher-precedence info/attributes overlay exists only inside
+    the Git subprocess namespace, even if the host file does not exist. Git's
+    original info/exclude and sparse-checkout semantics remain available.
+    """
+    if len(argv) < 2 or argv[0] != "git" or argv[1] not in {"status", "diff"}:
+        raise AgentSandboxError("snapshot filter guard accepts only worktree status/diff")
+    if not hasattr(os, "memfd_create") or not hasattr(os, "MFD_ALLOW_SEALING"):
+        raise AgentSandboxError("sealed Git attributes are unsupported")
+
+    from grabowski_git_ssh import trusted_git_cli_path
+
+    git = trusted_git_cli_path()
+    root = worktree.resolve(strict=True)
+    env = safe_git_environment()
+
+    def git_path(*args: str) -> Path:
+        probe = subprocess.run(
+            [git, "-C", str(root), "rev-parse", *args],
+            cwd=root, env=env, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=15, check=False,
+        )
+        if probe.returncode or not probe.stdout or len(probe.stdout) > 4096:
+            raise AgentSandboxError("snapshot Git administrative path is unavailable")
+        value = os.fsdecode(probe.stdout.strip())
+        if not value or "\x00" in value or "\n" in value:
+            raise AgentSandboxError("snapshot Git administrative path is invalid")
+        candidate = Path(value)
+        return candidate if candidate.is_absolute() else root / candidate
+
+    admin = git_path("--absolute-git-dir")
+    attributes = git_path("--path-format=absolute", "--git-path", "info/attributes")
+    info = attributes.parent
+    common = info.parent
+    if (
+        not admin.is_dir() or admin.is_symlink()
+        or not common.is_dir() or common.is_symlink()
+        or info.is_symlink() or (info.exists() and not info.is_dir())
+        or attributes.name != "attributes"
+    ):
+        raise AgentSandboxError("snapshot Git info directory is invalid")
+
+    # A linked worktree can have a mutable .git pointer. Pin the server-read
+    # administrative location and worktree for the actual effectful Git process.
+    env["GIT_DIR"] = str(admin)
+    env["GIT_WORK_TREE"] = str(root)
+    # Retain every original info attribute except the Git filter effect.
+    # The final higher-precedence rule neutralizes filter names without
+    # changing -diff, linguist, export-ignore or custom non-filter metadata.
+    original_attributes = b""
+    if attributes.is_symlink():
+        raise AgentSandboxError("snapshot Git info attributes is a symlink")
+    if attributes.exists():
+        before = os.stat(attributes, follow_symlinks=False)
+        if not stat.S_ISREG(before.st_mode) or before.st_size > 1024 * 1024:
+            raise AgentSandboxError("snapshot Git info attributes is unsafe")
+        try:
+            source_fd = os.open(
+                attributes, os.O_RDONLY | os.O_CLOEXEC
+                | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+            )
+            try:
+                opened = os.fstat(source_fd)
+                original_attributes = os.read(source_fd, 1024 * 1024 + 1)
+                closed = os.fstat(source_fd)
+            finally:
+                os.close(source_fd)
+        except OSError as exc:
+            raise AgentSandboxError("snapshot Git info attributes unreadable") from exc
+        stable = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+        after = os.stat(attributes, follow_symlinks=False)
+        if (
+            len(original_attributes) != before.st_size
+            or any(
+                getattr(a, field) != getattr(before, field)
+                for a in (opened, closed, after) for field in stable
+            )
+        ):
+            raise AgentSandboxError("snapshot Git info attributes changed")
+    protected_attributes = (
+        original_attributes
+        + (b"\n" if original_attributes and not original_attributes.endswith(b"\n") else b"")
+        + b"* -filter\n"
+    )
+
+    fd = os.memfd_create("grabowski-git-inert-attributes", os.MFD_ALLOW_SEALING)
+    try:
+        os.write(fd, protected_attributes)
+        os.lseek(fd, 0, os.SEEK_SET)
+        fcntl.fcntl(
+            fd, fcntl.F_ADD_SEALS,
+            fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW
+            | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL,
+        )
+        command = [
+            str(require_bwrap()), "--die-with-parent",
+            "--bind", "/", "/", "--dev-bind", "/dev", "/dev",
+        ]
+        # Ubuntu's distro bubblewrap predates --overlay-src; relying on it
+        # made every Candidate snapshot fail in the required Python CI.
+        # Both paths below use old, supported mounts and write only to the
+        # child namespace. Retain all original info entries except attributes.
+        if info.is_dir():
+            command.extend(("--tmpfs", str(info)))
+            originals = sorted(info.iterdir())
+            if len(originals) > 256:
+                raise AgentSandboxError("snapshot Git info directory exceeds bound")
+            for original in originals:
+                if original.name == "attributes":
+                    continue
+                if original.is_symlink() or not (
+                    original.is_file() or original.is_dir()
+                ):
+                    raise AgentSandboxError("snapshot Git info entry is unsafe")
+                command.extend(("--ro-bind", str(original), str(original)))
+        else:
+            # Git can legitimately have no info directory. Mount a private
+            # empty common-admin directory, then restore its original entries
+            # read-only so Git can still find HEAD, refs, objects and index.
+            # No mkdir on the host; a missing info path exists only in tmpfs.
+            command.extend(("--tmpfs", str(common)))
+            originals = sorted(common.iterdir())
+            if len(originals) > 256:
+                raise AgentSandboxError("snapshot Git admin directory exceeds bound")
+            for original in originals:
+                if original.name == "info":
+                    continue
+                if original.is_symlink() or not (
+                    original.is_file() or original.is_dir()
+                ):
+                    raise AgentSandboxError("snapshot Git admin entry is unsafe")
+                command.extend(("--ro-bind", str(original), str(original)))
+            command.extend(("--dir", str(info)))
+        git_arguments = list(argv[1:])
+        if git_arguments[0] == "diff":
+            # Git interprets diff.external= as an empty *executable*, not as
+            # disabled. Place the real helper-disabling flags after any caller
+            # options but before either end-of-options/pathspec separator.
+            boundary = next(
+                (
+                    i for i in range(1, len(git_arguments))
+                    if git_arguments[i] in {"--", "--end-of-options"}
+                ),
+                len(git_arguments),
+            )
+            git_arguments[boundary:boundary] = ["--no-ext-diff", "--no-textconv"]
+        command.extend((
+            "--ro-bind-data", str(fd), str(attributes),
+            "--", git, "-C", str(root), "-c", "diff.trustExitCode=false",
+            *git_arguments,
+        ))
+        yield command, env, (fd,)
+    finally:
+        os.close(fd)
 
 def runtime_sandbox_argv(arguments: list[str]) -> list[str]:
     """Bind execution to the validated, resolved bubblewrap binary."""

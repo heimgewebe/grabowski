@@ -1144,6 +1144,72 @@ class AgentWorkspaceTests(unittest.TestCase):
             marker.exists(), "candidate adoption executed an untrusted Git clean filter",
         )
 
+    def test_candidate_snapshot_does_not_execute_post_freeze_clean_filter(self) -> None:
+        """Git snapshot must not launch a mutable repository clean filter."""
+        _lane, manifest, collection, candidate, _closed = self.closed_lane_candidate_fixture()
+        marker = self.root / "executed-snapshot-clean-filter"
+        attr_raw = run(self.git.writer, "git", "rev-parse", "--git-path", "info/attributes")
+        attributes = Path(attr_raw)
+        if not attributes.is_absolute():
+            attributes = self.git.writer / attributes
+        attributes.parent.mkdir(parents=True, exist_ok=True)
+        attributes.write_text("src/app.py filter=adoption_probe\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "config", "--local", "filter.adoption_probe.clean",
+             f"sh -c 'touch {marker}; cat'"],
+            cwd=self.git.writer, check=True, capture_output=True,
+        )
+        self.assertEqual(
+            run(self.git.writer, "git", "check-attr", "filter", "--", "src/app.py"),
+            "src/app.py: filter: adoption_probe",
+        )
+        snapshot = workspace._adoption_candidate_snapshot(manifest, collection, candidate)
+        self.assertEqual(snapshot["diff_sha256"], collection["diff_sha256"])
+        self.assertEqual(snapshot["stage_worktree_sha256"], workspace._adoption_worktree_raw_fingerprint(
+            self.git.writer, collection["changed_paths"],
+        ))
+        self.assertFalse(marker.exists(), "Candidate snapshot launched an untrusted clean filter")
+
+    def test_collection_and_adoption_share_inert_filter_identity(self) -> None:
+        """A pre-freeze clean filter must not run or alter the frozen diff."""
+        manifest = self.manifest()
+        source = self.git.writer / "src" / "app.py"
+        source.write_text("new_value = 'lowercase'\n", encoding="utf-8")
+        marker = self.root / "executed-collection-clean-filter"
+        attr_raw = run(
+            self.git.writer, "git", "rev-parse", "--git-path", "info/attributes",
+        )
+        attributes = Path(attr_raw)
+        if not attributes.is_absolute():
+            attributes = self.git.writer / attributes
+        attributes.parent.mkdir(parents=True, exist_ok=True)
+        attributes.write_text("src/app.py filter=collection_probe\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "config", "--local", "filter.collection_probe.clean",
+             f"sh -c 'touch {marker}; tr a-z A-Z'"],
+            cwd=self.git.writer, check=True, capture_output=True,
+        )
+        self.assertEqual(
+            run(self.git.writer, "git", "check-attr", "filter", "--", "src/app.py"),
+            "src/app.py: filter: collection_probe",
+        )
+
+        collected = workspace._git_snapshot(manifest, workspace._run)
+        self.assertTrue(collected["dirty"])
+        self.assertIn("src/app.py", collected["changed_paths"])
+        self.assertFalse(marker.exists(), "collection launched a mutable clean filter")
+        adopted = workspace._git_snapshot(
+            manifest, workspace._run,
+            byte_reader=workspace._candidate_snapshot_checked_bytes,
+        )
+        self.assertEqual(collected["diff_sha256"], adopted["diff_sha256"])
+        self.assertEqual(collected["changed_paths"], adopted["changed_paths"])
+        writer_patch = workspace._materialize_writer_patch(
+            manifest, collected, workspace._run,
+        )
+        self.assertEqual(writer_patch["type"], "patch")
+        self.assertFalse(marker.exists(), "collection patch materializer ran a filter")
+
     def test_lane_candidate_adoption_blocks_outside_tracked_drift_before_commit(self) -> None:
         """Later tracked edits outside the Candidate must not advance the branch."""
         _lane, manifest, collection, candidate, _closed = self.closed_lane_candidate_fixture()
@@ -1247,8 +1313,8 @@ class AgentWorkspaceTests(unittest.TestCase):
         _lane, manifest, collection, candidate, _closed = self.closed_lane_candidate_fixture()
         real_git_snapshot = workspace._git_snapshot
 
-        def mutate_after_git_diff(manifest_value, runner):
-            snapshot = real_git_snapshot(manifest_value, runner)
+        def mutate_after_git_diff(manifest_value, runner, **kwargs):
+            snapshot = real_git_snapshot(manifest_value, runner, **kwargs)
             (self.git.writer / "src" / "app.py").write_text(
                 "replaced_after_git_diff = True\n", encoding="utf-8"
             )
