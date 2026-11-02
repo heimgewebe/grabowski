@@ -643,6 +643,29 @@ class WorkAcquireTests(unittest.TestCase):
                 self.assertGreaterEqual(len(observed_pages), 2)
                 self.assertEqual(live[999]["resource_key"], observed_pages[1][1])
 
+    def test_native_owner_inventory_rejects_fifo_without_blocking(self) -> None:
+        # A same-UID replacement with a FIFO must fail promptly, not hang
+        # the WorkAcquire lane lock at the initial os.open() before fstat().
+        self.state.mkdir(parents=True, exist_ok=True)
+        fifo = self.state / "native-owner-inventory-fifo"
+        os.mkfifo(fifo, mode=0o600)
+        with (
+            patch.object(work_acquire.resources, "RESOURCE_DB", fifo),
+            patch.object(
+                work_acquire.operator, "_require_operator_mutation",
+                return_value=None,
+            ) as require_admission,
+        ):
+            with self.assertRaisesRegex(
+                work_acquire.LeaseAcquisitionOutcomeUnknown,
+                "lease inventory source is unsafe",
+            ):
+                with work_acquire._native_owner_inventory_pagination_guard(
+                    work_acquire.resources.list_resources
+                ):
+                    self.fail("FIFO must not be accepted as lease database")
+        require_admission.assert_called_once_with("resource_lease")
+
     def test_native_owner_inventory_denial_happens_before_sqlite_wal_open(self) -> None:
         # SQLite mode=ro may still create WAL/SHM or write SHM reader marks.
         # The existing resource-lease kill switch must precede any native open.
