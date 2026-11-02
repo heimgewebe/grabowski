@@ -24,7 +24,7 @@ MAX_OUTPUT_BYTES = 131072
 MAX_MESSAGES = 64
 MAX_MODEL_PAGES = 5
 PREFLIGHT_SECONDS = 20
-ALLOWED_NOTIFICATIONS = frozenset({"remoteControl/status/changed"})
+ALLOWED_NOTIFICATIONS = frozenset({"remoteControl/status/changed", "configWarning"})
 
 
 class CodexPreflightDenied(RuntimeError):

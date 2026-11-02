@@ -54,6 +54,7 @@ import grabowski_transport_assertion
 import grabowski_transport_roundtrip
 import grabowski_serving_process
 import grabowski_physical_checkout
+import grabowski_git_ssh
 
 
 HOME = Path.home().resolve()
@@ -175,6 +176,12 @@ SYNCHRONOUS_INDIRECT_EXECUTABLES = SYNCHRONOUS_SHELL_WRAPPERS
 MAX_NOTIFY_ON_DONE_CHANNELS = 5
 MAX_NOTIFY_ON_DONE_TEXT = 200
 MAX_FINALIZATION_RECEIPT_BYTES = 64 * 1024
+# Keep this bound identical on durable job publication and readback.
+# A genuine ordinary job may exceed the old 64-KiB read-only ceiling.
+MAX_JOB_METADATA_BYTES = 256 * 1024
+# Reserve space for bounded launcher evidence, state transitions and readback
+# BEFORE systemd-run; rewriter enforces the same absolute 256-KiB ceiling.
+MAX_JOB_POST_DISPATCH_METADATA_RESERVE_BYTES = 32 * 1024
 JOB_NOTIFICATION_RECEIPT_NAME = "notification.json"
 JOB_NOTIFICATION_ACK_NAME = "notification-ack.json"
 DYNAMIC_SECRET_GLOBAL_MIN_LENGTH = 8
@@ -3266,6 +3273,32 @@ def _install_deployment_admission_gate() -> None:
                 tool=tool,
                 transport_arguments=arguments,
             )
+            domain_original = original
+            if tool_name in {
+                "grabowski_self_review_session_start",
+                "grabowski_self_review_source_read",
+                "grabowski_self_review_axis_submit",
+            }:
+                # The outer gate already consumed this request's real MAC.
+                # Pass its server-owned proof through the actual worker call;
+                # a second inner consume would be classified as a replay.
+                if (
+                    not isinstance(transport_evidence, dict)
+                    or transport_evidence.get("state") != "consumed"
+                    or transport_evidence.get("transport_mode") != "signed-one-call-v1"
+                    or transport_evidence.get("tool_name") != tool_name
+                ):
+                    raise RuntimeError(
+                        "first-party review requires consumed signed ingress"
+                    )
+
+                async def first_party_domain_original(
+                    *inner_args: Any, **inner_kwargs: Any,
+                ) -> Any:
+                    with base._first_party_preconsumed_transport(transport_evidence):
+                        return await original(*inner_args, **inner_kwargs)
+
+                domain_original = first_party_domain_original
             (
                 admission_transport_evidence,
                 replay_reentry_runtime_sha256,
@@ -3365,7 +3398,7 @@ def _install_deployment_admission_gate() -> None:
                         call_extra_args = ()
                     worker_future = _submit_sync_tool_call(
                         call_runner,
-                        original,
+                        domain_original,
                         args,
                         kwargs,
                         *call_extra_args,
@@ -3520,7 +3553,7 @@ def _install_deployment_admission_gate() -> None:
                         )
                     raise
             try:
-                result = await original(*args, **kwargs)
+                result = await domain_original(*args, **kwargs)
                 _record_repoground_consultation(tool_name)
             except BaseException as error:
                 if effect_admission is not None:
@@ -4257,12 +4290,46 @@ def _trusted_root_owned_executable_path(path: Path, label: str) -> str:
     return str(path)
 
 
+def _trusted_nixos_cli_path(command: str, label: str) -> str:
+    if command not in {"git", "gh"}:
+        raise ValueError("unsupported NixOS CLI executable")
+    path = Path("/run/current-system/sw/bin") / command
+    try:
+        resolved = grabowski_git_ssh._root_managed_resolution(path)
+    except PermissionError:
+        # An untrusted intermediate symlink is a security violation, not
+        # an unavailable system executable. Keep the fail-closed signal.
+        raise
+    except OSError as exc:
+        raise RuntimeError(f"trusted {label} path is unavailable") from exc
+    if not resolved.is_relative_to(Path("/nix/store")):
+        raise PermissionError(f"trusted {label} must resolve into the Nix store")
+    grabowski_git_ssh._root_managed_chain(path)
+    grabowski_git_ssh._root_managed_chain(resolved)
+    info = resolved.stat()
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != 0
+        or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        or not info.st_mode & stat.S_IXUSR
+        or not os.access(resolved, os.X_OK)
+    ):
+        raise PermissionError(f"trusted {label} is not a root-owned executable")
+    return str(resolved)
+
+
 def _trusted_github_cli_path() -> str:
-    return _trusted_root_owned_executable_path(TRUSTED_GITHUB_CLI_PATH, "GitHub CLI")
+    if os.path.lexists(TRUSTED_GITHUB_CLI_PATH):
+        return _trusted_root_owned_executable_path(TRUSTED_GITHUB_CLI_PATH, "GitHub CLI")
+    return _trusted_nixos_cli_path("gh", "GitHub CLI")
 
 
 def _trusted_git_cli_path() -> str:
-    return _trusted_root_owned_executable_path(TRUSTED_GIT_CLI_PATH, "Git CLI")
+    if os.path.lexists(TRUSTED_GIT_CLI_PATH):
+        if stat.S_ISLNK(TRUSTED_GIT_CLI_PATH.lstat().st_mode):
+            return grabowski_git_ssh.trusted_git_cli_path()
+        return _trusted_root_owned_executable_path(TRUSTED_GIT_CLI_PATH, "Git CLI")
+    return _trusted_nixos_cli_path("git", "Git CLI")
 
 
 def _safe_environment() -> dict[str, str]:
@@ -4560,7 +4627,7 @@ def _github_pr_default_remote(working_directory: Path) -> str | None:
     try:
         completed = subprocess.run(
             [
-                "/usr/bin/git", "-C", str(working_directory), "config", "--local",
+                _trusted_git_cli_path(), "-C", str(working_directory), "config", "--local",
                 "--get-regexp", r"^remote\..*\.gh-resolved$",
             ],
             stdout=subprocess.PIPE,
@@ -4596,7 +4663,7 @@ def _github_pr_default_remote(working_directory: Path) -> str | None:
 def _github_pr_remote_names(working_directory: Path) -> list[str]:
     try:
         completed = subprocess.run(
-            ["/usr/bin/git", "-C", str(working_directory), "remote"],
+            [_trusted_git_cli_path(), "-C", str(working_directory), "remote"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
@@ -4660,7 +4727,7 @@ def _github_pr_remote_host(working_directory: Path, remote: str) -> str | None:
     try:
         completed = subprocess.run(
             [
-                "/usr/bin/git", "-C", str(working_directory), "remote", "get-url",
+                _trusted_git_cli_path(), "-C", str(working_directory), "remote", "get-url",
                 "--all", remote,
             ],
             stdout=subprocess.PIPE,
@@ -4811,7 +4878,7 @@ def _github_pr_view_auth_lookup_environment(
     # selection knobs; the network-capable PR-view child never receives this
     # HOME/config environment.
     environment["GH_HOST"] = host
-    environment["PATH"] = str(TRUSTED_GITHUB_CLI_PATH.parent)
+    environment["PATH"] = str(Path(_trusted_github_cli_path()).parent)
     environment["GH_PAGER"] = "cat"
     environment["PAGER"] = "cat"
     environment["GIT_PAGER"] = "cat"
@@ -4978,7 +5045,8 @@ def _github_pr_view_isolated_config_path() -> str:
 
 
 def _github_pr_view_environment(
-    *, host: str, token: str, repository: str | None = None
+    *, host: str, token: str, repository: str | None = None,
+    cli_executable_path: str | None = None,
 ) -> dict[str, str]:
     isolated = _github_pr_view_isolated_config_path()
     credential = _validated_github_pr_view_token(token)
@@ -4987,7 +5055,7 @@ def _github_pr_view_environment(
         "XDG_CONFIG_HOME": isolated,
         "GH_CONFIG_DIR": isolated,
         "GH_HOST": host,
-        "PATH": str(TRUSTED_GITHUB_CLI_PATH.parent),
+        "PATH": str(Path(cli_executable_path or _trusted_github_cli_path()).parent),
         "GH_PAGER": "cat",
         "PAGER": "cat",
         "GIT_PAGER": "cat",
@@ -5017,7 +5085,7 @@ def _github_pr_help_environment() -> dict[str, str]:
         "HOME": isolated,
         "XDG_CONFIG_HOME": isolated,
         "GH_CONFIG_DIR": isolated,
-        "PATH": str(TRUSTED_GITHUB_CLI_PATH.parent),
+        "PATH": str(Path(_trusted_github_cli_path()).parent),
         "GH_PAGER": "cat",
         "PAGER": "cat",
         "GIT_PAGER": "cat",
@@ -6924,9 +6992,24 @@ def _job_directory(unit: str, *, create: bool = False) -> Path:
     return resolved
 
 
+def _bounded_job_metadata_bytes(payload: dict[str, Any]) -> bytes:
+    data = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    if len(data) > MAX_JOB_METADATA_BYTES:
+        raise ValueError("Job metadata exceeds bounded size limit")
+    return data
+
+
+def _require_job_metadata_pre_dispatch_headroom(payload: dict[str, Any]) -> None:
+    prepared = _bounded_job_metadata_bytes(payload)
+    if len(prepared) > (
+        MAX_JOB_METADATA_BYTES - MAX_JOB_POST_DISPATCH_METADATA_RESERVE_BYTES
+    ):
+        raise ValueError("Job metadata pre-dispatch headroom is insufficient")
+
+
 def _write_job_metadata(directory: Path, payload: dict[str, Any]) -> Path:
     path = directory / "metadata.json"
-    data = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    data = _bounded_job_metadata_bytes(payload)
     descriptor = os.open(
         path,
         os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
@@ -7101,8 +7184,8 @@ def _unit_dispatch_readback(unit: str) -> dict[str, Any]:
 
 def _replace_job_metadata(directory: Path, payload: dict[str, Any]) -> Path:
     path = directory / "metadata.json"
+    data = _bounded_job_metadata_bytes(payload)
     temp_path = directory / f"metadata.json.{uuid.uuid4().hex}.tmp"
-    data = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
     descriptor = os.open(
         temp_path,
         os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
@@ -7144,7 +7227,7 @@ def _read_job_metadata(unit: str) -> dict[str, Any]:
     path = directory / "metadata.json"
     if path.is_symlink() or not path.is_file():
         raise ValueError(f"Job metadata is missing: {unit}")
-    if path.stat().st_size > 64 * 1024:
+    if path.stat().st_size > MAX_JOB_METADATA_BYTES:
         raise ValueError(f"Job metadata is too large: {unit}")
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict) or payload.get("unit") != unit:
@@ -7188,8 +7271,11 @@ GIT_ENVIRONMENT_EXACT_DENY = frozenset(
 
 def _git_environment() -> dict[str, str]:
     environment = _safe_environment()
+    # Any inherited GIT_* can redirect scope, attributes, helpers, editor or
+    # transport after our preflight. Reintroduce only server-owned overrides;
+    # push separately binds its authenticated SSH identity below.
     for key in tuple(environment):
-        if key in GIT_ENVIRONMENT_EXACT_DENY or key.startswith("GIT_CONFIG_"):
+        if key.startswith("GIT_"):
             environment.pop(key, None)
     environment["GIT_TERMINAL_PROMPT"] = "0"
     environment["GCM_INTERACTIVE"] = "never"
@@ -7213,7 +7299,7 @@ def _git_push_environment() -> dict[str, str]:
     environment.update(
         {
             "GIT_ALLOW_PROTOCOL": "ssh",
-            "GIT_SSH_COMMAND": "/usr/bin/ssh -F /dev/null -oBatchMode=yes -oProxyCommand=none -oPermitLocalCommand=no -oClearAllForwardings=yes",
+            "GIT_SSH_COMMAND": grabowski_git_ssh.hardened_git_ssh_command(),
             "GIT_SSH_VARIANT": "ssh",
             "GIT_ASKPASS": "/bin/false",
             "SSH_ASKPASS": "/bin/false",
@@ -7972,6 +8058,29 @@ def _guard_git(arguments: list[str], repo: Path) -> None:
 
     subcommand, command_arguments, configurations = _split_git_invocation(arguments)
     _reject_git_alias_configuration(configurations)
+    # A caller-supplied Git -c comes after our root-owned Git settings and can
+    # override them at the actual effect (hooks, filters, fsmonitor, signing,
+    # credential or diff helpers). Admit only explicitly inert assignments.
+    inert_config = {
+        "core.pager": "cat",
+        "pager.status": "false",
+        "pager.diff": "false",
+        "pager.log": "false",
+        "pager.show": "false",
+        "core.hookspath": "/dev/null",
+        "core.fsmonitor": "false",
+        "core.editor": "/dev/null",
+        "commit.gpgsign": "false",
+        "diff.trustexitcode": "false",
+        "advice.graftfiledeprecated": "false",
+    }
+    for key, value in configurations:
+        if key in {"user.name", "user.email"} and value.strip() and len(value) <= 256:
+            continue
+        if key not in inert_config or value.casefold() != inert_config[key]:
+            raise PermissionError(
+                "Git -c configuration is not an inert override: " + key
+            )
     if subcommand in GIT_REMOTE_WRITE_BYPASS_SUBCOMMANDS:
         raise PermissionError(
             f"Direct Git remote-write subcommand is blocked; use push: {subcommand}"
@@ -8234,16 +8343,11 @@ def _start_job(
                     "provider_thread_request_sent": False,
                     "historical_review_receipts_modified": False,
                 })
-    directory = _job_directory(unit, create=True)
+    # Complete origin allocation before publishing a canonical job footprint:
+    # an unsuccessful bootstrap cannot leave missing-metadata review stubs.
+    directory = _jobs_root() / unit
     stdout_path = directory / "stdout.log"
     stderr_path = directory / "stderr.log"
-    for path in (stdout_path, stderr_path):
-        descriptor = os.open(
-            path,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
-            0o600,
-        )
-        os.close(descriptor)
 
     now_unix, now_iso, started_at_unix_ns = _job_start_timestamp()
     metadata_path = directory / "metadata.json"
@@ -8387,11 +8491,29 @@ def _start_job(
             terminalization,
         ),
     }
+    # Reject an unreadable future job, including the post-dispatch growth,
+    # before publishing a directory or dispatching a systemd unit.
+    _require_job_metadata_pre_dispatch_headroom(metadata)
+    # All origin and metadata preparation has completed. Reserve and verify the
+    # canonical destination only at the final pre-dispatch publication point.
+    created_directory = _job_directory(unit, create=True)
+    if created_directory != directory:
+        raise PermissionError("job directory identity drifted during preparation")
+    for path in (stdout_path, stderr_path):
+        descriptor = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+            0o600,
+        )
+        os.close(descriptor)
     metadata_path = _write_job_metadata(directory, metadata)
 
     systemd_argv = [
         "systemd-run",
         "--user",
+        # Generic jobs retain a finalization receipt before systemd collection.
+        # Reserved deployments use runner-owned finalization and must stay observable.
+        *(["--collect"] if finalization_expected_head is None else []),
         f"--description={_systemd_safe_description('job', unit, metadata['argv_sha256'])}",
         "--unit",
         unit,
@@ -8487,6 +8609,27 @@ def _start_job(
         # launcher can fail or time out after systemd created the unit.  Ask
         # systemd before claiming a definitive non-start.
         dispatch_readback = _unit_dispatch_readback(unit)
+        if finalization_expected_head is None and dispatch_readback["outcome"] == "not_started":
+            # --collect can unload an already completed unit before a failed
+            # launcher readback. Only a validated finalization proves start.
+            receipt = _finalization_receipt_result(unit, metadata)
+            if receipt.get("valid") is True:
+                dispatch_readback = {
+                    **dispatch_readback,
+                    "outcome": "started",
+                    "source": "validated-finalization-receipt",
+                    "receipt_sha256": receipt["receipt_sha256"],
+                }
+            else:
+                # --collect unloads both failed and successful short-lived jobs.
+                # Even a prompt nonzero launcher reply with a not-found unit
+                # cannot prove that no action ran. Avoid duplicate execution.
+                dispatch_readback = {
+                    **dispatch_readback,
+                    "outcome": "outcome_unknown",
+                    "source": "collect-mode-unloaded-or-never-started",
+                    "receipt_state": receipt.get("state"),
+                }
         message = result["stderr"] or result["stdout"] or "job launch failed"
         if dispatch_readback["outcome"] == "not_started":
             terminalization = {
@@ -8952,7 +9095,7 @@ def grabowski_git(
     elif subcommand == "push":
         remote, _source, _destination = _parse_safe_push_arguments(_command_arguments)
         command_prefix = [
-            "git",
+            _trusted_git_cli_path(),
             "-c",
             "core.hooksPath=/dev/null",
             "-c",
@@ -8976,10 +9119,73 @@ def grabowski_git(
         ]
         environment = _git_push_environment()
     else:
-        command_prefix = ["git", "-C", str(path)]
+        # Every local mutation, including a commit with an explicit CAS
+        # preimage, must disable executable repo hooks, fsmonitor and signing
+        # at Git spawn; the JIT-only fallback below was insufficient.
+        command_prefix = [
+            _trusted_git_cli_path(),
+            "-c", "core.hooksPath=/dev/null",
+            "-c", "core.fsmonitor=false",
+            "-c", "commit.gpgSign=false",
+            "-c", "core.editor=/dev/null",
+            "-c", "diff.trustExitCode=false",
+            "-C", str(path),
+        ]
         environment = _git_environment()
     if read_shape is None:
-        command = _validate_argv([*command_prefix, *arguments], cwd=path)
+        # diff.external= is NOT a safe disabled state: Git attempts to
+        # execute the empty string. Disable diff drivers with Git's actual
+        # --no-ext-diff/--no-textconv flags on diff-producing invocations,
+        # before any user path separator, without changing caller pathspecs.
+        guarded_arguments = list(arguments)
+        if subcommand in {"diff", "log", "show"}:
+            subcommand_index = len(arguments) - len(_command_arguments) - 1
+            # Git allows implicit paths without '--'. Put safe flags before
+            # all operands, then drop caller helper-enabling options. Preserve
+            # literal path arguments after '--' or '--end-of-options'.
+            source_options = guarded_arguments[subcommand_index + 1:]
+            options_ended = False
+            needs_value = False
+            # Git consumes the following token as data for these options.
+            # A literal '--textconv' used as --grep's value must not be
+            # silently deleted (that would change the reviewed log result).
+            value_options = {
+                "--grep", "--author", "--committer", "--format", "--encoding",
+                "--since", "--until", "--after", "--before", "--date",
+                "--max-count", "--skip", "--diff-filter", "--find-object",
+                "--word-diff-regex", "--line-prefix", "--src-prefix",
+                "--dst-prefix", "--output-indicator-new",
+                "--output-indicator-old", "--output-indicator-context",
+                "-S", "-G", "-I", "-n",
+            }
+            if subcommand == "diff":
+                # Unlike log/show, Git diff parses these helper-shaped tokens
+                # as options, *not* values (confirmed by executable-marker
+                # probes on the deployed NixOS Git). Do not preserve an
+                # executable --ext-diff/--textconv after any of them.
+                value_options -= {
+                    "--grep", "--author", "--committer", "--encoding",
+                    "--word-diff-regex", "--line-prefix", "--src-prefix",
+                    "--dst-prefix", "-S", "-G", "-I",
+                }
+            safe_options: list[str] = []
+            for item in source_options:
+                if needs_value:
+                    safe_options.append(item)
+                    needs_value = False
+                    continue
+                if item in {"--", "--end-of-options"}:
+                    options_ended = True
+                if not options_ended and item in {"--ext-diff", "--textconv"}:
+                    continue
+                safe_options.append(item)
+                if not options_ended and item in value_options:
+                    needs_value = True
+            guarded_arguments = [
+                *guarded_arguments[:subcommand_index + 1],
+                "--no-ext-diff", "--no-textconv", *safe_options,
+            ]
+        command = _validate_argv([*command_prefix, *guarded_arguments], cwd=path)
 
     branch_context: dict[str, Any] | None = None
     if subcommand in GIT_LOCAL_BRANCH_MUTATION_SUBCOMMANDS:
@@ -9262,7 +9468,8 @@ def grabowski_github(
                 if gh_repo:
                     environment_repository = gh_repo
             environment = _github_pr_view_environment(
-                host=github_host, token=github_token, repository=environment_repository
+                host=github_host, token=github_token, repository=environment_repository,
+                cli_executable_path=trusted_github_cli,
             )
     else:
         environment = None

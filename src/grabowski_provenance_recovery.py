@@ -341,6 +341,7 @@ def _competing_deployment_evidence(
     *,
     prune: bool = False,
     reconcile_stale_pending: bool = False,
+    resume_binding: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Detect an in-flight deployment that this lane must not race.
 
@@ -356,6 +357,7 @@ def _competing_deployment_evidence(
     evidence: dict[str, Any] = {
         "deploy_lock_free": False,
         "inflight_deploy_jobs": [],
+        "recovery_handoff_units": [],
         "idempotent_match": None,
         "pruned_units": [],
         "stale_pending_reconciliation": None,
@@ -395,6 +397,71 @@ def _competing_deployment_evidence(
     evidence["local_mutation_evidence"] = _recovery_local_mutation_evidence(evidence)
     if indexed["error"] is not None:
         evidence["error"] = indexed["error"]
+    # The retry of an already-switched cutover can encounter (1) the original
+    # authentic failed-deployment reservation and (2) one or more authentic
+    # *no-effect* failed resume attempts. Exclude a bounded complete set only
+    # from this exact recovery view. A second deploy, one unrelated job,
+    # unknown outcome, pending dispatch or failed proof blocks EVERYTHING.
+    # Normal scheduled deployments still observe the full original blockers.
+    # Assessment and under-lock recheck independently re-authenticate each.
+    blocking = list(indexed["blocking_units"])
+    if (
+        isinstance(resume_binding, dict)
+        and evidence["error"] is None
+        and 0 < len(blocking) <= 32
+        and indexed.get("idempotent_match") is None
+        and not indexed.get("ambiguous_identical_units")
+    ):
+        authenticated: list[str] = []
+        original_deploy_count = 0
+        same_cutover_job_count = 0
+        predecessor_count = 0
+        for unit in blocking:
+            try:
+                if self_deploy._indexed_failed_deploy_is_cutover_handoff(
+                    unit, resume_binding
+                ):
+                    original_deploy_count += 1
+                    verified = original_deploy_count == 1
+                    if verified:
+                        same_cutover_job_count += 1
+                else:
+                    # A scheduled runner may have failed during B's recovery
+                    # without the original blue-green deploy job remaining
+                    # indexed. Its authenticated same-B receipt is still a
+                    # real owner-private target, not a predecessor claim.
+                    verified = (
+                        self_deploy._indexed_failed_resume_is_noeffect_handoff(
+                            unit, resume_binding
+                        )
+                        or self_deploy._indexed_failed_scheduled_resume_is_handoff(
+                            unit, resume_binding
+                        )
+                    )
+                    if verified:
+                        same_cutover_job_count += 1
+                    if not verified and self_deploy._indexed_completed_predecessor_is_recovery_handoff(
+                        unit, resume_binding
+                    ):
+                        predecessor_count += 1
+                        # Several distinct signed ancestors may be on the
+                        # same unique completed chain leading to this B.
+                        verified = predecessor_count < 32
+            except (
+                OSError, RuntimeError, ValueError, PermissionError, AttributeError
+            ):
+                verified = False
+            if not verified:
+                break
+            authenticated.append(unit)
+        # A settled predecessor cannot itself grant resume: the exact still-
+        # unresolved B must also have an independently authenticated job.
+        if (
+            len(authenticated) == len(blocking)
+            and (predecessor_count == 0 or same_cutover_job_count >= 1)
+        ):
+            evidence["inflight_deploy_jobs"] = []
+            evidence["recovery_handoff_units"] = authenticated
     return evidence
 
 
@@ -434,7 +501,10 @@ def _blockade_evidence(repository: Path | None) -> dict[str, Any]:
 
 
 def _volatile_gate_recheck(
-    repository: Path | None, command: list[str] | None = None
+    repository: Path | None,
+    command: list[str] | None = None,
+    *,
+    resume_binding: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Re-read the gates that can change between assessment and dispatch."""
     kill_switch = base._kill_switch_state()
@@ -447,10 +517,16 @@ def _volatile_gate_recheck(
     # Once either stop gate denies mutation, competing-deploy classification is
     # explicitly not evaluated; the failed stop gate already closes dispatch.
     if mutation_allowed:
+        resume_options = (
+            {"resume_binding": resume_binding}
+            if resume_binding is not None
+            else {}
+        )
         competing = _competing_deployment_evidence(
             command,
             prune=True,
             reconcile_stale_pending=True,
+            **resume_options,
         )
     else:
         competing = {
@@ -690,9 +766,13 @@ def evaluate_resume_gate(expected_head: str) -> dict[str, Any]:
     # narrower blockade scope than the execution would report a lane as open and
     # then have it close underneath the operator.
     blockade = _blockade_evidence(_resume_effect_repository())
-    competing = _competing_deployment_evidence()
     lane = _recovery_lane(expected_head)
     resume_binding = lane.get("resume_binding")
+    competing = _competing_deployment_evidence(
+        resume_binding=resume_binding
+        if lane.get("lane") == midcutover.LANE_MID_CUTOVER_RESUME
+        else None
+    )
     resume_phase = (
         resume_binding.get("resume_phase")
         if isinstance(resume_binding, dict)
@@ -767,6 +847,70 @@ def evaluate_resume_gate(expected_head: str) -> dict[str, Any]:
     }
 
 
+def _local_backup_evidence_for_repair() -> dict[str, Any]:
+    """Use successful native backup evidence, never require a restore probe.
+
+    Recovery provenance repair intentionally has a backup-only freshness
+    prerequisite. The separate privileged recovery gate still requires its
+    root-owned restore/repository-check proof; this read-only assessment does
+    not consult or waive that proof.
+    """
+    nixos = bool(
+        getattr(recovery, "_NIXOS_OS_PRESENT", False)
+        or getattr(recovery, "_NIXOS_RESTIC_TIMER_PRESENT", False)
+    )
+    if not nixos:
+        return recovery._fresh_text_marker(recovery.BACKUP_SUCCESS)
+
+    unavailable: dict[str, Any] = {
+        "valid": False, "exists": False, "source": "nixos-native-unavailable",
+        "path": "systemd:restic-backups-heim-pc.service",
+        "timestamp_unix": None, "age_seconds": None,
+        "backup_invocation_id": None, "snapshot_id": None,
+    }
+    # On NixOS a missing native timer never authorizes the Pop! success file.
+    if not getattr(recovery, "_NIXOS_RESTIC_TIMER_PRESENT", False):
+        return unavailable
+    try:
+        # This helper verifies systemd's completed successful InvocationID
+        # and the matching trusted journal snapshot-save event. Unlike
+        # _local_backup_freshness it does not read recovery/restore markers.
+        row = recovery._nixos_native_backup_service_fresh()
+        if not isinstance(row, dict):
+            return unavailable
+        age, stamp = row.get("age_seconds"), row.get("timestamp_unix")
+        invocation, snapshot = row.get("backup_invocation_id"), row.get("snapshot_id")
+        start = row.get("service_start_unix")
+        end = row.get("service_exit_unix")
+        saved = row.get("snapshot_saved_at_unix")
+        now = int(time.time())
+        max_age = recovery.MAX_AGE_SECONDS
+        valid = (
+            row.get("valid") is True
+            and row.get("exists") is True
+            and row.get("source") == "nixos-system-restic-backup-completion"
+            and row.get("path") == "systemd:restic-backups-heim-pc.service"
+            and type(age) is int and type(stamp) is int
+            and type(start) is int and type(end) is int
+            and type(saved) is int
+            and type(max_age) is int and max_age > 0
+            and 0 < start <= end == stamp <= now
+            and 0 < saved <= end
+            and 0 <= now - saved <= max_age
+            and 0 <= age <= max_age and 0 <= now - stamp <= max_age
+            and abs(now - stamp - age) <= 5
+            and isinstance(invocation, str)
+            and len(invocation) == 32
+            and all(char in "0123456789abcdef" for char in invocation)
+            and isinstance(snapshot, str)
+            and 8 <= len(snapshot) <= 64
+            and all(char in "0123456789abcdef" for char in snapshot)
+        )
+        return {**unavailable, **row, "valid": valid}
+    except Exception:
+        # A broken native proof never falls back to a legacy text marker.
+        return unavailable
+
 def evaluate_gate(
     expected_head: str,
     source_repository: str | None = None,
@@ -779,7 +923,7 @@ def evaluate_gate(
     """
     audit = base._verify_audit_log(base.AUDIT_LOG)
     kill_switch = base._kill_switch_state()
-    local_backup = recovery._fresh_text_marker(recovery.BACKUP_SUCCESS)
+    local_backup = _local_backup_evidence_for_repair()
     broker = privileged.grabowski_privileged_broker_status()
     integrity = _integrity_evidence()
 
@@ -820,9 +964,8 @@ def evaluate_gate(
         "audit_writable": bool(audit.get("audit_writable", audit.get("valid"))),
         "kill_switch_clear": not bool(kill_switch.get("engaged")),
         "no_blocking_operator_blockade": bool(blockade["allows_mutation"]),
-        # Named for what is actually checked: a freshness marker, not a proven
-        # restore.  Restore provability lives in the separate server-recovery
-        # gate, which this lane deliberately does not require.
+        # Backup freshness only: the root-owned restore/canonical recovery
+        # proof remains a separate security gate, never implicitly waived.
         "local_backup_marker_fresh": bool(local_backup.get("valid")),
         "privileged_broker_ready": bool(broker.get("ready")),
         # Revision binding of the repair target.
@@ -861,8 +1004,18 @@ def evaluate_gate(
         "kill_switch": {"engaged": bool(kill_switch.get("engaged"))},
         "local_backup_marker": {
             "fresh": bool(local_backup.get("valid")),
+            "source": local_backup.get("source", "legacy-backup-text-marker"),
+            "path": str(local_backup.get("path", recovery.BACKUP_SUCCESS)),
+            "timestamp_unix": local_backup.get("timestamp_unix"),
             "age_seconds": local_backup.get("age_seconds"),
-            "proves": "a recent successful backup run wrote its marker",
+            "backup_invocation_id": local_backup.get("backup_invocation_id"),
+            "snapshot_id": local_backup.get("snapshot_id"),
+            "proves": (
+                "a completed NixOS systemd backup with its bound Restic journal snapshot"
+                if getattr(recovery, "_NIXOS_OS_PRESENT", False)
+                or getattr(recovery, "_NIXOS_RESTIC_TIMER_PRESENT", False)
+                else "a recent successful backup run wrote its marker"
+            ),
             "does_not_prove": "that a restore was performed or verified",
         },
         "privileged_broker": {"ready": bool(broker.get("ready"))},
@@ -1072,7 +1225,9 @@ def _resume_under_schedule_lock(
     }
     intent_sha256 = base._append_audit_with_digest(intent)
 
-    volatile = _volatile_gate_recheck(_resume_effect_repository(), command)
+    volatile = _volatile_gate_recheck(
+        _resume_effect_repository(), command, resume_binding=resume_binding
+    )
     # Absent evidence is not a match: a recheck that carries no competing-job
     # projection means nothing was recognised as ours, which must dispatch
     # normally rather than silently coalesce onto nothing.

@@ -78,6 +78,7 @@ ROOTBROKER_CUTOVER_ACTION = "operator_rootbroker_cutover"
 SECRET_PTY_ACTION = "operator_secret_pty_getpass_probe"
 BLOCKADE_LIFECYCLE_ACTION = "operator_blockade_marker_lifecycle"
 ROOT_TASK_ACTION = "operator_root_task_systemd_unit"
+NIXOS_RESTIC_ROOT_UNIT_ACTION = "nixos_restic_root_unit"
 CRITICAL_USER_DATA_INVENTORY_ACTION = "critical_user_data_inventory"
 CRITICAL_USER_DATA_INVENTORY_READ_ACTION = "critical_user_data_inventory_read"
 CRITICAL_USER_DATA_INVENTORY_TARGET_PATTERN = (
@@ -1626,6 +1627,59 @@ def _root_task_action_from_repository(
 
 
 
+def _validated_nixos_restic_root_unit_action(candidate: Any) -> dict[str, Any]:
+    """Only the broker's fixed unit, peer, timeout and both kill switches."""
+    required = {
+        "enabled", "mode", "target_pattern", "argv", "timeout_seconds",
+        "allowed_peer_uid", "allowed_peer_unit", "kill_switch_path",
+        "legacy_kill_switch_path",
+    }
+    if not isinstance(candidate, dict) or set(candidate) != required:
+        raise CutoverError("native Restic root unit action keys are invalid")
+    if (
+        candidate.get("enabled") is not True
+        or candidate.get("mode") != "template"
+        or candidate.get("target_pattern") != r"heim-pc-restic-recovery-probe\.service"
+        or candidate.get("argv") != [
+            "/run/current-system/sw/bin/systemctl",
+            "--system", "--no-block", "start",
+            "heim-pc-restic-recovery-probe.service",
+        ]
+        or type(candidate.get("timeout_seconds")) is not int
+        or candidate["timeout_seconds"] != 60
+        or type(candidate.get("allowed_peer_uid")) is not int
+        or candidate["allowed_peer_uid"] != 1000
+        or candidate.get("allowed_peer_unit") != OPERATOR_UNIT
+        or candidate.get("kill_switch_path") != str(CANONICAL_KILL_SWITCH)
+        or candidate.get("legacy_kill_switch_path") != str(LEGACY_KILL_SWITCH)
+    ):
+        raise CutoverError("native Restic root unit action differs from fixed broker contract")
+    return json.loads(json.dumps(candidate))
+
+
+def _nixos_restic_root_unit_action_from_repository(
+    repository: Path,
+    *,
+    expected_head: str,
+    runner: RunCommand,
+) -> dict[str, Any]:
+    """Use only commit-bound policy, never user or runtime-supplied argv."""
+    relative_path = "config/privileged-actions.example.json"
+    data = _repository_blob(
+        repository,
+        commit_id=expected_head,
+        relative_path=relative_path,
+        runner=runner,
+    )
+    example = _decode_json_object(data, label=relative_path)
+    actions = example.get("actions")
+    if not isinstance(actions, dict):
+        raise CutoverError("example privileged action catalog is malformed")
+    return _validated_nixos_restic_root_unit_action(
+        actions.get(NIXOS_RESTIC_ROOT_UNIT_ACTION)
+    )
+
+
 def _critical_user_data_inventory_action_from_repository(
     repository: Path,
     *,
@@ -2146,6 +2200,7 @@ def merge_privileged_config(
     power: dict[str, Any] | None = None,
     lifecycle: dict[str, Any] | None = None,
     root_task: dict[str, Any] | None = None,
+    nixos_restic_root_unit: dict[str, Any] | None = None,
     critical_user_data_inventory: dict[str, Any] | None = None,
     critical_user_data_inventory_read: dict[str, Any] | None = None,
     process_observer: dict[str, Any] | None = None,
@@ -2321,6 +2376,21 @@ def merge_privileged_config(
             )
         merged_actions[ROOT_TASK_ACTION] = json.loads(json.dumps(root_task))
 
+    native_root_before = actions.get(NIXOS_RESTIC_ROOT_UNIT_ACTION)
+    if nixos_restic_root_unit is not None:
+        fixed_native = _validated_nixos_restic_root_unit_action(
+            nixos_restic_root_unit
+        )
+        if (
+            not allow_controlled_updates
+            and native_root_before is not None
+            and native_root_before != fixed_native
+        ):
+            raise CutoverError(
+                "installed NixOS Restic root unit differs from commit-bound contract"
+            )
+        merged_actions[NIXOS_RESTIC_ROOT_UNIT_ACTION] = fixed_native
+
     critical_inventory_before = actions.get(CRITICAL_USER_DATA_INVENTORY_ACTION)
     if critical_user_data_inventory is not None:
         if (
@@ -2361,6 +2431,8 @@ def merge_privileged_config(
         controlled.add(BLOCKADE_LIFECYCLE_ACTION)
     if root_task is not None:
         controlled.add(ROOT_TASK_ACTION)
+    if nixos_restic_root_unit is not None:
+        controlled.add(NIXOS_RESTIC_ROOT_UNIT_ACTION)
     if critical_user_data_inventory is not None:
         controlled.add(CRITICAL_USER_DATA_INVENTORY_ACTION)
     if critical_user_data_inventory_read is not None:
@@ -2391,6 +2463,15 @@ def merge_privileged_config(
             _sha256(_canonical_json(root_task)) if root_task is not None else None
         ),
         "root_task_preexisting": root_task_before is not None,
+        "nixos_restic_root_unit_sha256": (
+            _sha256(_canonical_json(nixos_restic_root_unit))
+            if nixos_restic_root_unit is not None else None
+        ),
+        "nixos_restic_root_unit_preexisting": native_root_before is not None,
+        "nixos_restic_root_unit_before_sha256": (
+            _sha256(_canonical_json(native_root_before))
+            if isinstance(native_root_before, dict) else None
+        ),
         "critical_user_data_inventory_sha256": (
             _sha256(_canonical_json(critical_user_data_inventory))
             if critical_user_data_inventory is not None else None
@@ -3174,6 +3255,9 @@ def _apply_cutover_locked(
         runner=runner,
         automatic=automatic,
     )
+    nixos_restic_root_unit = _nixos_restic_root_unit_action_from_repository(
+        repository, expected_head=expected_head, runner=runner
+    )
     critical_user_data_inventory = _critical_user_data_inventory_action_from_repository(
         repository, expected_head=expected_head, runner=runner
     )
@@ -3223,6 +3307,7 @@ def _apply_cutover_locked(
         power=power,
         lifecycle=lifecycle,
         root_task=root_task,
+        nixos_restic_root_unit=nixos_restic_root_unit,
         critical_user_data_inventory=critical_user_data_inventory,
         critical_user_data_inventory_read=critical_user_data_inventory_read,
         process_observer=process_observer,
@@ -3578,6 +3663,9 @@ def build_plan(*, repository: Path, expected_head: str, runner: RunCommand = _ru
         expected_head=expected_head,
         runner=runner,
     )
+    nixos_restic_root_unit = _nixos_restic_root_unit_action_from_repository(
+        repository, expected_head=expected_head, runner=runner
+    )
     critical_user_data_inventory = _critical_user_data_inventory_action_from_repository(
         repository, expected_head=expected_head, runner=runner
     )
@@ -3619,6 +3707,7 @@ def build_plan(*, repository: Path, expected_head: str, runner: RunCommand = _ru
         power=power,
         lifecycle=lifecycle,
         root_task=root_task,
+        nixos_restic_root_unit=nixos_restic_root_unit,
         critical_user_data_inventory=critical_user_data_inventory,
         critical_user_data_inventory_read=critical_user_data_inventory_read,
         process_observer=process_observer,

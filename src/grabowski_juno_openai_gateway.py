@@ -283,6 +283,30 @@ def _router_module() -> Any:
     return _coding_agent_router
 
 
+
+def _codex_advertised_model_ids(*, cache_path: Path | None = None) -> frozenset[str] | None:
+    """Read only model IDs from Codex's account-specific, bounded public model cache."""
+    path = cache_path or (Path.home() / ".codex/models_cache.json")
+    try:
+        metadata = path.stat()
+        if not stat.S_ISREG(metadata.st_mode) or not 0 < metadata.st_size <= 2 * 1024 * 1024:
+            return None
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        models = payload.get("models")
+        if not isinstance(models, list) or not 0 < len(models) <= 128:
+            return None
+        ids = frozenset(
+            model["slug"]
+            for model in models
+            if isinstance(model, dict)
+            and isinstance(model.get("slug"), str)
+            and 1 <= len(model["slug"]) <= 128
+        )
+        return ids or None
+    except (OSError, ValueError, UnicodeError, TypeError):
+        return None
+
+
 def select_advisory_contract() -> dict[str, Any]:
     try:
         router = _router_module()
@@ -332,6 +356,19 @@ def select_advisory_contract() -> dict[str, Any]:
             "unsafe_route",
             "router returned an invalid route id",
         )
+    # The routing catalog may still recommend Spark although the logged-in
+    # ChatGPT Codex account rejects that model with HTTP 400. Prefer the
+    # available same-harness low route only when Codex itself advertises Luna
+    # and does not advertise Spark; still revalidate the actual alternative
+    # through the canonical non-paid advisory execution contract below.
+    if route_id == "codex-spark-low":
+        advertised = _codex_advertised_model_ids()
+        if (
+            advertised is not None
+            and "gpt-5.3-codex-spark" not in advertised
+            and "gpt-5.6-luna" in advertised
+        ):
+            route_id = "codex-luna-low"
     try:
         contract = router.advisory_route_execution_contract(
             route_id, paid_execution_authorized=False

@@ -33,7 +33,8 @@ import grabowski_lifecycle_collectors as lifecycle_collectors
 import grabowski_lifecycle_effect_plan as lifecycle_effect_plan
 import grabowski_physical_checkout as physical_checkout
 import grabowski_work_acquire as work_acquire
-from grabowski_agent_sandbox import safe_git_environment
+from grabowski_agent_sandbox import safe_git_environment, safe_git_snapshot_filter_effect
+from grabowski_git_ssh import trusted_git_cli_path
 try:
     import grabowski_operator_core as operator
 except ModuleNotFoundError:
@@ -71,6 +72,8 @@ TERMINAL_TASK_STATES = frozenset(
     {"completed", "failed", "cancelled", "timed_out", "signalled"}
 )
 READ_ONLY_ROLES = ("tests", "review")
+CONTROLLER_SELF_REVIEW_PENDING_ARGV = execution_plan.CONTROLLER_SELF_REVIEW_PENDING_ARGV
+
 ALL_ROLES = ("captain", "writer", "tests", "review")
 PLAN_FIELDS = (
     "schema_version",
@@ -1320,6 +1323,31 @@ def _preflight_cache_record_valid(record: Any, cache_key: str, now: int) -> bool
     )
 
 
+def _creation_role_preflight(
+    manifest: dict[str, Any], role: str, command: list[str],
+) -> dict[str, Any]:
+    """Defer only the exact never-executed First-Party controller placeholder.
+
+    Its argv is a handoff sentinel, not a read-only reviewer or a callable
+    toolchain. Running or probing it can create an artificial NixOS block,
+    while claiming a fake successful toolchain check would misstate evidence.
+    Writer/tests and every real reviewer command keep their normal probes.
+    """
+    if role == "review" and command == list(CONTROLLER_SELF_REVIEW_PENDING_ARGV):
+        return {
+            "role": "review",
+            "command_sha256": _sha256_json(command),
+            "checked_at": _utc(),
+            "sandbox": agent_role.SANDBOX_LABEL,
+            "passed": False,
+            "deferred": True,
+            "executed": False,
+            "failure_classification": "controller_self_review_pending",
+            "external_agent_profile": None,
+        }
+    return _role_toolchain_preflight(manifest, role, command)
+
+
 def _role_toolchain_preflight(manifest: dict[str, Any], role: str, command: list[str]) -> dict[str, Any]:
     """Validate exact role prerequisites with a short, snapshot-bound cross-workspace cache."""
     worktree = Path(str(manifest["writer_worktree"]))
@@ -1488,6 +1516,36 @@ def _checked_bytes(cwd: Path, argv: list[str], *, label: str) -> dict[str, Any]:
     return result
 
 
+
+def _candidate_snapshot_checked_bytes(
+    cwd: Path, argv: list[str], *, label: str,
+) -> dict[str, Any]:
+    """Run effectful snapshot Git reads with filters masked in the child."""
+    if argv[:2] not in (["git", "status"], ["git", "diff"]):
+        return _checked_bytes(cwd, argv, label=label)
+    try:
+        with safe_git_snapshot_filter_effect(cwd, argv) as (command, environment, fds):
+            completed = subprocess.run(
+                command, cwd=cwd, env=environment, pass_fds=fds,
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, timeout=120, check=False,
+            )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise AgentWorkspaceActionError(
+            f"{label} Git filter effect isolation unavailable"
+        ) from exc
+    result = {
+        "returncode": completed.returncode,
+        "stdout": completed.stdout,
+        "stderr": completed.stderr,
+    }
+    if completed.returncode:
+        detail = (completed.stderr or completed.stdout or label.encode()).decode(
+            "utf-8", errors="replace"
+        ).strip()
+        raise AgentWorkspaceActionError(f"{label} failed: {detail[:2000]}")
+    return result
+
 def _repo_top(runner: CommandRunner, repo: Path) -> Path:
     result = _checked(runner, repo, ["git", "rev-parse", "--show-toplevel"], label="git top-level")
     return Path(str(result.get("stdout", "")).strip()).resolve(strict=True)
@@ -1513,7 +1571,13 @@ def _lane_backed(manifest: dict[str, Any]) -> bool:
     return _workspace_ownership_mode(manifest) == WORKSPACE_OWNERSHIP_WORK_LANE
 
 
-def _lane_receipt(lane_id: str, expected_receipt_sha256: str, *, read_only: bool = False) -> dict[str, Any]:
+def _lane_receipt(
+    lane_id: str,
+    expected_receipt_sha256: str,
+    *,
+    read_only: bool = False,
+    allow_continuation: bool = False,
+) -> dict[str, Any]:
     identifier = _required_string(lane_id, "lane_id", max_length=32).lower()
     expected = _required_string(
         expected_receipt_sha256,
@@ -1561,7 +1625,46 @@ def _lane_receipt(lane_id: str, expected_receipt_sha256: str, *, read_only: bool
     if receipt is None or receipt.get("lane_id") != identifier:
         raise AgentWorkspaceError("work lane receipt is missing or bound to another lane")
     if receipt.get("receipt_sha256") != expected:
-        raise AgentWorkspaceError("work lane receipt digest drifted from the expected binding")
+        continuation = receipt.get("continuation_preimage")
+        worktree = receipt.get("worktree_receipt")
+        lifecycle = worktree.get("lifecycle") if isinstance(worktree, dict) else None
+        physical = (
+            lifecycle.get("physical_checkout")
+            if isinstance(lifecycle, dict) else None
+        )
+        inputs = receipt.get("inputs")
+        # Only an existing workspace may use an exact WorkAcquire
+        # CONTINUE_EXISTING renewal. New workspace creation still requires
+        # the caller's precise current receipt SHA. Later binding validation
+        # compares every immutable source/admission/lifecycle field against
+        # the workspace's saved binding; renewed leases never create a writer.
+        if not (
+            allow_continuation
+            and receipt.get("decision") == "CONTINUE_EXISTING"
+            and type(receipt.get("attempt_count")) is int
+            and receipt["attempt_count"] >= 2
+            and isinstance(continuation, dict)
+            and continuation.get("kind") == "grabowski.work_lane_continuation_preimage"
+            and continuation.get("lane_id") == identifier
+            and continuation.get("preimage_sha256") == work_acquire._sha(
+                {key: value for key, value in continuation.items() if key != "preimage_sha256"}
+            )
+            and isinstance(inputs, dict)
+            and isinstance(worktree, dict)
+            and isinstance(lifecycle, dict)
+            and isinstance(physical, dict)
+            and SHA256_RE.fullmatch(str(worktree.get("durable_receipt_sha256", ""))) is not None
+            and continuation.get("prior_worktree_receipt_sha256") == worktree["durable_receipt_sha256"]
+            and continuation.get("checkout_key") == lifecycle.get("checkout_key")
+            and continuation.get("checkout_path") == inputs.get("target_path")
+            and continuation.get("branch") == inputs.get("branch")
+            and continuation.get("head") == inputs.get("base_head")
+            and continuation.get("ensure_head") == inputs.get("base_head")
+            and continuation.get("physical_identity_sha256") == physical.get("physical_identity_sha256")
+            and continuation.get("lifecycle_retention_until_unix") == lifecycle.get("expires_at_unix")
+            and continuation.get("lifecycle_updated_at_unix") == lifecycle.get("updated_at_unix")
+        ):
+            raise AgentWorkspaceError("work lane receipt digest drifted from the expected binding")
     if receipt.get("state") != "ready":
         raise AgentWorkspaceError("work lane is not ready")
     if receipt.get("terminal_closeout") is not None:
@@ -1605,8 +1708,12 @@ def _validate_work_lane_binding(
     runtime_deadline_unix: int,
     runner: CommandRunner,
     read_only: bool = False,
+    allow_continuation: bool = False,
 ) -> dict[str, Any]:
-    receipt = _lane_receipt(lane_id, expected_receipt_sha256, read_only=read_only)
+    receipt = _lane_receipt(
+        lane_id, expected_receipt_sha256,
+        read_only=read_only, allow_continuation=allow_continuation,
+    )
     inputs = receipt.get("inputs")
     authority = receipt.get("authority")
     if not isinstance(inputs, dict) or receipt.get("inputs_sha256") != work_acquire._sha(inputs):
@@ -1825,6 +1932,7 @@ def _lane_binding_status(
             ),
             runner=runner,
             read_only=read_only,
+            allow_continuation=True,
         )
         if observed != lane_binding:
             raise AgentWorkspaceError("live work lane binding differs from immutable workspace binding")
@@ -2953,6 +3061,7 @@ def _writer_task_argv(
     attempt: int = 1,
     launch_nonce: str | None = None,
     dirty_preimage_sha256: str | None = None,
+    python_executable: str | None = None,
 ) -> list[str]:
     allowed_arguments = [
         value
@@ -2963,7 +3072,7 @@ def _writer_task_argv(
     if dirty_preimage_sha256 is not None and SHA256_RE.fullmatch(dirty_preimage_sha256) is None:
         raise AgentWorkspaceError("writer dirty preimage binding is invalid")
     return [
-        sys.executable,
+        sys.executable if python_executable is None else python_executable,
         "-m",
         "grabowski_agent_writer",
         "--repository",
@@ -2986,7 +3095,9 @@ def _writer_task_argv(
     ]
 
 
-def _writer_attempts(manifest: dict[str, Any]) -> list[dict[str, Any]]:
+def _writer_attempts(
+    manifest: dict[str, Any], *, initial_python_executable: str | None = None,
+) -> list[dict[str, Any]]:
     command = list(manifest["commands"]["writer"])
     legacy = {
         "attempt": 1,
@@ -2994,7 +3105,9 @@ def _writer_attempts(manifest: dict[str, Any]) -> list[dict[str, Any]]:
         "task_id": manifest["tasks"]["writer"],
         "command": command,
         "command_sha256": _sha256_json(command),
-        "task_argv_sha256": _task_argv_sha256(_writer_task_argv(manifest)),
+        "task_argv_sha256": _task_argv_sha256(
+            _writer_task_argv(manifest, python_executable=initial_python_executable)
+        ),
         "receipt_path": str(_role_receipt_path(manifest, "writer")),
         "expected_base_head": manifest["expected_base_head"],
         "expected_branch": manifest["writer_branch"],
@@ -3068,8 +3181,15 @@ def _writer_attempt_refs(manifest: dict[str, Any]) -> list[dict[str, Any]]:
     return [{key: item.get(key) for key in fields if key in item} for item in _writer_attempts(manifest)]
 
 
-def _effective_writer_attempt(manifest: dict[str, Any]) -> dict[str, Any]:
-    attempts = _writer_attempts(manifest)
+def _effective_writer_attempt(
+    manifest: dict[str, Any],
+    *,
+    initial_python_executable: str | None = None,
+    final_python_executable: str | None = None,
+) -> dict[str, Any]:
+    attempts = _writer_attempts(
+        manifest, initial_python_executable=initial_python_executable,
+    )
     final = _writer_final_attempt(manifest)
     if final != len(attempts):
         raise AgentWorkspaceError("writer_final_attempt must select the last append-only attempt")
@@ -3118,6 +3238,7 @@ def _effective_writer_attempt(manifest: dict[str, Any]) -> dict[str, Any]:
         attempt=final,
         launch_nonce=launch_nonce,
         dirty_preimage_sha256=dirty_preimage_sha256,
+        python_executable=final_python_executable,
     )
     if selected.get("task_argv_sha256") != _task_argv_sha256(argv):
         raise AgentWorkspaceError("effective writer task argv hash mismatch")
@@ -3277,6 +3398,7 @@ def _role_task_argv(
     *,
     command: list[str] | None = None,
     output_path: Path | None = None,
+    python_executable: str | None = None,
 ) -> list[str]:
     selected_command = (
         list(command) if command is not None else list(manifest["commands"][role])
@@ -3309,7 +3431,7 @@ def _role_task_argv(
             str(writer_result["sha256"]),
         ]
     return [
-        sys.executable,
+        sys.executable if python_executable is None else python_executable,
         "-m",
         "grabowski_agent_role",
         "--role",
@@ -3717,7 +3839,18 @@ def _integration_probe(
         }
 
 
-def _git_snapshot(manifest: dict[str, Any], runner: CommandRunner) -> dict[str, Any]:
+def _git_snapshot(
+    manifest: dict[str, Any], runner: CommandRunner,
+    *, byte_reader: Callable[..., dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    # Collection, frozen readback and adoption must hash the same inert Git
+    # representation. A mutable clean filter must not execute at collection.
+    if byte_reader is not None:
+        read_bytes = byte_reader
+    elif runner is _run:
+        read_bytes = _candidate_snapshot_checked_bytes
+    else:
+        read_bytes = _checked_bytes
     worktree = Path(str(manifest["writer_worktree"]))
     repo = Path(str(manifest["repository"]))
     base_head = str(manifest["expected_base_head"])
@@ -3728,33 +3861,33 @@ def _git_snapshot(manifest: dict[str, Any], runner: CommandRunner) -> dict[str, 
         runner, worktree, ["git", "branch", "--show-current"], label="writer branch"
     )
     branch = str(branch_result.get("stdout", "")).strip()
-    status_result = _checked_bytes(
+    status_result = read_bytes(
         worktree,
         ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
         label="writer status",
     )
     status_lines = [os.fsdecode(item) for item in bytes(status_result["stdout"]).split(b"\x00") if item]
-    committed_diff = _checked_bytes(
+    committed_diff = read_bytes(
         worktree,
         ["git", "diff", "--binary", "--no-ext-diff", "--no-textconv", f"{base_head}...{head}"],
         label="committed diff",
     )
-    working_diff = _checked_bytes(
+    working_diff = read_bytes(
         worktree,
         ["git", "diff", "--binary", "--no-ext-diff", "--no-textconv", "HEAD"],
         label="working diff",
     )
-    changed_result = _checked_bytes(
+    changed_result = read_bytes(
         worktree,
         ["git", "diff", "--name-only", "-z", "--no-renames", f"{base_head}...{head}"],
         label="changed paths",
     )
-    working_changed = _checked_bytes(
+    working_changed = read_bytes(
         worktree,
         ["git", "diff", "--name-only", "-z", "--no-renames", "HEAD"],
         label="working changed paths",
     )
-    untracked_result = _checked_bytes(
+    untracked_result = read_bytes(
         worktree,
         ["git", "ls-files", "--others", "--exclude-standard", "-z"],
         label="untracked files",
@@ -3870,7 +4003,7 @@ def _materialize_writer_patch(
         raise AgentWorkspaceError("writer patch requested for a non-patch result")
     worktree = Path(str(manifest["writer_worktree"]))
     base_head = str(manifest["expected_base_head"])
-    tracked = _checked_bytes(
+    tracked = _candidate_snapshot_checked_bytes(
         worktree,
         ["git", "diff", "--binary", "--no-ext-diff", "--no-textconv", base_head, "--"],
         label="writer full tracked patch",
@@ -4691,12 +4824,164 @@ def _require_adoption_lane_authority(manifest: dict[str, Any]) -> dict[str, Any]
     return {"lane_binding": lane_binding, "controller_actor": controller_actor}
 
 
+def _adoption_path_raw_entry(worktree: Path, item: str) -> tuple[Any, ...]:
+    """Fingerprint one path without following directory links or Git filters."""
+    relative = PurePosixPath(item)
+    if (
+        not relative.parts or relative.is_absolute()
+        or ".." in relative.parts or relative.as_posix() != item
+    ):
+        raise AgentWorkspaceError("candidate adoption path escapes worktree")
+    directory_flags = (
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    root_fd = current_fd = -1
+    try:
+        root_fd = os.open(worktree, directory_flags)
+        current_fd = root_fd
+        for component in relative.parts[:-1]:
+            try:
+                next_fd = os.open(component, directory_flags, dir_fd=current_fd)
+            except FileNotFoundError:
+                return (item, "absent")
+            except NotADirectoryError as exc:
+                # A former tracked directory may legitimately become a regular
+                # file. Its old descendants are then absent, not unsafe.
+                # Symlinked ancestors remain forbidden, including TOCTOU
+                # replacement between opening and classification.
+                try:
+                    ancestor = os.stat(
+                        component, dir_fd=current_fd, follow_symlinks=False,
+                    )
+                except OSError as probe_exc:
+                    raise AgentWorkspaceError(
+                        "candidate adoption path ancestor changed"
+                    ) from probe_exc
+                if stat.S_ISREG(ancestor.st_mode):
+                    return (item, "absent")
+                raise AgentWorkspaceError(
+                    "candidate adoption path ancestor is not a directory"
+                ) from exc
+            if current_fd != root_fd:
+                os.close(current_fd)
+            current_fd = next_fd
+        try:
+            before = os.stat(relative.parts[-1], dir_fd=current_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return (item, "absent")
+        identity_fields = (
+            "st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns"
+        )
+        if stat.S_ISREG(before.st_mode):
+            flags = (
+                os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_NONBLOCK", 0)
+            )
+            file_fd = os.open(relative.parts[-1], flags, dir_fd=current_fd)
+            try:
+                opened = os.fstat(file_fd)
+                if any(
+                    getattr(before, key) != getattr(opened, key)
+                    for key in identity_fields
+                ):
+                    raise AgentWorkspaceError("candidate adoption file changed before read")
+                digest = hashlib.sha256()
+                total = 0
+                while chunk := os.read(file_fd, 1024 * 1024):
+                    total += len(chunk)
+                    digest.update(chunk)
+                finished = os.fstat(file_fd)
+            finally:
+                os.close(file_fd)
+            if total != before.st_size or any(
+                getattr(before, key) != getattr(finished, key)
+                for key in identity_fields
+            ):
+                raise AgentWorkspaceError("candidate adoption file changed while hashing")
+            fingerprint = digest.hexdigest()
+            kind = "file"
+        elif stat.S_ISLNK(before.st_mode):
+            fingerprint = os.readlink(relative.parts[-1], dir_fd=current_fd)
+            kind = "symlink"
+        elif stat.S_ISDIR(before.st_mode):
+            fingerprint = ""
+            kind = "directory"
+        else:
+            raise AgentWorkspaceError("candidate adoption tracked entry is unsafe")
+        after = os.stat(relative.parts[-1], dir_fd=current_fd, follow_symlinks=False)
+        if any(
+            getattr(before, key) != getattr(after, key) for key in identity_fields
+        ):
+            raise AgentWorkspaceError("candidate adoption path changed during read")
+        return (
+            item, kind, stat.S_IMODE(after.st_mode), after.st_size, fingerprint
+        )
+    except AgentWorkspaceError:
+        raise
+    except OSError as exc:
+        raise AgentWorkspaceError("candidate adoption path is unreadable") from exc
+    finally:
+        if current_fd >= 0 and current_fd != root_fd:
+            os.close(current_fd)
+        if root_fd >= 0:
+            os.close(root_fd)
+
+
+def _adoption_worktree_raw_fingerprint(worktree: Path, changed_paths: list[str]) -> str:
+    """Bind every HEAD-tracked path plus Candidate paths without Git content filters.
+
+    The previous staging check inspected all tracked paths through git diff, not
+    just changed_paths. Check every original tracked entry before and after
+    staging to retain that out-of-scope drift protection.
+    """
+    if not isinstance(changed_paths, list) or not 0 < len(changed_paths) <= MAX_PATHS:
+        raise AgentWorkspaceError("candidate adoption path set is invalid")
+    tracked = _checked_bytes(
+        worktree,
+        ["git", "ls-tree", "-r", "-z", "HEAD"],
+        label="candidate adoption immutable tracked path inventory",
+    )
+    raw = bytes(tracked["stdout"])
+    if len(raw) > MAX_PATCH_BYTES:
+        raise AgentWorkspaceError("candidate adoption tracked inventory exceeds bound")
+    all_paths: set[str] = set()
+    for entry in raw.split(b"\x00"):
+        if not entry:
+            continue
+        identity, separator, name = entry.partition(b"\t")
+        if not separator or not name:
+            raise AgentWorkspaceError("candidate adoption tracked inventory is invalid")
+        # A gitlink tracks only a commit, not the dirty files inside a checked
+        # out submodule. The raw path fingerprint cannot prove those bytes and
+        # a worktree Git diff may execute locally configured clean filters.
+        # Reject this unsupported source type rather than silently treating
+        # its directory size as evidence of clean content.
+        if identity.startswith(b"160000 commit "):
+            raise AgentWorkspaceError(
+                "candidate adoption submodule requires verified content support"
+            )
+        all_paths.add(os.fsdecode(name))
+    all_paths.update(changed_paths)
+    if len(all_paths) > 100_000:
+        raise AgentWorkspaceError("candidate adoption tracked inventory exceeds path bound")
+    return _sha256_json([
+        _adoption_path_raw_entry(worktree, item) for item in sorted(all_paths)
+    ])
+
+
 def _adoption_candidate_snapshot(
     manifest: dict[str, Any],
     collection: dict[str, Any],
     candidate: dict[str, Any],
 ) -> dict[str, Any]:
-    snapshot = _git_snapshot(manifest, _run)
+    worktree = Path(str(manifest["writer_worktree"]))
+    before_raw_sha256 = _adoption_worktree_raw_fingerprint(
+        worktree, collection.get("changed_paths")
+    )
+    snapshot = _git_snapshot(
+        manifest, _run, byte_reader=_candidate_snapshot_checked_bytes,
+    )
     if (
         snapshot.get("writer_head") != candidate.get("base_head")
         or snapshot.get("writer_branch") != manifest.get("writer_branch")
@@ -4736,6 +5021,12 @@ def _adoption_candidate_snapshot(
         or writer_receipt.get("receipt_sha256") != collection.get("writer_receipt_sha256")
     ):
         raise AgentWorkspaceError("Candidate writer evidence drifted")
+    after_raw_sha256 = _adoption_worktree_raw_fingerprint(
+        worktree, snapshot["changed_paths"]
+    )
+    if after_raw_sha256 != before_raw_sha256:
+        raise AgentWorkspaceError("Candidate worktree changed during snapshot")
+    snapshot["stage_worktree_sha256"] = before_raw_sha256
     return snapshot
 
 
@@ -4795,10 +5086,10 @@ def _candidate_patch_tree_sha(
                 raise AgentWorkspaceError(f"{label} failed: {detail[:2000]}")
             return completed.stdout.strip()
 
-        run_index(["git", "read-tree", base_head], label="Candidate patch base tree")
+        run_index([trusted_git_cli_path(), "read-tree", base_head], label="Candidate patch base tree")
         run_index(
             [
-                "git",
+                trusted_git_cli_path(),
                 "apply",
                 "--cached",
                 "--binary",
@@ -4808,7 +5099,7 @@ def _candidate_patch_tree_sha(
             ],
             label="Candidate patch isolated apply",
         )
-        tree = run_index(["git", "write-tree"], label="Candidate patch tree").lower()
+        tree = run_index([trusted_git_cli_path(), "write-tree"], label="Candidate patch tree").lower()
     if SHA40_RE.fullmatch(tree) is None:
         raise AgentWorkspaceError("immutable Candidate patch tree identity is invalid")
     return tree
@@ -4818,6 +5109,8 @@ def _stage_candidate_for_adoption(
     manifest: dict[str, Any],
     collection: dict[str, Any],
     candidate: dict[str, Any],
+    *,
+    expected_worktree_sha256: str,
 ) -> str:
     worktree = Path(str(manifest["writer_worktree"]))
     base_head = str(manifest["expected_base_head"])
@@ -4831,12 +5124,46 @@ def _stage_candidate_for_adoption(
         ["git", "reset", "--mixed", "--quiet", base_head],
         label="candidate adoption index reset",
     )
-    _checked(
-        _run,
-        worktree,
-        ["git", "--literal-pathspecs", "add", "--all", "--", *[str(path) for path in changed_paths]],
-        label="candidate adoption stage",
-    )
+    # Stage the already frozen patch bytes, never the mutable worktree through
+    # git add: repository clean/process filters may be installed after review.
+    writer_result = collection.get("writer_result")
+    if (
+        not isinstance(writer_result, dict)
+        or writer_result.get("type") != "patch"
+        or not _verify_patch_artifact(
+            writer_result, expected_path=_writer_patch_path(manifest)
+        )
+    ):
+        raise AgentWorkspaceError("immutable Candidate patch artifact is invalid")
+    try:
+        patch_bytes = Path(str(writer_result["path"])).read_bytes()
+    except OSError as exc:
+        raise AgentWorkspaceError("immutable Candidate patch is unreadable") from exc
+    if (
+        len(patch_bytes) > MAX_PATCH_BYTES
+        or hashlib.sha256(patch_bytes).hexdigest() != candidate.get("patch_sha256")
+    ):
+        raise AgentWorkspaceError("immutable Candidate patch bytes drifted")
+    try:
+        applied = subprocess.run(
+            [trusted_git_cli_path(), "-C", str(worktree), "apply", "--cached",
+             "--binary", "--whitespace=nowarn", "-"],
+            input=patch_bytes,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=120,
+            check=False,
+            env=safe_git_environment(),
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise AgentWorkspaceError("candidate adoption cached patch stage unavailable") from exc
+    if applied.returncode != 0 or applied.stdout or applied.stderr:
+        detail = (applied.stderr or applied.stdout or b"Git apply failed").decode(
+            "utf-8", errors="replace"
+        ).strip()
+        raise AgentWorkspaceError(
+            f"candidate adoption cached patch stage failed: {detail[:2000]}"
+        )
     staged = _checked_bytes(
         worktree,
         ["git", "diff", "--cached", "--name-only", "-z", "--no-renames"],
@@ -4849,18 +5176,30 @@ def _stage_candidate_for_adoption(
     )
     if observed_paths != sorted(str(path) for path in changed_paths):
         raise AgentWorkspaceError("staged Candidate path set differs from collection")
-    unstaged = _checked_bytes(
-        worktree,
-        ["git", "diff", "--name-only", "-z", "--no-renames"],
-        label="candidate adoption unstaged paths",
-    )
+    # Git diff against the worktree may invoke a late clean filter when index
+    # timestamps are racy. Compare actual bytes to the pre-effect frozen
+    # snapshot instead; the index tree remains verified independently below.
     untracked = _checked_bytes(
         worktree,
         ["git", "ls-files", "--others", "--exclude-standard", "-z"],
         label="candidate adoption untracked paths",
     )
-    if bytes(unstaged["stdout"]) or bytes(untracked["stdout"]):
+    if bytes(untracked["stdout"]):
         raise AgentWorkspaceError("Candidate could not be fully staged for adoption")
+    observed_worktree_sha256 = _adoption_worktree_raw_fingerprint(
+        worktree, changed_paths
+    )
+    if (
+        not isinstance(expected_worktree_sha256, str)
+        or SHA256_RE.fullmatch(expected_worktree_sha256) is None
+        or observed_worktree_sha256 != expected_worktree_sha256
+    ):
+        restore = _run(worktree, ["git", "reset", "--mixed", "--quiet", base_head])
+        if restore.get("returncode") != 0:
+            raise AgentWorkspaceError(
+                "staged Candidate worktree drifted and index restoration failed"
+            )
+        raise AgentWorkspaceError("staged Candidate worktree differs from frozen snapshot")
     tree = str(
         _checked(_run, worktree, ["git", "write-tree"], label="candidate adoption tree").get(
             "stdout", ""
@@ -5427,6 +5766,18 @@ def _role_retry_classification(
         return start_intent
     task_id = manifest.get("tasks", {}).get(role)
     if task_id is None:
+        if (
+            role == "review"
+            and manifest.get("commands", {}).get("review")
+            == list(CONTROLLER_SELF_REVIEW_PENDING_ARGV)
+            and isinstance(manifest.get("frozen_writer"), dict)
+        ):
+            # No previous reviewer executed. This is a genuine controller
+            # handoff, not a failed semantic review verdict or quota event.
+            return "eligible", {
+                "prior_failure_classification": "controller_self_review_pending",
+                "prior_attempt_consumed": False,
+            }
         blocks = manifest.get("role_preflight_blocks", {})
         role_blocks = blocks.get(role) if isinstance(blocks, dict) else None
         if isinstance(role_blocks, list) and role_blocks:
@@ -5575,6 +5926,35 @@ def _role_retry_state(
     return {**raw, "count": count, "attempts": list(attempts)}, None
 
 
+def _role_recovery_attempts_used(
+    manifest: dict[str, Any], role: str, retry_state: dict[str, Any],
+) -> int:
+    """Count actual retries; the first frozen-Candidate handoff is attempt one.
+
+    Keep the complete attempt ledger for exact command/receipt provenance.
+    Only the authenticated initial pending-controller handoff is exempt from
+    the recovery budget; subsequent environmental retries remain counted.
+    """
+    count = retry_state["count"]
+    if (
+        role != "review"
+        or manifest.get("commands", {}).get("review")
+        != list(CONTROLLER_SELF_REVIEW_PENDING_ARGV)
+        or not retry_state["attempts"]
+    ):
+        return count
+    first = retry_state["attempts"][0]
+    if (
+        first.get("attempt") == 1
+        and first.get("selected_final_attempt") == 1
+        and first.get("previous_task_id") is None
+        and first.get("previous_failure_classification") == "controller_self_review_pending"
+        and first.get("retry_reason") == "controller_self_review_optional_role_handoff"
+    ):
+        return count - 1
+    return count
+
+
 def _status_role_retry(manifest: dict[str, Any], *, read_only: bool = False) -> dict[str, Any]:
     frozen = manifest.get("frozen_writer")
     result: dict[str, Any] = {}
@@ -5596,7 +5976,7 @@ def _status_role_retry(manifest: dict[str, Any], *, read_only: bool = False) -> 
                 **detail,
             }
             continue
-        retries_used = role_retry_state["count"]
+        retries_used = _role_recovery_attempts_used(manifest, role_name, role_retry_state)
         eligible = classification == "eligible" and retries_used < MAX_ROLE_RETRIES
         effective_classification = classification
         if classification == "eligible" and not eligible:
@@ -7782,7 +8162,7 @@ def grabowski_agent_workspace_create(
             worktree_created = True
         initial_preflights: dict[str, Any] = {}
         for preflight_role in ("writer", "tests", "review"):
-            role_preflight = _role_toolchain_preflight(
+            role_preflight = _creation_role_preflight(
                 manifest, preflight_role, list(plan["commands"][preflight_role])
             )
             initial_preflights[preflight_role] = role_preflight
@@ -7793,7 +8173,11 @@ def grabowski_agent_workspace_create(
                 manifest,
                 "role_preflight",
                 role=preflight_role,
-                outcome="passed" if role_preflight.get("passed") is True else "blocked",
+                outcome=(
+                    "deferred" if role_preflight.get("deferred") is True
+                    else "passed" if role_preflight.get("passed") is True
+                    else "blocked"
+                ),
                 evidence={
                     "phase": "workspace_creation",
                     "command_sha256": role_preflight.get("command_sha256"),
@@ -7812,7 +8196,15 @@ def grabowski_agent_workspace_create(
                 },
             )
             _write_manifest(manifest)
-            if role_preflight.get("passed") is not True:
+            pending_controller_handoff = (
+                preflight_role == "review"
+                and list(plan["commands"]["review"]) == list(CONTROLLER_SELF_REVIEW_PENDING_ARGV)
+                and role_preflight.get("deferred") is True
+                and role_preflight.get("passed") is False
+                and role_preflight.get("failure_classification") == "controller_self_review_pending"
+                and role_preflight.get("executed") is False
+            )
+            if role_preflight.get("passed") is not True and not pending_controller_handoff:
                 classification = role_preflight.get("failure_classification") or "toolchain_probe_error"
                 raise AgentWorkspaceActionError(
                     f"{preflight_role} toolchain preflight failed: {classification}"
@@ -8354,6 +8746,29 @@ def grabowski_agent_workspace_collect(workspace_id: str) -> dict[str, Any]:
             }
 
         for role in READ_ONLY_ROLES:
+            if (
+                role == "review"
+                and tasks_map.get("review") is None
+                and manifest.get("commands", {}).get("review")
+                == list(CONTROLLER_SELF_REVIEW_PENDING_ARGV)
+            ):
+                # Freeze the full Candidate first; start real tests normally.
+                # No synthetic BLOCK/PASS is run as a review role, so the
+                # existing retry/NEEDS_CHANGE contracts remain meaningful.
+                return {
+                    "workspace_id": identifier,
+                    "state": "controller_self_review_pending",
+                    "candidate_id": candidate_manifest["candidate_id"],
+                    "writer_head": snapshot["writer_head"],
+                    "diff_sha256": snapshot["diff_sha256"],
+                    "dirty": snapshot["dirty"],
+                    "patch_sha256": writer_result["sha256"],
+                    "test_task_id": tasks_map.get("tests"),
+                    "review_task_started": False,
+                    "next_action": "controller_self_review_bound_candidate",
+                    "worktree_preserved": True,
+                    "receipt_status": "passed",
+                }
             if tasks_map.get(role) is None:
                 # Do not preflight a sibling if reconciliation is already required.
                 reconciliation_block = _existing_role_reconciliation_block()
@@ -8472,6 +8887,12 @@ def grabowski_agent_workspace_collect(workspace_id: str) -> dict[str, Any]:
                 "snapshot": snapshot,
                 "receipt_status": "passed",
             }
+        from grabowski_self_review_producer import verify_workspace_candidate_review
+        try:
+            verify_workspace_candidate_review(manifest)
+        except (ValueError, OSError, RuntimeError) as exc:
+            return {"workspace_id": identifier, "state": "candidate_review_provenance_invalid",
+                    "error": _error_summary(exc), "receipt_status": "blocked"}
         test_receipt = _role_receipt(manifest, "tests")
         review_receipt = _role_receipt(manifest, "review")
         if test_receipt is None or review_receipt is None:
@@ -8777,8 +9198,11 @@ def grabowski_agent_workspace_adopt(
                 )
         if intent is None:
             _require_live_lane_binding(manifest, _run)
-            _adoption_candidate_snapshot(manifest, collection, candidate)
-            git_tree_sha = _stage_candidate_for_adoption(manifest, collection, candidate)
+            live_snapshot = _adoption_candidate_snapshot(manifest, collection, candidate)
+            git_tree_sha = _stage_candidate_for_adoption(
+                manifest, collection, candidate,
+                expected_worktree_sha256=live_snapshot["stage_worktree_sha256"],
+            )
             commit_sha = _create_adoption_commit_object(
                 manifest,
                 candidate_id=candidate["candidate_id"],
@@ -8849,8 +9273,11 @@ def grabowski_agent_workspace_adopt(
                 ["git", "reset", "--mixed", "--quiet", base_head],
                 label="candidate adoption reconcile index reset",
             )
-            _adoption_candidate_snapshot(manifest, collection, candidate)
-            observed_tree = _stage_candidate_for_adoption(manifest, collection, candidate)
+            live_snapshot = _adoption_candidate_snapshot(manifest, collection, candidate)
+            observed_tree = _stage_candidate_for_adoption(
+                manifest, collection, candidate,
+                expected_worktree_sha256=live_snapshot["stage_worktree_sha256"],
+            )
             if observed_tree != intent.get("expected_git_tree_sha"):
                 return {
                     "workspace_id": identifier,
@@ -9955,6 +10382,37 @@ def grabowski_agent_workspace_role_retry(
             }
         worktree = Path(str(manifest["writer_worktree"]))
         command = _role_argv(replacement_argv, "replacement_argv", cwd=worktree)
+        catalogue_fallback_selected = False
+        if (
+            role_name == "review"
+            and manifest.get("commands", {}).get("review")
+            == list(CONTROLLER_SELF_REVIEW_PENDING_ARGV)
+        ):
+            # Optional explicit recovery via an actual pinned review-only
+            # catalogue model. Never let a caller's Python one-liner claim
+            # controller self-review PASS. A native first-party Candidate
+            # proof still needs its own authenticated signed handoff.
+            from grabowski_decision_reviews import _review_route_evidence
+            from grabowski_self_review_producer import candidate_review_batch, verify_candidate_review_command
+            first_party_batch = candidate_review_batch(command)
+            if first_party_batch is not None:
+                verify_candidate_review_command(command, repository=worktree)
+                from grabowski_self_review_producer import _load_plan
+                if _load_plan(first_party_batch)["binding"]["candidate_binding"]["workspace_id"] != identifier:
+                    raise AgentWorkspaceError("Candidate review workspace replay")
+                manifest["first_party_candidate_review_batch"] = first_party_batch
+            elif _review_route_evidence(command) is None:
+                return {
+                    "workspace_id": identifier,
+                    "role": role_name,
+                    "state": "authentic_review_route_required",
+                    "retry_status": "blocked",
+                    "review_task_started": False,
+                }
+            else:
+                from grabowski_self_review_producer import assert_candidate_review_history
+                assert_candidate_review_history(identifier)
+                catalogue_fallback_selected = True
         start_intent = _role_start_intent_classification(manifest, role_name)
         if start_intent is not None:
             classification, detail = start_intent
@@ -10002,7 +10460,7 @@ def grabowski_agent_workspace_role_retry(
                 "retry_status": "blocked",
             }
         retries = dict(manifest.get("role_retries", {}))
-        if role_retry_state["count"] >= MAX_ROLE_RETRIES:
+        if _role_recovery_attempts_used(manifest, role_name, role_retry_state) >= MAX_ROLE_RETRIES:
             return {
                 "workspace_id": identifier,
                 "role": role_name,
@@ -10132,6 +10590,10 @@ def grabowski_agent_workspace_role_retry(
             expected_argv=task_argv,
             expected_cwd=cwd,
         )
+        if catalogue_fallback_selected:
+            # The accepted catalogue task replaces an abandoned first-party
+            # verifier; source-bound signed REJECT history remains enforced.
+            manifest.pop("first_party_candidate_review_batch", None)
         intents = dict(manifest.get("task_start_intents", {}))
         intents.pop(role_name, None)
         manifest["task_start_intents"] = intents
@@ -10145,6 +10607,8 @@ def grabowski_agent_workspace_role_retry(
         retry_reason = (
             "toolchain_preflight_blocked"
             if previous_failure_classification == "toolchain_preflight_blocked"
+            else "controller_self_review_optional_role_handoff"
+            if previous_failure_classification == "controller_self_review_pending"
             else "terminal_environment_toolchain_failure"
         )
         attempt_record = {
@@ -10159,6 +10623,8 @@ def grabowski_agent_workspace_role_retry(
             "new_task_id": public["task_id"],
             "selected_final_attempt": attempt_number,
         }
+        # Every concrete attempt retains its exact replacement-command hash,
+        # even when the initial pending handoff costs no recovery allowance.
         role_retry_state["count"] += 1
         role_retry_state["attempts"] = [*role_retry_state["attempts"], attempt_record]
         retries[role_name] = role_retry_state
@@ -10315,6 +10781,8 @@ def grabowski_agent_workspace_close(
         collection_integrity = _collection_integrity_status(manifest, collection)
         if not collection_integrity["valid"]:
             raise AgentWorkspaceError("collection receipt integrity is invalid")
+        from grabowski_self_review_producer import verify_workspace_candidate_review
+        verify_workspace_candidate_review(manifest)
         if collection.get("writer_head") != head or collection.get("diff_sha256") != diff_sha or collection.get("result_sha256") != result_sha:
             raise AgentWorkspaceError("close bindings do not match collection receipt")
         route_evidence, route_gate_passed, legacy_route = _route_gate(manifest)

@@ -2948,6 +2948,7 @@ class OperatorContractTests(unittest.TestCase):
             self.assertEqual(invoked[separator + 1 :], operator.command_identity.systemd_escape_argv(command))
             self.assertNotIn("--expand-environment=no", invoked[:separator])
             self.assertIn("systemd-run", invoked)
+            self.assertEqual(invoked[:separator].count("--collect"), 1)
             self.assertEqual(invoked.count("--property=LimitCORE=0"), 1)
             self.assertNotIn("--property=LimitNOFILE=65536", invoked)
             self.assertNotIn("--property=UMask=0077", invoked)
@@ -3301,7 +3302,7 @@ class OperatorContractTests(unittest.TestCase):
                 "--expected-diff-sha256", "e" * 64,
                 "--expected-dirty", "false",
                 "--output", str(root / "shared-legacy-output.json"),
-                "--", "grok", "--model", "grok-4.6", "Review frozen revision",
+                "--", "grok", "--model", "grok-4.6", "-p", "Review frozen revision",
             ]
             launched = {
                 "returncode": 0,
@@ -3349,6 +3350,50 @@ class OperatorContractTests(unittest.TestCase):
                 persisted = json.loads(Path(job["metadata_path"]).read_text(encoding="utf-8"))
                 self.assertEqual(persisted["origin_sha256"], job["origin_sha256"])
 
+
+    def test_failed_review_origin_bootstrap_leaves_no_canonical_prelaunch_stub(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state, jobs, cwd = root / "state", root / "state/jobs", root / "cwd"
+            cwd.mkdir(mode=0o700)
+            binding = {
+                "schema_version": 1,
+                "kind": operator.decision_reviews.BINDING_KIND,
+                "repo": "heimgewebe/vibe-lab",
+                "pr": 350,
+                "head_sha": "a" * 40,
+                "base_sha": "b" * 40,
+                "diff_sha256": "c" * 64,
+                "slot": "independent-reviewer",
+            }
+            with (
+                patch.object(operator, "STATE_DIR", state),
+                patch.object(operator, "JOBS_DIR", jobs),
+                patch.object(operator.uuid, "uuid4", return_value=types.SimpleNamespace(
+                    hex="abc123def456" + "f" * 20
+                )),
+                patch.object(
+                    operator.decision_reviews, "bind_job_review_role_argv",
+                    side_effect=lambda command, *_args, **_kwargs: command,
+                ),
+                patch.object(operator.decision_reviews, "review_role_provenance", return_value=None),
+                patch.object(
+                    operator.job_origin, "build_origin",
+                    side_effect=ValueError("origin bootstrap intentionally failed"),
+                ),
+                patch.object(operator, "_run", side_effect=AssertionError("must not dispatch")),
+            ):
+                with self.assertRaisesRegex(ValueError, "origin bootstrap intentionally failed"):
+                    operator._start_job(
+                        ["/usr/bin/python3", "-c", "print('review')"],
+                        cwd=str(cwd), runtime_seconds=60,
+                        decision_review_binding=binding,
+                    )
+            self.assertFalse(
+                list(jobs.glob("grabowski-job-*")),
+                "failed origin allocation must not leave any canonical prelaunch directory",
+            )
 
     def test_noncanonical_review_module_cannot_create_job_directory(self) -> None:
         operator = _load_operator_module()
@@ -3468,7 +3513,7 @@ class OperatorContractTests(unittest.TestCase):
             "terminated_unclear",
         )
 
-    def test_launch_failure_persists_failed_evidence_not_started(self) -> None:
+    def test_collected_fast_launch_failure_preserves_unknown_without_receipt(self) -> None:
         operator = _load_operator_module()
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -3501,18 +3546,20 @@ class OperatorContractTests(unittest.TestCase):
             ), patch.object(operator.uuid, "uuid4", return_value=fake_uuid), patch.object(
                 operator, "_run", side_effect=[launcher, launch_readback]
             ):
-                with self.assertRaisesRegex(RuntimeError, "systemd refused launch"):
+                with self.assertRaises(operator.JobDispatchUnknown) as caught:
                     operator.grabowski_job_start(["python3", "-c", "print(1)"], cwd=str(cwd))
+            self.assertEqual(caught.exception.dispatch_outcome, "outcome_unknown")
 
             metadata_path = jobs / "grabowski-job-bad1a0c00000" / "metadata.json"
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-            self.assertEqual(metadata["final_status"], "launch_failed")
-            self.assertEqual(metadata["terminalization_evidence"]["source"], "systemd-run-launch")
-            self.assertEqual(metadata["terminalization_evidence"]["final_status"], "launch_failed")
+            self.assertEqual(metadata["final_status"], "launch_outcome_unknown")
+            self.assertEqual(metadata["terminalization_evidence"]["source"], "systemd-run-launch-readback")
+            self.assertEqual(metadata["terminalization_evidence"]["final_status"], "launch_outcome_unknown")
             self.assertFalse(metadata["terminalization_evidence"]["systemd_visible"])
             self.assertEqual(metadata["launcher_evidence"]["returncode"], 1)
-            self.assertEqual(metadata["dispatch_outcome"], "not_started")
-            self.assertEqual(metadata["dispatch_readback"]["outcome"], "not_started")
+            self.assertEqual(metadata["dispatch_outcome"], "outcome_unknown")
+            self.assertEqual(metadata["dispatch_readback"]["outcome"], "outcome_unknown")
+            self.assertEqual(metadata["dispatch_readback"]["source"], "collect-mode-unloaded-or-never-started")
             self.assertNotEqual(metadata["final_status"], "started")
 
             systemctl = {
@@ -3534,9 +3581,16 @@ class OperatorContractTests(unittest.TestCase):
                 status = operator.grabowski_job_status("grabowski-job-bad1a0c00000")
 
             self.assertFalse(status["systemd_visible"])
-            self.assertEqual(status["final_status"], "launch_failed")
-            self.assertEqual(status["terminalization_evidence"]["source"], "systemd-run-launch")
-            self.assertEqual(status["notification_evidence"]["final_status_preserved"], "launch_failed")
+            # The unavailable unit and absent receipt never establish non-start.
+            # Keep that uncertainty when a later caller reads the job status.
+            self.assertEqual(status["final_status"], "missing_finalization_evidence")
+            self.assertEqual(status["terminalization_evidence"]["source"], "systemd-show")
+            self.assertFalse(status["terminalization_evidence"]["fallback_used"])
+            self.assertEqual(status["terminalization_evidence"]["receipt_state"], "missing_receipt")
+            self.assertEqual(
+                status["notification_evidence"]["final_status_preserved"],
+                "missing_finalization_evidence",
+            )
 
     def test_launcher_error_with_started_readback_is_a_started_job(self) -> None:
         operator = _load_operator_module()
@@ -3576,6 +3630,60 @@ class OperatorContractTests(unittest.TestCase):
                 "systemd-readback-after-launcher-error",
             )
             self.assertTrue(job["post_dispatch_warnings"])
+
+    def test_collected_launcher_timeout_uses_receipt_or_preserves_unknown(self) -> None:
+        operator = _load_operator_module()
+        for receipt_valid, timed_out in ((True, True), (True, False), (False, True), (False, False)):
+            with self.subTest(receipt_valid=receipt_valid, timed_out=timed_out), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                state, jobs, cwd = root / "state", root / "state/jobs", root / "cwd"
+                cwd.mkdir()
+                launcher = {
+                    "returncode": 1, "stdout": "", "stderr": "lost launcher reply",
+                    "argv": [], "argv_sha256": "0" * 64, "command": "systemd-run",
+                    "cwd": str(root), "timed_out": timed_out,
+                    "duration_seconds": 60.0 if timed_out else 0.01,
+                    "stdout_truncated": False, "stderr_truncated": False,
+                }
+                readback = {
+                    "returncode": 0,
+                    "stdout": "LoadState=not-found\nActiveState=inactive\n",
+                    "stderr": "", "timed_out": False,
+                }
+                receipt = {
+                    "valid": receipt_valid, "state": "valid" if receipt_valid else "missing_receipt",
+                    "receipt_sha256": "a" * 64,
+                }
+                with (
+                    patch.object(operator, "STATE_DIR", state),
+                    patch.object(operator, "JOBS_DIR", jobs),
+                    patch.object(operator.uuid, "uuid4", return_value=types.SimpleNamespace(
+                        hex="abcdef123456ffffffffffffffffffff")),
+                    patch.object(operator, "_run", side_effect=[launcher, readback]),
+                    patch.object(operator, "_finalization_receipt_result", return_value=receipt),
+                ):
+                    if receipt_valid:
+                        job = operator.grabowski_job_start(
+                            ["python3", "-c", "print(1)"], cwd=str(cwd)
+                        )
+                        self.assertEqual(job["dispatch_outcome"], "started")
+                        self.assertEqual(job["dispatch_readback"]["source"], "validated-finalization-receipt")
+                        self.assertEqual(job["dispatch_readback"]["receipt_sha256"], "a" * 64)
+                    else:
+                        with self.assertRaises(operator.JobDispatchUnknown):
+                            operator.grabowski_job_start(
+                                ["python3", "-c", "print(1)"], cwd=str(cwd)
+                            )
+                        metadata = json.loads(
+                            (jobs / "grabowski-job-abcdef123456" / "metadata.json").read_text(
+                                encoding="utf-8"
+                            )
+                        )
+                        self.assertEqual(metadata["dispatch_outcome"], "outcome_unknown")
+                        self.assertEqual(
+                            metadata["dispatch_readback"]["source"],
+                            "collect-mode-unloaded-or-never-started",
+                        )
 
     def test_launcher_error_with_unresolved_readback_is_outcome_unknown(self) -> None:
         operator = _load_operator_module()
@@ -4691,13 +4799,20 @@ class OperatorContractTests(unittest.TestCase):
             "GIT_CONFIG_COUNT": "1",
             "GIT_CONFIG_KEY_0": "remote.origin.push",
             "GIT_CONFIG_VALUE_0": "+HEAD:refs/heads/main",
+            "GIT_EXTERNAL_DIFF": "/tmp/untrusted-external-diff",
+            "GIT_EDITOR": "/tmp/untrusted-editor",
+            "GIT_SEQUENCE_EDITOR": "/tmp/untrusted-sequence-editor",
+            "GIT_SSH_COMMAND": "/tmp/untrusted-ssh",
+            "GIT_CONFIG_GLOBAL": "/tmp/foreign-gitconfig",
+            "GIT_DIFF_OPTS": "--unified=0",
         }
+        inherited_keys = tuple(injected)
         with patch.object(operator, "_safe_environment", return_value=injected):
             environment = operator._git_environment()
         self.assertEqual(environment["PATH"], "/usr/bin")
         self.assertEqual(environment["SSH_AUTH_SOCK"], "/run/user/1000/agent")
-        for key in injected:
-            if key.startswith("GIT_CONFIG_") or key in operator.GIT_ENVIRONMENT_EXACT_DENY:
+        for key in inherited_keys:
+            if key.startswith("GIT_"):
                 self.assertNotIn(key, environment)
         self.assertEqual(environment["GIT_TERMINAL_PROMPT"], "0")
         self.assertEqual(environment["GCM_INTERACTIVE"], "never")
@@ -5039,7 +5154,7 @@ class OperatorContractTests(unittest.TestCase):
             )
             with patch.object(operator, "_require_operator_mutation", return_value=None):
                 with self.assertRaisesRegex(
-                    PermissionError, "expected_preimage_sha256 is required"
+                    PermissionError, "Git -c configuration is not an inert override"
                 ):
                     operator.grabowski_git(
                         str(repo),
@@ -5971,7 +6086,10 @@ class OperatorContractTests(unittest.TestCase):
                 ["git", "-C", str(repo), "remote", "add", "origin", f"ssh://test.invalid{bare}"],
                 check=True,
             )
-            environment = operator._git_push_environment()
+            # This refspec test uses an isolated fake SSH transport, not a real
+            # GitHub writer identity on the GitHub Actions runner.
+            with patch.object(operator.grabowski_git_ssh, "hardened_git_ssh_command", return_value=str(fake_ssh)):
+                environment = operator._git_push_environment()
             environment["GIT_SSH_COMMAND"] = str(fake_ssh)
             with (
                 patch.object(operator, "_require_operator_mutation", return_value=None),
@@ -6002,11 +6120,15 @@ class OperatorContractTests(unittest.TestCase):
             "SSH_ASKPASS": "/tmp/evil-ssh-askpass",
             "GIT_ALLOW_PROTOCOL": "ext:file:ssh:https",
         }
-        with patch.object(operator, "_git_environment", return_value=injected):
+        fixed_command = "/usr/bin/ssh -F /dev/null -oBatchMode=yes -oIdentityFile=/trusted/key"
+        with (
+            patch.object(operator, "_git_environment", return_value=injected),
+            patch.object(operator.grabowski_git_ssh, "hardened_git_ssh_command", return_value=fixed_command),
+        ):
             environment = operator._git_push_environment()
         self.assertNotIn("GIT_SSH", environment)
         self.assertNotIn("GIT_PROXY_COMMAND", environment)
-        self.assertEqual("/usr/bin/ssh -F /dev/null -oBatchMode=yes -oProxyCommand=none -oPermitLocalCommand=no -oClearAllForwardings=yes", environment["GIT_SSH_COMMAND"])
+        self.assertEqual(fixed_command, environment["GIT_SSH_COMMAND"])
         self.assertEqual("ssh", environment["GIT_SSH_VARIANT"])
         self.assertEqual("/bin/false", environment["GIT_ASKPASS"])
         self.assertEqual("/bin/false", environment["SSH_ASKPASS"])
@@ -6030,6 +6152,291 @@ class OperatorContractTests(unittest.TestCase):
                 ["push", "origin", "HEAD:refs/heads/feature"],
                 repo,
             )
+
+    def test_git_global_config_rejects_executable_helper_overrides(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            operator.subprocess.run(
+                ["git", "init", "-q", "-b", "feature", str(repo)], check=True
+            )
+            hostile = (
+                "core.hooksPath=/tmp/untrusted-hooks",
+                "filter.attacker.clean=sh -c 'echo EXECUTED'",
+                "filter.attacker.process=sh -c 'echo EXECUTED'",
+                "core.fsmonitor=/tmp/untrusted-fsmonitor",
+                "diff.external=/tmp/untrusted-diff",
+                "diff.external=",
+                "diff.attacker.command=/tmp/untrusted-driver",
+                "core.editor=/tmp/untrusted-editor",
+                "gpg.program=/tmp/untrusted-signer",
+                "credential.helper=!sh -c 'echo EXECUTED'",
+            )
+            for config in hostile:
+                with self.subTest(config=config):
+                    with self.assertRaisesRegex(
+                        PermissionError, "Git -c configuration is not an inert override"
+                    ):
+                        operator._guard_git(
+                            ["-c", config, "commit", "-m", "unsafe"], repo
+                        )
+            for config in (
+                "core.pager=cat", "core.hooksPath=/dev/null",
+                "core.fsmonitor=false", "commit.gpgSign=false",
+            ):
+                with self.subTest(inert=config):
+                    operator._guard_git(
+                        ["-c", config, "status"], repo
+                    )
+
+    def test_generic_git_diff_disables_external_helper_without_empty_executable(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            operator.subprocess.run(
+                ["git", "init", "-q", "-b", "feature", str(repo)], check=True
+            )
+            for key, value in (
+                ("user.name", "Grabowski Test"),
+                ("user.email", "grabowski@example.invalid"),
+            ):
+                operator.subprocess.run(
+                    ["git", "-C", str(repo), "config", key, value], check=True
+                )
+            tracked = repo / "tracked.txt"
+            tracked.write_text("base\n", encoding="utf-8")
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "add", "tracked.txt"], check=True
+            )
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "commit", "-qm", "base"], check=True
+            )
+            marker = root / "external-diff-executed"
+            helper = root / "external-diff"
+            helper.write_text(
+                "#!/bin/sh\ntouch " + str(marker) + "\nexit 1\n",
+                encoding="utf-8",
+            )
+            helper.chmod(0o700)
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "config", "diff.external", str(helper)],
+                check=True,
+            )
+            tracked.write_text("changed-on-disk\n", encoding="utf-8")
+            for arguments in (
+                ["diff"],
+                ["diff", "--ext-diff"],
+                ["diff", "--ext-diff", "--", "tracked.txt"],
+                ["diff", "tracked.txt"],
+                ["diff", "--ext-diff", "tracked.txt"],
+                ["diff", "--end-of-options", "HEAD"],
+                ["diff", "--ext-diff", "--end-of-options", "HEAD"],
+            ):
+                with self.subTest(arguments=arguments):
+                    marker.unlink(missing_ok=True)
+                    with patch.object(
+                        operator, "_require_operator_mutation", return_value=None
+                    ):
+                        result = operator.grabowski_git(str(repo), arguments)
+                    self.assertEqual(result["returncode"], 0, result.get("stderr"))
+                    self.assertIn("changed-on-disk", result["stdout"])
+                    self.assertFalse(marker.exists(), "external Git diff helper executed")
+                    self.assertIn("--no-ext-diff", result["argv"])
+                    self.assertIn("--no-textconv", result["argv"])
+
+            # --end-of-options stops option parsing even without a -- pathspec.
+            # Both history commands must still receive their safe flags before it.
+            for arguments in (
+                ["log", "--end-of-options", "HEAD"],
+                ["show", "--end-of-options", "HEAD"],
+                ["log", "--follow", "tracked.txt"],
+                ["show", "HEAD:tracked.txt"],
+            ):
+                with self.subTest(arguments=arguments):
+                    marker.unlink(missing_ok=True)
+                    with patch.object(
+                        operator, "_require_operator_mutation", return_value=None
+                    ):
+                        result = operator.grabowski_git(str(repo), arguments)
+                    self.assertEqual(result["returncode"], 0, result.get("stderr"))
+                    self.assertFalse(marker.exists(), "history external helper executed")
+
+            # An option classified as consuming the next token must really
+            # consume it. Git log -U and Git diff --grep do not; a later
+            # --ext-diff must not become executable helper authority.
+            for arguments in (
+                ["log", "-p", "-U", "--ext-diff", "HEAD"],
+                ["show", "-U", "--ext-diff", "HEAD"],
+                ["diff", "--grep", "--ext-diff", "HEAD"],
+                ["diff", "-I", "--ext-diff", "HEAD"],
+            ):
+                with self.subTest(ambiguous_value=arguments):
+                    marker.unlink(missing_ok=True)
+                    with patch.object(
+                        operator, "_require_operator_mutation", return_value=None
+                    ):
+                        operator.grabowski_git(str(repo), arguments)
+                    self.assertFalse(
+                        marker.exists(), "ambiguous Git option activated an external helper"
+                    )
+
+            # Git textconv is a second executable helper mechanism. A
+            # caller --textconv must not override the operator's final guard.
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "config", "--unset", "diff.external"],
+                check=True,
+            )
+            attributes = repo / ".git" / "info" / "attributes"
+            attributes.write_text("tracked.txt diff=attack\n", encoding="utf-8")
+            textconv_marker = root / "textconv-executed"
+            textconv = root / "textconv"
+            textconv.write_text(
+                "#!/bin/sh\ntouch " + str(textconv_marker) + "\ncat \"$1\"\n",
+                encoding="utf-8",
+            )
+            textconv.chmod(0o700)
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "config", "diff.attack.textconv", str(textconv)],
+                check=True,
+            )
+            with patch.object(
+                operator, "_require_operator_mutation", return_value=None
+            ):
+                textconv_diff = operator.grabowski_git(
+                    str(repo), ["diff", "--textconv", "--", "tracked.txt"]
+                )
+            self.assertEqual(
+                textconv_diff["returncode"], 0, textconv_diff.get("stderr")
+            )
+            self.assertFalse(textconv_marker.exists(), "Git textconv helper executed")
+            self.assertIn("changed-on-disk", textconv_diff["stdout"])
+
+    def test_git_helper_like_option_values_preserve_log_search_semantics(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            operator.subprocess.run(
+                ["git", "init", "-q", "-b", "feature", str(repo)], check=True
+            )
+            for key, value in (
+                ("user.name", "Grabowski Test"),
+                ("user.email", "grabowski@example.invalid"),
+            ):
+                operator.subprocess.run(
+                    ["git", "-C", str(repo), "config", key, value], check=True
+                )
+            (repo / "file.txt").write_text("baseline\n", encoding="utf-8")
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "add", "file.txt"], check=True
+            )
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "commit", "-qm", "commit mentions -1"],
+                check=True,
+            )
+            for arguments in (
+                ["log", "--grep", "--textconv", "-1", "--format=%s"],
+                ["log", "--grep", "--ext-diff", "-1", "--format=%s"],
+                ["log", "--author", "--textconv", "-1", "--format=%s"],
+                ["log", "--committer", "--ext-diff", "-1", "--format=%s"],
+                ["log", "-p", "-S", "--ext-diff", "-1", "--format=%s"],
+                ["log", "-p", "-G", "--textconv", "-1", "--format=%s"],
+            ):
+                with self.subTest(arguments=arguments):
+                    expected = operator.subprocess.run(
+                        ["git", "-C", str(repo), *arguments],
+                        capture_output=True, text=True, check=True,
+                    )
+                    with patch.object(
+                        operator, "_require_operator_mutation", return_value=None
+                    ):
+                        actual = operator.grabowski_git(str(repo), arguments)
+                    self.assertEqual(actual["returncode"], 0, actual.get("stderr"))
+                    self.assertEqual(actual["stdout"], expected.stdout)
+                    literal = "--ext-diff" if "--ext-diff" in arguments else "--textconv"
+                    self.assertIn(literal, actual["argv"])
+
+    def test_grabowski_git_exact_preimage_commit_disables_hooks_and_signing(self) -> None:
+        operator = _load_operator_module()
+        import grabowski_resources as resources
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            operator.subprocess.run(
+                ["git", "init", "-q", "-b", "feature", str(repo)], check=True
+            )
+            for key, value in (
+                ("user.name", "Grabowski Test"),
+                ("user.email", "grabowski@example.invalid"),
+            ):
+                operator.subprocess.run(
+                    ["git", "-C", str(repo), "config", key, value], check=True
+                )
+            tracked = repo / "tracked.txt"
+            tracked.write_text("base\n", encoding="utf-8")
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "add", "tracked.txt"], check=True
+            )
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "commit", "-qm", "base"], check=True
+            )
+            tracked.write_text("new reviewed content\n", encoding="utf-8")
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "add", "tracked.txt"], check=True
+            )
+            hooks = root / "hooks"
+            hooks.mkdir()
+            hook_marker = root / "precommit-executed"
+            hook = hooks / "pre-commit"
+            hook.write_text(
+                "#!/bin/sh\ntouch " + str(hook_marker) + "\n", encoding="utf-8"
+            )
+            hook.chmod(0o700)
+            signer_marker = root / "signer-executed"
+            signer = root / "signer"
+            signer.write_text(
+                "#!/bin/sh\ntouch " + str(signer_marker) + "\nexit 1\n",
+                encoding="utf-8",
+            )
+            signer.chmod(0o700)
+            for key, value in (
+                ("core.hooksPath", str(hooks)),
+                ("commit.gpgSign", "true"),
+                ("gpg.program", str(signer)),
+            ):
+                operator.subprocess.run(
+                    ["git", "-C", str(repo), "config", key, value], check=True
+                )
+            expected = operator._git_branch_preimage(repo)["preimage_sha256"]
+            attempt = {
+                "schema_version": 1,
+                "owner_id": "operator:exact-preimage-no-hooks",
+                "operation_id": "commit-exact-preimage-guard",
+                "attempt_id": "attempt-1",
+                "branch": "feature",
+                "expected_preimage_sha256": expected,
+            }
+            with (
+                patch.object(resources, "RESOURCE_DB", root / "resources.sqlite3"),
+                patch.object(operator, "_require_operator_mutation", return_value=None),
+                patch.object(operator, "_append_effect_audit", return_value="a" * 64),
+            ):
+                result = operator.grabowski_git(
+                    str(repo), ["commit", "-m", "verified without helpers"],
+                    branch_attempt=attempt,
+                )
+            self.assertEqual(result["returncode"], 0, result.get("stderr"))
+            self.assertEqual(result["branch_mutation"]["status"], "completed")
+            self.assertFalse(hook_marker.exists(), "untrusted pre-commit hook executed")
+            self.assertFalse(signer_marker.exists(), "untrusted signing helper executed")
+            self.assertIn("core.hooksPath=/dev/null", result["argv"])
+            self.assertIn("core.fsmonitor=false", result["argv"])
+            self.assertIn("commit.gpgSign=false", result["argv"])
+            committed = operator.subprocess.check_output(
+                ["git", "-C", str(repo), "show", "HEAD:tracked.txt"]
+            )
+            self.assertEqual(committed, b"new reviewed content\n")
 
     def test_privileged_reference_has_expiry_replay_policy_and_bound_hash(self) -> None:
         operator = _load_operator_module()
@@ -7320,7 +7727,7 @@ class GitServerVerifiedReadTransportTests(unittest.TestCase):
                 )
 
             self.assertEqual(result["returncode"], 0)
-            self.assertEqual(result["argv"][0], "/usr/bin/git")
+            self.assertEqual(result["argv"][0], operator._trusted_git_cli_path())
             self.assertFalse(invoked.exists())
             mutation.assert_not_called()
 

@@ -13,6 +13,7 @@ import json
 from pathlib import Path
 import stat
 import sys
+import time
 import tempfile
 import types
 import unittest
@@ -83,6 +84,9 @@ def _load_provenance_recovery():
     privileged.grabowski_privileged_broker_status = lambda: {}
     recovery = types.ModuleType("grabowski_recovery")
     recovery.BACKUP_SUCCESS = Path("/nonexistent-backup-marker")
+    recovery.MAX_AGE_SECONDS = 24 * 60 * 60
+    recovery._NIXOS_OS_PRESENT = False
+    recovery._NIXOS_RESTIC_TIMER_PRESENT = False
     recovery._fresh_text_marker = lambda path: {}
     sys.modules.setdefault("grabowski_runtime_contract", __import__("grabowski_runtime_contract"))
     self_deploy = types.ModuleType("grabowski_self_deploy")
@@ -271,6 +275,134 @@ class ProvenanceRecoveryGateTests(unittest.TestCase):
         self.assertTrue(gate["allowed"], gate["reasons"])
         self.assertEqual(gate["reasons"], [])
         self.assertTrue(gate["runtime_integrity"]["repair_warranted"])
+
+    def _native_gate(self, local_evidence, *, legacy=None):
+        row = dict(local_evidence)
+        stamp = row.get("timestamp_unix")
+        if type(stamp) is int:
+            row.setdefault("service_start_unix", stamp - 30)
+            row.setdefault("service_exit_unix", stamp)
+            row.setdefault("snapshot_saved_at_unix", stamp - 1)
+        with (
+            patch.object(provenance_recovery.recovery,
+                         "_NIXOS_OS_PRESENT", True, create=True),
+            patch.object(provenance_recovery.recovery,
+                         "_NIXOS_RESTIC_TIMER_PRESENT", True, create=True),
+            patch.object(provenance_recovery.recovery, "_nixos_native_backup_service_fresh",
+                         return_value=row, create=True),
+            patch.object(provenance_recovery.recovery, "_local_backup_freshness",
+                         side_effect=AssertionError("restore-dependent helper"), create=True),
+            patch.object(provenance_recovery.recovery, "_server_source_marker",
+                         side_effect=AssertionError("restore source read"), create=True),
+        ):
+            return self._gate(backup=legacy or {"valid": True, "age_seconds": 30})
+
+    def test_native_root_snapshot_evidence_replaces_missing_legacy_marker(self):
+        stamp = int(time.time()) - 55
+        row = {"valid": True, "exists": True,
+               "source": "nixos-system-restic-backup-completion",
+               "path": "systemd:restic-backups-heim-pc.service",
+               "timestamp_unix": stamp, "age_seconds": 55,
+               "backup_invocation_id": "a" * 32, "snapshot_id": "b" * 8}
+        gate = self._native_gate(row, legacy={"valid": False, "age_seconds": None})
+        self.assertTrue(gate["allowed"], gate["reasons"])
+        self.assertEqual(gate["local_backup_marker"]["source"], row["source"])
+
+    def test_native_completed_systemd_backup_replaces_missing_pop_marker(self):
+        stamp = int(time.time()) - 40
+        row = {"valid": True, "exists": True,
+               "source": "nixos-system-restic-backup-completion",
+               "path": "systemd:restic-backups-heim-pc.service",
+               "timestamp_unix": stamp, "age_seconds": 40,
+               "backup_invocation_id": "a" * 32, "snapshot_id": "b" * 8}
+        gate = self._native_gate(row, legacy={"valid": False})
+        self.assertTrue(gate["checks"]["local_backup_marker_fresh"], gate["reasons"])
+
+    def test_native_backup_save_before_final_maintenance_execstart_is_valid(self):
+        stamp = int(time.time()) - 30
+        row = {"valid": True, "exists": True,
+               "source": "nixos-system-restic-backup-completion",
+               "path": "systemd:restic-backups-heim-pc.service",
+               "timestamp_unix": stamp, "age_seconds": 30,
+               "service_start_unix": stamp - 10,  # final prune/check ExecStart
+               "service_exit_unix": stamp,
+               "snapshot_saved_at_unix": stamp - 45,  # earlier backup ExecStart
+               "backup_invocation_id": "a" * 32, "snapshot_id": "b" * 8}
+        gate = self._native_gate(row, legacy={"valid": False})
+        self.assertTrue(gate["checks"]["local_backup_marker_fresh"], gate["reasons"])
+
+    def test_native_stale_evidence_cannot_be_bypassed_by_legacy_success(self):
+        row = {"valid": False, "source": "nixos-system-restic-backup-completion",
+               "timestamp_unix": None, "age_seconds": None}
+        gate = self._native_gate(row)
+        self.assertFalse(gate["allowed"])
+        self.assertIn("local_backup_marker_fresh", gate["reasons"])
+
+    def test_native_source_age_and_timestamp_are_all_required(self):
+        stamp = int(time.time()) - 50
+        valid = {"valid": True, "exists": True,
+                 "source": "nixos-system-restic-backup-completion",
+                 "path": "systemd:restic-backups-heim-pc.service",
+                 "timestamp_unix": stamp, "age_seconds": 50,
+                 "backup_invocation_id": "a" * 32, "snapshot_id": "b" * 8}
+        for label, bad in (
+            ("wrong_source", {**valid, "source": "legacy-marker"}),
+            ("missing_age", {**valid, "age_seconds": None}),
+            ("boolean_age", {**valid, "age_seconds": True}),
+            ("stale_age", {**valid, "age_seconds": 90000}),
+            ("stale_timestamp", {**valid, "timestamp_unix": stamp - 90000}),
+            ("future_timestamp", {**valid, "timestamp_unix": stamp + 120}),
+            ("missing_invocation", {**valid, "backup_invocation_id": None}),
+            ("malformed_invocation", {**valid, "backup_invocation_id": "f" * 31}),
+            ("missing_snapshot", {**valid, "snapshot_id": None}),
+            ("malformed_snapshot", {**valid, "snapshot_id": "not-a-restic-id"}),
+            ("missing_service_evidence", {**valid, "exists": False}),
+            ("malformed", {}),
+        ):
+            with self.subTest(label=label):
+                gate = self._native_gate(bad)
+                self.assertFalse(gate["allowed"])
+                self.assertIn("local_backup_marker_fresh", gate["reasons"])
+
+    def test_native_recovery_status_exception_fails_closed(self):
+        with (
+            patch.object(provenance_recovery.recovery,
+                         "_NIXOS_OS_PRESENT", True, create=True),
+            patch.object(provenance_recovery.recovery,
+                         "_NIXOS_RESTIC_TIMER_PRESENT", True, create=True),
+            patch.object(provenance_recovery.recovery, "_nixos_native_backup_service_fresh",
+                         side_effect=RuntimeError("root evidence unreadable"), create=True),
+        ):
+            gate = self._gate(backup={"valid": True, "age_seconds": 10})
+        self.assertFalse(gate["allowed"])
+        self.assertIn("local_backup_marker_fresh", gate["reasons"])
+
+    def test_nixos_missing_native_timer_does_not_accept_legacy_success(self):
+        with (
+            patch.object(provenance_recovery.recovery, "_NIXOS_OS_PRESENT",
+                         True, create=True),
+            patch.object(provenance_recovery.recovery,
+                         "_NIXOS_RESTIC_TIMER_PRESENT", False, create=True),
+            patch.object(provenance_recovery.recovery, "_nixos_native_backup_service_fresh",
+                         return_value={"valid": False, "exists": False,
+                                       "source": "nixos-system-restic-backup-completion"},
+                         create=True),
+        ):
+            gate = self._gate(backup={"valid": True, "age_seconds": 10})
+        self.assertFalse(gate["allowed"])
+        self.assertIn("local_backup_marker_fresh", gate["reasons"])
+
+    def test_non_native_legacy_text_marker_remains_authoritative(self):
+        with (
+            patch.object(provenance_recovery.recovery,
+                         "_NIXOS_OS_PRESENT", False, create=True),
+            patch.object(provenance_recovery.recovery,
+                         "_NIXOS_RESTIC_TIMER_PRESENT", False, create=True),
+            patch.object(provenance_recovery.recovery, "_nixos_native_backup_service_fresh",
+                         side_effect=RuntimeError("must not call on Pop!"), create=True),
+        ):
+            gate = self._gate(backup={"valid": True, "age_seconds": 45})
+        self.assertTrue(gate["allowed"], gate["reasons"])
 
     def test_lane_is_closed_when_the_runtime_is_healthy(self) -> None:
         """The lane must never be a way around gates that currently apply."""
@@ -2475,6 +2607,239 @@ class IndexedInflightJobEvidenceGateTests(unittest.TestCase):
         self.assertEqual(evidence["inflight_deploy_jobs"], [])
         # ...but it must be visible, so the dispatch can coalesce onto it.
         self.assertEqual(evidence["idempotent_match"], match)
+
+
+class PersistedCutoverRecoveryHandoffTests(unittest.TestCase):
+    """Only exact proved *recovery* may exclude a failed deploy from competition."""
+
+    UNIT = "grabowski-job-444444444444"
+    BINDING = {"schema_version": 2, "cutover_id": "bgc-exact",
+               "binding_sha256": "a" * 64}
+
+    def _projection(self, blocking=None):
+        blocking = [self.UNIT] if blocking is None else blocking
+        return {
+            "inflight_units": list(blocking),
+            "blocking_units": list(blocking),
+            "idempotent_match": None,
+            "ambiguous_identical_units": [],
+            "pruned_units": [],
+            "error": None,
+        }
+
+    def test_failed_deploy_with_exact_cutover_may_handoff_only_to_resume(self):
+        with (
+            patch.object(provenance_recovery.self_deploy,
+                         "inflight_runtime_job_evidence",
+                         return_value=self._projection(), create=True),
+            patch.object(provenance_recovery.self_deploy,
+                         "_indexed_failed_deploy_is_cutover_handoff",
+                         return_value=True, create=True) as authenticated,
+        ):
+            ordinary = provenance_recovery._competing_deployment_evidence()
+            resume = provenance_recovery._competing_deployment_evidence(
+                resume_binding=self.BINDING
+            )
+        self.assertEqual(ordinary["inflight_deploy_jobs"], [self.UNIT])
+        self.assertEqual(resume["inflight_deploy_jobs"], [])
+        self.assertEqual(resume["recovery_handoff_units"], [self.UNIT])
+        authenticated.assert_called_once_with(self.UNIT, self.BINDING)
+
+    def test_ambiguous_two_failed_deploys_never_admit_handoff(self):
+        units = [self.UNIT, "grabowski-job-555555555555"]
+        with (
+            patch.object(provenance_recovery.self_deploy,
+                         "inflight_runtime_job_evidence",
+                         return_value=self._projection(units), create=True),
+            patch.object(provenance_recovery.self_deploy,
+                         "_indexed_failed_deploy_is_cutover_handoff",
+                         return_value=True, create=True) as authenticated,
+        ):
+            resume = provenance_recovery._competing_deployment_evidence(
+                resume_binding=self.BINDING
+            )
+        self.assertEqual(resume["inflight_deploy_jobs"], units)
+        self.assertEqual(resume["recovery_handoff_units"], [])
+        # Prove each unit, but two positively classified original deploys
+        # are ambiguous and the all-or-nothing exemption must refuse both.
+        self.assertEqual(authenticated.call_count, 2)
+
+    def test_failed_deploy_and_verified_pre_resume_failure_can_handoff_together(self):
+        resumed_unit = "grabowski-job-555555555555"
+        units = [self.UNIT, resumed_unit]
+        with (
+            patch.object(
+                provenance_recovery.self_deploy, "inflight_runtime_job_evidence",
+                return_value=self._projection(units), create=True,
+            ),
+            patch.object(
+                provenance_recovery.self_deploy,
+                "_indexed_failed_deploy_is_cutover_handoff",
+                side_effect=lambda unit, _: unit == self.UNIT,
+                create=True,
+            ),
+            patch.object(
+                provenance_recovery.self_deploy,
+                "_indexed_failed_resume_is_noeffect_handoff",
+                side_effect=lambda unit, _: unit == resumed_unit,
+                create=True,
+            ),
+        ):
+            ordinary = provenance_recovery._competing_deployment_evidence()
+            resume = provenance_recovery._competing_deployment_evidence(
+                resume_binding=self.BINDING
+            )
+        self.assertEqual(ordinary["inflight_deploy_jobs"], units)
+        self.assertEqual(resume["inflight_deploy_jobs"], [])
+        self.assertEqual(resume["recovery_handoff_units"], units)
+
+
+    def test_completed_set_of_original_noeffect_and_progressed_jobs_only_handoffs_to_recovery(self):
+        """Three authentic old jobs may yield together, never individually.
+
+        A no-effect S0 job and a later progressed retry remain indexed until
+        completion. Ordinary deployments see them all, but fresh S1–S4 resume
+        must be able to proceed when every historical blocker authenticates.
+        """
+        old_noeffect = "grabowski-job-555555555555"
+        progressed = "grabowski-job-666666666666"
+        units = [self.UNIT, old_noeffect, progressed]
+        for progressed_authentic in (True, False):
+            with (
+                self.subTest(progressed_authentic=progressed_authentic),
+                patch.object(
+                    provenance_recovery.self_deploy,
+                    "inflight_runtime_job_evidence",
+                    return_value=self._projection(units), create=True,
+                ),
+                patch.object(
+                    provenance_recovery.self_deploy,
+                    "_indexed_failed_deploy_is_cutover_handoff",
+                    side_effect=lambda unit, _: unit == self.UNIT,
+                    create=True,
+                ),
+                patch.object(
+                    provenance_recovery.self_deploy,
+                    "_indexed_failed_resume_is_noeffect_handoff",
+                    side_effect=lambda unit, _: unit == old_noeffect,
+                    create=True,
+                ),
+                patch.object(
+                    provenance_recovery.self_deploy,
+                    "_indexed_failed_scheduled_resume_is_handoff",
+                    side_effect=lambda unit, _: (
+                        unit == progressed and progressed_authentic
+                    ), create=True,
+                ),
+            ):
+                ordinary = provenance_recovery._competing_deployment_evidence()
+                resume = provenance_recovery._competing_deployment_evidence(
+                    resume_binding=self.BINDING
+                )
+            self.assertEqual(ordinary["inflight_deploy_jobs"], units)
+            self.assertEqual(ordinary["recovery_handoff_units"], [])
+            if progressed_authentic:
+                self.assertEqual(resume["inflight_deploy_jobs"], [])
+                self.assertEqual(resume["recovery_handoff_units"], units)
+            else:
+                self.assertEqual(resume["inflight_deploy_jobs"], units)
+                self.assertEqual(resume["recovery_handoff_units"], [])
+
+    def test_one_invalid_resume_in_a_two_job_handoff_blocks_everything(self):
+        resumed_unit = "grabowski-job-555555555555"
+        units = [self.UNIT, resumed_unit]
+        with (
+            patch.object(
+                provenance_recovery.self_deploy, "inflight_runtime_job_evidence",
+                return_value=self._projection(units), create=True,
+            ),
+            patch.object(
+                provenance_recovery.self_deploy,
+                "_indexed_failed_deploy_is_cutover_handoff",
+                side_effect=lambda unit, _: unit == self.UNIT,
+                create=True,
+            ),
+            patch.object(
+                provenance_recovery.self_deploy,
+                "_indexed_failed_resume_is_noeffect_handoff",
+                return_value=False,
+                create=True,
+            ),
+        ):
+            resume = provenance_recovery._competing_deployment_evidence(
+                resume_binding=self.BINDING
+            )
+        self.assertEqual(resume["inflight_deploy_jobs"], units)
+        self.assertEqual(resume["recovery_handoff_units"], [])
+
+
+    def test_resume_assessment_and_locked_recheck_bind_exact_same_cutover(self):
+        """The fast assessment and under-lock dispatch must evaluate one binding."""
+        from unittest.mock import Mock
+
+        valid_competition = {
+            "deploy_lock_free": True,
+            "inflight_deploy_jobs": [],
+            "recovery_handoff_units": [self.UNIT],
+            "error": None,
+        }
+        with (
+            patch.object(provenance_recovery.base, "_verify_audit_log",
+                         return_value={"valid": True, "audit_writable": True}),
+            patch.object(provenance_recovery.base, "_kill_switch_state",
+                         return_value={"engaged": False}),
+            patch.object(provenance_recovery.privileged,
+                         "grabowski_privileged_broker_status",
+                         return_value={"ready": True}),
+            patch.object(provenance_recovery, "_integrity_evidence",
+                         return_value={"repair_warranted": True}),
+            patch.object(provenance_recovery, "_blockade_evidence",
+                         return_value={"allows_mutation": True}),
+            patch.object(provenance_recovery, "_recovery_lane",
+                         return_value={
+                             "lane": provenance_recovery.midcutover.LANE_MID_CUTOVER_RESUME,
+                             "resume_binding": self.BINDING,
+                         }),
+            patch.object(provenance_recovery, "_competing_deployment_evidence",
+                         return_value=valid_competition) as competing,
+        ):
+            assessment = provenance_recovery.evaluate_resume_gate(HEAD)
+            self.assertTrue(assessment["allowed"], assessment["reasons"])
+            competing.assert_called_once_with(resume_binding=self.BINDING)
+            competing.reset_mock()
+            locked = provenance_recovery._volatile_gate_recheck(
+                ROOT, ["resume-argv"], resume_binding=self.BINDING
+            )
+            self.assertEqual(locked["reasons"], [])
+            competing.assert_called_once_with(
+                ["resume-argv"],
+                prune=True,
+                reconcile_stale_pending=True,
+                resume_binding=self.BINDING,
+            )
+            competing.reset_mock()
+            ordinary = provenance_recovery._volatile_gate_recheck(
+                ROOT, ["regular-deploy-argv"]
+            )
+            self.assertEqual(ordinary["reasons"], [])
+            competing.assert_called_once_with(
+                ["regular-deploy-argv"], prune=True,
+                reconcile_stale_pending=True,
+            )
+
+    def test_invalid_or_missing_cutover_proof_still_blocks_resume(self):
+        with (
+            patch.object(provenance_recovery.self_deploy,
+                         "inflight_runtime_job_evidence",
+                         return_value=self._projection(), create=True),
+            patch.object(provenance_recovery.self_deploy,
+                         "_indexed_failed_deploy_is_cutover_handoff",
+                         return_value=False, create=True),
+        ):
+            resume = provenance_recovery._competing_deployment_evidence(
+                resume_binding=self.BINDING
+            )
+        self.assertEqual(resume["inflight_deploy_jobs"], [self.UNIT])
 
 
 class DispatchCoalescingTests(unittest.TestCase):

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 HEAD = "a" * 40
@@ -23,6 +25,19 @@ def _load_gate():
 
 
 gate = _load_gate()
+
+
+def setUpModule() -> None:
+    # Synthetic GitHub identities must not import unrelated signed state from
+    # the developer's real operator. Signed-history E2E tests use real receipts.
+    private_history = tempfile.TemporaryDirectory()
+    unittest.addModuleCleanup(private_history.cleanup)
+    patcher = mock.patch.object(
+        gate.review_provenance, "FIRST_PARTY_REVIEW_ROOT",
+        Path(private_history.name) / "no-signed-sessions",
+    )
+    patcher.start()
+    unittest.addModuleCleanup(patcher.stop)
 
 
 def _state(
@@ -59,10 +74,17 @@ def _state(
 
 
 def _iterations(count: int, *, first_material: int = 0) -> list[dict[str, object]]:
+    axes = gate.REQUIRED_HIGH_CRITICAL_REVIEW_AXES
     return [
         {
             "n": n,
-            "summary": f"review pass {n}",
+            "axis": axes[n - 1] if n <= len(axes) else "additional_adversarial_pass",
+            "summary": (
+                f"Reviewed {axes[n - 1] if n <= len(axes) else 'additional risk'} "
+                f"against exact Git diff, target contract and concrete regression "
+                f"evidence for iteration {n}; checked failure and success paths."
+            ),
+            "evidence_refs": [f"tests/test_pr_review_gate_external.py:pass-{n}-case"],
             "material_findings": first_material if n == 1 else 0,
         }
         for n in range(1, count + 1)
@@ -109,6 +131,82 @@ def _has_failure(result: dict[str, object], needle: str) -> bool:
 
 
 class SelfReviewDepthPolicyTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # These unit tests isolate risk classification from execution provenance.
+        # The real signer/task/evidence verifier has its own positive/negative
+        # tests; the explicit test below restores it at this public gate.
+        patcher = mock.patch.object(gate, "review_receipt_errors", return_value=[])
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_fake_five_passes_are_blocked_without_private_server_receipts(self) -> None:
+        # Other test fixtures mock the shared verifier. Import its unchanged
+        # reviewed implementation independently to ensure this negative gate
+        # case cannot inherit an unrelated mock.
+        spec = importlib.util.spec_from_file_location(
+            "isolated_real_self_review_verifier_negative_test",
+            ROOT / "src" / "grabowski_self_review_execution.py",
+        )
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        authentic = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(authentic)
+        state = _state("tools/pr_review_gate.py", additions=180)
+        fabricated = _self_review("tools/pr_review_gate.py", iterations=5)
+        origin_audit = {
+            "repo": state["repoName"], "pr": state["pr"]["number"],
+            "base_sha": state["pr"]["baseRefOid"],
+            "head_sha": state["pr"]["headRefOid"],
+            "diff_sha256": state["pr_diff_sha256"],
+            "review_batch_id": fabricated.get("review_batch_id"),
+            "review_iterations": fabricated["review_iterations"],
+            "review_pass_receipts": fabricated.get("review_pass_receipts"),
+        }
+        self.assertTrue(
+            authentic.review_receipt_errors(origin_audit),
+            "authentic verifier accepted five fabricated reports without receipts",
+        )
+        with mock.patch.object(
+            gate, "review_receipt_errors",
+            side_effect=authentic.review_receipt_errors,
+        ):
+            result = gate.evaluate_review_gate(state, self_review=fabricated)
+        self.assertEqual(result["verdict"], "BLOCK", result)
+        self.assertTrue(
+            _has_failure(result, "high_critical_server_review_provenance_invalid"),
+            result["failures"],
+        )
+
+    def test_gate_and_captain_audit_preserve_first_party_proof_origin(self) -> None:
+        state = _state("tools/pr_review_gate.py", additions=180)
+        self_review = _self_review("tools/pr_review_gate.py", iterations=5)
+        self_review.update({
+            "review_batch_id": "a" * 32,
+            "review_origin": "first_party_authenticated_controller_v1",
+            "review_pass_receipts": [{"signed": number} for number in range(5)],
+        })
+        with mock.patch.object(
+            gate, "review_receipt_errors", return_value=[],
+        ) as verifier:
+            result = gate.evaluate_review_gate(state, self_review=self_review)
+        projected = verifier.call_args.args[0]
+        self.assertEqual(
+            self_review["review_origin"], projected["review_origin"],
+        )
+        self.assertIs(
+            self_review["review_pass_receipts"], projected["review_pass_receipts"],
+        )
+        captain_audit = gate.build_self_review_audit(
+            state, result, self_review,
+        )
+        self.assertEqual(
+            self_review["review_origin"], captain_audit["review_origin"],
+        )
+        self.assertIs(
+            self_review["review_pass_receipts"],
+            captain_audit["review_pass_receipts"],
+        )
+
     def test_documentation_change_requires_one_self_review_iteration(self) -> None:
         result = gate.evaluate_review_gate(_state(), self_review=_self_review())
         self.assertEqual(result["verdict"], "PASS")
@@ -182,20 +280,79 @@ class SelfReviewDepthPolicyTests(unittest.TestCase):
         self.assertEqual(passed["complexity"]["review_tier"], "important_repo")
         self.assertFalse(passed["review_sources"]["external_review_required"])
 
-    def test_high_critical_path_requires_four_iterations(self) -> None:
+    def test_high_critical_path_requires_five_distinct_iterations(self) -> None:
         state = _state("tools/pr_review_gate.py")
         blocked = gate.evaluate_review_gate(
             state,
-            self_review=_self_review("tools/pr_review_gate.py", iterations=3),
+            self_review=_self_review("tools/pr_review_gate.py", iterations=4),
         )
         self.assertEqual(blocked["verdict"], "BLOCK")
-        self.assertTrue(_has_failure(blocked, "minimum 4"), blocked["failures"])
+        self.assertTrue(_has_failure(blocked, "minimum 5"), blocked["failures"])
         passed = gate.evaluate_review_gate(
             state,
-            self_review=_self_review("tools/pr_review_gate.py", iterations=4),
+            self_review=_self_review("tools/pr_review_gate.py", iterations=5),
         )
         self.assertEqual(passed["verdict"], "PASS")
         self.assertEqual(passed["complexity"]["review_tier"], "high_critical")
+
+    def test_critical_duplicate_method_axis_is_not_a_fifth_distinct_review(self) -> None:
+        review = _self_review("tools/pr_review_gate.py", iterations=5)
+        review["review_iterations"][4]["axis"] = review["review_iterations"][0]["axis"]
+        checked = gate.evaluate_review_gate(
+            _state("tools/pr_review_gate.py"), self_review=review
+        )
+        self.assertEqual(checked["verdict"], "BLOCK")
+        self.assertTrue(_has_failure(checked, "five distinct axes"), checked["failures"])
+
+    def test_critical_vague_fifth_pass_cannot_claim_substantive_review(self) -> None:
+        review = _self_review("tools/pr_review_gate.py", iterations=5)
+        review["review_iterations"][4]["summary"] = "PASS"
+        checked = gate.evaluate_review_gate(
+            _state("tools/pr_review_gate.py"), self_review=review
+        )
+        self.assertEqual(checked["verdict"], "BLOCK")
+        self.assertTrue(_has_failure(checked, "lacks a substantive summary"), checked["failures"])
+
+    def test_critical_fifth_pass_requires_referenced_evidence(self) -> None:
+        review = _self_review("tools/pr_review_gate.py", iterations=5)
+        review["review_iterations"][4]["evidence_refs"] = []
+        checked = gate.evaluate_review_gate(
+            _state("tools/pr_review_gate.py"), self_review=review
+        )
+        self.assertEqual(checked["verdict"], "BLOCK")
+        self.assertTrue(_has_failure(checked, "lacks concrete evidence_refs"), checked["failures"])
+
+    def test_critical_private_audit_preserves_five_distinct_axes_and_proof_hash(self) -> None:
+        state = _state("tools/pr_review_gate.py")
+        review = _self_review("tools/pr_review_gate.py", iterations=5)
+        result = gate.evaluate_review_gate(state, self_review=review)
+        self.assertEqual(result["verdict"], "PASS", result["failures"])
+        audit = gate.build_self_review_audit(state, result, review)
+        self.assertEqual(audit["review_pass_axes"], list(gate.REQUIRED_HIGH_CRITICAL_REVIEW_AXES))
+        self.assertEqual(audit["review_iterations"], review["review_iterations"])
+        self.assertEqual(
+            audit["review_pass_evidence_sha256"],
+            hashlib.sha256(
+                json.dumps(
+                    audit["review_iterations"], sort_keys=True,
+                    separators=(",", ":"), ensure_ascii=False,
+                ).encode("utf-8")
+            ).hexdigest(),
+        )
+        self.assertRegex(audit["review_pass_evidence_sha256"], r"^[0-9a-f]{64}$")
+
+    def test_sixth_critical_method_does_not_invalidate_five_required_axes(self) -> None:
+        state = _state("tools/pr_review_gate.py")
+        review = _self_review("tools/pr_review_gate.py", iterations=6)
+        result = gate.evaluate_review_gate(state, self_review=review)
+        self.assertEqual(result["verdict"], "PASS", result["failures"])
+        audit = gate.build_self_review_audit(state, result, review)
+        self.assertEqual(audit["actual_review_iterations"], 6)
+        self.assertEqual(len(audit["review_pass_axes"]), 6)
+        self.assertEqual(audit["review_pass_axes"][:5], list(
+            gate.REQUIRED_HIGH_CRITICAL_REVIEW_AXES
+        ))
+        self.assertEqual(audit["review_iterations"], review["review_iterations"])
 
     def test_multiple_critical_signals_raise_depth_to_five(self) -> None:
         state = _state("tools/pr_review_gate.py", additions=700, changed_files=16)
@@ -214,7 +371,7 @@ class SelfReviewDepthPolicyTests(unittest.TestCase):
 
     def test_uncertainty_can_raise_standard_change_to_high_critical(self) -> None:
         state = _state("src/feature.py", additions=45)
-        review = _self_review("src/feature.py", iterations=4, uncertainty=0.5)
+        review = _self_review("src/feature.py", iterations=5, uncertainty=0.5)
         result = gate.evaluate_review_gate(state, self_review=review)
         self.assertEqual(result["verdict"], "PASS")
         self.assertEqual(result["complexity"]["review_tier"], "high_critical")
@@ -224,7 +381,7 @@ class SelfReviewDepthPolicyTests(unittest.TestCase):
         state = _state("src/feature.py", additions=45)
         review = _self_review(
             "src/feature.py",
-            iterations=4,
+            iterations=5,
             material_after_first=4,
         )
         result = gate.evaluate_review_gate(state, self_review=review)
@@ -281,16 +438,56 @@ class SelfReviewDepthPolicyTests(unittest.TestCase):
         state = _state("tools/pr_review_gate.py")
         result = gate.evaluate_review_gate(
             state,
-            self_review=_self_review("tools/pr_review_gate.py", iterations=4),
+            self_review=_self_review("tools/pr_review_gate.py", iterations=5),
         )
         self.assertEqual(result["verdict"], "PASS")
         self.assertFalse(result["review_sources"]["external_review_required"])
+
+    def test_high_critical_selfreview_has_no_automatic_external_obligation(self) -> None:
+        state = _state("tools/pr_review_gate.py")
+        result = gate.evaluate_review_gate(
+            state, self_review=_self_review("tools/pr_review_gate.py", iterations=5),
+        )
+        self.assertEqual(result["verdict"], "PASS", result["failures"])
+        self.assertTrue(result["complexity"]["high_critical"])
+        self.assertFalse(result["review_sources"]["independent_review_required"])
+
+    def test_explicit_extra_review_blocks_when_evidence_is_absent(self) -> None:
+        state = _state("tools/pr_review_gate.py")
+        result = gate.evaluate_review_gate(
+            state,
+            self_review=_self_review("tools/pr_review_gate.py", iterations=5),
+            require_independent_review=True,
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(result["review_sources"]["independent_review_required"])
+        self.assertTrue(_has_failure(result, "external"), result["failures"])
+
+    def test_explicit_extra_review_rejects_malformed_evidence(self) -> None:
+        state = _state("tools/pr_review_gate.py")
+        result = gate.evaluate_review_gate(
+            state,
+            self_review=_self_review("tools/pr_review_gate.py", iterations=5),
+            external_review_evidence={"kind": "forged-PASS"},
+            require_independent_review=True,
+        )
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(_has_failure(result, "external"), result["failures"])
+
+    def test_remaining_material_findings_cannot_be_waived(self) -> None:
+        state = _state("tools/pr_review_gate.py")
+        review = _self_review("tools/pr_review_gate.py", iterations=5)
+        review["material_findings_remaining"] = 1
+        review["residual_risk"] = {"accepted": True, "reason": "not a finding resolution"}
+        result = gate.evaluate_review_gate(state, self_review=review)
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(_has_failure(result, "material findings remain"), result["failures"])
 
     def test_invalid_optional_external_evidence_warns_but_does_not_block(self) -> None:
         state = _state("tools/pr_review_gate.py")
         result = gate.evaluate_review_gate(
             state,
-            self_review=_self_review("tools/pr_review_gate.py", iterations=4),
+            self_review=_self_review("tools/pr_review_gate.py", iterations=5),
             external_review_evidence={"kind": "broken"},
         )
         self.assertEqual(result["verdict"], "PASS")
@@ -324,7 +521,7 @@ class SelfReviewDepthPolicyTests(unittest.TestCase):
         }
         result = gate.evaluate_review_gate(
             state,
-            self_review=_self_review("tools/pr_review_gate.py", iterations=4),
+            self_review=_self_review("tools/pr_review_gate.py", iterations=5),
             external_review_evidence=evidence,
         )
         self.assertEqual(result["verdict"], "PASS")
@@ -336,7 +533,7 @@ class SelfReviewDepthPolicyTests(unittest.TestCase):
         state = _state("tools/pr_review_gate.py")
         result = gate.evaluate_review_gate(
             state,
-            self_review=_self_review("tools/pr_review_gate.py", iterations=4),
+            self_review=_self_review("tools/pr_review_gate.py", iterations=5),
             policy_waiver={"kind": "obsolete"},
         )
         self.assertEqual(result["verdict"], "PASS")

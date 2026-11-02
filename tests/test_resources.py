@@ -59,6 +59,18 @@ class ResourceTests(unittest.TestCase):
         self.patch.stop()
         self.temporary.cleanup()
 
+    def test_bureau_runtime_exact_67_resources_fit_one_atomic_lease(self) -> None:
+        keys = ["path:" + str(self.root / ("stage-%03d" % i)) for i in range(67)]
+        self.assertEqual(67, len(resources.normalize_resource_keys(keys)))
+        owner = "operator:bureau-exact-67-resource-test"
+        resources.acquire_resources(owner, keys, purpose="Bureau exact bound set")
+        self.assertEqual(67, len(resources.list_resources(owner_id=owner)))
+        resources.release_resources(owner, keys)
+
+        excess = ["path:" + str(self.root / ("stage-%03d" % i)) for i in range(97)]
+        with self.assertRaisesRegex(ValueError, "at most 96 resource keys"):
+            resources.normalize_resource_keys(excess)
+
     def test_resource_writer_connections_are_closed_across_lease_lifecycle(self) -> None:
         # SQLite's connection context manager commits but does not close.
         # Hold references to every connection so garbage collection cannot
@@ -7589,6 +7601,128 @@ class ResourceTests(unittest.TestCase):
             set(snapshot),
         )
         self.assertNotIn("future_public_field", snapshot)
+
+
+
+class BureauPostMergePhysicalLeaseTests(unittest.TestCase):
+    def test_worktree_admin_accepts_only_real_bureau_checkout_physical_locks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "bureau"
+            repo.mkdir()
+            git_dir = repo / ".git"
+            git_dir.mkdir()
+            root_stat = repo.stat()
+            git_stat = git_dir.stat()
+            admin_key = f"path:{repo / '.bureau-scopes' / 'worktree-admin'}"
+            root_identity = (
+                f"component:physical-checkout-root:{root_stat.st_dev}:{root_stat.st_ino}"
+            )
+            git_identity = (
+                f"component:physical-git-common-dir:{git_stat.st_dev}:{git_stat.st_ino}"
+            )
+            keys = resources.normalize_resource_keys([
+                root_identity, git_identity, admin_key,
+                f"path:{repo}", f"path:{git_dir}",
+            ])
+            scope = {
+                "schema_version": 1,
+                "repository": str(repo),
+                "task_id": "post-merge-sync-" + "a" * 16,
+                "base_head": "a" * 40,
+                "head": "b" * 40,
+                "branch": "main",
+                "worktree": str(repo),
+                "effects": ["worktree-admin"],
+                "paths": [str(repo)],
+                "components": [],
+                "runtime_resources": [],
+                "processes": [],
+                "deployments": [],
+                "migrations": [],
+                "generated_artifacts": [],
+                "shared_gates": ["repository-worktree-admin"],
+            }
+
+            def assess(asked_keys: list[str], asked_scope: dict = scope) -> None:
+                with sqlite3.connect(":memory:") as connection:
+                    return resources._check_repository_semantic_conflicts(
+                        connection,
+                        keys=resources.normalize_resource_keys(asked_keys),
+                        owner="operator:physical-admin-regression",
+                        purpose="protected main exact fast-forward",
+                        ttl_seconds=300,
+                        metadata={"scope_manifest": asked_scope},
+                        nonconflict_proof=None,
+                        now=1,
+                    )
+
+            with (
+                patch.object(resources.bureau_leases, "BUREAU_REPOSITORY_ROOT", repo),
+                patch.object(resources.bureau_leases, "BUREAU_WORKTREE_ADMIN_KEY", admin_key),
+            ):
+                self.assertIsNone(assess(keys))
+
+                # Exercise the real atomic lease writer against an isolated DB.
+                # Only the production Bureau CLI authority is replaced by a
+                # known-valid contract result; no live database is touched.
+                with (
+                    patch.object(resources, "RESOURCE_DB", Path(directory) / "resources.sqlite3"),
+                    patch.object(
+                        resources.bureau_leases,
+                        "enforce_bureau_lease_contract",
+                        return_value={"phase": "worktree-admin"},
+                    ),
+                ):
+                    owner = "operator:physical-admin-regression"
+                    arguments = {
+                        "purpose": "protected main exact fast-forward",
+                        "ttl_seconds": 300,
+                        "metadata": {"scope_manifest": scope},
+                        "_work_admission_mode": "convergence",
+                    }
+                    with self.assertRaisesRegex(ValueError, "Bureau and non-Bureau"):
+                        resources.acquire_resources(
+                            owner, [*keys, "component:rogue-fence"], **arguments
+                        )
+                    self.assertEqual([], resources.list_resources(owner_id=owner))
+                    acquired = resources.acquire_resources(owner, keys, **arguments)
+                    self.assertEqual(
+                        keys,
+                        [item["resource_key"] for item in acquired["leases"]],
+                    )
+                    self.assertEqual(len(keys), len(resources.list_resources(owner_id=owner)))
+                    resources.release_resources(owner, keys)
+                    self.assertEqual([], resources.list_resources(owner_id=owner))
+                # A physical token without the real device/inode proves nothing.
+                for alien in (
+                    root_identity + "-foreign",
+                    f"component:physical-checkout-root:{root_stat.st_dev + 1}:{root_stat.st_ino}",
+                    f"component:physical-git-common-dir:{git_stat.st_dev}:{git_stat.st_ino + 1}",
+                    "component:unrelated-fence",
+                ):
+                    with self.subTest(alien=alien):
+                        replaced = [key for key in keys if key not in (root_identity, git_identity)]
+                        with self.assertRaisesRegex(ValueError, "Bureau and non-Bureau"):
+                            assess([*replaced, alien, git_identity])
+                with self.assertRaisesRegex(ValueError, "Bureau and non-Bureau"):
+                    assess([key for key in keys if key != admin_key])
+                # Other Bureau paths and non-postmerge tasks must not inherit
+                # the exceptional physical-lock admission.
+                with self.assertRaisesRegex(ValueError, "Bureau and non-Bureau"):
+                    assess([*keys, f"path:{repo / 'extra-file'}"])
+                with self.assertRaisesRegex(ValueError, "Bureau and non-Bureau"):
+                    assess(keys, {**scope, "task_id": "unrelated-resource-operation"})
+                with self.assertRaisesRegex(ValueError, "Bureau and non-Bureau"):
+                    assess(keys, {**scope, "effects": ["read"]})
+                with self.assertRaisesRegex(ValueError, "requires shared gate"):
+                    assess(keys, {**scope, "shared_gates": []})
+                # Symlink substitution must not authenticate an old inode token.
+                git_dir.rmdir()
+                real_git = Path(directory) / "foreign-git"
+                real_git.mkdir()
+                git_dir.symlink_to(real_git, target_is_directory=True)
+                with self.assertRaisesRegex(ValueError, "Bureau and non-Bureau"):
+                    assess(keys)
 
 
 

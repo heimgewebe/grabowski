@@ -63,12 +63,14 @@ class CheckoutIdentityTests(unittest.TestCase):
         self.worktrees = self.root / "worktrees"
         self.checkout = self.worktrees / "topic"
         self.checkout_db = self.root / "state" / "checkouts.sqlite3"
+        self.resource_db = self.root / "state" / "resources.sqlite3"
         self.now = 1_800_000_000
         self.repo.mkdir()
         self.common_dir.mkdir()
         self.worktrees.mkdir()
         self.patches = [
             patch.object(checkouts, "CHECKOUT_DB", self.checkout_db),
+            patch.object(checkouts.resources, "RESOURCE_DB", self.resource_db),
             patch.object(checkouts, "_git_common_dir", return_value=self.common_dir),
             patch.object(identity, "_now", return_value=self.now),
         ]
@@ -358,6 +360,104 @@ class CheckoutIdentityTests(unittest.TestCase):
             identity._ensure_schema(connection)
             row = connection.execute(query, parameters).fetchone()
         return None if row is None else dict(row)
+
+    def _live_checkout_path_lease(self, path: Path, owner: str) -> None:
+        with checkouts.resources._database() as connection:
+            connection.execute(
+                "INSERT INTO leases (resource_key, owner_id, purpose, "
+                "acquired_at_unix, updated_at_unix, expires_at_unix, "
+                "metadata_sha256, metadata_json, reclaimed_from_owner) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+                (
+                    f"path:{path.resolve(strict=False)}", owner, "test live checkout",
+                    self.now - 10, self.now - 10, self.now + 3600,
+                    "a" * 64, "{}",
+                ),
+            )
+            connection.commit()
+
+    def _active_slot_probe_inputs(self) -> dict[str, object]:
+        return {
+            **self._inputs(),
+            "repo_common_dir": str(self.common_dir.resolve()),
+            "checkout_key": self._checkout_key(),
+        }
+
+    def test_identity_rebind_cannot_exempt_existing_checkout_when_other_slot_full(self) -> None:
+        """Rebinding an already-leased row may not exceed the live writer limit."""
+        prior = self._seed_prior(owner="owner-new", branch="new-topic", head=NEW_HEAD)
+        competing_path = self.worktrees / "competing-writer"
+        self._seed_prior(
+            path=competing_path, owner="owner-other", branch="competing-topic",
+        )
+        self._live_checkout_path_lease(competing_path, "owner-other")
+        self._live_checkout_path_lease(self.checkout, "owner-new")
+        with (
+            patch.object(checkouts, "MAX_ACTIVE_CHECKOUTS_PER_REPO", 1),
+            checkouts._database() as connection,
+        ):
+            lifecycle = connection.execute(
+                "SELECT * FROM lifecycle_bindings WHERE checkout_key=?",
+                (prior["checkout_key"],),
+            ).fetchone()
+            self.assertIsNotNone(lifecycle)
+            with self.assertRaisesRegex(
+                identity.CheckoutIdentityConflict, "active checkout capacity",
+            ):
+                identity._active_slot_available(
+                    connection,
+                    inputs=self._active_slot_probe_inputs(),
+                    lifecycle=dict(lifecycle),
+                    now=self.now,
+                )
+
+    def test_identity_rebind_admits_when_other_active_binding_is_retained_only(self) -> None:
+        # The legacy limit counted long-term retention as active execution.
+        old_checkout = self.worktrees / "retained-only"
+        self._seed_prior(path=old_checkout, active_retention=True)
+        self._live_checkout_path_lease(self.checkout, "owner-new")
+        with (
+            patch.object(checkouts, "MAX_ACTIVE_CHECKOUTS_PER_REPO", 1),
+            checkouts._database() as connection,
+        ):
+            identity._active_slot_available(
+                connection, inputs=self._active_slot_probe_inputs(),
+                lifecycle=None, now=self.now,
+            )
+        self.assertTrue(old_checkout.parent.is_dir())
+
+    def test_identity_rebind_rejects_true_competing_checkout_lease_at_limit(self) -> None:
+        old_checkout = self.worktrees / "active-writer"
+        self._seed_prior(path=old_checkout, active_retention=True)
+        self._live_checkout_path_lease(old_checkout, "owner-old")
+        self._live_checkout_path_lease(self.checkout, "owner-new")
+        with (
+            patch.object(checkouts, "MAX_ACTIVE_CHECKOUTS_PER_REPO", 1),
+            checkouts._database() as connection,
+        ):
+            with self.assertRaisesRegex(
+                identity.CheckoutIdentityConflict, "active checkout capacity",
+            ):
+                identity._active_slot_available(
+                    connection, inputs=self._active_slot_probe_inputs(),
+                    lifecycle=None, now=self.now,
+                )
+
+    def test_identity_rebind_ignores_unrelated_owner_path_lease(self) -> None:
+        # A live lease elsewhere belonging to the retained checkout owner
+        # does not make that historical checkout an active writer.
+        old_checkout = self.worktrees / "retained-other-lease"
+        self._seed_prior(path=old_checkout, active_retention=True)
+        self._live_checkout_path_lease(self.worktrees / "unrelated", "owner-old")
+        self._live_checkout_path_lease(self.checkout, "owner-new")
+        with (
+            patch.object(checkouts, "MAX_ACTIVE_CHECKOUTS_PER_REPO", 1),
+            checkouts._database() as connection,
+        ):
+            identity._active_slot_available(
+                connection, inputs=self._active_slot_probe_inputs(),
+                lifecycle=None, now=self.now,
+            )
 
     def test_open_archive_reuse_requires_explicit_supersession(self) -> None:
         self._seed_prior(phase="archived", active_retention=False, archive=True)

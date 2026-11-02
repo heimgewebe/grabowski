@@ -257,6 +257,11 @@ def _collect_effect(
         )
     state = str(collected.get("state", "unknown"))
     actions.append({"action": "collect", "state": state})
+    if state == "controller_self_review_pending":
+        return _outcome(
+            identifier, "pending", "controller_self_review_pending",
+            polls=polls, actions=actions, status=status,
+        )
     if state in COLLECT_PROGRESS_STATES:
         return None
     if state in COLLECT_UNKNOWN_STATES:

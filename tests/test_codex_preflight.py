@@ -38,8 +38,12 @@ for line in sys.stdin:
         time.sleep(5)
     if mode == "abort" and method == "account/read":
         sys.exit(2)
-    if mode in {"remote_notification", "semantic_notification"} and method == "initialize":
-        event = "remoteControl/status/changed" if mode == "remote_notification" else "item/reasoning/textDelta"
+    if mode in {"remote_notification", "semantic_notification", "config_warning"} and method == "initialize":
+        event = {
+            "remote_notification": "remoteControl/status/changed",
+            "semantic_notification": "item/reasoning/textDelta",
+            "config_warning": "configWarning",
+        }[mode]
         sys.stdout.write(json.dumps({"jsonrpc": "2.0", "method": event, "params": {}}, separators=(",", ":")) + "\n")
         sys.stdout.flush()
     if mode == "malformed_notification" and method == "initialize":
@@ -157,6 +161,9 @@ class CodexPreflightProtocolTests(unittest.TestCase):
 
     def test_real_app_server_remote_control_status_notification_is_nonsemantic(self):
         self.assertEqual("metadata_accepted", self.probe("remote_notification")["status"])
+
+    def test_codex_config_warning_is_nonsemantic_metadata_notification(self):
+        self.assertEqual("metadata_accepted", self.probe("config_warning")["status"])
 
     def test_unsolicited_semantic_notification_remains_forbidden(self):
         self.assert_denied("semantic_notification", "unexpected_notification")

@@ -357,8 +357,9 @@ class TaskTests(unittest.TestCase):
         )
         separator = launch.index("--")
         capture = launch[separator + 1 :]
-        paths = tasks._task_output_paths(result["task"])
-        script = tasks._task_output_capture_script_path()
+        persisted = tasks._row_raw(str(result["task"]["task_id"]))
+        paths = tasks._task_output_paths(persisted)
+        script = tasks._task_output_capture_script_path(persisted)
         if selected["transport"] == "local":
             self.assertTrue(script.is_file(), "local launch must stage the wrapper")
             self.assertEqual(script.read_text(), tasks.TASK_OUTPUT_CAPTURE_CODE)
@@ -503,6 +504,184 @@ class TaskTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "could not be staged"):
                 tasks._stage_task_output_capture_script("heimserver", transport="ssh")
 
+    def test_legacy_local_status_survives_missing_fleet_registry(self) -> None:
+        started = self._start()
+        probe = _launcher()
+        probe["stdout"] = (
+            "LoadState=loaded\nActiveState=active\nSubState=running\n"
+            "Result=success\nExecMainCode=0\nExecMainStatus=0\n"
+        )
+        with patch.object(
+            tasks.fleet, "fleet_host",
+            side_effect=RuntimeError("Fleet registry missing: /ci/fleet.json"),
+        ), patch.object(tasks, "_dispatch", return_value=probe):
+            status = tasks.grabowski_task_status(started["task"]["task_id"])
+        self.assertEqual(status["state"], "running")
+
+    def test_ssh_status_missing_fleet_registry_stays_blocked(self) -> None:
+        started = self._start(host="heimserver")
+        record = tasks._row_raw(str(started["task"]["task_id"]))
+        with patch.object(
+            tasks.fleet, "fleet_host",
+            side_effect=RuntimeError("Fleet registry missing: /ci/fleet.json"),
+        ), patch.object(tasks, "_dispatch") as dispatch:
+            with self.assertRaisesRegex(RuntimeError, "remote target authority unavailable"):
+                tasks._observe(record)
+            dispatch.assert_not_called()
+
+    def test_ssh_without_task_home_binds_target_and_denies_drift(self) -> None:
+        with patch.dict(REMOTE_HOST, {"target": "remote"}), patch.object(
+            tasks.fleet, "fleet_host", return_value=REMOTE_HOST
+        ):
+            started = self._start(host="heimserver")
+            record = tasks._row_raw(str(started["task"]["task_id"]))
+            binding = json.loads(record["launcher_json"])
+            self.assertEqual(binding["task_output_remote_target"], "remote")
+            self.assertNotIn("task_output_remote_home", binding)
+            self.assertIsNone(tasks._task_output_remote_home(record))
+            REMOTE_HOST["target"] = "remote-other-host"
+            with self.assertRaisesRegex(RuntimeError, "remote task.*(identity|target)|target binding"):
+                tasks._require_reused_task_target_identity(record)
+            with patch.object(tasks, "_dispatch") as dispatch:
+                with self.assertRaisesRegex(RuntimeError, "remote task.*(identity|target)|target binding"):
+                    tasks._observe(record)
+                dispatch.assert_not_called()
+
+    def test_ssh_effect_time_target_swap_denied_inside_fleet_dispatch(self) -> None:
+        good = {**REMOTE_HOST, "target": "remote"}
+        changed = {**REMOTE_HOST, "target": "remote-other-host"}
+        with (
+            patch.object(tasks.fleet, "fleet_host", side_effect=[good, changed]),
+            patch.object(tasks.fleet.operator, "_run") as runner,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "target.*changed|target.*mismatch"):
+                tasks._dispatch(
+                    "heimserver", ["systemctl", "--user", "show", "example.service"],
+                    expected_target="remote",
+                )
+            runner.assert_not_called()
+
+    def test_ssh_task_home_is_bound_across_stage_capture_read_and_cleanup(self) -> None:
+        with patch.dict(REMOTE_HOST, {"task_home": "/home/remote"}), patch.object(
+            tasks.fleet, "fleet_host", return_value=REMOTE_HOST
+        ):
+            self.assertEqual(tasks._validate_cwd("heimserver", None), "/home/remote")
+            started = self._start(host="heimserver")
+            record = tasks._row_raw(str(started["task"]["task_id"]))
+            binding = json.loads(record["launcher_json"])
+            self.assertEqual(binding["task_output_remote_home"], "/home/remote")
+            self.assertEqual(binding["task_output_remote_target"], "remote")
+            script = tasks._task_output_capture_script_path(record)
+            self.assertEqual(
+                script.parent, Path("/home/remote/.local/state/grabowski/task-capture")
+            )
+            capture = tasks._task_output_capture_argv(record)
+            self.assertEqual(capture[1], str(script))
+            self.assertEqual(capture[2], str(tasks._task_output_paths(record)["directory"]))
+            self.assertTrue(capture[2].startswith("/home/remote/.grabowski-task-output-"))
+            cleanup = tasks._task_output_cleanup_argv(
+                record, mode="inspect", token="a" * 64
+            )
+            self.assertEqual(cleanup[4], capture[2])
+            with patch.object(
+                tasks.fleet, "run_fleet_task_capture_stage",
+                return_value={"result": {"returncode": 0, "stdout": "present"}},
+            ) as stage:
+                staged = tasks._stage_task_output_capture_script(
+                    "heimserver", transport="ssh", record=record
+                )
+            self.assertEqual(staged["path"], str(script))
+            self.assertEqual(stage.call_args.args[1][3], str(script))
+
+    def test_remote_home_drift_stops_launch_without_dispatch(self) -> None:
+        with patch.dict(REMOTE_HOST, {"task_home": "/home/remote"}), patch.object(
+            tasks.fleet, "fleet_host", return_value=REMOTE_HOST
+        ):
+            started = self._start(host="heimserver")
+            record = tasks._row_raw(str(started["task"]["task_id"]))
+            REMOTE_HOST["task_home"] = "/home/other"
+            with self.assertRaisesRegex(RuntimeError, "differs from fleet authority"):
+                tasks._task_output_paths(record)
+            with patch.object(tasks, "_dispatch") as dispatch:
+                refused = tasks._launch(record)
+            dispatch.assert_not_called()
+            self.assertTrue(refused["launch_not_dispatched"])
+            self.assertEqual(refused["returncode"], 1)
+
+    def test_remote_ssh_target_drift_is_not_a_home_match(self) -> None:
+        with patch.dict(REMOTE_HOST, {"task_home": "/home/remote"}), patch.object(
+            tasks.fleet, "fleet_host", return_value=REMOTE_HOST
+        ):
+            started = self._start(host="heimserver")
+            record = tasks._row_raw(str(started["task"]["task_id"]))
+            REMOTE_HOST["target"] = "another-host"
+            with self.assertRaisesRegex(RuntimeError, "differs from fleet authority"):
+                tasks._task_output_paths(record)
+            with patch.object(tasks, "_dispatch") as dispatch:
+                result = tasks._launch(record)
+            dispatch.assert_not_called()
+            self.assertTrue(result["launch_not_dispatched"])
+
+    def test_remote_host_identity_drift_blocks_prior_task_reuse(self) -> None:
+        with patch.dict(REMOTE_HOST, {"task_home": "/home/remote"}), patch.object(
+            tasks.fleet, "fleet_host", return_value=REMOTE_HOST
+        ):
+            started = self._start(host="heimserver")
+            previous = tasks._row_raw(str(started["task"]["task_id"]))
+            REMOTE_HOST["target"] = "another-host"
+            kwargs = {
+                "cwd": str(self.root),
+                "runtime_seconds": 60,
+                "resume_policy": "verify-then-retry",
+                "cpu_weight": 50,
+                "io_weight": 25,
+                "memory_max_bytes": 64 * 1024 * 1024,
+            }
+            with (
+                patch.object(
+                    tasks, "_normalize_task_operation_identity",
+                    return_value={"operation_identity_sha256": "a" * 64},
+                ),
+                patch.object(
+                    tasks, "_resolve_task_operation_identity",
+                    return_value={"reuse": previous, "reuse_reason": "matched", "retry_binding": None},
+                ),
+                patch.object(tasks, "_dispatch") as dispatch,
+                patch.object(tasks.base, "_append_audit"),
+                patch.object(tasks, "_require_recovery_gate", return_value={"checked_at_unix": 123}),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "remote task.*identity"):
+                    tasks.grabowski_task_start("heimserver", ["/bin/echo", "ok"], **kwargs)
+                dispatch.assert_not_called()
+            with (
+                patch.object(tasks, "_latest_matching_active_execution_record", return_value=previous),
+                patch.object(tasks, "_resolve_recent_completed_execution_reuse", return_value=None),
+                patch.object(tasks, "_dispatch") as dispatch,
+                patch.object(tasks.base, "_append_audit"),
+                patch.object(tasks, "_require_recovery_gate", return_value={"checked_at_unix": 123}),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "remote task.*identity"):
+                    tasks.grabowski_task_start("heimserver", ["/bin/echo", "ok"], **kwargs)
+                dispatch.assert_not_called()
+
+    def test_legacy_ssh_task_cannot_silently_adopt_new_home(self) -> None:
+        started = self._start(host="heimserver")
+        record = tasks._row_raw(str(started["task"]["task_id"]))
+        with patch.dict(REMOTE_HOST, {"task_home": "/home/remote"}), patch.object(
+            tasks.fleet, "fleet_host", return_value=REMOTE_HOST
+        ), patch.object(tasks, "_dispatch") as dispatch:
+            result = tasks._launch(record)
+        dispatch.assert_not_called()
+        self.assertTrue(result["launch_not_dispatched"])
+
+    def test_ssh_capture_staging_requires_positive_bound_readback(self) -> None:
+        with patch.object(
+            tasks.fleet, "run_fleet_task_capture_stage",
+            return_value={"result": {"returncode": 0, "stdout": "unverified"}},
+        ):
+            with self.assertRaisesRegex(RuntimeError, "could not be staged"):
+                tasks._stage_task_output_capture_script("heimserver", transport="ssh")
+
     def test_staging_bootstrap_stays_small_and_writes_the_wrapper(self) -> None:
         self.assertLess(
             len(tasks.TASK_OUTPUT_CAPTURE_STAGE_CODE.encode("utf-8")),
@@ -588,6 +767,7 @@ class TaskTests(unittest.TestCase):
             "attempt": 1,
             "argv_json": json.dumps(["/bin/echo", "hello"]),
             "backend": "user-systemd",
+            "launcher_json": json.dumps({tasks.TASK_OUTPUT_REMOTE_TARGET_BINDING_KEY: "remote"}),
         }
         with patch.object(
             tasks.fleet, "fleet_host", return_value=REMOTE_HOST
@@ -2930,7 +3110,9 @@ class TaskTests(unittest.TestCase):
         task_id = started["task"]["task_id"]
         missing = _launcher(returncode=1)
         missing["stderr"] = "unit not found"
-        with patch.object(tasks, "_dispatch", return_value=missing), patch.object(
+        with patch.object(
+            tasks.fleet, "fleet_host", return_value=REMOTE_HOST
+        ), patch.object(tasks, "_dispatch", return_value=missing), patch.object(
             tasks.base, "_append_audit"
         ), patch.object(
             tasks, "_require_recovery_gate", return_value={"checked_at_unix": 124}
@@ -3045,6 +3227,8 @@ class TaskTests(unittest.TestCase):
             "result": probe,
         }
         with patch.object(
+            tasks.fleet, "fleet_host", return_value={**REMOTE_HOST, "target": "remote"}
+        ), patch.object(
             tasks,
             "_dispatch",
             side_effect=tasks.fleet.FleetCommandDenied("Executable is not allowed for fleet host wg-prod-1: systemctl"),
@@ -3054,6 +3238,7 @@ class TaskTests(unittest.TestCase):
             result = tasks._observe({
                 "host": "wg-prod-1",
                 "unit": "grabowski-task-0123456789abcdef01234567-a1.service",
+                "launcher_json": json.dumps({tasks.TASK_OUTPUT_REMOTE_TARGET_BINDING_KEY: "remote"}),
             })
         self.assertEqual(result["state"], "completed")
         self.assertEqual(result["observer"]["kind"], tasks.fleet.TASK_UNIT_SHOW_OBSERVER)
@@ -3067,10 +3252,13 @@ class TaskTests(unittest.TestCase):
             tasks.fleet.TASK_UNIT_SHOW_PROPERTIES,
             timeout_seconds=30,
             max_output_bytes=8192,
+            expected_target="remote",
         )
 
     def test_reconcile_observer_propagates_narrow_probe_failure(self) -> None:
         with patch.object(
+            tasks.fleet, "fleet_host", return_value={**REMOTE_HOST, "target": "remote"}
+        ), patch.object(
             tasks,
             "_dispatch",
             side_effect=tasks.fleet.FleetCommandDenied("Executable is not allowed for fleet host wg-prod-1: systemctl"),
@@ -3081,6 +3269,7 @@ class TaskTests(unittest.TestCase):
                 tasks._observe({
                     "host": "wg-prod-1",
                     "unit": "grabowski-task-0123456789abcdef01234567-a1.service",
+                    "launcher_json": json.dumps({tasks.TASK_OUTPUT_REMOTE_TARGET_BINDING_KEY: "remote"}),
                 })
 
     def test_task_start_resume_policy_schema_matches_runtime_contract(self) -> None:
@@ -3241,6 +3430,39 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(payload["argv"], ["/usr/local/bin/sleep-heimserver"])
         self.assertEqual(payload["runtime_seconds"], 300)
         self.assertEqual(result["audit"]["execution_backend"], "systemd-root-broker")
+
+    def test_root_broker_resume_survives_missing_fleet_registry(self) -> None:
+        started = self._start()
+        task_id = str(started["task"]["task_id"])
+        with tasks._database_connection() as connection:
+            connection.execute(
+                "UPDATE tasks SET execution_backend='systemd-root-broker', "
+                "systemd_scope='system' WHERE task_id=?",
+                (task_id,),
+            )
+        observation = {
+            "state": "failed",
+            "properties": {"Result": "exit-code"},
+            "probe": _launcher(returncode=1),
+            "observer": {"kind": "test"},
+            "observed_at_unix": int(time.time()),
+        }
+        with (
+            patch.object(tasks, "_observe", return_value=observation),
+            patch.object(tasks, "_launch", return_value=_launcher()) as launch,
+            patch.object(
+                tasks.fleet,
+                "fleet_host",
+                side_effect=RuntimeError("Fleet registry missing: /ci/fleet.json"),
+            ) as fleet,
+            patch.object(tasks, "_require_recovery_gate", return_value={"checked_at_unix": 207}),
+            patch.object(tasks.base, "_append_audit"),
+        ):
+            resumed = tasks.grabowski_task_resume(task_id)
+        fleet.assert_not_called()
+        launch.assert_called_once()
+        self.assertEqual(resumed["task"]["attempt"], 2)
+        self.assertEqual(resumed["task"]["execution_backend"], "systemd-root-broker")
 
     def test_root_task_status_logs_and_cancel_route_by_stored_scope(self) -> None:
         running = _launcher()
@@ -11934,6 +12156,183 @@ class TaskTests(unittest.TestCase):
         )
         recovery.assert_not_called()
 
+    def test_readonly_snapshot_retries_wal_removed_during_entry(self) -> None:
+        with tasks._database_connection():
+            pass
+        original = tasks.sqlite_store.inventory_coherent_readonly_sqlite
+        attempts = []
+
+        @contextmanager
+        def checkpoint_once(*args, **kwargs):
+            attempts.append(1)
+            if len(attempts) == 1:
+                try:
+                    raise FileNotFoundError(2, "WAL checkpoint", str(tasks.TASK_DB) + "-wal")
+                except FileNotFoundError as missing:
+                    raise tasks.TaskSchemaInventoryChanged("moving WAL") from missing
+            with original(*args, **kwargs) as connection:
+                yield connection
+
+        with patch.object(
+            tasks.sqlite_store, "inventory_coherent_readonly_sqlite",
+            side_effect=checkpoint_once,
+        ):
+            with tasks._task_readonly_snapshot() as reader:
+                self.assertEqual(
+                    tasks.TASK_CURRENT_SCHEMA_VERSION,
+                    tasks._task_schema_version(reader),
+                )
+        self.assertEqual(2, len(attempts))
+
+    def test_readonly_snapshot_checkpoint_retry_is_bounded_and_fail_closed(self) -> None:
+        with tasks._database_connection():
+            pass
+
+        def missing_on_enter(filename):
+            @contextmanager
+            def changed(*args, **kwargs):
+                try:
+                    raise FileNotFoundError(2, "file vanished", str(filename))
+                except FileNotFoundError as missing:
+                    raise tasks.TaskSchemaInventoryChanged("moving WAL") from missing
+                yield
+            return changed
+
+        for filename, expected_attempts in (
+            (str(tasks.TASK_DB) + "-wal", 3),
+            (str(tasks.TASK_DB) + "-shm", 3),
+            (str(tasks.TASK_DB), 1),
+        ):
+            with self.subTest(filename=filename), patch.object(
+                tasks.sqlite_store, "inventory_coherent_readonly_sqlite",
+                side_effect=missing_on_enter(filename),
+            ) as observed:
+                with self.assertRaises(tasks.TaskSchemaInventoryChanged):
+                    with tasks._task_readonly_snapshot():
+                        pass
+                self.assertEqual(expected_attempts, observed.call_count)
+
+    def test_readonly_snapshot_never_retries_after_transaction_entry(self) -> None:
+        with tasks._database_connection():
+            pass
+        original = tasks.sqlite_store.inventory_coherent_readonly_sqlite
+
+        @contextmanager
+        def observed(*args, **kwargs):
+            with original(*args, **kwargs) as connection:
+                yield connection
+
+        with patch.object(
+            tasks.sqlite_store, "inventory_coherent_readonly_sqlite",
+            side_effect=observed,
+        ) as calls:
+            with self.assertRaises(tasks.TaskSchemaInventoryChanged):
+                with tasks._task_readonly_snapshot() as reader:
+                    reader.execute("SELECT 1 FROM tasks LIMIT 1").fetchone()
+                    try:
+                        raise FileNotFoundError(2, "checkpoint", str(tasks.TASK_DB) + "-wal")
+                    except FileNotFoundError as missing:
+                        raise tasks.TaskSchemaInventoryChanged("moving WAL") from missing
+        self.assertEqual(1, calls.call_count)
+
+    def test_task_list_readonly_retries_invalidated_wal_snapshot_at_exit(self) -> None:
+        task = self._start()["task"]
+        original = tasks._task_readonly_snapshot
+        attempts = []
+
+        @contextmanager
+        def snapshot_with_one_checkpoint():
+            attempts.append(1)
+            with original() as connection:
+                yield connection
+            if len(attempts) == 1:
+                # A quiescent, immutable read was rendered invalid when a
+                # new WAL appeared before its final sidecar check.
+                raise tasks.TaskSchemaInventoryChanged("WAL appeared on snapshot exit")
+
+        with patch.object(tasks, "_task_readonly_snapshot", snapshot_with_one_checkpoint):
+            result = tasks.grabowski_task_list(state="running", read_only=True)
+        self.assertEqual([task["task_id"]], [row["task_id"] for row in result["tasks"]])
+        self.assertEqual(2, len(attempts))
+        self.assertTrue(result["read_only_snapshot"])
+        self.assertFalse(result["reconciliation_performed"])
+
+    def test_task_list_readonly_wal_exit_retry_is_bounded_and_fail_closed(self) -> None:
+        self._start()
+        original = tasks._task_readonly_snapshot
+        attempts = []
+
+        @contextmanager
+        def invalidated_on_every_exit():
+            attempts.append(1)
+            with original() as connection:
+                yield connection
+            raise tasks.TaskSchemaInventoryChanged("WAL appeared on snapshot exit")
+
+        with patch.object(tasks, "_task_readonly_snapshot", invalidated_on_every_exit):
+            with self.assertRaises(tasks.TaskSchemaInventoryChanged):
+                tasks.grabowski_task_list(state="running", read_only=True)
+        self.assertEqual(3, len(attempts))
+
+    def test_task_list_readonly_retries_sidecar_entry_but_not_main_file(self) -> None:
+        self._start()
+        original = tasks._task_readonly_snapshot
+
+        def missing_snapshot(filename, *, once):
+            attempts = []
+
+            @contextmanager
+            def snapshot():
+                attempts.append(1)
+                if not once or len(attempts) == 1:
+                    try:
+                        raise FileNotFoundError(2, "checkpoint", filename)
+                    except FileNotFoundError as missing:
+                        raise tasks.TaskSchemaInventoryChanged("moving WAL") from missing
+                with original() as connection:
+                    yield connection
+
+            return snapshot, attempts
+
+        for suffix, retries in (("-wal", 2), ("-shm", 2), ("", 1)):
+            snapshot, attempts = missing_snapshot(
+                str(tasks.TASK_DB) + suffix, once=bool(suffix),
+            )
+            with self.subTest(suffix=suffix), patch.object(
+                tasks, "_task_readonly_snapshot", snapshot,
+            ):
+                if suffix:
+                    self.assertEqual(
+                        1, tasks.grabowski_task_list(state="running", read_only=True)["count"],
+                    )
+                else:
+                    with self.assertRaises(tasks.TaskSchemaInventoryChanged):
+                        tasks.grabowski_task_list(state="running", read_only=True)
+                self.assertEqual(retries, len(attempts))
+
+    def test_task_list_readonly_does_not_retry_mutations_schema_or_permissions(self) -> None:
+        def fail_invalid_inventory(*args, **kwargs):
+            raise tasks.TaskSchemaInventoryChanged("churn")
+
+        for options in (
+            {"read_only": False},
+            {"read_only": True, "schema_only": True},
+        ):
+            with self.subTest(options=options), patch.object(
+                tasks, "_grabowski_task_list_once", side_effect=fail_invalid_inventory,
+            ) as operation:
+                with self.assertRaises(tasks.TaskSchemaInventoryChanged):
+                    tasks.grabowski_task_list(**options)
+                operation.assert_called_once()
+
+        for problem in (PermissionError("denied"), RuntimeError("bad schema")):
+            with self.subTest(problem=type(problem).__name__), patch.object(
+                tasks, "_grabowski_task_list_once", side_effect=problem,
+            ) as operation:
+                with self.assertRaises(type(problem)):
+                    tasks.grabowski_task_list(read_only=True)
+                operation.assert_called_once()
+
     def test_task_schema_only_inventory_reports_migration_without_mutation(self) -> None:
         self._create_task_schema_version("2")
         before = self.database.read_bytes()
@@ -15093,6 +15492,53 @@ class TaskTests(unittest.TestCase):
                 identity,
                 resume_policy="verify-then-retry",
             )
+
+    def test_expired_completed_execution_skips_stale_remote_identity(self) -> None:
+        record, identity = self._completed_execution_reuse_validation_fixture()
+        expired = dict(record)
+        now = tasks._now()
+        expired["terminalized_at_unix"] = (
+            now - tasks.TASK_OPERATION_REUSE_WINDOW_SECONDS - 1
+        )
+        with (
+            patch.object(tasks, "_now", return_value=now),
+            patch.object(
+                tasks,
+                "_latest_matching_unbound_execution_record",
+                return_value=expired,
+            ),
+            patch.object(
+                tasks,
+                "_require_reused_task_target_identity",
+                side_effect=AssertionError("expired task target must not be inspected"),
+            ) as target_check,
+        ):
+            self.assertIsNone(
+                tasks._resolve_recent_completed_execution_reuse(
+                    identity, resume_policy="verify-then-retry"
+                )
+            )
+            target_check.assert_not_called()
+
+    def test_reusable_completed_execution_still_checks_target_identity(self) -> None:
+        record, identity = self._completed_execution_reuse_validation_fixture()
+        with (
+            patch.object(
+                tasks,
+                "_latest_matching_unbound_execution_record",
+                return_value=record,
+            ),
+            patch.object(
+                tasks,
+                "_require_reused_task_target_identity",
+                side_effect=RuntimeError("remote task identity mismatch"),
+            ) as target_check,
+            self.assertRaisesRegex(RuntimeError, "remote task identity mismatch"),
+        ):
+            tasks._resolve_recent_completed_execution_reuse(
+                identity, resume_policy="verify-then-retry"
+            )
+        target_check.assert_called_once_with(record)
 
     def test_unbound_execution_identity_inconsistent_record_fails_closed(self) -> None:
         record, identity = self._completed_execution_reuse_validation_fixture()

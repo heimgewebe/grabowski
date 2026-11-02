@@ -72,6 +72,84 @@ def _execution(source: Path, destination: Path, digest: str, generated_at: int) 
 
 
 class RecoveryFreshnessContractTests(unittest.TestCase):
+    def test_native_optional_snapshot_age_is_bound_without_breaking_legacy(self) -> None:
+        now = 200000
+        def validated(source: dict[str, object]) -> dict[str, object]:
+            raw = (json.dumps(source, sort_keys=True, separators=(",", ":")) + "\n").encode()
+            return broker._validate_recovery_source_record(
+                raw, source_owner_uid=os.getuid(), max_age_seconds=MAX_AGE,
+                configured_target=TARGET, now=now,
+            )
+        legacy = _source_payload(now - 1, snapshot_id="legacy-123")
+        self.assertEqual(validated(legacy)["source"]["snapshot_id"], "legacy-123")
+        native = dict(legacy, snapshot_time_unix=now - 100)
+        self.assertEqual(validated(native)["source"]["snapshot_time_unix"], now - 100)
+        for invalid in (
+            dict(native, snapshot_time_unix=now - MAX_AGE - 1),
+            dict(native, snapshot_time_unix=now + 1),
+            dict(native, snapshot_time_unix=True),
+            dict(native, snapshot_time_unix="1970-01-01"),
+        ):
+            with self.subTest(snapshot_timestamp=invalid["snapshot_time_unix"]):
+                with self.assertRaises(PermissionError):
+                    validated(invalid)
+        with self.assertRaises(ValueError):
+            validated(dict(native, untrusted_extra="ignored"))
+
+
+    def test_native_canonical_marker_and_both_broker_gates_expire_with_original_snapshot(self) -> None:
+        now = 200000
+        original_snapshot_time = now - 23 * 3600
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source = root / "source.json"
+            destination = root / "canonical.json"
+            payload = dict(
+                _source_payload(now, snapshot_id="native-snapshot"),
+                snapshot_time_unix=original_snapshot_time,
+            )
+            encoded = (
+                json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+            ).encode("utf-8")
+            source.write_bytes(encoded)
+            source.chmod(0o600)
+            digest = hashlib.sha256(encoded).hexdigest()
+            execution = _execution(source, destination, digest, now)
+            published = broker.publish_recovery_marker(execution, now=now)
+            self.assertTrue(published["published"])
+
+            fresh = broker.inspect_canonical_recovery_record(
+                destination, now=now, expected_max_age_seconds=MAX_AGE,
+                expected_target=TARGET, require_root_owned=False,
+            )
+            self.assertTrue(fresh["valid"], fresh["error"])
+            self.assertEqual(fresh["snapshot_time_unix"], original_snapshot_time)
+
+            later = now + 2 * 3600
+            stale = broker.inspect_canonical_recovery_record(
+                destination, now=later, expected_max_age_seconds=MAX_AGE,
+                expected_target=TARGET, require_root_owned=False,
+            )
+            self.assertFalse(stale["valid"])
+            self.assertEqual(stale["freshness_reason"], "stale")
+            self.assertEqual(stale["age_seconds"], 2 * 3600)
+            self.assertEqual(stale["snapshot_age_seconds"], 25 * 3600)
+
+            gate = {
+                "recovery_marker_path": str(destination),
+                "max_recovery_age_seconds": MAX_AGE,
+                "require_root_owned_gate_files": False,
+                "configured_target": TARGET,
+            }
+            with self.assertRaisesRegex(PermissionError, "stale"):
+                broker._validate_recovery_gate(gate, now=later)
+            with self.assertRaisesRegex(PermissionError, "stale"):
+                broker._validate_power_gate(
+                    {
+                        **gate, "kill_switch_path": str(root / "absent-kill-switch"),
+                    }, now=later,
+                )
+
     def test_example_config_keeps_recovery_root_task_but_decouples_power(self) -> None:
         config = json.loads((ROOT / "config/privileged-actions.example.json").read_text(encoding="utf-8"))
         publisher = config["actions"]["publish_recovery_marker"]

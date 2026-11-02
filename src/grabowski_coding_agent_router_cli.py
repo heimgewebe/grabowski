@@ -481,6 +481,9 @@ def _grok_subscription_auth_status(
         now = int(time.time()) if now_unix is None else now_unix
         expires_at = claims.get("exp")
         issued_at = claims.get("iat")
+        # An OIDC login without a paid tier can prove model access, not plan entitlement.
+        tier_claim = claims.get("tier")
+        tier_verified = type(tier_claim) is int and tier_claim == contract["tier_code"]
         stable_fields = ("principal_id", "principal_type", "team_id")
         if (
             isinstance(now, bool)
@@ -493,7 +496,7 @@ def _grok_subscription_auth_status(
             or issued_at > now + 300
             or claims.get("iss") != issuer
             or claims.get("principal_type") != contract["principal_type"]
-            or claims.get("tier") != contract["tier_code"]
+            or ("tier" in claims and not tier_verified)
             or claims.get("sub") != record.get("user_id")
             or claims.get("sub") != record.get("principal_id")
             or any(
@@ -514,9 +517,9 @@ def _grok_subscription_auth_status(
         status.update(
             {
                 "authenticated": True,
-                "entitlement_verified": True,
-                "status": "valid",
-                "subscription_tier": contract["plan"],
+                "entitlement_verified": tier_verified,
+                "status": "valid" if tier_verified else "tier-unverified",
+                "subscription_tier": contract["plan"] if tier_verified else None,
                 "account_binding_sha256": hashlib.sha256(
                     json.dumps(
                         binding,
@@ -877,7 +880,7 @@ def _probe(catalog: dict[str, Any]) -> dict[str, Any]:
         grok_logged_in
         and grok_auth_before.get("entitlement_verified") is True
         and grok_auth_after.get("entitlement_verified") is True
-        and "grok-4.6" in grok_models
+        and any(model in grok_models for model in ("grok-4.6", "grok-4.7"))
     )
     providers["grok"] = {
         "available": harnesses.get("grok", {}).get("available") is True,

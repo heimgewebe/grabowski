@@ -73,6 +73,10 @@ class RuntimePythonBindingTests(unittest.TestCase):
                 enabled=enabled,
             )
 
+    def test_runtime_python_uses_the_serving_interpreter(self) -> None:
+        # The currently running NixOS operator is not the retired Ubuntu venv.
+        self.assertEqual(Path(sys.executable), tasks.GRABOWSKI_RUNTIME_PYTHON)
+
     def test_task_start_runtime_python_is_explicit_opt_in(self) -> None:
         parameter = inspect.signature(tasks.grabowski_task_start).parameters[
             "runtime_python"

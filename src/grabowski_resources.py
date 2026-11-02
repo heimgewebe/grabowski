@@ -36,6 +36,8 @@ SERVER_OWNED_AUTHORITY_METADATA_KINDS = frozenset(
 )
 PUBLIC_RESERVED_AUTHORITY_METADATA_FIELDS = frozenset({"unit_file_config_root"})
 DEFAULT_RESOURCE_LIST_LIMIT = 200
+# Bureau runtime refresh requires 67 exact path/service leases; retain an atomic bound.
+MAX_ATOMIC_RESOURCE_KEYS = 96
 RESOURCE_DB = Path(
     os.environ.get(
         "GRABOWSKI_RESOURCE_DB",
@@ -471,7 +473,10 @@ def _validate_resource_lease_contract(connection: sqlite3.Connection) -> str:
 def _begin_resource_lease_projection_read(
     connection: sqlite3.Connection, *, quick_integrity: bool = False
 ) -> str:
-    connection.execute("BEGIN")
+    # The WAL inventory reader may already have pinned a transaction.
+    # A second BEGIN aborts the lease projection; retain that exact snapshot.
+    if not connection.in_transaction:
+        connection.execute("BEGIN")
     if quick_integrity:
         _resource_sqlite_integrity(connection, "Resource database", quick=True)
     return _validate_resource_lease_contract(connection)
@@ -1415,8 +1420,10 @@ def normalize_resource_keys(values: Iterable[str]) -> list[str]:
     normalized = sorted({normalize_resource_key(value) for value in values})
     if not normalized:
         raise ValueError("at least one resource key is required")
-    if len(normalized) > 64:
-        raise ValueError("at most 64 resource keys may be acquired atomically")
+    if len(normalized) > MAX_ATOMIC_RESOURCE_KEYS:
+        raise ValueError(
+            f"at most {MAX_ATOMIC_RESOURCE_KEYS} resource keys may be acquired atomically"
+        )
     return normalized
 
 
@@ -1762,6 +1769,50 @@ def _check_work_lane_path_scope_conflicts(
             )
 
 
+
+def _bureau_worktree_admin_physical_pair(
+    keys: list[str],
+    bureau_keys: list[str],
+    metadata: dict[str, Any],
+) -> bool:
+    """Admit only the live primary-checkout inode locks of one Bureau FF.
+
+    These two physical fences strengthen the existing atomic worktree-admin
+    lease; they are never a blanket mixed Bureau/non-Bureau exemption.
+    """
+    repo = bureau_leases.BUREAU_REPOSITORY_ROOT
+    git_dir = repo / ".git"
+    scope = _scope_manifest_from_metadata(metadata, required=False)
+    if (
+        scope is None
+        or scope.get("repository") != str(repo)
+        or scope.get("worktree") != str(repo)
+        or scope.get("branch") not in {"main", "master"}
+        or scope.get("effects") != ["worktree-admin"]
+        or scope.get("paths") != [str(repo)]
+        or scope.get("shared_gates") != ["repository-worktree-admin"]
+        or re.fullmatch(r"post-merge-sync-[0-9a-f]{16}", str(scope.get("task_id"))) is None
+        or set(bureau_keys) != {
+            bureau_leases.BUREAU_WORKTREE_ADMIN_KEY,
+            f"path:{repo}",
+            f"path:{git_dir}",
+        }
+        or len(keys) != 5
+    ):
+        return False
+    try:
+        root_stat = os.stat(repo, follow_symlinks=False)
+        git_stat = os.stat(git_dir, follow_symlinks=False)
+    except (OSError, ValueError):
+        return False
+    if not (stat.S_ISDIR(root_stat.st_mode) and stat.S_ISDIR(git_stat.st_mode)):
+        return False
+    return set(keys).difference(bureau_keys) == {
+        f"component:physical-checkout-root:{root_stat.st_dev}:{root_stat.st_ino}",
+        f"component:physical-git-common-dir:{git_stat.st_dev}:{git_stat.st_ino}",
+    }
+
+
 def _check_repository_semantic_conflicts(
     connection: sqlite3.Connection,
     *,
@@ -1777,7 +1828,8 @@ def _check_repository_semantic_conflicts(
     # broad-repository rule here would reintroduce the deprecated global blocker.
     bureau_keys = bureau_leases.bureau_resource_keys(keys)
     if bureau_keys and len(bureau_keys) != len(keys):
-        raise ValueError("Bureau and non-Bureau resources must be acquired separately")
+        if not _bureau_worktree_admin_physical_pair(keys, bureau_keys, metadata):
+            raise ValueError("Bureau and non-Bureau resources must be acquired separately")
     if bureau_keys:
         if nonconflict_proof is not None:
             raise nonconflict.NonConflictDenied(
@@ -8160,11 +8212,16 @@ def inspect_resources(resource_keys: Iterable[str]) -> dict[str, dict[str, Any]]
 
 @contextmanager
 def _resource_readonly_snapshot() -> Iterator[sqlite3.Connection]:
-    """Observe a stable store without writes; active WAL sidecars fail closed."""
+    """Observe a stable, transaction-pinned WAL or quiescent store without writes."""
     if RESOURCE_DB.is_symlink() or not RESOURCE_DB.is_file() or RESOURCE_DB.stat().st_size == 0:
         raise RuntimeError("Resource store cannot be observed without explicit initialization")
-    with _resource_inventory_readonly_sqlite(
-        RESOURCE_DB, allow_wal_copy=False
+    with sqlite_store.inventory_coherent_readonly_sqlite(
+        RESOURCE_DB,
+        temporary_prefix="unused-resource-readonly.",
+        error_type=ResourceSchemaInventoryChanged,
+        wal_mutation_admission=lambda: operator._require_operator_mutation(
+            "resource_lease"
+        ),
     ) as connection:
         if _resource_schema_version(connection) != RESOURCE_CURRENT_SCHEMA_VERSION:
             raise RuntimeError("Resource store requires an explicit schema migration")

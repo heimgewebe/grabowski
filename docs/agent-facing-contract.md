@@ -37,9 +37,11 @@ The rendered contract requires the agent to:
    `operation=repository` for a known repository, `operation=truth-owner` for a known
    authority-domain key, and `operation=relations` or `operation=entrypoints` for
    those query classes. Use `operation=authority-matrix` only when no targeted
-   identifier applies and a broader authority map is required. Use RepoGround for
-   local repository, implementation or free-text content. Current runtime, PR and
-   CI truth remains with its owning live source. When a Systemkatalog result changes
+   identifier applies and a broader authority map is required. For a known
+   local file or symbol, prefer the existing typed Git/file read. Use RepoGround
+   selectively for fresh, relevant relation or impact evidence (rule 16).
+   Current runtime, PR and CI truth remains with its owning live source. When a
+   Systemkatalog result changes
    or confirms a decision, record a hash-bound usage receipt through
    `tools/systemkatalog_usage_receipt.py` using only its fixed metadata categories
    and no conversation text or free prose. Do not add a connectivity-only health
@@ -101,7 +103,14 @@ The rendered contract requires the agent to:
     deploy, secret or retry authority. For Flowlines observability, include non-empty
     `reason` and stable `user_intent` on every ordinary tool call and invoke
     `report_outcome` exactly once as the final tool call before every final answer,
-    including read-only, partial, failed or blocked work.
+    including read-only, partial, failed or blocked work;
+16. for a known file or symbol, use typed Git/file reads first; no mandatory
+    RepoGround preflight. For unknown incoming callers, related tests or impact,
+    and revision or cross-repository links, consider one small RepoGround request
+    only when the published bundle is fresh and has useful coverage. Verify
+    returned citations against Git. With stale, unavailable or low-coverage
+    evidence, proceed with Git instead. No forced RepoGround calls, global default
+    promotion, extra cache or new routing service.
 
 The executable rules in `AGENT_INSTRUCTION_RULES` are the source of truth if
 this explanatory list drifts. Native Grabowski surfaces remain first-class

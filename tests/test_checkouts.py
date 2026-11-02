@@ -115,6 +115,240 @@ class CheckoutLifecycleTests(unittest.TestCase):
             text=True,
         )
 
+    def test_live_lease_snapshot_retries_one_transient_wal_change(self) -> None:
+        from contextlib import closing, contextmanager
+
+        with closing(checkouts.resources._database()) as connection:
+            connection.execute("SELECT 1 FROM leases").fetchone()
+        original = checkouts.resources._resource_readonly_snapshot
+        attempts: list[int] = []
+
+        @contextmanager
+        def checkpointed_once():
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise checkouts.resources.ResourceSchemaInventoryChanged(
+                    "Store changed while schema inventory was read; retry inventory"
+                )
+            with original() as connection:
+                yield connection
+
+        with patch.object(checkouts.resources, "_resource_readonly_snapshot", checkpointed_once):
+            self.assertEqual(checkouts._live_checkout_lease_keys(now=int(time.time())), {})
+        self.assertEqual(len(attempts), 2)
+
+        attempts.clear()
+
+        @contextmanager
+        def persistently_changed():
+            attempts.append(1)
+            raise checkouts.resources.ResourceSchemaInventoryChanged(
+                "Store changed while schema inventory was read; retry inventory"
+            )
+            yield  # generator contract, unreachable
+
+        with patch.object(checkouts.resources, "_resource_readonly_snapshot", persistently_changed):
+            with self.assertRaises(checkouts.resources.ResourceSchemaInventoryChanged):
+                checkouts._live_checkout_lease_keys(now=int(time.time()))
+        self.assertEqual(len(attempts), 2)
+
+    def test_rereserving_stale_checkout_cannot_exceed_live_capacity(self) -> None:
+        """Reacquiring a lease for a retained row must not create a 17th writer."""
+        common_dir = self._common_dir()
+        until = int(time.time()) + 3600
+        live_leases: dict[str, str] = {}
+
+        def reserve(name: str) -> dict[str, object]:
+            return checkouts._reserve_checkout_lifecycle(
+                repo_common_dir=common_dir,
+                repo_path=self.repo,
+                checkout_path=self.root / "worktrees" / f"returning-{name}",
+                owner_id=f"owner-{name}",
+                purpose=f"returning checkout {name}",
+                source_kind="work_lane",
+                source_id=f"returning-{name}",
+                artifact_class="implementation-worktree",
+                retention_until_unix=until,
+                expected_head=self.head,
+                expected_branch=f"returning-{name}",
+            )
+
+        with (
+            patch.object(checkouts, "MAX_ACTIVE_CHECKOUTS_PER_REPO", 1),
+            patch.object(
+                checkouts, "_live_checkout_lease_keys",
+                side_effect=lambda *, now: dict(live_leases),
+            ),
+        ):
+            stale = reserve("stale")
+            competitor = reserve("competitor")
+            live_leases[f"path:{competitor['checkout_path']}"] = "owner-competitor"
+            # The retained checkout only begins consuming capacity now.
+            live_leases[f"path:{stale['checkout_path']}"] = "owner-stale"
+            with checkouts._database() as connection:
+                observed_count = checkouts._active_creation_count(
+                    connection, repo_common_dir=common_dir,
+                    exclude_checkout_key=stale["checkout_key"],
+                    now=int(time.time()), live_leases=live_leases,
+                )
+            self.assertEqual(observed_count, 1, f"lease rows: {live_leases!r}")
+            with self.assertRaisesRegex(RuntimeError, "active checkout limit reached"):
+                reserve("stale")
+
+    def test_parallel_checkout_reservations_never_admit_seventeenth_live_lease(self) -> None:
+        """Force the 15/16 stale-lease schedule without timing-dependent sleeps.
+
+        Resource lease evidence is simulated, but concurrent checkout
+        admissions use separate real SQLite connections and writer locks.
+        """
+        import threading
+
+        common_dir = self._common_dir()
+        until = int(time.time()) + 3600
+
+        def reserve(index: str) -> dict[str, object]:
+            return checkouts._reserve_checkout_lifecycle(
+                repo_common_dir=common_dir,
+                repo_path=self.repo,
+                checkout_path=self.root / "worktrees" / f"race-{index}",
+                owner_id=f"race-owner-{index}",
+                purpose=f"race admission {index}",
+                source_kind="work_lane",
+                source_id=f"race-{index}",
+                artifact_class="implementation-worktree",
+                retention_until_unix=until,
+                expected_head=self.head,
+                expected_branch=f"race-{index}",
+            )
+
+        leases: dict[str, str] = {}
+        for index in range(15):
+            binding = reserve(str(index))
+            leases[f"path:{binding['checkout_path']}"] = f"race-owner-{index}"
+        leases[f"path:{self.root / 'worktrees' / 'race-A'}"] = "race-owner-A"
+
+        a_snapshot_seen = threading.Event()
+        b_finished = threading.Event()
+        a_was_locked: list[bool] = []
+        successes: list[str] = []
+        failures: list[BaseException] = []
+
+        def controlled_snapshot(*, now: int) -> dict[str, str]:
+            del now
+            observed = dict(leases)
+            if threading.current_thread().name == "race-admission-A":
+                probe = sqlite3.connect(self.checkout_db, timeout=0)
+                try:
+                    try:
+                        probe.execute("BEGIN IMMEDIATE")
+                    except sqlite3.OperationalError as exc:
+                        if "locked" not in str(exc):
+                            raise
+                        admission_lock_held = True
+                    else:
+                        admission_lock_held = False
+                    finally:
+                        probe.rollback()
+                finally:
+                    probe.close()
+                a_was_locked.append(admission_lock_held)
+                a_snapshot_seen.set()
+                if not admission_lock_held:
+                    if not b_finished.wait(5):
+                        raise AssertionError("B did not finish before stale A snapshot")
+            return observed
+
+        def acquire_a() -> None:
+            try:
+                reserve("A")
+            except BaseException as exc:
+                failures.append(exc)
+            else:
+                successes.append("A")
+
+        with patch.object(
+            checkouts, "_live_checkout_lease_keys", side_effect=controlled_snapshot
+        ):
+            a = threading.Thread(target=acquire_a, name="race-admission-A", daemon=True)
+            a.start()
+            self.assertTrue(a_snapshot_seen.wait(5), "A never sampled leases")
+            try:
+                # B acquires its exact lease after A has sampled the store.
+                leases[f"path:{self.root / 'worktrees' / 'race-B'}"] = "race-owner-B"
+                try:
+                    reserve("B")
+                except RuntimeError as exc:
+                    failures.append(exc)
+                else:
+                    successes.append("B")
+            finally:
+                b_finished.set()
+            a.join(5)
+
+        self.assertFalse(a.is_alive(), "A admission did not terminate")
+        self.assertEqual(len(successes), 1, f"two writers admitted: {successes}")
+        self.assertEqual(len(failures), 1, f"expected one capacity rejection: {failures}")
+        self.assertIn("active checkout limit", str(failures[0]))
+        self.assertEqual(a_was_locked, [True])
+        connection = checkouts._database()
+        try:
+            rows = connection.execute(
+                "SELECT owner_id, checkout_path FROM lifecycle_bindings "
+                "WHERE repo_common_dir=? AND phase='active'",
+                (str(common_dir),),
+            ).fetchall()
+        finally:
+            connection.close()
+        actual_live = sum(
+            leases.get(f"path:{row['checkout_path']}") == row["owner_id"]
+            for row in rows
+        )
+        self.assertEqual(actual_live, 16)
+        self.assertEqual(len(rows), 16)
+
+    def test_checkout_reservation_pins_lease_snapshot_under_sqlite_write_lock(self) -> None:
+        # A snapshot taken before BEGIN IMMEDIATE can omit another lane's
+        # committed live leases even after its lifecycle row becomes visible.
+        # Probe the *second* SQLite connection: it must be denied the writer
+        # lock while the admission routine reads its resource lease snapshot.
+        initialized = checkouts._database()
+        initialized.close()
+        observed = []
+
+        def snapshot_after_admission_lock(*, now: int) -> dict[str, str]:
+            self.assertIsInstance(now, int)
+            probe = sqlite3.connect(self.checkout_db, timeout=0)
+            try:
+                with self.assertRaisesRegex(sqlite3.OperationalError, "locked"):
+                    probe.execute("BEGIN IMMEDIATE")
+            finally:
+                probe.rollback()
+                probe.close()
+            observed.append("checkout-write-lock-held")
+            return {}
+
+        target = self.root / "worktrees" / "serialized-admission"
+        with patch.object(
+            checkouts, "_live_checkout_lease_keys",
+            side_effect=snapshot_after_admission_lock,
+        ) as lease_snapshot:
+            result = checkouts._reserve_checkout_lifecycle(
+                repo_common_dir=self._common_dir(),
+                repo_path=self.repo,
+                checkout_path=target,
+                owner_id="owner-a",
+                purpose="verify serialized capacity lease snapshot",
+                source_kind="bureau_task",
+                source_id="CAPACITY-RACE-P2",
+                artifact_class="operator_worktree",
+                retention_until_unix=int(time.time()) + 3600,
+                expected_head=self.head,
+                expected_branch="feat/serialized-admission",
+            )
+        self.assertEqual(observed, ["checkout-write-lock-held"])
+        lease_snapshot.assert_called_once()
+        self.assertEqual(result["owner_id"], "owner-a")
+
     def test_operation_lock_deadline_uses_nonblocking_bounded_wait(self) -> None:
         lock_attempt = checkouts.fcntl.LOCK_EX | checkouts.fcntl.LOCK_NB
         calls: list[int] = []
@@ -5450,6 +5684,67 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self.assertEqual(retained, 2)
         self.assertTrue(self.checkout.is_dir())
 
+
+    def test_retain_renews_exact_expired_lane_checkout_without_releasing_lease(self) -> None:
+        owner = "lane:" + "a" * 32
+        purpose = "frozen candidate same-lane renewal"
+        now = int(time.time())
+        initial_deadline = now + 60
+        renewed_deadline = now + 3600
+        common_dir = self._common_dir()
+        lifecycle = checkouts._reserve_checkout_lifecycle(
+            repo_common_dir=common_dir,
+            repo_path=self.repo,
+            checkout_path=self.checkout,
+            owner_id=owner,
+            purpose=purpose,
+            source_kind="thread_focus",
+            source_id="pr1649-original-candidate",
+            artifact_class="implementation-worktree",
+            retention_until_unix=initial_deadline,
+            expected_head=self.head,
+            expected_branch="topic",
+        )
+        checkouts._upsert_retention(
+            checkout_key=lifecycle["checkout_key"],
+            repo_common_dir=common_dir,
+            repo_path=self.repo,
+            checkout_path=self.checkout,
+            owner_id=owner,
+            purpose=purpose,
+            retention_until_unix=initial_deadline,
+            expected_head=self.head,
+            expected_branch="topic",
+        )
+        path_key = f"path:{self.checkout}"
+        branch_key = f"repo:{self.repo}:branch:topic"
+        checkouts.resources.acquire_resources(
+            owner, [path_key, branch_key], purpose=purpose, ttl_seconds=5400
+        )
+        old_path_lease = checkouts.resources.inspect_resource(path_key)
+        with patch.object(checkouts, "_now", return_value=now + 90):
+            result = checkouts.grabowski_checkout_retain(
+                str(self.repo), str(self.checkout), owner, purpose,
+                renewed_deadline, self.head, "topic",
+            )
+        self.assertEqual(result["retention"]["retention_until_unix"], renewed_deadline)
+        self.assertEqual(result["lifecycle"]["retention_until_unix"], renewed_deadline)
+        self.assertEqual(result["lifecycle"]["source"], lifecycle["source"])
+        self.assertEqual(result["lifecycle"]["owner_id"], owner)
+        self.assertEqual(result["lifecycle"]["checkout_key"], lifecycle["checkout_key"])
+        self.assertEqual(
+            checkouts.resources.inspect_resource(path_key),
+            old_path_lease,
+            "the active Work-Lane path lease must never be released or replaced",
+        )
+        self.assertEqual(result["lease"]["owner_id"], owner)
+        self.assertFalse(result["lease_release"]["released"])
+        with self.assertRaisesRegex(PermissionError, "another owner"):
+            checkouts.grabowski_checkout_retain(
+                str(self.repo), str(self.checkout), "owner-b", "foreign",
+                renewed_deadline + 60, self.head, "topic",
+            )
+
     def test_retention_can_protect_dirty_checkout_and_rejects_foreign_owner(self) -> None:
         (self.checkout / "untracked.txt").write_text("preserve me\n", encoding="utf-8")
         retained_until = int(time.time()) + 3600
@@ -5677,8 +5972,10 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self.assertEqual(capacity["expired_unclassified_active_rows"], 0)
         self.assertTrue(capacity["path_classification_complete"])
         self.assertEqual(capacity["path_observations_attempted"], 2)
-        self.assertEqual(capacity["used"], 1)
-        self.assertEqual(capacity["free"], checkouts.MAX_ACTIVE_CHECKOUTS_PER_REPO - 1)
+        self.assertEqual(capacity["unexpired_active_rows"], 1)
+        self.assertEqual(capacity["retained_without_live_lease_rows"], 1)
+        self.assertEqual(capacity["used"], 0)
+        self.assertEqual(capacity["free"], checkouts.MAX_ACTIVE_CHECKOUTS_PER_REPO)
         self.assertFalse(capacity["saturated"])
         self.assertIn("checkout_path_reuse_authority", capacity["does_not_establish"])
 
@@ -6069,6 +6366,117 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self._git("update-ref", f"refs/remotes/origin/{new_branch}", new_head)
         return binding, new_head, new_branch
 
+
+    def _expired_same_lane_fixture(self) -> tuple[dict[str, object], str, str]:
+        import grabowski_work_acquire as work_acquire
+        import grabowski_physical_checkout as physical_checkout
+
+        state_patch = patch.object(
+            work_acquire, "_state_root", return_value=self.root / "work-lanes"
+        )
+        state_patch.start()
+        self.patches.append(state_patch)
+        parameters = {
+            "source_kind": "direct-user",
+            "source_id": "user-mandate:expired-same-lane-test",
+            "controller_actor": "operator:test:expired-catchup",
+            "repo": str(self.repo),
+            "base_head": self.head,
+            "branch": "topic",
+            "target_path": str(self.checkout),
+            "purpose": "managed lifecycle fixture",
+            "retention_until_unix": int(time.time()) + 7200,
+            "idempotency_key": "expired-catchup-test",
+        }
+        inputs = work_acquire._normalize(parameters)
+        inputs.pop("_scoped_writer_argv")
+        lane_id = inputs["lane_id"]
+        owner = f"lane:{lane_id}"
+        binding = self._managed_binding(
+            owner=owner, source_kind="work_lane", source_id=lane_id
+        )
+        original_physical = physical_checkout.capture_physical_checkout_identity(
+            str(self.checkout)
+        )
+        lane_record = {
+            "kind": work_acquire.LANE_KIND,
+            "schema_version": 1,
+            "lane_id": lane_id,
+            "inputs": inputs,
+            "inputs_sha256": work_acquire._sha(inputs),
+            "state": "ready",
+            "decision": "ISOLATE_AND_EXECUTE",
+            "worktree_receipt": {
+                "result_state": "CREATED",
+                "durable_receipt_sha256": "a" * 64,
+                "lifecycle": {
+                    "checkout_key": binding["checkout_key"],
+                    "owner_id": owner,
+                    "checkout_path": str(self.checkout),
+                    "expected_head": self.head,
+                    "expected_branch": "topic",
+                    "physical_checkout": original_physical,
+                },
+            },
+        }
+        with work_acquire._lane_lock(lane_id) as path:
+            work_acquire._write_state(path, lane_record)
+
+        (self.checkout / "continued.txt").write_text("original writer work\n", encoding="utf-8")
+        self._git("add", "continued.txt", cwd=self.checkout)
+        self._git("commit", "-m", "original same-lane commit", cwd=self.checkout)
+        current_head = self._git("rev-parse", "HEAD", cwd=self.checkout).stdout.strip()
+        expired = int(time.time()) - 120
+        with checkouts._database() as connection:
+            connection.execute(
+                "UPDATE lifecycle_bindings SET retention_until_unix=? WHERE checkout_key=?",
+                (expired, binding["checkout_key"]),
+            )
+            connection.execute(
+                "UPDATE retention SET expected_head=?, retention_until_unix=?, "
+                "updated_at_unix=updated_at_unix+1 WHERE checkout_key=?",
+                (current_head, expired, binding["checkout_key"]),
+            )
+            connection.commit()
+        return binding, current_head, lane_id
+
+
+    def _change_original_lane_physical(
+        self, lane_id: str, *, change: str
+    ) -> None:
+        import copy
+        import grabowski_work_acquire as work_acquire
+        import grabowski_physical_checkout as physical_checkout
+
+        with work_acquire._lane_lock(lane_id) as path:
+            lane = work_acquire._read_state(path)
+            original = copy.deepcopy(
+                lane["worktree_receipt"]["lifecycle"]["physical_checkout"]
+            )
+            nodes = ("root", "git_dir", "common_dir")
+            if change == "uniform_device":
+                for node in nodes:
+                    original[node]["device"] += 41
+            elif change == "partial_device":
+                original["root"]["device"] += 41
+            elif change == "inode":
+                original["root"]["inode"] += 1
+            elif change == "path":
+                original["root"]["path"] = str(self.root / "wrong-identity")
+            else:
+                raise ValueError(change)
+            original["physical_identity_sha256"] = (
+                physical_checkout._identity_sha256(
+                    physical_checkout._identity_material(
+                        root=original["root"],
+                        git_dir=original["git_dir"],
+                        common_dir=original["common_dir"],
+                    )
+                )
+            )
+            lane["worktree_receipt"]["lifecycle"]["physical_checkout"] = original
+            work_acquire._write_state(path, lane)
+
     def test_binding_preview_preserves_terminal_path_without_branch_rename(self) -> None:
         binding = self._managed_binding(owner="owner-a")
         sentinel = {"kind": "checkout_terminal_reconciliation_preview", "status": "blocked"}
@@ -6379,6 +6787,220 @@ class CheckoutLifecycleTests(unittest.TestCase):
             new_branch,
         )
         self.assertEqual(binding["checkout_key"], archived["archive"]["checkout_key"])
+
+
+    def test_expired_same_lane_recovery_preserves_local_commit_and_owner(self) -> None:
+        binding, head, lane_id = self._expired_same_lane_fixture()
+        preview = checkouts.grabowski_checkout_binding_identity_rebind_preview(
+            binding["checkout_key"]
+        )
+        self.assertEqual("expired_same_lane_lifecycle_catchup", preview["rebind_mode"])
+        self.assertEqual(["binding-retention-head-mismatch"], preview["allowed_drift_reasons"])
+        self.assertFalse(preview["remote"]["remote_secured"])
+        self.assertEqual(lane_id, preview["expired_lane_recovery"]["lane_id"])
+        applied = checkouts.grabowski_checkout_binding_identity_rebind_apply(
+            binding["checkout_key"],
+            f"lane:{lane_id}",
+            preview["snapshot_sha256"],
+            preview["observed_at_unix"],
+            preview["confirmation"],
+        )
+        self.assertEqual("applied", applied["status"])
+        self.assertTrue(applied["lease_release"]["preserved_original_lane_leases"])
+        for row in applied["after"].values():
+            self.assertEqual(head, row["expected_head"])
+            self.assertEqual(f"lane:{lane_id}", row["owner_id"])
+            self.assertGreater(row["retention_until_unix"], time.time() + 3600)
+        self.assertEqual(head, self._git("rev-parse", "HEAD", cwd=self.checkout).stdout.strip())
+        self.assertEqual("", self._git("status", "--porcelain", cwd=self.checkout).stdout)
+        for key in preview["expired_lane_recovery"]["resource_keys"]:
+            self.assertEqual(f"lane:{lane_id}", checkouts.resources.inspect_resource(key)["owner_id"])
+
+
+    def test_expired_same_lane_recovery_accepts_only_uniform_device_renumber(self) -> None:
+        binding, head, lane_id = self._expired_same_lane_fixture()
+        self._change_original_lane_physical(lane_id, change="uniform_device")
+        preview = checkouts.grabowski_checkout_binding_identity_rebind_preview(
+            binding["checkout_key"]
+        )
+        evidence = preview["expired_lane_recovery"]
+        self.assertEqual("uniform_device_renumber", evidence["physical_identity_transition"])
+        self.assertNotEqual(
+            evidence["physical_identity_sha256"],
+            evidence["original_physical_identity_sha256"],
+        )
+        applied = checkouts.grabowski_checkout_binding_identity_rebind_apply(
+            binding["checkout_key"], f"lane:{lane_id}",
+            preview["snapshot_sha256"], preview["observed_at_unix"],
+            preview["confirmation"],
+        )
+        self.assertEqual(head, applied["after"]["lifecycle"]["expected_head"])
+        self.assertEqual("uniform_device_renumber", applied["audit"]["physical_identity_transition"])
+
+    def test_expired_same_lane_recovery_rejects_partial_device_renumber(self) -> None:
+        binding, _, lane_id = self._expired_same_lane_fixture()
+        self._change_original_lane_physical(lane_id, change="partial_device")
+        with self.assertRaisesRegex(RuntimeError, "physical checkout identity drifted"):
+            checkouts.grabowski_checkout_binding_identity_rebind_preview(binding["checkout_key"])
+
+    def test_expired_same_lane_recovery_rejects_inode_drift(self) -> None:
+        binding, _, lane_id = self._expired_same_lane_fixture()
+        self._change_original_lane_physical(lane_id, change="inode")
+        with self.assertRaisesRegex(RuntimeError, "physical checkout identity drifted"):
+            checkouts.grabowski_checkout_binding_identity_rebind_preview(binding["checkout_key"])
+
+    def test_expired_same_lane_recovery_rejects_path_drift(self) -> None:
+        binding, _, lane_id = self._expired_same_lane_fixture()
+        self._change_original_lane_physical(lane_id, change="path")
+        with self.assertRaisesRegex(RuntimeError, "physical checkout identity drifted"):
+            checkouts.grabowski_checkout_binding_identity_rebind_preview(binding["checkout_key"])
+
+    def test_expired_same_lane_recovery_rejects_open_operation_fence(self) -> None:
+        binding, _, lane_id = self._expired_same_lane_fixture()
+        with patch.object(
+            checkouts, "_active_checkout_operation_uncertainties",
+            return_value=[{"fence_id": "protected-unknown-effect"}],
+        ):
+            with self.assertRaisesRegex(RuntimeError, "unresolved checkout-effect fences"):
+                checkouts.grabowski_checkout_binding_identity_rebind_preview(
+                    binding["checkout_key"]
+                )
+
+    def test_expired_same_lane_recovery_compensates_precommit_lease_on_cas_drift(self) -> None:
+        binding, _, lane_id = self._expired_same_lane_fixture()
+        preview = checkouts.grabowski_checkout_binding_identity_rebind_preview(
+            binding["checkout_key"]
+        )
+        acquire = checkouts.resources.acquire_resources
+
+        def acquire_then_drift(*args, **kwargs):
+            result = acquire(*args, **kwargs)
+            with checkouts._database() as connection:
+                connection.execute(
+                    "UPDATE lifecycle_bindings SET updated_at_unix=updated_at_unix+1 "
+                    "WHERE checkout_key=?", (binding["checkout_key"],)
+                )
+                connection.commit()
+            return result
+
+        with patch.object(
+            checkouts.resources, "acquire_resources", side_effect=acquire_then_drift
+        ):
+            with self.assertRaisesRegex(RuntimeError, "snapshot changed"):
+                checkouts.grabowski_checkout_binding_identity_rebind_apply(
+                    binding["checkout_key"], f"lane:{lane_id}",
+                    preview["snapshot_sha256"], preview["observed_at_unix"],
+                    preview["confirmation"],
+                )
+        for key in preview["expired_lane_recovery"]["resource_keys"]:
+            self.assertIsNone(checkouts.resources.inspect_resource(key))
+        lifecycle = checkouts._strict_lifecycle_binding(binding["checkout_key"])
+        self.assertEqual(self.head, lifecycle["expected_head"])
+
+    def test_expired_same_lane_recovery_preserves_leases_on_postcommit_audit_loss(self) -> None:
+        binding, head, lane_id = self._expired_same_lane_fixture()
+        preview = checkouts.grabowski_checkout_binding_identity_rebind_preview(
+            binding["checkout_key"]
+        )
+        with patch.object(
+            checkouts.base, "_append_audit", side_effect=RuntimeError("audit unavailable")
+        ):
+            with self.assertRaisesRegex(RuntimeError, "committed without audit"):
+                checkouts.grabowski_checkout_binding_identity_rebind_apply(
+                    binding["checkout_key"], f"lane:{lane_id}",
+                    preview["snapshot_sha256"], preview["observed_at_unix"],
+                    preview["confirmation"],
+                )
+        after = checkouts._strict_lifecycle_binding(binding["checkout_key"])
+        self.assertEqual(head, after["expected_head"])
+        self.assertEqual(f"lane:{lane_id}", after["owner_id"])
+        for key in preview["expired_lane_recovery"]["resource_keys"]:
+            self.assertEqual(
+                f"lane:{lane_id}",
+                checkouts.resources.inspect_resource(key)["owner_id"],
+            )
+
+    def test_expired_same_lane_recovery_rejects_dirty_checkout(self) -> None:
+        binding, _, _ = self._expired_same_lane_fixture()
+        (self.checkout / "uncommitted.txt").write_text("dirty\n", encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "clean"):
+            checkouts.grabowski_checkout_binding_identity_rebind_preview(
+                binding["checkout_key"]
+            )
+
+    def test_expired_same_lane_recovery_rejects_unknown_effect(self) -> None:
+        import grabowski_work_acquire as work_acquire
+        binding, _, lane_id = self._expired_same_lane_fixture()
+        with work_acquire._lane_lock(lane_id) as path:
+            record = work_acquire._read_state(path)
+            work_acquire._write_state(
+                path, {**record, "state": "outcome_unknown", "decision": "HARD_BLOCK"}
+            )
+        with self.assertRaisesRegex(RuntimeError, "active source-lane authority"):
+            checkouts.grabowski_checkout_binding_identity_rebind_preview(
+                binding["checkout_key"]
+            )
+
+    def test_expired_same_lane_recovery_rejects_foreign_owner(self) -> None:
+        binding, _, _ = self._expired_same_lane_fixture()
+        with checkouts._database() as connection:
+            connection.execute(
+                "UPDATE retention SET owner_id='lane:ffffffffffffffffffffffffffffffff' "
+                "WHERE checkout_key=?", (binding["checkout_key"],)
+            )
+            connection.commit()
+        with self.assertRaisesRegex(PermissionError, "one unchanged owner"):
+            checkouts.grabowski_checkout_binding_identity_rebind_preview(
+                binding["checkout_key"]
+            )
+
+    def test_expired_same_lane_recovery_rejects_unrelated_head(self) -> None:
+        binding, _, _ = self._expired_same_lane_fixture()
+        tree = self._git("rev-parse", "HEAD^{tree}", cwd=self.checkout).stdout.strip()
+        unrelated = self._git(
+            "commit-tree", tree, "-m", "unrelated", cwd=self.checkout
+        ).stdout.strip()
+        self._git("reset", "--hard", unrelated, cwd=self.checkout)
+        with checkouts._database() as connection:
+            connection.execute(
+                "UPDATE retention SET expected_head=? WHERE checkout_key=?",
+                (unrelated, binding["checkout_key"]),
+            )
+            connection.commit()
+        with self.assertRaisesRegex(RuntimeError, "descend from recorded head"):
+            checkouts.grabowski_checkout_binding_identity_rebind_preview(
+                binding["checkout_key"]
+            )
+
+    def test_expired_same_lane_recovery_rejects_foreign_active_lease(self) -> None:
+        binding, _, lane_id = self._expired_same_lane_fixture()
+        key = checkouts.resources.normalize_resource_key(f"path:{self.checkout}")
+        checkouts.resources.acquire_resources(
+            "foreign-test-owner", [key], purpose="active foreign writer", ttl_seconds=3600
+        )
+        with self.assertRaisesRegex(RuntimeError, "coordinated by active work"):
+            checkouts.grabowski_checkout_binding_identity_rebind_preview(
+                binding["checkout_key"]
+            )
+        self.assertEqual("foreign-test-owner", checkouts.resources.inspect_resource(key)["owner_id"])
+
+    def test_expired_same_lane_recovery_rejects_cas_drift_before_apply(self) -> None:
+        binding, _, lane_id = self._expired_same_lane_fixture()
+        preview = checkouts.grabowski_checkout_binding_identity_rebind_preview(
+            binding["checkout_key"]
+        )
+        with checkouts._database() as connection:
+            connection.execute(
+                "UPDATE retention SET updated_at_unix=updated_at_unix+1 "
+                "WHERE checkout_key=?", (binding["checkout_key"],)
+            )
+            connection.commit()
+        with self.assertRaisesRegex(RuntimeError, "snapshot changed"):
+            checkouts.grabowski_checkout_binding_identity_rebind_apply(
+                binding["checkout_key"], f"lane:{lane_id}",
+                preview["snapshot_sha256"], preview["observed_at_unix"],
+                preview["confirmation"],
+            )
 
     def test_binding_identity_rebind_converges_lifecycle_when_retention_is_current(self) -> None:
         binding, new_head, new_branch = self._renamed_managed_checkout()
@@ -6917,6 +7539,80 @@ class CheckoutLifecycleTests(unittest.TestCase):
         for call in gate.call_args_list:
             self.assertEqual(call.args, ("resource_lease",))
         reader.assert_not_called()
+
+    def test_public_checkout_inventory_reads_ordinary_live_wal(self) -> None:
+        writer = checkouts._database()
+        try:
+            writer.execute("PRAGMA wal_autocheckpoint=0")
+            writer.execute("CREATE TABLE live_snapshot_probe(value INTEGER)")
+            writer.execute("INSERT INTO live_snapshot_probe VALUES(1)")
+            writer.commit()
+            wal = Path(str(self.checkout_db) + "-wal")
+            shm = Path(str(self.checkout_db) + "-shm")
+            self.assertTrue(wal.is_file())
+            self.assertTrue(shm.is_file())
+            inventory = checkouts.checkout_inventory(
+                self.repo, include_processes=False,
+                include_tasks=False, include_resources=False,
+            )
+            self.assertTrue(inventory["active_capacity"]["available"])
+            self.assertTrue(wal.is_file())
+            self.assertTrue(shm.is_file())
+        finally:
+            writer.close()
+
+    def test_live_resource_wal_inventory_keeps_pinned_transaction(self) -> None:
+        writer = checkouts.resources._database()
+        try:
+            writer.execute("PRAGMA wal_autocheckpoint=0")
+            writer.execute("CREATE TABLE inventory_wal_probe(value INTEGER)")
+            writer.execute("INSERT INTO inventory_wal_probe VALUES(1)")
+            writer.commit()
+            wal = Path(str(self.resource_db) + "-wal")
+            shm = Path(str(self.resource_db) + "-shm")
+            self.assertTrue(wal.is_file())
+            self.assertTrue(shm.is_file())
+            # Exercise the exact lease-reader fanout inside the pinned WAL scope.
+            with checkouts._strict_inventory_readonly_scope():
+                leases = checkouts._read_resource_leases()
+            self.assertIsInstance(leases, list)
+            inventory = checkouts.checkout_inventory(
+                self.repo, include_processes=False,
+                include_tasks=False, include_resources=True,
+            )
+            self.assertIn("worktrees", inventory)
+            self.assertTrue(wal.is_file())
+            self.assertTrue(shm.is_file())
+        finally:
+            writer.close()
+
+    def test_live_task_wal_requires_durable_job_before_shm_access(self) -> None:
+        writer = checkouts.tasks._database()
+        try:
+            writer.execute("PRAGMA wal_autocheckpoint=0")
+            writer.execute("CREATE TABLE inventory_task_wal_probe(value INTEGER)")
+            writer.execute("INSERT INTO inventory_task_wal_probe VALUES(1)")
+            writer.commit()
+            files = [self.task_db, Path(str(self.task_db) + "-wal"),
+                     Path(str(self.task_db) + "-shm")]
+            self.assertTrue(all(f.is_file() for f in files))
+            before = {str(f): f.read_bytes() for f in files}
+
+            def deny_task_wal(capability: str) -> None:
+                if capability == "durable_job":
+                    raise PermissionError("task WAL admission denied")
+
+            with (
+                patch.object(checkouts.operator, "_require_operator_mutation",
+                             side_effect=deny_task_wal) as gate,
+                checkouts._strict_inventory_readonly_scope(),
+            ):
+                with self.assertRaisesRegex(PermissionError, "task WAL admission denied"):
+                    checkouts._readonly_connection(checkouts.tasks.TASK_DB)
+            gate.assert_called_once_with("durable_job")
+            self.assertEqual(before, {str(f): f.read_bytes() for f in files})
+        finally:
+            writer.close()
 
     def test_public_checkout_inventory_refuses_live_wal_without_shm(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

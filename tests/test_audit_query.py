@@ -665,6 +665,107 @@ class AuditQueryTests(unittest.TestCase):
         )
         self.assertEqual(result["matched"], 1)
 
+    def test_captain_iso_timestamp_window_includes_legacy_audit_records(self) -> None:
+        """Real Captain records carry an aware ISO timestamp, not timestamp_unix."""
+        records = [
+            {
+                "operation": "captain-run-audit-intent",
+                "action": "pr-merge",
+                "target_repo": "heimgewebe/repoground",
+                "target_pr": 1353,
+                "timestamp": "2026-10-27T18:00:15.076860+00:00",
+                "record_sha256": "a" * 64,
+            },
+            {
+                "operation": "captain-run-audit-completion",
+                "action": "pr-merge",
+                "target_repo": "heimgewebe/repoground",
+                "target_pr": 1353,
+                "timestamp": "2026-10-27T20:00:34.008032+02:00",
+                "record_sha256": "b" * 64,
+            },
+        ]
+        module = self._load_module(
+            [_component("/tmp/grabowski-audit-test/write-audit.jsonl", records)]
+        )
+        result = module.query_audit(
+            {
+                "operation_prefix": "captain-run-audit",
+                "since_unix": 1793124015,
+                "until_unix": 1793124034,
+            },
+            order="asc",
+        )
+        self.assertEqual(result["matched"], 2)
+        self.assertEqual(
+            [item["record"]["operation"] for item in result["items"]],
+            ["captain-run-audit-intent", "captain-run-audit-completion"],
+        )
+        analysis = module.analyze_audit(
+            {
+                "operation_prefix": "captain-run-audit",
+                "since_unix": 1793124015,
+                "until_unix": 1793124034,
+            }
+        )
+        self.assertEqual(analysis["record_count"], 2)
+        self.assertEqual(
+            analysis["time_range_unix"],
+            {"minimum": 1793124015, "maximum": 1793124034},
+        )
+
+    def test_timestamp_window_rejects_naive_invalid_and_malformed_unix(self) -> None:
+        records = [
+            {"operation": "captain-run-audit-intent",
+             "timestamp": "2026-10-27T18:00:15", "record_sha256": "a" * 64},
+            {"operation": "captain-run-audit-intent",
+             "timestamp": "invalid", "record_sha256": "b" * 64},
+            {"operation": "captain-run-audit-intent",
+             "timestamp": "2026-10-27T18:00:15+00:00",
+             "timestamp_unix": True, "record_sha256": "c" * 64},
+            {"operation": "captain-run-audit-intent",
+             "timestamp": "2026-10-27T18:00:15+00:00",
+             "timestamp_unix": "1793124015", "record_sha256": "d" * 64},
+            {"operation": "captain-run-audit-intent",
+             "timestamp": "2026-10-27T18:00:15+00:00",
+             "timestamp_unix": 1793125000, "record_sha256": "e" * 64},
+        ]
+        module = self._load_module(
+            [_component("/tmp/grabowski-audit-test/write-audit.jsonl", records)]
+        )
+        result = module.query_audit(
+            {"since_unix": 1793124015, "until_unix": 1793124034}
+        )
+        self.assertEqual(result["matched"], 0)
+
+    def test_timestamp_window_never_falls_back_after_projected_invalid_unix(self) -> None:
+        """A dropped non-scalar Unix value is present but invalid, never absent."""
+        records = [
+            {
+                "operation": "captain-run-audit-intent",
+                "timestamp": "2026-10-27T18:00:15+00:00",
+                "timestamp_unix": {"secret": "not-a-timestamp"},
+                "record_sha256": "a" * 64,
+            },
+            {
+                "operation": "captain-run-audit-completion",
+                "timestamp": "2026-10-27T18:00:34+00:00",
+                "timestamp_unix": [1793124034],
+                "record_sha256": "b" * 64,
+            },
+        ]
+        module = self._load_module(
+            [_component("/tmp/grabowski-audit-test/write-audit.jsonl", records)]
+        )
+        unfiltered = module.query_audit({}, limit=2)
+        self.assertEqual(unfiltered["matched"], 2)
+        for item in unfiltered["items"]:
+            self.assertNotIn("timestamp_unix", item["record"])
+            self.assertIn("timestamp_unix", item["evidence"]["projection_omitted_fields"])
+        window = {"since_unix": 1793124015, "until_unix": 1793124034}
+        self.assertEqual(module.query_audit(window)["matched"], 0)
+        self.assertEqual(module.analyze_audit(window)["record_count"], 0)
+
     def test_unsupported_filter_and_anchor_fail_closed(self) -> None:
         module = self._load_module(self._components())
         with self.assertRaisesRegex(ValueError, "Unsupported audit query filter"):

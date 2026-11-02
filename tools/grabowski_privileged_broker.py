@@ -1864,9 +1864,10 @@ def _run_non_secret_reference_request(data: bytes) -> int:
     config = load_root_config(CONFIG)
     operator_peer: dict[str, object] | None = None
     # A denial during action/peer admission is BEFORE claim_once and before
-    # any process dispatch.  Only the fixed critical-data inventory start
-    # receives an explicit, reference-bound no-effect receipt.  Generic
-    # broker failures after claim remain ambiguous and cannot be retried.
+    # any process dispatch.  Fixed critical-data inventory and root-task
+    # requests receive an explicit reference-bound no-effect receipt.  A
+    # failed observation of an older root task is still not a task readback;
+    # generic broker failures after claim remain ambiguous.
     preclaim_stage = "action_resolution"
     try:
         execution = resolve_regular_execution(config, reference)
@@ -1882,11 +1883,15 @@ def _run_non_secret_reference_request(data: bytes) -> int:
             preclaim_stage = "peer_authority"
             operator_peer = _validate_blockade_lifecycle_peer(execution)
     except (PermissionError, ValueError, FileNotFoundError):
-        if reference.get("action") != "critical_user_data_inventory":
+        kind = {
+            "critical_user_data_inventory": "grabowski.critical_user_data_inventory_pre_effect_refusal.v1",
+            "operator_root_task_systemd_unit": "grabowski.root_task_systemd_pre_effect_refusal.v1",
+        }.get(reference.get("action"))
+        if kind is None:
             raise
         print(json.dumps({
             "schema_version": 1,
-            "kind": "grabowski.critical_user_data_inventory_pre_effect_refusal.v1",
+            "kind": kind,
             "request_id": reference["request_id"],
             "reference_sha256": reference["reference_sha256"],
             "action": reference["action"],

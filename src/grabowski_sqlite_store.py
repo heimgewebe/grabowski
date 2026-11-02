@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 import fcntl
 import hashlib
@@ -339,10 +339,54 @@ def inventory_native_wal_readonly_sqlite(
         raise _changed(error_type, message, cause=exc)
     finally:
         if connection is not None:
-            try:
-                connection.rollback()
-            finally:
-                connection.close()
+            # The outer inventory scope can outlive individual legacy readers
+            # that explicitly close their handle. SQLite connection.close()
+            # safely releases a pinned read-only WAL transaction and is
+            # idempotent; rollback() on an already-closed handle would raise
+            # ProgrammingError and hide the actual observation result.
+            connection.close()
+
+
+@contextmanager
+def inventory_coherent_readonly_sqlite(
+    path: Path,
+    *,
+    temporary_prefix: str,
+    error_type: type[ChangedError],
+    message: str = INVENTORY_CHANGED_MESSAGE,
+    allow_checkpointed_empty_wal: bool = False,
+    wal_mutation_admission: Callable[[], None] | None = None,
+) -> Iterator[sqlite3.Connection]:
+    """Pin a live WAL image only after explicit mutation admission.
+
+    SQLite mode=ro may update existing SHM read marks. A genuinely read-only
+    caller must not open a native WAL reader without the operator's mutation
+    gate. Quiescent immutable reads remain write-free and ungated. Never make,
+    delete, copy or checkpoint sidecars; incomplete pairs still fail closed.
+    """
+    wal = Path(str(path) + "-wal")
+    shm = Path(str(path) + "-shm")
+    if (wal.exists() or wal.is_symlink()) and (shm.exists() or shm.is_symlink()):
+        if wal_mutation_admission is None:
+            raise PermissionError(
+                "Native SQLite WAL observation requires mutation admission "
+                "before SHM read-mark writes"
+            )
+        wal_mutation_admission()
+        with inventory_native_wal_readonly_sqlite(
+            path, error_type=error_type, message=message,
+        ) as connection:
+            yield connection
+    else:
+        with inventory_readonly_sqlite(
+            path,
+            temporary_prefix=temporary_prefix,
+            error_type=error_type,
+            message=message,
+            allow_wal_copy=False,
+            allow_checkpointed_empty_wal=allow_checkpointed_empty_wal,
+        ) as connection:
+            yield connection
 
 
 def sqlite_integrity(

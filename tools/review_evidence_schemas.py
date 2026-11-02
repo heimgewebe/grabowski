@@ -8,7 +8,7 @@ from typing import Any
 _MISSING = object()
 
 # Bump when review-gate policy semantics change in a way that invalidates prior audits.
-REVIEW_POLICY_VERSION = 3
+REVIEW_POLICY_VERSION = 5
 REVIEW_GATE_ATTESTATION_KIND = "grabowski_review_gate_attestation"
 REVIEW_GATE_SIGNER_PRINCIPAL = "grabowski-review-gate@heimgewebe"
 REVIEW_GATE_SIGNATURE_NAMESPACE = "review-evidence@grabowski.heimgewebe"
@@ -180,6 +180,10 @@ SELF_REVIEW_SCHEMA = EvidenceSchema(
         "head_sha": STRING,
         "base_sha": STRING,
         "diff_sha256": STRING,
+        # Authenticated fields reach the semantic verifier; shape alone confers no trust.
+        "review_batch_id": STRING,
+        "review_origin": FieldRule(("string",), const="first_party_authenticated_controller_v1"),
+        "review_pass_receipts": OBJECT_ARRAY,
         "diff_reviewed": BOOLEAN,
         "reviewed_files": NON_EMPTY_STRING_ARRAY,
         "review_focus": NON_EMPTY_STRING_ARRAY,
@@ -333,6 +337,10 @@ SELF_REVIEW_AUDIT_SCHEMA = EvidenceSchema(
         "independent_review_required": BOOLEAN,
         "minimum_review_iterations": NON_NEGATIVE_INTEGER,
         "actual_review_iterations": NON_NEGATIVE_INTEGER,
+        "review_pass_axes": FieldRule(("array",), items=STRING),
+        "review_pass_evidence_sha256": STRING,
+        "review_batch_id": STRING,
+        "review_pass_receipts": FieldRule(("array",), items=FieldRule(("object",))),
         "all_findings_triaged": BOOLEAN,
         "finding_count": FieldRule(("integer", "null"), minimum=0),
         "material_findings_after_first_review": FieldRule(("integer", "null"), minimum=0),

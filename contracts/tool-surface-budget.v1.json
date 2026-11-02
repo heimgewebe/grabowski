@@ -1291,6 +1291,81 @@
         "tool": "grabowski_runtime_refresh_lease_release"
       }
     },
+    "grabowski_self_review_axis_submit": {
+      "evidence_refs": [
+        "docs:docs/review-evidence-provenance.md",
+        "tests:tests/test_self_review_first_party.py",
+        "tests:tests/test_transport_one_call.py"
+      ],
+      "exception_detail": {
+        "claim": "The tool owns one immutable semantic-axis verdict bound to an authenticated controller session and previously persisted source reads.",
+        "evidence": "Signed-ingress issuer binding, unique session nonce, exact-revision source references, two distinct risk assessments, create-only Ed25519 receipts and fail-closed material findings."
+      },
+      "justification_kind": "distinct_authority_boundary",
+      "operation_alternative_considered": "Generic file writes, task output and decision-review CLI text were rejected because none can bind the authenticated controller principal to exact server-observed reads while preventing caller-selected provenance.",
+      "rationale": "Semantic review submission is an authority transition rather than a generic artifact write; keeping it typed prevents arbitrary payloads, hashes or green tests from becoming review PASS evidence.",
+      "tool_contract": {
+        "authority_class": "mutation",
+        "category": "audit",
+        "effects": [
+          "private-semantic-review-receipt-create"
+        ],
+        "read_only": false,
+        "reversibility": "new-review-batch",
+        "risk_class": "medium",
+        "tool": "grabowski_self_review_axis_submit"
+      }
+    },
+    "grabowski_self_review_session_start": {
+      "evidence_refs": [
+        "docs:docs/review-evidence-provenance.md",
+        "tests:tests/test_self_review_first_party.py",
+        "tests:tests/test_transport_one_call.py"
+      ],
+      "exception_detail": {
+        "claim": "The tool creates the sole authenticated first-party review session for one private frozen review plan.",
+        "evidence": "Fresh signed-one-call assertion, enrolled connector principal, create-only batch index, random session and nonce, clean exact head, canonical Git diff and Ed25519 session receipt."
+      },
+      "justification_kind": "distinct_authority_boundary",
+      "operation_alternative_considered": "The durable task and decision-review launchers were rejected because their model-provider argv origin does not represent the already-interacting first-party MCP controller.",
+      "rationale": "A dedicated session boundary binds the controller's authenticated transport principal to one exact PR revision without treating spoofable SDK metadata or a provider alias as identity.",
+      "tool_contract": {
+        "authority_class": "mutation",
+        "category": "audit",
+        "effects": [
+          "private-review-session-create"
+        ],
+        "read_only": false,
+        "reversibility": "new-review-batch",
+        "risk_class": "medium",
+        "tool": "grabowski_self_review_session_start"
+      }
+    },
+    "grabowski_self_review_source_read": {
+      "evidence_refs": [
+        "docs:docs/review-evidence-provenance.md",
+        "tests:tests/test_self_review_first_party.py",
+        "tests:tests/test_transport_one_call.py"
+      ],
+      "exception_detail": {
+        "claim": "The tool returns and persists the exact immutable Git bytes actually shown to the authenticated controller for one semantic axis.",
+        "evidence": "Exact base/head object reads, canonical diff digest, changed-path boundary, bounded line ranges, persisted byte hash, signed issuer and create-only Ed25519 read receipt."
+      },
+      "justification_kind": "material_call_shape",
+      "operation_alternative_considered": "Generic Git and file reads were rejected because they do not persist axis-bound read evidence and therefore cannot prove that later semantic references were actually inspected in the authenticated session.",
+      "rationale": "The read has a deliberate audit effect: the exact returned bytes become immutable provenance consumed by the semantic gate, so it must remain explicitly mutating and separate from ordinary read-only tools.",
+      "tool_contract": {
+        "authority_class": "mutation",
+        "category": "audit",
+        "effects": [
+          "private-source-read-receipt-create"
+        ],
+        "read_only": false,
+        "reversibility": "new-review-batch",
+        "risk_class": "medium",
+        "tool": "grabowski_self_review_source_read"
+      }
+    },
     "grabowski_systemkatalog_query": {
       "evidence_refs": [
         "systemkatalog:heimgewebe/systemkatalog#164",

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 from collections.abc import Iterator
-from contextlib import closing, contextmanager, nullcontext
+from contextlib import ExitStack, closing, contextmanager, nullcontext
 from datetime import datetime, timezone
 import fcntl
 import functools
@@ -97,7 +97,9 @@ TASK_TERMINALIZATION_RECOVERY_CURSOR_METADATA_KEY = (
     "task_terminalization_recovery_cursor_v1"
 )
 TASK_TERMINALIZATION_RECOVERY_CURSOR_VERSION = 1
-GRABOWSKI_RUNTIME_PYTHON = operator.HOME / ".local/share/grabowski-mcp/.venv/bin/python"
+# Use the interpreter running this immutable Grabowski operator.
+# Retired /usr/bin/python3.10 venvs must not block the reserved executor on NixOS.
+GRABOWSKI_RUNTIME_PYTHON = Path(sys.executable)
 GRABOWSKI_REPOSITORY_SLUG = "heimgewebe/grabowski"
 MANAGED_BUILD_RESOLVER = (
     operator.HOME / ".local/lib/heim-pc/managed-build/scripts/managed_build.py"
@@ -122,6 +124,8 @@ TASK_OUTPUT_LEGACY_ROOT = Path(operator.HOME)
 TASK_OUTPUT_CONTRACT_VERSION = 2
 TASK_OUTPUT_LEGACY_CONTRACT_VERSION = 1
 TASK_OUTPUT_LAUNCHER_BINDING_KEY = "task_output_managed_from_attempt"
+TASK_OUTPUT_REMOTE_HOME_BINDING_KEY = "task_output_remote_home"
+TASK_OUTPUT_REMOTE_TARGET_BINDING_KEY = "task_output_remote_target"
 TASK_OUTPUT_DIRECTORY_PREFIX = ".grabowski-task-output"
 TASK_OUTPUT_MAX_BYTES = 8 * 1024 * 1024
 TASK_OUTPUT_TAIL_BYTES = 64 * 1024
@@ -3169,7 +3173,7 @@ def _reconcile_runtime_refresh_prelaunch_binding_journals(
     return {**material, "recovery_sha256": _sha256_json(material)}
 
 def _validate_cwd(host: str, raw: str | None) -> str:
-    candidate = str(operator.HOME) if raw is None else raw
+    candidate = fleet.task_home(host) if raw is None else raw
     if not isinstance(candidate, str) or not candidate.startswith("/"):
         raise ValueError("Task cwd must be an absolute path")
     if len(candidate.encode("utf-8")) > 4096 or "\x00" in candidate:
@@ -4708,6 +4712,7 @@ def _resolve_active_execution_reuse(
     latest = _latest_matching_active_execution_record(identity)
     if latest is None:
         return None
+    _require_reused_task_target_identity(latest)
     if (
         _persisted_retry_binding_or_raise(latest) is not None
         or _persisted_interrupted_recovery_binding_or_raise(latest) is not None
@@ -4823,10 +4828,14 @@ def _resolve_recent_completed_execution_reuse(
     *,
     resume_policy: ResumePolicy,
 ) -> dict[str, Any] | None:
-    return _resolve_recent_completed_record_reuse(
-        _latest_matching_unbound_execution_record(identity),
+    latest = _latest_matching_unbound_execution_record(identity)
+    reusable = _resolve_recent_completed_record_reuse(
+        latest,
         resume_policy=resume_policy,
     )
+    if reusable is not None:
+        _require_reused_task_target_identity(reusable)
+    return reusable
 
 
 def _matching_attention_execution_records(
@@ -5854,12 +5863,15 @@ def _dispatch(
     *,
     timeout_seconds: int = 60,
     allow_legacy_local_alias: bool = False,
+    expected_target: str | None = None,
 ) -> dict[str, Any]:
     if allow_legacy_local_alias:
         resolved_host, target, legacy_local_alias = _resolve_task_dispatch_host(host)
     else:
         resolved_host, target, legacy_local_alias = host, fleet.fleet_host(host), False
     if target["transport"] == "local":
+        if expected_target is not None:
+            raise RuntimeError("task SSH target changed before dispatch")
         result = operator._run(
             argv,
             cwd=operator.HOME,
@@ -5872,6 +5884,7 @@ def _dispatch(
             argv,
             timeout_seconds=timeout_seconds,
             max_output_bytes=operator.DEFAULT_OUTPUT_BYTES,
+            **({"expected_target": expected_target} if expected_target is not None else {}),
         )
         result = remote["result"]
     if legacy_local_alias:
@@ -5903,6 +5916,92 @@ def _task_output_managed_from_attempt(record: dict[str, Any]) -> int | None:
     return value
 
 
+def _task_output_remote_home(record: dict[str, Any]) -> str | None:
+    """Derive output path; retain existing home-binding validation when set."""
+    raw = record.get("launcher_json")
+    if not isinstance(raw, str):
+        return None
+    try:
+        launcher = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("task remote home binding is invalid JSON") from exc
+    if not isinstance(launcher, dict):
+        raise RuntimeError("task remote home binding is invalid")
+    home = launcher.get(TASK_OUTPUT_REMOTE_HOME_BINDING_KEY)
+    if home is None:
+        # Legacy path derivation is pure: effective SSH identity is enforced
+        # separately before every remote effect, not while constructing paths.
+        return None
+    target = fleet.fleet_host(str(record["host"]))
+    if (
+        not isinstance(home, str)
+        or target["transport"] != "ssh"
+        or target.get("task_home") != home
+        or launcher.get(TASK_OUTPUT_REMOTE_TARGET_BINDING_KEY) != target["target"]
+    ):
+        raise RuntimeError("task remote home binding differs from fleet authority")
+    return home
+
+
+def _task_output_remote_target(record: dict[str, Any]) -> str | None:
+    """Require the saved remote endpoint before any task effect or reuse."""
+    home = _task_output_remote_home(record)
+    raw = record.get("launcher_json")
+    host_name = str(record.get("host", ""))
+    previous_target = None
+    if isinstance(raw, str):
+        launcher = json.loads(raw)
+        previous_target = launcher.get(TASK_OUTPUT_REMOTE_TARGET_BINDING_KEY)
+    try:
+        target = fleet.fleet_host(host_name)
+    except (ValueError, RuntimeError) as exc:
+        legacy_local = host_name == "local" and previous_target is None and home is None
+        unknown_local_alias = (
+            isinstance(exc, ValueError)
+            and str(exc) == "Unknown fleet host: local"
+        )
+        missing_registry = (
+            isinstance(exc, RuntimeError)
+            and str(exc).startswith("Fleet registry missing: ")
+        )
+        if legacy_local and (unknown_local_alias or missing_registry):
+            # Read-only legacy local observations do not require Fleet config.
+            # A bound SSH task never passes this narrow exception.
+            return None
+        raise RuntimeError("task remote target authority unavailable") from exc
+    if target["transport"] != "ssh":
+        if previous_target is not None or home is not None:
+            raise RuntimeError("task remote target binding differs from fleet authority")
+        return None
+    if not isinstance(previous_target, str) or previous_target != target["target"]:
+        raise RuntimeError("task remote target binding missing or stale")
+    if home != target.get("task_home"):
+        raise RuntimeError("task remote home binding differs from fleet authority")
+    return previous_target
+
+
+def _require_reused_task_target_identity(record: dict[str, Any]) -> None:
+    """Reject deduplicated SSH work if its persisted destination differs."""
+    host = str(record["host"])
+    try:
+        target = fleet.fleet_host(host)
+    except ValueError as exc:
+        # Historic local-alias task records can be matched by internal
+        # read-only reconciliation even when the legacy alias is no longer
+        # registered. A new task must independently pass Fleet admission
+        # before this reuse path can be reached through its public surface.
+        if host == "local" and str(exc) == "Unknown fleet host: local":
+            return
+        raise RuntimeError("remote task identity unavailable before reuse") from exc
+    try:
+        previous_home = _task_output_remote_home(record)
+        _task_output_remote_target(record)
+    except (KeyError, TypeError, ValueError, RuntimeError, PermissionError) as exc:
+        raise RuntimeError("remote task identity unavailable before reuse") from exc
+    if target["transport"] == "ssh" and target.get("task_home") != previous_home:
+        raise RuntimeError("remote task identity missing or stale before reuse")
+
+
 def _task_output_root(record: dict[str, Any]) -> Path:
     attempt = record.get("attempt")
     if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1:
@@ -5911,7 +6010,7 @@ def _task_output_root(record: dict[str, Any]) -> Path:
     root = (
         Path(TASK_OUTPUT_ROOT)
         if managed_from is not None and attempt >= managed_from
-        else Path(TASK_OUTPUT_LEGACY_ROOT)
+        else Path(_task_output_remote_home(record) or TASK_OUTPUT_LEGACY_ROOT)
     )
     if not root.is_absolute():
         raise RuntimeError("task output root must be absolute")
@@ -6015,10 +6114,16 @@ def _bind_task_output_managed_from_attempt(
     return _row_raw(identifier)
 
 
-def _task_output_capture_script_path() -> Path:
-    """Return the wrapper path without touching the filesystem."""
+def _task_output_capture_script_path(record: dict[str, Any] | None = None) -> Path:
+    """Return the local or bound remote wrapper path without filesystem effects."""
     digest = hashlib.sha256(TASK_OUTPUT_CAPTURE_CODE.encode("utf-8")).hexdigest()
-    return TASK_OUTPUT_CAPTURE_SCRIPT_ROOT / f"capture-{digest}.py"
+    home = _task_output_remote_home(record) if record is not None else None
+    root = (
+        Path(home) / ".local/state/grabowski/task-capture"
+        if home is not None
+        else TASK_OUTPUT_CAPTURE_SCRIPT_ROOT
+    )
+    return root / f"capture-{digest}.py"
 
 
 def _task_output_capture_script() -> Path:
@@ -6082,7 +6187,9 @@ def _task_output_capture_script() -> Path:
     return path
 
 
-def _stage_task_output_capture_script(host: str, *, transport: str) -> dict[str, Any]:
+def _stage_task_output_capture_script(
+    host: str, *, transport: str, record: dict[str, Any] | None = None
+) -> dict[str, Any]:
     """Make sure the wrapper exists on the host that will run the task.
 
     A local target is written directly. Any other transport executes the task
@@ -6095,11 +6202,12 @@ def _stage_task_output_capture_script(host: str, *, transport: str) -> dict[str,
     one, so a host whose command allowlist omits an interpreter can still
     launch tasks.
     """
-    path = _task_output_capture_script_path()
+    path = _task_output_capture_script_path(record)
     if transport == "local":
         _task_output_capture_script()
         return {"host": host, "transport": transport, "path": str(path), "status": "local"}
     payload = base64.b64encode(TASK_OUTPUT_CAPTURE_CODE.encode("utf-8")).decode("ascii")
+    expected_target = _task_output_remote_target(record) if record is not None else None
     staged = fleet.run_fleet_task_capture_stage(
         host,
         [
@@ -6111,9 +6219,12 @@ def _stage_task_output_capture_script(host: str, *, transport: str) -> dict[str,
         ],
         timeout_seconds=60,
         max_output_bytes=operator.DEFAULT_OUTPUT_BYTES,
+        **({"expected_target": expected_target} if expected_target is not None else {}),
     )
     result = staged["result"]
-    if result.get("returncode") != 0:
+    if result.get("returncode") != 0 or str(result.get("stdout", "")).strip() not in {
+        "written", "present"
+    }:
         raise RuntimeError(
             "task output capture script could not be staged on the task host"
         )
@@ -6130,7 +6241,7 @@ def _task_output_capture_argv(record: dict[str, Any]) -> list[str]:
     paths = _task_output_paths(record)
     return [
         TASK_OUTPUT_CAPTURE_PYTHON,
-        str(_task_output_capture_script_path()),
+        str(_task_output_capture_script_path(record)),
         str(paths["directory"]),
         str(TASK_OUTPUT_MAX_BYTES),
         str(TASK_OUTPUT_TAIL_BYTES),
@@ -6443,6 +6554,7 @@ def _read_remote_task_output_stream(
     if stream not in {"stdout", "stderr"}:
         raise ValueError("task output stream is invalid")
     paths = _task_output_paths(record)
+    expected_target = _task_output_remote_target(record)
     envelope = fleet.run_fleet_task_output_read(
         str(record["host"]),
         [
@@ -6456,6 +6568,7 @@ def _read_remote_task_output_stream(
         ],
         timeout_seconds=30,
         max_output_bytes=int(operator.DEFAULT_OUTPUT_BYTES),
+        **({"expected_target": expected_target} if expected_target is not None else {}),
     )
     result = envelope["result"]
     returncode = int(result.get("returncode", 1))
@@ -6581,11 +6694,13 @@ def _task_output_cleanup_run(
     command = _task_output_cleanup_argv(
         record, mode=mode, token=token, inventory=inventory
     )
+    expected_target = _task_output_remote_target(record)
     envelope = fleet.run_fleet_task_output_cleanup(
         str(record["host"]),
         command,
         timeout_seconds=30,
         max_output_bytes=int(operator.DEFAULT_OUTPUT_BYTES),
+        **({"expected_target": expected_target} if expected_target is not None else {}),
     )
     result = envelope.get("result")
     if not isinstance(result, dict):
@@ -6773,8 +6888,20 @@ def _launch(record: dict[str, Any]) -> dict[str, Any]:
             }
     target = fleet.fleet_host(record["host"])
     try:
+        expected_remote_target = _task_output_remote_target(record)
+        if target["transport"] == "ssh" and expected_remote_target != target["target"]:
+            raise RuntimeError("task SSH target changed before launch")
         _stage_task_output_capture_script(
-            record["host"], transport=target["transport"]
+            record["host"], transport=target["transport"], record=record
+        )
+        return _dispatch(
+            record["host"],
+            _launch_argv(
+                record,
+                include_managed_runtime=target["transport"] == "local",
+            ),
+            timeout_seconds=60,
+            expected_target=expected_remote_target,
         )
     except (OSError, PermissionError, RuntimeError, ValueError) as exc:
         # The row is already committed as launching and its leases are held.
@@ -6792,14 +6919,7 @@ def _launch(record: dict[str, Any]) -> dict[str, Any]:
             "launch_not_dispatched": True,
             "privileged_broker": None,
         }
-    return _dispatch(
-        record["host"],
-        _launch_argv(
-            record,
-            include_managed_runtime=target["transport"] == "local",
-        ),
-        timeout_seconds=60,
-    )
+
 
 
 def _launch_state(result: dict[str, Any]) -> str:
@@ -7625,17 +7745,43 @@ def _task_read_snapshot() -> Iterator[sqlite3.Connection]:
 
 @contextmanager
 def _task_readonly_snapshot() -> Iterator[sqlite3.Connection]:
-    """Read without filesystem writes; refuse active WAL sidecars fail-closed."""
+    """Read a pinned WAL or quiescent task snapshot without filesystem writes."""
     if TASK_DB.is_symlink() or not TASK_DB.is_file() or TASK_DB.stat().st_size == 0:
         raise RuntimeError("Task store cannot be observed without explicit initialization")
-    with _inventory_readonly_sqlite(
-        TASK_DB, allow_wal_copy=False, allow_checkpointed_empty_wal=True,
-    ) as connection:
+    # A normal SQLite checkpoint can unlink -wal/-shm between the reader's
+    # preflight and first lstat. Retry only that exact entry race, against a
+    # fresh admission and inode check; never retry an entered transaction.
+    with ExitStack() as snapshot:
+        for attempt in range(3):
+            try:
+                connection = snapshot.enter_context(
+                    sqlite_store.inventory_coherent_readonly_sqlite(
+                        TASK_DB,
+                        temporary_prefix="unused-task-readonly.",
+                        error_type=TaskSchemaInventoryChanged,
+                        allow_checkpointed_empty_wal=True,
+                        wal_mutation_admission=lambda: operator._require_operator_mutation(
+                            "durable_job"
+                        ),
+                    )
+                )
+                break
+            except TaskSchemaInventoryChanged as exc:
+                missing = exc.__cause__
+                if (
+                    attempt == 2
+                    or not isinstance(missing, FileNotFoundError)
+                    or missing.filename not in {
+                        str(TASK_DB) + "-wal", str(TASK_DB) + "-shm",
+                    }
+                ):
+                    raise
         if _task_schema_version(connection) != TASK_CURRENT_SCHEMA_VERSION:
             raise RuntimeError("Task store requires an explicit schema migration")
         _validate_task_schema_current(connection)
         _task_reconcile_revision_contract(connection)
-        connection.execute("BEGIN DEFERRED")
+        if not connection.in_transaction:
+            connection.execute("BEGIN DEFERRED")
         try:
             yield connection
         finally:
@@ -8532,11 +8678,13 @@ def _observe(
         observer["transport"] = "local"
     else:
         try:
+            expected_remote_target = _task_output_remote_target(record)
             result = _dispatch(
                 record["host"],
                 command,
                 timeout_seconds=30,
                 allow_legacy_local_alias=True,
+                expected_target=expected_remote_target,
             )
         except fleet.FleetCommandDenied:
             # Production hosts intentionally do not expose generic systemctl through
@@ -8548,6 +8696,7 @@ def _observe(
                 fleet.TASK_UNIT_SHOW_PROPERTIES,
                 timeout_seconds=30,
                 max_output_bytes=8192,
+                **({"expected_target": expected_remote_target} if expected_remote_target is not None else {}),
             )
             result = observed["result"]
             observer = {
@@ -9178,6 +9327,7 @@ def grabowski_task_start(
     )
     reused_record = operation_resolution["reuse"]
     if reused_record is not None:
+        _require_reused_task_target_identity(reused_record)
         reused_classification = _project_task_effect_classification(
             _record_task_effect_classification(reused_record),
             fallback=task_effect_classification,
@@ -9588,6 +9738,16 @@ def grabowski_task_start(
         if target["transport"] == "local" and execution_backend == "systemd-user"
         else None
     )
+    task_output_remote_home = (
+        target.get("task_home")
+        if target["transport"] == "ssh" and execution_backend == "systemd-user"
+        else None
+    )
+    task_output_remote_target = (
+        target["target"]
+        if target["transport"] == "ssh" and execution_backend == "systemd-user"
+        else None
+    )
     executor_lease_binding_plan: dict[str, Any] | None = None
     executor_lease_binding_journal: dict[str, Any] | None = None
     executor_lease_binding: dict[str, Any] | None = None
@@ -9618,6 +9778,16 @@ def grabowski_task_start(
                     {TASK_OUTPUT_LAUNCHER_BINDING_KEY: task_output_managed_from_attempt}
                     if task_output_managed_from_attempt is not None
                     else {}
+                ),
+                **(
+                    {
+                        TASK_OUTPUT_REMOTE_TARGET_BINDING_KEY: task_output_remote_target,
+                        **(
+                            {TASK_OUTPUT_REMOTE_HOME_BINDING_KEY: task_output_remote_home}
+                            if task_output_remote_home is not None else {}
+                        ),
+                    }
+                    if task_output_remote_target is not None else {}
                 ),
                 "task_effect_classification": dict(
                     task_effect_classification
@@ -9912,6 +10082,16 @@ def grabowski_task_start(
         raise
     launcher = {
         **_launch(record),
+        **(
+            {
+                TASK_OUTPUT_REMOTE_TARGET_BINDING_KEY: task_output_remote_target,
+                **(
+                    {TASK_OUTPUT_REMOTE_HOME_BINDING_KEY: task_output_remote_home}
+                    if task_output_remote_home is not None else {}
+                ),
+            }
+            if task_output_remote_target is not None else {}
+        ),
         "task_effect_classification": dict(task_effect_classification),
         **(
             {
@@ -10230,6 +10410,7 @@ def grabowski_task_logs(task_id: str, max_lines: int = 200) -> dict[str, Any]:
                     str(max_lines),
                 ],
                 timeout_seconds=30,
+                expected_target=_task_output_remote_target(record),
             )
         else:
             output_source = "private-task-files-v1"
@@ -10263,6 +10444,7 @@ def grabowski_task_cancel(task_id: str) -> dict[str, Any]:
             timeout_seconds=60,
         )
     else:
+        expected_remote_target = _task_output_remote_target(record)
         resolved_host, target, _legacy_local_alias = _resolve_task_dispatch_host(
             str(record["host"])
         )
@@ -10278,6 +10460,7 @@ def grabowski_task_cancel(task_id: str) -> dict[str, Any]:
                 resolved_host,
                 ["systemctl", "--user", "stop", _authoritative_unit(record)],
                 timeout_seconds=60,
+                expected_target=expected_remote_target,
             )
     if result.get("outcome_unknown"):
         state = "outcome_unknown"
@@ -10413,10 +10596,38 @@ def grabowski_task_resume(
             coding_agent_pre_dispatch_admission = candidate_admission
     attempt = int(record["attempt"]) + 1
     task_output_managed_from_attempt = _task_output_managed_from_attempt(record)
+    if task_output_managed_from_attempt is not None and not _is_root_systemd_backend(record):
+        # Preserve the more specific existing rejection for a local task whose
+        # Fleet transport changed; no attempt or remote effect may start.
+        _resolved_host, current_transport, _alias = _resolve_task_dispatch_host(str(record["host"]))
+        if current_transport["transport"] != "local":
+            raise RuntimeError(
+                "Task with managed local output cannot resume on non-local transport; "
+                "restore the fleet host to local transport or start a new task"
+            )
+    task_output_remote_home: str | None = None
+    task_output_remote_target: str | None = None
     if not _is_root_systemd_backend(record):
+        # Rootbroker resumes run locally through the privileged broker and
+        # must not depend on a renamed or absent user Fleet registry.
+        task_output_remote_home = _task_output_remote_home(record)
+        task_output_remote_target = _task_output_remote_target(record)
+        if task_output_remote_target is not None:
+            recovery_launcher_bindings[TASK_OUTPUT_REMOTE_TARGET_BINDING_KEY] = (
+                task_output_remote_target
+            )
+        if task_output_remote_home is not None:
+            recovery_launcher_bindings[TASK_OUTPUT_REMOTE_HOME_BINDING_KEY] = (
+                task_output_remote_home
+            )
         _resolved_host, resume_target, _legacy_local_alias = (
             _resolve_task_dispatch_host(str(record["host"]))
         )
+        if resume_target["transport"] == "ssh" and (
+            resume_target.get("task_home") != task_output_remote_home
+            or resume_target["target"] != task_output_remote_target
+        ):
+            raise RuntimeError("task remote SSH target/home binding is missing or stale on resume")
         if task_output_managed_from_attempt is None:
             if resume_target["transport"] == "local":
                 record = _bind_task_output_managed_from_attempt(
@@ -10514,6 +10725,15 @@ def grabowski_task_resume(
                 "reconciled" if lease_result.get("preserved") else "reacquired"
             )
     launcher = _launch(candidate)
+    if task_output_remote_target is not None:
+        launcher = {
+            **launcher,
+            TASK_OUTPUT_REMOTE_TARGET_BINDING_KEY: task_output_remote_target,
+            **(
+                {TASK_OUTPUT_REMOTE_HOME_BINDING_KEY: task_output_remote_home}
+                if task_output_remote_home is not None else {}
+            ),
+        }
     if coding_agent_pre_dispatch_admission is not None:
         launcher = {
             **launcher,
@@ -13499,7 +13719,7 @@ def grabowski_task_reconcile(auto_resume: bool = False) -> dict[str, Any]:
     return _task_reconcile_after_guard(auto_resume)
 
 
-def grabowski_task_list(
+def _grabowski_task_list_once(
     limit: int = DEFAULT_TASK_LIST_LIMIT,
     state: str | None = None,
     view: str = "minimal",
@@ -13830,6 +14050,52 @@ def grabowski_task_list(
             "does_not_establish",
         ),
     )
+
+
+def grabowski_task_list(
+    limit: int = DEFAULT_TASK_LIST_LIMIT,
+    state: str | None = None,
+    view: str = "minimal",
+    cursor: str | None = None,
+    fields: list[str] | None = None,
+    schema_only: bool = False,
+    *,
+    read_only: bool = False,
+) -> dict[str, Any]:
+    """Retry a complete read-only task list if a WAL checkpoint invalidated its snapshot.
+
+    A WAL/SHM sidecar may appear while the immutable snapshot is closing,
+    *after* all SQL queries. The caller must discard that result and open a
+    fresh validated transaction, never accept a partially trusted page.
+    Mutable and schema-only requests retain their existing single execution.
+    """
+    if read_only is not True or schema_only:
+        return _grabowski_task_list_once(
+            limit, state, view, cursor, fields, schema_only, read_only=read_only,
+        )
+    for attempt in range(3):
+        try:
+            return _grabowski_task_list_once(
+                limit, state, view, cursor, fields, schema_only, read_only=True,
+            )
+        except TaskSchemaInventoryChanged as exc:
+            missing = exc.__cause__
+            # No-cause inventory drift may be a sidecar created on close.
+            # Only actual missing WAL/SHM filenames may retry on entry.
+            if (
+                attempt == 2
+                or (
+                    missing is not None
+                    and (
+                        not isinstance(missing, FileNotFoundError)
+                        or missing.filename not in {
+                            str(TASK_DB) + "-wal", str(TASK_DB) + "-shm",
+                        }
+                    )
+                )
+            ):
+                raise
+    raise AssertionError("bounded task-list snapshot retry ended unexpectedly")
 
 
 @mcp.tool(name="grabowski_task_start", annotations=MUTATING)
