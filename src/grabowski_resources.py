@@ -1791,9 +1791,13 @@ def _bureau_worktree_admin_physical_pair(
         or scope.get("effects") != ["worktree-admin"]
         or scope.get("paths") != [str(repo)]
         or scope.get("shared_gates") != ["repository-worktree-admin"]
-        or bureau_leases.BUREAU_WORKTREE_ADMIN_KEY not in bureau_keys
-        or f"path:{repo}" not in bureau_keys
-        or f"path:{git_dir}" not in bureau_keys
+        or re.fullmatch(r"post-merge-sync-[0-9a-f]{16}", str(scope.get("task_id"))) is None
+        or set(bureau_keys) != {
+            bureau_leases.BUREAU_WORKTREE_ADMIN_KEY,
+            f"path:{repo}",
+            f"path:{git_dir}",
+        }
+        or len(keys) != 5
     ):
         return False
     try:

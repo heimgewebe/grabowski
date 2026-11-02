@@ -7706,6 +7706,12 @@ class BureauPostMergePhysicalLeaseTests(unittest.TestCase):
                             assess([*replaced, alien, git_identity])
                 with self.assertRaisesRegex(ValueError, "Bureau and non-Bureau"):
                     assess([key for key in keys if key != admin_key])
+                # Other Bureau paths and non-postmerge tasks must not inherit
+                # the exceptional physical-lock admission.
+                with self.assertRaisesRegex(ValueError, "Bureau and non-Bureau"):
+                    assess([*keys, f"path:{repo / 'extra-file'}"])
+                with self.assertRaisesRegex(ValueError, "Bureau and non-Bureau"):
+                    assess(keys, {**scope, "task_id": "unrelated-resource-operation"})
                 with self.assertRaisesRegex(ValueError, "Bureau and non-Bureau"):
                     assess(keys, {**scope, "effects": ["read"]})
                 with self.assertRaisesRegex(ValueError, "requires shared gate"):
