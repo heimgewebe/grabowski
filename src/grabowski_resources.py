@@ -1769,6 +1769,46 @@ def _check_work_lane_path_scope_conflicts(
             )
 
 
+
+def _bureau_worktree_admin_physical_pair(
+    keys: list[str],
+    bureau_keys: list[str],
+    metadata: dict[str, Any],
+) -> bool:
+    """Admit only the live primary-checkout inode locks of one Bureau FF.
+
+    These two physical fences strengthen the existing atomic worktree-admin
+    lease; they are never a blanket mixed Bureau/non-Bureau exemption.
+    """
+    repo = bureau_leases.BUREAU_REPOSITORY_ROOT
+    git_dir = repo / ".git"
+    scope = _scope_manifest_from_metadata(metadata, required=False)
+    if (
+        scope is None
+        or scope.get("repository") != str(repo)
+        or scope.get("worktree") != str(repo)
+        or scope.get("branch") not in {"main", "master"}
+        or scope.get("effects") != ["worktree-admin"]
+        or scope.get("paths") != [str(repo)]
+        or scope.get("shared_gates") != ["repository-worktree-admin"]
+        or bureau_leases.BUREAU_WORKTREE_ADMIN_KEY not in bureau_keys
+        or f"path:{repo}" not in bureau_keys
+        or f"path:{git_dir}" not in bureau_keys
+    ):
+        return False
+    try:
+        root_stat = os.stat(repo, follow_symlinks=False)
+        git_stat = os.stat(git_dir, follow_symlinks=False)
+    except (OSError, ValueError):
+        return False
+    if not (stat.S_ISDIR(root_stat.st_mode) and stat.S_ISDIR(git_stat.st_mode)):
+        return False
+    return set(keys).difference(bureau_keys) == {
+        f"component:physical-checkout-root:{root_stat.st_dev}:{root_stat.st_ino}",
+        f"component:physical-git-common-dir:{git_stat.st_dev}:{git_stat.st_ino}",
+    }
+
+
 def _check_repository_semantic_conflicts(
     connection: sqlite3.Connection,
     *,
@@ -1784,7 +1824,8 @@ def _check_repository_semantic_conflicts(
     # broad-repository rule here would reintroduce the deprecated global blocker.
     bureau_keys = bureau_leases.bureau_resource_keys(keys)
     if bureau_keys and len(bureau_keys) != len(keys):
-        raise ValueError("Bureau and non-Bureau resources must be acquired separately")
+        if not _bureau_worktree_admin_physical_pair(keys, bureau_keys, metadata):
+            raise ValueError("Bureau and non-Bureau resources must be acquired separately")
     if bureau_keys:
         if nonconflict_proof is not None:
             raise nonconflict.NonConflictDenied(
