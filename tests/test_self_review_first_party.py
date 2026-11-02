@@ -2184,6 +2184,147 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
         )
         self.assertEqual(set(review.REQUIRED_AXES), set(verified))
 
+
+    def test_single_600k_generated_diff_line_remains_fully_signed_and_covered(self) -> None:
+        generated = self.repo / "src" / "large-generated-line.json"
+        generated.write_text('{"payload":"' + ("x" * 600_000) + '"}\n', encoding="utf-8")
+        self._git("add", "src/large-generated-line.json")
+        self._git("commit", "-qm", "add one large immutable generated source line")
+        self.head = self._git("rev-parse", "HEAD").strip()
+        plan = self._first_party_plan()
+        started = self._start_plan(plan)
+        lines = review._first_party_diff(self.repo, plan["binding"]).decode("utf-8").splitlines(keepends=True)
+        largest_line = max(len(line.encode("utf-8")) for line in lines)
+        self.assertGreater(largest_line, 256 * 1024)
+        self.assertLess(largest_line, review.FIRST_PARTY_MAX_READ_BYTES)
+        largest_line_number = max(
+            range(1, len(lines) + 1), key=lambda n: len(lines[n - 1].encode("utf-8"))
+        )
+        # Failed signed read consumes its request ID; positive call must differ.
+        with mock.patch.object(review, "FIRST_PARTY_MAX_READ_BYTES", 256 * 1024):
+            with self.assertRaisesRegex(review.ReviewExecutionRejected, "canonical diff chunk over budget"):
+                self._read(
+                    started, review.REQUIRED_AXES[0], "diff", "", "head",
+                    largest_line_number, largest_line_number,
+                )
+        complete = self._read(started, review.REQUIRED_AXES[0], "diff", "", "head", 1, len(lines))
+        self.assertEqual(len(lines), complete["diff_total_lines"])
+        self.assertEqual(
+            hashlib.sha256("".join(lines).encode("utf-8")).hexdigest(),
+            complete["content_sha256"],
+        )
+        for number, axis in enumerate(review.REQUIRED_AXES, start=1):
+            self._submit_axis(started, axis, number, full_diff=False)
+        audit, receipts = self._seal_direct(plan)
+        self.assertEqual([], self._receipt_errors(audit, receipts))
+
+
+    def test_generated_diff_line_above_new_budget_remains_unreadable(self) -> None:
+        generated = self.repo / "src" / "overlarge-generated-line.json"
+        generated.write_text(
+            '{"payload":"' + ("x" * (review.FIRST_PARTY_MAX_READ_BYTES + 1)) + '"}\n',
+            encoding="utf-8",
+        )
+        self._git("add", "src/overlarge-generated-line.json")
+        self._git("commit", "-qm", "add over-budget generated source line")
+        self.head = self._git("rev-parse", "HEAD").strip()
+        plan = self._first_party_plan()
+        started = self._start_plan(plan)
+        lines = review._first_party_diff(self.repo, plan["binding"]).decode("utf-8").splitlines(keepends=True)
+        large_line_number = max(range(1, len(lines) + 1), key=lambda i: len(lines[i - 1].encode("utf-8")))
+        self.assertGreater(len(lines[large_line_number - 1].encode("utf-8")), review.FIRST_PARTY_MAX_READ_BYTES)
+        with self.assertRaisesRegex(review.ReviewExecutionRejected, "canonical diff chunk over budget"):
+            self._read(
+                started, review.REQUIRED_AXES[0], "diff", "", "head",
+                large_line_number, large_line_number,
+            )
+        self.assertFalse(list((self.state / "sessions" / started["review_session_id"] / "reads").glob("*.json")))
+
+
+    def test_signed_read_wire_budget_without_optional_mcp_sdk(self) -> None:
+        payload = {
+            "status": "source_read_recorded",
+            "content": "x" * 600_000,
+            "read_id": "a" * 32,
+            "content_sha256": hashlib.sha256(b"x" * 600_000).hexdigest(),
+        }
+        # CI has only a deliberately stubbed MCP module. The signer must
+        # still validate real single-copy source bytes independently of SDK.
+        self.assertIsNone(review.first_party_source_read_wire_budget_validate(payload))
+        legacy_duplicate = json.dumps(
+            {"content": [payload], "structuredContent": payload},
+            ensure_ascii=False, separators=(",", ":"),
+        )
+        self.assertGreater(len(legacy_duplicate.encode("utf-8")), review.MAX_OUTPUT)
+        with self.assertRaisesRegex(review.ReviewExecutionRejected, "transport budget"):
+            review.first_party_source_read_wire_budget_validate({
+                **payload, "content": "\x01" * 200_000,
+            })
+
+    def test_mcp_signed_read_600k_uses_one_transport_copy(self) -> None:
+        try:
+            from mcp.types import CallToolResult, TextContent
+        except ImportError:
+            self.skipTest("Real MCP SDK unavailable; signer wire-size gate is tested without it")
+        import grabowski_mcp as server
+
+        payload = {
+            "status": "source_read_recorded", "content": "x" * 600_000,
+            "read_id": "a" * 32, "content_sha256": hashlib.sha256(b"x" * 600_000).hexdigest(),
+        }
+        with (
+            mock.patch.object(server, "_require_mutations_enabled"),
+            mock.patch.object(server, "_authenticated_self_review_issuer", return_value={}),
+            mock.patch.object(server.self_review_execution, "record_first_party_source_read", return_value=payload),
+        ):
+            result = server.grabowski_self_review_source_read(
+                "session", "nonce", review.REQUIRED_AXES[0], "diff", "",
+                "head", 1, 1, "transport proof", "Review every byte",
+            )
+        self.assertIsInstance(result, CallToolResult)
+        # Exercise the real SDK FastMCP converter rather than a JSON-size guess.
+        tool = server.mcp._tool_manager.get_tool("grabowski_self_review_source_read")
+        converted = tool.fn_metadata.convert_result(result)
+        self.assertIsInstance(converted, CallToolResult)
+        self.assertEqual(payload, converted.structuredContent)
+        self.assertTrue(all("x" * 256 not in block.text for block in converted.content))
+        self.assertLess(len(converted.model_dump_json(by_alias=True).encode()), review.MAX_OUTPUT)
+        from mcp.types import TextContent
+        for char in ('x', '"', "\\", "\x01", "\u2028", "ä", "💠"):
+            with self.subTest(codepoint=ord(char)):
+                sample = {"status": "source_read_recorded", "content": char * 12_000}
+                actual = CallToolResult(
+                    content=[TextContent(
+                        type="text", text=review.FIRST_PARTY_MCP_BRIEF_TEXT,
+                    )],
+                    structuredContent=sample,
+                )
+                serialized = len(actual.model_dump_json(by_alias=True).encode("utf-8"))
+                estimated = len(json.dumps({
+                    "content": [{"type": "text", "text": review.FIRST_PARTY_MCP_BRIEF_TEXT}],
+                    "structuredContent": sample, "isError": False,
+                }, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+                self.assertLessEqual(
+                    serialized, estimated + review.FIRST_PARTY_MCP_ENVELOPE_RESERVE_BYTES,
+                )
+
+    def test_escaped_mcp_output_rejected_before_persisting_signed_read(self) -> None:
+        generated = self.repo / "src" / "escaped-generated-line.txt"
+        generated.write_text(("\x01" * 200_000) + "\n", encoding="utf-8")
+        self._git("add", "src/escaped-generated-line.txt")
+        self._git("commit", "-qm", "add generated text with large JSON escaping overhead")
+        self.head = self._git("rev-parse", "HEAD").strip()
+        plan = self._first_party_plan()
+        started = self._start_plan(plan)
+        lines = review._first_party_diff(self.repo, plan["binding"]).decode("utf-8").splitlines(keepends=True)
+        largest = max(range(1, len(lines) + 1), key=lambda n: len(lines[n - 1].encode("utf-8")))
+        self.assertLess(len(lines[largest - 1].encode("utf-8")), review.FIRST_PARTY_MAX_READ_BYTES)
+        with self.assertRaisesRegex(review.ReviewExecutionRejected, "transport budget"):
+            self._read(started, review.REQUIRED_AXES[0], "diff", "", "head", largest, largest)
+        reads = self.state / "sessions" / started["review_session_id"] / "reads"
+        self.assertFalse(list(reads.glob("*.json")))
+        self.assertFalse(list(reads.glob("*.data")))
+
     def test_authenticated_self_review_mcp_mutations_require_operator_gate(self) -> None:
         # Even an enrolled connector cannot persist a signed review while
         # the operator mutation blockade or audit-integrity gate is denying.

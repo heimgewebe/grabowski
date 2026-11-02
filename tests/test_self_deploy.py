@@ -9620,15 +9620,17 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
                     expected,
                     "HEAD",
                     expected,
-                    "",
                 ],
-            ):
+            ), patch.object(
+                RUNNER, "_repository_dirty_without_git_filters", return_value=False
+            ) as raw_clean:
                 RUNNER.verify_repository(
                     source,
                     canonical,
                     "detached-worktree",
                     expected,
                 )
+            self.assertEqual(raw_clean.call_count, 1)
 
     def test_verify_repository_rejects_non_main(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
