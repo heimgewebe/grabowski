@@ -68,6 +68,35 @@ TASK_OUTPUT_CAPTURE_SCRIPT = re.compile(
 )
 TASK_OUTPUT_CAPTURE_PAYLOAD = re.compile(r"[A-Za-z0-9+/]+={0,2}\Z")
 TASK_OUTPUT_CAPTURE_MAX_PAYLOAD_BYTES = 256 * 1024
+TASK_HOME_USERNAME = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]{0,63}\Z")
+
+
+def _task_home(host: dict[str, Any]) -> str:
+    return str(host.get("task_home", HOME))
+
+
+def task_home(name: str) -> str:
+    return _task_home(fleet_host(name))
+
+
+def _capture_script_pattern(host: dict[str, Any]) -> re.Pattern[str]:
+    home = _task_home(host)
+    if home == str(HOME):
+        return TASK_OUTPUT_CAPTURE_SCRIPT
+    return re.compile(
+        re.escape(home)
+        + r"/\.local/state/grabowski/task-capture/capture-([0-9a-f]{64})\.py\Z"
+    )
+
+
+def _task_output_directory_pattern(host: dict[str, Any]) -> re.Pattern[str]:
+    home = _task_home(host)
+    if home == str(HOME):
+        return TASK_OUTPUT_DIRECTORY
+    return re.compile(
+        re.escape(home)
+        + r"/\.grabowski-task-output-([0-9a-f]{24})-a([1-9][0-9]*)\Z"
+    )
 
 
 class FleetCommandDenied(PermissionError):
@@ -111,7 +140,7 @@ def validate_fleet(raw: dict[str, Any]) -> dict[str, Any]:
             raise ValueError(f"Fleet host {name} must be an object")
         _keys(candidate,
               {"transport", "target", "enabled", "roles", "command_allowlist"},
-              {"connect_timeout_seconds", "remote_command_mode"}, f"Fleet host {name}")
+              {"connect_timeout_seconds", "remote_command_mode", "task_home"}, f"Fleet host {name}")
         transport = candidate["transport"]
         target = candidate["target"]
         roles = candidate["roles"]
@@ -138,6 +167,20 @@ def validate_fleet(raw: dict[str, Any]) -> dict[str, Any]:
             raise ValueError(f"Fleet host {name} has invalid remote command mode")
         if transport != "ssh" and remote_command_mode != "posix":
             raise ValueError(f"Fleet host {name} remote command mode requires SSH transport")
+        task_home_value = candidate.get("task_home")
+        if "task_home" in candidate:
+            if transport != "ssh" or remote_command_mode != "posix":
+                raise ValueError(f"Fleet host {name} task_home requires POSIX SSH")
+            if (
+                not isinstance(task_home_value, str)
+                or not task_home_value.startswith("/home/")
+                or TASK_HOME_USERNAME.fullmatch(task_home_value[6:]) is None
+                or task_home_value[6:] in {".", ".."}
+                or target.count("@") != 1
+                or not target.rsplit("@", 1)[1]
+                or target.split("@", 1)[0] != task_home_value[6:]
+            ):
+                raise ValueError(f"Fleet host {name} task_home is invalid or mismatched")
         hosts[name] = {
             **candidate,
             "connect_timeout_seconds": timeout,
@@ -217,9 +260,21 @@ def _ensure_command_allowed(name: str, host: dict[str, Any], command: list[str])
         raise FleetCommandDenied(f"Executable is not allowed for fleet host {name}: {command[0]}")
 
 
-def run_fleet_host(name: str, argv: list[str], *, timeout_seconds: int,
-                   max_output_bytes: int) -> dict[str, Any]:
+def _bound_task_destination(name: str, expected_target: str | None) -> dict[str, Any]:
+    """Bind the actual SSH argv destination in the same host snapshot used for execution."""
     host = fleet_host(name)
+    if expected_target is not None and (
+        not isinstance(expected_target, str)
+        or host["transport"] != "ssh"
+        or host["target"] != expected_target
+    ):
+        raise RuntimeError("task SSH target changed before dispatch")
+    return host
+
+
+def run_fleet_host(name: str, argv: list[str], *, timeout_seconds: int,
+                   max_output_bytes: int, expected_target: str | None = None) -> dict[str, Any]:
+    host = _bound_task_destination(name, expected_target)
     command = _safe_argv(argv)
     timeout = operator._timeout(timeout_seconds)
     output_limit = operator._output_limit(max_output_bytes)
@@ -251,6 +306,7 @@ def run_fleet_task_output_read(
     *,
     timeout_seconds: int,
     max_output_bytes: int,
+    expected_target: str | None = None,
 ) -> dict[str, Any]:
     """Run the narrow descriptor-bound task-output reader.
 
@@ -259,7 +315,7 @@ def run_fleet_task_output_read(
     every remaining argument against the task-output path grammar. It therefore
     does not authorize arbitrary Python execution through ``grabowski_fleet_run``.
     """
-    host = fleet_host(name)
+    host = _bound_task_destination(name, expected_target)
     command = operator._validate_argv(argv, cwd=HOME)
     if len(command) != 7:
         raise ValueError("Invalid task-output reader argv length")
@@ -268,7 +324,7 @@ def run_fleet_task_output_read(
     code_sha256 = hashlib.sha256(command[2].encode("utf-8")).hexdigest()
     if code_sha256 != TASK_OUTPUT_READ_CODE_SHA256:
         raise PermissionError("Task-output reader code identity mismatch")
-    directory_match = TASK_OUTPUT_DIRECTORY.fullmatch(command[3])
+    directory_match = _task_output_directory_pattern(host).fullmatch(command[3])
     if directory_match is None:
         raise ValueError("Invalid task-output directory")
     if command[4] not in TASK_OUTPUT_STREAM:
@@ -344,6 +400,7 @@ def run_fleet_task_capture_stage(
     *,
     timeout_seconds: int,
     max_output_bytes: int,
+    expected_target: str | None = None,
 ) -> dict[str, Any]:
     """Run the narrow digest-bound task-output capture stager.
 
@@ -354,7 +411,7 @@ def run_fleet_task_capture_stage(
     authorize arbitrary Python execution through ``grabowski_fleet_run``, and a
     host whose allowlist omits an interpreter can still launch tasks.
     """
-    host = fleet_host(name)
+    host = _bound_task_destination(name, expected_target)
     command = operator._validate_argv(argv, cwd=HOME)
     if len(command) != 5:
         raise ValueError("Invalid capture stager argv length")
@@ -363,7 +420,7 @@ def run_fleet_task_capture_stage(
     code_sha256 = hashlib.sha256(command[2].encode("utf-8")).hexdigest()
     if code_sha256 != TASK_OUTPUT_CAPTURE_STAGE_CODE_SHA256:
         raise PermissionError("Capture stager code identity mismatch")
-    script_match = TASK_OUTPUT_CAPTURE_SCRIPT.fullmatch(command[3])
+    script_match = _capture_script_pattern(host).fullmatch(command[3])
     if script_match is None:
         raise ValueError("Invalid capture script destination")
     payload = command[4]
@@ -439,6 +496,7 @@ def run_fleet_task_output_cleanup(
     *,
     timeout_seconds: int,
     max_output_bytes: int,
+    expected_target: str | None = None,
 ) -> dict[str, Any]:
     """Run the fixed task-output inventory/delete contract on one fleet host.
 
@@ -446,7 +504,7 @@ def run_fleet_task_output_cleanup(
     the hash-bound embedded program and exact task-output arguments. No caller-
     supplied Python program, executable, path family or deletion target is allowed.
     """
-    host = fleet_host(name)
+    host = _bound_task_destination(name, expected_target)
     command = operator._validate_argv(argv, cwd=HOME)
     if len(command) != 10:
         raise ValueError("Invalid task-output cleanup argv length")
@@ -458,7 +516,7 @@ def run_fleet_task_output_cleanup(
     mode = command[3]
     if mode not in {"inspect", "delete"}:
         raise ValueError("Invalid task-output cleanup mode")
-    directory_match = TASK_OUTPUT_DIRECTORY.fullmatch(command[4])
+    directory_match = _task_output_directory_pattern(host).fullmatch(command[4])
     if directory_match is None:
         raise ValueError("Invalid task-output cleanup directory")
     if re.fullmatch(r"[0-9a-f]{64}", command[5]) is None:
@@ -548,6 +606,7 @@ def run_fleet_task_unit_show(
     *,
     timeout_seconds: int,
     max_output_bytes: int,
+    expected_target: str | None = None,
 ) -> dict[str, Any]:
     """Run the narrow read-only task-unit observer used by task reconcile.
 
@@ -555,7 +614,7 @@ def run_fleet_task_unit_show(
     command allowlist.  The only accepted command shape is
     ``systemctl --user show <grabowski-task-unit>`` with bounded property names.
     """
-    host = fleet_host(name)
+    host = _bound_task_destination(name, expected_target)
     if not isinstance(unit, str) or _TASK_UNIT.fullmatch(unit) is None:
         raise ValueError("Invalid Grabowski task unit")
     if not (
