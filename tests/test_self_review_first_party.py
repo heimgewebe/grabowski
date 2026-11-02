@@ -1020,18 +1020,28 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
         current = review._read_signed_record(
             current_path, signers=self.signers, root_owned_signers=False,
         )
-        # This unrelated, genuinely signed product session must be recognized
-        # before filtering, not treated as corrupt heimgewebe-only history.
-        product = copy.deepcopy(current)
-        product["session_id"] = "f" * 32
-        product["binding"]["repo"] = "alexdermohr/kleinanzeiger"
-        product["binding"]["pr"] += 1
-        product["binding_sha256"] = review._digest(product["binding"])
-        product_dir = self.state / "sessions" / product["session_id"]
-        product_dir.mkdir(mode=0o700)
-        review._write_signed_record(
-            product_dir / "session.json", product, key=self.key, signers=self.signers,
-        )
+        # Authentically signed unrelated history may predate the current
+        # issuer allowlist. None of these repositories may poison an exact
+        # Heimgewebe review, even when the historical record is signed.
+        for owner, identity in (
+            ("alexdermohr/kleinanzeiger", "f" * 32),
+            ("alexdermohr/machtverflechtungen", "d" * 32),
+            ("Hall-of-Memory/memoraevents", "c" * 32),
+            ("former-owner/retired-reviewed-repo", "b" * 32),
+            ("heimgewebe/.github", "9" * 32),
+            ("heimgewebe/_internal", "8" * 32),
+            ("heimgewebe/-private", "7" * 32),
+        ):
+            product = copy.deepcopy(current)
+            product["session_id"] = identity
+            product["binding"]["repo"] = owner
+            product["binding"]["pr"] += 1
+            product["binding_sha256"] = review._digest(product["binding"])
+            product_dir = self.state / "sessions" / identity
+            product_dir.mkdir(mode=0o700)
+            review._write_signed_record(
+                product_dir / "session.json", product, key=self.key, signers=self.signers,
+            )
         for number, axis in enumerate(review.REQUIRED_AXES, 1):
             self._submit_axis(started, axis, number)
         audit, receipts = self._seal_direct(plan)

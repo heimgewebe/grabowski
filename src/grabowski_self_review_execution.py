@@ -56,6 +56,13 @@ REF = re.compile(r"(?P<path>[A-Za-z0-9_.@+/\[\]-]+)(?::(?P<source_revision>[a-f0
 FIRST_PARTY_ALLOWED_REPO = re.compile(
     r"(?:heimgewebe/[A-Za-z0-9_.-]+|alexdermohr/(?:kleinanzeiger|machtverflechtungen)|(?:Hall-of-Memory|hall-of-memory)/memoraevents)\Z"
 )
+# Previously authorized repositories remain in the authenticated review history.
+# Admission of NEW sessions still uses FIRST_PARTY_ALLOWED_REPO. A historical
+# signed session from another well-formed ASCII GitHub repo cannot invalidate
+# every current PR review merely because the current allowlist has changed.
+FIRST_PARTY_SIGNED_HISTORY_REPO = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9_.-]+\Z"
+)
 MAX_RECEIPT = 16384
 MAX_RECORD_SIGNATURE = 16384
 SIGNED_RECORD_ENVELOPE_KIND = "grabowski_signed_record_envelope_v1"
@@ -2118,13 +2125,14 @@ def _assert_prior_first_party_material_findings_resolved(
                     # merely because a caller used another name casing.
                     candidate_repo = candidate.get("repo")
                     decisive_repo = decisive.get("repo")
-                    # Reject malformed signed history before comparing repos.
-                    # Both GitHub slugs and first-party signer bindings use
-                    # ASCII identifiers; Unicode casefold can merge distinct
-                    # names (e.g. long-s and s), so compare ASCII lower only.
+                    # Authenticate every signed historical record, then
+                    # validate its ASCII GitHub slug without applying today's
+                    # narrower NEW-session admission list to older sources.
+                    # Same-repo signed REJECTs still compare after ASCII lower
+                    # (never Unicode casefold, which folds long-s to s).
                     if (
                         not isinstance(candidate_repo, str)
-                        or FIRST_PARTY_ALLOWED_REPO.fullmatch(candidate_repo) is None
+                        or FIRST_PARTY_SIGNED_HISTORY_REPO.fullmatch(candidate_repo) is None
                         or not isinstance(decisive_repo, str)
                         or FIRST_PARTY_ALLOWED_REPO.fullmatch(decisive_repo) is None
                     ):
