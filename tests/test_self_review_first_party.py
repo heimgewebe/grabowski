@@ -101,6 +101,32 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stderr)
         return result.stdout
 
+    def test_first_party_accepts_astro_bracket_routes_without_traversal(self) -> None:
+        route_name = "src/pages/produkte/[slug].astro"
+        route = self.repo / route_name
+        route.parent.mkdir(parents=True)
+        route.write_text("---\nconst slug = 'test';\n---\n", encoding="utf-8")
+        self._git("add", "--", route_name)
+        self._git("commit", "-qm", "add Astro dynamic route")
+        head = self._git("rev-parse", "HEAD").strip()
+
+        paths = review._first_party_changed_paths(
+            self.repo, {"base_sha": self.base, "head_sha": head}
+        )
+        self.assertIn(route_name, paths)
+        self.assertIsNotNone(review.REF.fullmatch(route_name + ":L1-L3"))
+        signed_reads = [{
+            "axis": "contracts_correctness", "read_kind": "source",
+            "path": route_name, "revision": "head",
+            "start_line": 1, "end_line": 3,
+        }]
+        self.assertFalse(review._read_covers_reference(
+            "src/pages/../secret.txt:L1-L2",
+            axis="contracts_correctness", reads=signed_reads,
+            binding={"base_sha": self.base, "head_sha": head},
+        ))
+        self.assertIsNone(review.REF.fullmatch("src/pages/produkte/<script>.astro:L1-L2"))
+
     def _plan(self) -> dict:
         return producer.plan_review(
             repo=self.repo, pr=1649, base_sha=self.base, head_sha=self.head,
