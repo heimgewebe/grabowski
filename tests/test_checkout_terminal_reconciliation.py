@@ -2857,6 +2857,67 @@ class CheckoutTerminalReconciliationTests(unittest.TestCase):
             ]
         )
 
+    def test_github_issue_merged_pull_request_is_terminal(self) -> None:
+        merged_url = "https://github.com/heimgewebe/heim-pc/pull/304"
+        with patch.object(
+            sources,
+            "_github_json",
+            return_value={
+                "number": 304,
+                "state": "MERGED",
+                "url": merged_url,
+                "closedAt": "2026-11-02T10:55:05Z",
+                "updatedAt": "2026-11-02T10:55:06Z",
+            },
+        ):
+            evidence = sources.source_terminal_evidence(
+                {"source": {"kind": "github_issue", "id": "heimgewebe/heim-pc#304"}}
+            )
+        self.assertEqual("CLOSED", evidence["terminal_state"])
+        self.assertEqual(304, evidence["issue_number"])
+        self.assertEqual(merged_url, evidence["url"])
+        self.assertEqual("2026-11-02T10:55:05Z", evidence["closed_at"])
+
+    def test_github_issue_closed_unmerged_pull_is_terminal(self) -> None:
+        with patch.object(
+            sources,
+            "_github_json",
+            return_value={
+                "number": 304,
+                "state": "CLOSED",
+                "url": "https://github.com/heimgewebe/heim-pc/pull/304",
+                "closedAt": "2026-11-02T10:55:05Z",
+                "updatedAt": "2026-11-02T10:55:06Z",
+            },
+        ):
+            evidence = sources.github_issue_terminal_evidence("heimgewebe/heim-pc#304")
+        self.assertEqual("CLOSED", evidence["terminal_state"])
+
+    def test_github_issue_merged_pull_requires_exact_identity_and_close(self) -> None:
+        canonical = "https://github.com/heimgewebe/heim-pc/pull/304"
+        cases = (
+            ("MERGED", "https://github.com/heimgewebe/heim-pc/issues/304", "2026-11-02T10:55:05Z"),
+            ("MERGED", "https://github.com/heimgewebe/heim-pc/pull/305", "2026-11-02T10:55:05Z"),
+            ("MERGED", "https://github.com/other/heim-pc/pull/304", "2026-11-02T10:55:05Z"),
+            ("MERGED", canonical, None),
+            ("OPEN", canonical, "2026-11-02T10:55:05Z"),
+        )
+        for state, url, closed_at in cases:
+            with self.subTest(state=state, url=url, closed_at=closed_at):
+                with patch.object(
+                    sources,
+                    "_github_json",
+                    return_value={
+                        "number": 304,
+                        "state": state,
+                        "url": url,
+                        "closedAt": closed_at,
+                        "updatedAt": "2026-11-02T10:55:06Z",
+                    },
+                ):
+                    with self.assertRaises(RuntimeError):
+                        sources.github_issue_terminal_evidence("heimgewebe/heim-pc#304")
+
     def test_github_issue_url_accepts_one_trailing_slash_only(self) -> None:
         self.assertEqual(
             ("heimgewebe/chronik", 299),

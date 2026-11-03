@@ -52,9 +52,16 @@ TRUSTED_SIGNERS = (
 SHA40 = re.compile(r"[a-f0-9]{40}\Z")
 SHA256 = re.compile(r"[a-f0-9]{64}\Z")
 ID = re.compile(r"[a-f0-9]{32}\Z")
-REF = re.compile(r"(?P<path>[A-Za-z0-9_.@+/-]+)(?::(?P<source_revision>[a-f0-9]{40}))?:L(?P<start>[1-9][0-9]{0,6})(?:-L(?P<end>[1-9][0-9]{0,6}))?\Z")
+REF = re.compile(r"(?P<path>[A-Za-z0-9_.@+/\[\]-]+)(?::(?P<source_revision>[a-f0-9]{40}))?:L(?P<start>[1-9][0-9]{0,6})(?:-L(?P<end>[1-9][0-9]{0,6}))?\Z")
 FIRST_PARTY_ALLOWED_REPO = re.compile(
     r"(?:heimgewebe/[A-Za-z0-9_.-]+|alexdermohr/(?:kleinanzeiger|machtverflechtungen)|(?:Hall-of-Memory|hall-of-memory)/memoraevents)\Z"
+)
+# Previously authorized repositories remain in the authenticated review history.
+# Admission of NEW sessions still uses FIRST_PARTY_ALLOWED_REPO. A historical
+# signed session from another well-formed ASCII GitHub repo cannot invalidate
+# every current PR review merely because the current allowlist has changed.
+FIRST_PARTY_SIGNED_HISTORY_REPO = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9_.-]+\Z"
 )
 MAX_RECEIPT = 16384
 MAX_RECORD_SIGNATURE = 16384
@@ -432,7 +439,7 @@ def trusted_phase_source(
         "    if not all(re.fullmatch(rb'[0-9a-f]{40}',oid) for oid in (old_sha,new_sha)):sys.exit(85)\n"
         "    try:status=raw_status.decode('ascii');path=fields[pos+1].decode('utf-8')\n"
         "    except UnicodeError:sys.exit(85)\n"
-        "    if status not in ('A','D','M','T') or not re.fullmatch(r'[A-Za-z0-9_.@+/-]{1,512}',path) or '..' in path.split('/') or path in seen_changed:sys.exit(87)\n"
+        "    if status not in ('A','D','M','T') or not re.fullmatch(r'[A-Za-z0-9_.@+/\\[\\]-]{1,512}',path) or '..' in path.split('/') or path in seen_changed:sys.exit(87)\n"
         "    if (status=='A' and old_mode!=b'000000') or (status=='D' and new_mode!=b'000000') or (status in ('M','T') and (old_mode==b'000000' or new_mode==b'000000')):sys.exit(87)\n"
         "    changed.append((status,path));seen_changed.add(path)\n"
         "if not changed or len(changed)>256:sys.exit(86)\n"
@@ -1352,7 +1359,7 @@ def _first_party_changed_paths(
         or len(paths) != len(set(paths))
         or any(
             not path or len(path) > 512 or ".." in Path(path).parts
-            or re.fullmatch(r"[A-Za-z0-9_.@+/-]+", path) is None
+            or re.fullmatch(r"[A-Za-z0-9_.@+/\[\]-]+", path) is None
             for path in paths
         )
     ):
@@ -2118,13 +2125,14 @@ def _assert_prior_first_party_material_findings_resolved(
                     # merely because a caller used another name casing.
                     candidate_repo = candidate.get("repo")
                     decisive_repo = decisive.get("repo")
-                    # Reject malformed signed history before comparing repos.
-                    # Both GitHub slugs and first-party signer bindings use
-                    # ASCII identifiers; Unicode casefold can merge distinct
-                    # names (e.g. long-s and s), so compare ASCII lower only.
+                    # Authenticate every signed historical record, then
+                    # validate its ASCII GitHub slug without applying today's
+                    # narrower NEW-session admission list to older sources.
+                    # Same-repo signed REJECTs still compare after ASCII lower
+                    # (never Unicode casefold, which folds long-s to s).
                     if (
                         not isinstance(candidate_repo, str)
-                        or FIRST_PARTY_ALLOWED_REPO.fullmatch(candidate_repo) is None
+                        or FIRST_PARTY_SIGNED_HISTORY_REPO.fullmatch(candidate_repo) is None
                         or not isinstance(decisive_repo, str)
                         or FIRST_PARTY_ALLOWED_REPO.fullmatch(decisive_repo) is None
                     ):

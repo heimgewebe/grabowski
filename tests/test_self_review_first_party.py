@@ -101,6 +101,32 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stderr)
         return result.stdout
 
+    def test_first_party_accepts_astro_bracket_routes_without_traversal(self) -> None:
+        route_name = "src/pages/produkte/[slug].astro"
+        route = self.repo / route_name
+        route.parent.mkdir(parents=True)
+        route.write_text("---\nconst slug = 'test';\n---\n", encoding="utf-8")
+        self._git("add", "--", route_name)
+        self._git("commit", "-qm", "add Astro dynamic route")
+        head = self._git("rev-parse", "HEAD").strip()
+
+        paths = review._first_party_changed_paths(
+            self.repo, {"base_sha": self.base, "head_sha": head}
+        )
+        self.assertIn(route_name, paths)
+        self.assertIsNotNone(review.REF.fullmatch(route_name + ":L1-L3"))
+        signed_reads = [{
+            "axis": "contracts_correctness", "read_kind": "source",
+            "path": route_name, "revision": "head",
+            "start_line": 1, "end_line": 3,
+        }]
+        self.assertFalse(review._read_covers_reference(
+            "src/pages/../secret.txt:L1-L2",
+            axis="contracts_correctness", reads=signed_reads,
+            binding={"base_sha": self.base, "head_sha": head},
+        ))
+        self.assertIsNone(review.REF.fullmatch("src/pages/produkte/<script>.astro:L1-L2"))
+
     def _plan(self) -> dict:
         return producer.plan_review(
             repo=self.repo, pr=1649, base_sha=self.base, head_sha=self.head,
@@ -994,18 +1020,28 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
         current = review._read_signed_record(
             current_path, signers=self.signers, root_owned_signers=False,
         )
-        # This unrelated, genuinely signed product session must be recognized
-        # before filtering, not treated as corrupt heimgewebe-only history.
-        product = copy.deepcopy(current)
-        product["session_id"] = "f" * 32
-        product["binding"]["repo"] = "alexdermohr/kleinanzeiger"
-        product["binding"]["pr"] += 1
-        product["binding_sha256"] = review._digest(product["binding"])
-        product_dir = self.state / "sessions" / product["session_id"]
-        product_dir.mkdir(mode=0o700)
-        review._write_signed_record(
-            product_dir / "session.json", product, key=self.key, signers=self.signers,
-        )
+        # Authentically signed unrelated history may predate the current
+        # issuer allowlist. None of these repositories may poison an exact
+        # Heimgewebe review, even when the historical record is signed.
+        for owner, identity in (
+            ("alexdermohr/kleinanzeiger", "f" * 32),
+            ("alexdermohr/machtverflechtungen", "d" * 32),
+            ("Hall-of-Memory/memoraevents", "c" * 32),
+            ("former-owner/retired-reviewed-repo", "b" * 32),
+            ("heimgewebe/.github", "9" * 32),
+            ("heimgewebe/_internal", "8" * 32),
+            ("heimgewebe/-private", "7" * 32),
+        ):
+            product = copy.deepcopy(current)
+            product["session_id"] = identity
+            product["binding"]["repo"] = owner
+            product["binding"]["pr"] += 1
+            product["binding_sha256"] = review._digest(product["binding"])
+            product_dir = self.state / "sessions" / identity
+            product_dir.mkdir(mode=0o700)
+            review._write_signed_record(
+                product_dir / "session.json", product, key=self.key, signers=self.signers,
+            )
         for number, axis in enumerate(review.REQUIRED_AXES, 1):
             self._submit_axis(started, axis, number)
         audit, receipts = self._seal_direct(plan)

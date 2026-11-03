@@ -1132,13 +1132,20 @@ def github_issue_terminal_evidence(source_id: str) -> dict[str, Any]:
     )
     if not isinstance(issue, dict) or issue.get("number") != number:
         raise RuntimeError("GitHub issue source identity differs")
-    if issue.get("state") != "CLOSED" or not issue.get("closedAt"):
+    state = issue.get("state")
+    if state not in {"CLOSED", "MERGED"} or not issue.get("closedAt"):
         raise RuntimeError("GitHub issue source is not closed")
-    expected_url = f"https://github.com/{repository}/issues/{number}"
+    # A merged pull request is also a terminal GitHub issue. gh issue view
+    # returns MERGED and its canonical /pull/ URL, not CLOSED and /issues/.
+    expected_urls = {f"https://github.com/{repository}/pull/{number}"}
+    if state == "CLOSED":
+        expected_urls.add(f"https://github.com/{repository}/issues/{number}")
     issue_url = issue.get("url")
     if (
         not isinstance(issue_url, str)
-        or issue_url.rstrip("/").casefold() != expected_url.casefold()
+        or issue_url.rstrip("/").casefold() not in {
+            url.casefold() for url in expected_urls
+        }
     ):
         raise RuntimeError("GitHub issue source identity differs")
     return _terminal_evidence(
