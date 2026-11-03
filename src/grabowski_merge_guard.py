@@ -88,8 +88,17 @@ def _signed_first_party_material_history_errors(bindings: dict[str, Any]) -> lis
     if not registry.exists():
         return []
     repo = bindings.get("repository")
-    if not isinstance(repo, str) or re.fullmatch(r"heimgewebe/[A-Za-z0-9_.-]+", repo) is None:
+    if not isinstance(repo, str) or re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo) is None:
         return ["merge_guard_signed_first_party_history_binding_invalid"]
+    # Only GitHub origins supported by the signed FirstParty producer may
+    # carry authenticated REJECT history. Never bypass this check for an
+    # explicitly admitted product or research repo. Canonicalize ASCII
+    # GitHub case aliases before the historical signed-record comparison.
+    owner, _, name = repo.partition("/")
+    normalized = ("heimgewebe/" + name) if owner.lower() == "heimgewebe" else repo.lower()
+    if provenance.FIRST_PARTY_ALLOWED_REPO.fullmatch(normalized) is None:
+        return []
+    repo = normalized
     binding = {
         "repo": repo,
         "pr": bindings.get("pull_request"),
@@ -2153,6 +2162,33 @@ def _merge_guard_legacy_local_review_diff_identity(
         local_digest = hashlib.sha256(local_diff).hexdigest()
         local_canonical_digest = github_pr_diff_identity_sha256(local_diff)
         provider_canonical_digest = github_pr_diff_identity_sha256(provider_diff)
+        # First-party reviews sign full-index BASE..HEAD committed bytes.
+        # GitHub abbreviates index OIDs. Accept this second representation
+        # only when the exact source commits, changed paths and provider
+        # hunks have already been proven identical.
+        if local_digest != expected_sha256 and local_canonical_digest == provider_canonical_digest:
+            full_result = _merge_guard_local_git_bytes(
+                repo_path,
+                [
+                    "-c", "diff.noprefix=false", "-c", "core.abbrev=auto",
+                    "diff", "--no-ext-diff", "--no-textconv", "--no-color", "--no-renames",
+                    "--ignore-submodules=none", "--unified=3", "--full-index",
+                    base_sha, head_sha, "--",
+                ],
+                timeout=60,
+            )
+            full_diff = full_result["stdout_bytes"]
+            if (
+                full_result["returncode"] == 0
+                and 0 < len(full_diff) <= _MERGE_GUARD_MAX_DIFF_BYTES
+                and not _merge_guard_diff_contains_binary_metadata(full_diff)
+                and hashlib.sha256(full_diff).hexdigest() == expected_sha256
+                and github_pr_diff_identity_sha256(full_diff) == provider_canonical_digest
+            ):
+                local_diff = full_diff
+                local_digest = expected_sha256
+                local_canonical_digest = provider_canonical_digest
+                evidence["proof_format"] = "first-party-full-index"
         evidence.update({
             "local_raw_sha256": local_digest,
             "local_canonical_sha256": local_canonical_digest,

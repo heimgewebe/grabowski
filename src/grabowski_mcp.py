@@ -7417,9 +7417,20 @@ def grabowski_self_review_source_read(
         ctx, tool_name=self_review_execution.FIRST_PARTY_TOOL_READ,
         arguments=arguments,
     )
-    return self_review_execution.record_first_party_source_read(
+    result = self_review_execution.record_first_party_source_read(
         review_session_id, session_nonce, axis, read_kind,
         path, revision, start_line, end_line, issuer,
+    )
+    # FastMCP 1.30 otherwise emits the same large dict twice.  Retain the
+    # declared dict output schema in structuredContent and one short text note.
+    from mcp.types import CallToolResult, TextContent
+
+    return CallToolResult(
+        content=[TextContent(
+            type="text",
+            text=self_review_execution.FIRST_PARTY_MCP_BRIEF_TEXT,
+        )],
+        structuredContent=result,
     )
 
 
@@ -9152,7 +9163,13 @@ def _repoground_git(
 def repoground_bundle_discover(
     repo: str | None = None, max_candidates: int = 20
 ) -> dict[str, Any]:
-    """Discover healthy RepoGround bundles from one deterministic publication catalog."""
+    """Discover healthy RepoGround bundles by repository identity, not a filesystem path.
+
+    The optional 'repo' filter is a name such as 'repoground',
+    'heimgewebe/repoground', or 'heimgewebe__repoground'.
+    Do not pass '/tmp/repoground' or another local checkout path.
+    Omit 'repo' to list the publication catalog; this tool never builds bundles.
+    """
     _require_capability("bundle_registry")
     if not isinstance(max_candidates, int) or not 1 <= max_candidates <= 100:
         raise ValueError("max_candidates must be between 1 and 100")
@@ -10197,7 +10214,22 @@ def _repoground_query_snippets(
         navigation_hits = _repoground_list_of_dicts(payload.get("navigation_hits"))
         if navigation_hits:
             for ordinal, hit in enumerate(navigation_hits[:max_snippets]):
-                path = hit.get("path")
+                # Graph callers/callees carry the source-indexed symbol nested.
+                # Only elevate its identity if it agrees with the hit path.
+                symbol_hit = hit
+                nested_key = (
+                    "caller_symbol" if payload.get("route") == "callers"
+                    else "callee_symbol" if payload.get("route") == "callees"
+                    else None
+                )
+                nested = hit.get(nested_key) if nested_key is not None else None
+                if isinstance(nested, dict) and (
+                    not hit.get("path") or nested.get("path") == hit["path"]
+                ):
+                    symbol_hit = nested
+                path = hit.get("path") or symbol_hit.get("path")
+                first_line = symbol_hit.get("start_line")
+                last_line = symbol_hit.get("end_line")
                 source_range = (
                     dict(hit["source_range"])
                     if isinstance(hit.get("source_range"), dict)
@@ -10206,8 +10238,8 @@ def _repoground_query_snippets(
                 if source_range is None and isinstance(path, str) and path:
                     source_range = {
                         "file_path": path,
-                        "start_line": hit.get("start_line"),
-                        "end_line": hit.get("end_line"),
+                        "start_line": first_line,
+                        "end_line": last_line,
                     }
                 elif source_range is not None and "file_path" not in source_range:
                     source_range["file_path"] = path
@@ -10215,14 +10247,14 @@ def _repoground_query_snippets(
                     {
                         "ordinal": ordinal,
                         "path": path,
-                        "chunk_id": hit.get("id"),
+                        "chunk_id": symbol_hit.get("id"),
                         "score": None,
                         "text_excerpt": None,
                         "range_ref": None,
                         "source_range": source_range,
                         "line_range": {
-                            "start_line": hit.get("start_line"),
-                            "end_line": hit.get("end_line"),
+                            "start_line": first_line,
+                            "end_line": last_line,
                         },
                         "citation_id": None,
                         "citation_status": None,
@@ -10234,10 +10266,10 @@ def _repoground_query_snippets(
                         "live_repo_address": None,
                         "live_repo_address_status": None,
                         "symbol": {
-                            "kind": hit.get("kind"),
-                            "name": hit.get("name"),
-                            "qualified_name": hit.get("qualified_name"),
-                            "range_ref": hit.get("range_ref"),
+                            "kind": symbol_hit.get("kind"),
+                            "name": symbol_hit.get("name"),
+                            "qualified_name": symbol_hit.get("qualified_name"),
+                            "range_ref": symbol_hit.get("range_ref"),
                         },
                     }
                 )

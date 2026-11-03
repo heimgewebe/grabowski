@@ -120,6 +120,7 @@ BOOTSTRAP_EXPECTED_CHECK_NAMES_BY_REPO = {
     "heimgewebe/metarepo": ("ci (ubuntu-latest)", "ci (macos-latest)"),
     "heimgewebe/mitschreiber": ("ci / reusable-ci",),
     "heimgewebe/nixer": ("nixer-ci",),
+    "heimgewebe/recovery-evidence-authority": ("security-selftest",),
     "heimgewebe/systemkatalog": ("Repository Contract", "Secret Scan"),
     "heimgewebe/weltgewebe": ("Detect docs updates", "Core Guard Tests"),
 }
@@ -4327,12 +4328,19 @@ def evaluate_review_gate(
                 "review_pass_receipts": self_review.get("review_pass_receipts"),
             }
             self_review_failures.extend(review_receipt_errors(origin_audit))
-        elif repo_name is not None and all((
-            type(pr.get("number")) is int,
-            isinstance(pr.get("baseRefOid"), str),
-            isinstance(pr.get("headRefOid"), str),
-            _normalize_sha256(state.get("pr_diff_sha256")) is not None,
-        )):
+        elif (
+            # Authenticated first-party sessions belong to managed Heimgewebe
+            # repositories only. Other GitHub owners have no matching signed
+            # history and must not be rejected by its owner-specific parser.
+            repo_name is not None
+            and repo_name.casefold().startswith("heimgewebe/")
+            and all((
+                type(pr.get("number")) is int,
+                isinstance(pr.get("baseRefOid"), str),
+                isinstance(pr.get("headRefOid"), str),
+                _normalize_sha256(state.get("pr_diff_sha256")) is not None,
+            ))
+        ):
             # Standard and elevated self-reviews need no five-axis PASS audit,
             # but they may not silently discard a signed material REJECT from
             # the same immutable PR revision. Reuse the authenticated registry
@@ -4426,10 +4434,11 @@ def evaluate_review_gate(
         if bucket not in PASS_CHECK_BUCKETS and bucket != "skipping":
             blocking_checks.append(check)
 
+    # A duplicate required name is ambiguous even when every check is green.
     missing_expected_checks = [
         name
         for name, buckets in expected_check_buckets_by_name.items()
-        if not buckets or not all(bucket in PASS_CHECK_BUCKETS for bucket in buckets)
+        if len(buckets) != 1 or buckets[0] not in PASS_CHECK_BUCKETS
     ]
     stale_or_unbound_base_checks = {
         name for name, matched in base_bound_check_matches.items() if not matched

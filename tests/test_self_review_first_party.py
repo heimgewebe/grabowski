@@ -101,6 +101,32 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stderr)
         return result.stdout
 
+    def test_first_party_accepts_astro_bracket_routes_without_traversal(self) -> None:
+        route_name = "src/pages/produkte/[slug].astro"
+        route = self.repo / route_name
+        route.parent.mkdir(parents=True)
+        route.write_text("---\nconst slug = 'test';\n---\n", encoding="utf-8")
+        self._git("add", "--", route_name)
+        self._git("commit", "-qm", "add Astro dynamic route")
+        head = self._git("rev-parse", "HEAD").strip()
+
+        paths = review._first_party_changed_paths(
+            self.repo, {"base_sha": self.base, "head_sha": head}
+        )
+        self.assertIn(route_name, paths)
+        self.assertIsNotNone(review.REF.fullmatch(route_name + ":L1-L3"))
+        signed_reads = [{
+            "axis": "contracts_correctness", "read_kind": "source",
+            "path": route_name, "revision": "head",
+            "start_line": 1, "end_line": 3,
+        }]
+        self.assertFalse(review._read_covers_reference(
+            "src/pages/../secret.txt:L1-L2",
+            axis="contracts_correctness", reads=signed_reads,
+            binding={"base_sha": self.base, "head_sha": head},
+        ))
+        self.assertIsNone(review.REF.fullmatch("src/pages/produkte/<script>.astro:L1-L2"))
+
     def _plan(self) -> dict:
         return producer.plan_review(
             repo=self.repo, pr=1649, base_sha=self.base, head_sha=self.head,
@@ -164,7 +190,11 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
         else:
             # A clean frozen patch already has immutable committed source.
             # Keep the existing dirty-workspace freezer's contract unchanged.
-            payload = review._first_party_diff(candidate, {"base_sha": self.base, "head_sha": self.head})
+            payload = producer.provenance._git_read(
+                candidate,
+                ["diff", "--binary", "--no-ext-diff", "--no-textconv", self.base, "--"],
+                maximum=workspace.MAX_PATCH_BYTES,
+            )
             path = workspace._writer_patch_path(manifest)
             size, sha = workspace._atomic_bounded_chunks(path, [payload], max_bytes=workspace.MAX_PATCH_BYTES)
             patch = {"type": "patch", "path": str(path), "sha256": sha, "bytes": size, "applies_to": self.base}
@@ -983,6 +1013,52 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
         audit, receipts = self._seal_direct(plan)
         self.assertEqual([], self._receipt_errors(audit, receipts))
 
+    def test_signed_mixed_repository_history_keeps_reviews_independent(self) -> None:
+        plan = self._first_party_plan()
+        started = self._start_plan(plan)
+        current_path = self.state / "sessions" / started["review_session_id"] / "session.json"
+        current = review._read_signed_record(
+            current_path, signers=self.signers, root_owned_signers=False,
+        )
+        # Authentically signed unrelated history may predate the current
+        # issuer allowlist. None of these repositories may poison an exact
+        # Heimgewebe review, even when the historical record is signed.
+        for owner, identity in (
+            ("alexdermohr/kleinanzeiger", "f" * 32),
+            ("alexdermohr/machtverflechtungen", "d" * 32),
+            ("Hall-of-Memory/memoraevents", "c" * 32),
+            ("former-owner/retired-reviewed-repo", "b" * 32),
+            ("heimgewebe/.github", "9" * 32),
+            ("heimgewebe/_internal", "8" * 32),
+            ("heimgewebe/-private", "7" * 32),
+        ):
+            product = copy.deepcopy(current)
+            product["session_id"] = identity
+            product["binding"]["repo"] = owner
+            product["binding"]["pr"] += 1
+            product["binding_sha256"] = review._digest(product["binding"])
+            product_dir = self.state / "sessions" / identity
+            product_dir.mkdir(mode=0o700)
+            review._write_signed_record(
+                product_dir / "session.json", product, key=self.key, signers=self.signers,
+            )
+        for number, axis in enumerate(review.REQUIRED_AXES, 1):
+            self._submit_axis(started, axis, number)
+        audit, receipts = self._seal_direct(plan)
+        self.assertEqual([], self._receipt_errors(audit, receipts))
+
+        # Conversely, a product review must not be poisoned by prior genuine
+        # heimgewebe sessions. This directly exercises the historical identity
+        # predicate; the separate origin tests cover product checkout admission.
+        decisive_product = copy.deepcopy(current)
+        decisive_product["session_id"] = "e" * 32
+        decisive_product["binding"]["repo"] = "alexdermohr/kleinanzeiger"
+        decisive_product["binding"]["pr"] += 2
+        review._assert_prior_first_party_material_findings_resolved(
+            decisive_product, {}, root=self.state, repository=self.repo,
+            signers=self.signers, root_owned_signers=False,
+        )
+
     def test_history_over_2048_authentic_unrelated_sessions(self) -> None:
         plan = self._first_party_plan()
         started = self._start_plan(plan)
@@ -1024,6 +1100,268 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
         self._submit_axis(rejected, review.REQUIRED_AXES[0], 1, reject=True)
         with self.assertRaisesRegex(review.ReviewExecutionRejected, "previous signed material"):
             self._seal_direct(plan)
+
+    def _legacy_abbreviated_diff(self, width: int) -> bytes:
+        return review._git_read(
+            self.repo,
+            [
+                "diff", "--no-ext-diff", "--no-textconv", "--no-renames",
+                "--ignore-submodules=none", "--unified=3", f"--abbrev={width}",
+                self.base, self.head, "--",
+            ],
+            maximum=review.FIRST_PARTY_MAX_DIFF_BYTES,
+        )
+
+    def test_legacy_short_prefixes_signed_five_axis(self) -> None:
+        for width in (4, 5, 6):
+            with self.subTest(width=width):
+                legacy = self._legacy_abbreviated_diff(width)
+                with mock.patch.object(review, "_first_party_diff", return_value=legacy):
+                    plan = self._first_party_plan()
+                    started = self._start_plan(plan)
+                    for number, axis in enumerate(review.REQUIRED_AXES, 1):
+                        self._submit_axis(started, axis, number)
+                audit, receipts = self._seal_direct(plan)
+                self.assertEqual([], self._receipt_errors(audit, receipts))
+
+    def test_legacy_short_prefix_partial_reject_blocks(self) -> None:
+        legacy = self._legacy_abbreviated_diff(4)
+        with mock.patch.object(review, "_first_party_diff", return_value=legacy):
+            old_plan = self._first_party_plan()
+            old = self._start_plan(old_plan)
+            self._submit_axis(old, review.REQUIRED_AXES[0], 1, reject=True)
+        current = self._first_party_plan()
+        session = self._start_plan(current)
+        for number, axis in enumerate(review.REQUIRED_AXES, 1):
+            self._submit_axis(session, axis, number)
+        with self.assertRaisesRegex(
+            review.ReviewExecutionRejected, "previous signed material",
+        ):
+            self._seal_direct(current)
+
+    def test_legacy_abbrev_pass_remains_signed_and_verified_after_full_index(self) -> None:
+        stable = review._first_party_diff(
+            self.repo, {"base_sha": self.base, "head_sha": self.head},
+        )
+        abbreviated = self._legacy_abbreviated_diff(10)
+        self.assertNotEqual(stable, abbreviated)
+        self.assertEqual(
+            abbreviated,
+            review._first_party_signed_diff(
+                self.repo, {
+                    "binding": {"review_purpose": "pull_request", "base_sha": self.base,
+                                "head_sha": self.head},
+                    "canonical_diff_sha256": hashlib.sha256(abbreviated).hexdigest(),
+                },
+            ),
+        )
+        with mock.patch.object(review, "_first_party_diff", return_value=abbreviated):
+            old_plan = self._first_party_plan()
+            started = self._start_plan(old_plan)
+            for number, axis in enumerate(review.REQUIRED_AXES, 1):
+                self._submit_axis(started, axis, number)
+            old_audit, old_receipts = self._seal_direct(old_plan)
+
+        # The old exact signed source reads must remain valid on the new
+        # pinned FULL-index renderer, without rewriting any old receipt.
+        self.assertEqual([], self._receipt_errors(old_audit, old_receipts))
+        new_plan = self._first_party_plan()
+        new_start = self._start_plan(new_plan)
+        for number, axis in enumerate(review.REQUIRED_AXES, 1):
+            self._submit_axis(new_start, axis, number)
+        new_audit, new_receipts = self._seal_direct(new_plan)
+        self.assertEqual([], self._receipt_errors(new_audit, new_receipts))
+
+        # Unrelated object growth cannot change the new full-index source.
+        other = self.repo / "unrelated-object"
+        other.write_text("not part of either reviewed commit", encoding="utf-8")
+        self._git("hash-object", "-w", "--", "unrelated-object")
+        self.assertEqual(
+            hashlib.sha256(stable).hexdigest(),
+            hashlib.sha256(review._first_party_diff(
+                self.repo, new_plan["binding"],
+            )).hexdigest(),
+        )
+
+    def test_signed_legacy_mixed_index_widths_survive_full_index_and_reject_tampering(self) -> None:
+        # Real SHA-1 collision in the first seven hex digits, not a mock PASS:
+        # Git uses 8 characters for this file and 7 for the other file.
+        collision = self.repo / "src" / "collision.py"
+        collision.write_bytes(b"unique-blob-00000506\n")
+        self._git("add", "src/collision.py")
+        self._git("commit", "-qm", "collision base")
+        self.base = self._git("rev-parse", "HEAD").strip()
+        collision.write_bytes(b"unique-blob-00005938\n")
+        ordinary = self.repo / self.source_path
+        ordinary.write_bytes(
+            ordinary.read_bytes() + "EXTRA_HEAD = 79\nNEL_BREAK\u0085SECOND = 80\n".encode("utf-8")
+        )
+        self._git("add", "src/collision.py", self.source_path)
+        self._git("commit", "-qm", "collision head")
+        self.head = self._git("rev-parse", "HEAD").strip()
+        legacy = self._legacy_abbreviated_diff(7)
+        rendered_indexes = [
+            line for line in legacy.decode("utf-8").splitlines()
+            if line.startswith("index ")
+        ]
+        self.assertEqual(2, len(rendered_indexes))
+        self.assertIn("index 53bb2227..53bb2222 100644", rendered_indexes)
+        self.assertTrue(any(
+            len(line.split()[1].split("..")[0]) == 7
+            and len(line.split()[1].split("..")[1]) == 7
+            for line in rendered_indexes
+        ))
+        complete = review._first_party_diff(
+            self.repo, {"base_sha": self.base, "head_sha": self.head},
+        )
+        self.assertNotEqual(legacy, complete)
+
+        with mock.patch.object(review, "_first_party_diff", return_value=legacy):
+            old_plan = self._first_party_plan()
+            started = self._start_plan(old_plan)
+            self._complete_candidate(old_plan, started)
+            old_audit, old_receipts = self._seal_direct(old_plan)
+
+        session_root = self.state / "sessions" / started["review_session_id"]
+        session = review._read_signed_record(
+            session_root / "session.json", signers=self.signers,
+            root_owned_signers=False,
+        )
+        self.assertIn("\u0085".encode("utf-8"), legacy)
+        original_git_read = review._git_read
+
+        def forbid_untrusted_redisplay(repo, arguments, **kwargs):
+            if any(item.startswith("--abbrev=") for item in arguments):
+                raise AssertionError("signed chunks must not need mutable Git abbreviation width")
+            return original_git_read(repo, arguments, **kwargs)
+
+        with mock.patch.object(review, "_git_read", side_effect=forbid_untrusted_redisplay):
+            recovered = review._first_party_signed_diff(
+                self.repo, session, session_root=session_root,
+                signers=self.signers, root_owned_signers=False,
+            )
+        self.assertEqual(legacy, recovered)
+        # The registered five signed diff reads must be checked using one
+        # historical diff reconstruction per verifier pass, not N times.
+        with mock.patch.object(
+            review, "_first_party_signed_diff", wraps=review._first_party_signed_diff,
+        ) as recover_once:
+            persisted = review._load_first_party_reads(
+                session, session_root, signers=self.signers,
+                root_owned_signers=False, repository=self.repo,
+            )
+        self.assertGreaterEqual(
+            sum(item["read_kind"] == "diff" for item in persisted), 5,
+        )
+        self.assertEqual(1, recover_once.call_count)
+        self.assertEqual([], self._receipt_errors(old_audit, old_receipts))
+
+        # A fresh signed review must keep the prior genuine full-read receipt.
+        current = self._first_party_plan()
+        current_start = self._start_plan(current)
+        self._complete_candidate(current, current_start)
+        current_audit, current_receipts = self._seal_direct(current)
+        self.assertEqual([], self._receipt_errors(current_audit, current_receipts))
+
+        # Corrupt a signed data sidecar: recomputation must never hide the
+        # mismatch behind a re-rendered Git diff or manufacture a PASS.
+        signed_diff = next(
+            item for item in sorted(session_root.joinpath("reads").glob("*.json"))
+            if review._read_signed_record(
+                item, signers=self.signers, root_owned_signers=False,
+            )["read_kind"] == "diff"
+        )
+        first_data = signed_diff.with_suffix(".data")
+        first_data.write_bytes(first_data.read_bytes() + b"tampering")
+        with self.assertRaises(review.ReviewExecutionRejected):
+            review._first_party_signed_diff(
+                self.repo, session, session_root=session_root,
+                signers=self.signers, root_owned_signers=False,
+            )
+
+    def test_legacy_abbrev_material_reject_still_blocks_full_index_review(self) -> None:
+        abbreviated = self._legacy_abbreviated_diff(9)
+        self.assertNotEqual(
+            abbreviated, review._first_party_diff(
+                self.repo, {"base_sha": self.base, "head_sha": self.head},
+            ),
+        )
+        with mock.patch.object(review, "_first_party_diff", return_value=abbreviated):
+            old_plan = self._first_party_plan()
+            old_start = self._start_plan(old_plan)
+            self._submit_axis(
+                old_start, review.REQUIRED_AXES[0], 1, reject=True,
+            )
+
+        # Complete old signed data and material REJECT travel through exact
+        # historical Git bytes, not through a synthetic empty-session skip.
+        new_plan = self._first_party_plan()
+        new_start = self._start_plan(new_plan)
+        for number, axis in enumerate(review.REQUIRED_AXES, 1):
+            self._submit_axis(new_start, axis, number)
+        with self.assertRaisesRegex(
+            review.ReviewExecutionRejected, "previous signed material",
+        ):
+            self._seal_direct(new_plan)
+
+    def test_empty_signed_wrong_canonical_diff_session_cannot_poison_new_review(self) -> None:
+        # Real production regression: one valid issuer-signed START accidentally
+        # used the GitHub-PR identity as local canonical diff identity. It has
+        # zero review-axis receipts, hence no finding or REJECT to suppress.
+        old_plan = self._first_party_plan()
+        github_rendered_diff = b"GitHub PR rendered diff != local git raw diff"
+        old_plan["binding"]["diff_sha256"] = hashlib.sha256(
+            github_rendered_diff
+        ).hexdigest()
+        with mock.patch.object(
+            review, "_first_party_diff", return_value=github_rendered_diff
+        ):
+            old_session = self._start_plan(old_plan)
+        legacy_root = self.state / "sessions" / old_session["review_session_id"]
+        self.assertEqual([], list((legacy_root / "axes").iterdir()))
+        legacy = review._read_signed_record(
+            legacy_root / "session.json", signers=self.signers,
+            root_owned_signers=False,
+        )
+        self.assertNotEqual(
+            hashlib.sha256(review._first_party_diff(
+                self.repo, old_plan["binding"]
+            )).hexdigest(),
+            legacy["canonical_diff_sha256"],
+        )
+        self.assertEqual(
+            legacy["binding"]["diff_sha256"], legacy["canonical_diff_sha256"],
+            "historical defect confused GitHub patch identity with local raw diff",
+        )
+        self.assertEqual(
+            producer._current_source(self.repo, old_plan["binding"]),
+            legacy["source_raw_diff_sha256"],
+        )
+
+        plan = self._first_party_plan()
+        started = self._start_plan(plan)
+        for number, axis in enumerate(review.REQUIRED_AXES, start=1):
+            self._submit_axis(started, axis, number)
+        audit, receipts = self._seal_direct(plan)
+        self.assertEqual([], self._receipt_errors(audit, receipts))
+
+        # If the supposedly empty historical registry later acquires any axis
+        # entry, the exact same audit must fail closed, not silently skip it.
+        invalid_axis = legacy_root / "axes" / "contracts_correctness.json"
+        invalid_axis.write_text("{}", encoding="utf-8")
+        invalid_axis.chmod(0o600)
+        self.assertTrue(self._receipt_errors(audit, receipts))
+        invalid_axis.unlink()
+
+        # A malformed/unsigned READ sidecar is also not an empty inert session.
+        # The old axis-only exception silently accepted this adversarial case.
+        invalid_read = legacy_root / "reads" / ("a" * 32 + ".json")
+        invalid_read.write_text("{}", encoding="utf-8")
+        invalid_read.chmod(0o600)
+        self.assertTrue(
+            self._receipt_errors(audit, receipts),
+            "malformed old read record must remain fail-closed",
+        )
 
     def test_prior_signed_material_reject_remains_blocking_across_batches(self) -> None:
         # No change to Git source, PR or canonical diff between batches.
@@ -1366,6 +1704,7 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
         authentic = review._assert_no_first_party_reject_for_legacy_review
 
         def inspect_original_signed_review(candidate: dict, **_options: object) -> None:
+            self.assertIn(candidate["repo"].casefold(), {"heimgewebe/grabowski", "alexdermohr/machtverflechtungen"})
             authentic(
                 candidate, repository=serving_checkout, root=self.state,
                 signers=self.signers, root_owned_signers=False,
@@ -1386,6 +1725,53 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
                 }),
                 "a signed REJECT must not bleed into another PR identity",
             )
+            self.assertEqual(
+                [], captain._signed_first_party_material_history_errors({
+                    **binding, "repository": "alexdermohr/machtverflechtungen",
+                }),
+                "an unrelated signed Heimgewebe REJECT cannot contaminate a supported research owner",
+            )
+            self.assertEqual(
+                ["merge_guard_signed_first_party_history_binding_invalid"],
+                captain._signed_first_party_material_history_errors({
+                    **binding, "repository": "../invalid/name",
+                }),
+                "invalid repository identities must still be rejected",
+            )
+            self.assertEqual(
+                ["merge_guard_signed_first_party_material_reject_or_invalid_history"],
+                captain._signed_first_party_material_history_errors({
+                    **binding, "repository": "Heimgewebe/grabowski",
+                }),
+                "case aliases of the signed owner must not bypass REJECT history",
+            )
+            self.assertEqual(
+                ["merge_guard_signed_first_party_material_reject_or_invalid_history"],
+                captain._signed_first_party_material_history_errors({
+                    **binding, "repository": "heimgewebe/Grabowski",
+                }),
+                "case aliases of signed repository names must not bypass REJECT history",
+            )
+
+            for malformed in (
+                "", "heimgewebe/", "heimgewebe//grabowski",
+                "heimgewebe/grabowski/extra", "heimgewebe/grabowski ",
+                None, 42, [], {},
+            ):
+                self.assertEqual(
+                    ["merge_guard_signed_first_party_history_binding_invalid"],
+                    captain._signed_first_party_material_history_errors({
+                        **binding, "repository": malformed,
+                    }),
+                    "malformed or untyped repository identities must fail closed",
+                )
+            self.assertEqual(
+                ["merge_guard_signed_first_party_material_reject_or_invalid_history"],
+                captain._signed_first_party_material_history_errors({
+                    **binding, "repository": "HEIMGEWEBE/Grabowski",
+                }),
+                "mixed-case owner and repository aliases retain the signed REJECT",
+            )
 
             self.now += 1
             resolution = self._start_plan(self._first_party_plan())
@@ -1395,6 +1781,163 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
             self.assertEqual(
                 [], captain._signed_first_party_material_history_errors(binding),
                 "a genuinely later signed resolution must clear the exact finding",
+            )
+            for alias in ("heimgewebe/Grabowski", "Heimgewebe/grabowski", "HEIMGEWEBE/Grabowski"):
+                self.assertEqual(
+                    [], captain._signed_first_party_material_history_errors({
+                        **binding, "repository": alias,
+                    }),
+                    "a signed resolution must also clear the same GitHub repository under case aliases",
+                )
+
+    def test_signed_mixed_case_historical_repository_reject_and_resolution(self) -> None:
+        # The original record is genuinely signed for a managed mixed-case
+        # repository, not rewritten after signing to manufacture a match.
+        lower = self.repo
+        upper = self.root / "Grabowski"
+        lower.rename(upper)
+        self.repo = upper
+        self._git("remote", "set-url", "origin", "git@github.com:heimgewebe/Grabowski.git")
+        historical = self._first_party_plan()
+        self.assertEqual("heimgewebe/Grabowski", historical["binding"]["repo"])
+        started = self._start_plan(historical)
+        self._submit_axis(started, review.REQUIRED_AXES[0], 1, reject=True)
+        signed = review._read_signed_record(
+            self.state / "sessions" / started["review_session_id"] / "session.json",
+            signers=self.signers, root_owned_signers=False,
+        )
+        self.assertEqual("heimgewebe/Grabowski", signed["binding"]["repo"])
+
+        self._git("remote", "set-url", "origin", "git@github.com:heimgewebe/grabowski.git")
+        upper.rename(lower)
+        self.repo = lower
+        same_revision = self._first_party_plan()
+        self.assertEqual("heimgewebe/grabowski", same_revision["binding"]["repo"])
+        newer = self._start_plan(same_revision)
+        for number, axis in enumerate(review.REQUIRED_AXES, 1):
+            self._submit_axis(newer, axis, number)
+        with self.assertRaisesRegex(review.ReviewExecutionRejected, "previous signed material"):
+            self._seal_direct(same_revision)
+
+        # The same real historic REJECT cannot bleed across PR identity.
+        separate_pr = producer.plan_first_party_review(
+            repo=self.repo, pr=1650, base_sha=self.base, head_sha=self.head,
+            diff_sha256=same_revision["binding"]["diff_sha256"],
+        )
+        other = self._start_plan(separate_pr)
+        for number, axis in enumerate(review.REQUIRED_AXES, 1):
+            self._submit_axis(other, axis, number)
+        other_audit, other_receipts = self._seal_direct(separate_pr)
+        self.assertEqual([], self._receipt_errors(other_audit, other_receipts))
+
+        # Only a later, actually signed resolution clears that exact PR.
+        self.now += 1
+        resolved_plan = self._first_party_plan()
+        resolved = self._start_plan(resolved_plan)
+        for number, axis in enumerate(review.REQUIRED_AXES, 1):
+            self._submit_axis(
+                resolved, axis, number,
+                resolve_ids=("material-1",) if number == 1 else (),
+            )
+        audit, receipts = self._seal_direct(resolved_plan)
+        self.assertEqual([], self._receipt_errors(audit, receipts))
+
+    def test_signed_unicode_historical_repository_is_invalid(self) -> None:
+        # The old record is signed by the real fixture key, not injected via
+        # an untrusted mock. Unicode long-s casefolds to ASCII "s" in Python,
+        # but GitHub repo identity and the signed producer are ASCII-only.
+        historical = self._first_party_plan()
+        started = self._start_plan(historical)
+        path = self.state / "sessions" / started["review_session_id"] / "session.json"
+        old = review._read_signed_record(
+            path, signers=self.signers, root_owned_signers=False,
+        )
+        old["binding"]["repo"] = "heimgewebe/grabow\u017fki"
+        old["binding_sha256"] = review._digest(old["binding"])
+        path.unlink()
+        path.with_suffix(".sig").unlink()
+        review._write_signed_record(
+            path, old, key=self.key, signers=self.signers,
+        )
+        signed = review._read_signed_record(
+            path, signers=self.signers, root_owned_signers=False,
+        )
+        self.assertEqual("heimgewebe/grabow\u017fki", signed["binding"]["repo"])
+        self.assertEqual(
+            "heimgewebe/grabowski", signed["binding"]["repo"].casefold(),
+            "the crafted signed history must exercise an actual Unicode-fold collision",
+        )
+
+        current = self._first_party_plan()
+        later = self._start_plan(current)
+        for number, axis in enumerate(review.REQUIRED_AXES, 1):
+            self._submit_axis(later, axis, number)
+        with self.assertRaisesRegex(
+            review.ReviewExecutionRejected,
+            "previous signed session repository identity invalid",
+        ):
+            self._seal_direct(current)
+
+    def test_captain_research_owner_uses_authentic_signed_reject_history(self) -> None:
+        import grabowski_merge_guard as captain
+
+        original_repo = self.repo
+        research = self.root / "machtverflechtungen"
+        self._git("clone", "--quiet", "--no-hardlinks", str(original_repo), str(research))
+        self.repo = research
+        self._git(
+            "remote", "set-url", "origin",
+            "git@github.com:alexdermohr/machtverflechtungen.git",
+        )
+        plan = self._first_party_plan()
+        rejected = self._start_plan(plan)
+        self._submit_axis(rejected, review.REQUIRED_AXES[0], 1, reject=True)
+        binding = {
+            "repository": "alexdermohr/machtverflechtungen",
+            "pull_request": plan["binding"]["pr"],
+            "base_sha": self.base,
+            "head_sha": self.head,
+            "diff_sha256": plan["binding"]["diff_sha256"],
+        }
+        authentic = review._assert_no_first_party_reject_for_legacy_review
+
+        def actual_signed_history(candidate: dict, **_options: object) -> None:
+            authentic(
+                candidate, repository=research, root=self.state,
+                signers=self.signers, root_owned_signers=False,
+            )
+
+        with (
+            mock.patch.object(review, "FIRST_PARTY_REVIEW_ROOT", self.state),
+            mock.patch.object(
+                review, "_assert_no_first_party_reject_for_legacy_review",
+                side_effect=actual_signed_history,
+            ),
+        ):
+            expected_reject = [
+                "merge_guard_signed_first_party_material_reject_or_invalid_history"
+            ]
+            self.assertEqual(
+                expected_reject,
+                captain._signed_first_party_material_history_errors(binding),
+            )
+            # GitHub owner/repo ASCII case aliases cannot erase a signed REJECT.
+            self.assertEqual(
+                expected_reject,
+                captain._signed_first_party_material_history_errors({
+                    **binding, "repository": "AlexDerMohr/Machtverflechtungen",
+                }),
+            )
+            # Different PRs and unsupported GitHub owners remain independent.
+            self.assertEqual(
+                [], captain._signed_first_party_material_history_errors({
+                    **binding, "pull_request": binding["pull_request"] + 1,
+                }),
+            )
+            self.assertEqual(
+                [], captain._signed_first_party_material_history_errors({
+                    **binding, "repository": "elsewhere/machtverflechtungen",
+                }),
             )
 
     def test_signed_reject_survives_equivalent_diff_identity(self) -> None:
@@ -1676,6 +2219,147 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
             signers=self.signers, root_owned_signers=False, now_unix=self.now,
         )
         self.assertEqual(set(review.REQUIRED_AXES), set(verified))
+
+
+    def test_single_600k_generated_diff_line_remains_fully_signed_and_covered(self) -> None:
+        generated = self.repo / "src" / "large-generated-line.json"
+        generated.write_text('{"payload":"' + ("x" * 600_000) + '"}\n', encoding="utf-8")
+        self._git("add", "src/large-generated-line.json")
+        self._git("commit", "-qm", "add one large immutable generated source line")
+        self.head = self._git("rev-parse", "HEAD").strip()
+        plan = self._first_party_plan()
+        started = self._start_plan(plan)
+        lines = review._first_party_diff(self.repo, plan["binding"]).decode("utf-8").splitlines(keepends=True)
+        largest_line = max(len(line.encode("utf-8")) for line in lines)
+        self.assertGreater(largest_line, 256 * 1024)
+        self.assertLess(largest_line, review.FIRST_PARTY_MAX_READ_BYTES)
+        largest_line_number = max(
+            range(1, len(lines) + 1), key=lambda n: len(lines[n - 1].encode("utf-8"))
+        )
+        # Failed signed read consumes its request ID; positive call must differ.
+        with mock.patch.object(review, "FIRST_PARTY_MAX_READ_BYTES", 256 * 1024):
+            with self.assertRaisesRegex(review.ReviewExecutionRejected, "canonical diff chunk over budget"):
+                self._read(
+                    started, review.REQUIRED_AXES[0], "diff", "", "head",
+                    largest_line_number, largest_line_number,
+                )
+        complete = self._read(started, review.REQUIRED_AXES[0], "diff", "", "head", 1, len(lines))
+        self.assertEqual(len(lines), complete["diff_total_lines"])
+        self.assertEqual(
+            hashlib.sha256("".join(lines).encode("utf-8")).hexdigest(),
+            complete["content_sha256"],
+        )
+        for number, axis in enumerate(review.REQUIRED_AXES, start=1):
+            self._submit_axis(started, axis, number, full_diff=False)
+        audit, receipts = self._seal_direct(plan)
+        self.assertEqual([], self._receipt_errors(audit, receipts))
+
+
+    def test_generated_diff_line_above_new_budget_remains_unreadable(self) -> None:
+        generated = self.repo / "src" / "overlarge-generated-line.json"
+        generated.write_text(
+            '{"payload":"' + ("x" * (review.FIRST_PARTY_MAX_READ_BYTES + 1)) + '"}\n',
+            encoding="utf-8",
+        )
+        self._git("add", "src/overlarge-generated-line.json")
+        self._git("commit", "-qm", "add over-budget generated source line")
+        self.head = self._git("rev-parse", "HEAD").strip()
+        plan = self._first_party_plan()
+        started = self._start_plan(plan)
+        lines = review._first_party_diff(self.repo, plan["binding"]).decode("utf-8").splitlines(keepends=True)
+        large_line_number = max(range(1, len(lines) + 1), key=lambda i: len(lines[i - 1].encode("utf-8")))
+        self.assertGreater(len(lines[large_line_number - 1].encode("utf-8")), review.FIRST_PARTY_MAX_READ_BYTES)
+        with self.assertRaisesRegex(review.ReviewExecutionRejected, "canonical diff chunk over budget"):
+            self._read(
+                started, review.REQUIRED_AXES[0], "diff", "", "head",
+                large_line_number, large_line_number,
+            )
+        self.assertFalse(list((self.state / "sessions" / started["review_session_id"] / "reads").glob("*.json")))
+
+
+    def test_signed_read_wire_budget_without_optional_mcp_sdk(self) -> None:
+        payload = {
+            "status": "source_read_recorded",
+            "content": "x" * 600_000,
+            "read_id": "a" * 32,
+            "content_sha256": hashlib.sha256(b"x" * 600_000).hexdigest(),
+        }
+        # CI has only a deliberately stubbed MCP module. The signer must
+        # still validate real single-copy source bytes independently of SDK.
+        self.assertIsNone(review.first_party_source_read_wire_budget_validate(payload))
+        legacy_duplicate = json.dumps(
+            {"content": [payload], "structuredContent": payload},
+            ensure_ascii=False, separators=(",", ":"),
+        )
+        self.assertGreater(len(legacy_duplicate.encode("utf-8")), review.MAX_OUTPUT)
+        with self.assertRaisesRegex(review.ReviewExecutionRejected, "transport budget"):
+            review.first_party_source_read_wire_budget_validate({
+                **payload, "content": "\x01" * 200_000,
+            })
+
+    def test_mcp_signed_read_600k_uses_one_transport_copy(self) -> None:
+        try:
+            from mcp.types import CallToolResult, TextContent
+        except ImportError:
+            self.skipTest("Real MCP SDK unavailable; signer wire-size gate is tested without it")
+        import grabowski_mcp as server
+
+        payload = {
+            "status": "source_read_recorded", "content": "x" * 600_000,
+            "read_id": "a" * 32, "content_sha256": hashlib.sha256(b"x" * 600_000).hexdigest(),
+        }
+        with (
+            mock.patch.object(server, "_require_mutations_enabled"),
+            mock.patch.object(server, "_authenticated_self_review_issuer", return_value={}),
+            mock.patch.object(server.self_review_execution, "record_first_party_source_read", return_value=payload),
+        ):
+            result = server.grabowski_self_review_source_read(
+                "session", "nonce", review.REQUIRED_AXES[0], "diff", "",
+                "head", 1, 1, "transport proof", "Review every byte",
+            )
+        self.assertIsInstance(result, CallToolResult)
+        # Exercise the real SDK FastMCP converter rather than a JSON-size guess.
+        tool = server.mcp._tool_manager.get_tool("grabowski_self_review_source_read")
+        converted = tool.fn_metadata.convert_result(result)
+        self.assertIsInstance(converted, CallToolResult)
+        self.assertEqual(payload, converted.structuredContent)
+        self.assertTrue(all("x" * 256 not in block.text for block in converted.content))
+        self.assertLess(len(converted.model_dump_json(by_alias=True).encode()), review.MAX_OUTPUT)
+        from mcp.types import TextContent
+        for char in ('x', '"', "\\", "\x01", "\u2028", "ä", "💠"):
+            with self.subTest(codepoint=ord(char)):
+                sample = {"status": "source_read_recorded", "content": char * 12_000}
+                actual = CallToolResult(
+                    content=[TextContent(
+                        type="text", text=review.FIRST_PARTY_MCP_BRIEF_TEXT,
+                    )],
+                    structuredContent=sample,
+                )
+                serialized = len(actual.model_dump_json(by_alias=True).encode("utf-8"))
+                estimated = len(json.dumps({
+                    "content": [{"type": "text", "text": review.FIRST_PARTY_MCP_BRIEF_TEXT}],
+                    "structuredContent": sample, "isError": False,
+                }, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+                self.assertLessEqual(
+                    serialized, estimated + review.FIRST_PARTY_MCP_ENVELOPE_RESERVE_BYTES,
+                )
+
+    def test_escaped_mcp_output_rejected_before_persisting_signed_read(self) -> None:
+        generated = self.repo / "src" / "escaped-generated-line.txt"
+        generated.write_text(("\x01" * 200_000) + "\n", encoding="utf-8")
+        self._git("add", "src/escaped-generated-line.txt")
+        self._git("commit", "-qm", "add generated text with large JSON escaping overhead")
+        self.head = self._git("rev-parse", "HEAD").strip()
+        plan = self._first_party_plan()
+        started = self._start_plan(plan)
+        lines = review._first_party_diff(self.repo, plan["binding"]).decode("utf-8").splitlines(keepends=True)
+        largest = max(range(1, len(lines) + 1), key=lambda n: len(lines[n - 1].encode("utf-8")))
+        self.assertLess(len(lines[largest - 1].encode("utf-8")), review.FIRST_PARTY_MAX_READ_BYTES)
+        with self.assertRaisesRegex(review.ReviewExecutionRejected, "transport budget"):
+            self._read(started, review.REQUIRED_AXES[0], "diff", "", "head", largest, largest)
+        reads = self.state / "sessions" / started["review_session_id"] / "reads"
+        self.assertFalse(list(reads.glob("*.json")))
+        self.assertFalse(list(reads.glob("*.data")))
 
     def test_authenticated_self_review_mcp_mutations_require_operator_gate(self) -> None:
         # Even an enrolled connector cannot persist a signed review while

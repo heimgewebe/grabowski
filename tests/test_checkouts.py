@@ -6366,6 +6366,117 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self._git("update-ref", f"refs/remotes/origin/{new_branch}", new_head)
         return binding, new_head, new_branch
 
+
+    def _expired_same_lane_fixture(self) -> tuple[dict[str, object], str, str]:
+        import grabowski_work_acquire as work_acquire
+        import grabowski_physical_checkout as physical_checkout
+
+        state_patch = patch.object(
+            work_acquire, "_state_root", return_value=self.root / "work-lanes"
+        )
+        state_patch.start()
+        self.patches.append(state_patch)
+        parameters = {
+            "source_kind": "direct-user",
+            "source_id": "user-mandate:expired-same-lane-test",
+            "controller_actor": "operator:test:expired-catchup",
+            "repo": str(self.repo),
+            "base_head": self.head,
+            "branch": "topic",
+            "target_path": str(self.checkout),
+            "purpose": "managed lifecycle fixture",
+            "retention_until_unix": int(time.time()) + 7200,
+            "idempotency_key": "expired-catchup-test",
+        }
+        inputs = work_acquire._normalize(parameters)
+        inputs.pop("_scoped_writer_argv")
+        lane_id = inputs["lane_id"]
+        owner = f"lane:{lane_id}"
+        binding = self._managed_binding(
+            owner=owner, source_kind="work_lane", source_id=lane_id
+        )
+        original_physical = physical_checkout.capture_physical_checkout_identity(
+            str(self.checkout)
+        )
+        lane_record = {
+            "kind": work_acquire.LANE_KIND,
+            "schema_version": 1,
+            "lane_id": lane_id,
+            "inputs": inputs,
+            "inputs_sha256": work_acquire._sha(inputs),
+            "state": "ready",
+            "decision": "ISOLATE_AND_EXECUTE",
+            "worktree_receipt": {
+                "result_state": "CREATED",
+                "durable_receipt_sha256": "a" * 64,
+                "lifecycle": {
+                    "checkout_key": binding["checkout_key"],
+                    "owner_id": owner,
+                    "checkout_path": str(self.checkout),
+                    "expected_head": self.head,
+                    "expected_branch": "topic",
+                    "physical_checkout": original_physical,
+                },
+            },
+        }
+        with work_acquire._lane_lock(lane_id) as path:
+            work_acquire._write_state(path, lane_record)
+
+        (self.checkout / "continued.txt").write_text("original writer work\n", encoding="utf-8")
+        self._git("add", "continued.txt", cwd=self.checkout)
+        self._git("commit", "-m", "original same-lane commit", cwd=self.checkout)
+        current_head = self._git("rev-parse", "HEAD", cwd=self.checkout).stdout.strip()
+        expired = int(time.time()) - 120
+        with checkouts._database() as connection:
+            connection.execute(
+                "UPDATE lifecycle_bindings SET retention_until_unix=? WHERE checkout_key=?",
+                (expired, binding["checkout_key"]),
+            )
+            connection.execute(
+                "UPDATE retention SET expected_head=?, retention_until_unix=?, "
+                "updated_at_unix=updated_at_unix+1 WHERE checkout_key=?",
+                (current_head, expired, binding["checkout_key"]),
+            )
+            connection.commit()
+        return binding, current_head, lane_id
+
+
+    def _change_original_lane_physical(
+        self, lane_id: str, *, change: str
+    ) -> None:
+        import copy
+        import grabowski_work_acquire as work_acquire
+        import grabowski_physical_checkout as physical_checkout
+
+        with work_acquire._lane_lock(lane_id) as path:
+            lane = work_acquire._read_state(path)
+            original = copy.deepcopy(
+                lane["worktree_receipt"]["lifecycle"]["physical_checkout"]
+            )
+            nodes = ("root", "git_dir", "common_dir")
+            if change == "uniform_device":
+                for node in nodes:
+                    original[node]["device"] += 41
+            elif change == "partial_device":
+                original["root"]["device"] += 41
+            elif change == "inode":
+                original["root"]["inode"] += 1
+            elif change == "path":
+                original["root"]["path"] = str(self.root / "wrong-identity")
+            else:
+                raise ValueError(change)
+            original["physical_identity_sha256"] = (
+                physical_checkout._identity_sha256(
+                    physical_checkout._identity_material(
+                        root=original["root"],
+                        git_dir=original["git_dir"],
+                        common_dir=original["common_dir"],
+                    )
+                )
+            )
+            lane["worktree_receipt"]["lifecycle"]["physical_checkout"] = original
+            work_acquire._write_state(path, lane)
+
     def test_binding_preview_preserves_terminal_path_without_branch_rename(self) -> None:
         binding = self._managed_binding(owner="owner-a")
         sentinel = {"kind": "checkout_terminal_reconciliation_preview", "status": "blocked"}
@@ -6676,6 +6787,220 @@ class CheckoutLifecycleTests(unittest.TestCase):
             new_branch,
         )
         self.assertEqual(binding["checkout_key"], archived["archive"]["checkout_key"])
+
+
+    def test_expired_same_lane_recovery_preserves_local_commit_and_owner(self) -> None:
+        binding, head, lane_id = self._expired_same_lane_fixture()
+        preview = checkouts.grabowski_checkout_binding_identity_rebind_preview(
+            binding["checkout_key"]
+        )
+        self.assertEqual("expired_same_lane_lifecycle_catchup", preview["rebind_mode"])
+        self.assertEqual(["binding-retention-head-mismatch"], preview["allowed_drift_reasons"])
+        self.assertFalse(preview["remote"]["remote_secured"])
+        self.assertEqual(lane_id, preview["expired_lane_recovery"]["lane_id"])
+        applied = checkouts.grabowski_checkout_binding_identity_rebind_apply(
+            binding["checkout_key"],
+            f"lane:{lane_id}",
+            preview["snapshot_sha256"],
+            preview["observed_at_unix"],
+            preview["confirmation"],
+        )
+        self.assertEqual("applied", applied["status"])
+        self.assertTrue(applied["lease_release"]["preserved_original_lane_leases"])
+        for row in applied["after"].values():
+            self.assertEqual(head, row["expected_head"])
+            self.assertEqual(f"lane:{lane_id}", row["owner_id"])
+            self.assertGreater(row["retention_until_unix"], time.time() + 3600)
+        self.assertEqual(head, self._git("rev-parse", "HEAD", cwd=self.checkout).stdout.strip())
+        self.assertEqual("", self._git("status", "--porcelain", cwd=self.checkout).stdout)
+        for key in preview["expired_lane_recovery"]["resource_keys"]:
+            self.assertEqual(f"lane:{lane_id}", checkouts.resources.inspect_resource(key)["owner_id"])
+
+
+    def test_expired_same_lane_recovery_accepts_only_uniform_device_renumber(self) -> None:
+        binding, head, lane_id = self._expired_same_lane_fixture()
+        self._change_original_lane_physical(lane_id, change="uniform_device")
+        preview = checkouts.grabowski_checkout_binding_identity_rebind_preview(
+            binding["checkout_key"]
+        )
+        evidence = preview["expired_lane_recovery"]
+        self.assertEqual("uniform_device_renumber", evidence["physical_identity_transition"])
+        self.assertNotEqual(
+            evidence["physical_identity_sha256"],
+            evidence["original_physical_identity_sha256"],
+        )
+        applied = checkouts.grabowski_checkout_binding_identity_rebind_apply(
+            binding["checkout_key"], f"lane:{lane_id}",
+            preview["snapshot_sha256"], preview["observed_at_unix"],
+            preview["confirmation"],
+        )
+        self.assertEqual(head, applied["after"]["lifecycle"]["expected_head"])
+        self.assertEqual("uniform_device_renumber", applied["audit"]["physical_identity_transition"])
+
+    def test_expired_same_lane_recovery_rejects_partial_device_renumber(self) -> None:
+        binding, _, lane_id = self._expired_same_lane_fixture()
+        self._change_original_lane_physical(lane_id, change="partial_device")
+        with self.assertRaisesRegex(RuntimeError, "physical checkout identity drifted"):
+            checkouts.grabowski_checkout_binding_identity_rebind_preview(binding["checkout_key"])
+
+    def test_expired_same_lane_recovery_rejects_inode_drift(self) -> None:
+        binding, _, lane_id = self._expired_same_lane_fixture()
+        self._change_original_lane_physical(lane_id, change="inode")
+        with self.assertRaisesRegex(RuntimeError, "physical checkout identity drifted"):
+            checkouts.grabowski_checkout_binding_identity_rebind_preview(binding["checkout_key"])
+
+    def test_expired_same_lane_recovery_rejects_path_drift(self) -> None:
+        binding, _, lane_id = self._expired_same_lane_fixture()
+        self._change_original_lane_physical(lane_id, change="path")
+        with self.assertRaisesRegex(RuntimeError, "physical checkout identity drifted"):
+            checkouts.grabowski_checkout_binding_identity_rebind_preview(binding["checkout_key"])
+
+    def test_expired_same_lane_recovery_rejects_open_operation_fence(self) -> None:
+        binding, _, lane_id = self._expired_same_lane_fixture()
+        with patch.object(
+            checkouts, "_active_checkout_operation_uncertainties",
+            return_value=[{"fence_id": "protected-unknown-effect"}],
+        ):
+            with self.assertRaisesRegex(RuntimeError, "unresolved checkout-effect fences"):
+                checkouts.grabowski_checkout_binding_identity_rebind_preview(
+                    binding["checkout_key"]
+                )
+
+    def test_expired_same_lane_recovery_compensates_precommit_lease_on_cas_drift(self) -> None:
+        binding, _, lane_id = self._expired_same_lane_fixture()
+        preview = checkouts.grabowski_checkout_binding_identity_rebind_preview(
+            binding["checkout_key"]
+        )
+        acquire = checkouts.resources.acquire_resources
+
+        def acquire_then_drift(*args, **kwargs):
+            result = acquire(*args, **kwargs)
+            with checkouts._database() as connection:
+                connection.execute(
+                    "UPDATE lifecycle_bindings SET updated_at_unix=updated_at_unix+1 "
+                    "WHERE checkout_key=?", (binding["checkout_key"],)
+                )
+                connection.commit()
+            return result
+
+        with patch.object(
+            checkouts.resources, "acquire_resources", side_effect=acquire_then_drift
+        ):
+            with self.assertRaisesRegex(RuntimeError, "snapshot changed"):
+                checkouts.grabowski_checkout_binding_identity_rebind_apply(
+                    binding["checkout_key"], f"lane:{lane_id}",
+                    preview["snapshot_sha256"], preview["observed_at_unix"],
+                    preview["confirmation"],
+                )
+        for key in preview["expired_lane_recovery"]["resource_keys"]:
+            self.assertIsNone(checkouts.resources.inspect_resource(key))
+        lifecycle = checkouts._strict_lifecycle_binding(binding["checkout_key"])
+        self.assertEqual(self.head, lifecycle["expected_head"])
+
+    def test_expired_same_lane_recovery_preserves_leases_on_postcommit_audit_loss(self) -> None:
+        binding, head, lane_id = self._expired_same_lane_fixture()
+        preview = checkouts.grabowski_checkout_binding_identity_rebind_preview(
+            binding["checkout_key"]
+        )
+        with patch.object(
+            checkouts.base, "_append_audit", side_effect=RuntimeError("audit unavailable")
+        ):
+            with self.assertRaisesRegex(RuntimeError, "committed without audit"):
+                checkouts.grabowski_checkout_binding_identity_rebind_apply(
+                    binding["checkout_key"], f"lane:{lane_id}",
+                    preview["snapshot_sha256"], preview["observed_at_unix"],
+                    preview["confirmation"],
+                )
+        after = checkouts._strict_lifecycle_binding(binding["checkout_key"])
+        self.assertEqual(head, after["expected_head"])
+        self.assertEqual(f"lane:{lane_id}", after["owner_id"])
+        for key in preview["expired_lane_recovery"]["resource_keys"]:
+            self.assertEqual(
+                f"lane:{lane_id}",
+                checkouts.resources.inspect_resource(key)["owner_id"],
+            )
+
+    def test_expired_same_lane_recovery_rejects_dirty_checkout(self) -> None:
+        binding, _, _ = self._expired_same_lane_fixture()
+        (self.checkout / "uncommitted.txt").write_text("dirty\n", encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "clean"):
+            checkouts.grabowski_checkout_binding_identity_rebind_preview(
+                binding["checkout_key"]
+            )
+
+    def test_expired_same_lane_recovery_rejects_unknown_effect(self) -> None:
+        import grabowski_work_acquire as work_acquire
+        binding, _, lane_id = self._expired_same_lane_fixture()
+        with work_acquire._lane_lock(lane_id) as path:
+            record = work_acquire._read_state(path)
+            work_acquire._write_state(
+                path, {**record, "state": "outcome_unknown", "decision": "HARD_BLOCK"}
+            )
+        with self.assertRaisesRegex(RuntimeError, "active source-lane authority"):
+            checkouts.grabowski_checkout_binding_identity_rebind_preview(
+                binding["checkout_key"]
+            )
+
+    def test_expired_same_lane_recovery_rejects_foreign_owner(self) -> None:
+        binding, _, _ = self._expired_same_lane_fixture()
+        with checkouts._database() as connection:
+            connection.execute(
+                "UPDATE retention SET owner_id='lane:ffffffffffffffffffffffffffffffff' "
+                "WHERE checkout_key=?", (binding["checkout_key"],)
+            )
+            connection.commit()
+        with self.assertRaisesRegex(PermissionError, "one unchanged owner"):
+            checkouts.grabowski_checkout_binding_identity_rebind_preview(
+                binding["checkout_key"]
+            )
+
+    def test_expired_same_lane_recovery_rejects_unrelated_head(self) -> None:
+        binding, _, _ = self._expired_same_lane_fixture()
+        tree = self._git("rev-parse", "HEAD^{tree}", cwd=self.checkout).stdout.strip()
+        unrelated = self._git(
+            "commit-tree", tree, "-m", "unrelated", cwd=self.checkout
+        ).stdout.strip()
+        self._git("reset", "--hard", unrelated, cwd=self.checkout)
+        with checkouts._database() as connection:
+            connection.execute(
+                "UPDATE retention SET expected_head=? WHERE checkout_key=?",
+                (unrelated, binding["checkout_key"]),
+            )
+            connection.commit()
+        with self.assertRaisesRegex(RuntimeError, "descend from recorded head"):
+            checkouts.grabowski_checkout_binding_identity_rebind_preview(
+                binding["checkout_key"]
+            )
+
+    def test_expired_same_lane_recovery_rejects_foreign_active_lease(self) -> None:
+        binding, _, lane_id = self._expired_same_lane_fixture()
+        key = checkouts.resources.normalize_resource_key(f"path:{self.checkout}")
+        checkouts.resources.acquire_resources(
+            "foreign-test-owner", [key], purpose="active foreign writer", ttl_seconds=3600
+        )
+        with self.assertRaisesRegex(RuntimeError, "coordinated by active work"):
+            checkouts.grabowski_checkout_binding_identity_rebind_preview(
+                binding["checkout_key"]
+            )
+        self.assertEqual("foreign-test-owner", checkouts.resources.inspect_resource(key)["owner_id"])
+
+    def test_expired_same_lane_recovery_rejects_cas_drift_before_apply(self) -> None:
+        binding, _, lane_id = self._expired_same_lane_fixture()
+        preview = checkouts.grabowski_checkout_binding_identity_rebind_preview(
+            binding["checkout_key"]
+        )
+        with checkouts._database() as connection:
+            connection.execute(
+                "UPDATE retention SET updated_at_unix=updated_at_unix+1 "
+                "WHERE checkout_key=?", (binding["checkout_key"],)
+            )
+            connection.commit()
+        with self.assertRaisesRegex(RuntimeError, "snapshot changed"):
+            checkouts.grabowski_checkout_binding_identity_rebind_apply(
+                binding["checkout_key"], f"lane:{lane_id}",
+                preview["snapshot_sha256"], preview["observed_at_unix"],
+                preview["confirmation"],
+            )
 
     def test_binding_identity_rebind_converges_lifecycle_when_retention_is_current(self) -> None:
         binding, new_head, new_branch = self._renamed_managed_checkout()

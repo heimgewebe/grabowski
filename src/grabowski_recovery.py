@@ -1969,6 +1969,169 @@ def _timer_probe(action: str) -> dict[str, Any]:
     return {"action": action, "ok": result["returncode"] == 0, "result": result}
 
 
+def _nixos_completed_backup_from_persistent_journal(now: int) -> dict[str, Any] | None:
+    """Recover a completed native backup invocation after systemd forgets it at reboot.
+
+    Only a root-owned Restic snapshot message bound to trusted PID-1 start
+    and successful finish records of the latest invocation can pass.
+    Incomplete, newer failed, stale or ambiguous journal evidence fails closed.
+    """
+    unit = "restic-backups-heim-pc.service"
+    journal = operator._run(
+        ["/run/current-system/sw/bin/journalctl", "--system", "--no-pager",
+         "--output=json", "-u", unit,
+         # Only required journal fields; --lines remains capped at 128.
+         "--output-fields=__CURSOR,__REALTIME_TIMESTAMP,__MONOTONIC_TIMESTAMP,"
+         "_BOOT_ID,_UID,_PID,_SYSTEMD_UNIT,_TRANSPORT,UNIT,INVOCATION_ID,"
+         "_SYSTEMD_INVOCATION_ID,MESSAGE,MESSAGE_ID,JOB_RESULT,JOB_TYPE",
+         # Do not prefilter by realtime: a newer boot can have an older clock.
+         # The latest 128 journal matches establish order before age checks.
+         "--grep", r"^(Starting restic-backups-heim-pc\.service\.\.\.|Finished restic-backups-heim-pc\.service\.|snapshot [0-9a-f]{8,64} saved)$",
+         "-n", "128"],
+        cwd=operator.HOME, timeout_seconds=30, max_output_bytes=256 * 1024,
+    )
+    if (journal.get("returncode") != 0 or journal.get("stdout_truncated")
+            or not isinstance(journal.get("stdout"), str)):
+        return None
+    events: list[dict[str, Any]] = []
+    try:
+        for line in journal["stdout"].splitlines():
+            event = json.loads(line)
+            if not isinstance(event, dict):
+                return None
+            boot, ts, mono = (
+                event.get("_BOOT_ID"), event.get("__REALTIME_TIMESTAMP"),
+                event.get("__MONOTONIC_TIMESTAMP"),
+            )
+            if (not isinstance(boot, str)
+                    or re.fullmatch(r"[0-9a-f]{32}", boot) is None
+                    or not isinstance(ts, str)
+                    or re.fullmatch(r"[0-9]{1,20}", ts) is None
+                    or not isinstance(mono, str)
+                    or re.fullmatch(r"[0-9]{1,20}", mono) is None
+                    or event.get("_UID") != "0"):
+                return None
+            timestamp, monotonic = int(ts), int(mono)
+            if not (0 < timestamp <= (now + 1) * 1_000_000 and monotonic > 0):
+                return None
+            # Realtime sorting is unsafe after clock rollback. A journal
+            # cursor preserves sequence within one journal identity.
+            cursor_identity = None
+            raw_cursor = event.get("__CURSOR")
+            if raw_cursor is not None:
+                if not isinstance(raw_cursor, str):
+                    return None
+                cursor_match = re.fullmatch(
+                    r"s=([0-9a-f]{32});i=([0-9a-f]{1,16});"
+                    r"b=([0-9a-f]{32});m=([0-9a-f]{1,16});"
+                    r"t=([0-9a-f]{1,16});x=[0-9a-f]{1,16}",
+                    raw_cursor,
+                )
+                if (cursor_match is None
+                        or cursor_match.group(3) != boot
+                        or int(cursor_match.group(4), 16) != monotonic
+                        or int(cursor_match.group(5), 16) != timestamp):
+                    return None
+                cursor_identity = (
+                    cursor_match.group(1), int(cursor_match.group(2), 16)
+                )
+            message = event.get("MESSAGE")
+            if message == f"Starting {unit}...":
+                kind, message_id = "start", "7d4958e842da4a758f6c1cdc7b36dcc5"
+            elif message == f"Finished {unit}.":
+                kind, message_id = "finish", "39f53479d3a045ac8e11786248231fbf"
+            elif isinstance(message, str) and re.fullmatch(
+                r"snapshot [0-9a-f]{8,64} saved", message
+            ):
+                kind, message_id = "snapshot", None
+            else:
+                return None
+            if kind == "snapshot":
+                invocation = event.get("_SYSTEMD_INVOCATION_ID")
+                if (event.get("_TRANSPORT") != "stdout"
+                        or event.get("_SYSTEMD_UNIT") != unit):
+                    return None
+            else:
+                invocation = event.get("INVOCATION_ID")
+                if (event.get("_TRANSPORT") != "journal"
+                        or event.get("_PID") != "1"
+                        or event.get("_SYSTEMD_UNIT") != "init.scope"
+                        or event.get("UNIT") != unit
+                        or event.get("MESSAGE_ID") != message_id):
+                    return None
+                if kind == "finish" and (
+                    event.get("JOB_RESULT") != "done"
+                    or event.get("JOB_TYPE") != "start"
+                ):
+                    return None
+            if not isinstance(invocation, str) or re.fullmatch(
+                r"[0-9a-f]{32}", invocation
+            ) is None:
+                return None
+            events.append({
+                "kind": kind, "boot": boot, "invocation": invocation,
+                "timestamp": timestamp, "monotonic": monotonic,
+                "cursor_identity": cursor_identity, "message": message,
+            })
+    except (ValueError, TypeError, OverflowError):
+        return None
+    # journalctl --grep -n may return newest-first. Within one boot
+    # use monotonic time; across boots require a shared, verified journal
+    # sequence identity rather than wall-clock recency.
+    starts = [event for event in events if event["kind"] == "start"]
+    if not starts:
+        return None
+    if len({event["boot"] for event in starts}) > 1:
+        identities = [event["cursor_identity"] for event in events]
+        if (any(value is None for value in identities)
+                or len({value[0] for value in identities}) != 1
+                or len({value[1] for value in identities}) != len(identities)):
+            return None
+        starts.sort(key=lambda event: event["cursor_identity"][1])
+    else:
+        starts.sort(key=lambda event: event["monotonic"])
+    last = starts[-1]
+    bound = [
+        event for event in events
+        if event["boot"] == last["boot"]
+        and event["invocation"] == last["invocation"]
+    ]
+    finished = [event for event in bound if event["kind"] == "finish"]
+    saved = [event for event in bound if event["kind"] == "snapshot"]
+    if (len(finished) != 1 or len(saved) != 1
+            or len([event for event in bound if event["kind"] == "start"]) != 1):
+        return None
+    end, snapshot = finished[0], saved[0]
+    if all(event["cursor_identity"] is not None for event in bound):
+        if (len({event["cursor_identity"][0] for event in bound}) != 1
+                or not (last["cursor_identity"][1]
+                        < snapshot["cursor_identity"][1]
+                        < end["cursor_identity"][1])):
+            return None
+    if not (
+        last["timestamp"] <= snapshot["timestamp"] <= end["timestamp"]
+        and last["monotonic"] <= snapshot["monotonic"] <= end["monotonic"]
+        and 0 <= now - end["timestamp"] // 1_000_000 <= MAX_AGE_SECONDS
+        and 0 <= now - snapshot["timestamp"] // 1_000_000 <= MAX_AGE_SECONDS
+        and abs((end["timestamp"] - last["timestamp"])
+                - (end["monotonic"] - last["monotonic"])) <= 2_000_000
+        and abs((end["timestamp"] - snapshot["timestamp"])
+                - (end["monotonic"] - snapshot["monotonic"])) <= 2_000_000
+    ):
+        return None
+    return {
+        "path": f"systemd:{unit}", "exists": True, "valid": True,
+        "timestamp_unix": end["timestamp"] // 1_000_000,
+        "age_seconds": now - end["timestamp"] // 1_000_000,
+        "backup_invocation_id": last["invocation"],
+        "snapshot_id": snapshot["message"].split()[1],
+        "snapshot_saved_at_unix": snapshot["timestamp"] // 1_000_000,
+        "service_start_unix": last["timestamp"] // 1_000_000,
+        "service_exit_unix": end["timestamp"] // 1_000_000,
+        "error": None, "source": "nixos-system-restic-backup-completion",
+    }
+
+
 def _nixos_native_backup_service_fresh() -> dict[str, Any]:
     """Prove a completed NixOS backup AND its exact saved Restic snapshot.
 
@@ -2007,6 +2170,19 @@ def _nixos_native_backup_service_fresh() -> dict[str, Any]:
     if set(fields) != set(names):
         return result
     result["exists"] = fields["LoadState"] == "loaded"
+    # After reboot, systemctl forgets successful oneshot metadata. A strict
+    # "never run in this boot" shape may be rebound from trusted journald;
+    # failed, queued, running or inconsistent unit states must not fall back.
+    if (result["exists"] and fields["ActiveState"] == "inactive"
+            and fields["Job"] in {"", "0"} and fields["Result"] == "success"
+            and fields["ExecMainCode"] == "0" and fields["ExecMainStatus"] == "0"
+            and fields["InvocationID"] == ""
+            and fields["ExecMainStartTimestampMonotonic"] == "0"
+            and fields["ExecMainExitTimestampMonotonic"] == "0"
+            and fields["ExecMainStartTimestamp"] == ""
+            and fields["ExecMainExitTimestamp"] == ""):
+        historical = _nixos_completed_backup_from_persistent_journal(int(time.time()))
+        return historical if historical is not None else result
     if (not result["exists"] or fields["ActiveState"] != "inactive"
             or fields["Job"] not in {"", "0"}
             or fields["Result"] != "success" or fields["ExecMainCode"] != "1"

@@ -397,5 +397,117 @@ class GrokQuota402Tests(unittest.TestCase):
             self.assertTrue(any("decision_review_result_invalid" in error for error in result["errors"]))
 
 
+
+class HistoricalGrokPreResultTests(unittest.TestCase):
+    """Exact real-world free quota and unknown-model pre-review failures."""
+
+    def _failed(self, jobs: Path, suffix: str, model: str, created: int) -> Path:
+        directory = fixtures.make_job(
+            jobs, suffix=suffix, slot="independent-grok-caddy1988-20261029",
+            terminal_status="failed", review_result=None, review_role=True,
+            attempt_bound=True, attempt_epoch=2, created_at_unix=created,
+            role_command_override=["grok", "--model", model, "-p", "Review frozen revision"],
+        )
+        metadata = json.loads((directory / "metadata.json").read_text())
+        cwd = metadata["scope"]["decision_review_provenance"]["repository"]
+        if model == "grok-4.7":
+            error = (
+                "You’ve reached your free Grok Build usage limit for now. "
+                "Get SuperGrok for much higher limits, or try again later: "
+                "https://grok.com/supergrok?referrer=grok-build"
+            )
+            commands = ["compact", "always-approve", "context",
+                        "session-info", "feedback", "goal"]
+            available = {"type": "available_commands", "tools": [], "commands": commands}
+            events = [available, available]
+        else:
+            self.assertEqual(model, "grok-4.6")
+            error = (
+                "Couldn't set model 'grok-4.6': Invalid params: "
+                '"unknown model id". Run \'grok models\' to see available models.'
+            )
+            events = []
+        events.append({"type": "error", "message": error, "cwd": cwd})
+        err = ("Error: " + error + "\n").encode()
+        # Keep the exact original UTF-8 provider stream, including “You’ve”:
+        # default json.dumps would rewrite it to escaped ASCII bytes.
+        stdout = "".join(
+            json.dumps(event, separators=(",", ":"), ensure_ascii=False) + "\n"
+            for event in events
+        )
+        amend_private_receipt(
+            directory, raw=stdout,
+            receipt_updates={
+                "stderr_tail": err.decode(),
+                "stderr_bytes": len(err),
+                "stderr_sha256": hashlib.sha256(err).hexdigest(),
+                "review_provider_stream_events": len(events),
+            },
+        )
+        return directory
+
+    def _pass(self, jobs: Path, created: int, *, model: str = "grok-4.7") -> Path:
+        return fixtures.make_job(
+            jobs, suffix="c00000001988", slot="independent-grok-4.7",
+            terminal_status="succeeded", review_result=None,
+            review_role=True, attempt_bound=True, attempt_epoch=2,
+            created_at_unix=created,
+            role_command_override=["grok", "--model", model, "-p", "Review frozen revision"],
+        )
+
+    def test_exact_old_failures_only_settle_with_later_same_family_pass(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs = Path(tmp) / "jobs"
+            jobs.mkdir(mode=0o700)
+            first = self._failed(jobs, "a00000001988", "grok-4.6", 1787000100)
+            second = self._failed(jobs, "b00000001988", "grok-4.7", 1787000200)
+            before = reconcile(jobs)
+            self.assertEqual(before["status"], "blocked")
+            self.assertTrue(all(
+                x["classification"] == "infrastructure_error"
+                for x in before["attempts"]
+            ))
+            self._pass(jobs, 1787000300)
+            after = reconcile(jobs)
+            self.assertEqual(after["status"], "settled", after["errors"])
+            self.assertEqual(after["errors"], [])
+            self.assertEqual(sum(x["independent_pass_count"] for x in after["slots"]), 1)
+            self.assertEqual(sum(x["infrastructure_error_count"] for x in after["slots"]), 2)
+            self.assertTrue(first.is_dir() and second.is_dir())
+
+    def test_unknown_error_or_extra_stream_never_becomes_pre_result(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs = Path(tmp) / "jobs"
+            jobs.mkdir(mode=0o700)
+            old = self._failed(jobs, "a00000001988", "grok-4.6", 1787000100)
+            receipt_path = old / fixtures.reviews.REVIEW_ROLE_ATTEMPT_RECEIPT_NAME
+            receipt = json.loads(receipt_path.read_text())
+            receipt["stderr_tail"] = receipt["stderr_tail"] + "not known\n"
+            raw = receipt["stderr_tail"].encode()
+            receipt["stderr_bytes"] = len(raw)
+            receipt["stderr_sha256"] = hashlib.sha256(raw).hexdigest()
+            receipt["receipt_sha256"] = fixtures.reviews._agent_role_receipt_sha256(receipt)
+            fixtures.write_private(receipt_path, json.dumps(receipt))
+            self._pass(jobs, 1787000300)
+            check = reconcile(jobs)
+            self.assertEqual(check["status"], "blocked")
+            self.assertTrue(any("InvalidReviewDocument" in e for e in check["errors"]))
+
+    def test_unrelated_provider_pass_does_not_supersede_old_grok(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs = Path(tmp) / "jobs"
+            jobs.mkdir(mode=0o700)
+            self._failed(jobs, "a00000001988", "grok-4.7", 1787000100)
+            fixtures.make_job(
+                jobs, suffix="c00000001988", slot="independent-claude",
+                terminal_status="succeeded", review_result=None,
+                review_role=True, attempt_bound=True, attempt_epoch=2,
+                created_at_unix=1787000300,
+            )
+            result = reconcile(jobs)
+            self.assertEqual(result["status"], "blocked")
+            self.assertTrue(any("infrastructure_not_superseded" in e for e in result["errors"]))
+
+
 if __name__ == "__main__":
     unittest.main()

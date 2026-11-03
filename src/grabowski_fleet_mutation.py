@@ -101,7 +101,7 @@ def _validate_host_spec(host: str, value: Any) -> dict[str, Any]:
         "connect_timeout_seconds",
         "remote_command_mode",
     }
-    if set(value) != required:
+    if not required.issubset(value) or set(value) - (required | {"task_home"}):
         raise ValueError("Fleet mutation host spec must supply the complete v1 host contract")
     # Reuse the canonical Fleet parser contract rather than maintaining a second
     # SSH/role/allowlist validator in the mutator.
@@ -110,6 +110,15 @@ def _validate_host_spec(host: str, value: Any) -> dict[str, Any]:
     )
     candidate = validated["hosts"][host]
     return candidate
+
+
+def _require_explicit_task_home_on_update(
+    current: dict[str, Any] | None, requested: dict[str, Any]
+) -> None:
+    # An update is a complete host replacement, not a partial patch.
+    # Never silently drop a bound remote home when an older caller omits it.
+    if current is not None and "task_home" in current and "task_home" not in requested:
+        raise FleetRegistryMutationError("Fleet host task_home must be explicit on update")
 
 
 def _parse_request(parameters: dict[str, str] | None) -> dict[str, Any]:
@@ -174,6 +183,10 @@ def plan_registry_mutation(parameters: dict[str, str] | None) -> dict[str, Any]:
             raise FleetRegistryMutationError(f"Fleet host already exists with different state: {host}")
     elif operation == "update" and host not in hosts:
         raise FleetRegistryMutationError(f"Fleet host does not exist: {host}")
+    elif operation == "update":
+        _require_explicit_task_home_on_update(
+            fleet.validate_fleet(before)["hosts"][host], request["host_spec"]
+        )
     elif operation == "disable" and host not in hosts:
         raise FleetRegistryMutationError(f"Fleet host does not exist: {host}")
     public = {
@@ -356,6 +369,7 @@ def mutate_registry(
         elif operation == "update":
             if host not in before["hosts"]:
                 raise FleetRegistryMutationError(f"Fleet host does not exist: {host}")
+            _require_explicit_task_home_on_update(current_normalized, expected_host)
             if current_normalized == expected_host:
                 no_change = True
             else:

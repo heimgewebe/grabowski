@@ -149,22 +149,36 @@ class HistoricalNixReviewOriginTests(unittest.TestCase):
             if key != "provenance_sha256"
         })
         normalized = reviews.normalize_binding(fixtures.binding("independent-reviewer"))
-        self.assertEqual(
-            reviews._normalize_review_role_provenance(
-                provenance, normalized, cwd="/tmp/review",
-            ),
-            provenance,
-        )
-        tampered = dict(provenance)
-        tampered["runner_module_sha256"] = "0" * 64
-        tampered["provenance_sha256"] = reviews.sha256_json({
-            key: value for key, value in tampered.items()
-            if key != "provenance_sha256"
-        })
-        with self.assertRaisesRegex(ValueError, "binding mismatch"):
-            reviews._normalize_review_role_provenance(
-                tampered, normalized, cwd="/tmp/review",
+        # A valid immutable store package is not sufficient authority.
+        # The full provenance requires a root-installed system generation.
+        with mock.patch.object(
+            reviews, "_historical_nix_deployed_generation_contains",
+            return_value=False,
+        ):
+            with self.assertRaisesRegex(ValueError, "binding mismatch"):
+                reviews._normalize_review_role_provenance(
+                    provenance, normalized, cwd="/tmp/review",
+                )
+        with mock.patch.object(
+            reviews, "_historical_nix_deployed_generation_contains",
+            return_value=True,
+        ):
+            self.assertEqual(
+                reviews._normalize_review_role_provenance(
+                    provenance, normalized, cwd="/tmp/review",
+                ),
+                provenance,
             )
+            tampered = dict(provenance)
+            tampered["runner_module_sha256"] = "0" * 64
+            tampered["provenance_sha256"] = reviews.sha256_json({
+                key: value for key, value in tampered.items()
+                if key != "provenance_sha256"
+            })
+            with self.assertRaisesRegex(ValueError, "binding mismatch"):
+                reviews._normalize_review_role_provenance(
+                    tampered, normalized, cwd="/tmp/review",
+                )
 
     def test_origin_cannot_be_supplied_as_untrusted_values(self) -> None:
         for python, module, digest in (

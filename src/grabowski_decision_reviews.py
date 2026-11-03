@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import closing, contextmanager
+from functools import lru_cache
 import fcntl
 import hashlib
 import hmac
@@ -1361,6 +1362,212 @@ def _historical_review_role_provenance(
     return {**material, "provenance_sha256": sha256_json(material)}
 
 
+
+_NIX_REVIEW_STORE_ROOT = Path("/nix/store")
+_NIX_REVIEW_OWNER_UID = 0
+_NIX_REVIEW_PACKAGE = re.compile(
+    r"[0-9a-df-np-sv-z]{32}-grabowski-operator-[0-9a-f]{8}\Z"
+)
+
+
+
+_NIX_REVIEW_PROFILES_ROOT = Path("/nix/var/nix/profiles")
+_NIX_REVIEW_NIX_STORE_BIN = Path("/run/current-system/sw/bin/nix-store")
+_NIX_SYSTEM_PROFILE_NAME = re.compile(r"system-[1-9][0-9]*-link\Z")
+_NIX_SYSTEM_PACKAGE_NAME = re.compile(
+    r"[0-9a-df-np-sv-z]{32}-nixos-system-[A-Za-z0-9._-]+\Z"
+)
+
+
+@lru_cache(maxsize=8)
+def _nix_installed_generation_requisites(
+    executable: str, resolved_binary: str,
+    system_generations: tuple[tuple[str, str], ...],
+) -> frozenset[str]:
+    """Memoize only immutable, root-controlled system generation closures.
+
+    Link path *and its resolved store target* are part of the cache identity.
+    Root changing or removing a generation forces a new validated lookup;
+    errors are never cached as a successful empty set.
+    """
+    query = subprocess.run(
+        [executable, "--query", "--requisites",
+         *(target for _link, target in system_generations)],
+        # Preserve nix-store as argv[0] for the Nix multicall dispatcher,
+        # but execute the already verified immutable store binary, not the
+        # mutable current-system symlink.
+        executable=resolved_binary,
+        capture_output=True, text=True, timeout=15, check=False,
+        # NIX_USER_CONF_FILES overrides ambient per-user nix.conf paths.
+        # Never load same-UID plugin-files while verifying review authority.
+        env={"PATH": "/run/current-system/sw/bin:/usr/bin:/bin",
+             "NIX_REMOTE": "daemon", "NIX_CONFIG": "",
+             "NIX_USER_CONF_FILES": "/dev/null",
+             "HOME": "/var/empty", "XDG_CONFIG_HOME": "/var/empty",
+             "NIX_CONFIG_HOME": "/var/empty"},
+    )
+    if query.returncode != 0 or len(query.stdout) > 8 * 1024 * 1024:
+        raise ValueError("root-installed NixOS generation closure unavailable")
+    return frozenset(query.stdout.splitlines())
+
+
+def _historical_nix_deployed_generation_contains(package: Path) -> bool:
+    """Require root-authorized system-generation closure, not merely a store name.
+
+    On multi-user Nix, any allowed builder can produce a root-owned store
+    output. Only a generation installed under the root-controlled system
+    profiles is evidence that the output was authorized for this host.
+    The query is read-only; it never creates or changes GC roots.
+    """
+    profiles = _NIX_REVIEW_PROFILES_ROOT
+    store = _NIX_REVIEW_STORE_ROOT
+    program = _NIX_REVIEW_NIX_STORE_BIN
+    try:
+        profile_stat = profiles.lstat()
+        if (
+            not stat.S_ISDIR(profile_stat.st_mode)
+            or profile_stat.st_uid != _NIX_REVIEW_OWNER_UID
+            or stat.S_IMODE(profile_stat.st_mode) & 0o022
+        ):
+            return False
+        entries = list(profiles.iterdir())
+        if len(entries) > 512:
+            return False
+        generations: list[tuple[str, str]] = []
+        for link in entries:
+            if not _NIX_SYSTEM_PROFILE_NAME.fullmatch(link.name):
+                continue
+            link_stat = link.lstat()
+            if not stat.S_ISLNK(link_stat.st_mode) or link_stat.st_uid != _NIX_REVIEW_OWNER_UID:
+                return False
+            target = link.resolve(strict=True)
+            target_stat = target.stat()
+            if (
+                target.parent != store
+                or not _NIX_SYSTEM_PACKAGE_NAME.fullmatch(target.name)
+                or not stat.S_ISDIR(target_stat.st_mode)
+                or target_stat.st_uid != _NIX_REVIEW_OWNER_UID
+                or stat.S_IMODE(target_stat.st_mode) & 0o022
+            ):
+                return False
+            generations.append((str(link), str(target)))
+        if not generations or len(generations) > 128:
+            return False
+        runner_lstat = program.lstat()
+        runner = program.resolve(strict=True)
+        runner_stat = runner.stat()
+        if (
+            not (stat.S_ISLNK(runner_lstat.st_mode) or stat.S_ISREG(runner_lstat.st_mode))
+            or runner_lstat.st_uid != _NIX_REVIEW_OWNER_UID
+            or not runner.is_relative_to(store)
+            or not stat.S_ISREG(runner_stat.st_mode)
+            or runner_stat.st_uid != _NIX_REVIEW_OWNER_UID
+            or stat.S_IMODE(runner_stat.st_mode) & 0o022
+            or not os.access(runner, os.X_OK)
+        ):
+            return False
+        # Use the exact resolved immutable Nix binary, not a mutable PATH or
+        # current-system symlink after validation. Cache only authenticated
+        # generation identity, never caller-supplied review verdicts.
+        # nix-store is a multi-call Nix wrapper. Preserve its verified argv[0]
+        # basename; executing the resolved bin/nix parses a different CLI.
+        # The resolved immutable binary remains part of the cache identity.
+        return str(package) in _nix_installed_generation_requisites(
+            str(program), str(runner), tuple(sorted(generations))
+        )
+    except (OSError, ValueError, RuntimeError, UnicodeError, subprocess.SubprocessError):
+        return False
+
+
+def _historical_nix_review_role_matches(
+    runner_python: Any, module_path: Any, module_sha256: Any,
+) -> bool:
+    """Accept a prior NixOS reviewer only from one unchanged immutable output.
+
+    Headless NixOS reviewers use a root-owned /nix/store package, not the
+    user-owned release virtualenv. Bind the previous executable and role
+    module to the same package, with exact recorded module bytes.
+    """
+    if (
+        not all(isinstance(value, str) and value for value in (runner_python, module_path))
+        or not isinstance(module_sha256, str)
+        or _SHA256_RE.fullmatch(module_sha256) is None
+    ):
+        return False
+    runner = Path(runner_python)
+    module = Path(module_path)
+    store = _NIX_REVIEW_STORE_ROOT
+    try:
+        if store.is_symlink() or store.resolve(strict=True) != store:
+            return False
+        store_stat = store.stat()
+        if (
+            not stat.S_ISDIR(store_stat.st_mode)
+            or store_stat.st_uid != _NIX_REVIEW_OWNER_UID
+            or stat.S_IMODE(store_stat.st_mode) & 0o002
+            or (
+                stat.S_IMODE(store_stat.st_mode) & 0o020
+                and not (store_stat.st_mode & stat.S_ISVTX)
+            )
+        ):
+            return False
+        package = runner.parents[1]
+        relative_module = module.relative_to(package).parts
+        if (
+            not runner.is_absolute() or not module.is_absolute()
+            or package.parent != store
+            or _NIX_REVIEW_PACKAGE.fullmatch(package.name) is None
+            or runner != package / "bin" / "python3"
+            or len(relative_module) != 4
+            or relative_module[0] != "lib"
+            or _REVIEW_ROLE_PYTHON_DIR_RE.fullmatch(relative_module[1]) is None
+            or relative_module[2:] != ("site-packages", f"{REVIEW_ROLE_MODULE}.py")
+        ):
+            return False
+        package_stat = package.lstat()
+        # A module's immutable inode is meaningful only while every
+        # intermediate directory is root-owned and non-writable.  lstat
+        # excludes aliasing via symlinked bin/lib/site-packages parents.
+        for directory in (
+            package / "bin",
+            package / "lib",
+            package / "lib" / relative_module[1],
+            package / "lib" / relative_module[1] / "site-packages",
+        ):
+            directory_stat = directory.lstat()
+            if (
+                not stat.S_ISDIR(directory_stat.st_mode)
+                or directory_stat.st_uid != _NIX_REVIEW_OWNER_UID
+                or stat.S_IMODE(directory_stat.st_mode) & 0o022
+            ):
+                return False
+        module_stat = module.lstat()
+        runner_stat = runner.lstat()
+        resolved_runner = runner.resolve(strict=True)
+        resolved_module = module.resolve(strict=True)
+        resolved_runner.relative_to(store)
+        resolved_runner_stat = resolved_runner.stat()
+        if (
+            not stat.S_ISDIR(package_stat.st_mode)
+            or not stat.S_ISREG(module_stat.st_mode)
+            or resolved_module != module
+            or not (stat.S_ISREG(runner_stat.st_mode) or stat.S_ISLNK(runner_stat.st_mode))
+            or not stat.S_ISREG(resolved_runner_stat.st_mode)
+            or not os.access(resolved_runner, os.X_OK)
+        ):
+            return False
+        for info in (package_stat, module_stat, runner_stat, resolved_runner_stat):
+            if info.st_uid != _NIX_REVIEW_OWNER_UID:
+                return False
+            if not stat.S_ISLNK(info.st_mode) and stat.S_IMODE(info.st_mode) & 0o022:
+                return False
+        return hmac.compare_digest(
+            hashlib.sha256(module.read_bytes()).hexdigest(), module_sha256,
+        ) and _historical_nix_deployed_generation_contains(package)
+    except (FileNotFoundError, IndexError, OSError, RuntimeError, ValueError):
+        return False
+
+
 def _normalize_review_role_provenance(
     value: Any, binding: dict[str, Any], *, cwd: str,
     attempt_directory: Path | None = None,
@@ -1395,32 +1602,35 @@ def _normalize_review_role_provenance(
     stable_python = str(REVIEW_ROLE_STABLE_PYTHON.expanduser())
     recorded_module_path = value.get("runner_module_path")
     recorded_module_sha256 = value.get("runner_module_sha256")
-    nix_origin_matches = _historical_nix_review_role_origin_matches(
-        recorded_runner_python, recorded_module_path, recorded_module_sha256,
+    # Retain exact current/legacy bindings; a historical Nix reviewer is
+    # accepted only with matching root-owned immutable interpreter AND module.
+    current_runner = (
+        recorded_runner_python == REVIEW_ROLE_PYTHON
+        and recorded_runner_python != stable_python
     )
-    runner_python_matches = (
-        (
-            recorded_runner_python == REVIEW_ROLE_PYTHON
-            and recorded_runner_python != stable_python
-        )
-        or _historical_review_role_python_matches(recorded_runner_python)
-        or nix_origin_matches
+    current_module = (
+        recorded_module_sha256 == runner_module_sha256
+        and recorded_module_path == runner_module_path
     )
-    # Historical attempts bind the module bytes installed when the review ran.
-    # A later source upgrade must not erase that evidence. Never trust an
-    # arbitrary caller-selected digest: require the exact byte-matching module
-    # in an owner-controlled, immutable release-layout path.
-    module_identity_matches = (
-        (
-            recorded_module_sha256 == runner_module_sha256
-            and recorded_module_path == runner_module_path
-        )
-        or _historical_review_role_module_matches(
-            recorded_module_path,
-            expected_sha256=recorded_module_sha256,
-        )
-        or nix_origin_matches
+    legacy_runner = (
+        not current_runner
+        and _historical_review_role_python_matches(recorded_runner_python)
     )
+    legacy_module = (
+        not current_module
+        and _historical_review_role_module_matches(
+            recorded_module_path, expected_sha256=recorded_module_sha256,
+        )
+    )
+    historical_nix = False
+    if not ((current_runner or legacy_runner) and (current_module or legacy_module)):
+        # A root-owned Nix store output is not proof of root-installed host
+        # authority: the legacy path-only predicate bypassed the generation check.
+        historical_nix = _historical_nix_review_role_matches(
+            recorded_runner_python, recorded_module_path, recorded_module_sha256,
+        )
+    runner_python_matches = current_runner or legacy_runner or historical_nix
+    module_identity_matches = current_module or legacy_module or historical_nix
     if (
         schema not in {1, 2}
         or value.get("kind") != "grabowski_decision_review_provenance"
@@ -1688,7 +1898,7 @@ def _proven_claude_auth_failure_before_review(
 def _proven_grok_quota_failure_before_review(
     receipt: dict[str, Any], provenance: dict[str, Any]
 ) -> bool:
-    """Recognize only the authenticated, three-event, pre-result xAI 402.
+    """Recognize exact authenticated, three-event, pre-result xAI quota failures.
 
     Recognition is *not* a review decision. It keeps the failed job in history
     and requires a later real independent PASS from the same provider slot.
@@ -1700,7 +1910,9 @@ def _proven_grok_quota_failure_before_review(
         provenance.get("schema_version") != 2
         or not isinstance(route, dict)
         or route.get("provider_family") != "xai"
-        or route.get("route_id") != "grok-4.6-review-high"
+        or route.get("route_id") not in {
+            "grok-4.6-review-high", "grok-4.7-review-high",
+        }
         or receipt.get("verdict") != "INVALID"
         or receipt.get("findings") != []
         or receipt.get("failure_classification") != "invalid_review_output"
@@ -1776,15 +1988,36 @@ def _proven_grok_quota_failure_before_review(
     ):
         return False
 
-    error_message = (
-        "API error (status 402 Payment Required): "
-        "Grok Build usage balance exhausted"
-    )
-    wrapped = (
-        'Internal error: {\n  "message": "' + error_message
-        + '",\n  "http_status": 402\n}'
-    )
-    if stderr != "Error: " + wrapped + "\n":
+    route_id = route["route_id"]
+    if route_id == "grok-4.6-review-high":
+        error_message = (
+            "API error (status 402 Payment Required): "
+            "Grok Build usage balance exhausted"
+        )
+        wrapped = (
+            'Internal error: {\n  "message": "' + error_message
+            + '",\n  "http_status": 402\n}'
+        )
+        error_event = {"type": "error", "message": wrapped}
+        expected_stderr = "Error: " + wrapped + "\n"
+    else:
+        # Grok 4.7's observed *pre-model* free-tier exhaustion: exactly
+        # two available-command events followed by one error event.
+        # Bind the provider's cwd to the authenticated review role origin;
+        # a different path or arbitrary quota prose is never sufficient.
+        observed_cwd = provenance.get("repository")
+        if not isinstance(observed_cwd, str) or not Path(observed_cwd).is_absolute():
+            return False
+        quota_message = (
+            "You’ve reached your free Grok Build usage limit for now. "
+            "Get SuperGrok for much higher limits, or try again later: "
+            "https://grok.com/supergrok?referrer=grok-build"
+        )
+        error_event = {
+            "type": "error", "message": quota_message, "cwd": observed_cwd,
+        }
+        expected_stderr = "Error: " + quota_message + "\n"
+    if stderr != expected_stderr:
         return False
     # No silent duplicate JSON member, Unicode alias, partial/truncated stream,
     # embedded prose, usage, tool event or end_turn can masquerade as zero work.
@@ -1822,9 +2055,104 @@ def _proven_grok_quota_failure_before_review(
         events == [
             {"type": "available_commands", "tools": [], "commands": commands},
             {"type": "available_commands", "tools": [], "commands": commands},
-            {"type": "error", "message": wrapped},
+            error_event,
         ]
         for commands in known_commands
+    )
+
+
+
+def _proven_grok_historical_cli_pre_result(
+    receipt: dict[str, Any], provenance: dict[str, Any]
+) -> bool:
+    """Two observed exact pre-review CLI failures, never review verdicts."""
+    route = provenance.get("review_route")
+    if provenance.get("schema_version") != 2 or not isinstance(route, dict):
+        return False
+    if route.get("provider_family") != "xai":
+        return False
+    quota = (
+        "You’ve reached your free Grok Build usage limit for now. "
+        "Get SuperGrok for much higher limits, or try again later: "
+        "https://grok.com/supergrok?referrer=grok-build"
+    )
+    bad_model = (
+        "Couldn't set model 'grok-4.6': Invalid params: "
+        '"unknown model id". Run \'grok models\' to see available models.'
+    )
+    model, route_id = route.get("model"), route.get("route_id")
+    if (model, route_id) == ("grok-4.7", "grok-4.7-review-high"):
+        error = quota
+        commands = ["compact", "always-approve", "context",
+                    "session-info", "feedback", "goal"]
+        available = {"type": "available_commands", "tools": [], "commands": commands}
+        events = [available, available]
+    elif (model, route_id) == ("grok-4.6", "grok-4.6-review-high"):
+        error = bad_model
+        events = []
+    else:
+        return False
+    events.append({"type": "error", "message": error, "cwd": provenance["repository"]})
+    expected_stdout = "".join(
+        json.dumps(event, separators=(",", ":"), ensure_ascii=False) + "\n"
+        for event in events
+    )
+    expected_stderr = "Error: " + error + "\n"
+    provider_keys = {
+        "review_provider_available_commands_events",
+        "review_provider_available_tools", "review_provider_completed_commands",
+        "review_provider_completed_tool_calls", "review_provider_completed_tools",
+        "review_provider_stream_bytes", "review_provider_stream_contract",
+        "review_provider_stream_events", "review_provider_stream_sha256",
+    }
+    probe = receipt.get("post_failure_toolchain_probe")
+    return (
+        receipt.get("verdict") == "INVALID"
+        and receipt.get("findings") == []
+        and receipt.get("failure_classification") == "invalid_review_output"
+        and type(receipt.get("returncode")) is int
+        and receipt["returncode"] == 126
+        and receipt.get("error") == "Grok review stream used unsupported event type: error"
+        and type(receipt.get("review_document_bytes")) is int
+        and receipt["review_document_bytes"] == 0
+        and receipt.get("review_document_sha256") is None
+        and receipt.get("review_document_normalizations") == []
+        and receipt.get("review_findings_normalized") is False
+        and receipt.get("review_input_source") == "committed_diff"
+        and type(receipt.get("review_input_bytes")) is int
+        and 0 < receipt["review_input_bytes"] <= 1024 * 1024
+        and isinstance(receipt.get("review_input_sha256"), str)
+        and _SHA256_RE.fullmatch(receipt["review_input_sha256"]) is not None
+        and isinstance(probe, dict)
+        and probe.get("passed") is True
+        and probe.get("failure_classification") == "passed"
+        and probe.get("missing_executable") is False
+        and probe.get("missing_python_module") is False
+        and {k for k in receipt if k.startswith("review_provider_")} == provider_keys
+        and receipt.get("review_provider_stream_contract")
+            == "grok-streaming-json-bound-diff-review-v2"
+        and receipt.get("review_provider_available_tools") == []
+        and receipt.get("review_provider_completed_tools") == []
+        and receipt.get("review_provider_completed_commands") == []
+        and type(receipt.get("review_provider_completed_tool_calls")) is int
+        and receipt["review_provider_completed_tool_calls"] == 0
+        and type(receipt.get("review_provider_available_commands_events")) is int
+        and receipt["review_provider_available_commands_events"] == 0
+        and type(receipt.get("review_provider_stream_events")) is int
+        and receipt["review_provider_stream_events"] == len(events)
+        and receipt.get("stdout_tail") == expected_stdout
+        and receipt.get("stderr_tail") == expected_stderr
+        and type(receipt.get("stdout_bytes")) is int
+        and receipt["stdout_bytes"] == len(expected_stdout.encode("utf-8"))
+        and receipt.get("stdout_sha256") ==
+            hashlib.sha256(expected_stdout.encode("utf-8")).hexdigest()
+        and type(receipt.get("review_provider_stream_bytes")) is int
+        and receipt["review_provider_stream_bytes"] == receipt["stdout_bytes"]
+        and receipt.get("review_provider_stream_sha256") == receipt["stdout_sha256"]
+        and type(receipt.get("stderr_bytes")) is int
+        and receipt["stderr_bytes"] == len(expected_stderr.encode("utf-8"))
+        and receipt.get("stderr_sha256") ==
+            hashlib.sha256(expected_stderr.encode("utf-8")).hexdigest()
     )
 
 
@@ -1910,6 +2238,10 @@ def _validated_review_role_evidence(
                 _proven_claude_quota_failure_before_review(receipt, provenance)
                 or _proven_grok_quota_failure_before_review(receipt, provenance)
             )
+        ),
+        "pre_result_cli_failure_verified": (
+            result is None
+            and _proven_grok_historical_cli_pre_result(receipt, provenance)
         ),
         "pre_result_auth_failure_verified": (
             result is None
@@ -2514,6 +2846,7 @@ def _reconcile_once(
                 "independence_verified": False,
                 "review_role_receipt_sha256": None,
                 "pre_result_quota_failure_verified": False,
+                "pre_result_cli_failure_verified": False,
                 "pre_result_auth_failure_verified": False,
                 "diff_identity_deferred": False,
             }
@@ -2653,6 +2986,7 @@ def _reconcile_once(
                         role_evidence is not None
                         and (
                             role_evidence.get("pre_result_quota_failure_verified") is True
+                            or role_evidence.get("pre_result_cli_failure_verified") is True
                             or role_evidence.get("pre_result_auth_failure_verified") is True
                         )
                         and attempt["terminal_status"] in _PRE_RESULT_INFRASTRUCTURE_STATUSES
@@ -2661,6 +2995,9 @@ def _reconcile_once(
                         attempt["classification"] = "infrastructure_error"
                         attempt["pre_result_quota_failure_verified"] = (
                             role_evidence.get("pre_result_quota_failure_verified") is True
+                        )
+                        attempt["pre_result_cli_failure_verified"] = (
+                            role_evidence.get("pre_result_cli_failure_verified") is True
                         )
                         attempt["pre_result_auth_failure_verified"] = (
                             role_evidence.get("pre_result_auth_failure_verified") is True
@@ -2685,6 +3022,15 @@ def _reconcile_once(
     if not _external_v1_role_receipts_unchanged(external_v1_snapshots):
         errors.append("decision_review_external_role_receipt_changed")
 
+    # A verified pre-review CLI failure is not a reviewer decision. A later
+    # real independent PASS in the same provider family may supersede it even
+    # when the operator used a newer, separately named reviewer slot. Every
+    # material REJECT and any ambiguous/unknown result remains blocking.
+    global_independent_passes = [
+        item for item in attempts
+        if item["classification"] == "pass"
+        and item.get("independence_verified") is True
+    ]
     slots: list[dict[str, Any]] = []
     for slot in sorted({str(item["slot"]) for item in attempts}):
         slot_attempts = [item for item in attempts if item["slot"] == slot]
@@ -2711,14 +3057,14 @@ def _reconcile_once(
             eligible_passes = passes
             if (
                 infrastructure_attempt.get("pre_result_quota_failure_verified") is True
+                or infrastructure_attempt.get("pre_result_cli_failure_verified") is True
                 or infrastructure_attempt.get("pre_result_auth_failure_verified") is True
             ):
-                # A legacy generic PASS cannot replace authenticated provider
-                # failure evidence. The later PASS must be independently
-                # verified for this provider when settling the same slot.
+                # Only authenticated pre-semantic failures can be superseded
+                # by a later independent PASS from the same provider family.
                 family = infrastructure_attempt.get("review_provider_family")
                 eligible_passes = [
-                    item for item in independent_passes
+                    item for item in global_independent_passes
                     if item.get("review_provider_family") == family
                 ]
             if not any(
@@ -2726,7 +3072,18 @@ def _reconcile_once(
                 for pass_attempt in eligible_passes
             ):
                 unsuperseded_infrastructure.append(infrastructure_attempt)
-        if not passes and not rejects:
+        pre_result_replaced = (
+            not passes and not rejects and bool(infrastructure)
+            and len(infrastructure) == len(slot_attempts)
+            and not unsuperseded_infrastructure
+            and all(
+                item.get("pre_result_quota_failure_verified") is True
+                or item.get("pre_result_cli_failure_verified") is True
+                or item.get("pre_result_auth_failure_verified") is True
+                for item in infrastructure
+            )
+        )
+        if not passes and not rejects and not pre_result_replaced:
             errors.append(f"decision_review_slot_without_pass:{slot}")
         named_family = _named_slot_provider_family(slot)
         if named_family is not None and not any(
@@ -2734,6 +3091,15 @@ def _reconcile_once(
             and attempt.get("independence_verified") is True
             and attempt.get("review_provider_family") == named_family
             for attempt in slot_attempts
+        ) and not (
+            pre_result_replaced
+            and any(
+                item.get("review_provider_family") == named_family
+                and all(
+                    _attempt_started_after(item, old) for old in infrastructure
+                )
+                for item in global_independent_passes
+            )
         ):
             errors.append(
                 f"decision_review_named_provider_slot_without_independent_pass:{slot}"
@@ -2781,6 +3147,7 @@ def _reconcile_once(
                 "independence_verified",
                 "review_role_receipt_sha256",
                 "pre_result_quota_failure_verified",
+                "pre_result_cli_failure_verified",
                 "pre_result_auth_failure_verified",
                 "diff_identity_deferred",
             )

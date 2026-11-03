@@ -2182,6 +2182,21 @@ def _default_github_runner(repo: Path, argv: list[str]) -> dict[str, Any]:
     }
 
 
+def _grip_receipt_safe_parameters(value: Any) -> Any:
+    """Never publish an offline-guessable hash of browser text from any Grip envelope."""
+    if isinstance(value, dict):
+        return {
+            key: (
+                "<redacted-browser-text>"
+                if key == "text_value" else _grip_receipt_safe_parameters(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_grip_receipt_safe_parameters(item) for item in value]
+    return value
+
+
 def _new_receipt(spec: GripSpec, parameters: dict[str, Any]) -> Receipt:
     return {
         "kind": GRIP_RECEIPT_KIND,
@@ -2195,7 +2210,7 @@ def _new_receipt(spec: GripSpec, parameters: dict[str, Any]) -> Receipt:
         "phase": "preflight",
         "started_at": utc_now(),
         "ended_at": None,
-        "parameters_sha256": sha256_json(parameters),
+        "parameters_sha256": sha256_json(_grip_receipt_safe_parameters(parameters)),
         "acceptance_ids": list(spec.acceptance_ids),
         "checks": [],
         "output_sha256": None,
@@ -4475,6 +4490,7 @@ _BROWSER_SEMANTIC_ACT_FIELDS = frozenset(
         "action_kind",
         "element_id",
         "navigation_target",
+        "text_value",
         "timeout_seconds",
     }
 )
@@ -4504,6 +4520,8 @@ def _browser_semantic_gateway_call(
             kwargs["element_id"] = parameters["element_id"]
         if "navigation_target" in parameters:
             kwargs["navigation_target"] = parameters["navigation_target"]
+        if "text_value" in parameters:
+            kwargs["text_value"] = parameters["text_value"]
     output = workers.browser_semantic_gateway(
         parameters["worker_id"], operation, **kwargs
     )
