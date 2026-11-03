@@ -2558,8 +2558,13 @@ def verified_first_party_semantic_review_passes(
                 "issuer_principal_sha256": _digest(session["issuer_principal"]),
                 "axis_receipt_sha256": hashlib.sha256(_canonical(record)).hexdigest(),
                 "axis_report_sha256": record["report_sha256"],
+                # Bind the source-read provenance to the signed axis
+                # submission. Later authenticated replay reads must remain
+                # integrity-checked but cannot alter an immutable PASS audit.
                 "source_reads_sha256": _digest(sorted(
-                    item["data_sha256"] for item in reads if item["axis"] == axis
+                    item["data_sha256"] for item in reads
+                    if item["axis"] == axis
+                    and item["observed_at_unix"] <= record["submitted_at_unix"]
                 )),
                 "canonical_diff_sha256": session["canonical_diff_sha256"],
             },

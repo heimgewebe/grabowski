@@ -2040,6 +2040,44 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
         persisted_read.write_bytes(b"tampered source bytes")
         self.assertTrue(self._receipt_errors(audit, receipts))
 
+    def test_late_signed_read_cannot_rewrite_sealed_axis_provenance(self) -> None:
+        """Late authenticated reads must not corrupt a completed review.
+
+        Their signatures and stored source bytes remain mandatory even though
+        they were not part of the earlier signed semantic verdict.
+        """
+        plan = self._first_party_plan()
+        started = self._start_plan(plan)
+        for number, axis in enumerate(review.REQUIRED_AXES, start=1):
+            self._submit_axis(started, axis, number)
+        audit, receipts = self._seal_direct(plan)
+        self.assertEqual([], self._receipt_errors(audit, receipts))
+
+        axis = review.REQUIRED_AXES[0]
+        late = self._read(
+            started, axis, "source", self.source_path, "head", 1, 7,
+            now_unix=self.now + 2,
+        )
+        self.assertEqual("source_read_recorded", late["status"])
+        self.assertEqual([], self._receipt_errors(audit, receipts))
+        checked = review.verified_first_party_semantic_review_passes(
+            plan["binding"], repository=self.repo, root=self.state,
+            signers=self.signers, root_owned_signers=False,
+            now_unix=self.now + 2,
+        )
+        self.assertEqual(
+            audit["review_pass_receipts"][0]["source_reads_sha256"],
+            checked[axis]["provenance"]["source_reads_sha256"],
+        )
+
+        # A late read cannot escape cryptographic verification.
+        stored = (
+            self.state / "sessions" / started["review_session_id"] /
+            "reads" / (late["read_id"] + ".data")
+        )
+        stored.write_bytes(b"corrupted-late-read")
+        self.assertTrue(self._receipt_errors(audit, receipts))
+
     def test_forged_repo_is_rejected_even_when_another_test_mocks_public_verifier(self) -> None:
         """Exercise the real cryptographic verifier despite prior gate fixture mocks."""
         plan = self._first_party_plan()
