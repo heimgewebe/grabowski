@@ -18242,7 +18242,7 @@ else:
             pr_number=None,
             bureau_task_id="",
             agent_run_id="",
-            since="",
+            since=tasks.OPERATOR_HISTORICAL_RECALL_ACTIVE_NIXOS_SINCE,
             limit=1,
         )
         self.assertTrue(result["available"])
@@ -18255,6 +18255,24 @@ else:
             result["result_reference"]["ledger_snapshot_sha256"],
             "b" * 64,
         )
+
+    def test_historical_recall_explicit_legacy_since_overrides_default_epoch(self) -> None:
+        with (
+            patch.object(tasks.operator, "_require_operator_capability"),
+            patch.object(tasks, "grabowski_chronik_history", return_value={}) as provider,
+            patch.object(
+                tasks.recall, "export_chronik_history_recall",
+                return_value={"available": True, "returned": 0},
+            ) as export,
+        ):
+            result = tasks.grabowski_operator_historical_recall(
+                repo="heimgewebe/grabowski",
+                since="2026-07-01T00:00:00Z",
+                limit=3,
+            )
+        self.assertEqual(provider.call_args.kwargs["since"], "2026-07-01T00:00:00Z")
+        export.assert_called_once_with({}, limit=3)
+        self.assertTrue(result["available"])
 
     def test_historical_recall_forwards_exact_target_selectors(self) -> None:
         history = {
