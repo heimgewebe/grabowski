@@ -15030,6 +15030,7 @@ def grabowski_chronik_history(
 OPERATOR_HISTORICAL_RECALL_TOOL = "grabowski_operator_historical_recall"
 OPERATOR_HISTORICAL_RECALL_CAPABILITY = "durable_job"
 OPERATOR_HISTORICAL_RECALL_HELPER = "_require_operator_capability"
+OPERATOR_HISTORICAL_RECALL_ACTIVE_NIXOS_SINCE = "2026-10-23T00:00:00Z"
 
 
 def _operator_runtime_head() -> str | None:
@@ -15097,6 +15098,13 @@ def grabowski_operator_historical_recall(
             missing_dependency=f"{operator_module}.{OPERATOR_HISTORICAL_RECALL_HELPER}"
         )
     operator._require_operator_capability("durable_job")
+    # Coarse recall is current-NixOS by default. Exact IDs and explicit time
+    # ranges deliberately retain access to the immutable Pop!_OS history.
+    effective_since = (
+        OPERATOR_HISTORICAL_RECALL_ACTIVE_NIXOS_SINCE
+        if since == "" and pr_number is None and not bureau_task_id and not agent_run_id
+        else since
+    )
     history = grabowski_chronik_history(
         repo=repo,
         host=host,
@@ -15108,7 +15116,7 @@ def grabowski_operator_historical_recall(
         pr_number=pr_number,
         bureau_task_id=bureau_task_id,
         agent_run_id=agent_run_id,
-        since=since,
+        since=effective_since,
         limit=limit,
     )
     return recall.export_chronik_history_recall(history, limit=limit)
