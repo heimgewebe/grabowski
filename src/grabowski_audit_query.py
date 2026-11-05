@@ -967,9 +967,19 @@ def _task_external_evidence(task_id: str) -> tuple[list[dict[str, Any]], list[di
     else:
         gaps.append(_external_gap("receipt", "receipt_not_bound", task_id=task_id))
 
-    if bool(raw.get("chronik_outbox_enabled")) or raw.get("state") in (
-        "failed", "timed_out", "outcome_unknown"
-    ):
+    default_chronik_expected = False
+    if not bool(raw.get("chronik_outbox_enabled")):
+        retained_check = getattr(tasks, "_chronik_retained_source_expected", None)
+        if callable(retained_check):
+            try:
+                default_chronik_expected = bool(retained_check(raw))
+            except Exception as exc:
+                gaps.append(_external_gap(
+                    "chronik", "chronik_admission_unverifiable",
+                    task_id=task_id, error=type(exc).__name__,
+                ))
+                return evidence, gaps
+    if bool(raw.get("chronik_outbox_enabled")) or default_chronik_expected:
         import grabowski_chronik as chronik
         try:
             current_state = raw.get("state")
@@ -977,7 +987,8 @@ def _task_external_evidence(task_id: str) -> tuple[list[dict[str, Any]], list[di
                 raise ValueError("stored task state is invalid")
             current_event = chronik.build_event(raw, current_state)
             current_source_expected = (
-                current_event is not None
+                bool(raw.get("chronik_outbox_enabled"))
+                and current_event is not None
                 and chronik._event_should_be_recorded(current_event)
             )
 
@@ -1037,7 +1048,7 @@ def _task_external_evidence(task_id: str) -> tuple[list[dict[str, Any]], list[di
                     or attempt_value < 1
                     or not isinstance(run_id_value, str)
                     or not run_id_value
-                    or event_kind_value != "agent.run.blocked"
+                    or event_kind_value not in {"agent.run.blocked", "agent.run.failed", "agent.run.timed_out"}
                 ):
                     raise ValueError("stored Chronik retained-source expectation is invalid")
                 source_expectations[run_id_value] = {

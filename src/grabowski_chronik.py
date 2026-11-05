@@ -608,7 +608,10 @@ def _archived_event_ids(path: Path) -> tuple[str, ...] | None:
 
 @contextmanager
 def _writer_compaction_lock(source_dir: Path):
-    source_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # Path.mkdir(parents=True) uses the default 0777 mode for ancestors.
+    # Provision Grabowski's audit/state parent privately before the outbox.
+    source_dir.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    source_dir.mkdir(exist_ok=True, mode=0o700)
     try:
         source_stat = source_dir.stat(follow_symlinks=False)
     except OSError as exc:

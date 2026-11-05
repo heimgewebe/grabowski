@@ -1,6 +1,7 @@
 import json
 import hashlib
 import os
+import stat
 import sys
 import tempfile
 import threading
@@ -146,6 +147,24 @@ class ChronikAgentOutboxTests(unittest.TestCase):
         os.environ[chronik.STATE_ROOT_ENV] = str(self.root)
         self.assertEqual(chronik.record_task_state(record(), "running"), {"enabled": False, "written": False})
         self.assertEqual(list(self.root.rglob("*.jsonl")), [])
+
+    def test_default_failure_creates_private_grabowski_parent_with_normal_umask(self):
+        os.environ.pop(chronik.ENABLED_ENV, None)
+        os.environ[chronik.STATE_ROOT_ENV] = str(self.root)
+        self.assertFalse((self.root / "grabowski").exists())
+        previous_umask = os.umask(0o022)
+        try:
+            result = chronik.record_task_state(record(host="heim-pc"), "failed")
+        finally:
+            os.umask(previous_umask)
+        self.assertTrue(result["written"])
+        self.assertEqual(
+            stat.S_IMODE((self.root / "grabowski").stat().st_mode), 0o700
+        )
+        self.assertEqual(
+            stat.S_IMODE((self.root / "grabowski" / "chronik-outbox").stat().st_mode),
+            0o700,
+        )
 
     def test_default_capture_only_actionable_terminal_failures(self):
         os.environ.pop(chronik.ENABLED_ENV, None)

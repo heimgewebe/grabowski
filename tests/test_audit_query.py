@@ -1126,6 +1126,15 @@ class AuditQueryTests(unittest.TestCase):
                 "chronik_outbox_enabled": 0,
                 "chronik_outbox_state_root": None,
             }
+            marker = {
+                "schema_version": 1,
+                "attempt": 1,
+                "run_id": f"task-{task_id}-a1",
+                "event_kind": "agent.run.failed",
+            }
+            row["launcher_json"] = json.dumps({
+                "_chronik_retained_source_expected_v1": [marker],
+            })
             event = chronik.build_event(row, "failed")
             self.assertIsNotNone(event)
             assert event is not None
@@ -1149,6 +1158,12 @@ class AuditQueryTests(unittest.TestCase):
                 "attempt": value["attempt"],
                 "state": value["state"],
             }
+            fake_tasks._chronik_retained_source_expectations = lambda value: json.loads(
+                value["launcher_json"]
+            ).get("_chronik_retained_source_expected_v1", [])
+            fake_tasks._chronik_retained_source_expected = lambda value: bool(
+                fake_tasks._chronik_retained_source_expectations(value)
+            )
             fake_sqlite = types.ModuleType("grabowski_sqlite_store")
 
             @contextmanager
@@ -1181,12 +1196,23 @@ class AuditQueryTests(unittest.TestCase):
                     [gap["reason"] for gap in gaps],
                 )
 
+                # Reconciliation may replace the current task state, but the
+                # retained source expectation must remain visible.
+                path.write_text(chronik.canonical_json(event) + "\n", encoding="utf-8")
                 row["state"] = "completed"
+                evidence, gaps = module._task_external_evidence(task_id)
+                self.assertIn("chronik", {item["source"] for item in evidence})
+                self.assertFalse(any(gap["source"] == "chronik" for gap in gaps))
+
+                # Historical pre-feature unopted failures carry no marker.
+                # They must not become spurious missing-source audit alarms.
+                row["launcher_json"] = "{}"
+                row["state"] = "failed"
+                path.unlink()
                 _, gaps = module._task_external_evidence(task_id)
-                self.assertIn(
-                    "chronik_not_enabled_for_task",
-                    [gap["reason"] for gap in gaps],
-                )
+                reasons = [gap["reason"] for gap in gaps]
+                self.assertIn("chronik_not_enabled_for_task", reasons)
+                self.assertNotIn("chronik_source_unverifiable", reasons)
 
     def test_chronik_evidence_uses_task_bound_state_root(self) -> None:
         module = self._load_module([])
