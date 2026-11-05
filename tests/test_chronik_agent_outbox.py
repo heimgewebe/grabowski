@@ -1,6 +1,7 @@
 import json
 import hashlib
 import os
+import stat
 import sys
 import tempfile
 import threading
@@ -146,6 +147,78 @@ class ChronikAgentOutboxTests(unittest.TestCase):
         os.environ[chronik.STATE_ROOT_ENV] = str(self.root)
         self.assertEqual(chronik.record_task_state(record(), "running"), {"enabled": False, "written": False})
         self.assertEqual(list(self.root.rglob("*.jsonl")), [])
+
+    def test_default_failure_creates_private_grabowski_parent_with_normal_umask(self):
+        os.environ.pop(chronik.ENABLED_ENV, None)
+        os.environ[chronik.STATE_ROOT_ENV] = str(self.root)
+        self.assertFalse((self.root / "grabowski").exists())
+        previous_umask = os.umask(0o022)
+        try:
+            result = chronik.record_task_state(record(host="heim-pc"), "failed")
+        finally:
+            os.umask(previous_umask)
+        self.assertTrue(result["written"])
+        self.assertEqual(
+            stat.S_IMODE((self.root / "grabowski").stat().st_mode), 0o700
+        )
+        self.assertEqual(
+            stat.S_IMODE((self.root / "grabowski" / "chronik-outbox").stat().st_mode),
+            0o700,
+        )
+
+    def test_default_capture_only_actionable_terminal_failures(self):
+        os.environ.pop(chronik.ENABLED_ENV, None)
+        os.environ[chronik.STATE_ROOT_ENV] = str(self.root)
+        for state in ("launching", "running", "completed", "cancelled", "signalled"):
+            self.assertEqual(
+                chronik.record_task_state(record(host="heim-pc"), state),
+                {"enabled": False, "written": False},
+            )
+        self.assertEqual(list(self.root.rglob("*.jsonl")), [])
+
+        for i, (state, kind) in enumerate((
+            ("failed", "agent.run.failed"),
+            ("timed_out", "agent.run.timed_out"),
+            ("outcome_unknown", "agent.run.blocked"),
+        ), start=1):
+            with self.subTest(state=state):
+                ident = f"{i:024x}"
+                value = record(
+                    task_id=ident,
+                    unit=f"grabowski-task-{ident}-a1.service",
+                    host="heim-pc",
+                    chronik_outbox_enabled=0,
+                    argv=["private-command"],
+                    cwd="/private/path",
+                )
+                first = chronik.record_task_state(value, state)
+                second = chronik.record_task_state(value, state)
+                self.assertTrue(first["enabled"])
+                self.assertTrue(first["written"])
+                self.assertEqual(second["written"], False)
+                event_lines = Path(first["path"]).read_text(encoding="utf-8").splitlines()
+                self.assertEqual(len(event_lines), 1)
+                event = json.loads(event_lines[0])
+                self.assertEqual(event["kind"], kind)
+                self.assertEqual(event["subject"], {"scope": "host", "host": "heim-pc"})
+                self.assertEqual(event["data"]["operation"], "other")
+                self.assertEqual(event["data"]["task_class"], "other")
+                self.assertEqual(event["trust_tier"], "observed")
+                self.assertNotIn("private-command", event_lines[0])
+                self.assertNotIn("/private/path", event_lines[0])
+                chronik._validate_agent_run_event_shape(event, label="unopted failure")
+
+    def test_default_failure_capture_does_not_block_task_on_writer_error(self):
+        os.environ.pop(chronik.ENABLED_ENV, None)
+        occupied = self.root / "occupied"
+        occupied.write_text("x", encoding="utf-8")
+        os.environ[chronik.STATE_ROOT_ENV] = str(occupied)
+        result = chronik.record_task_state_safely(
+            record(host="heim-pc", chronik_outbox_enabled=0), "failed"
+        )
+        self.assertTrue(result["enabled"])
+        self.assertFalse(result["written"])
+        self.assertIn("error", result)
 
     def test_task_opt_in_writes_without_global_environment(self):
         os.environ.pop(chronik.ENABLED_ENV, None)
