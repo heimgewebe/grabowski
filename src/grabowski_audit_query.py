@@ -1051,12 +1051,18 @@ def _task_external_evidence(task_id: str) -> tuple[list[dict[str, Any]], list[di
                     or event_kind_value not in {"agent.run.blocked", "agent.run.failed", "agent.run.timed_out"}
                 ):
                     raise ValueError("stored Chronik retained-source expectation is invalid")
-                source_expectations[run_id_value] = {
-                    "attempt": attempt_value,
-                    "run_id": run_id_value,
-                    "required": True,
-                    "event_kind": event_kind_value,
-                }
+                run_expectation = source_expectations.get(run_id_value)
+                if run_expectation is None:
+                    source_expectations[run_id_value] = {
+                        "attempt": attempt_value,
+                        "run_id": run_id_value,
+                        "required": True,
+                        "event_kinds": {event_kind_value},
+                    }
+                else:
+                    if run_expectation["attempt"] != attempt_value:
+                        raise ValueError("retained Chronik run attempt is inconsistent")
+                    run_expectation["event_kinds"].add(event_kind_value)
 
             current_run_id = chronik.run_id(raw)
             current_expectation = source_expectations.get(current_run_id)
@@ -1065,7 +1071,7 @@ def _task_external_evidence(task_id: str) -> tuple[list[dict[str, Any]], list[di
                     "attempt": int(raw["attempt"]),
                     "run_id": current_run_id,
                     "required": bool(current_source_expected),
-                    "event_kind": None,
+                    "event_kinds": set(),
                 }
             else:
                 current_expectation["required"] = bool(
@@ -1127,11 +1133,8 @@ def _task_external_evidence(task_id: str) -> tuple[list[dict[str, Any]], list[di
                     kind = event.get("kind")
                     if isinstance(kind, str):
                         event_kinds.append(kind)
-                retained_event_kind = expectation.get("event_kind")
-                if (
-                    retained_event_kind is not None
-                    and retained_event_kind not in event_kinds
-                ):
+                required_kinds = expectation["event_kinds"]
+                if any(kind not in event_kinds for kind in required_kinds):
                     raise ValueError("required retained Chronik event is missing")
             except Exception as exc:
                 gaps.append(

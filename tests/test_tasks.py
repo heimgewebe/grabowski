@@ -2475,6 +2475,29 @@ class TaskTests(unittest.TestCase):
             tasks._public(ambiguous)["launcher"],
         )
 
+        # The same attempt can first be blocked and then fail definitively.
+        # Neither event may replace the other's retained audit expectation.
+        for terminal_state in ("failed", "timed_out"):
+            with (
+                patch.object(tasks, "_terminal_projection", return_value={"attempt": 2}) as projection,
+                patch.object(
+                    tasks.resources,
+                    "begin_task_terminalization",
+                    side_effect=RuntimeError("capture terminal marker"),
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "capture terminal marker"):
+                    tasks._set_state(task["task_id"], terminal_state, attempt=2)
+            expected_terminal = {
+                **marker_2, "event_kind": f"agent.run.{terminal_state}",
+            }
+            self.assertEqual(
+                projection.call_args.kwargs["launcher"][
+                    tasks.CHRONIK_RETAINED_SOURCE_EXPECTATION_KEY
+                ],
+                [marker, marker_2, expected_terminal],
+            )
+
     def test_chronik_context_derives_repository_from_canonical_repo_claim(self) -> None:
         result = {"returncode": 0, "stdout": "git@github.com:heimgewebe/chronik.git\n", "stderr": "", "timed_out": False}
         with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(tasks.operator, "_run", return_value=result) as run:

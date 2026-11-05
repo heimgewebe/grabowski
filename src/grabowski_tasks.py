@@ -7645,7 +7645,7 @@ def _chronik_retained_source_expectations(record: dict[str, Any]) -> list[dict[s
         raise RuntimeError("Stored task Chronik retained-source expectation is invalid")
 
     expectations: list[dict[str, Any]] = []
-    seen_attempts: set[int] = set()
+    seen_events: set[tuple[int, str]] = set()
     for item in markers:
         if not isinstance(item, dict):
             raise RuntimeError("Stored task Chronik retained-source expectation is invalid")
@@ -7654,12 +7654,14 @@ def _chronik_retained_source_expectations(record: dict[str, Any]) -> list[dict[s
             isinstance(marker_attempt, bool)
             or not isinstance(marker_attempt, int)
             or marker_attempt < 1
-            or marker_attempt in seen_attempts
         ):
             raise RuntimeError("Stored task Chronik retained-source expectation is invalid")
         event_kind = item.get("event_kind")
         if event_kind not in {"agent.run.blocked", "agent.run.failed", "agent.run.timed_out"}:
             raise RuntimeError("Stored task Chronik retained event kind is invalid")
+        event_key = (marker_attempt, event_kind)
+        if event_key in seen_events:
+            raise RuntimeError("Duplicate task Chronik retained event expectation")
         expected_record = {**record, "attempt": marker_attempt}
         expected = {
             "schema_version": CHRONIK_RETAINED_SOURCE_EXPECTATION_SCHEMA_VERSION,
@@ -7669,9 +7671,9 @@ def _chronik_retained_source_expectations(record: dict[str, Any]) -> list[dict[s
         }
         if item != expected:
             raise RuntimeError("Stored task Chronik retained-source expectation is invalid")
-        seen_attempts.add(marker_attempt)
+        seen_events.add(event_key)
         expectations.append(dict(item))
-    expectations.sort(key=lambda item: int(item["attempt"]))
+    expectations.sort(key=lambda item: (int(item["attempt"]), str(item["event_kind"])))
     return expectations
 
 
@@ -8529,21 +8531,21 @@ def _set_state(
             "run_id": chronik.run_id(marker_record),
             "event_kind": chronik.classify(state)[0],
         }
-        by_attempt = {
-            int(item["attempt"]): dict(item) for item in retained_source_expectations
+        by_event = {
+            (int(item["attempt"]), str(item["event_kind"])): dict(item)
+            for item in retained_source_expectations
         }
-        existing_marker = by_attempt.get(selected_attempt)
+        event_key = (selected_attempt, marker["event_kind"])
+        existing_marker = by_event.get(event_key)
         if existing_marker is not None and existing_marker != marker:
-            # A prior blocked event remains a required history source even if
-            # the same attempt later terminates as failed or timed out.
-            if existing_marker["event_kind"] != "agent.run.blocked":
-                raise RuntimeError(
-                    "Stored task Chronik retained-source expectation conflicts with attempt"
-                )
-        else:
-            by_attempt[selected_attempt] = marker
+            raise RuntimeError(
+                "Stored task Chronik retained-source expectation conflicts with event"
+            )
+        # A blocked event and a later terminal failure in the same attempt are
+        # separate required sources, not mutually exclusive replacements.
+        by_event[event_key] = marker
         selected_launcher[CHRONIK_RETAINED_SOURCE_EXPECTATION_KEY] = [
-            by_attempt[key] for key in sorted(by_attempt)
+            by_event[key] for key in sorted(by_event)
         ]
         launcher = selected_launcher
 

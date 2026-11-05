@@ -1204,6 +1204,35 @@ class AuditQueryTests(unittest.TestCase):
                 self.assertIn("chronik", {item["source"] for item in evidence})
                 self.assertFalse(any(gap["source"] == "chronik" for gap in gaps))
 
+                # A blocked source alone is insufficient if the same attempt
+                # subsequently failed; both retained kinds must be verified.
+                blocked = chronik.build_event(row, "outcome_unknown")
+                self.assertIsNotNone(blocked)
+                assert blocked is not None
+                blocked_marker = {**marker, "event_kind": "agent.run.blocked"}
+                row["launcher_json"] = json.dumps({
+                    "_chronik_retained_source_expected_v1": [
+                        blocked_marker, marker,
+                    ],
+                })
+                path.write_text(chronik.canonical_json(blocked) + "\n", encoding="utf-8")
+                _, gaps = module._task_external_evidence(task_id)
+                self.assertIn(
+                    "chronik_source_unverifiable",
+                    [gap["reason"] for gap in gaps],
+                )
+                path.write_text(
+                    chronik.canonical_json(blocked) + "\n"
+                    + chronik.canonical_json(event) + "\n",
+                    encoding="utf-8",
+                )
+                evidence, gaps = module._task_external_evidence(task_id)
+                self.assertEqual(
+                    [entry["record"]["event_count"] for entry in evidence if entry["source"] == "chronik"],
+                    [2],
+                )
+                self.assertFalse(any(gap["source"] == "chronik" for gap in gaps))
+
                 # Historical pre-feature unopted failures carry no marker.
                 # They must not become spurious missing-source audit alarms.
                 row["launcher_json"] = "{}"
