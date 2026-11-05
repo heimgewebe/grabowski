@@ -1103,6 +1103,91 @@ class AuditQueryTests(unittest.TestCase):
             ["receipt_unverifiable"],
         )
 
+    def test_unopted_failure_chronik_audit_verifies_source_and_reports_drift(self) -> None:
+        module = self._load_module([])
+        import os
+        import grabowski_chronik as chronik
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            task_id = "a" * 24
+            row = {
+                "task_id": task_id,
+                "attempt": 1,
+                "state": "failed",
+                "host": "heim-pc",
+                "unit": f"grabowski-task-{task_id}-a1.service",
+                "created_at_unix": 1_700_000_000,
+                "updated_at_unix": 1_700_000_100,
+                "terminalized_at_unix": 1_700_000_200,
+                "lifecycle_receipt_sha256": None,
+                "terminalization_sha256": None,
+                "chronik_outbox_enabled": 0,
+                "chronik_outbox_state_root": None,
+            }
+            event = chronik.build_event(row, "failed")
+            self.assertIsNotNone(event)
+            assert event is not None
+            path = chronik.outbox_path(event, root)
+            path.parent.mkdir(parents=True)
+            path.write_text(chronik.canonical_json(event) + "\n", encoding="utf-8")
+
+            class Connection:
+                def execute(self, _query, _parameters):
+                    return self
+
+                def fetchone(self):
+                    return row
+
+            fake_tasks = types.ModuleType("grabowski_tasks")
+            fake_tasks.TASK_DB = root / "tasks.sqlite3"
+            fake_tasks.TASK_OUTCOMES_DIR = root / "outcomes"
+            fake_tasks._preflight_task_store = lambda: "5"
+            fake_tasks._task_archive_record = lambda value: {
+                "task_id": value["task_id"],
+                "attempt": value["attempt"],
+                "state": value["state"],
+            }
+            fake_sqlite = types.ModuleType("grabowski_sqlite_store")
+
+            @contextmanager
+            def readonly_sqlite(_path):
+                yield Connection()
+
+            fake_sqlite.readonly_sqlite = readonly_sqlite
+            with patch.dict(sys.modules, {
+                "grabowski_tasks": fake_tasks,
+                "grabowski_sqlite_store": fake_sqlite,
+            }), patch.dict(os.environ, {chronik.STATE_ROOT_ENV: str(root)}):
+                evidence, gaps = module._task_external_evidence(task_id)
+                sources = [item for item in evidence if item["source"] == "chronik"]
+                self.assertEqual(len(sources), 1)
+                self.assertEqual(sources[0]["record"]["event_ids"], [event["event_id"]])
+                self.assertFalse(any(gap["source"] == "chronik" for gap in gaps))
+
+                path.unlink()
+                _, gaps = module._task_external_evidence(task_id)
+                self.assertIn(
+                    "chronik_source_unverifiable",
+                    [gap["reason"] for gap in gaps],
+                )
+
+                tampered = {**event, "event_id": "sha256:" + "f" * 64}
+                path.write_text(chronik.canonical_json(tampered) + "\n", encoding="utf-8")
+                _, gaps = module._task_external_evidence(task_id)
+                self.assertIn(
+                    "chronik_source_unverifiable",
+                    [gap["reason"] for gap in gaps],
+                )
+
+                row["state"] = "completed"
+                _, gaps = module._task_external_evidence(task_id)
+                self.assertIn(
+                    "chronik_not_enabled_for_task",
+                    [gap["reason"] for gap in gaps],
+                )
+
     def test_chronik_evidence_uses_task_bound_state_root(self) -> None:
         module = self._load_module([])
         from contextlib import contextmanager

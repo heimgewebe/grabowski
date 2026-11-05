@@ -967,7 +967,9 @@ def _task_external_evidence(task_id: str) -> tuple[list[dict[str, Any]], list[di
     else:
         gaps.append(_external_gap("receipt", "receipt_not_bound", task_id=task_id))
 
-    if bool(raw.get("chronik_outbox_enabled")):
+    if bool(raw.get("chronik_outbox_enabled")) or raw.get("state") in (
+        "failed", "timed_out", "outcome_unknown"
+    ):
         import grabowski_chronik as chronik
         try:
             current_state = raw.get("state")
