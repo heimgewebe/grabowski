@@ -1211,6 +1211,69 @@ class NativeNixOSResticProofTests(unittest.TestCase):
             if allowed:
                 self.assertEqual(value["backup_invocation_id"], "a" * 32)
 
+    def test_nixos_prior_root_verified_restore_survives_newer_successful_backup(self) -> None:
+        prior = "cef8366c"
+        source = {
+            "path": "/tmp/native-record", "exists": True, "valid": True,
+            "snapshot_id": prior, "snapshot_time_unix": self.now - 120,
+            "snapshot_age_seconds": 120, "snapshot_fresh": True,
+            "source_record_sha256": "a" * 64,
+            "target": "local-backup-disk:UUID=example/restic/heim-pc",
+        }
+        newer = {
+            "path": "systemd:restic-backups-heim-pc.service",
+            "exists": True, "valid": True, "timestamp_unix": self.now - 30,
+            "age_seconds": 30, "source": "nixos-system-restic-backup-completion",
+            "backup_invocation_id": "b" * 32, "snapshot_id": "deadbeef",
+            "snapshot_saved_at_unix": self.now - 40,
+            "service_start_unix": self.now - 70,
+            "service_exit_unix": self.now - 30,
+            "error": None,
+        }
+        canonical = {
+            "valid": True, "snapshot_id": prior,
+            "source_record_sha256": "a" * 64,
+            "target": source["target"], "root_proof_sha256": "c" * 64,
+        }
+        cases = (
+            ("older_verified_snapshot", source, newer, canonical, True),
+            ("new_backup_does_not_prove_restore",
+             source, newer, {**canonical, "root_proof_sha256": None}, False),
+            ("invalid_canonical", source, newer, {**canonical, "valid": False}, False),
+            ("wrong_canonical_source", source, newer,
+             {**canonical, "source_record_sha256": "d" * 64}, False),
+            ("wrong_canonical_target", source, newer,
+             {**canonical, "target": "other"}, False),
+            ("source_newer_than_last_saved_backup",
+             {**source, "snapshot_time_unix": self.now - 35,
+              "snapshot_age_seconds": 35}, newer, canonical, False),
+            ("new_backup_not_verified", source, {**newer, "valid": False},
+             canonical, False),
+            ("stale_verified_snapshot",
+             {**source, "snapshot_time_unix": self.now - recovery.MAX_AGE_SECONDS - 1,
+              "snapshot_age_seconds": recovery.MAX_AGE_SECONDS + 1},
+             newer, canonical, False),
+        )
+        for label, current_source, current_backup, current_canonical, allowed in cases:
+            with self.subTest(case=label), patch.object(
+                recovery, "_NIXOS_OS_PRESENT", True
+            ), patch.object(
+                recovery, "_NIXOS_RESTIC_TIMER_PRESENT", True
+            ), patch.object(
+                recovery, "_configured_recovery_target_info",
+                return_value={"kind": "local_backup_disk"}
+            ), patch.object(
+                recovery, "_nixos_native_backup_service_fresh", return_value=current_backup
+            ), patch.object(
+                recovery, "_canonical_server_marker", return_value=current_canonical
+            ) as canonical_read, patch.object(recovery.time, "time", return_value=self.now):
+                status = recovery._local_backup_freshness(server_source=current_source)
+            self.assertEqual(status["valid"], allowed, label)
+            if allowed:
+                self.assertEqual(status["snapshot_id"], prior)
+                self.assertEqual(status["backup_invocation_id"], "b" * 32)
+                canonical_read.assert_called_once()
+
     def test_nixos_missing_native_timer_never_falls_back_to_pop_marker(self) -> None:
         with patch.object(recovery, "_NIXOS_OS_PRESENT", True), patch.object(
             recovery, "_NIXOS_RESTIC_TIMER_PRESENT", False
