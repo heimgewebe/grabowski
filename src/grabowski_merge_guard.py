@@ -2197,9 +2197,45 @@ def _merge_guard_legacy_local_review_diff_identity(
             "raw_digest_matches_review": local_digest == expected_sha256,
             "canonical_hunks_match": local_canonical_digest == provider_canonical_digest,
         })
-        if local_digest != expected_sha256 or local_canonical_digest != provider_canonical_digest:
-            evidence["reason"] = "review_digest_or_canonical_hunks_mismatch"
+        if local_canonical_digest != provider_canonical_digest:
+            evidence["reason"] = "canonical_hunks_mismatch"
             return False, evidence
+        if local_digest != expected_sha256:
+            # Authenticated first-party reviews sign the exact NUL-delimited
+            # committed --raw Git object delta, not GitHub's textual patch.
+            # Never accept that BASE..HEAD metadata on a diverged base:
+            # GitHub's PR patch is merge-base...HEAD, a different scope.
+            if common_ancestor != base_sha:
+                evidence["reason"] = "source_raw_review_requires_base_ancestor"
+                return False, evidence
+            raw_result = _merge_guard_local_git_bytes(
+                repo_path,
+                [
+                    "diff", "--no-ext-diff", "--no-textconv", "--no-renames",
+                    "--ignore-submodules=none", "--raw", "--abbrev=40", "-z",
+                    base_sha, head_sha, "--",
+                ], timeout=60,
+            )
+            source_raw = raw_result["stdout_bytes"]
+            if (
+                raw_result["returncode"] != 0
+                or not source_raw
+                or len(source_raw) > _MERGE_GUARD_MAX_DIFF_BYTES
+            ):
+                evidence["reason"] = "source_raw_review_unavailable"
+                return False, evidence
+            source_sha256 = hashlib.sha256(source_raw).hexdigest()
+            evidence["source_raw_metadata_sha256"] = source_sha256
+            evidence["source_raw_metadata_matches_review"] = (
+                source_sha256 == expected_sha256
+            )
+            if source_sha256 != expected_sha256:
+                evidence["reason"] = "review_digest_or_canonical_hunks_mismatch"
+                return False, evidence
+            evidence["review_identity_kind"] = "first-party-raw-git-metadata"
+            evidence["raw_digest_matches_review"] = True
+        else:
+            evidence["review_identity_kind"] = "legacy-local-text"
     except (OSError, subprocess.SubprocessError, ValueError, RuntimeError) as exc:
         evidence["reason"] = f"local_evidence_unavailable:{type(exc).__name__}"
         return False, evidence
