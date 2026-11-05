@@ -185,6 +185,11 @@ class TaskTests(unittest.TestCase):
         os.chmod(self.root / "state", 0o700)
         self.audit_log = self.root / "state" / "write-audit.jsonl"
         self.audit_patch = patch.object(tasks.base, "AUDIT_LOG", self.audit_log)
+        self.chronik_state_root_patch = patch.dict(
+            os.environ,
+            {tasks.chronik.STATE_ROOT_ENV: str(self.root / "state")},
+        )
+        self.chronik_state_root_patch.start()
         self.audit_patch.start()
         self.db_patch.start()
         self.outcomes_patch.start()
@@ -196,6 +201,7 @@ class TaskTests(unittest.TestCase):
         self.start_counter = 0
 
     def tearDown(self) -> None:
+        self.chronik_state_root_patch.stop()
         self.admission_patch.stop()
         self.resource_patch.stop()
         self.capture_script_root_patch.stop()
@@ -205,6 +211,12 @@ class TaskTests(unittest.TestCase):
         self.db_patch.stop()
         self.audit_patch.stop()
         self.temporary.cleanup()
+
+    def test_default_chronik_state_root_is_private_to_task_fixture(self) -> None:
+        self.assertEqual(tasks.chronik.state_root(), self.root / "state")
+        self.assertEqual(
+            os.environ[tasks.chronik.STATE_ROOT_ENV], str(self.root / "state")
+        )
 
     def _archive_and_project_tasks(self, task_ids: list[str]) -> dict[str, object]:
         lifecycle_evidence = tasks.lifecycle_projection.effect_plan.lifecycle_evidence
