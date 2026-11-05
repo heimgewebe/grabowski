@@ -704,7 +704,7 @@ class RootbrokerCutoverTests(unittest.TestCase):
 
             def runner(argv: list[str]) -> subprocess.CompletedProcess[str]:
                 calls.append(list(argv))
-                if argv[:2] == ["/usr/bin/systemd-run", "--system"] and argv[-1] == "refs/heads/main":
+                if argv[:2] == [cutover._systemd_run_executable(), "--system"] and argv[-1] == "refs/heads/main":
                     return _completed(argv, stdout=HEAD + "\trefs/heads/main\n")
                 if argv[-3:] == ["remote", "get-url", "origin"]:
                     return _completed(argv, stdout=cutover.CANONICAL_ORIGIN_URL + "\n")
@@ -743,7 +743,7 @@ class RootbrokerCutoverTests(unittest.TestCase):
 
                 def stale_remote(argv: list[str]) -> subprocess.CompletedProcess[str]:
                     result = runner(argv)
-                    if argv[:2] == ["/usr/bin/systemd-run", "--system"] and argv[-1] == "refs/heads/main":
+                    if argv[:2] == [cutover._systemd_run_executable(), "--system"] and argv[-1] == "refs/heads/main":
                         return _completed(argv, stdout="b" * 40 + "\trefs/heads/main\n")
                     return result
 
@@ -756,6 +756,16 @@ class RootbrokerCutoverTests(unittest.TestCase):
                     "root automatic preflight must not run git status or clean filters",
                 )
 
+    def test_systemd_run_executable_prefers_nixos_and_keeps_fhs_fallback(self) -> None:
+        with patch.object(cutover.os.path, "isfile", return_value=True) as isfile:
+            self.assertEqual(
+                cutover._systemd_run_executable(),
+                "/run/current-system/sw/bin/systemd-run",
+            )
+            isfile.assert_called_once_with("/run/current-system/sw/bin/systemd-run")
+        with patch.object(cutover.os.path, "isfile", return_value=False):
+            self.assertEqual(cutover._systemd_run_executable(), "/usr/bin/systemd-run")
+
     def test_authoritative_remote_main_lookup_is_fixed_and_network_isolated(self) -> None:
         calls: list[list[str]] = []
 
@@ -766,7 +776,7 @@ class RootbrokerCutoverTests(unittest.TestCase):
         self.assertEqual(cutover._authoritative_remote_main_head(runner), HEAD)
         self.assertEqual(len(calls), 1)
         argv = calls[0]
-        self.assertEqual(argv[:2], ["/usr/bin/systemd-run", "--system"])
+        self.assertEqual(argv[:2], [cutover._systemd_run_executable(), "--system"])
         self.assertIn("--property=DynamicUser=yes", argv)
         self.assertIn("--property=ProtectHome=yes", argv)
         self.assertIn("--property=CapabilityBoundingSet=", argv)
