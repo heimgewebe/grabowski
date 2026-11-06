@@ -530,6 +530,10 @@
       "source": "src/grabowski_chronik.py"
     },
     {
+      "module": "grabowski_chronik_full_search",
+      "source": "src/grabowski_chronik_full_search.py"
+    },
+    {
       "module": "grabowski_recovery",
       "source": "src/grabowski_recovery.py"
     },
