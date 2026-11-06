@@ -938,6 +938,13 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "effects": ["state-create", "audit-append"],
         "reversibility": "append-only-observation",
     },
+    "grabowski_chronik_full_search": {
+        "category": "coding-memory",
+        "purpose": "Search complete immutable Chronik ledger with evidence-bound snapshot pagination.",
+        "risk_class": "low",
+        "effects": [],
+        "reversibility": "not-applicable",
+    },
     "grabowski_chronik_history": {
         "category": "coding-memory",
         "purpose": "Read bounded historical coding events without asserting current truth.",

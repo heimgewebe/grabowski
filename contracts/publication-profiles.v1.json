@@ -1,16 +1,16 @@
 {
   "canonical_contract": {
     "path": "config/runtime-entrypoint.json",
-    "sha256": "23851f3e6deab58099ba689712a5f85d688077427a45c6dde9da9466ababac75"
+    "sha256": "6e92a64c4ca14d09bfa74d804dc62da24c1342fc7949d29937f974f0cce1df0d"
   },
   "capability_catalog": {
     "path": "contracts/capability-catalog.v1.json",
-    "sha256": "49d9b5dc4baea4add316848ec63614c7f7a4846ae373c2f440d551a7b8f274c6"
+    "sha256": "e2b3bc19f60e151c901c1346cc225a4ff709e4872248effcc0c8210b587f8cb5"
   },
   "counts": {
     "core": 25,
-    "full": 206,
-    "operator": 190
+    "full": 207,
+    "operator": 191
   },
   "profiles": {
     "core": [
@@ -163,6 +163,7 @@
       "grabowski_task_resume",
       "grabowski_task_list",
       "grabowski_chronik_outbox_import",
+      "grabowski_chronik_full_search",
       "grabowski_chronik_history",
       "grabowski_operator_historical_recall",
       "grabowski_task_reconcile_check",
@@ -356,6 +357,7 @@
       "grabowski_task_resume",
       "grabowski_task_list",
       "grabowski_chronik_outbox_import",
+      "grabowski_chronik_full_search",
       "grabowski_chronik_history",
       "grabowski_operator_historical_recall",
       "grabowski_task_reconcile_check",

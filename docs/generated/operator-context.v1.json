@@ -1633,6 +1633,17 @@
     },
     {
       "category": "coding-memory",
+      "description": "Search the full committed Chronik ledger with exact selectors and evidence-bound pagination.\n\nUnlike grabowski_chronik_history, this directly queries the entire ledger\nand does not silently limit exact matches to a coarse provider window.\nHistorical evidence is never a present-state or successful-deployment claim.",
+      "effects": [],
+      "id": "grabowski_chronik_full_search",
+      "purpose": "Search complete immutable Chronik ledger with evidence-bound snapshot pagination.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_chronik_full_search"
+    },
+    {
+      "category": "coding-memory",
       "description": "Read bounded historical coding events without asserting current truth.\n\nThe optional component filter is bound to Chronik's canonical producer/source\ncomponent; subject_component independently filters task-context subject.component.\nExact PR, Bureau-task and agent-run selectors are ANDed inside Grabowski after\nvalidating a bounded coarse Chronik provider window. They never fall back to\ncoarse history when no exact match is present.",
       "effects": [],
       "id": "grabowski_chronik_history",
@@ -3079,6 +3090,7 @@
       "grabowski_task_resume",
       "grabowski_task_list",
       "grabowski_chronik_outbox_import",
+      "grabowski_chronik_full_search",
       "grabowski_chronik_history",
       "grabowski_operator_historical_recall",
       "grabowski_task_reconcile_check",
@@ -3757,7 +3769,7 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "e894771c674ecb89d8261217bf5350beaf370fad28b150e053a11ac5221c4811"
+      "sha256": "dbe955e33d5eed360d0c6ab194c252d626f22eab2625937b2787ee08f7914b37"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -3765,7 +3777,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "23851f3e6deab58099ba689712a5f85d688077427a45c6dde9da9466ababac75"
+      "sha256": "6e92a64c4ca14d09bfa74d804dc62da24c1342fc7949d29937f974f0cce1df0d"
     },
     "runtime_source_digest_contract": "mcp-tool-surface-v1",
     "runtime_sources": {
@@ -3892,7 +3904,7 @@
       "src/grabowski_systemkatalog.py": "e3ec4884b3dd367b8970b3143432cab0fea5fe55963292806001f5df535c83f9",
       "src/grabowski_task_attention.py": "a16d4b045bef23bf78ad3df0c4c58d91a304dc9a83b6e757fb1b0f88754ad6f3",
       "src/grabowski_task_reconcile.py": "64dc6195c9d0cb3435d192e4715a0d4d5679b9f1904057308366f4e2f2e9bbea",
-      "src/grabowski_tasks.py": "52c70dd3238b0938612b65ceffa13d7ec50e8ecdcfe7c18aaf56cdeb90579cd9",
+      "src/grabowski_tasks.py": "831eee2b70ecb25acd81b093cabe84ce7b656b6946deffdfea8757be5e4acb97",
       "src/grabowski_terminal_convergence.py": "8f172a65b2af1dbca3d5b226a18e82df3ca5229ca5f4ae8b2ab1792506c69195",
       "src/grabowski_text_artifact_reconcile.py": "b302be1dbb101abbf825732bfe41658c13ac64417c2a6034326e57409daa4772",
       "src/grabowski_transport_assertion.py": "20d75d1f94c1d0273108c36eed8c58aa85e55a30b73546c4ac8af8a835fb8c8e",
