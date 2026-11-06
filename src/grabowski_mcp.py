@@ -167,10 +167,10 @@ AGENT_INSTRUCTION_RULES: tuple[tuple[str, str], ...] = (
     ),
     (
         "selective-repoground-retrieval",
-        "Known file/symbol: typed Git/file read first; no RepoGround preflight. "
-        "Unknown callers, impacts/tests or history/cross-repo: bounded "
-        "RepoGround query on fresh bundle; verify citations in Git. "
-        "Stale/unavailable/low coverage: Git fallback; optional."
+        "Git first: code/diffs/pins/history/cross-repo; no RepoGround "
+        "preflight. Published S1/snapshot/gaps: optional revision-pinned "
+        "RepoGround read; check manifest/artifact/pack/evidence SHA. "
+        "No bundle=unknown; historical!=live; S1!=runtime; Git fallback."
     ),
 )
 
