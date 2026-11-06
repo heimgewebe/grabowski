@@ -161,6 +161,7 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_task_resume` | task | no | variable | Recreate a missing or stopped task unit from its persistent record. |
 | `grabowski_task_list` | task | no | low | List recent persistent task records with optional state filtering. |
 | `grabowski_chronik_outbox_import` | coding-memory | no | medium | Import one redacted Grabowski outbox JSONL into optional local Chronik. |
+| `grabowski_chronik_full_search` | coding-memory | yes | low | Search complete immutable Chronik ledger with evidence-bound snapshot pagination. |
 | `grabowski_chronik_history` | coding-memory | yes | low | Read bounded historical coding events without asserting current truth. |
 | `grabowski_operator_historical_recall` | operator-recall | yes | low | Read evidence-bound operator recall derived from validated Chronik history. |
 | `grabowski_task_reconcile_check` | task | no | low | Preview persistent task reconciliation through the mutation gate; legacy SQLite stores may be initialized or migrated and privileged observations may create temporary reference files. |

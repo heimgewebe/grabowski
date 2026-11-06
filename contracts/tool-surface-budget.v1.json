@@ -634,6 +634,29 @@
         "tool": "grabowski_checkout_uncertainty_status"
       }
     },
+    "grabowski_chronik_full_search": {
+      "evidence_refs": [
+        "docs:docs/chronik-full-ledger-mcp.md",
+        "tests:tests/test_chronik_full_search.py",
+        "pr:heimgewebe/chronik#308"
+      ],
+      "exception_detail": {
+        "claim": "Read-only full-ledger Chronik search with exact selectors and snapshot-bound cursor, not present runtime authority.",
+        "evidence": "Real 54800+ event Chronik ledger returned four exact events for PR1717 in two disjoint pages where the existing bounded provider missed matches; the wrapper validates event hashes, query digest and ledger snapshot without additional storage."
+      },
+      "justification_kind": "material_call_shape",
+      "operation_alternative_considered": "Existing grabowski_chronik_history is bounded to a coarse provider window and lacks exact event-ID and snapshot-cursor selectors; generic terminal operations unnecessarily widen execution authority.",
+      "rationale": "Agents need a discoverable, evidence-bound query of the complete canonical historical ledger, distinct from the legacy 100-event window and without a second connector.",
+      "tool_contract": {
+        "authority_class": "read",
+        "category": "coding-memory",
+        "effects": [],
+        "read_only": true,
+        "reversibility": "not-applicable",
+        "risk_class": "low",
+        "tool": "grabowski_chronik_full_search"
+      }
+    },
     "grabowski_chronik_history": {
       "evidence_refs": [
         "bureau:CCM-V1-T002",

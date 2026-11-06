@@ -1633,6 +1633,17 @@
     },
     {
       "category": "coding-memory",
+      "description": "Search the full committed Chronik ledger with exact selectors and evidence-bound pagination.\n\nUnlike grabowski_chronik_history, this directly queries the entire ledger\nand does not silently limit exact matches to a coarse provider window.\nHistorical evidence is never a present-state or successful-deployment claim.",
+      "effects": [],
+      "id": "grabowski_chronik_full_search",
+      "purpose": "Search complete immutable Chronik ledger with evidence-bound snapshot pagination.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_chronik_full_search"
+    },
+    {
+      "category": "coding-memory",
       "description": "Read bounded historical coding events without asserting current truth.\n\nThe optional component filter is bound to Chronik's canonical producer/source\ncomponent; subject_component independently filters task-context subject.component.\nExact PR, Bureau-task and agent-run selectors are ANDed inside Grabowski after\nvalidating a bounded coarse Chronik provider window. They never fall back to\ncoarse history when no exact match is present.",
       "effects": [],
       "id": "grabowski_chronik_history",
@@ -3079,6 +3090,7 @@
       "grabowski_task_resume",
       "grabowski_task_list",
       "grabowski_chronik_outbox_import",
+      "grabowski_chronik_full_search",
       "grabowski_chronik_history",
       "grabowski_operator_historical_recall",
       "grabowski_task_reconcile_check",
@@ -3536,6 +3548,10 @@
         "source": "src/grabowski_chronik.py"
       },
       {
+        "module": "grabowski_chronik_full_search",
+        "source": "src/grabowski_chronik_full_search.py"
+      },
+      {
         "module": "grabowski_recovery",
         "source": "src/grabowski_recovery.py"
       },
@@ -3757,7 +3773,7 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "e894771c674ecb89d8261217bf5350beaf370fad28b150e053a11ac5221c4811"
+      "sha256": "dbe955e33d5eed360d0c6ab194c252d626f22eab2625937b2787ee08f7914b37"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -3765,7 +3781,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "23851f3e6deab58099ba689712a5f85d688077427a45c6dde9da9466ababac75"
+      "sha256": "7130dc15a14428838a93fe063df0435462faeee0360b37388fad332893b70e8d"
     },
     "runtime_source_digest_contract": "mcp-tool-surface-v1",
     "runtime_sources": {
@@ -3800,6 +3816,7 @@
       "src/grabowski_checkout_terminal_sources.py": "56e65c901e7b5ba5a6b9d764617b709cff14dc1d3d852244beff5ac5cadce32b",
       "src/grabowski_checkouts.py": "b765e63544a072a0b0ab24d1f7a06670173642f44c45356783492cbdbf52a4f8",
       "src/grabowski_chronik.py": "68785720fc9dac258b493011f99d5568ef1ca5543e21eee853e6d8e6c1616c17",
+      "src/grabowski_chronik_full_search.py": "6dbf23eff07d04b6e602ff8f440eb7ff4bc64cc3258e68d1cd16221c983e3688",
       "src/grabowski_client_snapshot.py": "777d9aa6d4bd964e7fdbb923d82586d186f9e0340e51b8e4b1140cae1e863eec",
       "src/grabowski_codex_preflight.py": "3a90bb4ba8118f178b3ae5ed517d2a18c1eff36f985fbf2a4ac2bc3dc5f27b76",
       "src/grabowski_coding_agent_catalog_data.py": "2e9b3163bf93f58f5c2848813e51d1cf0f13c59dc071eb678a11657c4bb645a2",
@@ -3892,7 +3909,7 @@
       "src/grabowski_systemkatalog.py": "e3ec4884b3dd367b8970b3143432cab0fea5fe55963292806001f5df535c83f9",
       "src/grabowski_task_attention.py": "a16d4b045bef23bf78ad3df0c4c58d91a304dc9a83b6e757fb1b0f88754ad6f3",
       "src/grabowski_task_reconcile.py": "64dc6195c9d0cb3435d192e4715a0d4d5679b9f1904057308366f4e2f2e9bbea",
-      "src/grabowski_tasks.py": "52c70dd3238b0938612b65ceffa13d7ec50e8ecdcfe7c18aaf56cdeb90579cd9",
+      "src/grabowski_tasks.py": "831eee2b70ecb25acd81b093cabe84ce7b656b6946deffdfea8757be5e4acb97",
       "src/grabowski_terminal_convergence.py": "8f172a65b2af1dbca3d5b226a18e82df3ca5229ca5f4ae8b2ab1792506c69195",
       "src/grabowski_text_artifact_reconcile.py": "b302be1dbb101abbf825732bfe41658c13ac64417c2a6034326e57409daa4772",
       "src/grabowski_transport_assertion.py": "20d75d1f94c1d0273108c36eed8c58aa85e55a30b73546c4ac8af8a835fb8c8e",
