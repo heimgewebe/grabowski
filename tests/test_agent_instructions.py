@@ -263,15 +263,15 @@ class AgentInstructionsTests(unittest.TestCase):
         rules = dict(grabowski_mcp.AGENT_INSTRUCTION_RULES)
         text = rules["selective-repoground-retrieval"].lower()
         for phrase in (
-            "code/diffs/pins/history/cross-repo",
             "git first",
+            "code/diffs/pins/history/cross-repo",
             "no repoground preflight",
             "published s1/snapshot/gaps",
-            "optional fresh pinned",
+            "optional revision-pinned",
             "repoground read",
             "check manifest/artifact/pack/evidence sha",
-            "missing/stale=unknown",
-            "unknown != no dependency",
+            "no bundle=unknown",
+            "historical!=live",
             "s1!=runtime",
             "git fallback",
         ):

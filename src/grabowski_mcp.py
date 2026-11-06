@@ -167,10 +167,10 @@ AGENT_INSTRUCTION_RULES: tuple[tuple[str, str], ...] = (
     ),
     (
         "selective-repoground-retrieval",
-        "Code/diffs/pins/history/cross-repo: Git first, no RepoGround "
-        "preflight. Published S1/snapshot/gaps: optional fresh pinned "
+        "Git first: code/diffs/pins/history/cross-repo; no RepoGround "
+        "preflight. Published S1/snapshot/gaps: optional revision-pinned "
         "RepoGround read; check manifest/artifact/pack/evidence SHA. "
-        "Missing/stale=unknown != no dependency; S1!=runtime; Git fallback."
+        "No bundle=unknown; historical!=live; S1!=runtime; Git fallback."
     ),
 )
 
