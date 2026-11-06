@@ -2534,19 +2534,42 @@ def verified_first_party_semantic_review_passes(
         session, session_root, signers=signers,
         root_owned_signers=root_owned_signers, repository=repository,
     )
-    # No review PASS from a single authentic but incomplete diff excerpt.
-    # Every line of the immutable base/head delta must have been returned to
-    # the enrolled controller across the signed source-read receipts.
+    axes = _load_first_party_axes(
+        session, session_root, reads=reads, signers=signers,
+        root_owned_signers=root_owned_signers,
+    )
+    if set(axes) != set(axes_to_review):
+        raise ReviewExecutionRejected("first-party semantic axis coverage incomplete")
+    # A late signed read remains integrity-checked, but cannot fill a missing
+    # canonical diff range after the axis verdict has already been signed.
+    # New axes pin exact read IDs. Historic axes have only signed timestamps;
+    # their audited cutoff is retained for legacy receipt verification.
+    bound_diff_ranges: list[tuple[int, int]] = []
+    for item in reads:
+        if item["read_kind"] != "diff":
+            continue
+        record = axes.get(item["axis"])
+        if record is None:
+            continue
+        sealed_ids = record.get("sealed_read_ids")
+        if sealed_ids is not None:
+            if item["read_id"] not in sealed_ids:
+                continue
+        else:
+            cutoff = (
+                legacy_seal_cutoff_unix
+                if legacy_seal_cutoff_unix is not None
+                else record["submitted_at_unix"]
+            )
+            if item["observed_at_unix"] > cutoff:
+                continue
+        bound_diff_ranges.append((item["start_line"], item["end_line"]))
     try:
         diff_line_count = len(diff.decode("utf-8").splitlines(keepends=True))
     except UnicodeError as exc:
         raise ReviewExecutionRejected("first-party canonical diff not text") from exc
     next_unseen = 1
-    ranges = sorted(
-        (item["start_line"], item["end_line"])
-        for item in reads if item["read_kind"] == "diff"
-    )
-    for first, last in ranges:
+    for first, last in sorted(bound_diff_ranges):
         if first > next_unseen:
             break
         next_unseen = max(next_unseen, last + 1)
@@ -2554,12 +2577,6 @@ def verified_first_party_semantic_review_passes(
             break
     if next_unseen <= diff_line_count:
         raise ReviewExecutionRejected("first-party canonical diff coverage incomplete")
-    axes = _load_first_party_axes(
-        session, session_root, reads=reads, signers=signers,
-        root_owned_signers=root_owned_signers,
-    )
-    if set(axes) != set(axes_to_review):
-        raise ReviewExecutionRejected("first-party semantic axis coverage incomplete")
     _assert_prior_first_party_material_findings_resolved(
         session, axes, root=root, repository=repository,
         signers=signers, root_owned_signers=root_owned_signers,

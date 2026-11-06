@@ -125,6 +125,60 @@ class ChronikFullSearchTests(unittest.TestCase):
         self.assertEqual(result["failure_code"], "chronik_repository_unavailable")
         self.assertEqual(self.calls, [])
 
+    def test_unusable_provider_continuation_cannot_claim_available(self):
+        for token in ("", "x" * 4097):
+            with self.subTest(length=len(token)):
+                self.payload["next_cursor"] = token
+                result = self.query()
+                self.assertFalse(result["available"])
+                self.assertEqual(
+                    result["failure_code"], "chronik_full_search_contract_failed"
+                )
+
+    def test_read_only_command_mounts_only_source_and_ledger(self):
+        from unittest.mock import patch
+
+        import grabowski_agent_sandbox as sandbox
+
+        repo = Path(self.config["repository"])
+        data = Path(self.config["data_dir"])
+        argv = [sys.executable, str(repo / "tools/chronik_search.py"),
+                "--data-dir", str(data), "search", "--pr-number", "1717"]
+        with patch.object(sandbox, "require_bwrap", return_value=Path("/usr/bin/bwrap")):
+            prepared = search.read_only_search_argv(argv, repo, data)
+        self.assertEqual(prepared[0], "/usr/bin/bwrap")
+        self.assertIn("--ro-bind", prepared)
+        self.assertNotIn("--bind", prepared)
+        self.assertIn(["--ro-bind", str(repo), str(repo)],
+                      [prepared[i:i + 3] for i in range(len(prepared) - 2)])
+        self.assertIn(["--ro-bind", str(data), str(data)],
+                      [prepared[i:i + 3] for i in range(len(prepared) - 2)])
+        self.assertEqual(prepared[-len(argv):], argv)
+
+    def test_live_read_only_sandbox_blocks_chronik_script_writes(self):
+        import os
+        import subprocess
+
+        # The immutable Nix deployment provides the verified bwrap executable.
+        # CI machines without that runtime still check the complete argv above.
+        if not os.environ.get("GRABOWSKI_BWRAP_BIN"):
+            self.skipTest("Nix bubblewrap runtime unavailable")
+        repo = Path(self.config["repository"])
+        data = Path(self.config["data_dir"])
+        sentinel = data / "sentinel.txt"
+        sentinel.write_text("unchanged", encoding="utf-8")
+        (repo / "tools/chronik_search.py").write_text(
+            "from pathlib import Path\\n"
+            f"Path({str(sentinel)!r}).write_text('modified')\\n",
+            encoding="utf-8",
+        )
+        argv = [sys.executable, str(repo / "tools/chronik_search.py"),
+                "--data-dir", str(data), "search"]
+        command = search.read_only_search_argv(argv, repo, data)
+        completed = subprocess.run(command, capture_output=True, timeout=20, check=False)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(sentinel.read_text(encoding="utf-8"), "unchanged")
+
     def test_bad_filters_and_limits_fail_before_execution(self):
         with self.assertRaisesRegex(ValueError, "selector"):
             search.query(selectors={}, configuration=self.config, executor=self.execute)

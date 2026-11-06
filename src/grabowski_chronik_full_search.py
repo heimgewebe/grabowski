@@ -79,7 +79,10 @@ def _validate(payload: Any, filters: dict[str, Any], limit: int) -> dict[str, An
         or type(remaining) is not int or remaining < len(events)
         or (payload["has_more"] and (not events or remaining <= len(events)))
         or (not payload["has_more"] and payload.get("next_cursor") is not None)
-        or (payload["has_more"] and not isinstance(payload.get("next_cursor"), str))):
+        or (payload["has_more"] and (
+            not isinstance(payload.get("next_cursor"), str)
+            or not 1 <= len(payload["next_cursor"]) <= 4096
+        ))):
         raise ValueError("Chronik pagination receipt mismatch")
     snap = payload.get("ledger_snapshot")
     if (not isinstance(snap, dict) or snap.get("domain") != "agent.ledger"
@@ -104,6 +107,45 @@ def _validate(payload: Any, filters: dict[str, Any], limit: int) -> dict[str, An
             raise ValueError("Chronik event payload is not hash-bound")
         seen.add(eid)
     return payload
+
+
+def read_only_search_argv(
+    argv: list[str], repository: Path, data_dir: Path,
+) -> list[str]:
+    """Confine the selected Chronik CLI to read-only source and ledger mounts.
+
+    The existing Grabowski bubblewrap runner supplies a private /tmp and no
+    host-writable mounts. The optional historical search must not inherit
+    the normal operator subprocess's access to the host filesystem.
+    """
+    from grabowski_agent_sandbox import minimal_sandbox_argv, require_bwrap
+
+    if (
+        not repository.is_absolute() or not data_dir.is_absolute()
+        or repository.is_symlink() or data_dir.is_symlink()
+        or not repository.is_dir() or not data_dir.is_dir()
+        or len(argv) < 2 or argv[1] != str(repository / "tools" / "chronik_search.py")
+    ):
+        raise ValueError("Chronik sandbox source/data identity invalid")
+    # Bubblewrap creates an otherwise empty mount namespace; only ancestors
+    # of the two mounted paths are needed as empty directory mount targets.
+    parents = {
+        ancestor for path in (repository, data_dir)
+        for ancestor in path.parents
+        if str(ancestor) not in {"/", "/dev", "/proc", "/usr", "/etc", "/tmp", "/nix"}
+        and not ancestor.is_relative_to(Path("/nix"))
+    }
+    command = minimal_sandbox_argv(
+        workspace=repository,
+        command=argv,
+        workspace_writable=False,
+        extra_read_only=((data_dir, data_dir),),
+        extra_directories=tuple(sorted(
+            parents, key=lambda path: (len(path.parts), str(path)),
+        )),
+    )
+    command[0] = str(require_bwrap())
+    return command
 
 
 def query(

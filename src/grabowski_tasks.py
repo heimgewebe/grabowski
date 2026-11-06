@@ -14839,15 +14839,28 @@ def grabowski_chronik_full_search(
         "since": since, "until": until, "keyword": keyword,
     }
     selectors = {name: None if value == "" else value for name, value in selectors.items()}
+    configuration = chronik.coding_memory_configuration()
+
+    def read_only_executor(argv: list[str], cwd: Path) -> dict[str, Any]:
+        try:
+            command = full_search.read_only_search_argv(
+                argv, cwd, Path(configuration["data_dir"]),
+            )
+        except (OSError, RuntimeError, ValueError):
+            # No unsandboxed fallback: an unavailable sandbox is an explicit
+            # evidence gap, never an excuse to run mutable host Python.
+            return {"returncode": 1, "stdout": "", "stderr": "Chronik sandbox unavailable"}
+        return operator._run(
+            command, cwd=cwd, timeout_seconds=CHRONIK_CLI_TIMEOUT_SECONDS,
+            max_output_bytes=CHRONIK_CLI_MAX_OUTPUT_BYTES,
+        )
+
     return full_search.query(
         selectors=selectors,
         limit=limit,
         cursor=cursor or None,
-        configuration=chronik.coding_memory_configuration(),
-        executor=lambda argv, cwd: operator._run(
-            argv, cwd=cwd, timeout_seconds=CHRONIK_CLI_TIMEOUT_SECONDS,
-            max_output_bytes=CHRONIK_CLI_MAX_OUTPUT_BYTES,
-        ),
+        configuration=configuration,
+        executor=read_only_executor,
     )
 
 
