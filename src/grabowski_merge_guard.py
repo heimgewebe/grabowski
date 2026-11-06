@@ -4201,6 +4201,17 @@ class CaptainMergeGuardRunner:
         }
         errors: list[str] = []
         if info["returncode"] != 0:
+            # Snapshot the exact plan-limit state and revalidate it at
+            # dispatch; the CAS guard independently proves eligibility.
+            if (
+                self._explicit_merge_method_requested()
+                and self.action["target"]["merge_method"] == "merge"
+                and _github_rules_plan_limit_error(info["stderr"])
+            ):
+                snapshot = [{"type": "github_plan_limit_403"}]
+                evidence["active_rules_state"] = "github_plan_limit_403"
+                evidence["merge_policy_sha256"] = _sha256_json(snapshot)
+                return snapshot, evidence, []
             errors.append("merge_guard_branch_merge_policy_query_failed")
             return None, evidence, errors
         try:

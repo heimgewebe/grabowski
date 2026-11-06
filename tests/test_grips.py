@@ -16643,6 +16643,102 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertTrue(guard["post_merge_verification_passed"])
         self.assertEqual("pushed_and_read_back", guard["exact_base_git_cas_merge"]["status"])
 
+    def test_captain_explicit_merge_plan_limit_dispatches_exact_base_cas(self) -> None:
+        original = self._exact_cas_parameters()
+        action = captain_action(
+            target={
+                "repo": "heimgewebe/grabowski",
+                "pr": 96,
+                "base": "main",
+                "merge_method": "merge",
+            }
+        )
+        action["scope"] = deepcopy(original["actions"][0]["scope"])
+        parameters = authorized_captain_run_parameters(actions=[action])
+
+        class PlanLimitedGh(FakeGh):
+            def __call__(self, repo: Path, argv: list[str]) -> dict[str, object]:
+                if any("/rules/branches/" in part for part in argv):
+                    self.calls.append(tuple(argv))
+                    return {
+                        "returncode": 1,
+                        "stdout": "",
+                        "stderr": (
+                            "gh: Upgrade to GitHub Pro or make this repository "
+                            "public to enable this feature. (HTTP 403)"
+                        ),
+                    }
+                if (
+                    argv[:2] == ["api", "repos/heimgewebe/grabowski"]
+                    and "--jq" in argv
+                    and any(".private" in arg for arg in argv)
+                ):
+                    self.calls.append(tuple(argv))
+                    return {
+                        "returncode": 0,
+                        "stdout": json.dumps(
+                            {"private": True, "allow_merge_commit": True}
+                        ),
+                        "stderr": "",
+                    }
+                return super().__call__(repo, argv)
+
+        gh = PlanLimitedGh(
+            view={
+                "number": 96,
+                "state": "OPEN",
+                "baseRefName": "main",
+                "baseRefOid": CAPTAIN_BASE_SHA,
+                "headRefName": "feat/captain",
+                "headRefOid": CAPTAIN_HEAD,
+                "isDraft": False,
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+            },
+            repo_settings={
+                "private": True,
+                "allow_merge_commit": True,
+                "allow_squash_merge": True,
+                "allow_rebase_merge": True,
+                "delete_branch_on_merge": False,
+            },
+            merge_updates_view=False,
+        )
+        closed_view = dict(gh.view, state="CLOSED", mergedAt=None, mergeCommit=None)
+
+        def fake_exact_cas(*args, on_dispatch=None, **kwargs):
+            del args, kwargs
+            if on_dispatch is not None:
+                on_dispatch()
+            gh.view = closed_view
+            return (
+                {"returncode": 0, "stdout": "merged via exact-base Git CAS\\n", "stderr": ""},
+                self._exact_cas_success_evidence(),
+            )
+
+        with patch.object(
+            merge_guard,
+            "_exact_base_git_cas_merge",
+            side_effect=fake_exact_cas,
+        ) as cas:
+            result = grips.grip_run(
+                "captain-run",
+                parameters,
+                profile="captain",
+                allow_mutation=True,
+                command_runner=FakeGit(),
+                github_runner=gh,
+            )
+
+        self.assertEqual("passed", result["receipt"]["status"], result["output"]["blocked_reasons"])
+        self.assertEqual("executed", result["output"]["decision"])
+        execution = result["output"]["executions"][0]
+        self.assertTrue(execution["verification_passed"])
+        self.assertEqual("exact_base_git_cas", execution["base_update_guard_mode"])
+        self.assertTrue(execution["merge_lease_guard"]["branch_merge_policy_revalidation"]["matched"])
+        self.assertEqual([], [c for c in gh.calls if c[:2] == ("pr", "merge")])
+        cas.assert_called_once()
+
     def test_exact_base_cas_closed_pr_reconciliation_fails_without_base_readback_proof(self) -> None:
         parameters = self._exact_cas_parameters()
         gh = FakeGh(
@@ -24510,3 +24606,119 @@ class SagaExternalMergeCloseoutGripTests(unittest.TestCase):
         result, append = self.run_closeout()
         self.assertEqual("passed", result["status"])
         append.assert_called_once()
+
+
+class CaptainExplicitPrivatePlanLimitTests(unittest.TestCase):
+    PLAN_LIMIT_403 = (
+        "gh: Upgrade to GitHub Pro or make this repository public "
+        "to enable this feature. (HTTP 403)"
+    )
+
+    class PlanLimitedGh(FakeGh):
+        def __init__(self, error: str | None):
+            super().__init__()
+            self.rule_error = error
+
+        def __call__(self, repo: Path, argv: list[str]) -> dict[str, object]:
+            if self.rule_error is not None and any(
+                "/rules/branches/" in value for value in argv
+            ):
+                self.calls.append(tuple(argv))
+                return {"returncode": 1, "stdout": "", "stderr": self.rule_error}
+            return super().__call__(repo, argv)
+
+    def policy(self, method: str | None, error: str | None = PLAN_LIMIT_403):
+        gh = self.PlanLimitedGh(error)
+        policy, query, errors = grips._captain_repository_merge_policy(
+            Path.cwd(), gh, repo_slug="heimgewebe/infra",
+            requested_method=method, base_branch="main",
+        )
+        return policy, query, errors, gh
+
+    def guard_snapshot(self, method: str, gh: PlanLimitedGh):
+        runner = object.__new__(merge_guard.CaptainMergeGuardRunner)
+        runner.action = {
+            "target": {"repo": "heimgewebe/infra", "base": "main",
+                       "pr": 96, "merge_method": method},
+        }
+        runner.repo_path = Path.cwd()
+        runner.github_runner = gh
+        runner.receipt = {}
+        runner.branch_merge_policy_args = None
+        runner.branch_merge_policy_snapshot = None
+        args = [
+            "api", "--method", "GET", "--paginate", "--slurp", "-f",
+            "per_page=100", "repos/heimgewebe/infra/rules/branches/main",
+        ]
+        runner._capture_branch_merge_policy_snapshot(args, gh(Path.cwd(), args))
+        return runner
+
+    def test_explicit_merge_accepts_known_plan_limit(self):
+        policy, query, errors, _ = self.policy("merge")
+        self.assertEqual([], errors)
+        self.assertEqual("merge", policy["selected_method"])
+        self.assertEqual("--merge", policy["selected_flag"])
+        self.assertEqual(
+            "github_plan_limit_403",
+            policy["branch_merge_policy"]["active_rules_state"],
+        )
+        self.assertIsNone(policy["branch_merge_policy"]["merge_queue_present"])
+        self.assertTrue(query["branch_merge_rules"]["plan_limit_cas_fallback_candidate"])
+
+    def test_implicit_merge_remains_unchanged(self):
+        policy, query, errors, gh = self.policy(None)
+        self.assertEqual([], errors)
+        self.assertEqual("merge", policy["selected_method"])
+        self.assertNotIn("branch_merge_rules", query)
+        self.assertFalse(any("/rules/branches/" in v for call in gh.calls for v in call))
+
+    def test_squash_rebase_and_generic_403_remain_blocked(self):
+        for method, error in (
+            ("squash", self.PLAN_LIMIT_403),
+            ("rebase", self.PLAN_LIMIT_403),
+            ("merge", "gh: forbidden (HTTP 403)"),
+        ):
+            with self.subTest(method=method, error=error):
+                policy, _, errors, _ = self.policy(method, error)
+                self.assertIsNone(policy)
+                self.assertIn("repository_branch_merge_rules_query_failed", errors)
+
+    def test_merge_commit_permission_still_required(self):
+        gh = self.PlanLimitedGh(self.PLAN_LIMIT_403)
+        gh.repo_settings["allow_merge_commit"] = False
+        policy, _, errors = grips._captain_repository_merge_policy(
+            Path.cwd(), gh, repo_slug="heimgewebe/infra",
+            requested_method="merge", base_branch="main",
+        )
+        self.assertEqual("merge", policy["selected_method"])
+        self.assertIn("repository_merge_method_not_allowed:merge", errors)
+
+    def test_dispatch_guard_revalidates_plan_limit(self):
+        gh = self.PlanLimitedGh(self.PLAN_LIMIT_403)
+        runner = self.guard_snapshot("merge", gh)
+        self.assertEqual(
+            [{"type": "github_plan_limit_403"}],
+            runner.branch_merge_policy_snapshot,
+        )
+        self.assertEqual([], runner._revalidate_branch_merge_policy())
+        self.assertTrue(runner.receipt["branch_merge_policy_revalidation"]["matched"])
+
+    def test_dispatch_guard_blocks_plan_change_or_403_drift(self):
+        for later_error, expected in (
+            (None, "merge_guard_branch_merge_policy_drift"),
+            ("gh: forbidden (HTTP 403)", "merge_guard_branch_merge_policy_query_failed"),
+        ):
+            with self.subTest(later_error=later_error):
+                gh = self.PlanLimitedGh(self.PLAN_LIMIT_403)
+                runner = self.guard_snapshot("merge", gh)
+                gh.rule_error = later_error
+                self.assertIn(expected, runner._revalidate_branch_merge_policy())
+
+    def test_dispatch_guard_rejects_plan_limit_for_squash(self):
+        gh = self.PlanLimitedGh(self.PLAN_LIMIT_403)
+        runner = self.guard_snapshot("squash", gh)
+        self.assertIsNone(runner.branch_merge_policy_snapshot)
+        self.assertIn(
+            "merge_guard_branch_merge_policy_snapshot_missing",
+            runner._revalidate_branch_merge_policy(),
+        )
