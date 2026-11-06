@@ -127,19 +127,36 @@ def read_only_search_argv(
         or len(argv) < 2 or argv[1] != str(repository / "tools" / "chronik_search.py")
     ):
         raise ValueError("Chronik sandbox source/data identity invalid")
-    # Bubblewrap creates an otherwise empty mount namespace; only ancestors
-    # of the two mounted paths are needed as empty directory mount targets.
+    runtime_python = Path(argv[0])
+    if not runtime_python.is_absolute() or not runtime_python.is_file():
+        raise ValueError("Chronik sandbox Python unavailable")
+    # The serving Grabowski process may run from a release-local virtualenv,
+    # not directly from /nix/store. Its pyvenv.cfg and site-packages must be
+    # readable without giving the subprocess host write permissions.
+    venv = runtime_python.parent.parent
+    virtualenv = (
+        not runtime_python.is_relative_to(Path("/nix/store"))
+        and runtime_python.parent.name == "bin"
+        and (venv / "pyvenv.cfg").is_file()
+    )
+    if not virtualenv and not (
+        runtime_python.is_relative_to(Path("/nix/store"))
+        or runtime_python.is_relative_to(Path("/usr"))
+    ):
+        raise ValueError("Chronik sandbox Python is not a trusted runtime")
+    mount_paths = (repository, data_dir, *((venv,) if virtualenv else ()))
     parents = {
-        ancestor for path in (repository, data_dir)
+        ancestor for path in mount_paths
         for ancestor in path.parents
         if str(ancestor) not in {"/", "/dev", "/proc", "/usr", "/etc", "/tmp", "/nix"}
         and not ancestor.is_relative_to(Path("/nix"))
     }
+    readonly = ((data_dir, data_dir),) + (((venv, venv),) if virtualenv else ())
     command = minimal_sandbox_argv(
         workspace=repository,
         command=argv,
         workspace_writable=False,
-        extra_read_only=((data_dir, data_dir),),
+        extra_read_only=readonly,
         extra_directories=tuple(sorted(
             parents, key=lambda path: (len(path.parts), str(path)),
         )),
