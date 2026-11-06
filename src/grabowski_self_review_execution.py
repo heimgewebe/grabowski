@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import ctypes
+from datetime import datetime, timezone
 import fcntl
 import json
 import os
@@ -2420,8 +2421,13 @@ def verified_first_party_semantic_review_passes(
     root_owned_signers: bool = True,
     now_unix: int | None = None,
     axes_to_review: tuple[str, ...] = REQUIRED_AXES,
+    legacy_seal_cutoff_unix: int | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Verify five signed controller reports and every persisted source read."""
+    if legacy_seal_cutoff_unix is not None and (
+        type(legacy_seal_cutoff_unix) is not int or legacy_seal_cutoff_unix < 0
+    ):
+        raise ReviewExecutionRejected("first-party legacy audit cutoff invalid")
     expected = _first_party_binding(binding)
     if axes_to_review != REQUIRED_AXES:
         raise ReviewExecutionRejected("first-party semantic method scope invalid")
@@ -2574,8 +2580,13 @@ def verified_first_party_semantic_review_passes(
         }
         sealed_ids = (
             set(record["sealed_read_ids"]) if "sealed_read_ids" in record
-            else None  # Legacy signed records retain their timestamp cutoff.
+            else None  # Legacy signed records lack an immutable read-ID list.
         )
+        if (
+            sealed_ids is None and legacy_seal_cutoff_unix is not None
+            and legacy_seal_cutoff_unix < record["submitted_at_unix"]
+        ):
+            raise ReviewExecutionRejected("legacy audit predates signed axis submission")
         accepted[axis] = {
             "phase": phase,
             "provenance_kind": "first_party_authenticated_controller",
@@ -2593,7 +2604,11 @@ def verified_first_party_semantic_review_passes(
                     if item["axis"] == axis
                     and (
                         item["read_id"] in sealed_ids if sealed_ids is not None
-                        else item["observed_at_unix"] <= record["submitted_at_unix"]
+                        else item["observed_at_unix"] <= (
+                            legacy_seal_cutoff_unix
+                            if legacy_seal_cutoff_unix is not None
+                            else record["submitted_at_unix"]
+                        )
                     )
                 )),
                 "canonical_diff_sha256": session["canonical_diff_sha256"],
@@ -3036,6 +3051,7 @@ def _verify(
             signers=signers, root_owned_signers=root_owned_signers,
             now_unix=now_unix, axes_to_review=tuple(axes),
         )
+        legacy_semantic_reviews: dict[str, dict[str, Any]] | None = None
         for phase, ref in zip(phases, refs, strict=True):
             axis = phase.get("axis") if isinstance(phase, dict) else None
             semantic = semantic_reviews.get(axis)
@@ -3059,9 +3075,47 @@ def _verify(
                 **semantic["provenance"],
             }
             if ref != expected_ref:
-                raise ReviewExecutionRejected(
-                    "direct first-party audit proof differs from signed records"
-                )
+                # Historical signed axes had no read-ID snapshot. The old
+                # sealer included signed reads after axis submission but
+                # before the audit was generated. Verify that exact window,
+                # never a freely supplied hash or unchecked source record.
+                if (
+                    not isinstance(ref, dict)
+                    or {k: v for k, v in ref.items() if k != "source_reads_sha256"}
+                    != {k: v for k, v in expected_ref.items() if k != "source_reads_sha256"}
+                ):
+                    raise ReviewExecutionRejected(
+                        "direct first-party audit proof differs from signed records"
+                    )
+                if legacy_semantic_reviews is None:
+                    stamped = audit.get("generated_at")
+                    try:
+                        if not isinstance(stamped, str):
+                            raise ValueError("missing audit timestamp")
+                        generated = datetime.fromisoformat(stamped)
+                        if generated.tzinfo is None or generated.utcoffset() is None:
+                            raise ValueError("naive audit timestamp")
+                        seal_cutoff = int(generated.astimezone(timezone.utc).timestamp())
+                        if seal_cutoff < 0 or seal_cutoff > now_unix + 300:
+                            raise ValueError("audit timestamp outside observed window")
+                    except (TypeError, ValueError, OverflowError, OSError) as exc:
+                        raise ReviewExecutionRejected(
+                            "first-party legacy audit timestamp invalid"
+                        ) from exc
+                    legacy_semantic_reviews = verified_first_party_semantic_review_passes(
+                        semantic_binding, repository=repository, root=first_party_root,
+                        signers=signers, root_owned_signers=root_owned_signers,
+                        now_unix=now_unix, axes_to_review=tuple(axes),
+                        legacy_seal_cutoff_unix=seal_cutoff,
+                    )
+                legacy = legacy_semantic_reviews.get(axis)
+                if not isinstance(legacy, dict) or ref != {
+                    **expected_ref,
+                    "source_reads_sha256": legacy["provenance"]["source_reads_sha256"],
+                }:
+                    raise ReviewExecutionRejected(
+                        "direct first-party audit proof differs from signed records"
+                    )
         return
     signer = _allowed_signers(signers, root_owned=root_owned_signers)
     if repository is None:

@@ -2097,6 +2097,76 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
             "A late read in the submission second must not rewrite signed provenance",
         )
 
+    def test_legacy_signed_axis_includes_read_added_before_audit_seal(self) -> None:
+        """Already sealed legacy hashes preserve reads between submit and seal.
+
+        A later read must not invalidate the original receipt, and all signed
+        receipts must still undergo integrity verification.
+        """
+        plan = self._first_party_plan()
+        started = self._start_plan(plan)
+        for number, axis in enumerate(review.REQUIRED_AXES, start=1):
+            self._submit_axis(started, axis, number)
+
+        # Authentic legacy axis envelopes did not contain sealed_read_ids.
+        session_root = self.state / "sessions" / started["review_session_id"]
+        for axis in review.REQUIRED_AXES:
+            path = session_root / "axes" / (axis + ".json")
+            signed = review._read_signed_record(
+                path, signers=self.signers, root_owned_signers=False,
+            )
+            del signed["sealed_read_ids"]
+            path.unlink()
+            review._write_signed_record(
+                path, signed, key=self.key, signers=self.signers, atomic=True,
+            )
+
+        axis = review.REQUIRED_AXES[0]
+        middle = self._read(
+            started, axis, "source", self.source_path, "head", 1, 7,
+            now_unix=self.now + 2,
+        )
+        self.assertEqual("source_read_recorded", middle["status"])
+        audit, receipts = self._seal_direct(plan)
+        self.assertEqual([], self._receipt_errors(audit, receipts))
+
+        # Reconstruct a historical pre-cutoff audit: it included all signed
+        # reads visible when the old sealer ran, including this middle read.
+        authenticated = [
+            review._read_signed_record(
+                path, signers=self.signers, root_owned_signers=False,
+            )
+            for path in sorted((session_root / "reads").glob("*.json"))
+        ]
+        original_digest = review._digest(sorted(
+            read["data_sha256"] for read in authenticated if read["axis"] == axis
+        ))
+        self.assertNotEqual(
+            original_digest, audit["review_pass_receipts"][0]["source_reads_sha256"],
+            "The regression must distinguish original legacy and timestamp-cutoff digests",
+        )
+        historical = copy.deepcopy(audit)
+        historical["review_pass_receipts"][0]["source_reads_sha256"] = original_digest
+        historical["generated_at"] = __import__("datetime").datetime.fromtimestamp(
+            self.now + 3, __import__("datetime").timezone.utc,
+        ).isoformat()
+
+        self.now += 6
+        self.assertEqual([], self._receipt_errors(historical, receipts))
+        # A verified read after historical sealing is not part of that audit.
+        later = self._read(
+            started, axis, "source", self.source_path, "head", 17, 23,
+            now_unix=self.now,
+        )
+        self.assertEqual("source_read_recorded", later["status"])
+        self.assertEqual([], self._receipt_errors(historical, receipts))
+        forged = copy.deepcopy(historical)
+        forged["review_pass_receipts"][0]["source_reads_sha256"] = "b" * 64
+        self.assertTrue(self._receipt_errors(forged, receipts))
+        stored = session_root / "reads" / (later["read_id"] + ".data")
+        stored.write_bytes(b"changed-late-signed-read")
+        self.assertTrue(self._receipt_errors(historical, receipts))
+
     def test_signed_axis_rejects_malformed_sealed_read_ids(self) -> None:
         """A valid signer cannot make invalid read-ID shapes bypass verification."""
         plan = self._first_party_plan()
