@@ -2304,6 +2304,38 @@ def _local_backup_freshness(
     start = completed.get("service_start_unix")
     end = completed.get("service_exit_unix")
     now = int(time.time())
+    same_snapshot = (
+        isinstance(source_id, str) and isinstance(journal_id, str)
+        and (source_id.startswith(journal_id) or journal_id.startswith(source_id))
+    )
+    older_restored_snapshot = False
+    # A newer *successful* backup must not revoke an earlier, still-current
+    # root-verified restore. The canonical record checks the actual root proof
+    # and binds it to the same source, repository/target and snapshot identity.
+    # Never accept a merely alleged older snapshot on source-marker text alone.
+    source_digest = server_source.get("source_record_sha256")
+    if (
+        not same_snapshot and completed.get("valid") is True
+        and server_source.get("valid") is True
+        and isinstance(source_id, str)
+        and isinstance(journal_id, str)
+        and isinstance(source_digest, str)
+        and re.fullmatch(r"[0-9a-f]{64}", source_digest) is not None
+        and type(snapshot_time) is int
+        and type(end) is int
+        and type(completed.get("snapshot_saved_at_unix")) is int
+        and 0 < snapshot_time < completed["snapshot_saved_at_unix"] <= end
+    ):
+        canonical = _canonical_server_marker()
+        root_digest = canonical.get("root_proof_sha256")
+        older_restored_snapshot = (
+            canonical.get("valid") is True
+            and canonical.get("snapshot_id") == source_id
+            and canonical.get("source_record_sha256") == source_digest
+            and canonical.get("target") == server_source.get("target")
+            and isinstance(root_digest, str)
+            and re.fullmatch(r"[0-9a-f]{64}", root_digest) is not None
+        )
     identity_bound = (
         server_source.get("valid") is True
         and server_source.get("exists") is True
@@ -2313,7 +2345,7 @@ def _local_backup_freshness(
         and re.fullmatch(r"[0-9a-f]{8,64}", source_id) is not None
         and isinstance(journal_id, str)
         and re.fullmatch(r"[0-9a-f]{8,64}", journal_id) is not None
-        and (source_id.startswith(journal_id) or journal_id.startswith(source_id))
+        and (same_snapshot or older_restored_snapshot)
         and type(snapshot_time) is int and type(snapshot_age) is int
         and type(start) is int and type(end) is int
         and 0 < start <= end <= now

@@ -15486,7 +15486,23 @@ def _captain_repository_merge_policy(
         )
         info["branch_merge_rules"] = branch_query
         if branch_errors or branch_policy is None:
-            return None, info, branch_errors or ["repository_branch_merge_policy_unavailable"]
+            # Explicit merge commits have the same CAS semantics as implicit
+            # merge selection when GitHub paywalls branch rules.
+            if not (
+                requested_method == "merge"
+                and grabowski_merge_guard._github_rules_plan_limit_error(
+                    str(branch_query.get("stderr") or "")
+                )
+            ):
+                return None, info, branch_errors or ["repository_branch_merge_policy_unavailable"]
+            branch_policy = {
+                "base_branch": base_branch,
+                "active_rules_state": "github_plan_limit_403",
+                "pull_request_allowed_methods": None,
+                "merge_queue_present": None,
+                "merge_queue_method": None,
+            }
+            info["branch_merge_rules"]["plan_limit_cas_fallback_candidate"] = True
 
     if requested_entry is not None:
         selected_method, selected_field, selected_flag = requested_entry

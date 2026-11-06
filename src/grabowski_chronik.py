@@ -28,6 +28,8 @@ TASK_CONTEXT_FIELD = "chronik_context_json"
 TRUTHY = {"1", "true", "yes", "on"}
 TERMINAL = {"completed", "failed", "cancelled", "timed_out", "signalled", "outcome_unknown"}
 HIGH_VALUE_LIFECYCLE_OPERATIONS = frozenset({"deploy", "merge", "recovery"})
+# Capture actionable terminal failures without enabling routine lifecycle logging.
+DEFAULT_CAPTURED_FAILURE_STATES = frozenset({"failed", "timed_out", "outcome_unknown"})
 ALWAYS_RETAINED_TERMINAL_EVENT_KINDS = frozenset(
     {
         "agent.run.failed",
@@ -606,7 +608,10 @@ def _archived_event_ids(path: Path) -> tuple[str, ...] | None:
 
 @contextmanager
 def _writer_compaction_lock(source_dir: Path):
-    source_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # Path.mkdir(parents=True) uses the default 0777 mode for ancestors.
+    # Provision Grabowski's audit/state parent privately before the outbox.
+    source_dir.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    source_dir.mkdir(exist_ok=True, mode=0o700)
     try:
         source_stat = source_dir.stat(follow_symlinks=False)
     except OSError as exc:
@@ -838,8 +843,12 @@ def _event_should_be_recorded(event: dict[str, Any]) -> bool:
     )
 
 
+def _record_enabled_for_state(record: dict[str, Any], state: str) -> bool:
+    return record_enabled(record) or state in DEFAULT_CAPTURED_FAILURE_STATES
+
+
 def record_task_state(record: dict[str, Any], state: str) -> dict[str, Any]:
-    if not record_enabled(record):
+    if not _record_enabled_for_state(record, state):
         return {"enabled": False, "written": False}
     event = build_event(record, state)
     if event is None or not _event_should_be_recorded(event):
@@ -852,7 +861,7 @@ def record_task_state_safely(record: dict[str, Any], state: str) -> dict[str, An
     try:
         return record_task_state(record, state)
     except Exception as exc:
-        return {"enabled": record_enabled(record), "written": False, "error": str(exc)}
+        return {"enabled": _record_enabled_for_state(record, state), "written": False, "error": str(exc)}
 
 
 def plexer_events_url(raw: str | None = None) -> str | None:

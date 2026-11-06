@@ -976,6 +976,35 @@ class CaptainLargePrMergeGuardTests(unittest.TestCase):
             self.assertEqual(evidence["local_raw_sha256"], reviewed_sha)
             self.assertTrue(evidence["canonical_hunks_match"])
 
+            signed_raw = subprocess.check_output([
+                "git", "-C", str(repo), "diff", "--no-ext-diff",
+                "--no-textconv", "--no-renames", "--ignore-submodules=none",
+                "--raw", "--abbrev=40", "-z", base, head, "--",
+            ])
+            signed_raw_sha = hashlib.sha256(signed_raw).hexdigest()
+            self.assertNotEqual(signed_raw_sha, reviewed_sha)
+            raw_proven, raw_evidence = merge_guard._merge_guard_legacy_local_review_diff_identity(
+                repo, base_sha=base, head_sha=head,
+                expected_sha256=signed_raw_sha,
+                provider_diff=provider, changed_paths=["app.py"],
+            )
+            self.assertTrue(raw_proven, raw_evidence)
+            self.assertEqual(raw_evidence["review_identity_kind"], "first-party-raw-git-metadata")
+            self.assertEqual(raw_evidence["source_raw_metadata_sha256"], signed_raw_sha)
+            self.assertTrue(raw_evidence["raw_digest_matches_review"])
+            self.assertTrue(raw_evidence["canonical_hunks_match"])
+            altered_raw_provider = provider.replace(
+                b"+    item_11 = 123", b"+    item_11 = 999",
+            )
+            self.assertNotEqual(altered_raw_provider, provider)
+            denied_raw, denied_evidence = merge_guard._merge_guard_legacy_local_review_diff_identity(
+                repo, base_sha=base, head_sha=head,
+                expected_sha256=signed_raw_sha,
+                provider_diff=altered_raw_provider, changed_paths=["app.py"],
+            )
+            self.assertFalse(denied_raw, denied_evidence)
+            self.assertEqual(denied_evidence["reason"], "canonical_hunks_mismatch")
+
             # Local Git formatting config may change after a reviewer signed
             # the immutable raw bytes; neither knob changes committed hunks.
             for setting, hostile_value in (
@@ -1048,6 +1077,15 @@ class CaptainLargePrMergeGuardTests(unittest.TestCase):
             self.assertTrue(
                 runner.receipt["local_review_diff_equivalence"]["canonical_hunks_match"]
             )
+            runner.parameters["diff_sha256"] = signed_raw_sha
+            raw_bindings, raw_errors = runner._live_bindings()
+            self.assertEqual(raw_errors, [])
+            self.assertEqual(raw_bindings["diff_sha256"], signed_raw_sha)
+            self.assertEqual(raw_bindings["diff_identity_mode"], "local-review-diff-proven-equivalent")
+            self.assertTrue(
+                runner.receipt["local_review_diff_equivalence"]["source_raw_metadata_matches_review"]
+            )
+            runner.parameters["diff_sha256"] = reviewed_sha
 
     def test_first_party_full_index_diff_requires_exact_hunks_and_bound_commits(self) -> None:
         # Authenticated first-party reviews sign --full-index Git diff bytes.
@@ -1172,6 +1210,20 @@ class CaptainLargePrMergeGuardTests(unittest.TestCase):
             self.assertFalse(evidence["base_is_ancestor"])
             self.assertEqual(evidence["common_ancestor_sha"], common)
             self.assertEqual(evidence["local_raw_sha256"], review_sha)
+            # On divergent histories BASE..HEAD metadata is not the same
+            # review scope as GitHub's merge-base...HEAD textual PR patch.
+            divergent_raw = subprocess.check_output([
+                "git", "-C", str(repo), "diff", "--no-ext-diff",
+                "--no-textconv", "--no-renames", "--ignore-submodules=none",
+                "--raw", "--abbrev=40", "-z", base, head, "--",
+            ])
+            raw_ok, raw_denied = merge_guard._merge_guard_legacy_local_review_diff_identity(
+                repo, base_sha=base, head_sha=head,
+                expected_sha256=hashlib.sha256(divergent_raw).hexdigest(),
+                provider_diff=github_diff, changed_paths=["app.py"],
+            )
+            self.assertFalse(raw_ok, raw_denied)
+            self.assertEqual(raw_denied["reason"], "source_raw_review_requires_base_ancestor")
 
             gh = _RenamePrGh(change_status="modified")
             gh.base_sha = base
