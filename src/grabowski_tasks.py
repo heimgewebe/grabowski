@@ -25,6 +25,7 @@ from typing import Any, Literal, cast, get_args
 import grabowski_fleet as fleet
 import grabowski_mcp as base
 import grabowski_chronik as chronik
+import grabowski_chronik_full_search as full_search
 import grabowski_recall as recall
 import grabowski_privileged as privileged
 import grabowski_recovery as recovery
@@ -14799,6 +14800,55 @@ def _chronik_target_selection(
         "global_history_exhaustive": False,
         "coarse_fallback_used": False,
     }
+
+
+@mcp.tool(name="grabowski_chronik_full_search", annotations=READ_ONLY)
+def grabowski_chronik_full_search(
+    event_id: str = "",
+    repo: str = "",
+    host: str = "",
+    component: str = "",
+    subject_component: str = "",
+    kind: str = "",
+    operation: str = "",
+    task_class: str = "",
+    outcome: str = "",
+    pr_number: int | None = None,
+    bureau_task_id: str = "",
+    run_id: str = "",
+    task_id: str = "",
+    since: str = "",
+    until: str = "",
+    keyword: str = "",
+    limit: int = 10,
+    cursor: str = "",
+) -> dict[str, Any]:
+    """Search the full committed Chronik ledger with exact selectors and evidence-bound pagination.
+
+    Unlike grabowski_chronik_history, this directly queries the entire ledger
+    and does not silently limit exact matches to a coarse provider window.
+    Historical evidence is never a present-state or successful-deployment claim.
+    """
+    operator._require_operator_capability("durable_job")
+    selectors = {
+        "event_id": event_id, "repo": repo, "host": host,
+        "component": component, "subject_component": subject_component,
+        "kind": kind, "operation": operation, "task_class": task_class,
+        "outcome": outcome, "pr_number": pr_number,
+        "bureau_task_id": bureau_task_id, "run_id": run_id, "task_id": task_id,
+        "since": since, "until": until, "keyword": keyword,
+    }
+    selectors = {name: None if value == "" else value for name, value in selectors.items()}
+    return full_search.query(
+        selectors=selectors,
+        limit=limit,
+        cursor=cursor or None,
+        configuration=chronik.coding_memory_configuration(),
+        executor=lambda argv, cwd: operator._run(
+            argv, cwd=cwd, timeout_seconds=CHRONIK_CLI_TIMEOUT_SECONDS,
+            max_output_bytes=CHRONIK_CLI_MAX_OUTPUT_BYTES,
+        ),
+    )
 
 
 @mcp.tool(name="grabowski_chronik_history", annotations=READ_ONLY)
