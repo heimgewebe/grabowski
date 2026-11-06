@@ -1969,7 +1969,9 @@ def _load_first_party_axes(
             record.get("issuer"), expected_tool=FIRST_PARTY_TOOL_SUBMIT,
         )
         if (
-            set(record) != {
+            # Old signed axis records remain readable. New records bind the
+            # precise read set under the same lock as the signed submission.
+            set(record) - {"sealed_read_ids"} != {
                 "schema_version", "kind", "session_id", "binding_sha256",
                 "axis", "report", "report_sha256", "issuer", "submitted_at_unix",
             }
@@ -1987,6 +1989,24 @@ def _load_first_party_axes(
         ):
             raise ReviewExecutionRejected("first-party axis receipt invalid or replayed")
         request_ids.add(issuer["request_id"])
+        if "sealed_read_ids" in record:
+            sealed = record["sealed_read_ids"]
+            axis_reads = {item["read_id"]: item for item in reads if item["axis"] == axis}
+            if (
+                not isinstance(sealed, list)
+                or any(
+                    not isinstance(read_id, str)
+                    or FIRST_PARTY_READ_ID_RE.fullmatch(read_id) is None
+                    for read_id in sealed
+                )
+                or sealed != sorted(set(sealed))
+                or any(
+                    read_id not in axis_reads
+                    or axis_reads[read_id]["observed_at_unix"] > record["submitted_at_unix"]
+                    for read_id in sealed
+                )
+            ):
+                raise ReviewExecutionRejected("first-party sealed axis reads invalid")
         report = _validate_first_party_report(
             record["report"], axis=axis, reads=reads,
             binding=session["binding"], prior_observations=observations,
@@ -2366,6 +2386,9 @@ def submit_first_party_axis_review(
             "session_id": session_id, "binding_sha256": session["binding_sha256"],
             "axis": axis, "report": normalized, "report_sha256": _digest(normalized),
             "issuer": authenticated, "submitted_at_unix": submitted_at,
+            # Exact under-lock snapshot. Unix-second timestamps alone cannot
+            # distinguish a read made before vs. after this signed submission.
+            "sealed_read_ids": sorted(item["read_id"] for item in reads if item["axis"] == axis),
         }
         axis_path = session_root / "axes" / (axis + ".json")
         if axis_path.exists():
@@ -2549,6 +2572,10 @@ def verified_first_party_semantic_review_passes(
             "n": sequence, "axis": axis, "summary": report["summary"],
             "evidence_refs": report["evidence_refs"], "material_findings": 0,
         }
+        sealed_ids = (
+            set(record["sealed_read_ids"]) if "sealed_read_ids" in record
+            else None  # Legacy signed records retain their timestamp cutoff.
+        )
         accepted[axis] = {
             "phase": phase,
             "provenance_kind": "first_party_authenticated_controller",
@@ -2564,7 +2591,10 @@ def verified_first_party_semantic_review_passes(
                 "source_reads_sha256": _digest(sorted(
                     item["data_sha256"] for item in reads
                     if item["axis"] == axis
-                    and item["observed_at_unix"] <= record["submitted_at_unix"]
+                    and (
+                        item["read_id"] in sealed_ids if sealed_ids is not None
+                        else item["observed_at_unix"] <= record["submitted_at_unix"]
+                    )
                 )),
                 "canonical_diff_sha256": session["canonical_diff_sha256"],
             },

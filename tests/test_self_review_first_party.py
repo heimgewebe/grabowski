@@ -2078,6 +2078,54 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
         stored.write_bytes(b"corrupted-late-read")
         self.assertTrue(self._receipt_errors(audit, receipts))
 
+    def test_same_second_late_read_does_not_rewrite_sealed_axis_provenance(self) -> None:
+        """Even a signed late read recorded in the submission second is later."""
+        plan = self._first_party_plan()
+        started = self._start_plan(plan)
+        for number, axis in enumerate(review.REQUIRED_AXES, start=1):
+            self._submit_axis(started, axis, number)
+        audit, receipts = self._seal_direct(plan)
+        self.assertEqual([], self._receipt_errors(audit, receipts))
+        axis = review.REQUIRED_AXES[0]
+        late = self._read(
+            started, axis, "source", self.source_path, "head", 1, 7,
+            now_unix=self.now,
+        )
+        self.assertEqual("source_read_recorded", late["status"])
+        self.assertEqual(
+            [], self._receipt_errors(audit, receipts),
+            "A late read in the submission second must not rewrite signed provenance",
+        )
+
+    def test_signed_axis_rejects_malformed_sealed_read_ids(self) -> None:
+        """A valid signer cannot make invalid read-ID shapes bypass verification."""
+        plan = self._first_party_plan()
+        started = self._start_plan(plan)
+        for number, axis in enumerate(review.REQUIRED_AXES, start=1):
+            self._submit_axis(started, axis, number)
+        audit, receipts = self._seal_direct(plan)
+        self.assertEqual([], self._receipt_errors(audit, receipts))
+        axis = review.REQUIRED_AXES[0]
+        path = (
+            self.state / "sessions" / started["review_session_id"] /
+            "axes" / (axis + ".json")
+        )
+        signed = review._read_signed_record(
+            path, signers=self.signers, root_owned_signers=False,
+        )
+        signed["sealed_read_ids"] = [["not-a-read-id"]]
+        path.unlink()  # Axis uses the atomic signed JSON envelope, no .sig sidecar.
+        review._write_signed_record(
+            path, signed, key=self.key, signers=self.signers, atomic=True,
+        )
+        with self.assertRaisesRegex(
+            review.ReviewExecutionRejected, "sealed axis reads invalid",
+        ):
+            review.verified_first_party_semantic_review_passes(
+                plan["binding"], repository=self.repo, root=self.state,
+                signers=self.signers, root_owned_signers=False,
+            )
+
     def test_forged_repo_is_rejected_even_when_another_test_mocks_public_verifier(self) -> None:
         """Exercise the real cryptographic verifier despite prior gate fixture mocks."""
         plan = self._first_party_plan()
