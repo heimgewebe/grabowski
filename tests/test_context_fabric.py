@@ -172,9 +172,17 @@ class PlanTests(ContextFabricTestCase):
         recall = plan["historical_recall"]
         self.assertEqual(
             recall["recommended_tool"],
+            "grabowski_chronik_full_search",
+        )
+        self.assertEqual(
+            recall["bounded_summary_tool"],
             "grabowski_operator_historical_recall",
         )
         self.assertEqual(recall["provider_source_tool"], "grabowski_chronik_history")
+        self.assertIn(
+            "full_search_zero_means_no_record_in_snapshot_not_no_work",
+            recall["requirements"],
+        )
         self.assertEqual(recall["requirement"], "conditional")
         self.assertEqual(recall["mode"], "selective_advisory")
         self.assertIn("re_reviewing_or_retrying_bound_pr", recall["read_when"])
@@ -185,7 +193,14 @@ class PlanTests(ContextFabricTestCase):
         self.assertEqual(selection["selector_kind"], "pull_request")
         self.assertEqual(
             selection["selector"],
+            {"subject_component": "grabowski", "pr_number": PR_BINDING["pull_request"]},
+        )
+        self.assertEqual(
+            selection["bounded_summary_selector"],
             {"repo": "heimgewebe/grabowski", "pr_number": PR_BINDING["pull_request"]},
+        )
+        self.assertEqual(
+            selection["project_component_source"], "repository_basename_heuristic"
         )
         self.assertEqual(selection["selector_source"], "derived_from_profile_binding")
         self.assertTrue(selection["exact_target_binding"])
@@ -204,6 +219,23 @@ class PlanTests(ContextFabricTestCase):
         )
         self.assertEqual(chronik_source["requirement"], "optional")
         self.assertEqual(chronik_source["temporal_marker"], "historical")
+
+    def test_pr_full_search_selects_actual_project_not_producer_repo(self) -> None:
+        binding = dict(PR_BINDING)
+        binding["repository"] = "heimgewebe/commonthing"
+        binding["pull_request"] = 1977
+        plan = self.module.plan_context("pr", binding)
+        recall = plan["historical_recall"]
+        self.assertTrue(recall["target_selection"]["read_eligible"])
+        self.assertEqual(
+            recall["target_selection"]["selector"],
+            {"subject_component": "commonthing", "pr_number": 1977},
+        )
+        self.assertEqual(
+            recall["target_selection"]["bounded_summary_selector"],
+            {"repo": "heimgewebe/commonthing", "pr_number": 1977},
+        )
+        self.assertEqual(recall["recommended_tool"], "grabowski_chronik_full_search")
 
     def test_historical_recall_plan_is_ineligible_until_binding_is_complete(self) -> None:
         plan = self.module.plan_context("pr", {"repository": "heimgewebe/grabowski"})
