@@ -950,5 +950,125 @@ class PlexerFlushTests(unittest.TestCase):
         self.assertEqual(len(path.read_text(encoding="utf-8").splitlines()), 1)
 
 
+class ChronikKnowledgeCaptureTests(unittest.TestCase):
+    setUp = ChronikAgentOutboxTests.setUp
+    tearDown = ChronikAgentOutboxTests.tearDown
+    enable = ChronikAgentOutboxTests.enable
+
+    def test_high_value_task_queues_knowledge_idempotently(self):
+        self.enable()
+        value = record(
+            task_id="e" * 24, unit="grabowski-task-" + "e" * 24 + "-a1.service",
+            argv=["private-command", "password=never-log-me"],
+            cwd="/home/private/undisclosed",
+            chronik_context_json={
+                "subject_scope": "repository", "repo": "heimgewebe/commonthing",
+                "operation": "deploy", "task_class": "deploy", "pr_number": 2070,
+            },
+        )
+        missing = chronik.terminal_knowledge_capture_status(value, "completed")
+        self.assertEqual(missing["classification"], "capture_missing")
+        first = chronik.record_task_state_safely(value, "completed")
+        retry = chronik.record_task_state_safely(value, "completed")
+        self.assertEqual(first["knowledge_capture"]["classification"], "queued_unverified")
+        self.assertFalse(first["knowledge_capture"]["ledger_verified"])
+        self.assertTrue(first["knowledge_capture"]["new"])
+        self.assertFalse(retry["knowledge_capture"]["new"])
+        path = (self.root / "grabowski" / "chronik-outbox" / "knowledge" /
+                (first["knowledge_capture"]["event_id"][7:] + ".json"))
+        knowledge = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(knowledge["knowledge_type"], "operation")
+        self.assertEqual(knowledge["epistemic_status"], "observed")
+        self.assertEqual(knowledge["source"]["system"], "heimgewebe/grabowski")
+        self.assertEqual(knowledge["subject"]["repo"], "heimgewebe/commonthing")
+        self.assertEqual(knowledge["subject"]["pr_number"], 2070)
+        self.assertEqual(knowledge["evidence_refs"], ["grabowski-task:" + "e"*24])
+        self.assertNotIn("private-command", path.read_text(encoding="utf-8"))
+        self.assertNotIn("password=", path.read_text(encoding="utf-8"))
+        self.assertNotIn("undisclosed", path.read_text(encoding="utf-8"))
+
+    def test_trivial_and_nonterminal_tasks_are_not_knowledge(self):
+        self.enable()
+        context = {"subject_scope": "host", "host": "heim-pc",
+                   "operation": "other", "task_class": "other"}
+        value = record(chronik_context_json=context)
+        self.assertEqual(
+            chronik.terminal_knowledge_capture_status(value, "completed")["classification"],
+            "not_required",
+        )
+        self.assertNotIn("knowledge_capture", chronik.record_task_state_safely(value, "completed"))
+        high = record(chronik_context_json={**context, "operation": "merge"})
+        self.assertEqual(chronik.capture_terminal_knowledge(high, "running")["classification"],
+                         "not_required")
+        self.assertEqual(list(self.root.rglob("knowledge/*.json")), [])
+
+    def test_missing_and_invalid_capture_are_detectable(self):
+        self.enable()
+        value = record(chronik_context_json={
+            "subject_scope": "host", "host": "heim-pc",
+            "operation": "recovery", "task_class": "recovery",
+        })
+        self.assertEqual(chronik.terminal_knowledge_capture_status(
+            value, "failed")["classification"], "capture_missing")
+        captured = chronik.capture_terminal_knowledge(value, "failed")
+        self.assertEqual(captured["classification"], "queued_unverified")
+        path = (self.root / "grabowski" / "chronik-outbox" / "knowledge" /
+                (captured["event_id"][7:] + ".json"))
+        path.write_text('{"invalid":true}\n', encoding="utf-8")
+        self.assertEqual(chronik.terminal_knowledge_capture_status(
+            value, "failed")["classification"], "capture_invalid")
+        result = chronik.record_task_state_safely(value, "failed")
+        self.assertEqual(result["knowledge_capture"]["classification"],
+                         "capture_missing_or_invalid")
+
+    def test_outbox_disk_failure_does_not_stop_task_terminalization(self):
+        occupied = self.root / "occupied"
+        occupied.write_text("block all writes", encoding="utf-8")
+        os.environ[chronik.STATE_ROOT_ENV] = str(occupied)
+        value = record(chronik_context_json={
+            "subject_scope": "host", "host": "heim-pc",
+            "operation": "deploy", "task_class": "deploy",
+        })
+        result = chronik.record_task_state_safely(value, "completed")
+        self.assertFalse(result["written"])
+        self.assertEqual(result["knowledge_capture"]["classification"],
+                         "capture_missing_or_invalid")
+        self.assertFalse(result["knowledge_capture"]["ledger_verified"])
+
+
+    def test_task_status_exposes_missing_and_queued_capture(self):
+        from test_tasks import tasks
+
+        self.enable()
+        task_id = "f" * 24
+        value = record(
+            task_id=task_id, state="completed",
+            chronik_context_json={
+                "subject_scope": "host", "host": "heim-pc",
+                "operation": "recovery", "task_class": "recovery",
+            },
+        )
+        with (
+            patch.object(tasks.operator, "_require_operator_mutation", return_value=None),
+            patch.object(tasks, "_task_row_after_scope_snapshot", return_value=value),
+            patch.object(tasks, "_observe", return_value={"state": "completed"}),
+            patch.object(tasks, "_effective_observed_state", return_value="completed"),
+            patch.object(tasks, "_maintain_record_resources", return_value=None),
+            patch.object(tasks, "_set_state", return_value=value),
+            patch.object(tasks, "_public", return_value={"task_id": task_id, "state": "completed"}),
+            patch("grabowski_task_attention.terminal_closeout_plan", return_value={}),
+        ):
+            status = tasks._task_status_after_mutation_guard.__wrapped__(task_id, {})
+            self.assertEqual(
+                status["chronik_knowledge_capture"]["classification"], "capture_missing"
+            )
+            chronik.capture_terminal_knowledge(value, "completed")
+            status = tasks._task_status_after_mutation_guard.__wrapped__(task_id, {})
+            self.assertEqual(
+                status["chronik_knowledge_capture"]["classification"], "queued_unverified"
+            )
+            self.assertFalse(status["chronik_knowledge_capture"]["ledger_verified"])
+
+
 if __name__ == "__main__":
     unittest.main()
