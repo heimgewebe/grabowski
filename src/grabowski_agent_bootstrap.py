@@ -28,6 +28,7 @@ IMMUTABLE_BOUNDARIES = (
 )
 
 ENTRY_SEQUENCE = (
+    "read_chronik_history_for_explicit_target_if_available",
     "read_live_runtime_and_connector_snapshot",
     "read_repository_head_dirty_state_and_leases",
     "classify_one_next_operation",
@@ -46,8 +47,8 @@ HISTORICAL_RECALL = {
     "tool": "grabowski_operator_historical_recall",
     "exact_search_tool": "grabowski_chronik_full_search",
     "exact_search_selectors": ["pr_number", "bureau_task_id", "run_id", "task_id", "event_id"],
-    "mode": "selective_before_execution",
-    "trigger_profiles": ["pr", "bureau", "deployment"],
+    "mode": "target_first_fail_open_then_selective_patterns",
+    "trigger_profiles": ["repository", "service_status", "failure_continuation", "pr", "bureau", "deployment"],
     "trigger_signals": [
         "retry",
         "recovery",
@@ -55,12 +56,9 @@ HISTORICAL_RECALL = {
         "re_review",
         "repeat_deploy",
     ],
-    "skip_for": [
-        "trivial_read",
-        "status_only_without_repeat_signal",
-        "one_off_discovery_without_repeat_signal",
-    ],
+    "skip_for": ["unbound_nonproject_task", "trivial_read_without_relevant_target"],
     "selection_order": [
+        "read_chronik_first_for_explicit_target_before_live_interpretation",
         "bind_target_from_fresh_live_context",
         "prefer_full_search_for_exact_or_cross_project_history",
         "filter_host_scoped_project_events_by_subject_component_not_source_repo",
@@ -70,7 +68,8 @@ HISTORICAL_RECALL = {
         "continue_from_fresh_live_truth",
     ],
     "requirements": [
-        "fresh_live_truth_precedes_history",
+        "bound_chronik_first_precedes_live_status_interpretation",
+        "fresh_live_truth_precedes_every_effect",
         "history_must_be_evidence_bound",
         "history_must_remain_historical_only",
         "full_search_cursors_are_bound_to_snapshot_and_must_restart_when_stale",
@@ -222,6 +221,96 @@ def call_shape_check(
     return result
 
 
+
+def _chronik_first_context(
+    *, repo: str = "", host: str = "", subject_component: str = "",
+    pr_number: int | None = None, search_fn: Any = None,
+) -> dict[str, Any]:
+    """Read bounded validated historical evidence for a known Heimgewebe target."""
+    targets = {"repo": repo, "host": host, "subject_component": subject_component}
+    filters: dict[str, Any] = {}
+    for key, value in targets.items():
+        if not isinstance(value, str) or len(value) > 160 or "\x00" in value:
+            raise ValueError(f"invalid Chronik target {key}")
+        if value:
+            filters[key] = value
+    if pr_number is not None:
+        if type(pr_number) is not int or not 1 <= pr_number <= 2_147_483_647:
+            raise ValueError("invalid Chronik PR number")
+        if not repo and not subject_component:
+            raise ValueError("Chronik PR number needs repository/component binding")
+        filters["pr_number"] = pr_number
+    base = {
+        "schema_version": 1,
+        "historical_only": True,
+        "authority": "chronik_advisory_historical_evidence",
+        "filters": filters,
+        "does_not_establish": [
+            "current_git_ci_or_runtime_state", "safe_retry",
+            "merge_or_deployment_authority", "task_completion",
+        ],
+    }
+    if not filters:
+        return {**base, "status": "skipped_unbound_target", "events": []}
+    try:
+        if search_fn is None:
+            from grabowski_tasks import grabowski_chronik_full_search
+            search_fn = grabowski_chronik_full_search
+        result = search_fn(**filters, limit=10)
+    except Exception as exc:
+        return {
+            **base, "status": "historical_context_unavailable",
+            "failure_code": type(exc).__name__, "events": [],
+        }
+    if not isinstance(result, dict) or result.get("available") is not True:
+        return {
+            **base, "status": "historical_context_unavailable",
+            "failure_code": (
+                result.get("failure_code", "provider_unavailable")
+                if isinstance(result, dict) else "invalid_provider_result"
+            ),
+            "events": [],
+        }
+    snapshot = result.get("ledger_snapshot")
+    if (
+        result.get("historical_only") is not True
+        or result.get("search_exhaustive") is not True
+        or not isinstance(snapshot, dict)
+        or snapshot.get("integrity_valid") is not True
+        or snapshot.get("invalid_record_count") != 0
+    ):
+        return {
+            **base, "status": "historical_context_unavailable",
+            "failure_code": "historical_evidence_not_verified", "events": [],
+        }
+    compact: list[dict[str, Any]] = []
+    for item in (result.get("events") or [])[:10]:
+        if not isinstance(item, dict) or not isinstance(item.get("event"), dict):
+            continue
+        event = item["event"]
+        data = event.get("data") if isinstance(event.get("data"), dict) else {}
+        source = event.get("source") if isinstance(event.get("source"), dict) else {}
+        refs = event.get("evidence_refs")
+        compact.append({
+            "event_ref": item.get("event_ref"),
+            "canonical_event_sha256": item.get("canonical_event_sha256"),
+            "observed_at": event.get("ts"),
+            "kind": event.get("kind"),
+            "operation": data.get("operation"),
+            "outcome": data.get("result"),
+            "task_class": data.get("task_class"),
+            "source_run_id": source.get("run_id"),
+            "evidence_refs": refs[:4] if isinstance(refs, list) else [],
+        })
+    return {
+        **base, "status": "available", "events": compact,
+        "matching_count": result.get("matching_count"),
+        "has_more": result.get("has_more"),
+        "snapshot_sha256": snapshot.get("sha256"),
+        "result_sha256": result.get("result_sha256"),
+    }
+
+
 def _workspace_metrics_snapshot(limit: int) -> dict[str, Any]:
     """Defer heavyweight workspace observation from the synchronous entry capsule.
 
@@ -258,7 +347,7 @@ def _workspace_metrics_snapshot(limit: int) -> dict[str, Any]:
     return {**body, "snapshot_sha256": _stable_sha256(body)}
 
 
-def agent_bootstrap(*, friction_limit: int = 100, outcome_limit: int = 200) -> dict[str, Any]:
+def agent_bootstrap(*, friction_limit: int = 100, outcome_limit: int = 200, repo: str = "", host: str = "", subject_component: str = "", pr_number: int | None = None) -> dict[str, Any]:
     if isinstance(friction_limit, bool) or not isinstance(friction_limit, int):
         raise ValueError("friction_limit must be an integer")
     if isinstance(outcome_limit, bool) or not isinstance(outcome_limit, int):
@@ -268,6 +357,7 @@ def agent_bootstrap(*, friction_limit: int = 100, outcome_limit: int = 200) -> d
     if not 1 <= outcome_limit <= 1000:
         raise ValueError("outcome_limit must be between 1 and 1000")
 
+    chronik_first = _chronik_first_context(repo=repo, host=host, subject_component=subject_component, pr_number=pr_number)
     friction = grabowski_friction.friction_summary(limit=friction_limit)
     governor = grabowski_friction.execution_governor_summary(limit=outcome_limit)
     workspace_metrics = _workspace_metrics_snapshot(
@@ -308,6 +398,7 @@ def agent_bootstrap(*, friction_limit: int = 100, outcome_limit: int = 200) -> d
         "adaptive_mode": "shadow" if adaptive_enabled else "disabled_fail_closed",
         "automatic_live_routing_enabled": False,
         "entry_sequence": list(ENTRY_SEQUENCE),
+        "chronik_first": chronik_first,
         "adler_sidecar": ADLER_SIDECAR,
         "historical_recall": HISTORICAL_RECALL,
         "reuse_before_build": REUSE_BEFORE_BUILD,
@@ -413,9 +504,9 @@ def agent_bootstrap(*, friction_limit: int = 100, outcome_limit: int = 200) -> d
 
 
 @mcp.tool(name="grabowski_agent_bootstrap", annotations=READ_ONLY)
-def grabowski_agent_bootstrap(friction_limit: int = 100, outcome_limit: int = 200) -> dict[str, Any]:
+def grabowski_agent_bootstrap(friction_limit: int = 100, outcome_limit: int = 200, repo: str = "", host: str = "", subject_component: str = "", pr_number: int | None = None) -> dict[str, Any]:
     """Return a bounded adaptive agent entry capsule for the current runtime evidence."""
-    return agent_bootstrap(friction_limit=friction_limit, outcome_limit=outcome_limit)
+    return agent_bootstrap(friction_limit=friction_limit, outcome_limit=outcome_limit, repo=repo, host=host, subject_component=subject_component, pr_number=pr_number)
 
 
 @mcp.tool(name="grabowski_call_shape_check", annotations=READ_ONLY)

@@ -319,19 +319,13 @@ class AgentBootstrapTests(unittest.TestCase):
             "missing_record_is_not_evidence_that_work_never_occurred",
             policy["requirements"],
         )
-        self.assertEqual(policy["mode"], "selective_before_execution")
-        self.assertEqual(policy["trigger_profiles"], ["pr", "bureau", "deployment"])
+        self.assertEqual(policy["mode"], "target_first_fail_open_then_selective_patterns")
+        self.assertIn("service_status", policy["trigger_profiles"])
         self.assertIn("recovery", policy["trigger_signals"])
         self.assertIn("repeated_failure", policy["trigger_signals"])
-        self.assertEqual(
-            policy["skip_for"],
-            [
-                "trivial_read",
-                "status_only_without_repeat_signal",
-                "one_off_discovery_without_repeat_signal",
-            ],
-        )
-        self.assertIn("fresh_live_truth_precedes_history", policy["requirements"])
+        self.assertIn("unbound_nonproject_task", policy["skip_for"])
+        self.assertNotIn("status_only_without_repeat_signal", policy["skip_for"])
+        self.assertIn("fresh_live_truth_precedes_every_effect", policy["requirements"])
         self.assertIn(
             "fresh_owning_authority_must_be_rechecked_before_effect",
             policy["requirements"],
@@ -370,7 +364,7 @@ class AgentBootstrapTests(unittest.TestCase):
     def test_reuse_before_build_orders_discovery_before_new_infrastructure(self) -> None:
         module = self.load_module()
         self.assertEqual(
-            module.ENTRY_SEQUENCE[3],
+            module.ENTRY_SEQUENCE[4],
             "discover_existing_capability_or_route",
         )
         policy = module.REUSE_BEFORE_BUILD
@@ -458,6 +452,101 @@ class AgentBootstrapTests(unittest.TestCase):
         self.assertEqual(contract["failure_semantics"], "local_reversible_work_may_continue")
         self.assertIn("read_adler_inbox_if_present", module.ENTRY_SEQUENCE)
         self.assertIn("blocking_authority", contract["does_not_establish"])
+
+    def test_chronik_first_returns_historical_receipt_for_exact_repository(self) -> None:
+        module = self.load_module()
+        calls = []
+        def search(**kwargs):
+            calls.append(kwargs)
+            return {
+                "available": True, "historical_only": True,
+                "search_exhaustive": True, "matching_count": 1, "has_more": False,
+                "result_sha256": "d" * 64,
+                "ledger_snapshot": {
+                    "integrity_valid": True, "invalid_record_count": 0,
+                    "sha256": "c" * 64,
+                },
+                "events": [{
+                    "event_ref": "chronik:agent.ledger:sha256:" + "a" * 64,
+                    "canonical_event_sha256": "b" * 64,
+                    "event": {
+                        "ts": "2026-11-07T12:00:00Z", "kind": "agent.run.failed",
+                        "data": {"result": "failed", "operation": "review", "task_class": "review"},
+                        "source": {"run_id": "task-123"},
+                        "evidence_refs": ["grabowski-task:123"],
+                        "private_payload": "MUST_NOT_LEAK",
+                    },
+                }],
+            }
+        context = module._chronik_first_context(
+            repo="heimgewebe/grabowski", search_fn=search,
+        )
+        self.assertEqual(calls, [{"repo": "heimgewebe/grabowski", "limit": 10}])
+        self.assertEqual(context["status"], "available")
+        self.assertEqual(context["events"][0]["outcome"], "failed")
+        self.assertNotIn("private_payload", str(context))
+        self.assertNotIn("MUST_NOT_LEAK", str(context))
+        self.assertEqual(context["snapshot_sha256"], "c" * 64)
+        self.assertTrue(context["historical_only"])
+
+    def test_chronik_first_supports_host_component_and_exact_pr(self) -> None:
+        module = self.load_module()
+        calls = []
+        def search(**kwargs):
+            calls.append(kwargs)
+            return {
+                "available": True, "historical_only": True,
+                "search_exhaustive": True, "matching_count": 0,
+                "has_more": False, "events": [],
+                "ledger_snapshot": {"integrity_valid": True, "invalid_record_count": 0},
+            }
+        host = module._chronik_first_context(
+            host="heim-pc", subject_component="rustdesk", search_fn=search,
+        )
+        pr = module._chronik_first_context(
+            repo="heimgewebe/grabowski", pr_number=1724, search_fn=search,
+        )
+        self.assertEqual(host["status"], "available")
+        self.assertEqual(pr["status"], "available")
+        self.assertEqual(calls[0], {"host": "heim-pc", "subject_component": "rustdesk", "limit": 10})
+        self.assertEqual(calls[1], {"repo": "heimgewebe/grabowski", "pr_number": 1724, "limit": 10})
+
+    def test_chronik_first_skips_unbound_nonproject_work(self) -> None:
+        module = self.load_module()
+        def no_search(**kwargs):
+            self.fail("unbound target triggered Chronik")
+        result = module._chronik_first_context(search_fn=no_search)
+        self.assertEqual(result["status"], "skipped_unbound_target")
+        self.assertEqual(result["events"], [])
+
+    def test_chronik_first_failure_is_nonblocking_and_explicit(self) -> None:
+        module = self.load_module()
+        def unavailable(**kwargs):
+            raise TimeoutError("simulated unavailable Chronik")
+        context = module._chronik_first_context(
+            repo="heimgewebe/grabowski", search_fn=unavailable,
+        )
+        self.assertEqual(context["status"], "historical_context_unavailable")
+        self.assertEqual(context["failure_code"], "TimeoutError")
+        self.assertEqual(context["events"], [])
+
+    def test_chronik_first_invoked_before_live_bootstrap_for_target(self) -> None:
+        module = self.load_module()
+        self.assertEqual(
+            module.ENTRY_SEQUENCE[0],
+            "read_chronik_history_for_explicit_target_if_available",
+        )
+        prior = module._chronik_first_context
+        observations = []
+        try:
+            module._chronik_first_context = lambda **kwargs: (
+                observations.append(kwargs) or {"status": "historical_context_unavailable"}
+            )
+            result = module.agent_bootstrap(repo="heimgewebe/grabowski")
+            self.assertEqual(observations[0]["repo"], "heimgewebe/grabowski")
+            self.assertEqual(result["chronik_first"]["status"], "historical_context_unavailable")
+        finally:
+            module._chronik_first_context = prior
 
 
 if __name__ == "__main__":
