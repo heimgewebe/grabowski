@@ -87,6 +87,19 @@ def _protected_job_retention_authority() -> bool:
     return False
 
 
+def _protected_retention_receipt_authority() -> bool:
+    """No independently protected receipt reservation/commit transaction exists.
+
+    A same-UID writer can fill the receipt temp budget AFTER preflight but
+    BEFORE final publication, even if the scanned directory FD is pinned.
+    Without an OS-protected transaction the completed systemd effect could
+    lack its terminal receipt. Do not make this a mutable environment switch.
+    Job and task/worker effects must fail closed until protected authority
+    is implemented and proven independently.
+    """
+    return False
+
+
 def _canonical_json(value: Any) -> bytes:
     return json.dumps(
         value,
@@ -513,6 +526,10 @@ def _failed_units(*, job_authority: bool = True) -> list[str]:
         fields = line.split()
         if fields:
             unit = fields[0]
+            # A failed periodic producer is never an independently resettable
+            # job, task or worker, even with future protected job authority.
+            if unit == "grabowski-runtime-retention.service":
+                continue
             # Never accept a job returned despite the restricted pattern.
             if not job_authority and JOB_UNIT.fullmatch(unit):
                 continue
@@ -1314,7 +1331,10 @@ def build_plan(
     planned_jobs_root_identity = (root_stat.st_dev, root_stat.st_ino)
     jobs_root = _private_directory(jobs_root)
     _archive_require_unchanged_root(jobs_root, pinned.jobs_fd)
-    authorized_job_effects = _protected_job_retention_authority()
+    authorized_receipt_effects = _protected_retention_receipt_authority()
+    authorized_job_effects = (
+        _protected_job_retention_authority() and authorized_receipt_effects
+    )
     if receipt_root.is_symlink() or (
         authorized_job_effects and archive_root.is_symlink()
     ):
@@ -1607,6 +1627,9 @@ def build_plan(
             reset_units.append(unit)
             continue
         if TASK_UNIT.fullmatch(unit):
+            if not authorized_receipt_effects:
+                block(unit, "automatic task reset requires protected receipt authority")
+                continue
             state = _task_state(unit, task_db)
             if state in TERMINAL_TASK_STATES:
                 reset_units.append(unit)
@@ -1614,6 +1637,9 @@ def build_plan(
                 block(unit, f"task state is not proven terminal: {state}")
             continue
         if WORKER_UNIT.fullmatch(unit):
+            if not authorized_receipt_effects:
+                block(unit, "automatic worker reset requires protected receipt authority")
+                continue
             try:
                 evidence = _worker_reset_evidence(
                     unit,
@@ -1985,20 +2011,31 @@ def _archive_require_json_temp_capacity(
     prefix = f".{target_basename}." if target_basename is not None else None
     retained_temps = 0
     scanned_entries = 0
-    with os.scandir(directory_fd) as entries:
-        for entry in entries:
-            if prefix is not None and not entry.name.startswith(prefix):
-                continue
-            scanned_entries += 1
-            if prefix is None and scanned_entries > MAX_JOB_REGISTRY_ENTRIES:
-                raise RuntimeError("retained atomic temp scan bound exceeded")
-            if re.fullmatch(
-                r"\..+\.[1-9][0-9]{0,11}\.[1-9][0-9]{0,19}\.tmp",
-                entry.name,
-            ):
-                retained_temps += 1
-                if retained_temps >= MAX_RETAINED_JSON_TEMPS:
-                    raise RuntimeError("retained atomic temp bound exceeded")
+    # A caller may have advanced the pinned directory FD cursor while
+    # selecting the receipt. Reopen its current directory inode via "." to
+    # obtain an independent cursor; otherwise preflight can miss retained
+    # temps and allow a reset before the eventual receipt write fails.
+    scan_fd = os.open(
+        ".", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        dir_fd=directory_fd,
+    )
+    try:
+        with os.scandir(scan_fd) as entries:
+            for entry in entries:
+                if prefix is not None and not entry.name.startswith(prefix):
+                    continue
+                scanned_entries += 1
+                if prefix is None and scanned_entries > MAX_JOB_REGISTRY_ENTRIES:
+                    raise RuntimeError("retained atomic temp scan bound exceeded")
+                if re.fullmatch(
+                    r"\..+\.[1-9][0-9]{0,11}\.[1-9][0-9]{0,19}\.tmp",
+                    entry.name,
+                ):
+                    retained_temps += 1
+                    if retained_temps >= MAX_RETAINED_JSON_TEMPS:
+                        raise RuntimeError("retained atomic temp bound exceeded")
+    finally:
+        os.close(scan_fd)
 
 
 def _archive_restore_exchanged_target(
@@ -3123,6 +3160,12 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
     ) and not _protected_job_retention_authority():
         raise RuntimeError(
             "automatic job archive/reset requires protected root/index authority"
+        )
+    if (
+        plan["archive_jobs"] or plan["reset_failed_units"]
+    ) and not _protected_retention_receipt_authority():
+        raise RuntimeError(
+            "automatic retention effects require protected receipt publication authority"
         )
     source = str(SRC)
     if source not in sys.path:
