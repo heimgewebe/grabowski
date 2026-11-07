@@ -201,7 +201,8 @@ PROFILES: dict[str, dict[str, Any]] = {
 }
 
 HISTORICAL_RECALL_POLICY: dict[str, Any] = {
-    "recommended_tool": "grabowski_operator_historical_recall",
+    "recommended_tool": "grabowski_chronik_full_search",
+    "bounded_summary_tool": "grabowski_operator_historical_recall",
     "provider_source_tool": "grabowski_chronik_history",
     "requirement": "conditional",
     "mode": "selective_advisory",
@@ -213,6 +214,8 @@ HISTORICAL_RECALL_POLICY: dict[str, Any] = {
     "requirements": (
         "fresh_live_authority_first",
         "history_must_be_evidence_bound",
+        "full_search_zero_means_no_record_in_snapshot_not_no_work",
+        "full_search_cursor_must_restart_after_snapshot_change",
         "returned_historical_context_must_match_current_target",
         "unmatched_or_unbound_history_must_be_discarded",
         "fresh_owning_authority_must_be_rechecked_before_effect",
@@ -918,17 +921,25 @@ def _historical_recall_target_selection(
     binding_complete = not missing
     if profile_name == "pr":
         selector: dict[str, Any] = {}
+        bounded_summary_selector: dict[str, Any] = {}
         if "repository" in normalized:
-            selector["repo"] = normalized["repository"]
+            repository = normalized["repository"]
+            # Grabowski-produced, host-scoped events use the producer as source.repo.
+            # The project identity is their subject.component, not source.repo.
+            selector["subject_component"] = repository.split("/", 1)[1]
+            bounded_summary_selector["repo"] = repository
         if "pull_request" in normalized:
             selector["pr_number"] = normalized["pull_request"]
-        exact_target_binding = {"repo", "pr_number"}.issubset(selector)
+            bounded_summary_selector["pr_number"] = normalized["pull_request"]
+        exact_target_binding = {"subject_component", "pr_number"}.issubset(selector)
         return {
             "binding": dict(normalized),
             "binding_complete": binding_complete,
             "selector_kind": "pull_request",
             "selector": selector,
+            "bounded_summary_selector": bounded_summary_selector,
             "selector_source": "derived_from_profile_binding",
+            "project_component_source": "repository_basename_heuristic",
             "exact_target_binding": exact_target_binding,
             "read_eligible": binding_complete and exact_target_binding,
             "unsupported_reason": None,
@@ -981,6 +992,7 @@ def plan_context(profile: Any, binding: Any = None) -> dict[str, Any]:
     recall_profile = HISTORICAL_RECALL_POLICY["profiles"][profile_name]
     historical_recall = {
         "recommended_tool": HISTORICAL_RECALL_POLICY["recommended_tool"],
+        "bounded_summary_tool": HISTORICAL_RECALL_POLICY["bounded_summary_tool"],
         "provider_source_tool": HISTORICAL_RECALL_POLICY["provider_source_tool"],
         "requirement": HISTORICAL_RECALL_POLICY["requirement"],
         "mode": HISTORICAL_RECALL_POLICY["mode"],

@@ -296,6 +296,29 @@ class AgentBootstrapTests(unittest.TestCase):
 
         policy = module.HISTORICAL_RECALL
         self.assertEqual(policy["tool"], "grabowski_operator_historical_recall")
+        self.assertEqual(policy["exact_search_tool"], "grabowski_chronik_full_search")
+        self.assertEqual(
+            policy["exact_search_selectors"],
+            ["pr_number", "bureau_task_id", "run_id", "task_id", "event_id"],
+        )
+        order = policy["selection_order"]
+        self.assertLess(
+            order.index("prefer_full_search_for_exact_or_cross_project_history"),
+            order.index("use_bounded_historical_recall_only_for_pattern_summaries"),
+        )
+        self.assertIn(
+            "filter_host_scoped_project_events_by_subject_component_not_source_repo",
+            order,
+        )
+        self.assertIn("check_exhaustive_integrity_before_concluding_no_record", order)
+        self.assertIn(
+            "full_search_cursors_are_bound_to_snapshot_and_must_restart_when_stale",
+            policy["requirements"],
+        )
+        self.assertIn(
+            "missing_record_is_not_evidence_that_work_never_occurred",
+            policy["requirements"],
+        )
         self.assertEqual(policy["mode"], "selective_before_execution")
         self.assertEqual(policy["trigger_profiles"], ["pr", "bureau", "deployment"])
         self.assertIn("recovery", policy["trigger_signals"])
