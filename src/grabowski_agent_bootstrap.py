@@ -224,10 +224,10 @@ def call_shape_check(
 
 def _chronik_first_context(
     *, repo: str = "", host: str = "", subject_component: str = "",
-    pr_number: int | None = None, search_fn: Any = None,
+    pr_number: int | None = None, task_id: str = "", search_fn: Any = None,
 ) -> dict[str, Any]:
     """Read bounded validated historical evidence for a known Heimgewebe target."""
-    targets = {"repo": repo, "host": host, "subject_component": subject_component}
+    targets = {"repo": repo, "host": host, "subject_component": subject_component, "task_id": task_id}
     filters: dict[str, Any] = {}
     for key, value in targets.items():
         if not isinstance(value, str) or len(value) > 160 or "\x00" in value:
@@ -284,10 +284,17 @@ def _chronik_first_context(
             "failure_code": "historical_evidence_not_verified", "events": [],
         }
     compact: list[dict[str, Any]] = []
+    discarded = 0
     for item in (result.get("events") or [])[:10]:
         if not isinstance(item, dict) or not isinstance(item.get("event"), dict):
             continue
         event = item["event"]
+        subject = event.get("subject") if isinstance(event.get("subject"), dict) else {}
+        # source.repo identifies the producer, not the repository being worked on.
+        # In particular every Grabowski task uses source.repo=heimgewebe/grabowski.
+        if repo and subject.get("repo") != repo:
+            discarded += 1
+            continue
         data = event.get("data") if isinstance(event.get("data"), dict) else {}
         source = event.get("source") if isinstance(event.get("source"), dict) else {}
         refs = event.get("evidence_refs")
@@ -304,7 +311,13 @@ def _chronik_first_context(
         })
     return {
         **base, "status": "available", "events": compact,
-        "matching_count": result.get("matching_count"),
+        "matching_count": (
+            len(compact) if not result.get("has_more") else None
+        ),
+        "provider_matching_count": result.get("matching_count"),
+        "discarded_source_only_matches": discarded,
+        "selection_complete": not result.get("has_more"),
+        "context_gap": "bounded_candidate_page_only" if result.get("has_more") else None,
         "has_more": result.get("has_more"),
         "snapshot_sha256": snapshot.get("sha256"),
         "result_sha256": result.get("result_sha256"),
@@ -347,7 +360,7 @@ def _workspace_metrics_snapshot(limit: int) -> dict[str, Any]:
     return {**body, "snapshot_sha256": _stable_sha256(body)}
 
 
-def agent_bootstrap(*, friction_limit: int = 100, outcome_limit: int = 200, repo: str = "", host: str = "", subject_component: str = "", pr_number: int | None = None) -> dict[str, Any]:
+def agent_bootstrap(*, friction_limit: int = 100, outcome_limit: int = 200, repo: str = "", host: str = "", subject_component: str = "", pr_number: int | None = None, task_id: str = "") -> dict[str, Any]:
     if isinstance(friction_limit, bool) or not isinstance(friction_limit, int):
         raise ValueError("friction_limit must be an integer")
     if isinstance(outcome_limit, bool) or not isinstance(outcome_limit, int):
@@ -357,7 +370,7 @@ def agent_bootstrap(*, friction_limit: int = 100, outcome_limit: int = 200, repo
     if not 1 <= outcome_limit <= 1000:
         raise ValueError("outcome_limit must be between 1 and 1000")
 
-    chronik_first = _chronik_first_context(repo=repo, host=host, subject_component=subject_component, pr_number=pr_number)
+    chronik_first = _chronik_first_context(repo=repo, host=host, subject_component=subject_component, pr_number=pr_number, task_id=task_id)
     friction = grabowski_friction.friction_summary(limit=friction_limit)
     governor = grabowski_friction.execution_governor_summary(limit=outcome_limit)
     workspace_metrics = _workspace_metrics_snapshot(
@@ -504,9 +517,9 @@ def agent_bootstrap(*, friction_limit: int = 100, outcome_limit: int = 200, repo
 
 
 @mcp.tool(name="grabowski_agent_bootstrap", annotations=READ_ONLY)
-def grabowski_agent_bootstrap(friction_limit: int = 100, outcome_limit: int = 200, repo: str = "", host: str = "", subject_component: str = "", pr_number: int | None = None) -> dict[str, Any]:
+def grabowski_agent_bootstrap(friction_limit: int = 100, outcome_limit: int = 200, repo: str = "", host: str = "", subject_component: str = "", pr_number: int | None = None, task_id: str = "") -> dict[str, Any]:
     """Return a bounded adaptive agent entry capsule for the current runtime evidence."""
-    return agent_bootstrap(friction_limit=friction_limit, outcome_limit=outcome_limit, repo=repo, host=host, subject_component=subject_component, pr_number=pr_number)
+    return agent_bootstrap(friction_limit=friction_limit, outcome_limit=outcome_limit, repo=repo, host=host, subject_component=subject_component, pr_number=pr_number, task_id=task_id)
 
 
 @mcp.tool(name="grabowski_call_shape_check", annotations=READ_ONLY)

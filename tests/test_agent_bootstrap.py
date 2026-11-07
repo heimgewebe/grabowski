@@ -473,6 +473,7 @@ class AgentBootstrapTests(unittest.TestCase):
                         "ts": "2026-11-07T12:00:00Z", "kind": "agent.run.failed",
                         "data": {"result": "failed", "operation": "review", "task_class": "review"},
                         "source": {"run_id": "task-123"},
+                        "subject": {"scope": "repository", "repo": "heimgewebe/grabowski"},
                         "evidence_refs": ["grabowski-task:123"],
                         "private_payload": "MUST_NOT_LEAK",
                     },
@@ -488,6 +489,9 @@ class AgentBootstrapTests(unittest.TestCase):
         self.assertNotIn("MUST_NOT_LEAK", str(context))
         self.assertEqual(context["snapshot_sha256"], "c" * 64)
         self.assertTrue(context["historical_only"])
+        self.assertEqual(context["matching_count"], 1)
+        self.assertTrue(context["selection_complete"])
+        self.assertIsNone(context["context_gap"])
 
     def test_chronik_first_supports_host_component_and_exact_pr(self) -> None:
         module = self.load_module()
@@ -518,6 +522,49 @@ class AgentBootstrapTests(unittest.TestCase):
         result = module._chronik_first_context(search_fn=no_search)
         self.assertEqual(result["status"], "skipped_unbound_target")
         self.assertEqual(result["events"], [])
+
+    def test_chronik_first_rejects_producer_repo_as_subject(self) -> None:
+        module = self.load_module()
+        def search(**kwargs):
+            return {
+                "available": True, "historical_only": True,
+                "search_exhaustive": True, "matching_count": 55112,
+                "has_more": True,
+                "ledger_snapshot": {"integrity_valid": True, "invalid_record_count": 0},
+                "events": [{"event": {
+                    "source": {"repo": "heimgewebe/grabowski"},
+                    "subject": subject,
+                }} for subject in (
+                    {"scope": "host", "host": "heim-pc"},
+                    {"scope": "repository", "repo": "heimgewebe/other"},
+                    {},
+                )],
+            }
+        context = module._chronik_first_context(repo="heimgewebe/grabowski", search_fn=search)
+        self.assertEqual(context["events"], [])
+        self.assertEqual(context["discarded_source_only_matches"], 3)
+        self.assertIsNone(context["matching_count"])
+        self.assertEqual(context["provider_matching_count"], 55112)
+        self.assertFalse(context["selection_complete"])
+        self.assertEqual(context["context_gap"], "bounded_candidate_page_only")
+
+    def test_chronik_first_incident_continuation_uses_exact_task(self) -> None:
+        module = self.load_module()
+        calls = []
+        def search(**kwargs):
+            calls.append(kwargs)
+            return {
+                "available": True, "historical_only": True,
+                "search_exhaustive": True, "matching_count": 1, "has_more": False,
+                "ledger_snapshot": {"integrity_valid": True, "invalid_record_count": 0},
+                "events": [{"event_ref": "chronik:agent.ledger:incident",
+                            "canonical_event_sha256": "b" * 64,
+                            "event": {"data": {"operation": "diagnose", "result": "failed"}}}],
+            }
+        context = module._chronik_first_context(task_id="a" * 24, search_fn=search)
+        self.assertEqual(calls, [{"task_id": "a" * 24, "limit": 10}])
+        self.assertEqual(context["status"], "available")
+        self.assertEqual(context["events"][0]["outcome"], "failed")
 
     def test_chronik_first_failure_is_nonblocking_and_explicit(self) -> None:
         module = self.load_module()
