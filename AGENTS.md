@@ -13,6 +13,26 @@ Vor jeder Mutation müssen mindestens vorliegen:
 - Stop-Kriterium,
 - Rückrollpfad.
 
+## Chronik First – historische Evidenz vor Heimgewebe-Arbeit
+
+Bei jedem neuen relevanten Heimgewebe-Arbeitsauftrag, bei Statusfragen und bei
+Fortsetzung einer früheren Diagnose zuerst die bestehende schreibfreie
+grabowski_chronik_full_search gezielt auf das Repository, den Host, die
+Komponente, den PR oder die Aufgabe anwenden. Die Repository-Slugform muss
+vollständig sein (beispielsweise heimgewebe/grabowski). Belegte frühere
+Erkenntnisse und Fehlschläge vor erneuter Untersuchung berücksichtigen.
+
+Danach den Ist-Zustand über Git, GitHub, CI, Runtime oder andere zuständige
+Live-Primärquellen frisch prüfen. Chronik ist historische Evidenz, kein
+Deploymentnachweis und keine Mutations- oder Retry-Autorität. Bei Ausfall den
+fehlenden Historienabgleich transparent machen und regulär weiterarbeiten.
+Bei sachfremden Aufgaben keine Chronik-Abfrage. Grabowski ist alleiniger
+autorisierter Writer/Operator.
+
+Der Agent-Bootstrap kann bei expliziter Zielbindung einen wirklichen
+historischen Kurzkontext abrufen. Dokumentation:
+docs/chronik-first-agent-start.md.
+
 ## Adaptive Einstiegskapsel
 
 Für konkrete Statusfragen nur den engsten fachlich zuständigen, **nachweislich schreibfreien** Zugriff verwenden. Eine `READ_ONLY`-Annotation allein ist kein Nachweis: **Vor jedem Werkzeugaufruf** dessen mögliche direkte, bedingte und transitive Schreibeffekte prüfen. `grabowski_task_status` kann Task-Zustand und Leases ändern, `grabowski_task_list` Terminalisierungs-Recovery ausführen und `grabowski_resource_list` die Ressourcen-Datenbank anlegen oder migrieren. **Diese Werkzeuge sind keine schreibfreien Statusleser.** Für sie sowie jedes andere Werkzeug mit möglichen Schreibeffekten gelten **vor jedem Aufruf** sämtliche für diese Effekte erforderlichen Arbeits-, Lease-, Audit-, Kill-Switch- und Mutations-Gates – unabhängig davon, ob der Aufruf als Statusabfrage bezeichnet wird. Fehlt eine Voraussetzung, **nicht aufrufen**; stattdessen einen nachweislich schreibfreien und zulässigen Zugriff wählen oder die Abfrage abbrechen. `grabowski_context(profile="concise")` dient der quellenübergreifenden Orientierung, `grabowski_current_work` der kombinierten Arbeitslage aus Tasks, Leases, Checkouts und Prozessen; für beide gelten dieselben Prüfregeln, ihre Bezeichnung macht sie nicht schreibfrei. Eine Statusabfrage erteilt niemals Mutationsfreigabe. Review-, Captain- und Deployment-Gates bleiben zusätzlich an die jeweils von ihnen erfassten Aktionen gebunden.
