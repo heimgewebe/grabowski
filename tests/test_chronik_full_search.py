@@ -125,6 +125,126 @@ class ChronikFullSearchTests(unittest.TestCase):
         self.assertEqual(result["failure_code"], "chronik_repository_unavailable")
         self.assertEqual(self.calls, [])
 
+    def test_unusable_provider_continuation_cannot_claim_available(self):
+        for token in ("", "x" * 4097):
+            with self.subTest(length=len(token)):
+                self.payload["next_cursor"] = token
+                result = self.query()
+                self.assertFalse(result["available"])
+                self.assertEqual(
+                    result["failure_code"], "chronik_full_search_contract_failed"
+                )
+
+    def test_read_only_command_mounts_only_source_and_ledger(self):
+        from unittest.mock import patch
+
+        import grabowski_agent_sandbox as sandbox
+
+        repo = Path(self.config["repository"])
+        data = Path(self.config["data_dir"])
+        # CI may use /opt/hostedtoolcache Python rather than /usr or Nix.
+        # Construct a declared release-style venv instead of relaxing the
+        # production executor's trusted-interpreter boundary for a unit test.
+        venv = Path(self.tmp.name) / "static-review-runtime" / ".venv"
+        (venv / "bin").mkdir(parents=True)
+        (venv / "bin/python").symlink_to(sys.executable)
+        (venv / "pyvenv.cfg").write_text(
+            f"home = {Path(sys.executable).resolve().parent}\n", encoding="utf-8",
+        )
+        argv = [str(venv / "bin/python"), str(repo / "tools/chronik_search.py"),
+                "--data-dir", str(data), "search", "--pr-number", "1717"]
+        with patch.object(sandbox, "require_bwrap", return_value=Path("/usr/bin/bwrap")):
+            prepared = search.read_only_search_argv(argv, repo, data)
+        self.assertEqual(prepared[0], "/usr/bin/bwrap")
+        self.assertIn("--ro-bind", prepared)
+        self.assertNotIn("--bind", prepared)
+        self.assertIn(["--ro-bind", str(repo), str(repo)],
+                      [prepared[i:i + 3] for i in range(len(prepared) - 2)])
+        self.assertIn(["--ro-bind", str(data), str(data)],
+                      [prepared[i:i + 3] for i in range(len(prepared) - 2)])
+        self.assertEqual(prepared[-len(argv):], argv)
+
+    def test_virtualenv_python_is_bound_read_only(self):
+        from unittest.mock import patch
+
+        import grabowski_agent_sandbox as sandbox
+
+        repo = Path(self.config["repository"])
+        data = Path(self.config["data_dir"])
+        venv = Path(self.tmp.name) / "grabowski-release" / ".venv"
+        (venv / "bin").mkdir(parents=True)
+        (venv / "bin" / "python").symlink_to(sys.executable)
+        (venv / "pyvenv.cfg").write_text("home = /nix/store\n", encoding="utf-8")
+        argv = [str(venv / "bin/python"), str(repo / "tools/chronik_search.py"),
+                "--data-dir", str(data), "search"]
+        with patch.object(sandbox, "require_bwrap", return_value=Path("/usr/bin/bwrap")):
+            prepared = search.read_only_search_argv(argv, repo, data)
+        self.assertIn(["--ro-bind", str(venv), str(venv)],
+                      [prepared[i:i + 3] for i in range(len(prepared) - 2)])
+        self.assertNotIn("--bind", prepared)
+
+    def test_live_virtualenv_python_runs_inside_read_only_sandbox(self):
+        import os
+        import subprocess
+
+        if not os.environ.get("GRABOWSKI_BWRAP_BIN"):
+            self.skipTest("Nix bubblewrap runtime unavailable")
+        repo = Path(self.config["repository"])
+        data = Path(self.config["data_dir"])
+        venv = repo / "grabowski-operator-release" / ".venv"
+        (venv / "bin").mkdir(parents=True)
+        (venv / "bin/python").symlink_to(sys.executable)
+        (venv / "pyvenv.cfg").write_text(
+            f"home = {Path(sys.executable).resolve().parent}\n",
+            encoding="utf-8",
+        )
+        (repo / "tools/chronik_search.py").write_text(
+            "import sys\nprint('sandbox-venv-ok')\n", encoding="utf-8",
+        )
+        argv = [str(venv / "bin/python"), str(repo / "tools/chronik_search.py"),
+                "--data-dir", str(data), "search"]
+        completed = subprocess.run(
+            search.read_only_search_argv(argv, repo, data),
+            capture_output=True, timeout=20, check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.strip(), b"sandbox-venv-ok")
+
+    def test_live_read_only_sandbox_blocks_chronik_script_writes(self):
+        import os
+        import subprocess
+
+        if not os.environ.get("GRABOWSKI_BWRAP_BIN"):
+            self.skipTest("Nix bubblewrap runtime unavailable")
+        repo = Path(self.config["repository"])
+        data = Path(self.config["data_dir"])
+        sentinel = data / "sentinel.txt"
+        sentinel.write_text("unchanged", encoding="utf-8")
+        cli = repo / "tools/chronik_search.py"
+        script = (
+            "from pathlib import Path\n"
+            f"Path({str(sentinel)!r}).write_text('modified')\n"
+        )
+        compile(script, str(cli), "exec")
+        cli.write_text(script, encoding="utf-8")
+        argv = [sys.executable, str(cli), "--data-dir", str(data), "search"]
+        # A real positive control proves the payload is executable and would
+        # mutate the host sentinel if not mounted read-only.
+        control = subprocess.run(argv, capture_output=True, timeout=20, check=False)
+        self.assertEqual(control.returncode, 0, control.stderr)
+        self.assertEqual(sentinel.read_text(encoding="utf-8"), "modified")
+        sentinel.write_text("unchanged", encoding="utf-8")
+        command = search.read_only_search_argv(argv, repo, data)
+        completed = subprocess.run(command, capture_output=True, timeout=20, check=False)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertTrue(
+            b"Read-only file system" in completed.stderr
+            or b"PermissionError" in completed.stderr,
+            completed.stderr,
+        )
+        self.assertNotIn(b"SyntaxError", completed.stderr)
+        self.assertEqual(sentinel.read_text(encoding="utf-8"), "unchanged")
+
     def test_bad_filters_and_limits_fail_before_execution(self):
         with self.assertRaisesRegex(ValueError, "selector"):
             search.query(selectors={}, configuration=self.config, executor=self.execute)

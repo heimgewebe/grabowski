@@ -2337,6 +2337,27 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
                 signers=self.signers, root_owned_signers=False, now_unix=self.now,
             )
 
+    def test_late_diff_completion_cannot_authorize_partial_signed_axes(self) -> None:
+        """A read signed after every axis cannot fill an earlier review gap."""
+        plan, started = self._start()
+        for number, axis in enumerate(review.REQUIRED_AXES, start=1):
+            self._submit_axis(started, axis, number, full_diff=False)
+        lines = review._first_party_diff(self.repo, plan["binding"]).decode().splitlines()
+        self.assertGreater(len(lines), 2)
+        late = self._read(
+            started, review.REQUIRED_AXES[0], "diff", "", "head",
+            2, len(lines), now_unix=self.now + 1,
+        )
+        self.assertEqual("source_read_recorded", late["status"])
+        with self.assertRaisesRegex(
+            review.ReviewExecutionRejected, "canonical diff coverage incomplete",
+        ):
+            review.verified_first_party_semantic_review_passes(
+                plan["binding"], repository=self.repo, root=self.state,
+                signers=self.signers, root_owned_signers=False,
+                now_unix=self.now + 1,
+            )
+
     def test_large_delta_is_verified_from_multiple_bounded_chunks(self) -> None:
         # A real large PR must not be returned as a single truncation-prone
         # MCP response. Verify all Git diff lines across separate read receipts.
