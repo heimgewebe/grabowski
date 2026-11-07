@@ -2243,6 +2243,90 @@ def _merge_guard_legacy_local_review_diff_identity(
     return True, evidence
 
 
+
+def _merge_guard_first_party_full_index_fallback_equivalence(
+    repo_path: Path, *, base_sha: str, head_sha: str,
+    expected_sha256: str, fallback_diff: bytes,
+    fallback_receipt: dict[str, Any] | None,
+) -> tuple[bool, dict[str, Any]]:
+    """Prove a signed full-index diff equals a HEAD-attribute-pinned 406 fallback.
+
+    GitHub refuses PR patches above its file/line limits. The already verified
+    fallback compares one exact merge-base/head object pair and pins attributes
+    to HEAD. To admit a separately signed first-party review of that same pair,
+    read its exact full-index bytes and compare the *canonical hunks* to the
+    pinned fallback. Neither the expected digest nor a matching title alone
+    grants authority. Diverged bases, unsupported binary patches, and drift
+    fail closed.
+    """
+    evidence: dict[str, Any] = {
+        "source": "first-party-full-index-versus-pinned-local-pr-diff",
+        "base_sha": base_sha,
+        "head_sha": head_sha,
+        "status": "not_proven",
+    }
+    if (
+        _SHA40_RE.fullmatch(base_sha) is None
+        or _SHA40_RE.fullmatch(head_sha) is None
+        or _SHA256_RE.fullmatch(expected_sha256) is None
+        or not isinstance(fallback_diff, bytes)
+        or not fallback_diff
+        or len(fallback_diff) > _MERGE_GUARD_MAX_DIFF_BYTES
+        or _merge_guard_diff_contains_binary_metadata(fallback_diff)
+        or not isinstance(fallback_receipt, dict)
+        or fallback_receipt.get("source") != "local-bound-git-diff"
+        or fallback_receipt.get("merge_base_sha") != base_sha
+        or fallback_receipt.get("returncode") != 0
+        or fallback_receipt.get("raw_sha256") != hashlib.sha256(fallback_diff).hexdigest()
+    ):
+        evidence["reason"] = "unbound_or_unsupported_fallback"
+        return False, evidence
+    try:
+        result = _merge_guard_local_git_bytes(
+            repo_path,
+            [
+                "-c", "diff.noprefix=false", "-c", "color.ui=never",
+                "diff", "--no-ext-diff", "--no-textconv", "--no-renames",
+                "--ignore-submodules=none", "--no-color", "--unified=3",
+                "--full-index", base_sha, head_sha, "--",
+            ],
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        evidence["reason"] = f"full_index_read_unavailable:{type(exc).__name__}"
+        return False, evidence
+    original = result.get("stdout_bytes")
+    if (
+        result.get("returncode") != 0
+        or not isinstance(original, bytes)
+        or not original
+        or len(original) > _MERGE_GUARD_MAX_DIFF_BYTES
+        or _merge_guard_diff_contains_binary_metadata(original)
+    ):
+        evidence["reason"] = "full_index_unavailable_or_unsupported"
+        return False, evidence
+    signed_sha256 = hashlib.sha256(original).hexdigest()
+    full_canonical = github_pr_diff_identity_sha256(original)
+    fallback_canonical = github_pr_diff_identity_sha256(fallback_diff)
+    evidence.update({
+        "full_index_bytes": len(original),
+        "full_index_sha256": signed_sha256,
+        "full_index_matches_signed_review": signed_sha256 == expected_sha256,
+        "full_index_canonical_sha256": full_canonical,
+        "pinned_fallback_canonical_sha256": fallback_canonical,
+        "canonical_hunks_match": full_canonical == fallback_canonical,
+    })
+    if signed_sha256 != expected_sha256:
+        evidence["reason"] = "signed_full_index_digest_mismatch"
+        return False, evidence
+    if full_canonical != fallback_canonical:
+        evidence["reason"] = "canonical_hunks_mismatch"
+        return False, evidence
+    evidence["status"] = "proven"
+    evidence["proof_format"] = "signed-first-party-full-index-after-github-http406"
+    return True, evidence
+
+
 def _merge_guard_github_diff_too_large(
     info: dict[str, Any], *, changed_files: int
 ) -> bool:
@@ -5837,6 +5921,29 @@ class CaptainMergeGuardRunner:
         else:
             binding_diff_sha256 = canonical_live_diff_sha256
             diff_identity_mode = "unmatched"
+        # GitHub's HTTP 406 file/line cap has no provider patch bytes.
+        # The local fallback above already proved the paths and the exact
+        # merge-base/head pair using pinned HEAD attributes. Admit the
+        # authenticated first-party full-index review only after matching its
+        # literal signed bytes AND the fallback's canonical file hunks.
+        if (
+            diff_identity_mode == "unmatched"
+            and diff_source == "local-bound-git-diff-after-github-too-large"
+        ):
+            equivalent, full_index_evidence = (
+                _merge_guard_first_party_full_index_fallback_equivalence(
+                    self.repo_path, base_sha=base_sha, head_sha=expected_head,
+                    expected_sha256=expected_diff,
+                    fallback_diff=raw_live_diff_bytes,
+                    fallback_receipt=self.receipt.get("local_diff_fallback"),
+                )
+            )
+            self.receipt["first_party_full_index_fallback_equivalence"] = (
+                full_index_evidence
+            )
+            if equivalent:
+                binding_diff_sha256 = expected_diff
+                diff_identity_mode = "first-party-full-index-pinned-fallback-proven"
         # A completed independent review may bind GitHub's per-commit
         # "--patch" mbox instead of the default cumulative PR diff. Admit
         # its digest only after proving byte-for-byte equivalent file hunks

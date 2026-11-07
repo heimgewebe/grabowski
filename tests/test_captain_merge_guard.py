@@ -1162,6 +1162,90 @@ class CaptainLargePrMergeGuardTests(unittest.TestCase):
                     self.assertFalse(rejected, detail)
                     self.assertEqual(detail["status"], "not_proven")
 
+    def test_http406_local_fallback_accepts_only_signed_full_index_same_hunks(self) -> None:
+        # Provider HTTP 406 supplies no patch. This uses only committed Git
+        # objects, the HEAD-attribute-pinned local fallback and the exact
+        # first-party full-index format; no caller-provided PASS is trusted.
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            _git(repo, "init", "-q")
+            _git(repo, "config", "user.email", "captain-test@example.invalid")
+            _git(repo, "config", "user.name", "Captain Test")
+            path = repo / "app.py"
+            path.write_text(
+                "def item():\n" +
+                "".join(f"    entry_{i} = {i}\n" for i in range(20)) +
+                "    return entry_5\n", encoding="utf-8",
+            )
+            _git(repo, "add", "app.py")
+            _git(repo, "commit", "-q", "-m", "base")
+            base = _git(repo, "rev-parse", "HEAD")
+            path.write_text(
+                path.read_text().replace("entry_5 = 5", "entry_5 = 155"),
+                encoding="utf-8",
+            )
+            _git(repo, "add", "app.py")
+            _git(repo, "commit", "-q", "-m", "reviewed")
+            head = _git(repo, "rev-parse", "HEAD")
+            signed = subprocess.check_output([
+                "git", "-C", str(repo), "diff", "--no-ext-diff",
+                "--no-textconv", "--no-renames", "--ignore-submodules=none",
+                "--unified=3", "--full-index", base, head, "--",
+            ])
+            signed_sha = hashlib.sha256(signed).hexdigest()
+            fallback, receipt, errors = merge_guard._merge_guard_local_diff_bytes(
+                repo, base_sha=base, head_sha=head,
+            )
+            self.assertEqual(errors, [])
+            self.assertEqual(receipt["merge_base_sha"], base)
+            self.assertNotEqual(hashlib.sha256(fallback).hexdigest(), signed_sha)
+            arguments = {
+                "base_sha": base, "head_sha": head,
+                "expected_sha256": signed_sha,
+                "fallback_diff": fallback, "fallback_receipt": receipt,
+            }
+            passed, evidence = (
+                merge_guard._merge_guard_first_party_full_index_fallback_equivalence(
+                    repo, **arguments,
+                )
+            )
+            self.assertTrue(passed, evidence)
+            self.assertEqual(evidence["proof_format"],
+                             "signed-first-party-full-index-after-github-http406")
+            self.assertTrue(evidence["canonical_hunks_match"])
+            self.assertEqual(evidence["full_index_sha256"], signed_sha)
+
+            altered = fallback.replace(b"+    entry_5 = 155", b"+    entry_5 = 955")
+            self.assertNotEqual(altered, fallback)
+            forged_receipt = {
+                **receipt, "raw_sha256": hashlib.sha256(altered).hexdigest(),
+            }
+            for label, changes, reason in (
+                ("wrong signed digest", {"expected_sha256": "f" * 64},
+                 "signed_full_index_digest_mismatch"),
+                ("tampered fallback bytes", {"fallback_diff": altered},
+                 "unbound_or_unsupported_fallback"),
+                ("tampered hunks with matching claimed receipt",
+                 {"fallback_diff": altered, "fallback_receipt": forged_receipt},
+                 "canonical_hunks_mismatch"),
+                ("wrong base in fallback", {
+                    "fallback_receipt": {**receipt, "merge_base_sha": "b" * 40},
+                }, "unbound_or_unsupported_fallback"),
+                ("unavailable head", {"head_sha": "a" * 40},
+                 "full_index_unavailable_or_unsupported"),
+                ("binary patch", {"fallback_diff": b"GIT binary patch\n"},
+                 "unbound_or_unsupported_fallback"),
+            ):
+                with self.subTest(label=label):
+                    denied, details = (
+                        merge_guard._merge_guard_first_party_full_index_fallback_equivalence(
+                            repo, **{**arguments, **changes},
+                        )
+                    )
+                    self.assertFalse(denied, details)
+                    self.assertEqual(details["status"], "not_proven")
+                    self.assertEqual(details["reason"], reason)
+
     def test_legacy_review_accepts_diverged_base_with_exact_three_dot_patch(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
