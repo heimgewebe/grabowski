@@ -142,7 +142,16 @@ class ChronikFullSearchTests(unittest.TestCase):
 
         repo = Path(self.config["repository"])
         data = Path(self.config["data_dir"])
-        argv = [sys.executable, str(repo / "tools/chronik_search.py"),
+        # CI may use /opt/hostedtoolcache Python rather than /usr or Nix.
+        # Construct a declared release-style venv instead of relaxing the
+        # production executor's trusted-interpreter boundary for a unit test.
+        venv = Path(self.tmp.name) / "static-review-runtime" / ".venv"
+        (venv / "bin").mkdir(parents=True)
+        (venv / "bin/python").symlink_to(sys.executable)
+        (venv / "pyvenv.cfg").write_text(
+            f"home = {Path(sys.executable).resolve().parent}\n", encoding="utf-8",
+        )
+        argv = [str(venv / "bin/python"), str(repo / "tools/chronik_search.py"),
                 "--data-dir", str(data), "search", "--pr-number", "1717"]
         with patch.object(sandbox, "require_bwrap", return_value=Path("/usr/bin/bwrap")):
             prepared = search.read_only_search_argv(argv, repo, data)
