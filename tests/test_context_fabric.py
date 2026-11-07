@@ -172,9 +172,17 @@ class PlanTests(ContextFabricTestCase):
         recall = plan["historical_recall"]
         self.assertEqual(
             recall["recommended_tool"],
+            "grabowski_chronik_full_search",
+        )
+        self.assertEqual(
+            recall["bounded_summary_tool"],
             "grabowski_operator_historical_recall",
         )
         self.assertEqual(recall["provider_source_tool"], "grabowski_chronik_history")
+        self.assertIn(
+            "full_search_zero_means_no_record_in_snapshot_not_no_work",
+            recall["requirements"],
+        )
         self.assertEqual(recall["requirement"], "conditional")
         self.assertEqual(recall["mode"], "selective_advisory")
         self.assertIn("re_reviewing_or_retrying_bound_pr", recall["read_when"])
@@ -185,7 +193,32 @@ class PlanTests(ContextFabricTestCase):
         self.assertEqual(selection["selector_kind"], "pull_request")
         self.assertEqual(
             selection["selector"],
+            {"subject_component": "grabowski", "pr_number": PR_BINDING["pull_request"]},
+        )
+        self.assertEqual(
+            selection["bounded_summary_selector"],
             {"repo": "heimgewebe/grabowski", "pr_number": PR_BINDING["pull_request"]},
+        )
+        self.assertEqual(
+            selection["project_component_source"], "repository_basename_heuristic"
+        )
+        self.assertEqual(selection["project_component_scope"], "host_events_only")
+        self.assertEqual(
+            selection["repository_scoped_selector"],
+            {"repo": "heimgewebe/grabowski", "pr_number": PR_BINDING["pull_request"]},
+        )
+        self.assertEqual(
+            selection["full_search_selectors"],
+            [
+                {"scope": "host_component", "selector": selection["selector"]},
+                {"scope": "repository", "selector": selection["repository_scoped_selector"]},
+            ],
+        )
+        self.assertEqual(
+            selection["full_search_combination"], "exhaust_each_query_then_union_by_event_id"
+        )
+        self.assertEqual(
+            selection["full_search_zero_policy"], "zero_only_after_both_exhaustive_queries_never_no_work"
         )
         self.assertEqual(selection["selector_source"], "derived_from_profile_binding")
         self.assertTrue(selection["exact_target_binding"])
@@ -204,6 +237,55 @@ class PlanTests(ContextFabricTestCase):
         )
         self.assertEqual(chronik_source["requirement"], "optional")
         self.assertEqual(chronik_source["temporal_marker"], "historical")
+
+    def test_pr_full_search_selects_actual_project_not_producer_repo(self) -> None:
+        binding = dict(PR_BINDING)
+        binding["repository"] = "heimgewebe/commonthing"
+        binding["pull_request"] = 1977
+        plan = self.module.plan_context("pr", binding)
+        recall = plan["historical_recall"]
+        self.assertTrue(recall["target_selection"]["read_eligible"])
+        self.assertEqual(
+            recall["target_selection"]["selector"],
+            {"subject_component": "commonthing", "pr_number": 1977},
+        )
+        self.assertEqual(
+            recall["target_selection"]["bounded_summary_selector"],
+            {"repo": "heimgewebe/commonthing", "pr_number": 1977},
+        )
+        self.assertEqual(recall["recommended_tool"], "grabowski_chronik_full_search")
+
+    def test_pr_search_preserves_repository_scoped_history_with_other_component(self) -> None:
+        # Historical #1724 Codex P2: heimgewebe/chronik PR 306 has
+        # subject.component="task-runner", not the basename "chronik".
+        binding = dict(PR_BINDING)
+        binding["repository"] = "heimgewebe/chronik"
+        binding["pull_request"] = 306
+        selection = self.module.plan_context("pr", binding)["historical_recall"]["target_selection"]
+        self.assertTrue(selection["read_eligible"])
+        self.assertEqual(
+            selection["selector"], {"subject_component": "chronik", "pr_number": 306}
+        )
+        # A repository-scoped event with a different subject.component must
+        # still match the second query. Combining both filters would exclude it.
+        self.assertEqual(
+            selection["repository_scoped_selector"],
+            {"repo": "heimgewebe/chronik", "pr_number": 306},
+        )
+        self.assertNotIn("subject_component", selection["repository_scoped_selector"])
+        self.assertEqual(
+            selection["full_search_selectors"],
+            [
+                {"scope": "host_component", "selector": selection["selector"]},
+                {"scope": "repository", "selector": selection["repository_scoped_selector"]},
+            ],
+        )
+        self.assertEqual(
+            selection["full_search_combination"], "exhaust_each_query_then_union_by_event_id"
+        )
+        self.assertEqual(
+            selection["full_search_zero_policy"], "zero_only_after_both_exhaustive_queries_never_no_work"
+        )
 
     def test_historical_recall_plan_is_ineligible_until_binding_is_complete(self) -> None:
         plan = self.module.plan_context("pr", {"repository": "heimgewebe/grabowski"})
