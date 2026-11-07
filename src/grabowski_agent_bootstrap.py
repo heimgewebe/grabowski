@@ -44,6 +44,8 @@ ENTRY_SEQUENCE = (
 HISTORICAL_RECALL = {
     "authority": "advisory_historical_evidence_only",
     "tool": "grabowski_operator_historical_recall",
+    "exact_search_tool": "grabowski_chronik_full_search",
+    "exact_search_selectors": ["pr_number", "bureau_task_id", "run_id", "task_id", "event_id"],
     "mode": "selective_before_execution",
     "trigger_profiles": ["pr", "bureau", "deployment"],
     "trigger_signals": [
@@ -60,8 +62,10 @@ HISTORICAL_RECALL = {
     ],
     "selection_order": [
         "bind_target_from_fresh_live_context",
-        "prefer_exact_available_chronik_filters",
-        "read_bounded_historical_recall",
+        "prefer_full_search_for_exact_or_cross_project_history",
+        "filter_host_scoped_project_events_by_subject_component_not_source_repo",
+        "check_exhaustive_integrity_before_concluding_no_record",
+        "use_bounded_historical_recall_only_for_pattern_summaries",
         "discard_nonmatching_or_unbound_history",
         "continue_from_fresh_live_truth",
     ],
@@ -69,6 +73,8 @@ HISTORICAL_RECALL = {
         "fresh_live_truth_precedes_history",
         "history_must_be_evidence_bound",
         "history_must_remain_historical_only",
+        "full_search_cursors_are_bound_to_snapshot_and_must_restart_when_stale",
+        "missing_record_is_not_evidence_that_work_never_occurred",
         "fresh_owning_authority_must_be_rechecked_before_effect",
     ],
     "does_not_establish": [
