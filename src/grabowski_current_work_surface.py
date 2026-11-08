@@ -27,6 +27,13 @@ def _operator() -> Any:
     return _module("grabowski_operator_core")
 
 
+def _checkout_wal_admission(shm_path: Path) -> None:
+    # A native WAL read can update this exact SHM path; honor path freezes.
+    _operator()._require_operator_mutation(
+        "resource_lease", path=str(shm_path), host="heim-pc"
+    )
+
+
 def _require_repositories(repositories: list[str]) -> list[str]:
     if not isinstance(repositories, list) or not 1 <= len(repositories) <= current_work.MAX_REPOSITORIES:
         raise ValueError(
@@ -343,7 +350,9 @@ def _task_checkout_presence(
     for retention in retentions:
         add(retention)
 
-    database_after = reconciler.collect_lifecycle_bindings_from_db()
+    database_after = reconciler.collect_lifecycle_bindings_from_db(
+        _wal_mutation_admission=_checkout_wal_admission,
+    )
     if database_after.get("snapshot_sha256") != expected_database_sha256:
         raise RuntimeError(
             "checkout lifecycle database changed during current_work observation"
@@ -361,7 +370,9 @@ def _task_checkout_presence(
 
 def _reconciliation_payload(repositories: list[str]) -> dict[str, Any]:
     reconciler = _module("grabowski_checkout_binding_reconciler")
-    database_snapshot = reconciler.collect_lifecycle_bindings_from_db()
+    database_snapshot = reconciler.collect_lifecycle_bindings_from_db(
+        _wal_mutation_admission=_checkout_wal_admission,
+    )
     payload = reconciler.reconcile_checkout_bindings(
         repository_filters=repositories,
         limit=reconciler.MAX_PAGE_LIMIT,

@@ -516,17 +516,19 @@
         "tests:tests/test_current_work.py"
       ],
       "exception_detail": {
-        "claim": "This tool owns only bounded read-only comparison between the existing checkout lifecycle store and canonical Git observations.",
-        "evidence": "Immutable-or-copied SQLite snapshots, canonical worktree records, snapshot-bound pagination and regression tests preserve fail-closed behavior without mutation authority."
+        "claim": "This tool owns bounded checkout reconciliation against Git and SQLite; a live WAL read may update only admitted SHM read marks, never checkout lifecycle data.",
+        "evidence": "Pinned native WAL snapshots after SHM path-scoped mutation admission, idle immutable snapshots, canonical Git observations and regression tests preserve source data and fail-closed boundaries."
       },
       "justification_kind": "distinct_authority_boundary",
       "operation_alternative_considered": "Extending checkout inventory or Current Work alone was rejected because callers need one typed reconciliation result with explicit absence-versus-unobservability semantics and a snapshot-bound cursor.",
-      "rationale": "Durable bindings can survive physical worktrees; a distinct read-only surface exposes that contradiction without treating absence, retention or archive evidence as cleanup proof.",
+      "rationale": "Durable checkout bindings may outlive physical worktrees; this distinct reconciliation surface compares their identity without granting lifecycle cleanup or terminalization authority.",
       "tool_contract": {
-        "authority_class": "read",
+        "authority_class": "mutation",
         "category": "checkout-lifecycle",
-        "effects": [],
-        "read_only": true,
+        "effects": [
+          "sqlite-wal-shm-sidecar-write"
+        ],
+        "read_only": null,
         "reversibility": "not-applicable",
         "risk_class": "low",
         "tool": "grabowski_checkout_binding_reconciliation"
@@ -901,17 +903,19 @@
         "tests:tests/test_current_work_surface.py"
       ],
       "exception_detail": {
-        "claim": "The tool exposes only a bounded ephemeral projection over existing authoritative task, attention, lease, checkout and worker sources while keeping heuristic physical relations non-authoritative.",
-        "evidence": "Source-bound grouping, exact child-lease aggregation, current/history separation, snapshot-bound pagination, explicit completeness/uncertainty and live-pilot tests."
+        "claim": "The bounded current-work projection persists no lifecycle data; native SQLite WAL observations may update SHM read marks only after admitted path-scoped mutation checks.",
+        "evidence": "Source-bound grouping, exact child-lease aggregation, snapshot-bound pagination, SHM write-mark admission, path-sensitive kill-switch tests and live-pilot tests."
       },
       "justification_kind": "material_call_shape",
       "operation_alternative_considered": "Composing generic task, resource, checkout, tmux, process and worker reads client-side was rejected because it would duplicate binding precedence, heuristic separation, bounded pagination and no-second-truth semantics across operators.",
-      "rationale": "Operator current-work comprehension requires one bounded cross-source read shape; it adds no mutation authority and persists no lifecycle state.",
+      "rationale": "Operator current-work comprehension needs bounded cross-source projection with no lifecycle mutation, apart from admitted SQLite SHM read marks when WAL is active.",
       "tool_contract": {
-        "authority_class": "read",
+        "authority_class": "mutation",
         "category": "operations-observability",
-        "effects": [],
-        "read_only": true,
+        "effects": [
+          "sqlite-wal-shm-sidecar-write"
+        ],
+        "read_only": null,
         "reversibility": "not-applicable",
         "risk_class": "low",
         "tool": "grabowski_current_work"
@@ -1220,17 +1224,19 @@
         "contract:config/runtime-entrypoint.json"
       ],
       "exception_detail": {
-        "claim": "The tool composes only bounded read-only evidence from existing audit, friction, execution-outcome and current-work sources and explicitly excludes personal activity telemetry.",
-        "evidence": "Source-bound hashes, partial-source warnings, bounded time-window comparison, no raw event or work-item payloads in the minimal view, explicit nonclaims and focused deterministic tests."
+        "claim": "The tool composes bounded evidence and excludes personal activity telemetry; transitive current-work WAL reads may update SHM marks under the same mutation gates.",
+        "evidence": "Source-bound hashes, partial-source warnings, bounded time-window comparisons and explicit transitive WAL SHM mutation admission with no lifecycle data writes."
       },
       "justification_kind": "material_call_shape",
       "operation_alternative_considered": "Client-side composition of audit, friction, execution-governor and current-work calls was rejected because it would duplicate window normalization, source binding, partial-evidence handling, finding ranking and no-productivity-claim semantics across operators.",
-      "rationale": "A manual ecosystem optimization audit needs one bounded cross-source read shape. The tool adds no mutable truth, task creation, policy mutation, routing promotion or personal telemetry.",
+      "rationale": "A manual optimization audit needs one bounded cross-source projection without task or policy mutation or personal telemetry; transitive SQLite SHM read marks remain explicitly admitted.",
       "tool_contract": {
-        "authority_class": "read",
+        "authority_class": "mutation",
         "category": "operations-observability",
-        "effects": [],
-        "read_only": true,
+        "effects": [
+          "sqlite-wal-shm-sidecar-write"
+        ],
+        "read_only": null,
         "reversibility": "not-applicable",
         "risk_class": "low",
         "tool": "grabowski_operator_optimization_report"

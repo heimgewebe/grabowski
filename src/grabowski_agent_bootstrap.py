@@ -142,6 +142,36 @@ REUSE_BEFORE_BUILD = {
 }
 
 
+
+HARD_CASE_ADVISORY = {
+    "schema_version": 1,
+    "mode": "source_frontdoor_auto_dispatch",
+    "scope": "agent-execution-happy-path Source mode; other operator paths remain explicit",
+    "signal_field": "hard_case_advisory",
+    "signal_kinds": ["repeated_failure", "contradictory_evidence", "material_architecture"],
+    "evidence_requirement": "distinct source-bound references; shared error_fingerprint for repeated_failure",
+    "route_selection": "canonical independent-review model ranking for selection only",
+    "execution_tool": "grabowski_agent_competition_start",
+    "output_readback": "grabowski_agent_competition_status",
+    "eligible_providers": ["claude", "grok"],
+    "max_budget_usd": 0,
+    "paid_execution_authorized": False,
+    "one_request_id_per_source_kind_and_error_fingerprint": True,
+    "no_additional_review_gate": True,
+    "continue_primary_work_on_unavailability": True,
+    "unknown_provider_start_is_not_retried": True,
+    "context": "only committed, redaction-checked README.md",
+    "authority": "advisory_only",
+    "does_not_establish": [
+        "automatic_detection_in_every_external_thread",
+        "successful_provider_response",
+        "mandatory_external_review",
+        "model_optimality",
+        "authorization_for_paid_fallback",
+    ],
+}
+
+
 def _stable_sha256(value: dict[str, Any]) -> str:
     payload = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
@@ -541,6 +571,7 @@ def agent_bootstrap(*, friction_limit: int = 100, outcome_limit: int = 200, repo
         "chronik_first": chronik_first,
         "adler_sidecar": ADLER_SIDECAR,
         "historical_recall": HISTORICAL_RECALL,
+        "hard_case_advisory": HARD_CASE_ADVISORY,
         "reuse_before_build": REUSE_BEFORE_BUILD,
         "call_rules": {
             "one_independent_intent_per_call": True,
