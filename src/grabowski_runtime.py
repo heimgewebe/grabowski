@@ -118,7 +118,7 @@ async def grabowski_current_work(
     )
 
 
-@mcp.tool(name="grabowski_operator_optimization_report", annotations=READ_ONLY)
+@mcp.tool(name="grabowski_operator_optimization_report", annotations=grabowski_operator_core.MUTATING)
 async def grabowski_operator_optimization_report(
     repositories: list[str],
     window: str = "7d",

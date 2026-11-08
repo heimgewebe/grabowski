@@ -753,6 +753,7 @@ class CheckoutBindingLiveIntegrationTests(unittest.TestCase):
         tool_names = {
             "grabowski_current_work",
             "grabowski_checkout_binding_reconciliation",
+            "grabowski_operator_optimization_report",
         }
         functions = {
             item.name: item
