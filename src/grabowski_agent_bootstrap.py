@@ -259,6 +259,9 @@ def _chronik_first_context(
     queries: list[tuple[str, dict[str, Any]]] = []
     if repo and not task_id:
         repository_query: dict[str, Any] = {"repo": repo}
+        # An explicit component selector is a constraint, not a hint.
+        if subject_component:
+            repository_query["subject_component"] = subject_component
         if pr_number is not None:
             repository_query["pr_number"] = pr_number
         queries.append(("repository", repository_query))
@@ -335,7 +338,11 @@ def _chronik_first_context(
             subject = event.get("subject") if isinstance(event.get("subject"), dict) else {}
             match_basis = "exact_target"
             if repo:
-                if subject.get("scope") == "repository" and subject.get("repo") == repo:
+                if (
+                    subject.get("scope") == "repository"
+                    and subject.get("repo") == repo
+                    and (not subject_component or subject.get("component") == subject_component)
+                ):
                     match_basis = "subject_repository"
                 elif (
                     subject.get("scope") == "host"

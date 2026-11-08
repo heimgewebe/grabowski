@@ -569,6 +569,58 @@ class AgentBootstrapTests(unittest.TestCase):
         self.assertFalse(context["selection_complete"])
         self.assertEqual(context["context_gap"], "bounded_candidate_page_only")
 
+    def test_chronik_first_preserves_explicit_repository_component(self) -> None:
+        module = self.load_module()
+        calls = []
+
+        def event(component, tag):
+            return {
+                "event_ref": "chronik:agent.ledger:sha256:" + tag * 64,
+                "canonical_event_sha256": tag * 64,
+                "event": {
+                    "ts": "2026-10-27T14:18:14Z",
+                    "kind": "agent.run.failed",
+                    "subject": {
+                        "scope": "repository", "repo": "heimgewebe/chronik",
+                        "component": component, "pr_number": 306,
+                    },
+                    "source": {"run_id": "task-example"},
+                    "data": {"result": "failed", "operation": "review", "task_class": "review"},
+                    "evidence_refs": ["grabowski-task:example"],
+                },
+            }
+
+        def search(**kwargs):
+            calls.append(kwargs)
+            events = [
+                event("task-runner", "a"),
+                event("other-component", "b"),
+            ] if "repo" in kwargs else []
+            return {
+                "available": True, "historical_only": True,
+                "search_exhaustive": True, "matching_count": len(events),
+                "has_more": False, "events": events,
+                "ledger_snapshot": {
+                    "integrity_valid": True, "invalid_record_count": 0,
+                    "sha256": "c" * 64,
+                },
+            }
+
+        context = module._chronik_first_context(
+            repo="heimgewebe/chronik", subject_component="task-runner",
+            pr_number=306, search_fn=search,
+        )
+        self.assertEqual(calls, [
+            {
+                "repo": "heimgewebe/chronik", "subject_component": "task-runner",
+                "pr_number": 306, "limit": 10,
+            },
+            {"subject_component": "task-runner", "pr_number": 306, "limit": 10},
+        ])
+        self.assertEqual(context["selected_event_count"], 1)
+        self.assertEqual(context["events"][0]["match_basis"], "subject_repository")
+        self.assertEqual(context["discarded_source_only_matches"], 1)
+
     def test_chronik_first_finds_host_scoped_commonthing_pr_1977(self) -> None:
         module = self.load_module()
         calls = []
