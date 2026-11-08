@@ -691,6 +691,51 @@ class AgentBootstrapTests(unittest.TestCase):
         self.assertEqual(context["context_gap"], "ledger_snapshot_changed_between_scopes")
         self.assertIsNone(context["snapshot_sha256"])
 
+    def test_chronik_first_exact_task_keeps_pr_constraint(self) -> None:
+        module = self.load_module()
+        calls = []
+
+        def event(pr, tag):
+            return {
+                "event_ref": "chronik:agent.ledger:sha256:" + tag * 64,
+                "canonical_event_sha256": tag * 64,
+                "event": {
+                    "ts": "2026-11-08T08:00:00Z", "kind": "agent.run.completed",
+                    "subject": {"scope": "repository", "repo": "heimgewebe/chronik",
+                                "component": "task-runner", "pr_number": pr},
+                    "source": {"run_id": "task-example"},
+                    "data": {"operation": "review", "result": "completed",
+                             "task_class": "review"},
+                    "evidence_refs": ["grabowski-task:example"],
+                },
+            }
+
+        def search(**kwargs):
+            calls.append(kwargs)
+            # Deliberately overbroad provider response: consumer must still
+            # reject the wrong PR rather than falsely marking it as evidence.
+            return {
+                "available": True, "historical_only": True,
+                "search_exhaustive": True, "matching_count": 2,
+                "has_more": False, "events": [event(305, "a"), event(306, "b")],
+                "ledger_snapshot": {"integrity_valid": True, "invalid_record_count": 0,
+                                    "sha256": "c" * 64},
+            }
+
+        context = module._chronik_first_context(
+            repo="heimgewebe/chronik", subject_component="task-runner",
+            pr_number=306, task_id="f" * 24, search_fn=search,
+        )
+        self.assertEqual(calls, [{
+            "task_id": "f" * 24, "pr_number": 306,
+            "subject_component": "task-runner", "limit": 10,
+        }])
+        self.assertEqual(context["selected_event_count"], 1)
+        self.assertEqual(context["discarded_source_only_matches"], 1)
+        self.assertEqual(context["events"][0]["event_ref"],
+                         "chronik:agent.ledger:sha256:" + "b" * 64)
+        self.assertEqual(context["events"][0]["match_basis"], "subject_repository")
+
     def test_chronik_first_incident_continuation_uses_exact_task(self) -> None:
         module = self.load_module()
         calls = []
