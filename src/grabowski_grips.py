@@ -8838,6 +8838,7 @@ _AGENT_EXECUTION_SOURCE_FIELDS = frozenset(
         "effect_profile",
         "review_objective",
         "runtime_seconds",
+        "hard_case_advisory",
     }
 )
 _AGENT_EXECUTION_CONTINUATION_ENV = "GRABOWSKI_AEF_CONTINUATION"
@@ -8905,6 +8906,121 @@ def _agent_execution_int_parameter(
 def _agent_execution_slug(value: str, *, maximum: int = 28) -> str:
     normalized = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
     return (normalized or "source")[:maximum].rstrip("-") or "source"
+
+
+
+def _agent_execution_validate_hard_case_advisory(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict) or value.get("kind") not in {
+        "repeated_failure", "contradictory_evidence", "material_architecture"
+    }:
+        raise GripPreflightError("hard_case_advisory.kind is invalid")
+    fields = {"kind", "evidence_refs"}
+    if value["kind"] == "repeated_failure":
+        fields.add("error_fingerprint")
+    if set(value) != fields:
+        raise GripPreflightError("hard_case_advisory has invalid fields")
+    refs = value.get("evidence_refs")
+    minimum = 1 if value["kind"] == "material_architecture" else 2
+    if (
+        not isinstance(refs, list) or not minimum <= len(refs) <= 8
+        or any(not isinstance(ref, str) or not 8 <= len(ref) <= 256
+               or any(ord(ch) < 32 or ord(ch) == 127 for ch in ref) for ref in refs)
+        or len(set(refs)) != len(refs)
+    ):
+        raise GripPreflightError("hard_case_advisory requires distinct evidence references")
+    if value["kind"] == "repeated_failure" and not _is_sha256_hex(value["error_fingerprint"]):
+        raise GripPreflightError("repeated_failure requires a shared error SHA-256")
+    return dict(value)
+
+
+def _agent_execution_hard_case_advisory(
+    *, signal: dict[str, Any], task_class: str, novelty: str,
+    risk_flags: list[str], router: Any, repo: Path, head: str,
+    source_identity_sha256: str, objective: str, duration_minutes: int,
+    changed_files: int,
+) -> dict[str, Any]:
+    kind = signal["kind"]
+    flags = set(risk_flags)
+    qualified = (
+        (kind == "repeated_failure" and "prior-attempt-failed" in flags
+         and task_class in {"deep-debug", "complex-patch", "architecture", "migration"})
+        or (kind == "contradictory_evidence" and novelty == "high"
+            and task_class in {"deep-debug", "complex-patch", "architecture", "migration"})
+        or (kind == "material_architecture" and novelty == "high"
+            and "high-risk" in flags and task_class in {"architecture", "migration"})
+    )
+    base = {
+        "schema_version": 1, "signal": kind,
+        "evidence_refs_sha256": sha256_json(signal["evidence_refs"]),
+        "authority": "advisory_only", "non_blocking": True,
+        "automatic_apply": False,
+    }
+    if not qualified:
+        return {**base, "state": "not-triggered", "reason": "unqualified_signal"}
+    if flags.intersection(router.SENSITIVE_EXTERNAL_REVIEW_RISK_FLAGS):
+        return {**base, "state": "withheld", "reason": "sensitive_context"}
+    try:
+        import grabowski_agent_competition as competition
+        redact = getattr(competition.operator, "_redact", None)
+        if not callable(redact) or redact(objective) != objective:
+            return {**base, "state": "withheld", "reason": "objective_redaction_required"}
+        choice = router.canonical_execution_route(
+            "independent-review", changed_files=changed_files,
+            duration_minutes=duration_minutes, novelty=novelty,
+            risk_flags=risk_flags, latency_priority=False, need_review=True,
+            verification_policy="independent_review", effect_profile="candidate",
+        )
+        candidates = [*choice.get("reviewers", []), *choice.get("review_fallbacks", [])]
+        reviewer = next(
+            (c for c in candidates if isinstance(c, dict)
+             and c.get("harness") in {"claude", "grok"}
+             and c.get("route_role") == "reviewer"
+             and c.get("paid_only") is not True
+             and isinstance(c.get("route"), str)), None
+        )
+        if reviewer is None:
+            return {**base, "state": "unavailable", "reason": "no_subscription_route"}
+        request_id = "hardcase-" + sha256_json({
+            "source": source_identity_sha256, "signal": kind,
+            "error": signal.get("error_fingerprint"),
+        })[:32]
+        prompt = (
+            "Independent READ-ONLY technical second opinion in German. "
+            "Do not execute commands or modify any files. Separate supported facts, "
+            "alternative hypotheses, discriminating tests and a smallest reversible "
+            "repair. No API credits or paid fallback. Task: " + objective
+        )
+        started = competition.grabowski_agent_competition_start(
+            request_id=request_id, provider=reviewer["harness"],
+            mode="contrast", repository=str(repo), expected_head=head,
+            task=prompt, allowed_paths=["README.md"], context_paths=["README.md"],
+            forbidden_paths=[], primary_summary="Hard-case: " + kind,
+            timeout_seconds=360, max_budget_usd=0, require_hard_budget=True,
+            route_id=reviewer["route"], paid_execution_authorized=False,
+        )
+        if (not isinstance(started, dict) or not started.get("competition_id")
+                or not started.get("task_id")):
+            return {**base, "state": "unavailable",
+                    "reason": "candidate_start_receipt_incomplete",
+                    "retry_automatically": False}
+        return {
+            **base, "state": "reused" if started.get("already_started") else "dispatched",
+            "provider": reviewer["harness"], "model": reviewer.get("model"),
+            "route_id": reviewer["route"], "request_id": request_id,
+            "competition_id": started.get("competition_id"),
+            "task_id": started.get("task_id"),
+            "readback_tool": "grabowski_agent_competition_status",
+            "does_not_establish": ["provider_success", "review_authority"],
+        }
+    except Exception as exc:
+        return {
+            **base, "state": "unavailable",
+            "reason": "start_unavailable_or_outcome_unknown",
+            "error_type": type(exc).__name__,
+            "retry_automatically": False,
+        }
 
 
 def _agent_execution_route_command(
@@ -9101,6 +9217,9 @@ def _agent_execution_source_request(
     if novelty not in {"low", "medium", "high"}:
         raise GripPreflightError("novelty must be low, medium or high")
     risk_flags = _string_list_parameter(parameters, "risk_flags")
+    hard_case_signal = _agent_execution_validate_hard_case_advisory(
+        parameters.get("hard_case_advisory")
+    )
     verification_policy = parameters.get("verification_policy", "independent_review")
     if verification_policy not in {
         "deterministic", "self_review", "independent_review",
@@ -9219,6 +9338,13 @@ def _agent_execution_source_request(
             "stop": True,
         }
     controller_actor = _agent_execution_controller_actor(parameters)
+    if hard_case_signal is not None:
+        frontdoor["hard_case_advisory"] = _agent_execution_hard_case_advisory(
+            signal=hard_case_signal, task_class=task_class.strip(), novelty=novelty,
+            risk_flags=risk_flags, router=router, repo=repo, head=source_revision,
+            source_identity_sha256=source_identity_sha256, objective=objective,
+            duration_minutes=duration_minutes, changed_files=len(write_paths),
+        )
     if route.get("executor") == "controller":
         if route.get("direct_work_required") is not True:
             raise GripPreflightError(
