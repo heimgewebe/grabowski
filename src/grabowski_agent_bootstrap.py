@@ -264,6 +264,8 @@ def _chronik_first_context(
             repository_query["subject_component"] = subject_component
         if pr_number is not None:
             repository_query["pr_number"] = pr_number
+        if host:
+            repository_query["host"] = host
         queries.append(("repository", repository_query))
         component_query: dict[str, Any] = {
             "subject_component": subject_component or repo.split("/", 1)[-1],
@@ -346,15 +348,16 @@ def _chronik_first_context(
             match_basis = "exact_target"
             # A named host is an exact boundary, including for exact-task
             # lookups; never let the unattributed fallback admit another host.
-            if host and subject.get("scope") == "host" and subject.get("host") != host:
+            if host and subject.get("host") != host:
+                discarded += 1
+                continue
+            if pr_number is not None and subject.get("pr_number") != pr_number:
+                discarded += 1
+                continue
+            if subject_component and subject.get("component") != subject_component:
                 discarded += 1
                 continue
             if repo:
-                # Never attribute a different PR to the requested target, even
-                # when a provider unexpectedly returns an overbroad candidate.
-                if pr_number is not None and subject.get("pr_number") != pr_number:
-                    discarded += 1
-                    continue
                 if (
                     subject.get("scope") == "repository"
                     and subject.get("repo") == repo
