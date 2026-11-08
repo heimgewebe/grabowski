@@ -458,6 +458,15 @@ class AgentBootstrapTests(unittest.TestCase):
         calls = []
         def search(**kwargs):
             calls.append(kwargs)
+            if "subject_component" in kwargs:
+                return {
+                    "available": True, "historical_only": True,
+                    "search_exhaustive": True, "matching_count": 0, "has_more": False,
+                    "ledger_snapshot": {
+                        "integrity_valid": True, "invalid_record_count": 0,
+                        "sha256": "c" * 64,
+                    }, "events": [],
+                }
             return {
                 "available": True, "historical_only": True,
                 "search_exhaustive": True, "matching_count": 1, "has_more": False,
@@ -482,7 +491,10 @@ class AgentBootstrapTests(unittest.TestCase):
         context = module._chronik_first_context(
             repo="heimgewebe/grabowski", search_fn=search,
         )
-        self.assertEqual(calls, [{"repo": "heimgewebe/grabowski", "limit": 10}])
+        self.assertEqual(calls, [
+            {"repo": "heimgewebe/grabowski", "limit": 10},
+            {"subject_component": "grabowski", "limit": 10},
+        ])
         self.assertEqual(context["status"], "available")
         self.assertEqual(context["events"][0]["outcome"], "failed")
         self.assertNotIn("private_payload", str(context))
@@ -514,6 +526,7 @@ class AgentBootstrapTests(unittest.TestCase):
         self.assertEqual(pr["status"], "available")
         self.assertEqual(calls[0], {"host": "heim-pc", "subject_component": "rustdesk", "limit": 10})
         self.assertEqual(calls[1], {"repo": "heimgewebe/grabowski", "pr_number": 1724, "limit": 10})
+        self.assertEqual(calls[2], {"subject_component": "grabowski", "pr_number": 1724, "limit": 10})
 
     def test_chronik_first_skips_unbound_nonproject_work(self) -> None:
         module = self.load_module()
@@ -526,6 +539,14 @@ class AgentBootstrapTests(unittest.TestCase):
     def test_chronik_first_rejects_producer_repo_as_subject(self) -> None:
         module = self.load_module()
         def search(**kwargs):
+            if "subject_component" in kwargs:
+                return {
+                    "available": True, "historical_only": True,
+                    "search_exhaustive": True, "matching_count": 0,
+                    "has_more": False,
+                    "ledger_snapshot": {"integrity_valid": True, "invalid_record_count": 0},
+                    "events": [],
+                }
             return {
                 "available": True, "historical_only": True,
                 "search_exhaustive": True, "matching_count": 55112,
@@ -548,6 +569,76 @@ class AgentBootstrapTests(unittest.TestCase):
         self.assertFalse(context["selection_complete"])
         self.assertEqual(context["context_gap"], "bounded_candidate_page_only")
 
+    def test_chronik_first_finds_host_scoped_commonthing_pr_1977(self) -> None:
+        module = self.load_module()
+        calls = []
+        def search(**kwargs):
+            calls.append(kwargs)
+            match = "subject_component" in kwargs
+            events = [{
+                "event_ref": "chronik:agent.ledger:sha256:" + "a" * 64,
+                "canonical_event_sha256": "b" * 64,
+                "event": {
+                    "kind": "agent.run.failed", "ts": "2026-10-27T14:18:14Z",
+                    "subject": {"scope": "host", "host": "heim-pc",
+                                "component": "commonthing", "pr_number": 1977},
+                    "source": {"repo": "heimgewebe/grabowski", "run_id": "task-example"},
+                    "data": {"result": "failed", "operation": "review", "task_class": "review"},
+                    "evidence_refs": ["grabowski-task:example"],
+                },
+            }] if match else []
+            return {
+                "available": True, "historical_only": True,
+                "search_exhaustive": True, "matching_count": len(events),
+                "has_more": False, "events": events,
+                "result_sha256": ("e" if match else "d") * 64,
+                "ledger_snapshot": {"integrity_valid": True, "invalid_record_count": 0,
+                                    "sha256": "c" * 64},
+            }
+        context = module._chronik_first_context(
+            repo="heimgewebe/commonthing", pr_number=1977, search_fn=search,
+        )
+        self.assertEqual(calls, [
+            {"repo": "heimgewebe/commonthing", "pr_number": 1977, "limit": 10},
+            {"subject_component": "commonthing", "pr_number": 1977, "limit": 10},
+        ])
+        self.assertEqual(context["selected_event_count"], 1)
+        self.assertEqual(context["events"][0]["outcome"], "failed")
+        self.assertEqual(context["events"][0]["match_basis"], "host_component_heuristic")
+        self.assertFalse(context["selection_complete"])
+        self.assertEqual(context["context_gap"], "host_component_attribution_heuristic")
+
+    def test_chronik_first_secondary_scope_failure_is_not_false_zero(self) -> None:
+        module = self.load_module()
+        def search(**kwargs):
+            if "subject_component" in kwargs:
+                raise TimeoutError("secondary scope unavailable")
+            return {"available": True, "historical_only": True,
+                    "search_exhaustive": True, "matching_count": 0,
+                    "has_more": False, "events": [],
+                    "ledger_snapshot": {"integrity_valid": True, "invalid_record_count": 0}}
+        context = module._chronik_first_context(
+            repo="heimgewebe/commonthing", pr_number=1977, search_fn=search,
+        )
+        self.assertEqual(context["status"], "historical_context_unavailable")
+        self.assertEqual(context["failed_scope"], "host_component")
+        self.assertEqual(context["failure_code"], "TimeoutError")
+
+    def test_chronik_first_two_scope_snapshot_drift_is_explicit(self) -> None:
+        module = self.load_module()
+        def search(**kwargs):
+            return {"available": True, "historical_only": True,
+                    "search_exhaustive": True, "matching_count": 0,
+                    "has_more": False, "events": [],
+                    "ledger_snapshot": {"integrity_valid": True, "invalid_record_count": 0,
+                        "sha256": ("d" if "subject_component" in kwargs else "c") * 64}}
+        context = module._chronik_first_context(
+            repo="heimgewebe/commonthing", pr_number=1977, search_fn=search,
+        )
+        self.assertFalse(context["selection_complete"])
+        self.assertEqual(context["context_gap"], "ledger_snapshot_changed_between_scopes")
+        self.assertIsNone(context["snapshot_sha256"])
+
     def test_chronik_first_incident_continuation_uses_exact_task(self) -> None:
         module = self.load_module()
         calls = []
@@ -565,6 +656,19 @@ class AgentBootstrapTests(unittest.TestCase):
         self.assertEqual(calls, [{"task_id": "a" * 24, "limit": 10}])
         self.assertEqual(context["status"], "available")
         self.assertEqual(context["events"][0]["outcome"], "failed")
+
+    def test_chronik_first_missing_provider_import_is_nonblocking(self) -> None:
+        from unittest import mock
+
+        module = self.load_module()
+        with mock.patch.dict(sys.modules, {"grabowski_tasks": None}):
+            context = module._chronik_first_context(
+                repo="heimgewebe/commonthing", pr_number=1977,
+            )
+        self.assertEqual(context["status"], "historical_context_unavailable")
+        self.assertEqual(context["failure_code"], "ModuleNotFoundError")
+        self.assertEqual(context["failed_scope"], "provider_import")
+        self.assertEqual(context["events"], [])
 
     def test_chronik_first_failure_is_nonblocking_and_explicit(self) -> None:
         module = self.load_module()

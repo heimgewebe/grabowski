@@ -921,13 +921,15 @@ def _historical_recall_target_selection(
     binding_complete = not missing
     if profile_name == "pr":
         selector: dict[str, Any] = {}
+        host_component_selector: dict[str, Any] = {}
         repository_scoped_selector: dict[str, Any] = {}
         bounded_summary_selector: dict[str, Any] = {}
         if "repository" in normalized:
             repository = normalized["repository"]
             # Host-scoped Grabowski events have the producer as source.repo,
             # with the project commonly (but not invariably) in subject.component.
-            selector["subject_component"] = repository.split("/", 1)[1]
+            selector["repo"] = repository
+            host_component_selector["subject_component"] = repository.split("/", 1)[1]
             # Repository-scoped events may carry an independent component,
             # e.g. heimgewebe/chronik PR 306 with component "task-runner".
             # Filtering these by the basename would produce false zero results.
@@ -936,23 +938,24 @@ def _historical_recall_target_selection(
         if "pull_request" in normalized:
             number = normalized["pull_request"]
             selector["pr_number"] = number
+            host_component_selector["pr_number"] = number
             repository_scoped_selector["pr_number"] = number
             bounded_summary_selector["pr_number"] = number
         exact_target_binding = (
-            {"subject_component", "pr_number"}.issubset(selector)
-            and {"repo", "pr_number"}.issubset(repository_scoped_selector)
+            {"subject_component", "pr_number"}.issubset(host_component_selector)
+            and {"repo", "pr_number"}.issubset(selector)
         )
         return {
             "binding": dict(normalized),
             "binding_complete": binding_complete,
             "selector_kind": "pull_request",
-            # Backwards-compatible primary selector for host-scoped history.
+            # Preserve the original repository-scoped selector for callers.
             "selector": selector,
-            # Must also search independently for repo-scoped events; Chronik
-            # joins fields with AND, so these cannot be one combined query.
+            # Host-scoped producer events need an independent component query.
+            "host_component_selector": host_component_selector,
             "repository_scoped_selector": repository_scoped_selector,
             "full_search_selectors": [
-                {"scope": "host_component", "selector": dict(selector)},
+                {"scope": "host_component", "selector": dict(host_component_selector)},
                 {"scope": "repository", "selector": dict(repository_scoped_selector)},
             ],
             "full_search_combination": "exhaust_each_query_then_union_by_event_id",

@@ -8,8 +8,14 @@ kein zusätzlicher Dienst und keine neue Autorisierungsgrenze.
 
 Wenn ein aufrufender Agent einen ausdrücklichen Zielselektor übergibt
 (Repository-Slug, Host, Komponentenname, PR), führt der
-Grabowski-Agent-Bootstrap vor seinen weiteren Beobachtungen einmal
-grabowski_chronik_full_search mit maximal zehn Treffern aus. Der Rückgabewert
+Grabowski-Agent-Bootstrap vor seinen weiteren Beobachtungen bis zu zwei
+unabhängige gezielte Chronik-Vollsuchen mit je maximal zehn Treffern aus:
+eine repository-scoped Suche nach Repository-Slug und eine host-scoped
+Suche nach der Komponente, die üblicherweise den Repository-Basename trägt.
+Bei PR-Anfragen wird dieselbe PR-Nummer in beiden Suchen verwendet.
+Einträge werden anhand ihrer Ereignisreferenz dedupliziert. Host-Ereignisse
+werden als heuristische Komponentenzuordnung gekennzeichnet, denn sie
+enthalten keinen beweiskräftigen Repository-Slug. Der Rückgabewert
 chronik_first enthält nur geprüfte zeitgebundene Event-Referenzen,
 SHA-256-Bindungen, Operationen, Outcomes und Belegreferenzen sowie
 Trefferzahl, Snapshot-Hash und den Hinweis auf weitere Treffer.
@@ -31,13 +37,22 @@ grabowski_agent_bootstrap(task_id="<bekannte Task-ID zur Incident-Fortsetzung>")
 
 Die zugrunde liegende Vollsuche unterstützt weitere Selektoren,
 Cursor und Pagination. Das Bootstrap-Budget bleibt bewusst auf zehn
-Treffer pro zielgebundenem Einstieg beschränkt.
+Treffer pro Query und zehn Ereignisse im Gesamtergebnis beschränkt.
+Wenn eine Kandidatenseite unvollständig ist, bleibt selection_complete=false
+und context_gap=bounded_candidate_page_only. Unterschiedliche Snapshots der
+beiden Suchscopes führen zu ledger_snapshot_changed_between_scopes.
+Bei zugeordneten Host-Ereignissen wird ein
+host_component_attribution_heuristic-Kontextvorbehalt ausgewiesen.
+Fehlt einer der Scopes, darf nicht behauptet werden, die Historie sei vollständig.
+Die Query- und Snapshot-Belege bleiben pro Scope erhalten.
 
-Repository-Kontext akzeptiert ausschließlich `subject.repo` als Arbeitsziel.
+Repository-Kontext akzeptiert `subject.repo` als Arbeitsziel.
 `source.repo` bezeichnet den Ereignisproduzenten; bei Grabowski steht dort
 auch für fremde Repositories und Host-Aufgaben `heimgewebe/grabowski`.
 Die kanonische Vollsuche behält ihren bestehenden Vertrag (Quelle oder Ziel).
 Der Bootstrap verwirft deshalb reine Quelltreffer vor der Kontextübernahme.
+Passende Host-Ereignisse bleiben dagegen mit dem expliziten
+match_basis=host_component_heuristic als historische Hinweise erhalten.
 `provider_matching_count` ist die ungefilterte Kandidatenzahl. Bei weiteren
 Kandidatenseiten bleibt `matching_count` unbekannt, `selection_complete=false`
 und `context_gap=bounded_candidate_page_only`. Eine leere erste Seite beweist
