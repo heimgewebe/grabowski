@@ -71,8 +71,9 @@ class CurrentWorkSurfaceTests(unittest.TestCase):
         database_reads = 0
         reconciliation_snapshots: list[object] = []
 
-        def collect_database() -> dict:
+        def collect_database(*, _wal_mutation_admission=None) -> dict:
             nonlocal database_reads
+            self.assertTrue(callable(_wal_mutation_admission))
             database_reads += 1
             return database
 
@@ -181,7 +182,7 @@ class CurrentWorkSurfaceTests(unittest.TestCase):
             "retentions": [],
         }
         reconciler = SimpleNamespace(
-            collect_lifecycle_bindings_from_db=lambda: database,
+            collect_lifecycle_bindings_from_db=lambda **_kwargs: database,
             collect_git_worktrees_for_repos=lambda targets, **_kwargs: (
                 observed_targets.append(list(targets))
                 or {
@@ -226,7 +227,7 @@ class CurrentWorkSurfaceTests(unittest.TestCase):
             "retentions": [],
         }
         reconciler = SimpleNamespace(
-            collect_lifecycle_bindings_from_db=lambda: database,
+            collect_lifecycle_bindings_from_db=lambda **_kwargs: database,
             collect_git_worktrees_for_repos=lambda *_args, **_kwargs: (
                 (_ for _ in ()).throw(
                     AssertionError("Git observation must not exceed repository bound")
@@ -264,7 +265,7 @@ class CurrentWorkSurfaceTests(unittest.TestCase):
             "retentions": [],
         }
         reconciler = SimpleNamespace(
-            collect_lifecycle_bindings_from_db=lambda: database,
+            collect_lifecycle_bindings_from_db=lambda **_kwargs: database,
             collect_git_worktrees_for_repos=lambda _targets, **_kwargs: {
                 "worktrees": [{"checkout_key": "checkout-bound"}],
                 "observable_repo_paths": [requested, REPOSITORY],
@@ -947,7 +948,7 @@ class CurrentWorkSurfaceTests(unittest.TestCase):
         reconciler = SimpleNamespace(
             MAX_PAGE_LIMIT=100,
             reconcile_checkout_bindings=reconcile,
-            collect_lifecycle_bindings_from_db=lambda: {
+            collect_lifecycle_bindings_from_db=lambda **_kwargs: {
                 "snapshot_sha256": "a" * 64,
             },
         )
