@@ -274,8 +274,13 @@ def _chronik_first_context(
             component_query["pr_number"] = pr_number
         queries.append(("host_component", component_query))
     elif repo and task_id:
-        # A unique task identity crosses host/repository event scopes.
-        queries.append(("exact_task", {"task_id": task_id}))
+        # A unique task crosses host/repository scopes; preserve explicit constraints.
+        exact_task_query: dict[str, Any] = {"task_id": task_id}
+        if pr_number is not None:
+            exact_task_query["pr_number"] = pr_number
+        if subject_component:
+            exact_task_query["subject_component"] = subject_component
+        queries.append(("exact_task", exact_task_query))
     else:
         queries.append(("exact_target", filters))
 
@@ -338,6 +343,11 @@ def _chronik_first_context(
             subject = event.get("subject") if isinstance(event.get("subject"), dict) else {}
             match_basis = "exact_target"
             if repo:
+                # Never attribute a different PR to the requested target, even
+                # when a provider unexpectedly returns an overbroad candidate.
+                if pr_number is not None and subject.get("pr_number") != pr_number:
+                    discarded += 1
+                    continue
                 if (
                     subject.get("scope") == "repository"
                     and subject.get("repo") == repo
