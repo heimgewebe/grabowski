@@ -138,7 +138,7 @@ def _regular_file_identity(
     label: str,
     allow_missing: bool = False,
 ) -> tuple[int, int, int, int, int] | None:
-    flags = os.O_RDONLY | os.O_CLOEXEC
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
@@ -167,7 +167,7 @@ def _read_regular_file(
     label: str,
     allow_missing: bool = False,
 ) -> tuple[bytes, tuple[int, int, int, int, int]] | None:
-    flags = os.O_RDONLY | os.O_CLOEXEC
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
@@ -857,11 +857,171 @@ def record_task_state(record: dict[str, Any], state: str) -> dict[str, Any]:
     return {"enabled": True, "written": append_unique(path, event), "path": str(path), "kind": event["kind"]}
 
 
+_KNOWLEDGE_REF = re.compile(r"[A-Za-z0-9][A-Za-z0-9:/._@#-]{0,199}\Z")
+
+
+def build_terminal_knowledge(record: dict[str, Any], state: str) -> dict[str, Any] | None:
+    """Preserve observed high-value task outcomes, never claim verified fixes."""
+    # outcome_unknown is a refreshable observation, not a terminal task state.
+    # Only the task lifecycle's final states have stable capture identity/time.
+    if state not in {"completed", "failed", "cancelled", "timed_out", "signalled"}:
+        return None
+    context = _context(record)
+    operation = context.get("operation")
+    if operation not in HIGH_VALUE_LIFECYCLE_OPERATIONS:
+        return None
+    key = {"repository": "repo", "host": "host"}.get(context.get("subject_scope"))
+    if key is None:
+        raise ValueError("invalid terminal knowledge target scope")
+    target, task_id, attempt = context.get(key), record.get("task_id"), record.get("attempt")
+    if not isinstance(target, str) or not _KNOWLEDGE_REF.fullmatch(target):
+        raise ValueError("invalid terminal knowledge target")
+    if not isinstance(task_id, str) or re.fullmatch(r"[0-9a-f]{24}", task_id) is None:
+        raise ValueError("invalid terminal knowledge task ID")
+    if type(attempt) is not int or not 1 <= attempt <= 1000000:
+        raise ValueError("invalid terminal knowledge attempt")
+    source = {"system": "heimgewebe/grabowski", "component": "task-terminalization"}
+    record_key = f"task:{task_id}:attempt:{attempt}:operation:{operation}:state:{state}"
+    subject = {key: target, "task_id": task_id}
+    if context.get("component") is not None:
+        component = context["component"]
+        # The task-context API accepts trimmed, non-control Unicode text up to
+        # 160 chars. Keep that contract at capture time (Chronik validates too).
+        if (not isinstance(component, str) or not component or
+                component.strip() != component or len(component) > 160 or
+                any(ord(char) < 32 or ord(char) == 127 for char in component)):
+            raise ValueError("invalid terminal knowledge component")
+        subject["component"] = component
+    if context.get("pr_number") is not None:
+        pr = context["pr_number"]
+        if type(pr) is not int or not 1 <= pr <= 2147483647:
+            raise ValueError("invalid terminal knowledge PR")
+        subject["pr_number"] = pr
+    refs = [f"grabowski-task:{task_id}"]
+    if _valid_sha256(record.get("lifecycle_receipt_sha256")):
+        refs.append(f"grabowski-receipt:{record['lifecycle_receipt_sha256']}")
+    event = {
+        "schema_version": "chronik-knowledge-event.v1",
+        "event_id": "sha256:" + _sha256_bytes(_canonical_bytes([source, record_key])),
+        "record_key": record_key, "kind": "knowledge.insight.published.v1",
+        "ts": _event_timestamp(record, state),
+        "source": source, "subject": subject,
+        "knowledge_type": "operation", "epistemic_status": "observed",
+        "statement": (
+            f"Grabowski task {task_id} reached {state} for {operation} on "
+            f"{key} {target}; task outcome does not verify production."
+        ),
+        "evidence_refs": refs, "relations": [],
+    }
+    if len(_canonical_bytes(event)) > 16384:
+        raise ValueError("terminal knowledge exceeds record budget")
+    return event
+
+
+def terminal_knowledge_capture_status(record: dict[str, Any], state: str) -> dict[str, Any]:
+    """A source queue is pending, never canonical-readback verified."""
+    event = build_terminal_knowledge(record, state)
+    if event is None:
+        return {"classification": "not_required"}
+    path = (state_root(record) / "grabowski" / "chronik-outbox" /
+            "knowledge" / (event["event_id"][7:] + ".json"))
+    try:
+        loaded = _read_regular_file(
+            path, maximum=16385, label="terminal knowledge", allow_missing=True
+        )
+        if loaded is None:
+            return {"classification": "capture_missing", "event_id": event["event_id"]}
+        if loaded[0] != _canonical_bytes(event) + b"\n":
+            return {"classification": "capture_invalid", "event_id": event["event_id"]}
+    except (OSError, ValueError):
+        return {"classification": "capture_invalid", "event_id": event["event_id"]}
+    return {"classification": "queued_unverified", "event_id": event["event_id"],
+            "outbox_sha256": _sha256_bytes(loaded[0]), "ledger_verified": False}
+
+
+
+def _fsync_knowledge_directory_chain(directory: Path) -> None:
+    # A newly created outbox or knowledge/ directory is not durable simply
+    # because its contents are fsynced. Replays must also close this gap.
+    current = directory.resolve(strict=True)
+    while True:
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(current, flags)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        if current.parent == current:
+            break
+        current = current.parent
+
+
+def capture_terminal_knowledge(record: dict[str, Any], state: str) -> dict[str, Any]:
+    event = build_terminal_knowledge(record, state)
+    if event is None:
+        return {"classification": "not_required"}
+    root = state_root(record) / "grabowski" / "chronik-outbox"
+    path = root / "knowledge" / (event["event_id"][7:] + ".json")
+    raw = _canonical_bytes(event) + b"\n"
+    with _writer_compaction_lock(root):
+        path.parent.mkdir(mode=0o700, exist_ok=True)
+        parent_stat = path.parent.lstat()
+        if (not stat.S_ISDIR(parent_stat.st_mode) or
+                parent_stat.st_uid != os.geteuid() or parent_stat.st_mode & 0o022):
+            raise ValueError("knowledge outbox directory is not private and owned")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            descriptor = os.open(path, flags, 0o600)
+        except FileExistsError:
+            # The first attempt may have created a complete visible source but
+            # failed fsync. Identity comparison alone cannot acknowledge it.
+            read_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
+            if hasattr(os, "O_NOFOLLOW"):
+                read_flags |= os.O_NOFOLLOW
+            descriptor = os.open(path, read_flags)
+            with os.fdopen(descriptor, "rb") as handle:
+                source_stat = os.fstat(handle.fileno())
+                if (not stat.S_ISREG(source_stat.st_mode) or
+                        source_stat.st_size != len(raw) or
+                        handle.read(len(raw) + 1) != raw):
+                    raise ValueError("knowledge identity conflict or incomplete source")
+                os.fsync(handle.fileno())
+            _fsync_knowledge_directory_chain(path.parent)
+            status = terminal_knowledge_capture_status(record, state)
+            if status["classification"] != "queued_unverified":
+                raise ValueError("knowledge identity conflict or incomplete source")
+            return {**status, "new": False}
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(raw)
+            handle.flush()
+            os.fsync(handle.fileno())
+        _fsync_knowledge_directory_chain(path.parent)
+    status = terminal_knowledge_capture_status(record, state)
+    if status["classification"] != "queued_unverified":
+        raise ValueError("knowledge source readback failed")
+    return {**status, "new": True}
+
+
 def record_task_state_safely(record: dict[str, Any], state: str) -> dict[str, Any]:
     try:
-        return record_task_state(record, state)
+        result = record_task_state(record, state)
     except Exception as exc:
-        return {"enabled": _record_enabled_for_state(record, state), "written": False, "error": str(exc)}
+        result = {"enabled": _record_enabled_for_state(record, state),
+                  "written": False, "error": str(exc)}
+    try:
+        knowledge = capture_terminal_knowledge(record, state)
+        if knowledge["classification"] != "not_required":
+            result["knowledge_capture"] = knowledge
+    except Exception as exc:
+        result["knowledge_capture"] = {
+            "classification": "capture_missing_or_invalid",
+            "error_class": type(exc).__name__, "ledger_verified": False,
+        }
+    return result
 
 
 def plexer_events_url(raw: str | None = None) -> str | None:

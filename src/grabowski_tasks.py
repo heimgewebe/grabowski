@@ -10306,6 +10306,18 @@ def _task_status_after_mutation_guard(
 
     result["closeout"] = task_attention.terminal_closeout_plan(stored)
     result["lease_maintenance"] = lease_maintenance
+    if _is_terminal_state(stored["state"]):
+        try:
+            knowledge_status = chronik.terminal_knowledge_capture_status(
+                stored, stored["state"]
+            )
+        except (OSError, ValueError, TypeError) as exc:
+            knowledge_status = {
+                "classification": "source_unreadable",
+                "error_class": type(exc).__name__, "ledger_verified": False,
+            }
+        if knowledge_status["classification"] != "not_required":
+            result["chronik_knowledge_capture"] = knowledge_status
     return result
 
 
