@@ -656,6 +656,18 @@ def _strict_inventory_readonly_scope() -> Iterator[None]:
             _INVENTORY_READ_ONLY_STACK.reset(token)
 
 
+def _finish_inventory_readonly_snapshot() -> None:
+    """Validate and release captured SQL rows before slow Git observation.
+
+    The strict reader pins DB/WAL identity only while fetching lifecycle and
+    lease rows. Holding those pins across hundreds of Git probes incorrectly
+    fails ordinary concurrent SQLite commits after the rows were captured.
+    """
+    stack = _INVENTORY_READ_ONLY_STACK.get()
+    if stack is not None:
+        stack.pop_all().close()
+
+
 def _readonly_connection(path: Path) -> sqlite3.Connection | None:
     stack = _INVENTORY_READ_ONLY_STACK.get()
     if not path.exists():
@@ -5587,6 +5599,7 @@ def _linked_checkout_coordination(
     include_tasks: bool = True,
     include_resources: bool = True,
     ignored_lease_owner_ids: Iterable[str] = (),
+    resource_leases: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     if owner_id is not None:
         _owner(owner_id)
@@ -5596,7 +5609,9 @@ def _linked_checkout_coordination(
     )
     resource_blockers: list[dict[str, Any]] = []
     if include_resources:
-        for lease in _read_resource_leases():
+        for lease in (
+            resource_leases if resource_leases is not None else _read_resource_leases()
+        ):
             if lease["owner_id"] in ignored_owners:
                 continue
             resource_key = lease["resource_key"]
@@ -6039,6 +6054,11 @@ def checkout_inventory(
         return rank, str(record["path"])
 
     ordered_records = sorted(records, key=observation_priority)
+    # All lifecycle and lease evidence is now in Python records. Reuse the
+    # same lease observation for every checkout instead of opening a new SQLite
+    # snapshot per worktree while Git status and remote-ref probes are running.
+    resource_leases = _read_resource_leases() if include_resources and records else []
+    _finish_inventory_readonly_snapshot()
 
     def remaining_git_timeout() -> float | None:
         if deadline_monotonic is None:
@@ -6105,6 +6125,7 @@ def checkout_inventory(
             include_processes=include_processes,
             include_tasks=include_tasks,
             include_resources=include_resources,
+            resource_leases=resource_leases,
         )
         lifecycle = {
             "retention": retention.get(record["checkout_key"]),

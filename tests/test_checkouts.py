@@ -6113,6 +6113,52 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self.assertIsNone(status["returncode"])
         self.assertEqual(status["error"], "git status timed out")
 
+    def test_strict_inventory_releases_sqlite_snapshot_before_git_probes(self) -> None:
+        binding = self._managed_binding()
+        original_status = checkouts._worktree_status
+        committed_after_snapshot = False
+
+        def concurrent_status(record, *, timeout_seconds):
+            nonlocal committed_after_snapshot
+            if not committed_after_snapshot:
+                writer = checkouts._database()
+                try:
+                    writer.execute(
+                        "UPDATE retention SET updated_at_unix=updated_at_unix+1 "
+                        "WHERE checkout_key=?",
+                        (binding["checkout_key"],),
+                    )
+                    writer.commit()
+                finally:
+                    writer.close()
+                committed_after_snapshot = True
+            return original_status(record, timeout_seconds=timeout_seconds)
+
+        with patch.object(checkouts, "_worktree_status", side_effect=concurrent_status):
+            with checkouts._strict_inventory_readonly_scope():
+                inventory = checkouts.checkout_inventory(
+                    self.repo,
+                    include_processes=False,
+                    include_tasks=False,
+                    include_resources=False,
+                )
+        self.assertTrue(committed_after_snapshot)
+        self.assertFalse(inventory["truncated"])
+        self.assertEqual(inventory["observed_worktree_count"], 2)
+
+    def test_checkout_inventory_reuses_one_lease_snapshot_for_all_worktrees(self) -> None:
+        with patch.object(
+            checkouts, "_read_resource_leases", return_value=[]
+        ) as read_leases:
+            inventory = checkouts.checkout_inventory(
+                self.repo,
+                include_processes=False,
+                include_tasks=False,
+                include_resources=True,
+            )
+        self.assertEqual(inventory["observed_worktree_count"], 2)
+        read_leases.assert_called_once_with()
+
     def test_bounded_inventory_does_not_probe_expired_capacity_paths(self) -> None:
         binding = self._managed_binding()
         expired = int(time.time()) - 1
