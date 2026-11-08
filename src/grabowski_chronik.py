@@ -862,7 +862,9 @@ _KNOWLEDGE_REF = re.compile(r"[A-Za-z0-9][A-Za-z0-9:/._@#-]{0,199}\Z")
 
 def build_terminal_knowledge(record: dict[str, Any], state: str) -> dict[str, Any] | None:
     """Preserve observed high-value task outcomes, never claim verified fixes."""
-    if state not in TERMINAL:
+    # outcome_unknown is a refreshable observation, not a terminal task state.
+    # Only the task lifecycle's final states have stable capture identity/time.
+    if state not in {"completed", "failed", "cancelled", "timed_out", "signalled"}:
         return None
     context = _context(record)
     operation = context.get("operation")
@@ -883,7 +885,11 @@ def build_terminal_knowledge(record: dict[str, Any], state: str) -> dict[str, An
     subject = {key: target, "task_id": task_id}
     if context.get("component") is not None:
         component = context["component"]
-        if not isinstance(component, str) or not _KNOWLEDGE_REF.fullmatch(component):
+        # The task-context API accepts trimmed, non-control Unicode text up to
+        # 160 chars. Keep that contract at capture time (Chronik validates too).
+        if (not isinstance(component, str) or not component or
+                component.strip() != component or len(component) > 160 or
+                any(ord(char) < 32 or ord(char) == 127 for char in component)):
             raise ValueError("invalid terminal knowledge component")
         subject["component"] = component
     if context.get("pr_number") is not None:

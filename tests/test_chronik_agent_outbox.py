@@ -1002,6 +1002,46 @@ class ChronikKnowledgeCaptureTests(unittest.TestCase):
                          "not_required")
         self.assertEqual(list(self.root.rglob("knowledge/*.json")), [])
 
+    def test_outcome_unknown_is_refreshable_not_terminal_knowledge(self):
+        self.enable()
+        value = record(chronik_context_json={
+            "subject_scope": "host", "host": "heim-pc",
+            "operation": "merge", "task_class": "merge",
+        })
+        for observed_at in (1_700_000_100, 1_700_000_500):
+            value["updated_at_unix"] = observed_at
+            status = chronik.record_task_state_safely(value, "outcome_unknown")
+            self.assertNotIn("knowledge_capture", status)
+            self.assertEqual(
+                chronik.terminal_knowledge_capture_status(value, "outcome_unknown")["classification"],
+                "not_required",
+            )
+        self.assertEqual(list(self.root.rglob("knowledge/*.json")), [])
+        self.assertEqual(
+            chronik.capture_terminal_knowledge(value, "completed")["classification"],
+            "queued_unverified",
+        )
+
+    def test_component_with_spaces_and_unicode_uses_task_metadata_contract(self):
+        self.enable()
+        component = "deploy worker – München"
+        value = record(chronik_context_json={
+            "subject_scope": "repository", "repo": "heimgewebe/chronik",
+            "operation": "deploy", "task_class": "deploy",
+            "component": component,
+        })
+        result = chronik.capture_terminal_knowledge(value, "completed")
+        self.assertEqual(result["classification"], "queued_unverified")
+        path = (self.root / "grabowski" / "chronik-outbox" / "knowledge" /
+                (result["event_id"][7:] + ".json"))
+        self.assertEqual(
+            json.loads(path.read_text(encoding="utf-8"))["subject"]["component"],
+            component,
+        )
+        self.assertEqual(
+            chronik.capture_terminal_knowledge(value, "completed")["new"], False
+        )
+
     def test_missing_and_invalid_capture_are_detectable(self):
         self.enable()
         value = record(chronik_context_json={
