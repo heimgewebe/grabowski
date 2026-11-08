@@ -691,6 +691,61 @@ class AgentBootstrapTests(unittest.TestCase):
         self.assertEqual(context["context_gap"], "ledger_snapshot_changed_between_scopes")
         self.assertIsNone(context["snapshot_sha256"])
 
+    def test_chronik_first_repository_and_host_are_both_constraints(self) -> None:
+        module = self.load_module()
+        calls = []
+
+        def event(subject, tag):
+            return {
+                "event_ref": "chronik:agent.ledger:sha256:" + tag * 64,
+                "canonical_event_sha256": tag * 64,
+                "event": {
+                    "ts": "2026-11-08T08:00:00Z", "kind": "agent.run.failed",
+                    "subject": subject,
+                    "source": {"repo": "heimgewebe/grabowski",
+                               "run_id": "task-example"},
+                    "data": {"result": "failed", "operation": "review",
+                             "task_class": "review"},
+                    "evidence_refs": ["grabowski-task:example"],
+                },
+            }
+
+        def search(**kwargs):
+            calls.append(kwargs)
+            # Even an overbroad repository search must not admit a record
+            # without the explicitly requested host.
+            events = ([event(
+                {"scope": "repository", "repo": "heimgewebe/commonthing"}, "a"
+            )] if "repo" in kwargs else [event(
+                {"scope": "host", "host": "requested-host",
+                 "component": "commonthing"}, "b"
+            )])
+            return {
+                "available": True, "historical_only": True,
+                "search_exhaustive": True, "matching_count": 1,
+                "has_more": False, "events": events,
+                "ledger_snapshot": {"integrity_valid": True,
+                                    "invalid_record_count": 0,
+                                    "sha256": "c" * 64},
+            }
+
+        context = module._chronik_first_context(
+            repo="heimgewebe/commonthing", host="requested-host",
+            search_fn=search,
+        )
+        self.assertEqual(calls, [
+            {"repo": "heimgewebe/commonthing",
+             "host": "requested-host", "limit": 10},
+            {"subject_component": "commonthing",
+             "host": "requested-host", "limit": 10},
+        ])
+        self.assertEqual(context["selected_event_count"], 1)
+        self.assertEqual(context["discarded_source_only_matches"], 1)
+        self.assertEqual(context["events"][0]["event_ref"],
+                         "chronik:agent.ledger:sha256:" + "b" * 64)
+        self.assertEqual(context["events"][0]["match_basis"],
+                         "host_component_heuristic")
+
     def test_chronik_first_exact_task_keeps_host_constraint(self) -> None:
         module = self.load_module()
         calls = []
