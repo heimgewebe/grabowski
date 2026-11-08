@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 import hashlib
 import json
 import os
@@ -610,6 +610,7 @@ def collect_lifecycle_bindings_from_db(
     db_path: Path | str | None = None,
     *,
     _native_wal_snapshot: bool = False,
+    _wal_mutation_admission: Callable[[], None] | None = None,
     _wal_transition_retry_available: bool = True,
 ) -> dict[str, Any]:
     """Read every durable lifecycle binding from one pinned read-only transaction."""
@@ -618,8 +619,17 @@ def collect_lifecycle_bindings_from_db(
         raise ValueError("native WAL snapshot mode must be boolean")
     if type(_wal_transition_retry_available) is not bool:
         raise ValueError("WAL transition retry flag must be boolean")
+    if _wal_mutation_admission is not None and not callable(_wal_mutation_admission):
+        raise ValueError("WAL mutation admission must be callable")
     wal_path = Path(str(path) + "-wal")
-    native = _native_wal_snapshot and (wal_path.exists() or wal_path.is_symlink())
+    native = (
+        _native_wal_snapshot or _wal_mutation_admission is not None
+    ) and (wal_path.exists() or wal_path.is_symlink())
+    # Native WAL reads may update existing -shm read marks. Admit that exact
+    # side effect before opening SQLite; idle/no-WAL reads stay genuinely
+    # immutable and do not need mutation admission.
+    if native and _wal_mutation_admission is not None:
+        _wal_mutation_admission()
     inventory = (
         sqlite_store.inventory_native_wal_readonly_sqlite
         if native else sqlite_store.inventory_readonly_sqlite
@@ -729,7 +739,7 @@ def collect_lifecycle_bindings_from_db(
         # source never completed schema/data validation.  Sidecar safety checks
         # run again in the native reader and still deny invalid paths.
         if (
-            _native_wal_snapshot
+            (_native_wal_snapshot or _wal_mutation_admission is not None)
             and _wal_transition_retry_available
             and not native
             and snapshot_complete
@@ -739,6 +749,7 @@ def collect_lifecycle_bindings_from_db(
             return collect_lifecycle_bindings_from_db(
                 path,
                 _native_wal_snapshot=True,
+                _wal_mutation_admission=_wal_mutation_admission,
                 _wal_transition_retry_available=False,
             )
         if (
@@ -882,6 +893,7 @@ def reconcile_checkout_bindings(
     ),
     _database_snapshot: dict[str, Any] | None = None,
     _single_complete_snapshot: bool = False,
+    _wal_mutation_admission: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """Compare one pinned database/Git snapshot with worktrees.
 
@@ -899,7 +911,9 @@ def reconcile_checkout_bindings(
         database = _validated_database_snapshot(_database_snapshot)
     else:
         database = collect_lifecycle_bindings_from_db(
-            db_path, _native_wal_snapshot=_single_complete_snapshot,
+            db_path,
+            _native_wal_snapshot=_single_complete_snapshot,
+            _wal_mutation_admission=_wal_mutation_admission,
         )
     bindings = list(database["bindings"])
     if filters is not None:
