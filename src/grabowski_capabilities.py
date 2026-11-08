@@ -362,9 +362,9 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
     },
     "grabowski_checkout_binding_reconciliation": {
         "category": "checkout-lifecycle",
-        "purpose": "Classify durable checkout lifecycle bindings against current canonical Git worktree observations without creating mutation authority.",
+        "purpose": "Classify durable checkout bindings against canonical Git observations; active WAL reads require admitted SQLite SHM read-mark writes.",
         "risk_class": "low",
-        "effects": [],
+        "effects": ["sqlite-wal-shm-sidecar-write"],
         "reversibility": "not-applicable",
     },
     "grabowski_checkout_binding_terminal_preview": {
@@ -1224,9 +1224,9 @@ TOOL_PROFILES.update(
         },
         "grabowski_current_work": {
             "category": "operations-observability",
-            "purpose": "Project bounded global operator work from task, attention, lease, worker and physical sources plus repository-filtered checkout evidence, with mixed scope explicit and no second lifecycle truth.",
+            "purpose": "Project global operator work and repository-filtered checkout evidence; active SQLite WAL reads may update admitted SHM read marks.",
             "risk_class": "low",
-            "effects": [],
+            "effects": ["sqlite-wal-shm-sidecar-write"],
             "reversibility": "not-applicable",
         },
         "grabowski_work_acquire": {
@@ -1245,9 +1245,9 @@ TOOL_PROFILES.update(
         },
         "grabowski_operator_optimization_report": {
             "category": "operations-observability",
-            "purpose": "Compose bounded audit, friction, execution-outcome and current-work evidence into a manual read-only optimization report.",
+            "purpose": "Compose audit, friction, execution-outcome and current-work evidence; transitive active WAL reads may update admitted SHM read marks.",
             "risk_class": "low",
-            "effects": [],
+            "effects": ["sqlite-wal-shm-sidecar-write"],
             "reversibility": "not-applicable",
         },
         "grabowski_git_status": {

@@ -626,10 +626,12 @@
     {
       "category": "operations-observability",
       "description": "Project global operator work plus repository-filtered Git surfaces without blocking the MCP event loop.",
-      "effects": [],
+      "effects": [
+        "sqlite-wal-shm-sidecar-write"
+      ],
       "id": "grabowski_current_work",
-      "purpose": "Project bounded global operator work from task, attention, lease, worker and physical sources plus repository-filtered checkout evidence, with mixed scope explicit and no second lifecycle truth.",
-      "read_only": true,
+      "purpose": "Project global operator work and repository-filtered checkout evidence; active SQLite WAL reads may update admitted SHM read marks.",
+      "read_only": null,
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_current_work"
@@ -655,10 +657,12 @@
     {
       "category": "operations-observability",
       "description": "Audit bounded operator friction without blocking the MCP event loop.",
-      "effects": [],
+      "effects": [
+        "sqlite-wal-shm-sidecar-write"
+      ],
       "id": "grabowski_operator_optimization_report",
-      "purpose": "Compose bounded audit, friction, execution-outcome and current-work evidence into a manual read-only optimization report.",
-      "read_only": true,
+      "purpose": "Compose audit, friction, execution-outcome and current-work evidence; transitive active WAL reads may update admitted SHM read marks.",
+      "read_only": null,
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_operator_optimization_report"
@@ -899,10 +903,12 @@
     {
       "category": "checkout-lifecycle",
       "description": "Compare checkout bindings without blocking the MCP event loop.",
-      "effects": [],
+      "effects": [
+        "sqlite-wal-shm-sidecar-write"
+      ],
       "id": "grabowski_checkout_binding_reconciliation",
-      "purpose": "Classify durable checkout lifecycle bindings against current canonical Git worktree observations without creating mutation authority.",
-      "read_only": true,
+      "purpose": "Classify durable checkout bindings against canonical Git observations; active WAL reads require admitted SQLite SHM read-mark writes.",
+      "read_only": null,
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_checkout_binding_reconciliation"
@@ -3773,7 +3779,7 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "dbe955e33d5eed360d0c6ab194c252d626f22eab2625937b2787ee08f7914b37"
+      "sha256": "fa35f718ca3fe770b81d8138d41736a2091a3cbaf5486fb47619407b32a445b5"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -3897,7 +3903,7 @@
       "src/grabowski_repoground_catalog.py": "b8ea8d611a37bb287ae8836790c6aa7abf29c08dcccf252492fb355c9f9ba58f",
       "src/grabowski_repoground_post_merge.py": "6907ea6de2a66209975d3b835fe4bf70683a35bffdcbe479182e9ae010954a5a",
       "src/grabowski_resources.py": "28fee9a0fe8f04c0d99e218ee64ef536f30db9a525d6efe5859cd0184fe81a43",
-      "src/grabowski_runtime.py": "783a6ed8635da45733a80ed9872a5afcd33aedf638f567fea464e4ab623ff182",
+      "src/grabowski_runtime.py": "8a671808830948b094f6c89a0d917e8c51113c090d1570671797e60a4d3fb35e",
       "src/grabowski_runtime_contract.py": "4528ec08c1019a2b773a7e05250f4842ca2403d1c9171b19ef98a63c6e588054",
       "src/grabowski_runtime_extensions.py": "4bbaabe4120acc6879297e85d3664c69193fe0a9850e48522d1839b7844b2297",
       "src/grabowski_self_deploy.py": "1c2bd7e9800a1d98fa8d4f456dd33759b66c3d6b4523e63012a31684c86c3db1",
