@@ -610,7 +610,7 @@ def collect_lifecycle_bindings_from_db(
     db_path: Path | str | None = None,
     *,
     _native_wal_snapshot: bool = False,
-    _wal_mutation_admission: Callable[[], None] | None = None,
+    _wal_mutation_admission: Callable[[Path], None] | None = None,
     _wal_transition_retry_available: bool = True,
 ) -> dict[str, Any]:
     """Read every durable lifecycle binding from one pinned read-only transaction."""
@@ -629,7 +629,7 @@ def collect_lifecycle_bindings_from_db(
     # side effect before opening SQLite; idle/no-WAL reads stay genuinely
     # immutable and do not need mutation admission.
     if native and _wal_mutation_admission is not None:
-        _wal_mutation_admission()
+        _wal_mutation_admission(Path(str(path) + "-shm"))
     inventory = (
         sqlite_store.inventory_native_wal_readonly_sqlite
         if native else sqlite_store.inventory_readonly_sqlite
@@ -893,7 +893,7 @@ def reconcile_checkout_bindings(
     ),
     _database_snapshot: dict[str, Any] | None = None,
     _single_complete_snapshot: bool = False,
-    _wal_mutation_admission: Callable[[], None] | None = None,
+    _wal_mutation_admission: Callable[[Path], None] | None = None,
 ) -> dict[str, Any]:
     """Compare one pinned database/Git snapshot with worktrees.
 

@@ -84,7 +84,7 @@ def _stage_unpublished_tools() -> None:
 _stage_unpublished_tools()
 
 
-@mcp.tool(name="grabowski_current_work", annotations=READ_ONLY)
+@mcp.tool(name="grabowski_current_work", annotations=grabowski_operator_core.MUTATING)
 async def grabowski_current_work(
     repositories: Annotated[
         list[str],
@@ -169,7 +169,7 @@ async def grabowski_operator_optimization_report(
     )
 
 
-@mcp.tool(name="grabowski_checkout_binding_reconciliation", annotations=READ_ONLY)
+@mcp.tool(name="grabowski_checkout_binding_reconciliation", annotations=grabowski_operator_core.MUTATING)
 async def grabowski_checkout_binding_reconciliation(
     repository_filters: list[str] | None = None,
     limit: int = 20,
@@ -183,8 +183,8 @@ async def grabowski_checkout_binding_reconciliation(
         cursor=cursor,
         # SQLite mode=ro may update existing SHM read marks. The existing
         # mutation gate is consulted only when an actual WAL reader is needed.
-        _wal_mutation_admission=lambda: grabowski_operator_core._require_operator_mutation(
-            "resource_lease"
+        _wal_mutation_admission=lambda shm_path: grabowski_operator_core._require_operator_mutation(
+            "resource_lease", path=str(shm_path), host="heim-pc"
         ),
     )
 

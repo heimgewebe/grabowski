@@ -745,13 +745,48 @@ def observed_repo(*records: dict) -> dict:
 
 
 class CheckoutBindingLiveIntegrationTests(unittest.TestCase):
+    def test_public_wal_tools_are_not_readonly_transport_bypasses(self) -> None:
+        import ast
+
+        runtime = Path(__file__).resolve().parents[1] / "src" / "grabowski_runtime.py"
+        module = ast.parse(runtime.read_text(encoding="utf-8"))
+        tool_names = {
+            "grabowski_current_work",
+            "grabowski_checkout_binding_reconciliation",
+        }
+        functions = {
+            item.name: item
+            for item in module.body
+            if isinstance(item, ast.AsyncFunctionDef) and item.name in tool_names
+        }
+        self.assertEqual(set(functions), tool_names)
+        for name, function in functions.items():
+            with self.subTest(tool=name):
+                decorators = [
+                    entry
+                    for entry in function.decorator_list
+                    if isinstance(entry, ast.Call)
+                    and isinstance(entry.func, ast.Attribute)
+                    and entry.func.attr == "tool"
+                ]
+                self.assertEqual(len(decorators), 1)
+                annotations = [
+                    keyword.value
+                    for keyword in decorators[0].keywords
+                    if keyword.arg == "annotations"
+                ]
+                self.assertEqual(len(annotations), 1)
+                self.assertEqual(
+                    ast.unparse(annotations[0]), "grabowski_operator_core.MUTATING"
+                )
+
     def test_public_no_wal_does_not_request_mutation_admission(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             database = Path(temp) / "checkouts.sqlite3"
             create_checkout_db(database)
             observed = collect_lifecycle_bindings_from_db(
                 database,
-                _wal_mutation_admission=lambda: (_ for _ in ()).throw(
+                _wal_mutation_admission=lambda _shm_path: (_ for _ in ()).throw(
                     AssertionError("no WAL must not require mutation admission")
                 ),
             )
@@ -790,7 +825,7 @@ class CheckoutBindingLiveIntegrationTests(unittest.TestCase):
                 with self.assertRaisesRegex(PermissionError, "denied read-mark"):
                     collect_lifecycle_bindings_from_db(
                         database,
-                        _wal_mutation_admission=lambda: (_ for _ in ()).throw(
+                        _wal_mutation_admission=lambda _shm_path: (_ for _ in ()).throw(
                             PermissionError("denied read-mark")
                         ),
                     )
@@ -798,7 +833,7 @@ class CheckoutBindingLiveIntegrationTests(unittest.TestCase):
                 admissions: list[str] = []
                 snapshot = collect_lifecycle_bindings_from_db(
                     database,
-                    _wal_mutation_admission=lambda: admissions.append("admitted"),
+                    _wal_mutation_admission=lambda shm_path: admissions.append(str(shm_path)),
                 )
                 self.assertEqual(snapshot["snapshot_mode"], "native-ro-wal")
                 self.assertEqual(
@@ -819,9 +854,9 @@ class CheckoutBindingLiveIntegrationTests(unittest.TestCase):
                         db_path=database,
                         repository_filters=[REPO],
                         limit=1,
-                        _wal_mutation_admission=lambda: admissions.append("admitted"),
+                        _wal_mutation_admission=lambda shm_path: admissions.append(str(shm_path)),
                     )
-                self.assertEqual(admissions, ["admitted", "admitted"])
+                self.assertEqual(admissions, [str(database) + "-shm"] * 2)
                 self.assertEqual(result["count"], 1)
                 self.assertEqual(result["total_count"], 1)
                 self.assertEqual(result["bindings"][0]["checkout_key"], "key-active-wal")
@@ -1296,7 +1331,11 @@ class CheckoutBindingLiveIntegrationTests(unittest.TestCase):
                     mock.patch.object(
                         current_work_surface, "_operator",
                         return_value=mock.Mock(
-                            _require_operator_mutation=admissions.append,
+                            _require_operator_mutation=(
+                                lambda capability, **kwargs: admissions.append(
+                                    (capability, kwargs.get("path"), kwargs.get("host"))
+                                )
+                            ),
                         ),
                     ),
                     mock.patch.object(
@@ -1309,7 +1348,10 @@ class CheckoutBindingLiveIntegrationTests(unittest.TestCase):
                 temp_dir.assert_not_called()
                 self.assertEqual(result["total_count"], 0)
                 self.assertTrue(result["task_checkout_presence_complete"])
-                self.assertEqual(admissions, ["resource_lease", "resource_lease"])
+                self.assertEqual(
+                    admissions,
+                    [("resource_lease", str(path) + "-shm", "heim-pc")] * 2,
+                )
                 # Native SQLite may touch -shm, never durable DB/WAL contents.
                 self.assertEqual(path.read_bytes(), main_before)
                 self.assertEqual(wal.read_bytes(), wal_before)

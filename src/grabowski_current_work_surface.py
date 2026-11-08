@@ -27,9 +27,11 @@ def _operator() -> Any:
     return _module("grabowski_operator_core")
 
 
-def _checkout_wal_admission() -> None:
-    # A native SQLite reader may only update existing -shm read marks.
-    _operator()._require_operator_mutation("resource_lease")
+def _checkout_wal_admission(shm_path: Path) -> None:
+    # A native WAL read can update this exact SHM path; honor path freezes.
+    _operator()._require_operator_mutation(
+        "resource_lease", path=str(shm_path), host="heim-pc"
+    )
 
 
 def _require_repositories(repositories: list[str]) -> list[str]:
