@@ -1224,9 +1224,9 @@ TOOL_PROFILES.update(
         },
         "grabowski_current_work": {
             "category": "operations-observability",
-            "purpose": "Project bounded global operator work from task, attention, lease, worker and physical sources plus repository-filtered checkout evidence, with mixed scope explicit and no second lifecycle truth.",
+            "purpose": "Project global operator work and repository-filtered checkout evidence; active SQLite WAL reads may update admitted SHM read marks.",
             "risk_class": "low",
-            "effects": [],
+            "effects": ["sqlite-wal-shm-sidecar-write"],
             "reversibility": "not-applicable",
         },
         "grabowski_work_acquire": {
@@ -1245,9 +1245,9 @@ TOOL_PROFILES.update(
         },
         "grabowski_operator_optimization_report": {
             "category": "operations-observability",
-            "purpose": "Compose bounded audit, friction, execution-outcome and current-work evidence into a manual read-only optimization report.",
+            "purpose": "Compose audit, friction, execution-outcome and current-work evidence; transitive active WAL reads may update admitted SHM read marks.",
             "risk_class": "low",
-            "effects": [],
+            "effects": ["sqlite-wal-shm-sidecar-write"],
             "reversibility": "not-applicable",
         },
         "grabowski_git_status": {

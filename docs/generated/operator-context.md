@@ -85,9 +85,9 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_deployment_identity` | context | yes | low | Read bounded runtime identity and integrity flags without local paths. |
 | `grabowski_contract_drift` | context | yes | low | Read bounded runtime-contract and capability-catalog drift. |
 | `grabowski_checkout_summary` | version-control | yes | low | Read a bounded summary of Grabowski repository worktrees. |
-| `grabowski_current_work` | operations-observability | yes | low | Project bounded global operator work from task, attention, lease, worker and physical sources plus repository-filtered checkout evidence, with mixed scope explicit and no second lifecycle truth. |
+| `grabowski_current_work` | operations-observability | unknown | low | Project global operator work and repository-filtered checkout evidence; active SQLite WAL reads may update admitted SHM read marks. |
 | `grabowski_work_acquire` | work-coordination | no | high | Atomically bind and prepare one controller lane, or persist and audit its evidence-bound terminal closeout with retry-safe audit recovery. |
-| `grabowski_operator_optimization_report` | operations-observability | yes | low | Compose bounded audit, friction, execution-outcome and current-work evidence into a manual read-only optimization report. |
+| `grabowski_operator_optimization_report` | operations-observability | unknown | low | Compose audit, friction, execution-outcome and current-work evidence; transitive active WAL reads may update admitted SHM read marks. |
 | `grabowski_git_status` | version-control | yes | low | Read fixed short Git status and optionally the exact CAS branch preimage for one allowed repository. |
 | `grabowski_git_diff` | version-control | yes | low | Read a bounded staged or unstaged Git diff without external helpers. |
 | `grabowski_git_log` | version-control | yes | low | Read a bounded fixed-format Git commit log. |
@@ -107,7 +107,7 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_git` | version-control | no | variable | Run Git in one repository; generic push is limited to one explicit unprotected branch ref. |
 | `grabowski_git_branch` | version-control | no | medium | Create or switch local branches through a typed, audited branch operation. |
 | `grabowski_checkout_inventory` | checkout-lifecycle | yes | low | Return deterministic linked-checkout inventory with retention, task, process and resource coordination state. |
-| `grabowski_checkout_binding_reconciliation` | checkout-lifecycle | yes | low | Classify durable checkout lifecycle bindings against current canonical Git worktree observations without creating mutation authority. |
+| `grabowski_checkout_binding_reconciliation` | checkout-lifecycle | unknown | low | Classify durable checkout bindings against canonical Git observations; active WAL reads require admitted SQLite SHM read-mark writes. |
 | `grabowski_checkout_binding_terminal_preview` | checkout-lifecycle | no | low | Preview one exact evidence-bound terminal reconciliation for an absent managed checkout, a clean terminal Work Lane, or a present terminal thread_focus checkout whose only admitted local state is hash-bound .review-audits evidence and whose head is exactly retention-bound. |
 | `grabowski_checkout_binding_terminal_apply` | checkout-lifecycle | no | medium | Apply one fresh compare-and-swap terminal reconciliation: absent checkouts to externally_terminal_missing; clean terminal Work Lanes to completed_retained; or bounded present terminal thread_focus checkouts with hash-bound review evidence, including an explicit lifecycle-head catch-up only to the already-retained head while preserving checkout, evidence, retention and cleanup authority boundaries. |
 | `grabowski_checkout_binding_identity_rebind_preview` | checkout-lifecycle | no | low | Preview one clean, coordination-free and remote-secured existing checkout for a supported identity repair: branch rename, repo-path canonicalization, or lifecycle catch-up when retention already matches current Git identity. |
