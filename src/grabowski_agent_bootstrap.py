@@ -280,6 +280,8 @@ def _chronik_first_context(
             exact_task_query["pr_number"] = pr_number
         if subject_component:
             exact_task_query["subject_component"] = subject_component
+        if host:
+            exact_task_query["host"] = host
         queries.append(("exact_task", exact_task_query))
     else:
         queries.append(("exact_target", filters))
@@ -342,6 +344,11 @@ def _chronik_first_context(
             event = item["event"]
             subject = event.get("subject") if isinstance(event.get("subject"), dict) else {}
             match_basis = "exact_target"
+            # A named host is an exact boundary, including for exact-task
+            # lookups; never let the unattributed fallback admit another host.
+            if host and subject.get("scope") == "host" and subject.get("host") != host:
+                discarded += 1
+                continue
             if repo:
                 # Never attribute a different PR to the requested target, even
                 # when a provider unexpectedly returns an overbroad candidate.
