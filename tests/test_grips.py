@@ -1,6 +1,6 @@
 from __future__ import annotations
 import asyncio
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 
@@ -24743,7 +24743,8 @@ class HardCaseAutoAdvisoryTests(unittest.TestCase):
         }
 
     def run_signal(self, signal, *, task_class="deep-debug", novelty="high",
-                   risk_flags=None, route=None, starter=None):
+                   risk_flags=None, route=None, starter=None, store_root=None,
+                   objective="Investigate same repeated RustDesk black screen"):
         router = types.SimpleNamespace(
             SENSITIVE_EXTERNAL_REVIEW_RISK_FLAGS=frozenset(
                 {"credential", "customer-data", "private-context", "secrets", "user_data"}
@@ -24754,19 +24755,25 @@ class HardCaseAutoAdvisoryTests(unittest.TestCase):
             "competition_id": "gac-hard-case", "task_id": "task-hard-case",
             "already_started": False,
         })
-        competition = types.SimpleNamespace(
-            operator=types.SimpleNamespace(_redact=lambda text: text),
-            grabowski_agent_competition_start=start,
-        )
-        with patch.dict(sys.modules, {"grabowski_agent_competition": competition}):
-            result = grips._agent_execution_hard_case_advisory(
-                signal=signal, task_class=task_class, novelty=novelty,
-                risk_flags=(["prior-attempt-failed"] if risk_flags is None else risk_flags),
-                router=router, repo=Path("/home/test/repo"),
-                head="b" * 40, source_identity_sha256="c" * 64,
-                objective="Investigate same repeated RustDesk black screen",
-                duration_minutes=180, changed_files=3,
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) if store_root is None else Path(store_root)
+            competition = types.SimpleNamespace(
+                operator=types.SimpleNamespace(_redact=lambda text: text),
+                grabowski_agent_competition_start=start,
+                _competition_root=lambda: root,
+                _competition_request_lock=lambda identifier: nullcontext(),
+                _validated_manifest=lambda identifier: json.loads(
+                    (root / identifier / "manifest.json").read_text()
+                ),
             )
+            with patch.dict(sys.modules, {"grabowski_agent_competition": competition}):
+                result = grips._agent_execution_hard_case_advisory(
+                    signal=signal, task_class=task_class, novelty=novelty,
+                    risk_flags=(["prior-attempt-failed"] if risk_flags is None else risk_flags),
+                    router=router, repo=Path("/home/test/repo"),
+                    head="b" * 40, source_identity_sha256="c" * 64,
+                    objective=objective, duration_minutes=180, changed_files=3,
+                )
         return result, start, router
 
 
@@ -24817,6 +24824,8 @@ class HardCaseAutoAdvisoryTests(unittest.TestCase):
             competition = types.SimpleNamespace(
                 operator=types.SimpleNamespace(_redact=lambda text: text),
                 grabowski_agent_competition_start=started,
+                _competition_root=lambda: repo,
+                _competition_request_lock=lambda identifier: nullcontext(),
             )
             parameters = {
                 "source_kind": "direct-user", "source_id": "rustdesk-hardcase",
@@ -24883,6 +24892,56 @@ class HardCaseAutoAdvisoryTests(unittest.TestCase):
         two, _, _ = self.run_signal(extended)
         self.assertEqual(one["request_id"], two["request_id"])
         self.assertEqual(start.call_count, 1)
+
+    def test_existing_incident_reuses_original_claude_when_reranked_to_grok(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first, first_start, _ = self.run_signal(
+                self.sample_signal(), store_root=root
+            )
+            self.assertEqual(first["state"], "dispatched")
+            request_digest = hashlib.sha256(
+                first["request_id"].encode("utf-8")
+            ).hexdigest()[:10]
+            task_digest = hashlib.sha256(
+                first_start.call_args.kwargs["task"].encode("utf-8")
+            ).hexdigest()[:10]
+            identifier = f"gac-claude-contrast-{task_digest}-{request_digest}"
+            entry = root / identifier
+            entry.mkdir()
+            (entry / "manifest.json").write_text(json.dumps({
+                "request_id": first["request_id"],
+                "provider": "claude",
+                "repository": "/home/test/repo",
+                "expected_head": "b" * 40,
+                "task_id": "original-claude-task",
+                "route_contract": {"route_id": "claude-opus-5.5-high"},
+            }))
+            grok = {"reviewers": [self.sample_route()["review_fallbacks"][0]],
+                    "review_fallbacks": []}
+            duplicate = Mock()
+            second, started, router = self.run_signal(
+                self.sample_signal(), route=grok, store_root=root,
+                starter=duplicate, objective="Changed diagnosis and more logs"
+            )
+            self.assertEqual(second["state"], "reused")
+            self.assertEqual(second["competition_id"], identifier)
+            self.assertEqual(second["task_id"], "original-claude-task")
+            self.assertEqual(second["provider"], "claude")
+            duplicate.assert_not_called()
+            router.canonical_execution_route.assert_not_called()
+
+            # An incomplete first start must block a second provider, not
+            # silently reinterpret an unknown effect as a safe retry.
+            (entry / "manifest.json").unlink()
+            unresolved, _, _ = self.run_signal(
+                self.sample_signal(), route=grok, store_root=root,
+                starter=duplicate
+            )
+            self.assertEqual(unresolved["state"], "unavailable")
+            self.assertEqual(unresolved["reason"], "existing_incident_start_unresolved")
+            self.assertFalse(unresolved["retry_automatically"])
+            duplicate.assert_not_called()
 
     def test_contradiction_and_architecture_need_strong_qualifying_context(self):
         conflict = self.sample_signal("contradictory_evidence")

@@ -8966,54 +8966,106 @@ def _agent_execution_hard_case_advisory(
         redact = getattr(competition.operator, "_redact", None)
         if not callable(redact) or redact(objective) != objective:
             return {**base, "state": "withheld", "reason": "objective_redaction_required"}
-        choice = router.canonical_execution_route(
-            "independent-review", changed_files=changed_files,
-            duration_minutes=duration_minutes, novelty=novelty,
-            risk_flags=risk_flags, latency_priority=False, need_review=True,
-            verification_policy="independent_review", effect_profile="candidate",
-        )
-        candidates = [*choice.get("reviewers", []), *choice.get("review_fallbacks", [])]
-        reviewer = next(
-            (c for c in candidates if isinstance(c, dict)
-             and c.get("harness") in {"claude", "grok"}
-             and c.get("route_role") == "reviewer"
-             and c.get("paid_only") is not True
-             and isinstance(c.get("route"), str)), None
-        )
-        if reviewer is None:
-            return {**base, "state": "unavailable", "reason": "no_subscription_route"}
+        # The canonical Candidate identity also hashes provider and prompt.
+        # A stable request_id alone would not prevent a second Claude/Grok
+        # start after route availability or the objective changes. Reuse the
+        # existing create-only candidate directory as the durable claim.
         request_id = "hardcase-" + sha256_json({
             "source": source_identity_sha256, "signal": kind,
             "error": signal.get("error_fingerprint"),
         })[:32]
-        prompt = (
-            "Independent READ-ONLY technical second opinion in German. "
-            "Do not execute commands or modify any files. Separate supported facts, "
-            "alternative hypotheses, discriminating tests and a smallest reversible "
-            "repair. No API credits or paid fallback. Task: " + objective
-        )
-        started = competition.grabowski_agent_competition_start(
-            request_id=request_id, provider=reviewer["harness"],
-            mode="contrast", repository=str(repo), expected_head=head,
-            task=prompt, allowed_paths=["README.md"], context_paths=["README.md"],
-            forbidden_paths=[], primary_summary="Hard-case: " + kind,
-            timeout_seconds=360, max_budget_usd=0, require_hard_budget=True,
-            route_id=reviewer["route"], paid_execution_authorized=False,
-        )
-        if (not isinstance(started, dict) or not started.get("competition_id")
-                or not started.get("task_id")):
-            return {**base, "state": "unavailable",
-                    "reason": "candidate_start_receipt_incomplete",
-                    "retry_automatically": False}
-        return {
-            **base, "state": "reused" if started.get("already_started") else "dispatched",
-            "provider": reviewer["harness"], "model": reviewer.get("model"),
-            "route_id": reviewer["route"], "request_id": request_id,
-            "competition_id": started.get("competition_id"),
-            "task_id": started.get("task_id"),
-            "readback_tool": "grabowski_agent_competition_status",
-            "does_not_establish": ["provider_success", "review_authority"],
-        }
+
+        request_digest = hashlib.sha256(request_id.encode("utf-8")).hexdigest()[:10]
+        # Use the candidate store's existing request flock, with a reserved
+        # identifier that never denotes an actual provider task.
+        request_lock = f"gac-claude-contrast-0000000000-{request_digest}"
+        with competition._competition_request_lock(request_lock):
+            for entry in competition._competition_root().iterdir():
+                if not re.fullmatch(
+                    rf"gac-(?:claude|antigravity|opencode|openhands|agy|codex|grok)"
+                    rf"-(?:competitor|contrast)-[0-9a-f]{{10}}-{request_digest}",
+                    entry.name,
+                ):
+                    continue
+                # Existing persisted or ambiguous start always wins over a
+                # newly ranked route. Never retry an uncertain prior effect.
+                if entry.is_symlink() or not entry.is_dir():
+                    return {**base, "state": "unavailable",
+                            "reason": "existing_incident_candidate_unsafe",
+                            "retry_automatically": False}
+                try:
+                    previous = competition._validated_manifest(entry.name)
+                except Exception:
+                    return {**base, "state": "unavailable",
+                            "reason": "existing_incident_start_unresolved",
+                            "competition_id": entry.name,
+                            "retry_automatically": False}
+                if (
+                    previous.get("request_id") != request_id
+                    or previous.get("repository") != str(repo)
+                    or previous.get("expected_head") != head
+                ):
+                    return {**base, "state": "unavailable",
+                            "reason": "incident_claim_identity_collision",
+                            "retry_automatically": False}
+                original_route = previous.get("route_contract")
+                return {
+                    **base, "state": "reused",
+                    "provider": previous.get("provider"),
+                    "route_id": (
+                        original_route.get("route_id")
+                        if isinstance(original_route, dict) else None
+                    ),
+                    "request_id": request_id,
+                    "competition_id": entry.name,
+                    "task_id": previous.get("task_id"),
+                    "readback_tool": "grabowski_agent_competition_status",
+                    "does_not_establish": ["provider_success", "review_authority"],
+                }
+            choice = router.canonical_execution_route(
+                "independent-review", changed_files=changed_files,
+                duration_minutes=duration_minutes, novelty=novelty,
+                risk_flags=risk_flags, latency_priority=False, need_review=True,
+                verification_policy="independent_review", effect_profile="candidate",
+            )
+            candidates = [*choice.get("reviewers", []), *choice.get("review_fallbacks", [])]
+            reviewer = next(
+                (c for c in candidates if isinstance(c, dict)
+                 and c.get("harness") in {"claude", "grok"}
+                 and c.get("route_role") == "reviewer"
+                 and c.get("paid_only") is not True
+                 and isinstance(c.get("route"), str)), None
+            )
+            if reviewer is None:
+                return {**base, "state": "unavailable", "reason": "no_subscription_route"}
+            prompt = (
+                "Independent READ-ONLY technical second opinion in German. "
+                "Do not execute commands or modify any files. Separate supported facts, "
+                "alternative hypotheses, discriminating tests and a smallest reversible "
+                "repair. No API credits or paid fallback. Task: " + objective
+            )
+            started = competition.grabowski_agent_competition_start(
+                request_id=request_id, provider=reviewer["harness"],
+                mode="contrast", repository=str(repo), expected_head=head,
+                task=prompt, allowed_paths=["README.md"], context_paths=["README.md"],
+                forbidden_paths=[], primary_summary="Hard-case: " + kind,
+                timeout_seconds=360, max_budget_usd=0, require_hard_budget=True,
+                route_id=reviewer["route"], paid_execution_authorized=False,
+            )
+            if (not isinstance(started, dict) or not started.get("competition_id")
+                    or not started.get("task_id")):
+                return {**base, "state": "unavailable",
+                        "reason": "candidate_start_receipt_incomplete",
+                        "retry_automatically": False}
+            return {
+                **base, "state": "reused" if started.get("already_started") else "dispatched",
+                "provider": reviewer["harness"], "model": reviewer.get("model"),
+                "route_id": reviewer["route"], "request_id": request_id,
+                "competition_id": started.get("competition_id"),
+                "task_id": started.get("task_id"),
+                "readback_tool": "grabowski_agent_competition_status",
+                "does_not_establish": ["provider_success", "review_authority"],
+            }
     except Exception as exc:
         return {
             **base, "state": "unavailable",
