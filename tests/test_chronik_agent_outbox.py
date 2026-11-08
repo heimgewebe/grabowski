@@ -1110,5 +1110,83 @@ class ChronikKnowledgeCaptureTests(unittest.TestCase):
             self.assertFalse(status["chronik_knowledge_capture"]["ledger_verified"])
 
 
+
+    def test_new_knowledge_directory_and_identical_replay_are_durable(self):
+        self.enable()
+        value = record(chronik_context_json={
+            "subject_scope": "host", "host": "heim-pc",
+            "operation": "recovery", "task_class": "recovery",
+        })
+        source_dir = self.root / "grabowski" / "chronik-outbox" / "knowledge"
+        calls = []
+        original = os.fsync
+
+        def observe(fd):
+            calls.append(os.readlink(f"/proc/self/fd/{fd}"))
+            return original(fd)
+
+        with patch.object(chronik.os, "fsync", side_effect=observe):
+            first = chronik.capture_terminal_knowledge(value, "completed")
+        self.assertTrue(first["new"])
+        event_path = source_dir / (first["event_id"][7:] + ".json")
+        for expected in (event_path, source_dir, source_dir.parent, source_dir.parent.parent):
+            self.assertIn(str(expected.resolve()), calls)
+
+        calls.clear()
+        with patch.object(chronik.os, "fsync", side_effect=observe):
+            replay = chronik.capture_terminal_knowledge(value, "completed")
+        self.assertFalse(replay["new"])
+        for expected in (event_path, source_dir, source_dir.parent, source_dir.parent.parent):
+            self.assertIn(str(expected.resolve()), calls)
+
+    def test_uncertain_directory_fsync_is_recovered_on_replay(self):
+        self.enable()
+        value = record(chronik_context_json={
+            "subject_scope": "host", "host": "heim-pc",
+            "operation": "deploy", "task_class": "deploy",
+        })
+        outbox_root = self.root / "grabowski" / "chronik-outbox"
+        original = os.fsync
+        failed = False
+
+        def fail_parent_once(fd):
+            nonlocal failed
+            target = os.readlink(f"/proc/self/fd/{fd}")
+            if target == str(outbox_root.parent) and not failed:
+                failed = True
+                raise OSError("knowledge parent directory durability uncertain")
+            return original(fd)
+
+        with patch.object(chronik.os, "fsync", side_effect=fail_parent_once):
+            with self.assertRaisesRegex(OSError, "durability uncertain"):
+                chronik.capture_terminal_knowledge(value, "completed")
+        self.assertTrue(failed)
+        self.assertEqual(len(list((outbox_root / "knowledge").glob("*.json"))), 1)
+
+        retried = chronik.capture_terminal_knowledge(value, "completed")
+        self.assertFalse(retried["new"])
+        self.assertEqual(retried["classification"], "queued_unverified")
+
+    def test_fifo_outbox_source_cannot_block_status_or_replay(self):
+        self.enable()
+        value = record(chronik_context_json={
+            "subject_scope": "host", "host": "heim-pc",
+            "operation": "merge", "task_class": "merge",
+        })
+        event = chronik.build_terminal_knowledge(value, "completed")
+        self.assertIsNotNone(event)
+        path = self.root / "grabowski" / "chronik-outbox" / "knowledge" / (
+            event["event_id"][7:] + ".json"
+        )
+        path.parent.mkdir(parents=True, mode=0o700)
+        os.mkfifo(path, 0o600)
+        self.assertEqual(
+            chronik.terminal_knowledge_capture_status(value, "completed")["classification"],
+            "capture_invalid",
+        )
+        with self.assertRaises(ValueError):
+            chronik.capture_terminal_knowledge(value, "completed")
+
+
 if __name__ == "__main__":
     unittest.main()

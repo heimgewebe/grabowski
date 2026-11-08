@@ -138,7 +138,7 @@ def _regular_file_identity(
     label: str,
     allow_missing: bool = False,
 ) -> tuple[int, int, int, int, int] | None:
-    flags = os.O_RDONLY | os.O_CLOEXEC
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
@@ -167,7 +167,7 @@ def _read_regular_file(
     label: str,
     allow_missing: bool = False,
 ) -> tuple[bytes, tuple[int, int, int, int, int]] | None:
-    flags = os.O_RDONLY | os.O_CLOEXEC
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
@@ -939,6 +939,25 @@ def terminal_knowledge_capture_status(record: dict[str, Any], state: str) -> dic
             "outbox_sha256": _sha256_bytes(loaded[0]), "ledger_verified": False}
 
 
+
+def _fsync_knowledge_directory_chain(directory: Path) -> None:
+    # A newly created outbox or knowledge/ directory is not durable simply
+    # because its contents are fsynced. Replays must also close this gap.
+    current = directory.resolve(strict=True)
+    while True:
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(current, flags)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        if current.parent == current:
+            break
+        current = current.parent
+
+
 def capture_terminal_knowledge(record: dict[str, Any], state: str) -> dict[str, Any]:
     event = build_terminal_knowledge(record, state)
     if event is None:
@@ -958,6 +977,20 @@ def capture_terminal_knowledge(record: dict[str, Any], state: str) -> dict[str, 
         try:
             descriptor = os.open(path, flags, 0o600)
         except FileExistsError:
+            # The first attempt may have created a complete visible source but
+            # failed fsync. Identity comparison alone cannot acknowledge it.
+            read_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
+            if hasattr(os, "O_NOFOLLOW"):
+                read_flags |= os.O_NOFOLLOW
+            descriptor = os.open(path, read_flags)
+            with os.fdopen(descriptor, "rb") as handle:
+                source_stat = os.fstat(handle.fileno())
+                if (not stat.S_ISREG(source_stat.st_mode) or
+                        source_stat.st_size != len(raw) or
+                        handle.read(len(raw) + 1) != raw):
+                    raise ValueError("knowledge identity conflict or incomplete source")
+                os.fsync(handle.fileno())
+            _fsync_knowledge_directory_chain(path.parent)
             status = terminal_knowledge_capture_status(record, state)
             if status["classification"] != "queued_unverified":
                 raise ValueError("knowledge identity conflict or incomplete source")
@@ -966,11 +999,7 @@ def capture_terminal_knowledge(record: dict[str, Any], state: str) -> dict[str, 
             handle.write(raw)
             handle.flush()
             os.fsync(handle.fileno())
-        dirfd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(dirfd)
-        finally:
-            os.close(dirfd)
+        _fsync_knowledge_directory_chain(path.parent)
     status = terminal_knowledge_capture_status(record, state)
     if status["classification"] != "queued_unverified":
         raise ValueError("knowledge source readback failed")
