@@ -193,6 +193,10 @@ class PlanTests(ContextFabricTestCase):
         self.assertEqual(selection["selector_kind"], "pull_request")
         self.assertEqual(
             selection["selector"],
+            {"repo": "heimgewebe/grabowski", "pr_number": PR_BINDING["pull_request"]},
+        )
+        self.assertEqual(
+            selection["host_component_selector"],
             {"subject_component": "grabowski", "pr_number": PR_BINDING["pull_request"]},
         )
         self.assertEqual(
@@ -210,7 +214,7 @@ class PlanTests(ContextFabricTestCase):
         self.assertEqual(
             selection["full_search_selectors"],
             [
-                {"scope": "host_component", "selector": selection["selector"]},
+                {"scope": "host_component", "selector": selection["host_component_selector"]},
                 {"scope": "repository", "selector": selection["repository_scoped_selector"]},
             ],
         )
@@ -247,6 +251,10 @@ class PlanTests(ContextFabricTestCase):
         self.assertTrue(recall["target_selection"]["read_eligible"])
         self.assertEqual(
             recall["target_selection"]["selector"],
+            {"repo": "heimgewebe/commonthing", "pr_number": 1977},
+        )
+        self.assertEqual(
+            recall["target_selection"]["host_component_selector"],
             {"subject_component": "commonthing", "pr_number": 1977},
         )
         self.assertEqual(
@@ -264,7 +272,11 @@ class PlanTests(ContextFabricTestCase):
         selection = self.module.plan_context("pr", binding)["historical_recall"]["target_selection"]
         self.assertTrue(selection["read_eligible"])
         self.assertEqual(
-            selection["selector"], {"subject_component": "chronik", "pr_number": 306}
+            selection["selector"], {"repo": "heimgewebe/chronik", "pr_number": 306}
+        )
+        self.assertEqual(
+            selection["host_component_selector"],
+            {"subject_component": "chronik", "pr_number": 306},
         )
         # A repository-scoped event with a different subject.component must
         # still match the second query. Combining both filters would exclude it.
@@ -276,7 +288,7 @@ class PlanTests(ContextFabricTestCase):
         self.assertEqual(
             selection["full_search_selectors"],
             [
-                {"scope": "host_component", "selector": selection["selector"]},
+                {"scope": "host_component", "selector": selection["host_component_selector"]},
                 {"scope": "repository", "selector": selection["repository_scoped_selector"]},
             ],
         )

@@ -256,7 +256,7 @@ def _chronik_first_context(
     *, repo: str = "", host: str = "", subject_component: str = "",
     pr_number: int | None = None, task_id: str = "", search_fn: Any = None,
 ) -> dict[str, Any]:
-    """Read bounded validated historical evidence for a known Heimgewebe target."""
+    """Read bounded Chronik evidence without losing host-scoped project history."""
     targets = {"repo": repo, "host": host, "subject_component": subject_component, "task_id": task_id}
     filters: dict[str, Any] = {}
     for key, value in targets.items():
@@ -282,75 +282,202 @@ def _chronik_first_context(
     }
     if not filters:
         return {**base, "status": "skipped_unbound_target", "events": []}
-    try:
-        if search_fn is None:
+
+    # repo matches source.repo OR subject.repo in the Chronik provider.
+    # Host-scoped producer events identify the project by subject.component,
+    # not subject.repo. Both scopes must be searched separately.
+    queries: list[tuple[str, dict[str, Any]]] = []
+    if repo and not task_id:
+        repository_query: dict[str, Any] = {"repo": repo}
+        # An explicit component selector is a constraint, not a hint.
+        if subject_component:
+            repository_query["subject_component"] = subject_component
+        if pr_number is not None:
+            repository_query["pr_number"] = pr_number
+        if host:
+            repository_query["host"] = host
+        queries.append(("repository", repository_query))
+        component_query: dict[str, Any] = {
+            "subject_component": subject_component or repo.split("/", 1)[-1],
+        }
+        if host:
+            component_query["host"] = host
+        if pr_number is not None:
+            component_query["pr_number"] = pr_number
+        queries.append(("host_component", component_query))
+    elif repo and task_id:
+        # A unique task crosses host/repository scopes; preserve explicit constraints.
+        exact_task_query: dict[str, Any] = {"task_id": task_id}
+        if pr_number is not None:
+            exact_task_query["pr_number"] = pr_number
+        if subject_component:
+            exact_task_query["subject_component"] = subject_component
+        if host:
+            exact_task_query["host"] = host
+        queries.append(("exact_task", exact_task_query))
+    else:
+        queries.append(("exact_target", filters))
+
+    if search_fn is None:
+        try:
             from grabowski_tasks import grabowski_chronik_full_search
-            search_fn = grabowski_chronik_full_search
-        result = search_fn(**filters, limit=10)
-    except Exception as exc:
-        return {
-            **base, "status": "historical_context_unavailable",
-            "failure_code": type(exc).__name__, "events": [],
-        }
-    if not isinstance(result, dict) or result.get("available") is not True:
-        return {
-            **base, "status": "historical_context_unavailable",
-            "failure_code": (
-                result.get("failure_code", "provider_unavailable")
-                if isinstance(result, dict) else "invalid_provider_result"
-            ),
-            "events": [],
-        }
-    snapshot = result.get("ledger_snapshot")
-    if (
-        result.get("historical_only") is not True
-        or result.get("search_exhaustive") is not True
-        or not isinstance(snapshot, dict)
-        or snapshot.get("integrity_valid") is not True
-        or snapshot.get("invalid_record_count") != 0
-    ):
-        return {
-            **base, "status": "historical_context_unavailable",
-            "failure_code": "historical_evidence_not_verified", "events": [],
-        }
+        except Exception as exc:
+            return {
+                **base, "status": "historical_context_unavailable",
+                "failure_code": type(exc).__name__,
+                "failed_scope": "provider_import", "events": [],
+            }
+        search_fn = grabowski_chronik_full_search
+
+    results: list[tuple[str, dict[str, Any]]] = []
+    for scope, query in queries:
+        try:
+            result = search_fn(**query, limit=10)
+        except Exception as exc:
+            return {
+                **base, "status": "historical_context_unavailable",
+                "failure_code": type(exc).__name__, "failed_scope": scope,
+                "events": [],
+            }
+        if not isinstance(result, dict) or result.get("available") is not True:
+            failure = result.get("failure") if isinstance(result, dict) else None
+            return {
+                **base, "status": "historical_context_unavailable",
+                "failure_code": (
+                    result.get("failure_code")
+                    or (failure.get("code") if isinstance(failure, dict) else None)
+                    or "provider_unavailable"
+                ) if isinstance(result, dict) else "invalid_provider_result",
+                "failed_scope": scope, "events": [],
+            }
+        snapshot = result.get("ledger_snapshot")
+        if (
+            result.get("historical_only") is not True
+            or result.get("search_exhaustive") is not True
+            or not isinstance(snapshot, dict)
+            or snapshot.get("integrity_valid") is not True
+            or snapshot.get("invalid_record_count") != 0
+        ):
+            return {
+                **base, "status": "historical_context_unavailable",
+                "failure_code": "historical_evidence_not_verified",
+                "failed_scope": scope, "events": [],
+            }
+        results.append((scope, result))
+
     compact: list[dict[str, Any]] = []
+    seen: set[str] = set()
     discarded = 0
-    for item in (result.get("events") or [])[:10]:
-        if not isinstance(item, dict) or not isinstance(item.get("event"), dict):
-            continue
-        event = item["event"]
-        subject = event.get("subject") if isinstance(event.get("subject"), dict) else {}
-        # source.repo identifies the producer, not the repository being worked on.
-        # In particular every Grabowski task uses source.repo=heimgewebe/grabowski.
-        if repo and subject.get("repo") != repo:
-            discarded += 1
-            continue
-        data = event.get("data") if isinstance(event.get("data"), dict) else {}
-        source = event.get("source") if isinstance(event.get("source"), dict) else {}
-        refs = event.get("evidence_refs")
-        compact.append({
-            "event_ref": item.get("event_ref"),
-            "canonical_event_sha256": item.get("canonical_event_sha256"),
-            "observed_at": event.get("ts"),
-            "kind": event.get("kind"),
-            "operation": data.get("operation"),
-            "outcome": data.get("result"),
-            "task_class": data.get("task_class"),
-            "source_run_id": source.get("run_id"),
-            "evidence_refs": refs[:4] if isinstance(refs, list) else [],
-        })
+    heuristic_host_matches = 0
+    for scope, result in results:
+        for index, item in enumerate((result.get("events") or [])[:10]):
+            if not isinstance(item, dict) or not isinstance(item.get("event"), dict):
+                continue
+            event = item["event"]
+            subject = event.get("subject") if isinstance(event.get("subject"), dict) else {}
+            match_basis = "exact_target"
+            # A named host is an exact boundary, including for exact-task
+            # lookups; never let the unattributed fallback admit another host.
+            if host and subject.get("host") != host:
+                discarded += 1
+                continue
+            if pr_number is not None and subject.get("pr_number") != pr_number:
+                discarded += 1
+                continue
+            if subject_component and subject.get("component") != subject_component:
+                discarded += 1
+                continue
+            if repo:
+                if (
+                    subject.get("scope") == "repository"
+                    and subject.get("repo") == repo
+                    and (not subject_component or subject.get("component") == subject_component)
+                ):
+                    match_basis = "subject_repository"
+                elif (
+                    subject.get("scope") == "host"
+                    and subject.get("repo") is None
+                    and subject.get("component") == (
+                        subject_component or repo.split("/", 1)[-1]
+                    )
+                    and (not host or subject.get("host") == host)
+                    and (pr_number is None or subject.get("pr_number") == pr_number)
+                ):
+                    match_basis = "host_component_heuristic"
+                elif scope == "exact_task" and subject.get("repo") is None:
+                    # Keep exact task evidence, but never claim repo attribution.
+                    match_basis = "exact_task_unattributed"
+                else:
+                    discarded += 1
+                    continue
+            elif host and subject.get("host") not in {host, None}:
+                discarded += 1
+                continue
+            key = (
+                item.get("event_ref") or event.get("event_id")
+                or item.get("canonical_event_sha256")
+                or f"{scope}:{index}"
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            data = event.get("data") if isinstance(event.get("data"), dict) else {}
+            source = event.get("source") if isinstance(event.get("source"), dict) else {}
+            refs = event.get("evidence_refs")
+            compact.append({
+                "event_ref": item.get("event_ref"),
+                "canonical_event_sha256": item.get("canonical_event_sha256"),
+                "observed_at": event.get("ts"),
+                "kind": event.get("kind"),
+                "operation": data.get("operation"),
+                "outcome": data.get("result"),
+                "task_class": data.get("task_class"),
+                "source_run_id": source.get("run_id"),
+                "evidence_refs": refs[:4] if isinstance(refs, list) else [],
+                "match_basis": match_basis,
+            })
+            if match_basis in {"host_component_heuristic", "exact_task_unattributed"}:
+                heuristic_host_matches += 1
+
+    snapshots = {
+        scope: result["ledger_snapshot"].get("sha256")
+        for scope, result in results
+    }
+    snapshot_values = list(snapshots.values())
+    snapshots_consistent = len(set(snapshot_values)) <= 1
+    any_more = any(result.get("has_more") is True for _, result in results)
+    selection_truncated = len(compact) > 10
+    context_gap = (
+        "ledger_snapshot_changed_between_scopes" if not snapshots_consistent
+        else "bounded_candidate_page_only" if any_more or selection_truncated
+        else "host_component_attribution_heuristic" if heuristic_host_matches
+        else None
+    )
+    completed = context_gap is None
+    provider_counts = {
+        scope: result.get("matching_count") for scope, result in results
+    }
+    provider_result_hashes = {
+        scope: result.get("result_sha256") for scope, result in results
+    }
     return {
-        **base, "status": "available", "events": compact,
-        "matching_count": (
-            len(compact) if not result.get("has_more") else None
+        **base, "status": "available", "events": compact[:10],
+        "selected_event_count": len(compact[:10]),
+        "matching_count": len(compact) if completed else None,
+        "provider_matching_count": (
+            sum(value for value in provider_counts.values() if type(value) is int)
         ),
-        "provider_matching_count": result.get("matching_count"),
+        "provider_matching_counts": provider_counts,
         "discarded_source_only_matches": discarded,
-        "selection_complete": not result.get("has_more"),
-        "context_gap": "bounded_candidate_page_only" if result.get("has_more") else None,
-        "has_more": result.get("has_more"),
-        "snapshot_sha256": snapshot.get("sha256"),
-        "result_sha256": result.get("result_sha256"),
+        "selection_complete": completed,
+        "context_gap": context_gap,
+        "has_more": any_more or selection_truncated,
+        "snapshot_sha256": snapshot_values[0] if snapshots_consistent else None,
+        "scope_snapshot_sha256": snapshots,
+        # A multi-query aggregate is NOT a canonical provider result receipt.
+        "result_sha256": results[0][1].get("result_sha256") if len(results) == 1 else None,
+        "scope_result_sha256": provider_result_hashes,
+        "scope_queries": [scope for scope, _ in queries],
     }
 
 
