@@ -103,3 +103,40 @@ erfolgen.
 - A canonical lane-backed `scoped_writer` is distinct from an advisory competitor or contrast agent. It may mutate only when the canonical route selects `executor=scoped_writer`, declares `route_role=scoped-writer`, sets `execution_eligible_if_separately_authorized=true`, is not `contrast_only`, and the exact Work Lane grants the requested write scope. Competition and `contrast_only` routes remain advisory.
 - Generate a contrast matrix from bound receipts. Convert shared risks and tests into deterministic validation; investigate divergent boundaries instead of voting by majority.
 - External agreement is not proof of correctness, and no automatic winner selection is permitted.
+
+
+### Automatic hard-case second opinion: existing Source frontdoor
+
+For each nontrivial source-bound task, independently assess repeated failures,
+conflicting primary observations, and material architecture risk *before* reusing
+a failed approach. Never wait for another user prompt solely to request a
+read-only second perspective.
+
+When invoking agent-execution-happy-path in Source mode, provide the optional
+hard_case_advisory signal only when grounded in real event/readback evidence:
+
+- repeated_failure: kind, two distinct evidence_refs for failures with the
+  same normalized error identity, and one actual error_fingerprint (SHA-256).
+  Include the existing prior-attempt-failed risk flag. Never synthesize receipts.
+- contradictory_evidence: kind and two distinct evidence_refs from materially
+  inconsistent current observations. Use novelty=high.
+- material_architecture: kind and at least one concrete evidence_ref for a
+  high-novelty architecture or migration decision with the high-risk flag.
+
+The normal Source frontdoor selects the best eligible subscription-backed Claude
+or Grok reviewer through the existing canonical model router and starts one
+idempotent, advisory-only contrast Candidate. The contract fixes
+max_budget_usd=0 and paid_execution_authorized=false. It exports only the
+committed, redaction-checked README, not arbitrary workspaces, credentials
+or private context. It never imposes a mandatory external PR review, selects
+a winning patch, mutates a repository, or introduces a provider usage quota.
+
+Read the returned competition_id with grabowski_agent_competition_status
+before acting on any findings. A start receipt is not a completed second
+opinion. Unavailable or ambiguous provider starts must be surfaced as such;
+continue safe primary work and never blindly repeat unknown effects.
+
+For ordinary investigations or existing threads that do not enter the AEF
+Source frontdoor, the controller must still classify the same evidence and
+call the existing advisory starter when warranted. The source-frontdoor
+dispatch is automated but does not guarantee invocation in unrelated tools.

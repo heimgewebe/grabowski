@@ -596,5 +596,19 @@ class AgentBootstrapTests(unittest.TestCase):
             module._chronik_first_context = prior
 
 
+
+    def test_bootstrap_exposes_bounded_hard_case_advisory_contract(self):
+        module = self.load_module()
+        policy = module.HARD_CASE_ADVISORY
+        self.assertEqual(policy["mode"], "source_frontdoor_auto_dispatch")
+        self.assertEqual(policy["max_budget_usd"], 0)
+        self.assertFalse(policy["paid_execution_authorized"])
+        self.assertTrue(policy["no_additional_review_gate"])
+        self.assertTrue(policy["continue_primary_work_on_unavailability"])
+        self.assertIn("automatic_detection_in_every_external_thread",
+                      policy["does_not_establish"])
+
+
+
 if __name__ == "__main__":
     unittest.main()
