@@ -560,7 +560,9 @@ def _validate_receipt(
 
 
 def _is_shared_pool(scope: dict[str, str]) -> bool:
-    return scope["kind"] == "shared_unlabeled"
+    # A connector capability identifies a shared principal, not an individual
+    # chat. Concurrent calls must not replace each other's pending challenge.
+    return scope["kind"] in {"shared_unlabeled", "connector_capability"}
 
 
 def _empty_state(scope: dict[str, str]) -> dict[str, Any]:
@@ -824,6 +826,7 @@ def _current_receipts(
         and (
             receipt.get("kind") != VERIFICATION_KIND
             or not _is_shared_pool(scope)
+            or scope["kind"] == "connector_capability"
             or _receipt_execution_capability_sha256(receipt) is not None
         )
         and _receipt_is_current(
@@ -1062,7 +1065,12 @@ def _projection(
         state_name = "challenge_pending"
         gate_open = False
         next_action = _pending_challenge_next_action(scope)
-    elif shared and (verified_current or pending_current):
+    elif shared and (verified_current or pending_current) and (
+        scope["kind"] == "shared_unlabeled"
+        or bool(pending_current)
+        or len(verified_current) != 1
+        or _receipt_execution_capability_sha256(verified_current[0]) is not None
+    ):
         projected_pending = None
         projected_verified = None
         state_name = "pooled"
@@ -1133,11 +1141,9 @@ def _projection(
     if shared:
         does_not_establish.extend(
             [
-                "which unlabeled caller owns a pooled verification",
-                "caller identity: shared_unlabeled is a shared storage "
-                "partition, not an identity",
-                "that two unlabeled callers of the same exact intent are "
-                "distinguishable",
+                "which caller owns a pooled verification",
+                "a shared storage scope does not identify an individual conversation",
+                "that two callers of the same exact intent are distinguishable",
             ]
         )
     return {
@@ -1341,9 +1347,9 @@ def acknowledge(
                 "intent and cannot be replayed; begin a new handshake with "
                 "target_tool_name and target_arguments"
             )
-        if _is_shared_pool(scope):
+        if scope["kind"] == "shared_unlabeled":
             raise TransportAtomicExecutionRequired(
-                "shared_unlabeled transport cannot acknowledge into a transferable "
+                "pooled transport cannot acknowledge into a transferable "
                 "verification; use action=execute with the exact challenge, target "
                 "tool and target arguments"
             )
@@ -1850,7 +1856,7 @@ def consume_verified(
             if not unreserved:
                 if _is_shared_pool(scope):
                     raise TransportAtomicExecutionRequired(
-                        "shared_unlabeled mutation requires action=execute; a direct "
+                        "pooled mutation requires action=execute; a direct "
                         "target call cannot consume another caller's reservation"
                     )
                 raise TransportExecutionCapabilityRequired(
