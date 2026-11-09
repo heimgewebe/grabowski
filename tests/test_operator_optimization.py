@@ -831,6 +831,32 @@ class OperatorOptimizationReportTests(unittest.TestCase):
             self.assertFalse(result["source_health"]["runtime_available"])
             self.assertIn("source_unavailable", {item["code"] for item in result["warnings"]})
 
+    def test_unavailable_audit_never_reports_complete_window(self) -> None:
+        def unavailable_audit(**_kwargs) -> dict:
+            raise RuntimeError("audit-chain verification unavailable")
+
+        report = optimization.build_operator_optimization_report(
+            [REPOSITORY],
+            now_unix=1_785_220_000,
+            window="7d",
+            health_provider=health_provider,
+            audit_provider=unavailable_audit,
+            friction_provider=friction_provider,
+            outcome_provider=outcome_provider,
+            current_work_provider=current_work_provider,
+        )
+        self.assertFalse(report["source_health"]["audit_available"])
+        self.assertFalse(report["source_health"]["audit_window_complete"])
+        self.assertFalse(report["source_health"]["bounded_source_set_complete"])
+        self.assertIsNone(report["measurement"]["selected_window"])
+        self.assertIsNone(report["measurement"]["comparison_window"])
+
+    def test_30d_without_comparison_keeps_valid_audit_coverage(self) -> None:
+        report = self.build(window="30d")
+        self.assertTrue(report["source_health"]["audit_available"])
+        self.assertTrue(report["source_health"]["audit_window_complete"])
+        self.assertIsNone(report["measurement"]["comparison_window"])
+
     def test_partial_source_failure_is_explicit_not_false_green(self) -> None:
         def broken_health() -> dict:
             raise RuntimeError("unavailable")

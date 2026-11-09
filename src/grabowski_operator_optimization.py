@@ -1268,7 +1268,15 @@ def _source_health(evidence: ReportEvidence) -> dict[str, Any]:
         truncation = evidence.current_work.get("source_truncation")
         current_truncated = isinstance(truncation, dict) and any(truncation.values())
         current_has_errors = bool(evidence.current_work.get("source_errors"))
-    audit_incomplete = any(
+    audit_metrics_available = (
+        isinstance(evidence.audit, dict)
+        and isinstance(evidence.selected_metrics, dict)
+        and (
+            evidence.comparison_label is None
+            or isinstance(evidence.comparison_metrics, dict)
+        )
+    )
+    audit_incomplete = not audit_metrics_available or any(
         isinstance(metrics, dict) and metrics.get("coverage") == "incomplete"
         for metrics in (evidence.selected_metrics, evidence.comparison_metrics)
     )
