@@ -168,7 +168,9 @@ _GITHUB_LOGIN_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?\Z"
 _GITHUB_ID_NOREPLY_CUTOFF = datetime(2017, 7, 19, tzinfo=timezone.utc)
 _GITHUB_SCP_REMOTE_RE = re.compile(r"(?:[^@\s]+@)?github\.com:(?P<path>[^?#\s]+)\Z", re.IGNORECASE)
 _MERGE_GUARD_TTL_SECONDS = 300
-_MERGE_GUARD_MAX_CHANGED_PATHS = 3000
+_MERGE_GUARD_MAX_CHANGED_PATHS = 10000
+# GitHub returns at most 3,000 PR file records, even with pagination.
+_MERGE_GUARD_GITHUB_PR_FILES_API_LIMIT = 3000
 _MERGE_GUARD_MAX_CHANGED_PATH_BYTES = 512 * 1024
 _MERGE_GUARD_MAX_SINGLE_CHANGED_PATH_BYTES = 8 * 1024
 _MERGE_GUARD_GITHUB_DIFF_MAX_FILES = 300
@@ -2348,6 +2350,84 @@ def _merge_guard_github_diff_too_large(
         or "diff exceeded the maximum number of files" in message
     )
     return line_limit or file_limit
+
+
+def _merge_guard_exact_large_pr_paths(
+    repo_path: Path, *,
+    changed_files: int, view_files: Any, base_branch: str, pr_number: int,
+    base_sha: str, head_sha: str,
+) -> tuple[list[str], dict[str, Any], list[str]]:
+    """Prove a >3,000-file PR without trusting GitHub's truncated file listing.
+
+    The PR head/base SHA are checked against the live GitHub view by the caller.
+    Git objects must be present at those exact SHAs, and the unique merge-base
+    path set must have the provider's exact changedFiles count. The complete
+    authenticated diff is checked separately; the first provider file page is
+    only an additional disagreement detector, never the source of authority.
+    """
+    receipt: dict[str, Any] = {
+        "source": "exact-head-local-paths-after-github-files-api-cap",
+        "changed_files": changed_files,
+        "github_files_api_limit": _MERGE_GUARD_GITHUB_PR_FILES_API_LIMIT,
+        "base_sha": base_sha,
+        "head_sha": head_sha,
+    }
+    if (
+        type(changed_files) is not int
+        or not _MERGE_GUARD_GITHUB_PR_FILES_API_LIMIT < changed_files <= _MERGE_GUARD_MAX_CHANGED_PATHS
+    ):
+        return [], receipt, ["merge_guard_large_pr_count_out_of_bounds"]
+    objects, object_errors = _merge_guard_ensure_pr_objects(
+        repo_path, base_branch=base_branch, pr_number=pr_number,
+        base_sha=base_sha, head_sha=head_sha,
+    )
+    receipt["git_objects"] = objects
+    if object_errors:
+        return [], receipt, object_errors
+    paths, local_receipt, path_errors = _merge_guard_local_changed_paths(
+        repo_path, base_sha=base_sha, head_sha=head_sha,
+    )
+    receipt["local_paths"] = local_receipt
+    if path_errors:
+        return [], receipt, path_errors
+    receipt["complete_path_count"] = len(paths)
+    receipt["complete_paths_sha256"] = _sha256_json(paths)
+    errors: list[str] = []
+    if len(paths) != changed_files:
+        errors.append("merge_guard_large_pr_changed_file_count_drift")
+    if not isinstance(view_files, list) or not 1 <= len(view_files) <= 100:
+        errors.append("merge_guard_large_pr_provider_file_sample_missing_or_invalid")
+    else:
+        local_set = set(paths)
+        sampled: set[str] = set()
+        for index, item in enumerate(view_files):
+            if not isinstance(item, dict):
+                errors.append(f"merge_guard_large_pr_provider_file_invalid:{index}")
+                continue
+            path = item.get("path")
+            change_type = item.get("changeType")
+            # No provider rename/copy is silently rewritten as a local add.
+            # The small-PR path continues to handle those types explicitly.
+            if (
+                not isinstance(path, str) or not path or path.startswith("/")
+                or "\x00" in path
+                or len(path.encode("utf-8")) > _MERGE_GUARD_MAX_SINGLE_CHANGED_PATH_BYTES
+                or any(part in {"", ".", ".."} for part in path.split("/"))
+                or path in sampled or path not in local_set
+                or change_type not in {"ADDED", "MODIFIED", "DELETED"}
+            ):
+                errors.append(f"merge_guard_large_pr_provider_sample_drift:{index}")
+                continue
+            sampled.add(path)
+        receipt["provider_sample_count"] = len(view_files)
+        receipt["provider_sample_sha256"] = _sha256_json(view_files)
+    if (
+        len(_canonical_json(paths).encode("utf-8"))
+        > _MERGE_GUARD_MAX_CHANGED_PATH_BYTES
+    ):
+        errors.append("merge_guard_large_pr_changed_paths_exceed_byte_limit")
+    receipt["status"] = "verified" if not errors else "blocked"
+    return (paths if not errors else []), receipt, errors
 
 
 def _merge_guard_github_file_records(
@@ -5734,6 +5814,22 @@ class CaptainMergeGuardRunner:
         changed_files = viewed.get("changedFiles")
         raw_files = viewed.get("files")
         changed_paths: list[str] = []
+        large_pr_mode = (
+            type(changed_files) is int
+            and _MERGE_GUARD_GITHUB_PR_FILES_API_LIMIT < changed_files
+            <= _MERGE_GUARD_MAX_CHANGED_PATHS
+        )
+        if large_pr_mode:
+            changed_paths, large_receipt, large_errors = (
+                _merge_guard_exact_large_pr_paths(
+                    self.repo_path, changed_files=changed_files,
+                    view_files=raw_files, base_branch=expected_base,
+                    pr_number=pr_number, base_sha=base_sha,
+                    head_sha=expected_head,
+                )
+            )
+            self.receipt["large_pr_paths"] = large_receipt
+            errors.extend(large_errors)
         if type(changed_files) is not int or changed_files < 1:
             errors.append("merge_guard_changed_file_count_invalid")
         elif changed_files > _MERGE_GUARD_MAX_CHANGED_PATHS:
@@ -5746,7 +5842,7 @@ class CaptainMergeGuardRunner:
         ]
         requires_complete_file_projection = (
             type(changed_files) is int
-            and changed_files <= _MERGE_GUARD_MAX_CHANGED_PATHS
+            and changed_files <= _MERGE_GUARD_GITHUB_PR_FILES_API_LIMIT
             and (changed_files > 100 or bool(rename_or_copy_indexes))
         )
         if requires_complete_file_projection:
@@ -5765,7 +5861,11 @@ class CaptainMergeGuardRunner:
                     errors.append("merge_guard_changed_file_count_exceeds_supported_limit")
                     if isinstance(raw_files, list) and len(raw_files) > 128:
                         errors.append("merge_guard_changed_path_count_exceeds_limit")
-        if not isinstance(raw_files, list):
+        if large_pr_mode:
+            # The authenticated Git tree is complete, unlike the provider
+            # file projection capped at 3,000 entries.
+            pass
+        elif not isinstance(raw_files, list):
             errors.append("merge_guard_changed_file_list_missing")
         else:
             for index, item in enumerate(raw_files):
