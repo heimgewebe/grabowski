@@ -45,6 +45,61 @@ def task_payload() -> dict:
 
 
 class CurrentWorkSurfaceTests(unittest.TestCase):
+    def test_reconciliation_uses_complete_snapshot_only_within_projection_bound(self) -> None:
+        # Ordinary public reconciliation remains limited to 100 rows; the
+        # internal Current Work snapshot must not arbitrarily lose row 101.
+        for count, foreign_count in (
+            (0, 0), (100, 0), (101, 0),
+            (surface.current_work.MAX_WORKTREES, 0),
+            (surface.current_work.MAX_WORKTREES + 1, 0),
+            (313, 1200),
+        ):
+            with self.subTest(binding_count=count, foreign_count=foreign_count):
+                database = {
+                    "snapshot_sha256": "a" * 64,
+                    "bindings": (
+                        [{"checkout_key": f"row-{index}", "repo_path": REPOSITORY}
+                         for index in range(count)]
+                        + [{"checkout_key": f"foreign-{index}",
+                            "repo_path": "/home/alex/repos/other"}
+                           for index in range(foreign_count)]
+                    ),
+                    "retentions": [],
+                }
+                calls: list[dict] = []
+
+                def reconcile(**kwargs: object) -> dict:
+                    calls.append(kwargs)
+                    complete = kwargs["_single_complete_snapshot"]
+                    scoped = [row for row in database["bindings"]
+                              if row["repo_path"] == REPOSITORY]
+                    rows = scoped if complete else scoped[:100]
+                    return {
+                        "bindings": rows,
+                        "total_count": count,
+                        "pagination": {"has_more": len(rows) < count},
+                    }
+
+                reconciler = SimpleNamespace(
+                    MAX_PAGE_LIMIT=100,
+                    collect_lifecycle_bindings_from_db=lambda **_kwargs: database,
+                    reconcile_checkout_bindings=reconcile,
+                )
+                with (
+                    patch.object(surface, "_module", return_value=reconciler),
+                    patch.object(surface, "_task_checkout_presence",
+                                 return_value=({}, True)),
+                ):
+                    result = surface._reconciliation_payload([REPOSITORY])
+
+                within_bound = count <= surface.current_work.MAX_WORKTREES
+                self.assertEqual(calls[0]["_single_complete_snapshot"], within_bound)
+                self.assertIs(calls[0]["_database_snapshot"], database)
+                self.assertEqual(calls[0]["limit"], 100)
+                self.assertEqual(len(result["bindings"]),
+                                 count if within_bound else 100)
+                self.assertEqual(result["pagination"]["has_more"], not within_bound)
+
     def test_reconciliation_payload_adds_complete_task_checkout_presence(self) -> None:
         database = {
             "snapshot_sha256": "a" * 64,

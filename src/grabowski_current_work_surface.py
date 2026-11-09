@@ -373,11 +373,27 @@ def _reconciliation_payload(repositories: list[str]) -> dict[str, Any]:
     database_snapshot = reconciler.collect_lifecycle_bindings_from_db(
         _wal_mutation_admission=_checkout_wal_admission,
     )
+    # Public reconciliation stays paginated at 100 rows. Current Work can
+    # consume the existing single-snapshot admission path while the result
+    # fits its own bounded evidence capacity; no second Git scan is needed.
+    bindings = database_snapshot.get("bindings")
+    complete_snapshot = (
+        isinstance(bindings, list)
+        and all(
+            isinstance(row, dict) and isinstance(row.get("repo_path"), str)
+            for row in bindings
+        )
+        and sum(
+            str(Path(row["repo_path"]).expanduser().resolve(strict=False)) in repositories
+            for row in bindings
+        ) <= current_work.MAX_WORKTREES
+    )
     payload = reconciler.reconcile_checkout_bindings(
         repository_filters=repositories,
         limit=reconciler.MAX_PAGE_LIMIT,
         git_timeout_seconds=CURRENT_WORK_GIT_TIMEOUT_SECONDS,
         _database_snapshot=database_snapshot,
+        _single_complete_snapshot=complete_snapshot,
     )
     (
         task_checkout_presence,
