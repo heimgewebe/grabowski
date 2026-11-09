@@ -178,12 +178,22 @@ def _attention_payload(
 
 def _resources_payload() -> dict[str, Any]:
     resources = _module("grabowski_resources")
-    leases = resources.list_resources(
-        include_expired=False,
-        limit=MAX_SOURCE_LEASES,
-        read_only=True,
-    )
-    total = resources.count_resources(include_expired=False, read_only=True)
+    # Use one transaction and one expiry cutoff for both values.  Separate
+    # list/count snapshots may disagree when a lease is renewed mid-read.
+    now = resources._now()
+    live_filter = "typeof(expires_at_unix)='integer' AND expires_at_unix>?"
+    with resources._resource_readonly_snapshot() as connection:
+        rows = connection.execute(
+            "SELECT * FROM leases WHERE " + live_filter
+            + " ORDER BY resource_key LIMIT ?",
+            (now, MAX_SOURCE_LEASES),
+        ).fetchall()
+        count_row = connection.execute(
+            "SELECT COUNT(*) AS count FROM leases WHERE " + live_filter,
+            (now,),
+        ).fetchone()
+    leases = [resources._public(row) for row in rows]
+    total = int(count_row["count"])
     return {
         "leases": leases,
         "count": total,
