@@ -14876,6 +14876,45 @@ def grabowski_chronik_full_search(
     )
 
 
+def _chronik_read_only_executor(configuration: dict[str, Any]):
+    def executor(argv: list[str], cwd: Path) -> dict[str, Any]:
+        try:
+            command = full_search.read_only_search_argv(
+                argv, cwd, Path(configuration["data_dir"]),
+            )
+        except (OSError, RuntimeError, ValueError):
+            # No unsandboxed fallback, as for the full agent-ledger search.
+            return {"returncode": 1, "stdout": "", "stderr": "Chronik sandbox unavailable"}
+        return operator._run(
+            command, cwd=cwd, timeout_seconds=CHRONIK_CLI_TIMEOUT_SECONDS,
+            max_output_bytes=CHRONIK_CLI_MAX_OUTPUT_BYTES,
+        )
+    return executor
+
+
+def chronik_knowledge_search(
+    repo: str = "", host: str = "", keyword: str = "",
+    knowledge_type: str = "", limit: int = 10,
+) -> dict[str, Any]:
+    """Internal read-only knowledge.ledger search for the agent bootstrap.
+
+    Not an MCP tool: it adds no authority and no new tool surface. It reads
+    semantic Chronik knowledge (causes, repairs, decisions, refutations)
+    through the same read-only sandbox as grabowski_chronik_full_search.
+    """
+    operator._require_operator_capability("durable_job")
+    configuration = chronik.coding_memory_configuration()
+    return full_search.knowledge_query(
+        selectors={
+            "repo": repo, "host": host, "keyword": keyword,
+            "knowledge_type": knowledge_type,
+        },
+        limit=limit,
+        configuration=configuration,
+        executor=_chronik_read_only_executor(configuration),
+    )
+
+
 @mcp.tool(name="grabowski_chronik_history", annotations=READ_ONLY)
 def grabowski_chronik_history(
     repo: str = "",
