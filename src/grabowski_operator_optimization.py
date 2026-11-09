@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 import hashlib
 import importlib
 import time
@@ -297,6 +298,52 @@ def _comparison(
             "independent experiment."
         ),
     }
+
+
+def _mask_incomplete_audit_window(
+    metrics: dict[str, Any] | None,
+    label: str | None,
+    audit: dict[str, Any] | None,
+    now_unix: int,
+    warnings: list[dict[str, Any]],
+) -> None:
+    """Keep observed counts, but never extrapolate truncated audit coverage."""
+    if metrics is None or label is None or not isinstance(audit, dict):
+        return
+    binding = audit.get("source_binding")
+    if not isinstance(binding, dict) or binding.get("scan_truncated") is not True:
+        return
+    oldest = binding.get("first_timestamp")
+    oldest_unix = None
+    if isinstance(oldest, str):
+        try:
+            instant = datetime.fromisoformat(oldest.replace("Z", "+00:00"))
+            if instant.tzinfo is not None:
+                oldest_unix = instant.timestamp()
+        except ValueError:
+            pass
+    if oldest_unix is not None and oldest_unix <= now_unix - REPORT_WINDOWS[label]:
+        metrics["coverage"] = "complete"
+        return
+    metrics["coverage"] = "incomplete"
+    for field in (
+        "records_per_day",
+        "failure_signal_rate",
+        "failure_signals_per_day",
+        "task_starts_per_day",
+        "task_cancels_per_1000_starts",
+        "resource_reclamation_events_per_1000_starts",
+        "reclaimed_resources_per_1000_starts",
+    ):
+        metrics[field] = None
+    warnings.append(
+        {
+            "code": "audit_window_incomplete",
+            "window": label,
+            "source": "audit_projection",
+            "reason": "truncated_source_before_window_start",
+        }
+    )
 
 
 def _evidence_ref(prefix: str, value: Any, suffix: str = "") -> str | None:
@@ -1235,8 +1282,18 @@ def _source_health(evidence: ReportEvidence) -> dict[str, Any]:
         truncation = evidence.current_work.get("source_truncation")
         current_truncated = isinstance(truncation, dict) and any(truncation.values())
         current_has_errors = bool(evidence.current_work.get("source_errors"))
-    bounded_complete = all_available and not current_truncated and not current_has_errors
+    audit_incomplete = any(
+        isinstance(metrics, dict) and metrics.get("coverage") == "incomplete"
+        for metrics in (evidence.selected_metrics, evidence.comparison_metrics)
+    )
+    bounded_complete = (
+        all_available
+        and not current_truncated
+        and not current_has_errors
+        and not audit_incomplete
+    )
     return {
+        "audit_window_complete": not audit_incomplete,
         "runtime_available": evidence.health is not None,
         "runtime_healthy": (
             evidence.health.get("healthy")
@@ -1403,6 +1460,16 @@ def build_operator_optimization_report(
         current_work_limit=current_work_limit,
         providers=providers,
         warnings=warnings,
+    )
+    _mask_incomplete_audit_window(
+        evidence.selected_metrics, window, evidence.audit, generated_at_unix, warnings
+    )
+    _mask_incomplete_audit_window(
+        evidence.comparison_metrics,
+        evidence.comparison_label,
+        evidence.audit,
+        generated_at_unix,
+        warnings,
     )
     findings = _collect_findings(evidence, warnings)
     recommendations = [_recommendation(item) for item in findings]

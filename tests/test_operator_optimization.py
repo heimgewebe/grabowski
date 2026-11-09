@@ -520,6 +520,83 @@ class OperatorOptimizationReportTests(unittest.TestCase):
         self.assertIn("449 remain historical or unattributed", reclamation["observation"])
         self.assertIn("do not change lease duration", reclamation["recommended_action"])
 
+    def test_truncated_audit_scan_does_not_fabricate_window_rates(self) -> None:
+        def truncated_audit(**_kwargs) -> dict:
+            payload = audit_provider()
+            payload["source_binding"].update(
+                {
+                    "scan_truncated": True,
+                    "first_timestamp": "2026-11-06T13:49:47+00:00",
+                }
+            )
+            return payload
+
+        report = optimization.build_operator_optimization_report(
+            [REPOSITORY],
+            now_unix=1_794_247_200,
+            window="7d",
+            health_provider=health_provider,
+            audit_provider=truncated_audit,
+            friction_provider=friction_provider,
+            outcome_provider=outcome_provider,
+            current_work_provider=current_work_provider,
+        )
+        measured = report["measurement"]
+        self.assertFalse(report["source_health"]["audit_window_complete"])
+        self.assertFalse(report["source_health"]["bounded_source_set_complete"])
+        for label in ("selected_window", "comparison_window"):
+            metrics = measured[label]
+            self.assertEqual(metrics["coverage"], "incomplete")
+            self.assertGreater(metrics["record_count"], 0)
+            self.assertIsNone(metrics["records_per_day"])
+            self.assertIsNone(metrics["task_starts_per_day"])
+            self.assertIsNone(metrics["failure_signal_rate"])
+        self.assertIsNone(
+            measured["comparison"]["rates"]["task_starts_per_day"]["relative_change"]
+        )
+        self.assertEqual(
+            {"7d", "30d"},
+            {
+                item["window"]
+                for item in report["warnings"]
+                if item["code"] == "audit_window_incomplete"
+            },
+        )
+
+    def test_truncated_scan_with_full_window_coverage_keeps_rates(self) -> None:
+        def covered_audit(**_kwargs) -> dict:
+            payload = audit_provider()
+            payload["source_binding"].update(
+                {
+                    "scan_truncated": True,
+                    "first_timestamp": "2026-09-01T00:00:00+00:00",
+                }
+            )
+            return payload
+
+        report = optimization.build_operator_optimization_report(
+            [REPOSITORY],
+            now_unix=1_794_247_200,
+            window="7d",
+            health_provider=health_provider,
+            audit_provider=covered_audit,
+            friction_provider=friction_provider,
+            outcome_provider=outcome_provider,
+            current_work_provider=current_work_provider,
+        )
+        self.assertEqual(
+            report["measurement"]["comparison_window"]["coverage"], "complete"
+        )
+        self.assertIsNotNone(
+            report["measurement"]["comparison"]["rates"]["task_starts_per_day"][
+                "relative_change"
+            ]
+        )
+        self.assertNotIn(
+            "audit_window_incomplete",
+            {item["code"] for item in report["warnings"]},
+        )
+
     def test_report_compares_normalized_overlapping_window_rates(self) -> None:
         result = self.build(window="7d")
         comparison = result["measurement"]["comparison"]
