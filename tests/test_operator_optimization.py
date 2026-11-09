@@ -563,8 +563,10 @@ class OperatorOptimizationReportTests(unittest.TestCase):
             },
         )
 
-    def test_truncated_scan_with_full_window_coverage_keeps_rates(self) -> None:
-        def covered_audit(**_kwargs) -> dict:
+    def test_truncated_scan_with_backdated_first_timestamp_stays_incomplete(self) -> None:
+        # Append order is not timestamp order: an old first record does not
+        # prove that records omitted by the scan fall outside either window.
+        def backdated_audit(**_kwargs) -> dict:
             payload = audit_provider()
             payload["source_binding"].update(
                 {
@@ -579,22 +581,26 @@ class OperatorOptimizationReportTests(unittest.TestCase):
             now_unix=1_794_247_200,
             window="7d",
             health_provider=health_provider,
-            audit_provider=covered_audit,
+            audit_provider=backdated_audit,
             friction_provider=friction_provider,
             outcome_provider=outcome_provider,
             current_work_provider=current_work_provider,
         )
-        self.assertEqual(
-            report["measurement"]["comparison_window"]["coverage"], "complete"
-        )
-        self.assertIsNotNone(
+        self.assertFalse(report["source_health"]["audit_window_complete"])
+        self.assertFalse(report["source_health"]["bounded_source_set_complete"])
+        for label in ("selected_window", "comparison_window"):
+            metrics = report["measurement"][label]
+            self.assertEqual(metrics["coverage"], "incomplete")
+            self.assertGreater(metrics["record_count"], 0)
+            self.assertIsNone(metrics["task_starts_per_day"])
+        self.assertIsNone(
             report["measurement"]["comparison"]["rates"]["task_starts_per_day"][
                 "relative_change"
             ]
         )
-        self.assertNotIn(
-            "audit_window_incomplete",
-            {item["code"] for item in report["warnings"]},
+        self.assertEqual(
+            {"7d", "30d"},
+            {item["window"] for item in report["warnings"] if item["code"] == "audit_window_incomplete"},
         )
 
     def test_report_compares_normalized_overlapping_window_rates(self) -> None:

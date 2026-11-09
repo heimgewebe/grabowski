@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
 import hashlib
 import importlib
 import time
@@ -304,26 +303,13 @@ def _mask_incomplete_audit_window(
     metrics: dict[str, Any] | None,
     label: str | None,
     audit: dict[str, Any] | None,
-    now_unix: int,
     warnings: list[dict[str, Any]],
 ) -> None:
-    """Keep observed counts, but never extrapolate truncated audit coverage."""
+    """Keep counts, but never infer complete coverage from a truncated scan."""
     if metrics is None or label is None or not isinstance(audit, dict):
         return
     binding = audit.get("source_binding")
     if not isinstance(binding, dict) or binding.get("scan_truncated") is not True:
-        return
-    oldest = binding.get("first_timestamp")
-    oldest_unix = None
-    if isinstance(oldest, str):
-        try:
-            instant = datetime.fromisoformat(oldest.replace("Z", "+00:00"))
-            if instant.tzinfo is not None:
-                oldest_unix = instant.timestamp()
-        except ValueError:
-            pass
-    if oldest_unix is not None and oldest_unix <= now_unix - REPORT_WINDOWS[label]:
-        metrics["coverage"] = "complete"
         return
     metrics["coverage"] = "incomplete"
     for field in (
@@ -341,7 +327,7 @@ def _mask_incomplete_audit_window(
             "code": "audit_window_incomplete",
             "window": label,
             "source": "audit_projection",
-            "reason": "truncated_source_before_window_start",
+            "reason": "truncated_scan_coverage_unproven",
         }
     )
 
@@ -1462,13 +1448,12 @@ def build_operator_optimization_report(
         warnings=warnings,
     )
     _mask_incomplete_audit_window(
-        evidence.selected_metrics, window, evidence.audit, generated_at_unix, warnings
+        evidence.selected_metrics, window, evidence.audit, warnings
     )
     _mask_incomplete_audit_window(
         evidence.comparison_metrics,
         evidence.comparison_label,
         evidence.audit,
-        generated_at_unix,
         warnings,
     )
     findings = _collect_findings(evidence, warnings)
