@@ -588,6 +588,110 @@ class RiskScaledIndependentReviewContractTests(unittest.TestCase):
         )
 
 
+class CaptainLargePrProviderCapTests(unittest.TestCase):
+    """GitHub's 3,000-file listing cap cannot gate an exact signed PR diff."""
+
+    def setUp(self) -> None:
+        self.paths = [f"releases/new/part-{i:04d}.json" for i in range(3587)]
+        self.sample = [
+            {"path": path, "changeType": "ADDED"} for path in self.paths[:100]
+        ]
+        self.params = {
+            "changed_files": len(self.paths),
+            "view_files": self.sample,
+            "base_branch": "main",
+            "pr_number": 238,
+            "base_sha": "a" * 40,
+            "head_sha": "b" * 40,
+        }
+
+    def run_large_paths(self, **overrides: object):
+        inputs = {**self.params, **overrides}
+        with mock.patch.object(
+            merge_guard, "_merge_guard_ensure_pr_objects",
+            return_value=({"available": True}, []),
+        ) as objects, mock.patch.object(
+            merge_guard, "_merge_guard_local_changed_paths",
+            return_value=(self.paths, {"source": "local-bound-git-name-only"}, []),
+        ) as local:
+            result = merge_guard._merge_guard_exact_large_pr_paths(
+                Path.cwd(), **inputs
+            )
+        self.assertEqual(objects.call_count, 1)
+        self.assertEqual(local.call_count, 1)
+        self.assertEqual(local.call_args.kwargs["head_sha"], "b" * 40)
+        return result
+
+    def test_accept_complete_local_paths_with_exact_provider_count_and_sample(self) -> None:
+        paths, receipt, errors = self.run_large_paths()
+        self.assertEqual(errors, [])
+        self.assertEqual(paths, self.paths)
+        self.assertEqual(receipt["complete_path_count"], 3587)
+        self.assertEqual(receipt["status"], "verified")
+        self.assertEqual(receipt["provider_sample_count"], 100)
+
+    def test_reject_partial_or_unverified_oversized_paths(self) -> None:
+        bad_cases = (
+            ("count mismatch", {"changed_files": 3588}, "changed_file_count_drift"),
+            ("unknown sample path", {"view_files": [
+                {"path": "untrusted/payload.json", "changeType": "ADDED"}
+            ]}, "provider_sample_drift"),
+            ("renamed sample", {"view_files": [
+                {"path": self.paths[0], "changeType": "RENAMED", "previousPath": "other"}
+            ]}, "provider_sample_drift"),
+            ("duplicate sample", {"view_files": [
+                self.sample[0], self.sample[0]
+            ]}, "provider_sample_drift"),
+            ("missing provider sample", {"view_files": []}, "sample_missing_or_invalid"),
+        )
+        for label, overrides, reason in bad_cases:
+            with self.subTest(label=label):
+                paths, receipt, errors = self.run_large_paths(**overrides)
+                self.assertEqual(paths, [])
+                self.assertEqual(receipt["status"], "blocked")
+                self.assertTrue(any(reason in e for e in errors), errors)
+
+    def test_live_binding_uses_exact_local_diff_not_provider_3000_file_list(self) -> None:
+        gh = _LargePrGh(
+            base_sha="a" * 40, head_sha="b" * 40, paths=self.paths,
+        )
+        raw = b"diff --git a/test.txt b/test.txt\n"
+        expected_sha = merge_guard.github_pr_diff_identity_sha256(raw)
+        runner = object.__new__(merge_guard.CaptainMergeGuardRunner)
+        runner.action = {
+            "target": {"repo": "heimgewebe/commonworld", "pr": 212, "base": "main"},
+        }
+        runner.parameters = {
+            "expected_head": gh.head_sha,
+            "expected_base_sha": gh.base_sha,
+            "diff_sha256": expected_sha,
+        }
+        runner.static_errors = []
+        runner.repo_path = Path.cwd()
+        runner.github_runner = gh
+        runner.receipt = {}
+        runner.execution_intent_sha256 = "1" * 64
+        runner._revalidate_codex_review = lambda _bindings, phase: []
+        with mock.patch.object(
+            merge_guard, "_merge_guard_ensure_pr_objects",
+            return_value=({"available": True}, []),
+        ), mock.patch.object(
+            merge_guard, "_merge_guard_local_changed_paths",
+            return_value=(self.paths, {"source": "local-bound-git-name-only"}, []),
+        ), mock.patch.object(
+            merge_guard, "_merge_guard_local_diff_bytes",
+            return_value=(raw, {"raw_sha256": hashlib.sha256(raw).hexdigest()}, []),
+        ):
+            bindings, errors = runner._live_bindings()
+        self.assertEqual(errors, [])
+        self.assertIsNotNone(bindings)
+        assert bindings is not None
+        self.assertEqual(bindings["changed_paths"], self.paths)
+        self.assertEqual(bindings["diff_sha256"], expected_sha)
+        self.assertEqual(runner.receipt["large_pr_paths"]["status"], "verified")
+        self.assertFalse(any(call[:2] == ("api", "--paginate") for call in gh.calls))
+
+
 class CaptainLargePrMergeGuardTests(unittest.TestCase):
     def test_github_diff_too_large_is_narrowly_detected(self) -> None:
         info = {
