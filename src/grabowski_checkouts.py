@@ -765,11 +765,15 @@ def _lifecycle_public(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _lifecycle_bindings(keys: Iterable[str]) -> dict[str, dict[str, Any]]:
+def _lifecycle_bindings(
+    keys: Iterable[str], *, connection: sqlite3.Connection | None = None,
+) -> dict[str, dict[str, Any]]:
     wanted = sorted(set(keys))
     if not wanted:
         return {}
-    connection = _readonly_connection(CHECKOUT_DB)
+    owns_connection = connection is None
+    if owns_connection:
+        connection = _readonly_connection(CHECKOUT_DB)
     if connection is None:
         return {}
     try:
@@ -780,7 +784,8 @@ def _lifecycle_bindings(keys: Iterable[str]) -> dict[str, dict[str, Any]]:
     except sqlite3.OperationalError:
         return {}
     finally:
-        connection.close()
+        if owns_connection:
+            connection.close()
     return {row["checkout_key"]: _lifecycle_public(row) for row in rows}
 
 
@@ -1048,9 +1053,12 @@ def _active_capacity_projection(
     now: int,
     max_path_observations: int = MAX_ACTIVE_CAPACITY_PATH_OBSERVATIONS,
     deadline_monotonic: float | None = None,
+    connection: sqlite3.Connection | None = None,
 ) -> dict[str, Any]:
     """Read one repository's active capacity without creating state on absence."""
-    connection = _readonly_connection(CHECKOUT_DB)
+    owns_connection = connection is None
+    if owns_connection:
+        connection = _readonly_connection(CHECKOUT_DB)
     if connection is None:
         return _unavailable_active_capacity_projection()
     try:
@@ -1064,7 +1072,8 @@ def _active_capacity_projection(
     except sqlite3.OperationalError:
         return _unavailable_active_capacity_projection()
     finally:
-        connection.close()
+        if owns_connection:
+            connection.close()
 
 
 def active_capacity_projection(repo: Path) -> dict[str, Any]:
@@ -1427,11 +1436,15 @@ def _mark_checkout_archived(
     return lifecycle
 
 
-def _retention_records(keys: Iterable[str]) -> dict[str, dict[str, Any]]:
+def _retention_records(
+    keys: Iterable[str], *, connection: sqlite3.Connection | None = None,
+) -> dict[str, dict[str, Any]]:
     wanted = sorted(set(keys))
     if not wanted:
         return {}
-    connection = _readonly_connection(CHECKOUT_DB)
+    owns_connection = connection is None
+    if owns_connection:
+        connection = _readonly_connection(CHECKOUT_DB)
     if connection is None:
         return {}
     try:
@@ -1442,7 +1455,8 @@ def _retention_records(keys: Iterable[str]) -> dict[str, dict[str, Any]]:
     except sqlite3.OperationalError:
         return {}
     finally:
-        connection.close()
+        if owns_connection:
+            connection.close()
     return {row["checkout_key"]: _retention_public(row) for row in rows}
 
 def _release_retention_exact(retention: dict[str, Any]) -> bool:
@@ -1487,11 +1501,15 @@ def _archive_supersession_ids(connection: sqlite3.Connection) -> set[str]:
     }
 
 
-def _latest_archives(keys: Iterable[str]) -> dict[str, dict[str, Any]]:
+def _latest_archives(
+    keys: Iterable[str], *, connection: sqlite3.Connection | None = None,
+) -> dict[str, dict[str, Any]]:
     wanted = sorted(set(keys))
     if not wanted:
         return {}
-    connection = _readonly_connection(CHECKOUT_DB)
+    owns_connection = connection is None
+    if owns_connection:
+        connection = _readonly_connection(CHECKOUT_DB)
     if connection is None:
         return {}
     try:
@@ -1507,7 +1525,8 @@ def _latest_archives(keys: Iterable[str]) -> dict[str, dict[str, Any]]:
     except sqlite3.OperationalError:
         return {}
     finally:
-        connection.close()
+        if owns_connection:
+            connection.close()
     latest: dict[str, dict[str, Any]] = {}
     for row in rows:
         if row["archive_id"] in superseded or row["checkout_key"] in latest:
@@ -6026,18 +6045,28 @@ def checkout_inventory(
         timeout_seconds=git_timeout,
     )
     keys = [record["checkout_key"] for record in records]
-    retention = _retention_records(keys)
-    bindings = _lifecycle_bindings(keys)
-    archives = _latest_archives(keys)
     now = _now()
-    active_capacity = _active_capacity_projection(
-        common_dir,
-        now=now,
-        max_path_observations=(
-            0 if bounded_observation else MAX_ACTIVE_CAPACITY_PATH_OBSERVATIONS
-        ),
-        deadline_monotonic=deadline_monotonic,
-    )
+    # One SQLite transaction for checkout metadata, retaining strict WAL/SHM
+    # admission and source identity. Release before slow Git status probes.
+    metadata_connection = _readonly_connection(CHECKOUT_DB)
+    try:
+        if metadata_connection is not None and not metadata_connection.in_transaction:
+            metadata_connection.execute("BEGIN")
+        retention = _retention_records(keys, connection=metadata_connection)
+        bindings = _lifecycle_bindings(keys, connection=metadata_connection)
+        archives = _latest_archives(keys, connection=metadata_connection)
+        active_capacity = _active_capacity_projection(
+            common_dir,
+            now=now,
+            max_path_observations=(
+                0 if bounded_observation else MAX_ACTIVE_CAPACITY_PATH_OBSERVATIONS
+            ),
+            deadline_monotonic=deadline_monotonic,
+            connection=metadata_connection,
+        )
+    finally:
+        if metadata_connection is not None:
+            metadata_connection.close()
 
     def observation_priority(record: dict[str, Any]) -> tuple[int, str]:
         key = str(record["checkout_key"])
