@@ -45,6 +45,36 @@ def task_payload() -> dict:
 
 
 class CurrentWorkSurfaceTests(unittest.TestCase):
+    def test_resources_payload_uses_one_snapshot_and_one_expiry_cutoff(self) -> None:
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        connection.execute(
+            "CREATE TABLE leases (resource_key TEXT, expires_at_unix INTEGER)"
+        )
+        connection.executemany(
+            "INSERT INTO leases VALUES (?, ?)",
+            [("live-a", 101), ("live-b", 102), ("expired", 99)],
+        )
+        snapshot_opens: list[int] = []
+
+        def snapshot():
+            snapshot_opens.append(1)
+            return nullcontext(connection)
+
+        resources = SimpleNamespace(
+            _resource_readonly_snapshot=snapshot,
+            _now=lambda: 100,
+            _public=lambda row: dict(row),
+        )
+        with patch.object(surface, "_module", return_value=resources):
+            with patch.object(surface, "MAX_SOURCE_LEASES", 1):
+                result = surface._resources_payload()
+        self.assertEqual(snapshot_opens, [1])
+        self.assertEqual(result["count"], 2)
+        self.assertEqual([row["resource_key"] for row in result["leases"]], ["live-a"])
+        self.assertTrue(result["truncated"])
+        connection.close()
+
     def test_reconciliation_uses_complete_snapshot_only_within_projection_bound(self) -> None:
         # Ordinary public reconciliation remains limited to 100 rows; the
         # internal Current Work snapshot must not arbitrarily lose row 101.
