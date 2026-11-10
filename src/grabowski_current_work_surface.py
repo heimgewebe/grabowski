@@ -62,6 +62,24 @@ def _source_error(source: str, exc: Exception) -> dict[str, str]:
     }
 
 
+def _transient_sqlite_snapshot_change(source: str, exc: Exception) -> bool:
+    # A checkpoint can remove WAL/SHM between preflight and reader entry.
+    # Only these exact snapshot errors justify one completely new observation.
+    classes = {
+        "resources": ("grabowski_resources", "ResourceSchemaInventoryChanged"),
+        "tasks": ("grabowski_tasks", "TaskSchemaInventoryChanged"),
+        "attention": ("grabowski_tasks", "TaskSchemaInventoryChanged"),
+    }
+    target = classes.get(source)
+    if target is None:
+        return False
+    try:
+        changed_type = getattr(_module(target[0]), target[1])
+    except (ImportError, AttributeError):
+        return False
+    return isinstance(changed_type, type) and isinstance(exc, changed_type)
+
+
 def _attempt_source(
     source: str,
     capability: str,
@@ -71,7 +89,14 @@ def _attempt_source(
 ) -> Any:
     try:
         _operator()._require_operator_capability(capability)
-        return loader()
+        try:
+            return loader()
+        except Exception as exc:
+            if not _transient_sqlite_snapshot_change(source, exc):
+                raise
+            # Discard the failed read entirely. A new transaction may succeed
+            # after sidecar turnover; persistent drift stays explicit below.
+            return loader()
     except Exception as exc:  # Each unavailable source remains explicit and partial.
         errors.append(_source_error(source, exc))
         return default
