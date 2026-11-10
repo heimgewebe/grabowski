@@ -28,6 +28,25 @@ historical_context_unavailable und setzt die zulässige Arbeit fort.
 Aktuelle Git-, CI-, Runtime- oder Review-Wahrheit wird nie durch alte
 Ereignisse ersetzt.
 
+## Wissenseinträge (knowledge.ledger)
+
+Zusätzlich zu den Laufereignissen enthält `chronik_first.knowledge` bis zu
+acht Einträge aus dem semantischen `knowledge.ledger` (bestätigte Ursachen,
+Reparaturen, Entscheidungen, Widerlegungen, offene Probleme) zum Repository
+(`subject.repo`) oder – ohne Repository – zum Host. Explizite Komponente und
+PR-Nummer wirken als harte Einschränkung. Aktuelle Einträge stehen vor
+überholten (`superseded_by` nicht leer); überholte bleiben als Historie
+sichtbar. Aussagen werden auf 400 Zeichen gekürzt, Quellfelder außerhalb der
+kompakten Auswahl werden nicht übernommen.
+
+Gelesen wird über dieselbe schreibfreie Sandbox wie bei der Vollsuche
+(`tools/knowledge_ledger.py search`); es gibt **kein neues MCP-Werkzeug** und
+keine neue Autorität. Ein Ausfall erscheint als
+`knowledge.status=knowledge_context_unavailable` und ändert den Status der
+Laufereignisse nicht. Eine Task-ID allein ist kein Wissensselektor
+(`skipped_no_supported_selector`). Für die vollständige Wissensrecherche die
+Chronik-CLI `knowledge_ledger.py search` verwenden.
+
 ## Gezielter Aufruf
 
 grabowski_agent_bootstrap(repo="heimgewebe/grabowski")
