@@ -2489,6 +2489,10 @@ def reconcile_recent_captain_audit_followups(
         if callable(getattr(cursor_tasks, "_database_connection", None)):
             scan_next_before = _load_reconcile_scan_next(cursor_tasks)
 
+    # Keep the *stored* preimage for the SQLite CAS. A missing metadata row is
+    # None, even if we later use ordinal zero as the effective scan boundary.
+    discovery_ordinal_cas_before = discovery_ordinal_before
+
     since_unix = int(time.time()) - lookback_seconds
     snapshot = grabowski_audit_query.capture_verified_audit_snapshot()
     max_scan_records = grabowski_audit_query.MAX_SCAN_RECORDS
@@ -2844,7 +2848,7 @@ def reconcile_recent_captain_audit_followups(
             # Existing mocked legacy unit fixtures without a database retain
             # their original signature; actual TaskStore persistence is CAS.
             if callable(getattr(cursor_tasks, "_database_connection", None)):
-                progress_args["expected_discovery_ordinal"] = discovery_ordinal_before
+                progress_args["expected_discovery_ordinal"] = discovery_ordinal_cas_before
                 progress_args["expected_cursor"] = cursor_before
                 progress_args["expected_scan_next_ordinal"] = scan_next_before
             _save_reconcile_progress(cursor_tasks, **progress_args)
