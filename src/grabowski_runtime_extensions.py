@@ -269,6 +269,47 @@ def _host_validate_locators(document: dict[str, Any]) -> dict[str, dict[str, Any
     return validated
 
 
+def _host_origin_main_blob_matches(path: Path, installed: dict[str, Any]) -> bool:
+    """Verify a bounded immutable main Git blob without network or ref mutation."""
+    repository = HOME / "repos/heim-pc"
+    if path != repository / "manifest/operator-entry.v1.json":
+        return False
+
+    def git(*argv: str) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.run(
+            ["git", "-C", str(repository), *argv],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+            check=False,
+        )
+
+    try:
+        identity = git(
+            "rev-parse", "--verify",
+            "refs/remotes/origin/main:manifest/operator-entry.v1.json",
+        )
+        if identity.returncode:
+            return False
+        blob = identity.stdout.decode("ascii").strip()
+        if len(blob) != 40 or any(char not in "0123456789abcdef" for char in blob):
+            return False
+        size_result = git("cat-file", "-s", blob)
+        if size_result.returncode:
+            return False
+        size = int(size_result.stdout.strip())
+        if size != installed["bytes"] or not 2 <= size <= HOST_OPERATOR_ENTRY_MAX_BYTES:
+            return False
+        content = git("cat-file", "blob", blob)
+        return (
+            content.returncode == 0
+            and len(content.stdout) == size
+            and hashlib.sha256(content.stdout).hexdigest() == installed["sha256"]
+        )
+    except (OSError, ValueError, UnicodeError, subprocess.TimeoutExpired):
+        return False
+
+
 def _host_projection_identity(
     document: dict[str, Any],
     installed: dict[str, Any],
@@ -292,20 +333,31 @@ def _host_projection_identity(
         missing_code="canonical_contract_missing",
         invalid_code="canonical_contract_invalid",
     )
-    if canonical["sha256"] != installed["sha256"]:
-        raise HostCapabilityResolutionError(
-            "installed_projection_drift",
-            "installed host operator-entry differs from canonical source",
-            details={
-                "installed_sha256": installed["sha256"],
-                "canonical_sha256": canonical["sha256"],
-            },
-        )
+    worktree_drift = canonical["sha256"] != installed["sha256"]
+    if worktree_drift:
+        # A feature-branch or lagging main checkout is not the immutable
+        # origin/main contract. Verify the exact local Git blob without fetch.
+        if not _host_origin_main_blob_matches(Path(canonical_resolved), installed):
+            raise HostCapabilityResolutionError(
+                "installed_projection_drift",
+                "installed host operator-entry differs from canonical source",
+                details={
+                    "installed_sha256": installed["sha256"],
+                    "canonical_sha256": canonical["sha256"],
+                },
+            )
+        canonical = {
+            "path": "git:refs/remotes/origin/main:manifest/operator-entry.v1.json",
+            "sha256": installed["sha256"],
+            "bytes": installed["bytes"],
+            "source": "local_origin_main_blob",
+        }
     return {
         "required": True,
         "matches": True,
         "installed": installed,
         "canonical": canonical,
+        "working_tree_drift": worktree_drift,
     }
 
 
