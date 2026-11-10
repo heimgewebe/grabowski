@@ -6,6 +6,7 @@ authoritative. Callers must not treat historical evidence as live system truth.
 """
 from __future__ import annotations
 
+from datetime import datetime
 import hashlib
 import json
 from pathlib import Path
@@ -54,6 +55,19 @@ def _selectors(values: dict[str, Any]) -> dict[str, Any]:
         elif value is not None:
             if not isinstance(value, str) or not value.strip() or len(value) > 500 or "\x00" in value:
                 raise ValueError("invalid selector " + name)
+            if name in {"since", "until"}:
+                try:
+                    timestamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                except ValueError as exc:
+                    raise ValueError(
+                        f"{name} must be an ISO 8601 timestamp with timezone, "
+                        "e.g. 2026-11-05T00:00:00+01:00"
+                    ) from exc
+                if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+                    raise ValueError(
+                        f"{name} must be an ISO 8601 timestamp with timezone, "
+                        "e.g. 2026-11-05T00:00:00+01:00"
+                    )
         normalized[name] = value
     if all(value is None or value == "" for value in normalized.values()):
         raise ValueError("at least one historical selector required")
