@@ -180,6 +180,78 @@ class RepoGroundPostMergeConvergenceTests(unittest.TestCase):
         self.assertEqual(result["status"], "failed")
         self.assertEqual(result["reason"], "publisher_failed")
 
+    def test_publisher_warn_existing_fresh_ancestor_is_satisfied(self) -> None:
+        # A verified older Captain merge can already be included in a newer
+        # healthy, current-head bundle. Its historic publisher may say warn.
+        result = post_merge.converge(
+            repository=REPO,
+            merge_sha=MERGE,
+            publisher_runner=lambda _argv, _timeout: publisher_result("warn"),
+            freshness_reader=lambda _repo: freshness(
+                state="fresh_exact", bundle=HEAD, live=HEAD
+            ),
+            ancestry_checker=lambda _path, merge, head: (merge, head) == (MERGE, HEAD),
+            max_attempts=1,
+        )
+        self.assertEqual(result["status"], "fresh_exact")
+        self.assertEqual(result["attempts"][0]["publisher_status"], "warn")
+        self.assertTrue(result["final"]["merge_is_ancestor"])
+
+    def test_publisher_warn_stale_bundle_is_not_satisfied(self) -> None:
+        result = post_merge.converge(
+            repository=REPO,
+            merge_sha=MERGE,
+            publisher_runner=lambda _argv, _timeout: publisher_result("warn"),
+            freshness_reader=lambda _repo: freshness(
+                state="stale_head", bundle=MERGE, live=HEAD
+            ),
+            ancestry_checker=lambda _path, _merge, _head: True,
+            max_attempts=1,
+        )
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["reason"], "publisher_failed")
+
+    def test_publisher_warn_unrelated_merge_is_not_satisfied(self) -> None:
+        result = post_merge.converge(
+            repository=REPO,
+            merge_sha=MERGE,
+            publisher_runner=lambda _argv, _timeout: publisher_result("warn"),
+            freshness_reader=lambda _repo: freshness(
+                state="fresh_exact", bundle=HEAD, live=HEAD
+            ),
+            ancestry_checker=lambda _path, _merge, _head: False,
+            max_attempts=1,
+        )
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["reason"], "publisher_failed")
+
+    def test_publisher_warn_remote_mismatch_is_not_satisfied(self) -> None:
+        result = post_merge.converge(
+            repository=REPO,
+            merge_sha=MERGE,
+            publisher_runner=lambda _argv, _timeout: publisher_result("warn"),
+            freshness_reader=lambda _repo: freshness(
+                state="fresh_exact", bundle=HEAD, live=HEAD, remote="c" * 40
+            ),
+            ancestry_checker=lambda _path, _merge, _head: True,
+            max_attempts=1,
+        )
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["reason"], "publisher_failed")
+
+    def test_publisher_warn_nonzero_rc_still_fails_without_freshness_read(self) -> None:
+        result = post_merge.converge(
+            repository=REPO,
+            merge_sha=MERGE,
+            publisher_runner=lambda _argv, _timeout: publisher_result("warn", returncode=1),
+            freshness_reader=lambda _repo: (_ for _ in ()).throw(
+                AssertionError("nonzero publisher must not use freshness")
+            ),
+            max_attempts=1,
+        )
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["reason"], "publisher_failed")
+
     def test_merge_must_remain_ancestor_of_final_head(self) -> None:
         result = post_merge.converge(
             repository=REPO,
