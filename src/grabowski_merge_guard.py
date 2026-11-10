@@ -2049,7 +2049,31 @@ def _merge_guard_local_diff_bytes(
     if len(stdout) > _MERGE_GUARD_MAX_DIFF_BYTES:
         return b"", info, ["merge_guard_local_diff_exceeds_byte_limit"]
     if _merge_guard_diff_contains_binary_metadata(stdout):
-        return b"", info, ["merge_guard_local_diff_binary_unsupported"]
+        if re.search(rb"(?m)^GIT binary patch\r?$", stdout):
+            return b"", info, ["merge_guard_local_diff_binary_unsupported"]
+        # The local diff was reconstructed from the exact reviewed commits.
+        # A binary summary omits bytes, so retain their Git blob OIDs as
+        # separate evidence; the live head/base SHA must still match GitHub.
+        object_delta = _merge_guard_local_git_bytes(
+            repo_path,
+            ["diff", "--raw", "--abbrev=40", "-z", "--no-ext-diff",
+             "--no-textconv", "--no-renames", "--ignore-submodules=none",
+             merge_base, head_sha, "--"],
+            timeout=60,
+        )
+        raw_objects = object_delta["stdout_bytes"]
+        if (
+            object_delta["returncode"] != 0 or not raw_objects
+            or len(raw_objects) > 4 * _MERGE_GUARD_MAX_CHANGED_PATH_BYTES
+        ):
+            return b"", info, ["merge_guard_binary_object_delta_unavailable"]
+        info["binary_metadata"] = {
+            "kind": "exact-commit-git-blob-oids",
+            "base_sha": merge_base,
+            "head_sha": head_sha,
+            "raw_object_delta_sha256": hashlib.sha256(raw_objects).hexdigest(),
+            "raw_object_delta_bytes": len(raw_objects),
+        }
     canonical = canonicalize_github_pr_diff_identity(stdout)
     info.update(
         {

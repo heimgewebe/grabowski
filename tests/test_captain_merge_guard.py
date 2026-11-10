@@ -1768,6 +1768,48 @@ class CaptainLargePrMergeGuardTests(unittest.TestCase):
             merge_guard._merge_guard_diff_contains_binary_metadata(patch_binary_diff)
         )
 
+    def test_local_bound_binary_summary_keeps_exact_blob_oid_evidence(self) -> None:
+        temporary, repo, base_sha, _, _ = _large_git_repo(file_count=2)
+        self.addCleanup(temporary.cleanup)
+        binary = repo / "release" / "poster.bin"
+        binary.write_bytes(bytes(range(256)) * 4)
+        _git(repo, "add", "release/poster.bin")
+        _git(repo, "commit", "-q", "-m", "add binary")
+        first_head = _git(repo, "rev-parse", "HEAD")
+        first, evidence, errors = merge_guard._merge_guard_local_diff_bytes(
+            repo, base_sha=base_sha, head_sha=first_head
+        )
+        self.assertEqual(errors, [])
+        self.assertIn(b"Binary files /dev/null and b/release/poster.bin differ", first)
+        self.assertEqual(evidence["binary_metadata"]["kind"], "exact-commit-git-blob-oids")
+        self.assertEqual(evidence["binary_metadata"]["head_sha"], first_head)
+        self.assertEqual(len(evidence["binary_metadata"]["raw_object_delta_sha256"]), 64)
+
+        binary.write_bytes(bytes(range(256)) * 4 + b"working-tree-only")
+        same, same_evidence, same_errors = merge_guard._merge_guard_local_diff_bytes(
+            repo, base_sha=base_sha, head_sha=first_head
+        )
+        self.assertEqual(same_errors, [])
+        self.assertEqual(same, first)
+        self.assertEqual(same_evidence["binary_metadata"], evidence["binary_metadata"])
+
+        _git(repo, "add", "release/poster.bin")
+        _git(repo, "commit", "-q", "-m", "change binary content")
+        second_head = _git(repo, "rev-parse", "HEAD")
+        second, second_evidence, second_errors = merge_guard._merge_guard_local_diff_bytes(
+            repo, base_sha=base_sha, head_sha=second_head
+        )
+        self.assertEqual(second_errors, [])
+        self.assertNotEqual(first_head, second_head)
+        self.assertNotEqual(
+            evidence["binary_metadata"]["raw_object_delta_sha256"],
+            second_evidence["binary_metadata"]["raw_object_delta_sha256"],
+        )
+        self.assertNotEqual(
+            merge_guard.github_pr_diff_identity_sha256(first),
+            merge_guard.github_pr_diff_identity_sha256(second),
+        )
+
     def test_local_bound_diff_supports_large_text_release(self) -> None:
         temporary, repo, base_sha, head_sha, expected_paths = _large_git_repo()
         self.addCleanup(temporary.cleanup)
