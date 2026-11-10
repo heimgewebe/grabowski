@@ -648,8 +648,9 @@ class WorkAcquireTests(unittest.TestCase):
         required = [f"component:required-{i:03d}" for i in range(78)]
         long_key = "path:/" + "x" * (8192 - len("path:/"))
         prefix = [f"component:earlier-{i:04d}" for i in range(921)]
+        required_receipt = self.acquired(owner, required)
         live = sorted(
-            self.acquired(owner, required + prefix + [long_key, "port:4321"])["leases"],
+            required_receipt["leases"] + self.acquired(owner, prefix + [long_key, "port:4321"])["leases"],
             key=lambda lease: lease["resource_key"],
         )
         self.assertEqual(1001, len(live))
@@ -666,7 +667,7 @@ class WorkAcquireTests(unittest.TestCase):
         work_acquire._verify_multibatch_live_lease_generations(
             owner_id=owner,
             required_keys=required,
-            acquisitions=[{"receipt": self.acquired(owner, required)}],
+            acquisitions=[{"receipt": required_receipt}],
             inventory_fn=inventory,
         )
         self.assertEqual([None, long_key], cursors)
