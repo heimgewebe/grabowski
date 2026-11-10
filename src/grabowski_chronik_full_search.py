@@ -21,6 +21,10 @@ MAX_LIMIT = 20
 MAX_OUTPUT_BYTES = 1024 * 1024
 SHA = re.compile(r"[0-9a-f]{64}\Z")
 Executor = Callable[[list[str], Path], dict[str, Any]]
+# Only these Chronik CLIs may run in the read-only search sandbox.
+READ_ONLY_CLIS = ("chronik_search.py", "knowledge_ledger.py")
+KNOWLEDGE_LIMIT = 20
+KNOWLEDGE_SELECTORS = ("repo", "host", "keyword", "knowledge_type")
 
 
 def _sha(value: Any) -> str:
@@ -124,7 +128,9 @@ def read_only_search_argv(
         not repository.is_absolute() or not data_dir.is_absolute()
         or repository.is_symlink() or data_dir.is_symlink()
         or not repository.is_dir() or not data_dir.is_dir()
-        or len(argv) < 2 or argv[1] != str(repository / "tools" / "chronik_search.py")
+        or len(argv) < 2 or argv[1] not in {
+            str(repository / "tools" / name) for name in READ_ONLY_CLIS
+        }
     ):
         raise ValueError("Chronik sandbox source/data identity invalid")
     runtime_python = Path(argv[0])
@@ -218,5 +224,114 @@ def query(
         "ledger_snapshot": data["ledger_snapshot"],
         "search_exhaustive": True, "result_scope": data["result_scope"],
         "does_not_establish": data["does_not_establish"],
+        "result_sha256": _sha(data),
+    }
+
+
+def _knowledge_failure(code: str) -> dict[str, Any]:
+    return {
+        "kind": "grabowski_chronik_knowledge_search", "schema_version": 1,
+        "available": False, "historical_only": True,
+        "failure_code": code, "events": [],
+        "does_not_establish": [
+            "current runtime state", "successful deployment", "unrecorded knowledge",
+        ],
+    }
+
+
+def _validate_knowledge(payload: Any, limit: int) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise ValueError("Chronik knowledge response is not an object")
+    events = payload.get("events")
+    snap = payload.get("ledger_snapshot")
+    if (
+        payload.get("schema_version") != "chronik-knowledge-search.v1"
+        or payload.get("historical_only") is not True
+        or type(payload.get("matching_count")) is not int
+        or type(payload.get("has_more")) is not bool
+        or not isinstance(events, list) or len(events) > limit
+        or payload.get("returned") != len(events)
+        or payload["matching_count"] < len(events)
+    ):
+        raise ValueError("Chronik knowledge search contract mismatch")
+    if (not isinstance(snap, dict) or snap.get("domain") != "knowledge.ledger"
+        or snap.get("integrity_valid") is not True
+        or type(snap.get("record_count")) is not int
+        or not isinstance(snap.get("sha256"), str)
+        or not SHA.fullmatch(snap["sha256"])):
+        raise ValueError("Chronik knowledge ledger is invalid or unbound")
+    seen: set[str] = set()
+    for item in events:
+        event = item.get("event") if isinstance(item, dict) else None
+        if (not isinstance(event, dict)
+            or event.get("kind") != "knowledge.insight.published.v1"
+            or not isinstance(event.get("event_id"), str)
+            or event["event_id"] in seen
+            or not isinstance(event.get("subject"), dict)
+            or not isinstance(event.get("statement"), str)
+            or not isinstance(item.get("superseded_by"), list)):
+            raise ValueError("Chronik knowledge event shape mismatch")
+        seen.add(event["event_id"])
+    return payload
+
+
+def knowledge_query(
+    *, selectors: dict[str, Any], limit: int = 10,
+    configuration: dict[str, Any], executor: Executor,
+) -> dict[str, Any]:
+    """Read semantic knowledge (causes, repairs, decisions) from knowledge.ledger.
+
+    Uses only selectors that every deployed Chronik knowledge CLI supports.
+    The result is historical evidence, never a current-state claim.
+    """
+    if not isinstance(selectors, dict) or not set(selectors) <= set(KNOWLEDGE_SELECTORS):
+        raise ValueError("unsupported Chronik knowledge selector")
+    filters = {}
+    for name, value in selectors.items():
+        if value is None or value == "":
+            continue
+        if not isinstance(value, str) or len(value) > 200 or "\x00" in value:
+            raise ValueError("invalid knowledge selector " + name)
+        filters[name] = value
+    if not filters:
+        raise ValueError("at least one knowledge selector required")
+    if type(limit) is not int or not 1 <= limit <= KNOWLEDGE_LIMIT:
+        raise ValueError("limit must be between 1 and 20")
+    if not configuration.get("available"):
+        return _knowledge_failure(str(configuration.get("reason") or "chronik_unavailable"))
+    repo = Path(configuration["repository"])
+    cli = repo / "tools" / "knowledge_ledger.py"
+    python = Path(configuration["python"])
+    data_dir = Path(configuration["data_dir"])
+    if (not repo.is_absolute() or not repo.is_dir()
+        or not cli.is_file() or cli.is_symlink()
+        or not python.is_absolute() or not python.is_file()
+        or not data_dir.is_dir()):
+        return _knowledge_failure("chronik_knowledge_runtime_unavailable")
+    argv = [str(python), str(cli), "--data-dir", str(data_dir), "search"]
+    for name, value in filters.items():
+        argv.extend(("--" + name.replace("_", "-"), value))
+    argv.extend(("--limit", str(limit)))
+    result = executor(argv, repo)
+    if (not isinstance(result, dict) or result.get("returncode") != 0
+        or result.get("timed_out") is True
+        or result.get("stdout_truncated") is True):
+        return _knowledge_failure("chronik_knowledge_cli_failed")
+    try:
+        raw = result.get("stdout")
+        if not isinstance(raw, str) or len(raw.encode("utf-8")) > MAX_OUTPUT_BYTES:
+            raise ValueError("knowledge output missing or too large")
+        data = _validate_knowledge(json.loads(raw), limit)
+    except (ValueError, TypeError, KeyError, json.JSONDecodeError):
+        return _knowledge_failure("chronik_knowledge_contract_failed")
+    return {
+        "kind": "grabowski_chronik_knowledge_search", "schema_version": 1,
+        "available": True, "historical_only": True, "query": filters,
+        "returned": data["returned"], "matching_count": data["matching_count"],
+        "has_more": data["has_more"], "events": data["events"],
+        "ledger_snapshot": data["ledger_snapshot"],
+        "does_not_establish": [
+            "current runtime state", "successful deployment", "unrecorded knowledge",
+        ],
         "result_sha256": _sha(data),
     }

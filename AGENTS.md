@@ -21,6 +21,9 @@ grabowski_chronik_full_search gezielt auf das Repository, den Host, die
 Komponente, den PR oder die Aufgabe anwenden. Die Repository-Slugform muss
 vollständig sein (beispielsweise heimgewebe/grabowski). Belegte frühere
 Erkenntnisse und Fehlschläge vor erneuter Untersuchung berücksichtigen.
+Der Bootstrap liefert dafür neben Laufereignissen (`agent.ledger`) auch
+Wissenseinträge (`chronik_first.knowledge` aus `knowledge.ledger`: Ursachen,
+Reparaturen, Entscheidungen, Widerlegungen); diese zuerst lesen.
 
 Danach den Ist-Zustand über Git, GitHub, CI, Runtime oder andere zuständige
 Live-Primärquellen frisch prüfen. Chronik ist historische Evidenz, kein

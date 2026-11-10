@@ -252,11 +252,133 @@ def call_shape_check(
 
 
 
+KNOWLEDGE_CONTEXT_LIMIT = 8
+KNOWLEDGE_STATEMENT_CHARS = 400
+
+
+def _chronik_knowledge_context(
+    *, repo: str, host: str, subject_component: str,
+    pr_number: int | None, knowledge_search_fn: Any,
+) -> dict[str, Any]:
+    """Compact semantic knowledge (causes, repairs, decisions) for the target.
+
+    Independent of the agent.ledger result: a knowledge outage is an explicit
+    gap and never changes the run-event status.
+    """
+    base = {
+        "ledger": "knowledge.ledger", "historical_only": True,
+        "does_not_establish": [
+            "current_git_ci_or_runtime_state", "production_verification",
+            "unrecorded_knowledge",
+        ],
+    }
+    if repo:
+        selectors = {"repo": repo}
+    elif host:
+        selectors = {"host": host}
+    else:
+        return {**base, "status": "skipped_no_supported_selector", "events": []}
+    if knowledge_search_fn is None:
+        try:
+            from grabowski_tasks import chronik_knowledge_search
+        except Exception as exc:
+            return {**base, "status": "knowledge_context_unavailable",
+                    "failure_code": type(exc).__name__, "events": []}
+        knowledge_search_fn = chronik_knowledge_search
+    try:
+        # Fetch the full bounded page: client-side constraints may drop items.
+        result = knowledge_search_fn(**selectors, limit=20)
+    except Exception as exc:
+        return {**base, "status": "knowledge_context_unavailable",
+                "failure_code": type(exc).__name__, "events": []}
+    snapshot = result.get("ledger_snapshot") if isinstance(result, dict) else None
+    if (not isinstance(result, dict) or result.get("available") is not True
+        or result.get("historical_only") is not True
+        or not isinstance(snapshot, dict)
+        or snapshot.get("integrity_valid") is not True):
+        return {**base, "status": "knowledge_context_unavailable",
+                "failure_code": (result.get("failure_code") if isinstance(result, dict)
+                                 else None) or "knowledge_not_verified",
+                "events": []}
+    compact: list[dict[str, Any]] = []
+    discarded = 0
+    for item in result.get("events") or []:
+        event = item.get("event") if isinstance(item, dict) else None
+        if not isinstance(event, dict):
+            continue
+        subject = event.get("subject") if isinstance(event.get("subject"), dict) else {}
+        # Explicit target fields are constraints, as for run events.
+        if ((host and repo and subject.get("host") not in {host, None})
+            or (subject_component and subject.get("component") != subject_component)
+            or (pr_number is not None and subject.get("pr_number") != pr_number)):
+            discarded += 1
+            continue
+        statement = event.get("statement") if isinstance(event.get("statement"), str) else ""
+        if len(statement) > KNOWLEDGE_STATEMENT_CHARS:
+            statement = statement[:KNOWLEDGE_STATEMENT_CHARS - 1] + "…"
+        refs = event.get("evidence_refs")
+        superseded_by = item.get("superseded_by")
+        compact.append({
+            "event_id": event.get("event_id"),
+            "observed_at": event.get("ts"),
+            "knowledge_type": event.get("knowledge_type"),
+            "epistemic_status": event.get("epistemic_status"),
+            "statement": statement,
+            "evidence_refs": refs[:4] if isinstance(refs, list) else [],
+            "superseded_by": superseded_by[:4] if isinstance(superseded_by, list) else [],
+        })
+    # Current knowledge first; superseded entries stay visible as history.
+    current = [e for e in compact if not e["superseded_by"]]
+    superseded = [e for e in compact if e["superseded_by"]]
+    ordered = (current + superseded)[:KNOWLEDGE_CONTEXT_LIMIT]
+    has_more = result.get("has_more") is True or len(compact) > KNOWLEDGE_CONTEXT_LIMIT
+    return {
+        **base, "status": "available", "query": selectors,
+        "events": ordered, "selected_event_count": len(ordered),
+        "provider_matching_count": result.get("matching_count"),
+        "discarded_by_target_constraints": discarded,
+        "has_more": has_more,
+        "context_gap": "bounded_candidate_page_only" if has_more else None,
+        "snapshot_sha256": snapshot.get("sha256"),
+        "result_sha256": result.get("result_sha256"),
+        "full_search": "knowledge_ledger.py search (Chronik CLI)",
+    }
+
+
 def _chronik_first_context(
     *, repo: str = "", host: str = "", subject_component: str = "",
     pr_number: int | None = None, task_id: str = "", search_fn: Any = None,
+    knowledge_search_fn: Any = None,
 ) -> dict[str, Any]:
-    """Read bounded Chronik evidence without losing host-scoped project history."""
+    """Read bounded Chronik evidence without losing host-scoped project history.
+
+    Run events (agent.ledger) and semantic knowledge (knowledge.ledger) are
+    read separately; the ``knowledge`` section never alters run-event status.
+    """
+    context = _chronik_run_event_context(
+        repo=repo, host=host, subject_component=subject_component,
+        pr_number=pr_number, task_id=task_id, search_fn=search_fn,
+    )
+    if context.get("status") == "skipped_unbound_target":
+        return context
+    # Injected run-event search without knowledge provider = isolated test of
+    # the run-event path; never fall through to the live provider then.
+    if search_fn is not None and knowledge_search_fn is None:
+        context["knowledge"] = {"ledger": "knowledge.ledger",
+                                "status": "not_requested", "events": []}
+        return context
+    context["knowledge"] = _chronik_knowledge_context(
+        repo=repo, host=host, subject_component=subject_component,
+        pr_number=pr_number, knowledge_search_fn=knowledge_search_fn,
+    )
+    return context
+
+
+def _chronik_run_event_context(
+    *, repo: str = "", host: str = "", subject_component: str = "",
+    pr_number: int | None = None, task_id: str = "", search_fn: Any = None,
+) -> dict[str, Any]:
+    """Read bounded agent.ledger evidence without losing host-scoped project history."""
     targets = {"repo": repo, "host": host, "subject_component": subject_component, "task_id": task_id}
     filters: dict[str, Any] = {}
     for key, value in targets.items():
