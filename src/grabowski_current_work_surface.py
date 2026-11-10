@@ -14,7 +14,9 @@ MAX_SOURCE_LEASES = current_work.MAX_LEASES
 MAX_SOURCE_WORKERS = current_work.MAX_WORKERS
 CURRENT_TASK_STATES = ("launching", "running", "interrupted", "outcome_unknown")
 CURRENT_WORK_GIT_TIMEOUT_SECONDS = 1.0
-CURRENT_WORK_CHECKOUT_OBSERVATION_BUDGET_SECONDS = 8.0
+# Bounded full-worktree observation needs headroom beyond idle Git-probe timings.
+# Retain a finite limit; unavailable probes remain explicitly partial.
+CURRENT_WORK_CHECKOUT_OBSERVATION_BUDGET_SECONDS = 16.0
 CURRENT_WORK_CHECKOUT_MAX_WORKTREES: int | None = None
 CURRENT_WORK_MAX_PARALLEL_SOURCES = 2
 
