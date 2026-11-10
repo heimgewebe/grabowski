@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from pathlib import Path
+import json
 import sqlite3
 import subprocess
 import tempfile
@@ -660,6 +662,113 @@ class RepoGroundCaptainAuditFollowupTests(unittest.TestCase):
 
 
 class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
+
+    def test_first_run_with_verified_large_audit_starts_bounded_window(self) -> None:
+        # A new host can inherit a >100k-record verified Captain audit and
+        # have no discovery watermark yet. This must not require manual
+        # initialization of live TaskStore metadata.
+        def row(ordinal: int) -> dict:
+            return {
+                "record": {"operation": "runtime-observation", "timestamp_unix": 9_950},
+                "evidence": {
+                    "record_sha256": f"{ordinal:064x}",
+                    "global_ordinal": ordinal,
+                },
+            }
+
+        rows = [row(ordinal) for ordinal in range(1, 6)]
+        snapshot = types.SimpleNamespace(
+            total_records=5,
+            segments=(types.SimpleNamespace(
+                global_start_ordinal=1, global_end_ordinal=5,
+            ),),
+        )
+        observed_orders = []
+
+        def iter_items(_snapshot: object, *, order: str) -> object:
+            observed_orders.append(order)
+            return iter(rows if order == "asc" else list(reversed(rows)))
+
+        audit_query = types.SimpleNamespace(
+            MAX_SCAN_RECORDS=3,
+            capture_verified_audit_snapshot=lambda: snapshot,
+            _iter_snapshot_items=iter_items,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            db = Path(temporary) / "tasks.sqlite3"
+            with sqlite3.connect(db) as connection:
+                connection.execute(
+                    "CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+                )
+
+            @contextmanager
+            def database_connection():
+                connection = sqlite3.connect(db)
+                try:
+                    with connection:
+                        yield connection
+                finally:
+                    connection.close()
+
+            operator = types.SimpleNamespace(STATE_DIR=Path(temporary))
+            tasks_module = types.SimpleNamespace(
+                _database_connection=database_connection
+            )
+            with (
+                patch.dict(sys.modules, {
+                    "grabowski_audit_query": audit_query,
+                    "grabowski_operator_core": operator,
+                    "grabowski_tasks": tasks_module,
+                }),
+                patch.object(post_merge.time, "time", return_value=10_000),
+                patch.object(
+                    post_merge, "resolve_job_starter",
+                    return_value=lambda *_a, **_k: {},
+                ),
+            ):
+                first = post_merge.reconcile_recent_captain_audit_followups(
+                    lookback_seconds=100,
+                )
+                with database_connection() as connection:
+                    saved = dict(connection.execute(
+                        "SELECT key, value FROM metadata"
+                    ).fetchall())
+                self.assertEqual(
+                    json.loads(saved[post_merge.RECONCILE_DISCOVERY_METADATA_KEY]),
+                    {"schema_version": 1, "global_ordinal": 3},
+                )
+                self.assertEqual(
+                    json.loads(saved[post_merge.RECONCILE_SCAN_NEXT_METADATA_KEY]),
+                    {"schema_version": 1, "next_ordinal": 4},
+                )
+                second = post_merge.reconcile_recent_captain_audit_followups(
+                    lookback_seconds=100,
+                )
+
+            with database_connection() as connection:
+                persisted = dict(connection.execute(
+                    "SELECT key, value FROM metadata"
+                ).fetchall())
+
+        self.assertEqual(observed_orders, ["asc", "asc"])
+        self.assertEqual(first["scan_mode"], "bounded_rotation")
+        self.assertEqual(first["discovery_ordinal_before"], 0)
+        self.assertEqual(first["discovery_ordinal_after"], 3)
+        self.assertEqual(first["scanned_records"], 3)
+        self.assertEqual(first["scan_next_after"], 4)
+        self.assertTrue(first["progress_persisted"])
+        self.assertEqual(second["discovery_ordinal_before"], 3)
+        self.assertEqual(second["discovery_ordinal_after"], 5)
+        self.assertEqual(second["scanned_records"], 2)
+        self.assertTrue(second["progress_persisted"])
+        self.assertEqual(
+            json.loads(persisted[post_merge.RECONCILE_DISCOVERY_METADATA_KEY]),
+            {"schema_version": 1, "global_ordinal": 5},
+        )
+        self.assertEqual(
+            json.loads(persisted[post_merge.RECONCILE_SCAN_NEXT_METADATA_KEY]),
+            {"schema_version": 1, "next_ordinal": 6},
+        )
 
     def test_reconciler_uses_core_after_facade_split(self) -> None:
         def row(ordinal: int) -> dict:

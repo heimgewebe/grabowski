@@ -2489,6 +2489,10 @@ def reconcile_recent_captain_audit_followups(
         if callable(getattr(cursor_tasks, "_database_connection", None)):
             scan_next_before = _load_reconcile_scan_next(cursor_tasks)
 
+    # Keep the *stored* preimage for the SQLite CAS. A missing metadata row is
+    # None, even if we later use ordinal zero as the effective scan boundary.
+    discovery_ordinal_cas_before = discovery_ordinal_before
+
     since_unix = int(time.time()) - lookback_seconds
     snapshot = grabowski_audit_query.capture_verified_audit_snapshot()
     max_scan_records = grabowski_audit_query.MAX_SCAN_RECORDS
@@ -2497,6 +2501,21 @@ def reconcile_recent_captain_audit_followups(
         or max_scan_records < 1
     ):
         raise RepoGroundPostMergeError("Captain audit reconciliation scan bound is invalid")
+
+    # An uninitialized durable discovery cursor on a pre-existing large ledger
+    # must use the same verified, bounded oldest-first windows as an explicit
+    # ordinal-zero watermark. Otherwise the first run scans past the limit and
+    # fails forever until someone manually edits TaskStore metadata. No
+    # unsigned/segmentless or non-persistent source is admitted to this path.
+    if (
+        discovery_ordinal_before is None
+        and cursor_tasks is not None
+        and type(getattr(snapshot, "total_records", None)) is int
+        and snapshot.total_records > max_scan_records
+        and isinstance(getattr(snapshot, "segments", None), tuple)
+        and snapshot.segments
+    ):
+        discovery_ordinal_before = 0
 
     # Bootstrap with the bounded wall-clock lookback, then resume from a durable
     # audit ordinal. Once the watermark exists, outages cannot age an unseen
@@ -2829,7 +2848,7 @@ def reconcile_recent_captain_audit_followups(
             # Existing mocked legacy unit fixtures without a database retain
             # their original signature; actual TaskStore persistence is CAS.
             if callable(getattr(cursor_tasks, "_database_connection", None)):
-                progress_args["expected_discovery_ordinal"] = discovery_ordinal_before
+                progress_args["expected_discovery_ordinal"] = discovery_ordinal_cas_before
                 progress_args["expected_cursor"] = cursor_before
                 progress_args["expected_scan_next_ordinal"] = scan_next_before
             _save_reconcile_progress(cursor_tasks, **progress_args)
