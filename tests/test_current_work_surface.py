@@ -75,6 +75,96 @@ class CurrentWorkSurfaceTests(unittest.TestCase):
         self.assertTrue(result["truncated"])
         connection.close()
 
+    def test_transient_sqlite_checkpoint_race_reobserves_only_affected_source(self) -> None:
+        cases = [
+            ("resources", "resource_lease", checkouts_module.resources.ResourceSchemaInventoryChanged),
+            ("tasks", "durable_job", checkouts_module.tasks.TaskSchemaInventoryChanged),
+            ("attention", "durable_job", checkouts_module.tasks.TaskSchemaInventoryChanged),
+        ]
+        for source, capability, changed in cases:
+            with self.subTest(source=source):
+                reads: list[int] = []
+                admissions: list[str] = []
+                errors: list[dict] = []
+
+                def read():
+                    reads.append(1)
+                    if len(reads) == 1:
+                        raise changed("sidecar rotated before SQLite snapshot")
+                    return {"source": source, "complete": True}
+
+                operator = SimpleNamespace(
+                    _require_operator_capability=admissions.append,
+                )
+                with patch.object(surface, "_operator", return_value=operator):
+                    result = surface._attempt_source(
+                        source, capability, read, errors, {"complete": False},
+                    )
+                self.assertEqual(result, {"source": source, "complete": True})
+                self.assertEqual(reads, [1, 1], "one complete fresh retry")
+                self.assertEqual(admissions, [capability])
+                self.assertEqual(errors, [])
+
+    def test_persistent_sqlite_snapshot_change_stays_explicitly_partial(self) -> None:
+        for source, changed in [
+            ("resources", checkouts_module.resources.ResourceSchemaInventoryChanged),
+            ("tasks", checkouts_module.tasks.TaskSchemaInventoryChanged),
+            ("attention", checkouts_module.tasks.TaskSchemaInventoryChanged),
+        ]:
+            with self.subTest(source=source):
+                reads: list[int] = []
+                errors: list[dict] = []
+
+                def failing_read():
+                    reads.append(1)
+                    raise changed("moving SQLite WAL")
+
+                operator = SimpleNamespace(
+                    _require_operator_capability=lambda _cap: None,
+                )
+                with patch.object(surface, "_operator", return_value=operator):
+                    result = surface._attempt_source(
+                        source, "durable_job", failing_read, errors, {"partial": True},
+                    )
+                self.assertEqual(result, {"partial": True})
+                self.assertEqual(reads, [1, 1], "no unbounded retry")
+                self.assertEqual(
+                    errors, [{"source": source, "error": changed.__name__}],
+                )
+
+    def test_other_failure_and_denied_capability_do_not_retry(self) -> None:
+        errors: list[dict] = []
+        reads: list[int] = []
+
+        def unexpected_failure():
+            reads.append(1)
+            raise RuntimeError("not a WAL snapshot race")
+
+        operator = SimpleNamespace(_require_operator_capability=lambda _cap: None)
+        with patch.object(surface, "_operator", return_value=operator):
+            result = surface._attempt_source(
+                "resources", "resource_lease", unexpected_failure,
+                errors, {"partial": True},
+            )
+        self.assertEqual(result, {"partial": True})
+        self.assertEqual(reads, [1])
+        self.assertEqual(errors, [{"source": "resources", "error": "RuntimeError"}])
+
+        def denied(_capability):
+            raise PermissionError("capability unavailable")
+
+        with patch.object(
+            surface, "_operator",
+            return_value=SimpleNamespace(_require_operator_capability=denied),
+        ):
+            result = surface._attempt_source(
+                "tasks", "durable_job", unexpected_failure,
+                errors, {"partial": True},
+            )
+        self.assertEqual(result, {"partial": True})
+        self.assertEqual(reads, [1], "denied access cannot trigger a read")
+        self.assertEqual(errors[-1], {"source": "tasks", "error": "PermissionError"})
+
     def test_reconciliation_uses_complete_snapshot_only_within_projection_bound(self) -> None:
         # Ordinary public reconciliation remains limited to 100 rows; the
         # internal Current Work snapshot must not arbitrarily lose row 101.
