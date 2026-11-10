@@ -80,6 +80,36 @@ class ChronikFullSearchTests(unittest.TestCase):
         self.assertNotIn("query", argv)
         self.assertEqual(len(result["events"]), 1)
 
+    def test_invalid_datetime_filters_fail_before_provider_invocation(self):
+        cases = (
+            ("since", "2026-11-05"),
+            ("since", "2026-11-05T00:00:00"),
+            ("since", "not-a-date"),
+            ("until", "2026-11-06"),
+            ("until", "2026-11-06T23:59:59"),
+            ("until", "2026-13-06T00:00:00+01:00"),
+        )
+        for field, value in cases:
+            with self.subTest(field=field, value=value):
+                self.filters[field] = value
+                with self.assertRaisesRegex(ValueError, field + " must be an ISO 8601 timestamp with timezone"):
+                    self.query()
+                self.filters[field] = None
+        self.assertEqual(self.calls, [])
+
+    def test_timezone_aware_datetime_filters_reach_provider_unchanged(self):
+        self.filters["since"] = "2026-11-05T00:00:00+01:00"
+        self.filters["until"] = "2026-11-06T23:59:59Z"
+        self.payload["query"] = dict(self.filters)
+        self.payload["query_sha256"] = search._sha(self.filters)
+        result = self.query()
+        self.assertTrue(result["available"])
+        argv, _ = self.calls[0]
+        for field in ("since", "until"):
+            self.assertEqual(
+                argv[argv.index("--" + field) + 1], self.filters[field]
+            )
+
     def test_hash_tampering_must_not_be_reported_as_available_history(self):
         self.payload["events"][0]["canonical_event_sha256"] = "0" * 64
         result = self.query()
