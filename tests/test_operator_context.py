@@ -282,6 +282,8 @@ Limit = Annotated[int, 5]
         *,
         intent: str,
         drift_canonical: bool = False,
+        git_main_blob: bool = False,
+        tamper_installed: bool = False,
     ) -> dict[str, object]:
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
@@ -293,6 +295,19 @@ Limit = Annotated[int, 5]
             encoded = json.dumps(contract, ensure_ascii=False, indent=2) + "\n"
             installed.write_text(encoded, encoding="utf-8")
             canonical.write_text(encoded, encoding="utf-8")
+            if git_main_blob:
+                repo = home / "repos/heim-pc"
+                for arguments in (
+                    ["init", "-q"],
+                    ["add", "--", "manifest/operator-entry.v1.json"],
+                    ["-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                     "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgSign=false", "commit", "-qm", "contract"],
+                    ["update-ref", "refs/remotes/origin/main", "HEAD"],
+                ):
+                    subprocess.run(
+                        ["git", "-C", str(repo), *arguments],
+                        check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    )
             if drift_canonical:
                 changed = dict(contract)
                 changed["testDrift"] = True
@@ -300,9 +315,20 @@ Limit = Annotated[int, 5]
                     json.dumps(changed, ensure_ascii=False, indent=2) + "\n",
                     encoding="utf-8",
                 )
+            if tamper_installed:
+                changed_installed = json.loads(json.dumps(contract))
+                changed_installed["capabilityLocators"]["audioTranscription"]["authority"] = (
+                    "heim_pc_asr_fake_engine"
+                )
+                installed.write_text(
+                    json.dumps(changed_installed, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
             code = f"""
 import json
+import os
 from pathlib import Path
+import subprocess as _subprocess
 import sys
 import types
 
@@ -319,7 +345,10 @@ operator.READ_ONLY = object()
 operator.MUTATING = object()
 operator.MAX_OUTPUT_BYTES = 1024 * 1024
 operator._require_operator_capability = lambda capability: None
-operator._safe_environment = lambda: {{}}
+operator._safe_environment = lambda: {{
+    "PATH": os.environ.get("PATH", ""),
+    "GIT_NO_LAZY_FETCH": "0",
+}}
 
 sys.modules['grabowski_operator_core'] = operator
 sys.modules['grabowski_capabilities'] = types.ModuleType('grabowski_capabilities')
@@ -327,6 +356,17 @@ sys.modules['grabowski_mcp'] = types.ModuleType('grabowski_mcp')
 sys.modules['grabowski_consumer_surface'] = types.ModuleType('grabowski_consumer_surface')
 
 import grabowski_runtime_extensions as runtime
+
+_original_run = _subprocess.run
+def _checked_git_run(argv, *args, **kwargs):
+    if isinstance(argv, list) and argv and argv[0] == "git":
+        environment = kwargs.get("env")
+        assert isinstance(environment, dict)
+        assert environment.get("GIT_NO_LAZY_FETCH") == "1"
+        assert environment.get("GIT_OPTIONAL_LOCKS") == "0"
+    return _original_run(argv, *args, **kwargs)
+_subprocess.run = _checked_git_run
+
 print(json.dumps(runtime.resolve_host_capability({intent!r}), sort_keys=True))
 """
             environment = dict(os.environ)
@@ -376,6 +416,25 @@ print(json.dumps(runtime.resolve_host_capability({intent!r}), sort_keys=True))
         result = self._run_host_capability_resolution(
             intent="transcription",
             drift_canonical=True,
+        )
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["error"]["code"], "installed_projection_drift")
+
+    def test_host_capability_resolver_accepts_exact_origin_main_blob_on_stale_checkout(self) -> None:
+        result = self._run_host_capability_resolution(
+            intent="transcription", drift_canonical=True, git_main_blob=True,
+        )
+        self.assertEqual(result["status"], "resolved")
+        identity = result["contract_identity"]
+        self.assertTrue(identity["matches"])
+        self.assertTrue(identity["working_tree_drift"])
+        self.assertEqual(identity["canonical"]["source"], "local_origin_main_blob")
+        self.assertEqual(identity["canonical"]["sha256"], identity["installed"]["sha256"])
+
+    def test_host_capability_resolver_rejects_tampered_installed_copy_despite_main_blob(self) -> None:
+        result = self._run_host_capability_resolution(
+            intent="transcription", drift_canonical=True,
+            git_main_blob=True, tamper_installed=True,
         )
         self.assertEqual(result["status"], "blocked")
         self.assertEqual(result["error"]["code"], "installed_projection_drift")
