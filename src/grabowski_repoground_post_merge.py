@@ -2498,6 +2498,21 @@ def reconcile_recent_captain_audit_followups(
     ):
         raise RepoGroundPostMergeError("Captain audit reconciliation scan bound is invalid")
 
+    # An uninitialized durable discovery cursor on a pre-existing large ledger
+    # must use the same verified, bounded oldest-first windows as an explicit
+    # ordinal-zero watermark. Otherwise the first run scans past the limit and
+    # fails forever until someone manually edits TaskStore metadata. No
+    # unsigned/segmentless or non-persistent source is admitted to this path.
+    if (
+        discovery_ordinal_before is None
+        and cursor_tasks is not None
+        and type(getattr(snapshot, "total_records", None)) is int
+        and snapshot.total_records > max_scan_records
+        and isinstance(getattr(snapshot, "segments", None), tuple)
+        and snapshot.segments
+    ):
+        discovery_ordinal_before = 0
+
     # Bootstrap with the bounded wall-clock lookback, then resume from a durable
     # audit ordinal. Once the watermark exists, outages cannot age an unseen
     # Captain merge out of discovery.

@@ -661,6 +661,68 @@ class RepoGroundCaptainAuditFollowupTests(unittest.TestCase):
 
 class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
 
+    def test_first_run_with_verified_large_audit_starts_bounded_window(self) -> None:
+        # A new host can inherit a >100k-record verified Captain audit and
+        # have no discovery watermark yet. This must not require manual
+        # initialization of live TaskStore metadata.
+        def row(ordinal: int) -> dict:
+            return {
+                "record": {"operation": "runtime-observation", "timestamp_unix": 9_950},
+                "evidence": {
+                    "record_sha256": f"{ordinal:064x}",
+                    "global_ordinal": ordinal,
+                },
+            }
+
+        rows = [row(ordinal) for ordinal in range(1, 6)]
+        snapshot = types.SimpleNamespace(
+            total_records=5,
+            segments=(types.SimpleNamespace(
+                global_start_ordinal=1, global_end_ordinal=5,
+            ),),
+        )
+        observed_orders = []
+
+        def iter_items(_snapshot: object, *, order: str) -> object:
+            observed_orders.append(order)
+            return iter(rows if order == "asc" else list(reversed(rows)))
+
+        audit_query = types.SimpleNamespace(
+            MAX_SCAN_RECORDS=3,
+            capture_verified_audit_snapshot=lambda: snapshot,
+            _iter_snapshot_items=iter_items,
+        )
+        operator = types.SimpleNamespace(STATE_DIR=Path("/state"))
+        tasks_module = types.SimpleNamespace()
+        with (
+            patch.dict(sys.modules, {
+                "grabowski_audit_query": audit_query,
+                "grabowski_operator_core": operator,
+                "grabowski_tasks": tasks_module,
+            }),
+            patch.object(post_merge.time, "time", return_value=10_000),
+            patch.object(post_merge, "_load_reconcile_cursor", return_value=None),
+            patch.object(
+                post_merge, "_load_reconcile_discovery_ordinal",
+                return_value=None,
+            ),
+            patch.object(post_merge, "resolve_job_starter", return_value=lambda *_a, **_k: {}),
+            patch.object(post_merge, "_save_reconcile_progress") as save_progress,
+        ):
+            result = post_merge.reconcile_recent_captain_audit_followups(
+                lookback_seconds=100,
+            )
+
+        self.assertEqual(observed_orders, ["asc"])
+        self.assertEqual(result["scan_mode"], "bounded_rotation")
+        self.assertEqual(result["discovery_ordinal_before"], 0)
+        self.assertEqual(result["discovery_ordinal_after"], 3)
+        self.assertEqual(result["scanned_records"], 3)
+        self.assertEqual(result["scan_next_after"], 4)
+        self.assertTrue(result["progress_persisted"])
+        self.assertEqual(save_progress.call_args.kwargs["discovery_ordinal"], 3)
+        self.assertEqual(save_progress.call_args.kwargs["scan_next_ordinal"], 4)
+
     def test_reconciler_uses_core_after_facade_split(self) -> None:
         def row(ordinal: int) -> dict:
             return {
