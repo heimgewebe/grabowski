@@ -91,14 +91,23 @@ def _attempt_source(
 ) -> Any:
     try:
         _operator()._require_operator_capability(capability)
-        try:
-            return loader()
-        except Exception as exc:
-            if not _transient_sqlite_snapshot_change(source, exc):
-                raise
-            # Discard the failed read entirely. A new transaction may succeed
-            # after sidecar turnover; persistent drift stays explicit below.
-            return loader()
+        # Attention starts after checkout/binding observation and can overlap
+        # a second transient WAL creation/checkpoint on the task store. Retry
+        # its whole read at most twice; no individual snapshot is reused.
+        attempts = 3 if source == "attention" else 2
+        for attempt in range(attempts):
+            try:
+                return loader()
+            except Exception as exc:
+                if (
+                    attempt + 1 == attempts
+                    or not _transient_sqlite_snapshot_change(source, exc)
+                ):
+                    raise
+                # The reader has closed its failed transaction before here.
+                # Short bounded spacing avoids racing the same sidecar turnover.
+                if source == "attention":
+                    time.sleep(0.04 * (attempt + 1))
     except Exception as exc:  # Each unavailable source remains explicit and partial.
         errors.append(_source_error(source, exc))
         return default
