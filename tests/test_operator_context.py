@@ -326,7 +326,9 @@ Limit = Annotated[int, 5]
                 )
             code = f"""
 import json
+import os
 from pathlib import Path
+import subprocess as _subprocess
 import sys
 import types
 
@@ -343,7 +345,10 @@ operator.READ_ONLY = object()
 operator.MUTATING = object()
 operator.MAX_OUTPUT_BYTES = 1024 * 1024
 operator._require_operator_capability = lambda capability: None
-operator._safe_environment = lambda: {{}}
+operator._safe_environment = lambda: {{
+    "PATH": os.environ.get("PATH", ""),
+    "GIT_NO_LAZY_FETCH": "0",
+}}
 
 sys.modules['grabowski_operator_core'] = operator
 sys.modules['grabowski_capabilities'] = types.ModuleType('grabowski_capabilities')
@@ -351,6 +356,17 @@ sys.modules['grabowski_mcp'] = types.ModuleType('grabowski_mcp')
 sys.modules['grabowski_consumer_surface'] = types.ModuleType('grabowski_consumer_surface')
 
 import grabowski_runtime_extensions as runtime
+
+_original_run = _subprocess.run
+def _checked_git_run(argv, *args, **kwargs):
+    if isinstance(argv, list) and argv and argv[0] == "git":
+        environment = kwargs.get("env")
+        assert isinstance(environment, dict)
+        assert environment.get("GIT_NO_LAZY_FETCH") == "1"
+        assert environment.get("GIT_OPTIONAL_LOCKS") == "0"
+    return _original_run(argv, *args, **kwargs)
+_subprocess.run = _checked_git_run
+
 print(json.dumps(runtime.resolve_host_capability({intent!r}), sort_keys=True))
 """
             environment = dict(os.environ)

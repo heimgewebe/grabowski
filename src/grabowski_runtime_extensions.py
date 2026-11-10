@@ -276,10 +276,18 @@ def _host_origin_main_blob_matches(path: Path, installed: dict[str, Any]) -> boo
         return False
 
     def git(*argv: str) -> subprocess.CompletedProcess[bytes]:
+        environment = operator._safe_environment()
+        environment.update({
+            "GIT_NO_LAZY_FETCH": "1",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_NO_REPLACE_OBJECTS": "1",
+        })
         return subprocess.run(
             ["git", "-C", str(repository), *argv],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
+            env=environment,
             timeout=3,
             check=False,
         )
