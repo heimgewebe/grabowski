@@ -855,12 +855,16 @@ def _live_checkout_lease_keys(*, now: int) -> dict[str, str]:
             ).fetchall()
         return {str(row["resource_key"]): str(row["owner_id"]) for row in rows}
 
-    try:
-        return read_once()
-    except resources.ResourceSchemaInventoryChanged:
-        # SQLite can remove a checkpointed WAL between the sidecar check and
-        # its first stat; one fresh read recovers a quiescent snapshot.
-        return read_once()
+    # Resource-store WAL creation/checkpoint can turn over two sidecars while
+    # an inventory starts. Reopen the entire read, never combine partial rows.
+    # Persistent churn still propagates to the caller as an explicit partial.
+    for attempt in range(3):
+        try:
+            return read_once()
+        except resources.ResourceSchemaInventoryChanged:
+            if attempt == 2:
+                raise
+            time.sleep(0.04 * (attempt + 1))
 
 
 def _active_lifecycle_consumes_capacity(
