@@ -5311,62 +5311,87 @@ class RepoGroundPostMergeSchedulingTests(unittest.TestCase):
 
 class PublisherInventoryAdmissionTests(unittest.TestCase):
     def setUp(self) -> None:
-        post_merge._publisher_inventory_missing_repository.cache_clear()
+        post_merge._publisher_authoritative_members.cache_clear()
 
     def tearDown(self) -> None:
-        post_merge._publisher_inventory_missing_repository.cache_clear()
+        post_merge._publisher_authoritative_members.cache_clear()
 
-    def test_exact_publisher_missing_repo_is_not_scheduled(self) -> None:
-        repo = "Hall-of-Memory/memoraevents"
-        payload = {
-            "returncode": 2,
-            "payload": {"status": "invalid", "missing_repositories": [repo]},
+    @staticmethod
+    def authoritative_inventory(members: list[str]) -> dict[str, object]:
+        return {
+            "returncode": 0,
+            "payload": {
+                "status": "ok",
+                "membership": {
+                    "schema": "repoground.fleet-membership-authority.v1",
+                    "member_count": len(members),
+                    "members": members,
+                },
+            },
         }
-        with patch.object(post_merge, "_run_publisher", return_value=payload) as publisher:
-            self.assertTrue(post_merge._publisher_inventory_missing_repository(repo))
-            self.assertTrue(post_merge._publisher_inventory_missing_repository(repo))
-            publisher.assert_called_once_with(
-                [str(post_merge.DEFAULT_PUBLISHER), "--inventory", "--repo", repo],
-                15,
-            )
 
-        request = {
-            "status": "ready",
-            "repository": repo,
-            "merge_sha": MERGE,
-            "argv": ["python3", "-B", "post-merge", "--repo", repo],
-            "cwd": "/tmp",
-        }
+    def test_nonmember_repos_are_not_scheduled(self) -> None:
+        for repository in ("Hall-of-Memory/memoraevents", "alexdermohr/livia"):
+            post_merge._publisher_authoritative_members.cache_clear()
+            inventory = self.authoritative_inventory(["heimgewebe/grabowski"])
+            with patch.object(post_merge, "_run_publisher", return_value=inventory) as publisher:
+                self.assertTrue(post_merge._publisher_inventory_missing_repository(repository))
+                self.assertTrue(post_merge._publisher_inventory_missing_repository(repository))
+                publisher.assert_called_once_with(
+                    [str(post_merge.DEFAULT_PUBLISHER), "--inventory"], 15
+                )
+
+            request = {
+                "status": "ready",
+                "repository": repository,
+                "merge_sha": MERGE,
+                "argv": ["python3", "-B", "post-merge", "--repo", repository],
+                "cwd": "/tmp",
+            }
+            with patch.object(
+                post_merge, "captain_followup_request_from_audit", return_value=request
+            ), patch.object(
+                post_merge, "_publisher_inventory_missing_repository", return_value=True
+            ):
+                result = post_merge.schedule_from_captain_audit_completion(
+                    "d" * 64,
+                    job_starter=lambda *args, **kwargs: self.fail("must not dispatch"),
+                    python_executable=sys.executable,
+                    script_path=Path(__file__),
+                )
+            self.assertEqual("not_scheduled", result["status"])
+            self.assertEqual("publisher_inventory_missing_repository", result["reason"])
+            self.assertEqual("d" * 64, result["captain_audit_completion_sha256"])
+            self.assertIn("publication_completed", result["does_not_establish"])
+
+    def test_authoritative_members_are_not_excluded(self) -> None:
+        repo = "heimgewebe/grabowski"
         with patch.object(
-            post_merge, "captain_followup_request_from_audit", return_value=request
-        ), patch.object(
-            post_merge, "_publisher_inventory_missing_repository", return_value=True
-        ):
-            result = post_merge.schedule_from_captain_audit_completion(
-                "d" * 64,
-                job_starter=lambda *args, **kwargs: self.fail("must not dispatch"),
-                python_executable=sys.executable,
-                script_path=Path(__file__),
+            post_merge, "_run_publisher",
+            return_value=self.authoritative_inventory([repo]),
+        ) as publisher:
+            self.assertFalse(post_merge._publisher_inventory_missing_repository(repo))
+            publisher.assert_called_once_with(
+                [str(post_merge.DEFAULT_PUBLISHER), "--inventory"], 15
             )
-        self.assertEqual("not_scheduled", result["status"])
-        self.assertEqual("publisher_inventory_missing_repository", result["reason"])
-        self.assertEqual("d" * 64, result["captain_audit_completion_sha256"])
-        self.assertIn("publication_completed", result["does_not_establish"])
 
-    def test_only_exact_missing_repo_response_is_exclusion(self) -> None:
-        repo = "Hall-of-Memory/memoraevents"
+    def test_ambiguous_or_targeted_inventory_does_not_prove_exclusion(self) -> None:
         for payload in (
             {"returncode": 2, "payload": {"status": "invalid", "missing_repositories": ["other/repo"]}},
             {"returncode": 2, "payload": {"status": "invalid"}},
-            {"returncode": 0, "payload": {"status": "ok", "repos": [{"key": repo}]}},
+            {"returncode": 0, "payload": {"status": "ok", "repos": []}},
+            {"returncode": 1, "payload": {"status": "warn", "membership": {"schema": "repoground.fleet-membership-authority.v1"}}},
+            {"returncode": 0, "payload": {"status": "ok", "membership": {"schema": "repoground.fleet-membership-authority.v1", "members": ["heimgewebe/grabowski"], "member_count": 2}}},
+            {"returncode": 0, "payload": {"status": "ok", "membership": {"schema": "repoground.fleet-membership-authority.v1", "members": ["heimgewebe/grabowski", "heimgewebe/grabowski"], "member_count": 2}}},
             {"returncode": 1, "payload": {"status": "error"}},
         ):
-            post_merge._publisher_inventory_missing_repository.cache_clear()
+            post_merge._publisher_authoritative_members.cache_clear()
             with patch.object(post_merge, "_run_publisher", return_value=payload):
-                self.assertFalse(post_merge._publisher_inventory_missing_repository(repo))
-        post_merge._publisher_inventory_missing_repository.cache_clear()
+                self.assertFalse(post_merge._publisher_inventory_missing_repository("alexdermohr/livia"))
+        post_merge._publisher_authoritative_members.cache_clear()
         with patch.object(post_merge, "_run_publisher", side_effect=OSError("unavailable")):
-            self.assertFalse(post_merge._publisher_inventory_missing_repository(repo))
+            self.assertFalse(post_merge._publisher_inventory_missing_repository("alexdermohr/livia"))
+
 
 if __name__ == "__main__":
     unittest.main()

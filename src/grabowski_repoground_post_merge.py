@@ -1753,27 +1753,41 @@ def captain_followup_request_from_audit(
     )
 
 
-@lru_cache(maxsize=128)
-def _publisher_inventory_missing_repository(repository: str) -> bool:
-    """Recognize only a proven missing fleet entry; unknown errors stay retryable.
+@lru_cache(maxsize=1)
+def _publisher_authoritative_members() -> frozenset[str] | None:
+    """Read the authoritative fleet membership once per reconcile process.
 
-    The publisher is the authority for repository selection. Cache per
-    reconciliation process, not across future fleet membership changes.
+    Targeted inventory is explicitly non-authoritative and includes local
+    checkout repos excluded from the real fleet. Unknown is not exclusion.
     """
     try:
-        inventory = _run_publisher(
-            [str(DEFAULT_PUBLISHER), "--inventory", "--repo", repository],
-            15,
-        )
+        inventory = _run_publisher([str(DEFAULT_PUBLISHER), "--inventory"], 15)
     except (OSError, subprocess.SubprocessError, RepoGroundPostMergeError, ValueError):
-        return False
+        return None
+    if not isinstance(inventory, dict) or inventory.get("returncode") != 0:
+        return None
     payload = inventory.get("payload")
-    return bool(
-        inventory.get("returncode") == 2
-        and isinstance(payload, dict)
-        and payload.get("status") == "invalid"
-        and payload.get("missing_repositories") == [repository]
-    )
+    if not isinstance(payload, dict) or payload.get("status") != "ok":
+        return None
+    membership = payload.get("membership")
+    if not isinstance(membership, dict) or (
+        membership.get("schema") != "repoground.fleet-membership-authority.v1"
+    ):
+        return None
+    members = membership.get("members")
+    if not isinstance(members, list) or (
+        any(not isinstance(repo, str) or not REPOSITORY_RE.fullmatch(repo) for repo in members)
+        or type(membership.get("member_count")) is not int
+        or membership["member_count"] != len(members)
+        or len(set(members)) != len(members)
+    ):
+        return None
+    return frozenset(members)
+
+
+def _publisher_inventory_missing_repository(repository: str) -> bool:
+    members = _publisher_authoritative_members()
+    return members is not None and repository not in members
 
 
 def schedule_from_captain_audit_completion(
