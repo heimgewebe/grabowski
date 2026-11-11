@@ -2663,11 +2663,28 @@ def _iter_pinned_review_job_directories(
                 ) == identity
                 for name, identity in original_root_entries.items()
             )
-            additions_are_new_private_jobs = bool(added_names) and all(
-                _UNIT_RE.fullmatch(name) is not None
-                and stat.S_ISDIR(current_entries[name].st_mode)
-                and current_entries[name].st_uid == os.geteuid()
+            # Foreign RepoGround jobs and private non-job receipts can appear
+            # while an unrelated PR's full scan is running. They are no more
+            # authoritative than canonical new jobs: re-scan the entire root,
+            # never accept a partial inventory. Existing entries must remain
+            # at their exact original dev/inode; missing/replaced entries,
+            # symlinks, public files, and malformed job names still hard-block.
+            additions_are_private = bool(added_names) and all(
+                current_entries[name].st_uid == os.geteuid()
                 and not (stat.S_IMODE(current_entries[name].st_mode) & 0o077)
+                and (
+                    (
+                        stat.S_ISDIR(current_entries[name].st_mode)
+                        and (
+                            _UNIT_RE.fullmatch(name) is not None
+                            or _RGPM_UNIT_RE.fullmatch(name) is not None
+                        )
+                    )
+                    or (
+                        stat.S_ISREG(current_entries[name].st_mode)
+                        and not name.startswith("grabowski-job-")
+                    )
+                )
                 for name in added_names
             )
             if (
@@ -2676,7 +2693,7 @@ def _iter_pinned_review_job_directories(
                 and root_stat.st_uid == after.st_uid
                 and root_stat.st_mode == after.st_mode
                 and unchanged
-                and additions_are_new_private_jobs
+                and additions_are_private
             ):
                 errors.append("decision_review_jobs_root_addition_race")
             else:
