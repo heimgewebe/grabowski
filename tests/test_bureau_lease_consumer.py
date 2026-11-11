@@ -1532,6 +1532,53 @@ class BureauEmergencyConflictTests(_BureauLeaseTestCase):
 
 
 class BureauContractIntegrityTests(_BureauLeaseTestCase):
+    @staticmethod
+    def _source_safe_environment():
+        import importlib.util
+
+        source_file = SRC / "grabowski_bureau_leases.py"
+        spec = importlib.util.spec_from_file_location(
+            "grabowski_bureau_leases_gh_env_source_test", source_file
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module._safe_environment
+
+    def test_safe_environment_selects_only_packaged_nixos_gh(self) -> None:
+        safe_environment = self._source_safe_environment()
+        package = Path("/nix/store/test-grabowski-operator")
+        gh = package / "bin/gh"
+        module = package / "lib/python3.12/site-packages/grabowski_bureau_leases.py"
+        with (
+            patch.dict(safe_environment.__globals__, {"__file__": str(module)}),
+            patch.object(Path, "is_file", autospec=True, side_effect=lambda path: path == gh),
+            patch.object(
+                os,
+                "access",
+                side_effect=lambda path, mode: path == gh and mode == os.X_OK,
+            ),
+            patch.dict(os.environ, {"BUREAU_GH_BIN": "/tmp/untrusted/gh", "PATH": "/tmp/untrusted"}),
+        ):
+            environment = safe_environment()
+        self.assertEqual(Path(safe_environment.__code__.co_filename), SRC / "grabowski_bureau_leases.py")
+        self.assertEqual(environment["BUREAU_GH_BIN"], str(gh))
+        self.assertEqual(environment["PATH"], "/usr/bin:/bin")
+        self.assertNotIn("/tmp/untrusted", str(environment))
+
+    def test_safe_environment_fails_closed_without_packaged_gh(self) -> None:
+        safe_environment = self._source_safe_environment()
+        package = Path("/nix/store/test-grabowski-operator")
+        module = package / "lib/python3.12/site-packages/grabowski_bureau_leases.py"
+        with (
+            patch.dict(safe_environment.__globals__, {"__file__": str(module)}),
+            patch.object(Path, "is_file", return_value=False),
+            patch.dict(os.environ, {"BUREAU_GH_BIN": "/tmp/untrusted/gh"}),
+        ):
+            environment = safe_environment()
+        self.assertNotIn("BUREAU_GH_BIN", environment)
+        self.assertEqual(environment["PATH"], "/usr/bin:/bin")
+
     def test_environment_cannot_redirect_canonical_bureau_roots(self) -> None:
         import inspect
 
