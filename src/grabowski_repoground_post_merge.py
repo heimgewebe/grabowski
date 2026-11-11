@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime
+from functools import lru_cache
 import hashlib
 import os
 import stat as statmod
@@ -1752,6 +1753,29 @@ def captain_followup_request_from_audit(
     )
 
 
+@lru_cache(maxsize=128)
+def _publisher_inventory_missing_repository(repository: str) -> bool:
+    """Recognize only a proven missing fleet entry; unknown errors stay retryable.
+
+    The publisher is the authority for repository selection. Cache per
+    reconciliation process, not across future fleet membership changes.
+    """
+    try:
+        inventory = _run_publisher(
+            [str(DEFAULT_PUBLISHER), "--inventory", "--repo", repository],
+            15,
+        )
+    except (OSError, subprocess.SubprocessError, RepoGroundPostMergeError, ValueError):
+        return False
+    payload = inventory.get("payload")
+    return bool(
+        inventory.get("returncode") == 2
+        and isinstance(payload, dict)
+        and payload.get("status") == "invalid"
+        and payload.get("missing_repositories") == [repository]
+    )
+
+
 def schedule_from_captain_audit_completion(
     completion_record_sha256: str,
     *,
@@ -1767,11 +1791,29 @@ def schedule_from_captain_audit_completion(
         script_path=script_path,
         verified_snapshot=verified_snapshot,
     )
-    result = schedule_followup_request(
-        request,
-        job_starter=job_starter,
-        runtime_seconds=runtime_seconds,
-    )
+    if (
+        request.get("status") == "ready"
+        and _publisher_inventory_missing_repository(request["repository"])
+    ):
+        result = {
+            **_followup_base(
+                status="not_scheduled",
+                reason="publisher_inventory_missing_repository",
+                repository=request["repository"],
+                merge_sha=request.get("merge_sha"),
+            ),
+            "does_not_establish": [
+                "publication_completed",
+                "freshness_converged",
+                "future_fleet_membership",
+            ],
+        }
+    else:
+        result = schedule_followup_request(
+            request,
+            job_starter=job_starter,
+            runtime_seconds=runtime_seconds,
+        )
     result["captain_audit_completion_sha256"] = completion_record_sha256
     return result
 
@@ -2795,6 +2837,7 @@ def reconcile_recent_captain_audit_followups(
                         outcome["reason"] in {
                             "merge_verification_not_passed",
                             "captain_merge_not_fast_path_eligible",
+                            "publisher_inventory_missing_repository",
                         }
                         or (
                             outcome["reason"] == "durable_freshness_job_slots_exhausted"

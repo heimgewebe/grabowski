@@ -970,6 +970,10 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
             }),
             patch.object(post_merge.time, "time", return_value=10_000),
             patch.object(post_merge, "resolve_job_starter", return_value=starter),
+            patch.object(
+                post_merge, "_publisher_inventory_missing_repository",
+                return_value=False,
+            ),
         ):
             result = post_merge.reconcile_recent_captain_audit_followups(
                 lookback_seconds=100,
@@ -5303,6 +5307,66 @@ class RepoGroundPostMergeSchedulingTests(unittest.TestCase):
         self.assertIn("job_not_started", result["does_not_establish"])
         self.assertIn("merge_failure", result["does_not_establish"])
 
+
+
+class PublisherInventoryAdmissionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        post_merge._publisher_inventory_missing_repository.cache_clear()
+
+    def tearDown(self) -> None:
+        post_merge._publisher_inventory_missing_repository.cache_clear()
+
+    def test_exact_publisher_missing_repo_is_not_scheduled(self) -> None:
+        repo = "Hall-of-Memory/memoraevents"
+        payload = {
+            "returncode": 2,
+            "payload": {"status": "invalid", "missing_repositories": [repo]},
+        }
+        with patch.object(post_merge, "_run_publisher", return_value=payload) as publisher:
+            self.assertTrue(post_merge._publisher_inventory_missing_repository(repo))
+            self.assertTrue(post_merge._publisher_inventory_missing_repository(repo))
+            publisher.assert_called_once_with(
+                [str(post_merge.DEFAULT_PUBLISHER), "--inventory", "--repo", repo],
+                15,
+            )
+
+        request = {
+            "status": "ready",
+            "repository": repo,
+            "merge_sha": MERGE,
+            "argv": ["python3", "-B", "post-merge", "--repo", repo],
+            "cwd": "/tmp",
+        }
+        with patch.object(
+            post_merge, "captain_followup_request_from_audit", return_value=request
+        ), patch.object(
+            post_merge, "_publisher_inventory_missing_repository", return_value=True
+        ):
+            result = post_merge.schedule_from_captain_audit_completion(
+                "d" * 64,
+                job_starter=lambda *args, **kwargs: self.fail("must not dispatch"),
+                python_executable=sys.executable,
+                script_path=Path(__file__),
+            )
+        self.assertEqual("not_scheduled", result["status"])
+        self.assertEqual("publisher_inventory_missing_repository", result["reason"])
+        self.assertEqual("d" * 64, result["captain_audit_completion_sha256"])
+        self.assertIn("publication_completed", result["does_not_establish"])
+
+    def test_only_exact_missing_repo_response_is_exclusion(self) -> None:
+        repo = "Hall-of-Memory/memoraevents"
+        for payload in (
+            {"returncode": 2, "payload": {"status": "invalid", "missing_repositories": ["other/repo"]}},
+            {"returncode": 2, "payload": {"status": "invalid"}},
+            {"returncode": 0, "payload": {"status": "ok", "repos": [{"key": repo}]}},
+            {"returncode": 1, "payload": {"status": "error"}},
+        ):
+            post_merge._publisher_inventory_missing_repository.cache_clear()
+            with patch.object(post_merge, "_run_publisher", return_value=payload):
+                self.assertFalse(post_merge._publisher_inventory_missing_repository(repo))
+        post_merge._publisher_inventory_missing_repository.cache_clear()
+        with patch.object(post_merge, "_run_publisher", side_effect=OSError("unavailable")):
+            self.assertFalse(post_merge._publisher_inventory_missing_repository(repo))
 
 if __name__ == "__main__":
     unittest.main()
