@@ -14,7 +14,9 @@ MAX_SOURCE_LEASES = current_work.MAX_LEASES
 MAX_SOURCE_WORKERS = current_work.MAX_WORKERS
 CURRENT_TASK_STATES = ("launching", "running", "interrupted", "outcome_unknown")
 CURRENT_WORK_GIT_TIMEOUT_SECONDS = 1.0
-CURRENT_WORK_CHECKOUT_OBSERVATION_BUDGET_SECONDS = 8.0
+# Bounded full-worktree observation needs headroom beyond idle Git-probe timings.
+# Retain a finite limit; unavailable probes remain explicitly partial.
+CURRENT_WORK_CHECKOUT_OBSERVATION_BUDGET_SECONDS = 16.0
 CURRENT_WORK_CHECKOUT_MAX_WORKTREES: int | None = None
 CURRENT_WORK_MAX_PARALLEL_SOURCES = 2
 
@@ -89,14 +91,23 @@ def _attempt_source(
 ) -> Any:
     try:
         _operator()._require_operator_capability(capability)
-        try:
-            return loader()
-        except Exception as exc:
-            if not _transient_sqlite_snapshot_change(source, exc):
-                raise
-            # Discard the failed read entirely. A new transaction may succeed
-            # after sidecar turnover; persistent drift stays explicit below.
-            return loader()
+        # Attention starts after checkout/binding observation and can overlap
+        # a second transient WAL creation/checkpoint on the task store. Retry
+        # its whole read at most twice; no individual snapshot is reused.
+        attempts = 3 if source == "attention" else 2
+        for attempt in range(attempts):
+            try:
+                return loader()
+            except Exception as exc:
+                if (
+                    attempt + 1 == attempts
+                    or not _transient_sqlite_snapshot_change(source, exc)
+                ):
+                    raise
+                # The reader has closed its failed transaction before here.
+                # Short bounded spacing avoids racing the same sidecar turnover.
+                if source == "attention":
+                    time.sleep(0.04 * (attempt + 1))
     except Exception as exc:  # Each unavailable source remains explicit and partial.
         errors.append(_source_error(source, exc))
         return default

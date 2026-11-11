@@ -467,6 +467,9 @@ def _publisher_command(publisher: Path, repository: str) -> list[str]:
         "--repo",
         repository,
         "--if-changed",
+        # Fleet watch units disable optional authenticated Git/CI handoff.
+        # Captain follow-ups must use the same source-publication policy.
+        "--no-authenticated-events",
         "--retention",
         "3",
     ]
@@ -782,6 +785,36 @@ def converge(
                 }
             sleep_fn(busy_sleep_seconds)
             continue
+
+        if returncode == 0 and publisher_status == "warn":
+            # The publisher can warn on an older, already superseded Captain
+            # merge even though today's canonical bundle is fresh_exact and
+            # the historical merge is an ancestor of the observed remote head.
+            # Reuse the existing strict freshness/remote/ancestry proof before
+            # classifying this immutable obligation as a failed publication.
+            # Missing or mismatched evidence must retain the original failure.
+            try:
+                current = freshness_reader(repository)
+                exact, projection = _fresh_exact(
+                    current,
+                    merge_sha=merge_sha,
+                    target_branch=target_branch,
+                    ancestry_checker=ancestry_checker,
+                )
+            except (OSError, subprocess.SubprocessError, RepoGroundPostMergeError) as exc:
+                attempt_record["freshness_check_error"] = type(exc).__name__
+            else:
+                attempt_record["freshness"] = projection
+                if exact:
+                    return {
+                        "kind": "grabowski.repoground_post_merge_freshness",
+                        "schema_version": 1,
+                        "status": "fresh_exact",
+                        "repository": repository,
+                        "merge_sha": merge_sha,
+                        "attempts": attempts,
+                        "final": projection,
+                    }
 
         if returncode != 0 or publisher_status not in {"ok", "success"}:
             return {

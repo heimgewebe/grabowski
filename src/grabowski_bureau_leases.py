@@ -503,7 +503,7 @@ def sanitize_bureau_metadata(
 
 
 def _safe_environment() -> dict[str, str]:
-    return {
+    environment = {
         "HOME": str(Path.home()),
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
@@ -512,6 +512,14 @@ def _safe_environment() -> dict[str, str]:
         "PYTHONDONTWRITEBYTECODE": "1",
         "PYTHONPYCACHEPREFIX": "/dev/null/grabowski-bureau-contract",
     }
+    # Bureau's PR guard runs under this restricted environment. NixOS has no
+    # /usr/bin/gh, so point only the GH binary to our immutable package wrapper.
+    package_root = Path(__file__).resolve().parents[3]
+    if package_root.parent == Path("/nix/store"):
+        packaged_gh = package_root / "bin/gh"
+        if packaged_gh.is_file() and os.access(packaged_gh, os.X_OK):
+            environment["BUREAU_GH_BIN"] = str(packaged_gh)
+    return environment
 
 
 def _metadata_identity(metadata: os.stat_result) -> tuple[int, ...]:

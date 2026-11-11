@@ -140,6 +140,26 @@ class CheckoutLifecycleTests(unittest.TestCase):
         attempts.clear()
 
         @contextmanager
+        def checkpointed_twice():
+            attempts.append(1)
+            if len(attempts) < 3:
+                raise checkouts.resources.ResourceSchemaInventoryChanged(
+                    "Second WAL turnover during checkout live-lease read"
+                )
+            with original() as connection:
+                yield connection
+
+        with (
+            patch.object(checkouts.resources, "_resource_readonly_snapshot", checkpointed_twice),
+            patch.object(checkouts.time, "sleep") as pause,
+        ):
+            self.assertEqual(checkouts._live_checkout_lease_keys(now=int(time.time())), {})
+        self.assertEqual(len(attempts), 3)
+        self.assertEqual([call.args[0] for call in pause.call_args_list], [0.04, 0.08])
+
+        attempts.clear()
+
+        @contextmanager
         def persistently_changed():
             attempts.append(1)
             raise checkouts.resources.ResourceSchemaInventoryChanged(
@@ -150,7 +170,25 @@ class CheckoutLifecycleTests(unittest.TestCase):
         with patch.object(checkouts.resources, "_resource_readonly_snapshot", persistently_changed):
             with self.assertRaises(checkouts.resources.ResourceSchemaInventoryChanged):
                 checkouts._live_checkout_lease_keys(now=int(time.time()))
-        self.assertEqual(len(attempts), 2)
+        self.assertEqual(len(attempts), 3)
+
+    def test_live_lease_snapshot_does_not_retry_permission_error(self) -> None:
+        from contextlib import closing, contextmanager
+
+        with closing(checkouts.resources._database()) as connection:
+            connection.execute("SELECT 1 FROM leases").fetchone()
+        attempts: list[int] = []
+
+        @contextmanager
+        def denied():
+            attempts.append(1)
+            raise PermissionError("no snapshot permission")
+            yield
+
+        with patch.object(checkouts.resources, "_resource_readonly_snapshot", denied):
+            with self.assertRaises(PermissionError):
+                checkouts._live_checkout_lease_keys(now=int(time.time()))
+        self.assertEqual(attempts, [1])
 
     def test_rereserving_stale_checkout_cannot_exceed_live_capacity(self) -> None:
         """Reacquiring a lease for a retained row must not create a 17th writer."""

@@ -105,6 +105,65 @@ class CurrentWorkSurfaceTests(unittest.TestCase):
                 self.assertEqual(admissions, [capability])
                 self.assertEqual(errors, [])
 
+    def test_attention_two_checkpoint_turnovers_reobserve_fresh_third_snapshot(self) -> None:
+        attempts: list[int] = []
+        admissions: list[str] = []
+        errors: list[dict] = []
+
+        def read():
+            attempts.append(1)
+            if len(attempts) < 3:
+                raise checkouts_module.tasks.TaskSchemaInventoryChanged(
+                    "Task WAL/SHM rotated before completed snapshot"
+                )
+            return {"records": ["valid"], "pagination": {"has_more": False}}
+
+        with (
+            patch.object(
+                surface, "_operator",
+                return_value=SimpleNamespace(
+                    _require_operator_capability=admissions.append
+                ),
+            ),
+            patch.object(surface.time, "sleep") as pause,
+        ):
+            result = surface._attempt_source(
+                "attention", "durable_job", read,
+                errors, {"records": [], "pagination": {"has_more": True}},
+            )
+
+        self.assertEqual(result["records"], ["valid"])
+        self.assertEqual(attempts, [1, 1, 1])
+        self.assertEqual(admissions, ["durable_job"])
+        self.assertEqual(errors, [])
+        self.assertEqual([call.args[0] for call in pause.call_args_list], [0.04, 0.08])
+
+    def test_attention_unrelated_error_after_checkpoint_does_not_retry_again(self) -> None:
+        attempts: list[int] = []
+        errors: list[dict] = []
+
+        def read():
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise checkouts_module.tasks.TaskSchemaInventoryChanged("WAL turnover")
+            raise PermissionError("new untrusted condition")
+
+        with (
+            patch.object(
+                surface, "_operator",
+                return_value=SimpleNamespace(_require_operator_capability=lambda _: None),
+            ),
+            patch.object(surface.time, "sleep") as pause,
+        ):
+            result = surface._attempt_source(
+                "attention", "durable_job", read, errors, {"partial": True},
+            )
+
+        self.assertEqual(result, {"partial": True})
+        self.assertEqual(attempts, [1, 1])
+        self.assertEqual(errors, [{"source": "attention", "error": "PermissionError"}])
+        pause.assert_called_once_with(0.04)
+
     def test_persistent_sqlite_snapshot_change_stays_explicitly_partial(self) -> None:
         for source, changed in [
             ("resources", checkouts_module.resources.ResourceSchemaInventoryChanged),
@@ -127,7 +186,11 @@ class CurrentWorkSurfaceTests(unittest.TestCase):
                         source, "durable_job", failing_read, errors, {"partial": True},
                     )
                 self.assertEqual(result, {"partial": True})
-                self.assertEqual(reads, [1, 1], "no unbounded retry")
+                self.assertEqual(
+                    reads,
+                    [1, 1, 1] if source == "attention" else [1, 1],
+                    "persistently changing WAL remains bounded and explicitly partial",
+                )
                 self.assertEqual(
                     errors, [{"source": source, "error": changed.__name__}],
                 )
