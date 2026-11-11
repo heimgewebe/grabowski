@@ -21847,10 +21847,28 @@ class CaptainAuthorityPathTests(unittest.TestCase):
                         )
                         connection.commit()
                 else:
+                    # Reproduce a pre-contract manually created gate row. The
+                    # generic acquisition API now rejects creating this state,
+                    # but an existing legacy row must still block a live merge.
                     gate = next(key for key in keys if key.startswith("gate:github-merge:"))
-                    resources.acquire_resources(
-                        "alex", [gate], purpose="first concurrent merge", ttl_seconds=60,
-                    )
+                    now = int(time.time())
+                    metadata_json, metadata_sha256 = resources._metadata({})
+                    with resources._database() as connection:
+                        connection.execute(
+                            """
+                            INSERT INTO leases(
+                                resource_key, owner_id, purpose,
+                                acquired_at_unix, updated_at_unix,
+                                expires_at_unix, metadata_sha256,
+                                metadata_json, reclaimed_from_owner
+                            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                            """,
+                            (
+                                gate, "alex", "historical manual merge gate",
+                                now, now, now + 60, metadata_sha256, metadata_json,
+                            ),
+                        )
+                        connection.commit()
                 gh = FakeGh(view={
                     "number": 96, "state": "OPEN", "baseRefName": "main",
                     "baseRefOid": "e" * 40, "headRefOid": CAPTAIN_HEAD,
@@ -22106,10 +22124,34 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             purpose="same repository but disjoint file",
             ttl_seconds=60,
         )
-        resources.acquire_resources(
+        # A foreign repository contributes a REAL typed, fully bound merge
+        # guard. An unbound manually created gate is intentionally rejected.
+        other_repo = Path(self._resource_tempdir.name) / "unrelated-merge-repo"
+        other_repo.mkdir()
+        other_keys = merge_guard.merge_guard_resource_keys(
+            other_repo,
+            repo_slug="heimgewebe/other",
+            pr_number=97,
+            base="main",
+            head="feat/other",
+        )
+        other_gate = next(key for key in other_keys if key.startswith("gate:github-merge:"))
+        resources.acquire_merge_guard_resources(
+            "captain-merge:foreign-other-repo",
             "foreign-other-repo",
-            ["gate:github-merge:heimgewebe-other:main"],
-            purpose="unrelated repository merge", ttl_seconds=60,
+            other_keys,
+            repository=str(other_repo),
+            changed_paths=[str(other_repo / "src" / "other.py")],
+            purpose="unrelated repository merge",
+            ttl_seconds=60,
+            metadata={
+                "merge_guard": {
+                    "head_sha": "f" * 40,
+                    "diff_sha256": "a" * 64,
+                    "base_branch": "main",
+                    "head_branch": "feat/other",
+                }
+            },
         )
         parameters = authorized_captain_run_parameters()
         gh = FakeGh(view={
@@ -22127,8 +22169,8 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertEqual(
             "foreign-same-repo", resources.inspect_resource(local_disjoint)["owner_id"]
         )
-        self.assertEqual("foreign-other-repo", resources.inspect_resource(
-            "gate:github-merge:heimgewebe-other:main"
+        self.assertEqual("captain-merge:foreign-other-repo", resources.inspect_resource(
+            other_gate
         )["owner_id"])
 
     def test_atomic_merge_guard_rejects_incomplete_or_rename_path_evidence(self) -> None:

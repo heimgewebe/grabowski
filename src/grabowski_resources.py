@@ -6099,6 +6099,11 @@ def acquire_resources(
     owner = _owner(owner_id)
     task_owner_match = re.fullmatch(r"task:([0-9a-f]{24})", owner)
     keys = normalize_resource_keys(resource_keys)
+    if any(key.startswith("gate:github-merge:") for key in keys):
+        raise PermissionError(
+            "GitHub merge gates require acquire_merge_guard_resources; "
+            "generic acquisitions cannot create unbound merge guards"
+        )
     lease_purpose = _purpose(purpose)
     ttl = _ttl(ttl_seconds)
     if metadata is not None and not isinstance(metadata, dict):
