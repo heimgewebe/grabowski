@@ -467,6 +467,9 @@ def _publisher_command(publisher: Path, repository: str) -> list[str]:
         "--repo",
         repository,
         "--if-changed",
+        # Fleet watch units disable optional authenticated Git/CI handoff.
+        # Captain follow-ups must use the same source-publication policy.
+        "--no-authenticated-events",
         "--retention",
         "3",
     ]
