@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime
+from functools import lru_cache
 import hashlib
 import os
 import stat as statmod
@@ -1752,6 +1753,43 @@ def captain_followup_request_from_audit(
     )
 
 
+@lru_cache(maxsize=1)
+def _publisher_authoritative_members() -> frozenset[str] | None:
+    """Read the authoritative fleet membership once per reconcile process.
+
+    Targeted inventory is explicitly non-authoritative and includes local
+    checkout repos excluded from the real fleet. Unknown is not exclusion.
+    """
+    try:
+        inventory = _run_publisher([str(DEFAULT_PUBLISHER), "--inventory"], 15)
+    except (OSError, subprocess.SubprocessError, RepoGroundPostMergeError, ValueError):
+        return None
+    if not isinstance(inventory, dict) or inventory.get("returncode") != 0:
+        return None
+    payload = inventory.get("payload")
+    if not isinstance(payload, dict) or payload.get("status") != "ok":
+        return None
+    membership = payload.get("membership")
+    if not isinstance(membership, dict) or (
+        membership.get("schema") != "repoground.fleet-membership-authority.v1"
+    ):
+        return None
+    members = membership.get("members")
+    if not isinstance(members, list) or (
+        any(not isinstance(repo, str) or not REPOSITORY_RE.fullmatch(repo) for repo in members)
+        or type(membership.get("member_count")) is not int
+        or membership["member_count"] != len(members)
+        or len(set(members)) != len(members)
+    ):
+        return None
+    return frozenset(members)
+
+
+def _publisher_inventory_missing_repository(repository: str) -> bool:
+    members = _publisher_authoritative_members()
+    return members is not None and repository not in members
+
+
 def schedule_from_captain_audit_completion(
     completion_record_sha256: str,
     *,
@@ -1767,11 +1805,29 @@ def schedule_from_captain_audit_completion(
         script_path=script_path,
         verified_snapshot=verified_snapshot,
     )
-    result = schedule_followup_request(
-        request,
-        job_starter=job_starter,
-        runtime_seconds=runtime_seconds,
-    )
+    if (
+        request.get("status") == "ready"
+        and _publisher_inventory_missing_repository(request["repository"])
+    ):
+        result = {
+            **_followup_base(
+                status="not_scheduled",
+                reason="publisher_inventory_missing_repository",
+                repository=request["repository"],
+                merge_sha=request.get("merge_sha"),
+            ),
+            "does_not_establish": [
+                "publication_completed",
+                "freshness_converged",
+                "future_fleet_membership",
+            ],
+        }
+    else:
+        result = schedule_followup_request(
+            request,
+            job_starter=job_starter,
+            runtime_seconds=runtime_seconds,
+        )
     result["captain_audit_completion_sha256"] = completion_record_sha256
     return result
 
@@ -2795,6 +2851,7 @@ def reconcile_recent_captain_audit_followups(
                         outcome["reason"] in {
                             "merge_verification_not_passed",
                             "captain_merge_not_fast_path_eligible",
+                            "publisher_inventory_missing_repository",
                         }
                         or (
                             outcome["reason"] == "durable_freshness_job_slots_exhausted"
