@@ -148,6 +148,24 @@ class ChronikFullSearchTests(unittest.TestCase):
             result["failure_code"], "chronik_cursor_stale_restart_from_first_page",
         )
 
+    def test_unsupported_operation_is_input_error_not_provider_outage(self):
+        def unsupported(argv, cwd):
+            self.calls.append((argv, cwd))
+            return {
+                "returncode": 2, "stdout": "",
+                "stderr": "chronik-search: unsupported operation\n",
+            }
+        self.filters["operation"] = "never-existing-operation"
+        result = search.query(
+            selectors=self.filters, configuration=self.config,
+            executor=unsupported, limit=2,
+        )
+        self.assertFalse(result["available"])
+        self.assertEqual(
+            result["failure_code"], "chronik_full_search_unsupported_operation"
+        )
+        self.assertEqual(len(self.calls), 1)
+
     def test_missing_provider_is_unavailable_not_an_empty_result(self):
         config = dict(self.config, available=False, reason="chronik_repository_unavailable")
         result = search.query(selectors=self.filters, configuration=config, executor=self.execute)

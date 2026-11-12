@@ -52,6 +52,7 @@ def maybe_start_claude_review(
     route_selector: Callable[..., dict[str, Any]] | None = None,
     binding_reader: Callable[..., tuple[str, str, bool]] | None = None,
     committed_diff_reader: Callable[..., bytes] | None = None,
+    provider_preflight: Callable[[list[str]], Any] | None = None,
     reconcile: Callable[..., dict[str, Any]] | None = None,
     job_start: Callable[..., dict[str, Any]] | None = None,
     lock_root: Path | None = None,
@@ -116,7 +117,13 @@ def maybe_start_claude_review(
             and item.get("route") == "claude-opus-5.5-high"
             and item.get("harness") == "claude"
             and item.get("review_only") is True
-            and item.get("paid_only") is not True
+            and item.get("paid_only") is False
+            and isinstance(item.get("model"), str)
+            and bool(item["model"].strip())
+            and isinstance(item.get("argv_prefix"), list)
+            and bool(item["argv_prefix"])
+            and all(isinstance(arg, str) and arg for arg in item["argv_prefix"])
+            and Path(item["argv_prefix"][0]).name == "claude"
             and item.get("execution_eligible_if_separately_authorized") is True
         )), None)
         if reviewer is None:
@@ -140,6 +147,22 @@ def maybe_start_claude_review(
             committed_input.decode("utf-8", errors="strict")
         except UnicodeDecodeError:
             return {**result, "state": "unavailable", "reason": "claude_input_not_utf8"}
+        # The actual role resolves the CLI and its private credentials *before*
+        # writing a V2 receipt. Failure after registration would otherwise
+        # create merge debt, although no external review had run. Use that
+        # same canonical filesystem admission before reserving the job.
+        if provider_preflight is None:
+            from grabowski_agent_sandbox import prepare_external_agent_command
+            provider_preflight = prepare_external_agent_command
+        try:
+            provider_preflight([*reviewer["argv_prefix"], PROMPT])
+        except Exception as exc:
+            return {
+                **result, "state": "unavailable",
+                "reason": "claude_cli_or_auth_preflight_failed",
+                "error_type": type(exc).__name__,
+                "automatic_retry": False,
+            }
         inspect = reconcile or reviews.reconcile
         starter = job_start
         with _one_revision_claim(binding, lock_root or reviews.LOCKS_ROOT):
@@ -165,10 +188,20 @@ def maybe_start_claude_review(
                 "--output", str(reviews.JOBS_ROOT / "reserved-claude-review.json"),
                 "--", *reviewer["argv_prefix"], PROMPT,
             ]
-            launched = starter(
-                command, cwd=str(repo), runtime_seconds=1800,
-                decision_review_binding=binding,
-            )
+            try:
+                launched = starter(
+                    command, cwd=str(repo), runtime_seconds=1800,
+                    decision_review_binding=binding,
+                )
+            except Exception as exc:
+                # A failed call can have started a durable unit; only registry
+                # readback can prove absence, never silently retry or waive it.
+                return {
+                    **result, "state": "outcome_unknown",
+                    "reason": "review_start_may_have_registered",
+                    "error_type": type(exc).__name__,
+                    "automatic_retry": False,
+                }
             if not isinstance(launched, dict) or not isinstance(launched.get("unit"), str):
                 return {**result, "state": "outcome_unknown", "reason": "review_start_receipt_incomplete"}
             return {

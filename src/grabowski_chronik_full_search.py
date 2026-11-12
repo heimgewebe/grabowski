@@ -218,6 +218,10 @@ def query(
         stderr = result.get("stderr")
         if isinstance(stderr, str) and "stale search cursor: ledger changed" in stderr:
             return _failure("chronik_cursor_stale_restart_from_first_page")
+        if (result.get("returncode") == 2 and isinstance(stderr, str)
+            and stderr.startswith("chronik-search: unsupported operation")):
+            # Invalid caller filter, not a Chronik CLI or ledger outage.
+            return _failure("chronik_full_search_unsupported_operation")
     if (not isinstance(result, dict) or result.get("returncode") != 0
         or result.get("timed_out") is True
         or result.get("stdout_truncated") is True):
