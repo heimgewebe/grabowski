@@ -159,16 +159,19 @@ class BureauRuntimeRefreshExecutorTests(unittest.TestCase):
         Path("/run/current-system/sw/bin/findmnt").is_file(),
         "NixOS system profile required for live findmnt probe",
     )
-    def test_nixos_findmnt_probes_real_runtime_state_root(self) -> None:
-        evidence = executor._probe_writable_directory(
-            "state_root", executor.CANONICAL_STATE_ROOT
-        )
-        self.assertEqual(
-            executor.CANONICAL_FINDMNT,
-            Path("/run/current-system/sw/bin/findmnt"),
-        )
-        self.assertTrue(evidence["writable"])
-        self.assertTrue(evidence["mount_rw"])
+    def test_nixos_findmnt_probes_writable_temporary_directory(self) -> None:
+        # The operator's private StateStore need not exist on another NixOS
+        # runner; test the real mounted filesystem using a portable fixture.
+        with tempfile.TemporaryDirectory() as temp_root:
+            evidence = executor._probe_writable_directory(
+                "state_root", Path(temp_root)
+            )
+            self.assertEqual(
+                executor.CANONICAL_FINDMNT,
+                Path("/run/current-system/sw/bin/findmnt"),
+            )
+            self.assertTrue(evidence["writable"])
+            self.assertTrue(evidence["mount_rw"])
 
     def test_generic_surfaces_reject_direct_runtime_refresh_apply(self) -> None:
         argv = [
