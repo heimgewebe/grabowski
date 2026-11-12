@@ -1790,6 +1790,71 @@ def _publisher_inventory_missing_repository(repository: str) -> bool:
     return members is not None and repository not in members
 
 
+@lru_cache(maxsize=64)
+def _publisher_canonical_publication_ref(repository: str) -> str | None:
+    """Read one current, remote-bound fleet publication branch per reconcile pass.
+
+    A merge into a different branch cannot be proven by publishing the
+    canonical branch. Unknown or stale publication evidence never excludes.
+    """
+    try:
+        current = _read_freshness(repository)
+    except (
+        OSError, subprocess.SubprocessError, RepoGroundPostMergeError,
+        ValueError, TypeError, RuntimeError,
+    ):
+        return None
+    if (
+        not isinstance(current, dict)
+        or current.get("repo") != repository
+        or current.get("freshness") != "fresh_exact"
+        or current.get("freshness_status") != "fresh"
+    ):
+        return None
+    bundle = current.get("bundle")
+    live = current.get("live_repo")
+    if not isinstance(bundle, dict) or not isinstance(live, dict):
+        return None
+    observed = live.get("branch_head_observation")
+    ref = bundle.get("ref")
+    head = bundle.get("git_commit")
+    if (
+        not isinstance(ref, str)
+        or not ref
+        or not isinstance(head, str)
+        or SHA40_RE.fullmatch(head) is None
+        or bundle.get("git_dirty") is not False
+        or live.get("dirty") is not False
+        or live.get("source_kind") != "publication_source_checkout"
+        or live.get("head") != head
+        or not isinstance(observed, dict)
+        or observed.get("status") != "observed"
+        or observed.get("basis") != "git_ls_remote_origin"
+        or observed.get("returncode") != 0
+        or observed.get("ref") != ref
+        or observed.get("full_ref") != f"refs/heads/{ref}"
+        or observed.get("head") != head
+    ):
+        return None
+    return ref
+
+
+def _publisher_canonical_target_mismatch(request: dict[str, Any]) -> str | None:
+    if request.get("status") != "ready":
+        return None
+    repository = request["repository"]
+    members = _publisher_authoritative_members()
+    if members is None or repository not in members:
+        return None
+    target_branch = request.get("target_branch")
+    if not isinstance(target_branch, str):
+        return None
+    canonical_ref = _publisher_canonical_publication_ref(repository)
+    if canonical_ref is None or target_branch == canonical_ref:
+        return None
+    return canonical_ref
+
+
 def schedule_from_captain_audit_completion(
     completion_record_sha256: str,
     *,
@@ -1799,6 +1864,10 @@ def schedule_from_captain_audit_completion(
     runtime_seconds: int = DEFAULT_JOB_RUNTIME_SECONDS,
     verified_snapshot: Any | None = None,
 ) -> dict[str, Any]:
+    # The operator is long-lived; only the verified reconciliation pass may
+    # reuse an observed canonical ref. Direct Captain actions always refresh.
+    if verified_snapshot is None:
+        _publisher_canonical_publication_ref.cache_clear()
     request = captain_followup_request_from_audit(
         completion_record_sha256,
         python_executable=python_executable,
@@ -1820,6 +1889,22 @@ def schedule_from_captain_audit_completion(
                 "publication_completed",
                 "freshness_converged",
                 "future_fleet_membership",
+            ],
+        }
+    elif canonical_ref := _publisher_canonical_target_mismatch(request):
+        result = {
+            **_followup_base(
+                status="not_scheduled",
+                reason="publisher_target_branch_not_canonical",
+                repository=request["repository"],
+                merge_sha=request.get("merge_sha"),
+            ),
+            "target_branch": request["target_branch"],
+            "publication_branch": canonical_ref,
+            "does_not_establish": [
+                "publication_completed",
+                "target_branch_freshness_converged",
+                "future_publisher_ref",
             ],
         }
     else:
@@ -2560,6 +2645,8 @@ def reconcile_recent_captain_audit_followups(
     if type(limit) is not int or not 1 <= limit <= 100:
         raise RepoGroundPostMergeError("reconcile limit is out of bounds")
 
+    # No cached remote publication authority crosses separate audit passes.
+    _publisher_canonical_publication_ref.cache_clear()
     discovery_started_monotonic = time.monotonic()
 
     import grabowski_audit_query
@@ -2852,6 +2939,7 @@ def reconcile_recent_captain_audit_followups(
                             "merge_verification_not_passed",
                             "captain_merge_not_fast_path_eligible",
                             "publisher_inventory_missing_repository",
+                            "publisher_target_branch_not_canonical",
                         }
                         or (
                             outcome["reason"] == "durable_freshness_job_slots_exhausted"
