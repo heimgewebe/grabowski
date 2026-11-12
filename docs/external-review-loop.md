@@ -2,6 +2,35 @@
 
 Status: active
 
+## Best-effort Claude subscription review (2026-11-11)
+
+When a managed PR starts its signed first-party five-axis review session,
+Grabowski also attempts one **decision-bound, read-only** Claude Opus 5.5
+review of that exact repository/PR/base/head/diff.  The attempt uses the
+existing canonical reviewer role and private durable-job registry, not GitHub
+review-body text, an API key, a secondary writer, or a paid credit route.
+A per-revision lock and registry readback prevent repeated automatic requests
+for the same Claude slot.  The session-start response reports
+`claude_advisory.state` as `dispatched`, `already_attempted`,
+`unavailable`, `outcome_unknown`, or `not_applicable`.
+
+This is a **review-attempt policy**, not
+`independent_review_required=true`: missing quota, revoked subscription,
+unavailable CLI, or a provider's verified pre-result limit cannot fabricate
+PASS or block the required five authenticated self-review axes.  Existing
+decision-bound rules still retain real material REJECTs and unresolved
+review findings; the operator must assess genuine findings before merge.
+A running review may temporarily delay a merge under the existing decision-job
+semantics; provider availability never authorizes bypassing CI, self-review,
+recovery, or unresolved findings.  No new Grok route is executable because the provider pool is
+owner-disabled; historical route identities stay for old signed receipts.  No API usage credits, additional pay-as-you-go,
+or automatic overage are authorized.
+
+The automatic trigger currently covers signed first-party PR reviews; an
+ordinary self-review without such a session is unchanged.  This is not a
+claim that all critical PRs are automatically routed through Claude until
+the full delivery and live-provider journey is exercised.
+
 ## Decision
 
 Grabowski self-review remains the universal required review control. Under review policy v5, `high_critical` requires five distinct, substantive, exact-revision **self-review phases** with authenticated execution and complete semantic output. It does **not** by itself require an independent external provider review. An additional independent reviewer is mandatory only after an explicit PR-specific opt-in. GitHub Codex settlement is a separate explicit opt-in (`codex_review_required=true`), except that already existing material Codex findings and trusted unresolved threads still block independently of whether a new review is requested. A provider quota failure is neither a self-review PASS nor a waiver of finding debt.
