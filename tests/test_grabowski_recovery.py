@@ -1205,6 +1205,8 @@ class NativeNixOSResticProofTests(unittest.TestCase):
                 recovery, "_configured_recovery_target_info", return_value={"kind": "local_backup_disk"}
             ), patch.object(
                 recovery, "_nixos_native_backup_service_fresh", return_value=changed_service
+            ), patch.object(
+                recovery, "_nixos_native_backup_inflight", return_value=False
             ), patch.object(recovery.time, "time", return_value=self.now):
                 value = recovery._local_backup_freshness(server_source=changed_source)
             self.assertEqual(value["valid"], allowed, label)
@@ -1264,6 +1266,8 @@ class NativeNixOSResticProofTests(unittest.TestCase):
                 return_value={"kind": "local_backup_disk"}
             ), patch.object(
                 recovery, "_nixos_native_backup_service_fresh", return_value=current_backup
+            ), patch.object(
+                recovery, "_nixos_native_backup_inflight", return_value=False
             ), patch.object(
                 recovery, "_canonical_server_marker", return_value=current_canonical
             ) as canonical_read, patch.object(recovery.time, "time", return_value=self.now):
