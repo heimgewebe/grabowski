@@ -7381,7 +7381,13 @@ def grabowski_self_review_session_start(
         _store_plan(plan)
     else:
         plan = _load_plan(review_batch_id)
-    return self_review_execution.start_first_party_review_session(plan, issuer)
+    response = self_review_execution.start_first_party_review_session(plan, issuer)
+    if workspace_id is None:
+        # The signed five-axis session already exists. Provider unavailability
+        # is advisory, never grounds to undo or block the first-party review.
+        from grabowski_critical_review_dispatch import maybe_start_claude_review
+        response["claude_advisory"] = maybe_start_claude_review(plan)
+    return response
 
 
 @mcp.tool(

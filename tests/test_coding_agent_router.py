@@ -268,9 +268,9 @@ class CodingAgentRouterTests(unittest.TestCase):
         allowed, reasons, _penalty, execution_eligible = router._pool_gate(
             "grok-com", self.catalog, self._fresh_state(), critical=False
         )
-        self.assertTrue(allowed)
+        self.assertFalse(allowed)
         self.assertFalse(execution_eligible)
-        self.assertIn("quota is opaque", reasons)
+        self.assertTrue(any("No active Grok/SuperGrok subscription" in reason for reason in reasons))
 
         unsafe_cases = {
             "payg_fallback_allowed": True,
@@ -303,9 +303,9 @@ class CodingAgentRouterTests(unittest.TestCase):
         allowed, reasons, _penalty, execution_eligible = router._pool_gate(
             "grok-com", self.catalog, state, critical=False
         )
-        self.assertTrue(allowed)
+        self.assertFalse(allowed)
         self.assertFalse(execution_eligible)
-        self.assertIn("quota is opaque", reasons)
+        self.assertTrue(any("No active Grok/SuperGrok subscription" in reason for reason in reasons))
         self.assertFalse(
             self.catalog["quota_pools"]["grok-com"]["payg_fallback_allowed"]
         )
@@ -1073,32 +1073,23 @@ class CodingAgentRouterTests(unittest.TestCase):
         self.assertTrue(fable["paid_only"])
         self.assertEqual(fable["model"], "claude-fable-5")
 
-    def test_review_execution_contract_accepts_review_only_grok_route(self) -> None:
+    def test_review_execution_contract_rejects_unsubscribed_grok_route(self) -> None:
+        # Keep route identities to verify old signed Grok review receipts.
+        self.assertTrue(next(
+            r for r in self.catalog["routes"] if r["id"] == "grok-4.6-review-high"
+        )["enabled"])
         with self.assertRaisesRegex(
             router.CodingAgentRouterError, "enabled contrast route"
         ):
             router.contrast_route_execution_contract("grok-4.6-review-high")
-        review = router.review_route_execution_contract("grok-4.6-review-high")
-        advisory = router.advisory_route_execution_contract(
-            "grok-4.6-review-high"
-        )
-        self.assertEqual(review, advisory)
-        self.assertEqual(review["harness"], "grok")
-        self.assertEqual(review["model"], "grok-4.6")
-        self.assertEqual(review["quota_pools"], ["grok-com"])
-        self.assertFalse(review["paid_only"])
-        self.assertIsNone(review["permission_mode"])
-        self.assertEqual(
-            review["route_contract_sha256"],
-            router._canonical_sha256(
-                {
-                    key: value
-                    for key, value in review.items()
-                    if key != "route_contract_sha256"
-                }
-            ),
-        )
-
+        for adapter in (
+            router.review_route_execution_contract,
+            router.advisory_route_execution_contract,
+        ):
+            with self.assertRaisesRegex(
+                router.CodingAgentRouterError, "quota gate failed"
+            ):
+                adapter("grok-4.6-review-high")
     def test_review_execution_contract_accepts_review_only_codex_route(self) -> None:
         with self.assertRaisesRegex(
             router.CodingAgentRouterError, "enabled contrast route"
@@ -1251,15 +1242,11 @@ class CodingAgentRouterTests(unittest.TestCase):
         )
         self.assertEqual(fallback_review["decision"], "controller")
         self.assertEqual(fallback_review["primary_role"], "controller-reviewer")
-        self.assertTrue(fallback_review["reviewers"])
+        # Grok is no longer subscribed; Claude quota exhaustion must not
+        # route to a paid xAI API or manufacture an independent PASS.
+        self.assertEqual(fallback_review["reviewers"], [])
         self.assertTrue(fallback_review["external_primary_reviewer_forbidden"])
         self.assertEqual(fallback_review["review_authority"], "controller-primary")
-        self.assertNotEqual(fallback_review["reviewers"][0]["provider_family"], "openai")
-        self.assertFalse(
-            fallback_review["reviewers"][0][
-                "execution_eligible_if_separately_authorized"
-            ]
-        )
         self.assertEqual(fallback_review["review_gap"], 1)
 
         for pool_id in (
@@ -1894,8 +1881,8 @@ class CodingAgentRouterTests(unittest.TestCase):
             result = self._route(task_class, need_review=True)
             self.assertEqual(result["decision"], "controller")
             self.assertEqual(result["primary_role"], "controller-integrator")
-            self.assertEqual(result["review_gap"], 1)
-            self.assertFalse(
+            self.assertEqual(result["review_gap"], 0)
+            self.assertTrue(
                 result["reviewers"][0][
                     "execution_eligible_if_separately_authorized"
                 ]
@@ -1909,8 +1896,8 @@ class CodingAgentRouterTests(unittest.TestCase):
             self.assertEqual(review["decision"], "controller")
             self.assertEqual(review["primary_role"], "controller-reviewer")
             self.assertTrue(review["direct_review_required"])
-            self.assertEqual(review["review_gap"], 1)
-            self.assertFalse(
+            self.assertEqual(review["review_gap"], 0)
+            self.assertTrue(
                 review["reviewers"][0][
                     "execution_eligible_if_separately_authorized"
                 ]
@@ -2120,8 +2107,8 @@ class CodingAgentRouterTests(unittest.TestCase):
         self.assertEqual(self.catalog["models"]["grok-4.7"]["quality_prior_class"], "A")
         self.assertIn("grok-4.7", policy["quality_classes"]["A"]["models"])
         self.assertIn("grok-4.6", policy["quality_classes"]["A"]["models"])
-        self.assertIn("grok-4.7-review-high", policy["frontier_model_policy"]["upper_review_or_contrast_routes"])
-        self.assertIn("grok-4.6-review-high", policy["frontier_model_policy"]["upper_review_or_contrast_routes"])
+        self.assertNotIn("grok-4.7-review-high", policy["frontier_model_policy"]["upper_review_or_contrast_routes"])
+        self.assertNotIn("grok-4.6-review-high", policy["frontier_model_policy"]["upper_review_or_contrast_routes"])
 
     def test_jules_is_a_managed_harness_not_a_ranked_model_claim(self) -> None:
         model = self.catalog["models"]["jules-managed-latest"]

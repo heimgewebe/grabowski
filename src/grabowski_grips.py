@@ -9031,7 +9031,7 @@ def _agent_execution_hard_case_advisory(
             candidates = [*choice.get("reviewers", []), *choice.get("review_fallbacks", [])]
             reviewer = next(
                 (c for c in candidates if isinstance(c, dict)
-                 and c.get("harness") in {"claude", "grok"}
+                 and c.get("harness") == "claude"
                  and c.get("route_role") == "reviewer"
                  and c.get("paid_only") is not True
                  and isinstance(c.get("route"), str)), None
