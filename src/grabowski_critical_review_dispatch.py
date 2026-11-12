@@ -51,6 +51,7 @@ def maybe_start_claude_review(
     *,
     route_selector: Callable[..., dict[str, Any]] | None = None,
     binding_reader: Callable[..., tuple[str, str, bool]] | None = None,
+    committed_diff_reader: Callable[..., bytes] | None = None,
     reconcile: Callable[..., dict[str, Any]] | None = None,
     job_start: Callable[..., dict[str, Any]] | None = None,
     lock_root: Path | None = None,
@@ -84,6 +85,10 @@ def maybe_start_claude_review(
         if binding_reader is None:
             from grabowski_agent_role import current_binding
             binding_reader = current_binding
+        from grabowski_agent_role import MAX_CLAUDE_REVIEW_INPUT_BYTES
+        if committed_diff_reader is None:
+            from grabowski_agent_role import committed_diff
+            committed_diff_reader = committed_diff
         if job_start is None:
             from grabowski_operator import grabowski_job_start
             job_start = grabowski_job_start
@@ -120,6 +125,21 @@ def maybe_start_claude_review(
         actual_head, workspace_diff, dirty = reader(repo, binding["base_sha"])
         if actual_head != binding["head_sha"] or dirty:
             return {**result, "state": "unavailable", "reason": "frozen_worktree_identity_not_clean"}
+        # The first-party review can handle larger or binary diffs than the
+        # Claude role. Preflight the *same* committed bytes consumed by that
+        # role before any decision-bound job gets registered. A pre-result
+        # launch failure without a V2 role receipt is otherwise merge debt.
+        committed_input = committed_diff_reader(
+            repo, binding["base_sha"], binding["head_sha"]
+        )
+        if not isinstance(committed_input, bytes):
+            return {**result, "state": "unavailable", "reason": "claude_input_not_bytes"}
+        if len(committed_input) > MAX_CLAUDE_REVIEW_INPUT_BYTES:
+            return {**result, "state": "unavailable", "reason": "claude_input_too_large"}
+        try:
+            committed_input.decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            return {**result, "state": "unavailable", "reason": "claude_input_not_utf8"}
         inspect = reconcile or reviews.reconcile
         starter = job_start
         with _one_revision_claim(binding, lock_root or reviews.LOCKS_ROOT):

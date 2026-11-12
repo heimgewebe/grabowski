@@ -25,10 +25,11 @@ class CriticalClaudeDispatchTest(unittest.TestCase):
   self.plan={"kind":"grabowski_first_party_review_plan","binding":dict(BINDING),"worktree":str(self.repo)}
   self.route=Mock(return_value={"reviewers":[dict(ROUTE)],"review_fallbacks":[]})
   self.reader=Mock(return_value=(BINDING["head_sha"],"e"*64,False))
+  self.diff=Mock(return_value=b"diff --git a/demo b/demo\n")
   self.history=Mock(return_value={"attempts":[],"errors":[]})
   self.starter=Mock(return_value={"unit":"grabowski-job-abcdef123456"})
  def run_dispatch(self,**overrides):
-  opts={"route_selector":self.route,"binding_reader":self.reader,"reconcile":self.history,"job_start":self.starter,"lock_root":pathlib.Path(self.tmp.name)/"locks"}
+  opts={"route_selector":self.route,"binding_reader":self.reader,"committed_diff_reader":self.diff,"reconcile":self.history,"job_start":self.starter,"lock_root":pathlib.Path(self.tmp.name)/"locks"}
   return maybe_start_claude_review(self.plan,**(opts|overrides))
  def test_launches_only_read_only_opaque_quota_eligible_claude(self):
   result=self.run_dispatch()
@@ -59,6 +60,28 @@ class CriticalClaudeDispatchTest(unittest.TestCase):
   self.plan["binding"]["review_purpose"]="post_merge_release"
   self.assertEqual(self.run_dispatch()["state"],"not_applicable")
   self.starter.assert_not_called()
+ def test_large_first_party_diff_does_not_register_blocking_claude_job(self):
+  # Signed first-party sessions admit larger inputs than the Claude reviewer.
+  self.diff.return_value=b"x"*(1024*1024+1)
+  result=self.run_dispatch()
+  self.assertEqual(result["state"],"unavailable")
+  self.assertEqual(result["reason"],"claude_input_too_large")
+  self.starter.assert_not_called()
+  self.history.assert_not_called()
+ def test_non_utf8_diff_does_not_register_blocking_claude_job(self):
+  self.diff.return_value=b"diff --git a/demo b/demo\n"+bytes([0xff])
+  result=self.run_dispatch()
+  self.assertEqual(result["state"],"unavailable")
+  self.assertEqual(result["reason"],"claude_input_not_utf8")
+  self.starter.assert_not_called()
+  self.history.assert_not_called()
+ def test_input_reader_failure_never_registers_job(self):
+  self.diff.side_effect=OSError("cannot read committed diff")
+  result=self.run_dispatch()
+  self.assertEqual(result["state"],"unavailable")
+  self.assertEqual(result["error_type"],"OSError")
+  self.starter.assert_not_called()
+  self.history.assert_not_called()
  def test_dirty_worktree_never_starts(self):
   self.reader.return_value=(BINDING["head_sha"],"e"*64,True)
   self.assertEqual(self.run_dispatch()["reason"],"frozen_worktree_identity_not_clean")
