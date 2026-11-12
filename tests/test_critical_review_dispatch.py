@@ -26,10 +26,11 @@ class CriticalClaudeDispatchTest(unittest.TestCase):
   self.route=Mock(return_value={"reviewers":[dict(ROUTE)],"review_fallbacks":[]})
   self.reader=Mock(return_value=(BINDING["head_sha"],"e"*64,False))
   self.diff=Mock(return_value=b"diff --git a/demo b/demo\n")
+  self.preflight=Mock()
   self.history=Mock(return_value={"attempts":[],"errors":[]})
   self.starter=Mock(return_value={"unit":"grabowski-job-abcdef123456"})
  def run_dispatch(self,**overrides):
-  opts={"route_selector":self.route,"binding_reader":self.reader,"committed_diff_reader":self.diff,"reconcile":self.history,"job_start":self.starter,"lock_root":pathlib.Path(self.tmp.name)/"locks"}
+  opts={"route_selector":self.route,"binding_reader":self.reader,"committed_diff_reader":self.diff,"provider_preflight":self.preflight,"reconcile":self.history,"job_start":self.starter,"lock_root":pathlib.Path(self.tmp.name)/"locks"}
   return maybe_start_claude_review(self.plan,**(opts|overrides))
  def test_launches_only_read_only_opaque_quota_eligible_claude(self):
   result=self.run_dispatch()
@@ -86,12 +87,37 @@ class CriticalClaudeDispatchTest(unittest.TestCase):
   self.reader.return_value=(BINDING["head_sha"],"e"*64,True)
   self.assertEqual(self.run_dispatch()["reason"],"frozen_worktree_identity_not_clean")
   self.starter.assert_not_called()
- def test_start_failure_does_not_kill_signed_first_party_session(self):
-  self.starter.side_effect=OSError("provider absent")
+ def test_start_exception_is_unknown_not_a_proven_absent_review(self):
+  self.starter.side_effect=OSError("launch acknowledgement lost")
+  result=self.run_dispatch()
+  self.assertEqual(result["state"],"outcome_unknown")
+  self.assertEqual(result["reason"],"review_start_may_have_registered")
+  self.assertEqual(result["error_type"],"OSError")
+  self.assertFalse(result["automatic_retry"])
+  self.assertFalse(result["mandatory_external_pass"])
+ def test_missing_claude_executable_never_registers_review_job(self):
+  self.preflight.side_effect=FileNotFoundError("cli unavailable")
   result=self.run_dispatch()
   self.assertEqual(result["state"],"unavailable")
-  self.assertEqual(result["error_type"],"OSError")
-  self.assertFalse(result["mandatory_external_pass"])
+  self.assertEqual(result["reason"],"claude_cli_or_auth_preflight_failed")
+  self.assertEqual(result["error_type"],"FileNotFoundError")
+  self.history.assert_not_called()
+  self.starter.assert_not_called()
+ def test_missing_claude_credentials_never_registers_review_job(self):
+  self.preflight.side_effect=PermissionError("credential missing")
+  self.assertEqual(self.run_dispatch()["reason"],"claude_cli_or_auth_preflight_failed")
+  self.starter.assert_not_called()
+ def test_absent_paid_flag_and_wrong_executable_are_ineligible(self):
+  for route in (dict(ROUTE,paid_only=None),dict(ROUTE,argv_prefix=["grok","--model","grok-4.7"])):
+   self.route.return_value={"reviewers":[route],"review_fallbacks":[]}
+   self.assertEqual(self.run_dispatch()["reason"],"claude_subscription_review_not_eligible")
+   self.starter.assert_not_called()
+ def test_missing_model_is_ineligible_before_registration(self):
+  route=dict(ROUTE)
+  route.pop("model")
+  self.route.return_value={"reviewers":[route],"review_fallbacks":[]}
+  self.assertEqual(self.run_dispatch()["reason"],"claude_subscription_review_not_eligible")
+  self.starter.assert_not_called()
  def test_history_failure_does_not_retry_uncertain_effect(self):
   self.history.return_value={"attempts":[],"errors":["decision_review_history_ambiguous"]}
   self.assertEqual(self.run_dispatch()["reason"],"existing_review_history_unsettled")
