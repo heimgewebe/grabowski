@@ -1753,17 +1753,30 @@ class ResourceTests(unittest.TestCase):
         self.assertIsNone(resources.inspect_resource("port:9223"))
         self.assertEqual(resources.inspect_resource("port:9222")["owner_id"], "owner-a")
 
-    def test_github_merge_gate_is_nonrenewable_even_for_same_owner(self) -> None:
-        key = f"gate:github-merge:{REPOSITORY_ID}:{MAIN_BRANCH_ID}"
-        first = resources.acquire_resources(
-            "owner-a", [key], purpose="first merge dispatch", ttl_seconds=60
-        )
-        self.assertEqual("owner-a", first["leases"][0]["owner_id"])
-        with self.assertRaises(resources.ResourceConflict):
-            resources.acquire_resources(
-                "owner-a", [key], purpose="concurrent duplicate merge", ttl_seconds=60
-            )
-        self.assertEqual("owner-a", resources.inspect_resource(key)["owner_id"])
+    def test_generic_acquire_refuses_unbound_github_merge_gates_atomically(self) -> None:
+        # A manually reserved gate with metadata={} poisoned unrelated repository
+        # operations: the merge-conflict reader failed closed before comparing
+        # repositories. Only the typed merge-guard path may persist this key.
+        gate = f"gate:github-merge:{REPOSITORY_ID}:{MAIN_BRANCH_ID}"
+        other = "component:unrelated-acquisition"
+        for metadata in (
+            None,
+            {},
+            {"merge_guard": {"base_branch": "main", "head_branch": "feat/work"}},
+        ):
+            with self.subTest(metadata=metadata):
+                with self.assertRaisesRegex(
+                    PermissionError, "require acquire_merge_guard_resources"
+                ):
+                    resources.acquire_resources(
+                        "operator:manual-merge-gate",
+                        [other, gate],
+                        purpose="unsafe manual merge reservation",
+                        ttl_seconds=60,
+                        metadata=metadata,
+                    )
+                self.assertIsNone(resources.inspect_resource(gate))
+                self.assertIsNone(resources.inspect_resource(other))
 
     def test_merge_guard_snapshots_existing_owner_leases_and_releases_only_guard_keys(self) -> None:
         repository = self.root / "repo"
