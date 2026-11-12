@@ -122,6 +122,54 @@ def _reserved_argv() -> list[str]:
 
 
 class BureauRuntimeRefreshExecutorTests(unittest.TestCase):
+    def test_findmnt_resolves_nixos_profile_before_standard_linux(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_root:
+            root = Path(temp_root)
+            nixos_findmnt = root / "nixos" / "findmnt"
+            linux_findmnt = root / "usr" / "findmnt"
+            nixos_findmnt.parent.mkdir(parents=True)
+            linux_findmnt.parent.mkdir(parents=True)
+            linux_findmnt.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            linux_findmnt.chmod(0o755)
+            self.assertEqual(
+                executor._canonical_findmnt_path(nixos_findmnt, linux_findmnt),
+                linux_findmnt,
+            )
+            nixos_findmnt.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            nixos_findmnt.chmod(0o644)
+            self.assertEqual(
+                executor._canonical_findmnt_path(nixos_findmnt, linux_findmnt),
+                linux_findmnt,
+            )
+            nixos_findmnt.chmod(0o755)
+            self.assertEqual(
+                executor._canonical_findmnt_path(nixos_findmnt, linux_findmnt),
+                nixos_findmnt,
+            )
+
+    def test_findmnt_live_resolution_follows_package_presence(self) -> None:
+        nixos = Path("/run/current-system/sw/bin/findmnt")
+        legacy = Path("/usr/bin/findmnt")
+        expected = (
+            nixos if nixos.is_file() and os.access(nixos, os.X_OK) else legacy
+        )
+        self.assertEqual(executor.CANONICAL_FINDMNT, expected)
+
+    @unittest.skipUnless(
+        Path("/run/current-system/sw/bin/findmnt").is_file(),
+        "NixOS system profile required for live findmnt probe",
+    )
+    def test_nixos_findmnt_probes_real_runtime_state_root(self) -> None:
+        evidence = executor._probe_writable_directory(
+            "state_root", executor.CANONICAL_STATE_ROOT
+        )
+        self.assertEqual(
+            executor.CANONICAL_FINDMNT,
+            Path("/run/current-system/sw/bin/findmnt"),
+        )
+        self.assertTrue(evidence["writable"])
+        self.assertTrue(evidence["mount_rw"])
+
     def test_generic_surfaces_reject_direct_runtime_refresh_apply(self) -> None:
         argv = [
             "/home/alex/.local/bin/bureau-runtime-refresh",

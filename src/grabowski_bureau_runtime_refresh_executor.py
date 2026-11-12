@@ -16,7 +16,19 @@ SCHEMA_VERSION = 1
 RESERVED_TASK_COMMAND = "grabowski-bureau-runtime-refresh-apply"
 EXECUTOR_MODULE = "grabowski_bureau_runtime_refresh_executor"
 CANONICAL_BUREAU_REFRESH = Path("/home/alex/.local/bin/bureau-runtime-refresh")
-CANONICAL_FINDMNT = Path("/usr/bin/findmnt")
+
+
+def _canonical_findmnt_path(
+    nixos_path: Path = Path("/run/current-system/sw/bin/findmnt"),
+    fallback_path: Path = Path("/usr/bin/findmnt"),
+) -> Path:
+    """Prefer the NixOS system profile without inheriting caller PATH."""
+    if nixos_path.is_file() and os.access(nixos_path, os.X_OK):
+        return nixos_path
+    return fallback_path
+
+
+CANONICAL_FINDMNT = _canonical_findmnt_path()
 CANONICAL_STATE_ROOT = Path("/home/alex/.local/state/bureau/runtime-refresh")
 CANONICAL_BUREAU_STATE_DB = Path("/home/alex/.local/state/bureau/bureau.sqlite3")
 CANONICAL_INTENTS_ROOT = CANONICAL_STATE_ROOT / "intents"
