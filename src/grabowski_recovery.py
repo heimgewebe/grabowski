@@ -2275,6 +2275,32 @@ def _nixos_native_backup_service_fresh() -> dict[str, Any]:
     return result
 
 
+def _nixos_native_backup_inflight() -> bool:
+    """Only recognize an actually running native backup, not a failed or queued unit."""
+    keys = ("LoadState", "ActiveState", "SubState", "InvocationID")
+    observed = operator._run(
+        ["/run/current-system/sw/bin/systemctl", "--system", "show",
+         "restic-backups-heim-pc.service",
+         *[f"--property={key}" for key in keys]],
+        cwd=operator.HOME, timeout_seconds=15, max_output_bytes=1024,
+    )
+    if observed.get("returncode") != 0 or not isinstance(observed.get("stdout"), str):
+        return False
+    values: dict[str, str] = {}
+    for line in observed["stdout"].splitlines():
+        key, sep, value = line.partition("=")
+        if not sep or key not in keys or key in values:
+            return False
+        values[key] = value
+    return (
+        set(values) == set(keys)
+        and values["LoadState"] == "loaded"
+        and values["ActiveState"] == "activating"
+        and values["SubState"] in {"start", "start-pre", "start-post"}
+        and re.fullmatch(r"[0-9a-f]{32}", values["InvocationID"]) is not None
+    )
+
+
 def _local_backup_freshness(
     *, server_source: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -2297,6 +2323,47 @@ def _local_backup_freshness(
 
     if server_source is None:
         server_source = _server_source_marker()
+
+    # A new backup is not yet a successful backup. However, its in-flight
+    # systemd state must not revoke an independently root-verified, still-fresh
+    # restore from the preceding successful run. Never use this fallback for
+    # inactive, failed or unknown service states, or for unbound marker text.
+    if completed.get("valid") is not True and _nixos_native_backup_inflight():
+        canonical = _canonical_server_marker()
+        prior_id = server_source.get("snapshot_id")
+        prior_sha = server_source.get("source_record_sha256")
+        prior_time = server_source.get("snapshot_time_unix")
+        prior_age = server_source.get("snapshot_age_seconds")
+        root_digest = canonical.get("root_proof_sha256")
+        now = int(time.time())
+        if (
+            server_source.get("valid") is True
+            and server_source.get("exists") is True
+            and server_source.get("snapshot_fresh") is True
+            and isinstance(prior_id, str)
+            and re.fullmatch(r"[0-9a-f]{8,64}", prior_id) is not None
+            and isinstance(prior_sha, str)
+            and re.fullmatch(r"[0-9a-f]{64}", prior_sha) is not None
+            and type(prior_time) is int and type(prior_age) is int
+            and 0 < prior_time <= now
+            and 0 <= prior_age <= MAX_AGE_SECONDS
+            and 0 <= now - prior_time <= MAX_AGE_SECONDS
+            and abs(now - prior_time - prior_age) <= 5
+            and canonical.get("valid") is True
+            and canonical.get("snapshot_id") == prior_id
+            and canonical.get("source_record_sha256") == prior_sha
+            and canonical.get("target") == server_source.get("target")
+            and isinstance(root_digest, str)
+            and re.fullmatch(r"[0-9a-f]{64}", root_digest) is not None
+        ):
+            return {
+                "path": server_source.get("path"), "exists": True,
+                "valid": True, "timestamp_unix": prior_time,
+                "age_seconds": prior_age,
+                "source": "verified-nixos-native-restic",
+                "backup_invocation_id": None, "snapshot_id": prior_id,
+                "error": None,
+            }
     source_id = server_source.get("snapshot_id")
     journal_id = completed.get("snapshot_id")
     snapshot_time = server_source.get("snapshot_time_unix")

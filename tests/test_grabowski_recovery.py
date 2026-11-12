@@ -1274,6 +1274,83 @@ class NativeNixOSResticProofTests(unittest.TestCase):
                 self.assertEqual(status["backup_invocation_id"], "b" * 32)
                 canonical_read.assert_called_once()
 
+
+    def test_nixos_inflight_helper_requires_exact_running_systemd_identity(self) -> None:
+        valid = {
+            "LoadState": "loaded", "ActiveState": "activating",
+            "SubState": "start", "InvocationID": "f" * 32,
+        }
+        cases = (
+            ("real_running", valid, True),
+            ("start_pre", {**valid, "SubState": "start-pre"}, True),
+            ("inactive", {**valid, "ActiveState": "inactive"}, False),
+            ("failed", {**valid, "ActiveState": "failed"}, False),
+            ("queued", {**valid, "ActiveState": "inactive", "SubState": "dead"}, False),
+            ("invalid_invocation", {**valid, "InvocationID": ""}, False),
+            ("wrong_substate", {**valid, "SubState": "auto-restart"}, False),
+            ("not_loaded", {**valid, "LoadState": "not-found"}, False),
+        )
+        for name, properties, expected in cases:
+            output = "\n".join(f"{k}={v}" for k, v in properties.items()) + "\n"
+            with self.subTest(name=name), patch.object(
+                recovery.operator, "_run",
+                return_value={"returncode": 0, "stdout": output},
+            ):
+                self.assertEqual(recovery._nixos_native_backup_inflight(), expected)
+        with patch.object(
+            recovery.operator, "_run", return_value={"returncode": 1, "stdout": ""},
+        ):
+            self.assertFalse(recovery._nixos_native_backup_inflight())
+
+    def test_verified_prior_restic_proof_survives_only_active_backup(self) -> None:
+        source = {
+            "path": "/tmp/native-record", "exists": True, "valid": True,
+            "snapshot_id": "cef8366c", "snapshot_time_unix": self.now - 600,
+            "snapshot_age_seconds": 600, "snapshot_fresh": True,
+            "source_record_sha256": "a" * 64,
+            "target": "local-backup-disk:UUID=example/restic/heim-pc",
+        }
+        canonical = {
+            "valid": True, "snapshot_id": source["snapshot_id"],
+            "source_record_sha256": source["source_record_sha256"],
+            "target": source["target"], "root_proof_sha256": "c" * 64,
+        }
+        no_completed_run = {
+            "valid": False, "exists": True,
+            "backup_invocation_id": None, "snapshot_id": None,
+        }
+        cases = (
+            ("running_with_verified_previous_restore", True, source, canonical, True),
+            ("not_running", False, source, canonical, False),
+            ("no_root_proof", True, source,
+             {**canonical, "root_proof_sha256": None}, False),
+            ("wrong_canonical_snapshot", True, source,
+             {**canonical, "snapshot_id": "deadbeef"}, False),
+            ("stale_snapshot", True,
+             {**source, "snapshot_age_seconds": recovery.MAX_AGE_SECONDS + 1,
+              "snapshot_time_unix": self.now - recovery.MAX_AGE_SECONDS - 1},
+             canonical, False),
+        )
+        for label, inflight, record, proof, expected in cases:
+            with self.subTest(case=label), patch.object(
+                recovery, "_NIXOS_OS_PRESENT", True
+            ), patch.object(
+                recovery, "_NIXOS_RESTIC_TIMER_PRESENT", True
+            ), patch.object(
+                recovery, "_configured_recovery_target_info",
+                return_value={"kind": "local_backup_disk"}
+            ), patch.object(
+                recovery, "_nixos_native_backup_service_fresh",
+                return_value=no_completed_run
+            ), patch.object(
+                recovery, "_nixos_native_backup_inflight", return_value=inflight,
+                create=True
+            ), patch.object(
+                recovery, "_canonical_server_marker", return_value=proof
+            ), patch.object(recovery.time, "time", return_value=self.now):
+                status = recovery._local_backup_freshness(server_source=record)
+            self.assertEqual(status["valid"], expected, label)
+
     def test_nixos_missing_native_timer_never_falls_back_to_pop_marker(self) -> None:
         with patch.object(recovery, "_NIXOS_OS_PRESENT", True), patch.object(
             recovery, "_NIXOS_RESTIC_TIMER_PRESENT", False
