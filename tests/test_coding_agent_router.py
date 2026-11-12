@@ -1382,6 +1382,13 @@ class CodingAgentRouterTests(unittest.TestCase):
             "bounded read-only Claude Pro subscription review",
             admission["quota_pools"][0]["reasons"],
         )
+        equivalent = dict(opus)
+        equivalent["argv_prefix"] = [
+            *opus["argv_prefix"][:-2], "--permission-mode=plan"
+        ]
+        self.assertTrue(router._bounded_opaque_claude_review(
+            equivalent, "claude-pro", True, ["quota is opaque"], False,
+        ))
 
         sonnet = next(
             route for route in self.catalog["routes"]

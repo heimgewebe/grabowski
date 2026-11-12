@@ -1448,7 +1448,6 @@ def _bounded_opaque_claude_review(
     reasons: list[str], execution_eligible: bool,
 ) -> bool:
     """Permit only a configured read-only Claude Pro review on opaque quota."""
-    argv = route.get("argv_prefix")
     return (
         allowed and not execution_eligible
         and pool_id == "claude-pro"
@@ -1456,11 +1455,7 @@ def _bounded_opaque_claude_review(
         and route.get("harness") == "claude"
         and route.get("review_only") is True
         and route.get("paid_only") is not True
-        and isinstance(argv, list)
-        and any(
-            argv[index:index + 2] == ["--permission-mode", "plan"]
-            for index in range(len(argv) - 1)
-        )
+        and _route_uses_plan_mode(route)
     )
 
 
