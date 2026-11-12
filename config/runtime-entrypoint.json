@@ -406,6 +406,10 @@
       "source": "src/grabowski_coding_agent_router.py"
     },
     {
+      "module": "grabowski_critical_review_dispatch",
+      "source": "src/grabowski_critical_review_dispatch.py"
+    },
+    {
       "module": "grabowski_capabilities",
       "source": "src/grabowski_capabilities.py"
     },

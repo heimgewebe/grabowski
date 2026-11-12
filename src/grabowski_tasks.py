@@ -20,7 +20,18 @@ import tempfile
 import threading
 import time
 import uuid
-from typing import Any, Literal, cast, get_args
+from typing import Annotated, Any, Literal, cast, get_args
+
+# The real MCP runtime provides Pydantic; keep dependency-free local tests
+# importable when FastMCP is unavailable.
+try:
+    from pydantic import Field
+except ModuleNotFoundError as error:
+    if error.name != "pydantic":
+        raise
+
+    def Field(**_kwargs: Any) -> None:
+        return None
 
 import grabowski_fleet as fleet
 import grabowski_mcp as base
@@ -14829,10 +14840,10 @@ def grabowski_chronik_full_search(
     bureau_task_id: str = "",
     run_id: str = "",
     task_id: str = "",
-    since: str = "",
-    until: str = "",
+    since: Annotated[str, Field(description="Timezone-aware ISO 8601 timestamp, e.g. 2026-11-05T00:00:00+01:00; date-only is invalid")] = "",
+    until: Annotated[str, Field(description="Timezone-aware ISO 8601 timestamp, e.g. 2026-11-05T23:59:59+01:00; date-only is invalid")] = "",
     keyword: str = "",
-    limit: int = 10,
+    limit: Annotated[int, Field(ge=1, le=20, description="Maximum 20 events per page")] = 10,
     cursor: str = "",
 ) -> dict[str, Any]:
     """Search the full committed Chronik ledger with exact selectors and evidence-bound pagination.

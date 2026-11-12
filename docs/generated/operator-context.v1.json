@@ -3430,6 +3430,10 @@
         "source": "src/grabowski_coding_agent_router.py"
       },
       {
+        "module": "grabowski_critical_review_dispatch",
+        "source": "src/grabowski_critical_review_dispatch.py"
+      },
+      {
         "module": "grabowski_capabilities",
         "source": "src/grabowski_capabilities.py"
       },
@@ -3787,7 +3791,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "7130dc15a14428838a93fe063df0435462faeee0360b37388fad332893b70e8d"
+      "sha256": "e4854ca1a9f5aa848e91d3973ae37154c41676f21a88ba3414a03b743474e59e"
     },
     "runtime_source_digest_contract": "mcp-tool-surface-v1",
     "runtime_sources": {
@@ -3834,6 +3838,7 @@
       "src/grabowski_consumer_surface.py": "f007b746c61f89f207b5477d02bc7b8e621b8e6b75810cfc05e437d1bcfdc249",
       "src/grabowski_context_fabric.py": "dda7f6bf1fcc8346df98a323bc545c047548e3f333f317e98838f2f15ae875e0",
       "src/grabowski_convergence.py": "9f12a1397767a088bd20c500d307014a870547d9435587a2d04f5a43afb31e19",
+      "src/grabowski_critical_review_dispatch.py": "17395dfc892af036e8c76d0c0b8010cbf93addb7d896cd9cbe9c80be31249732",
       "src/grabowski_current_work.py": "d41765110381118767800c6c332305c2d74d600ffdd8da981e45a6fb1960fdf2",
       "src/grabowski_current_work_surface.py": "1b48a548e25fd1f9adb44d7b7d69edb36886078f75865913d7d3c507a950fe73",
       "src/grabowski_decision_reviews.py": "764a4fac2827bcca7293d02d38c9e9eea70ac6b364a25c0d4f6c9d9173f9821c",
@@ -3915,7 +3920,7 @@
       "src/grabowski_systemkatalog.py": "e3ec4884b3dd367b8970b3143432cab0fea5fe55963292806001f5df535c83f9",
       "src/grabowski_task_attention.py": "a16d4b045bef23bf78ad3df0c4c58d91a304dc9a83b6e757fb1b0f88754ad6f3",
       "src/grabowski_task_reconcile.py": "64dc6195c9d0cb3435d192e4715a0d4d5679b9f1904057308366f4e2f2e9bbea",
-      "src/grabowski_tasks.py": "831eee2b70ecb25acd81b093cabe84ce7b656b6946deffdfea8757be5e4acb97",
+      "src/grabowski_tasks.py": "5bed35c593ff0ffd3702768255b8562c30a9fc579cad938179353df2fd2ec297",
       "src/grabowski_terminal_convergence.py": "8f172a65b2af1dbca3d5b226a18e82df3ca5229ca5f4ae8b2ab1792506c69195",
       "src/grabowski_text_artifact_reconcile.py": "b302be1dbb101abbf825732bfe41658c13ac64417c2a6034326e57409daa4772",
       "src/grabowski_transport_assertion.py": "20d75d1f94c1d0273108c36eed8c58aa85e55a30b73546c4ac8af8a835fb8c8e",

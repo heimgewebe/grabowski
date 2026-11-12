@@ -153,7 +153,7 @@ HARD_CASE_ADVISORY = {
     "route_selection": "canonical independent-review model ranking for selection only",
     "execution_tool": "grabowski_agent_competition_start",
     "output_readback": "grabowski_agent_competition_status",
-    "eligible_providers": ["claude", "grok"],
+    "eligible_providers": ["claude"],
     "max_budget_usd": 0,
     "paid_execution_authorized": False,
     "one_request_id_per_source_kind_and_error_fingerprint": True,
