@@ -1364,6 +1364,58 @@ class CodingAgentRouterTests(unittest.TestCase):
         self.assertRegex(admission["admission_sha256"], r"^[0-9a-f]{64}$")
         self.assertNotIn("prompt", json.dumps(admission, sort_keys=True))
 
+    def test_opaque_claude_pro_review_admitted_but_writer_and_exhaustion_blocked(
+        self,
+    ) -> None:
+        opus = next(
+            route for route in self.catalog["routes"]
+            if route["id"] == "claude-opus-5.5-high"
+        )
+        review_argv = [*opus["argv_prefix"], "-p", "Review frozen diff"]
+        admission = router.coding_agent_pre_dispatch_admission(review_argv)
+        self.assertTrue(admission["applicable"])
+        self.assertTrue(admission["admitted"])
+        self.assertEqual(admission["reason_code"], "admitted")
+        self.assertEqual(admission["quota_pools"][0]["pool_id"], "claude-pro")
+        self.assertTrue(admission["quota_pools"][0]["execution_eligible"])
+        self.assertIn(
+            "bounded read-only Claude Pro subscription review",
+            admission["quota_pools"][0]["reasons"],
+        )
+        equivalent = dict(opus)
+        equivalent["argv_prefix"] = [
+            *opus["argv_prefix"][:-2], "--permission-mode=plan"
+        ]
+        self.assertTrue(router._bounded_opaque_claude_review(
+            equivalent, "claude-pro", True, ["quota is opaque"], False,
+        ))
+
+        sonnet = next(
+            route for route in self.catalog["routes"]
+            if route["id"] == "claude-sonnet-5-high"
+        )
+        writer = router.coding_agent_pre_dispatch_admission(
+            [*sonnet["argv_prefix"], "-p", "Edit files"]
+        )
+        self.assertFalse(writer["admitted"])
+        self.assertEqual(writer["reason_code"], "quota_pool_blocked")
+        self.assertFalse(writer["quota_pools"][0]["execution_eligible"])
+
+        self.state["pools"]["claude-pro"] = {"status": "exhausted"}
+        self._write_state()
+        exhausted = router.coding_agent_pre_dispatch_admission(review_argv)
+        self.assertFalse(exhausted["admitted"])
+        self.assertEqual(exhausted["reason_code"], "quota_pool_blocked")
+
+        nonzero_cost = json.loads(json.dumps(self.catalog))
+        nonzero_cost["quota_pools"]["claude-pro"]["marginal_cost_usd"] = 1
+        allowed, reasons, _, execution = router._pool_gate(
+            "claude-pro", nonzero_cost, self.state, critical=True,
+        )
+        self.assertFalse(allowed)
+        self.assertFalse(execution)
+        self.assertIn("cost is unknown or non-zero", reasons)
+
     def test_pre_dispatch_admission_rejects_advisory_only_execution_pool(self) -> None:
         route = next(
             item for item in self.catalog["routes"] if item["id"] == "codex-sol-high"
