@@ -23046,12 +23046,15 @@ class WorktreeHygieneReconcileTests(unittest.TestCase):
         cases = ("archive", "cleanup", "default", "active", "dirty", "lease",
                  "owner_conflict", "head_drift", "branch_drift", "source_error",
                  "physical_drift", "receipt_drift", "archive_error", "cleanup_error",
-                 "binding_drift", "unsafe_plan")
+                 "binding_drift", "unsafe_plan", "opened", "updated", "successor",
+                 "followup", "unknown", "no_change", "deployed", "merged_opened",
+                 "source_false", "source_absent", "merged_source_false", "owned_opened",
+                 "cleanup_opened", "merged_mismatch", "merged_ambiguous", "github_unavailable")
         for case in cases:
             with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
                 path = str(Path(tmp) / "worktree")
                 owner = "lane:" + "b" * 32
-                state = "cleanup_candidate" if case in {"cleanup", "cleanup_error", "unsafe_plan"} else "completed_retained"
+                state = "cleanup_candidate" if case in {"cleanup", "cleanup_error", "unsafe_plan", "cleanup_opened"} else "completed_retained"
                 item = self._owned_item(path, state=state)
                 item["checkout_key"] = "checkout-key"
                 binding = {
@@ -23066,10 +23069,38 @@ class WorktreeHygieneReconcileTests(unittest.TestCase):
                 if state == "cleanup_candidate":
                     item["lifecycle"]["latest_archive"] = {"owner_id": owner, "archive_id": "archive"}
                 physical = {"signed": "original"}
-                original = {**binding, "physical_checkout": physical}
+                original = {**binding, "physical_checkout": physical, "automatic_cleanup_authorized": True}
                 lane = {"lane_id": "b" * 32, "receipt_sha256": "c" * 64,
                         "worktree_receipt": {"lifecycle": original}}
-                evidence = {"evidence_sha256": "d" * 64, "lane_receipt_sha256": "c" * 64}
+                evidence = {"evidence_sha256": "d" * 64, "lane_receipt_sha256": "c" * 64,
+                            "terminal_state": "pr_merged"}
+                terminal_states = {"opened": "pr_opened", "updated": "pr_updated",
+                    "successor": "successor_handoff", "followup": "blocked_with_durable_followup",
+                    "unknown": None, "no_change": "no_change_proven", "deployed": "deployed"}
+                evidence["terminal_state"] = terminal_states.get(case, "pr_merged")
+                if case in {"merged_opened", "merged_source_false", "owned_opened", "cleanup_opened",
+                            "merged_mismatch", "merged_ambiguous", "github_unavailable"}:
+                    evidence["terminal_state"] = "pr_opened"
+                if case in {"source_false", "merged_source_false"}:
+                    original["automatic_cleanup_authorized"] = False
+                if case == "source_absent":
+                    original.pop("automatic_cleanup_authorized")
+                if case == "owned_opened":
+                    params_owner = owner
+                else:
+                    params_owner = self.OWNER
+                def github_runner(_repo, argv):
+                    if case == "github_unavailable":
+                        return {"returncode": 1, "stderr": "unavailable"}
+                    if argv[:2] == ["repo", "view"]:
+                        return {"returncode": 0, "stdout": json.dumps({"defaultBranchRef": {"name": "main"}})}
+                    pr = {"number": 77, "url": "https://github.com/heimgewebe/grabowski/pull/77",
+                          "state": "MERGED", "baseRefName": "main", "headRefName": self.BRANCH,
+                          "headRefOid": self.HEAD, "mergedAt": "2026-11-12T00:00:00Z"}
+                    if case == "merged_mismatch":
+                        pr["headRefOid"] = "0" * 40
+                    prs = [pr] if case in {"merged_opened", "merged_mismatch"} else [pr, pr] if case == "merged_ambiguous" else []
+                    return {"returncode": 0, "stdout": json.dumps(prs)}
                 if case == "active":
                     item["lifecycle_state"] = "managed_active_attention"
                     binding["phase"] = "active"
@@ -23086,7 +23117,7 @@ class WorktreeHygieneReconcileTests(unittest.TestCase):
                 if case == "receipt_drift":
                     lane["receipt_sha256"] = "e" * 64
                 params = {**self._parameters(tmp, apply_cleanup=True),
-                          "include_terminal_owners": case != "default"}
+                          "include_terminal_owners": case != "default", "owner_id": params_owner}
                 with (
                     patch("grabowski_checkouts.checkout_inventory", return_value={"worktrees": [item]}),
                     patch("grabowski_checkouts._binding_consistency",
@@ -23109,9 +23140,9 @@ class WorktreeHygieneReconcileTests(unittest.TestCase):
                 ):
                     result = grips.run_grip("worktree-hygiene-reconcile", params,
                                             allow_mutation=True, command_runner=FakeGit(),
-                                            github_runner=lambda *_: self.fail("terminal source needs no PR inference"))
+                                            github_runner=github_runner)
                 status = result["receipt"]["status"]
-                if case == "archive":
+                if case in {"archive", "no_change", "deployed", "merged_opened"}:
                     self.assertEqual("passed", status)
                     archive.assert_called_once()
                     self.assertEqual(owner, archive.call_args.kwargs["owner_id"])
@@ -23135,7 +23166,9 @@ class WorktreeHygieneReconcileTests(unittest.TestCase):
                 else:
                     archive.assert_not_called()
                     cleanup.assert_not_called()
-                    if case in {"head_drift", "branch_drift", "source_error", "physical_drift", "receipt_drift", "binding_drift"}:
+                    if case in {"head_drift", "branch_drift", "source_error", "physical_drift", "receipt_drift", "binding_drift", "opened", "updated", "successor", "followup",
+                                "unknown", "source_false", "source_absent", "merged_source_false", "owned_opened",
+                                "cleanup_opened", "merged_mismatch", "merged_ambiguous", "github_unavailable"}:
                         self.assertEqual("blocked", status)
                         self.assertTrue(result["output"]["errors"])
 

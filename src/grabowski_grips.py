@@ -6093,6 +6093,42 @@ def _run_worktree_hygiene_reconcile(
                         raise RuntimeError("original physical receipt binding differs")
                     grabowski_checkouts._verify_expected_physical_checkout_identity(Path(path), physical)
                     physical_parameters = {"expected_physical_identity": physical}
+                    # Operator opt-in never overrides the original source permission.
+                    # A signed closeout alone can still describe ongoing PR work.
+                    reason = None
+                    terminal_state = source_terminal.get("terminal_state")
+                    if original.get("automatic_cleanup_authorized") is not True:
+                        reason = "source_automatic_cleanup_not_authorized"
+                    elif terminal_state in {"pr_opened", "pr_updated"}:
+                        if candidate_pr_queries >= WORKTREE_HYGIENE_MAX_CANDIDATES:
+                            reason = "github_query_bound_reached"
+                        else:
+                            if default_branch is None and default_branch_error is None:
+                                default_evidence = _lookup_default_branch(repo, github_runner)
+                                github_queries += 1
+                                if default_evidence.get("status") == "available":
+                                    default_branch = str(default_evidence["name"])
+                                else:
+                                    default_branch_error = default_evidence
+                            if default_branch is None:
+                                reason = "default_branch_not_proven"
+                            else:
+                                merged = _lookup_merged_pr_for_checkout(
+                                    repo, branch=branch, head=head,
+                                    default_branch=default_branch, github_runner=github_runner,
+                                )
+                                github_queries += 1
+                                candidate_pr_queries += 1
+                                if merged.get("status") != "exact_merged":
+                                    reason = "terminal_owner_exact_merge_not_proven"
+                                else:
+                                    source_terminal = {**source_terminal, "merged_pr": merged}
+                    elif terminal_state not in {"pr_merged", "deployed", "no_change_proven"}:
+                        reason = "terminal_owner_work_not_final"
+                    if reason is not None:
+                        skipped.append({"path": path, "reason": reason, "state": state})
+                        errors.append({"path": path, "error": reason})
+                        continue
                 except (ValueError, RuntimeError, PermissionError, OSError) as exc:
                     errors.append({"path": path, "error": str(exc)})
                     continue
