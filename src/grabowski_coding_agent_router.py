@@ -1902,6 +1902,18 @@ def _score_route(
         )
         reasons.extend(f"{pool_id}: {reason}" for reason in pool_reasons)
         scarcity = max(scarcity, pool_scarcity)
+        # Unknown Claude Pro quota is not exhaustion. A bounded, read-only
+        # review may try the subscription; this never grants writer authority
+        # or permission to consume paid API/overage.
+        if (
+            allowed and not pool_execution and reviewer
+            and route.get("review_only") is True
+            and route.get("harness") == "claude"
+            and pool_id == "claude-pro"
+            and "quota is opaque" in pool_reasons
+        ):
+            pool_execution = True
+            reasons.append("claude-pro: bounded read-only review attempt allowed with opaque quota")
         execution_eligible = execution_eligible and pool_execution
         if not allowed:
             return (
