@@ -23042,6 +23042,103 @@ class WorktreeHygieneReconcileTests(unittest.TestCase):
             "confirmation": grips.WORKTREE_HYGIENE_CONFIRMATION,
         }
 
+    def test_opt_in_terminal_owners_preserve_authority_and_fail_closed(self) -> None:
+        cases = ("archive", "cleanup", "default", "active", "dirty", "lease",
+                 "owner_conflict", "head_drift", "branch_drift", "source_error",
+                 "physical_drift", "receipt_drift", "archive_error", "cleanup_error",
+                 "binding_drift", "unsafe_plan")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                path = str(Path(tmp) / "worktree")
+                owner = "lane:" + "b" * 32
+                state = "cleanup_candidate" if case in {"cleanup", "cleanup_error", "unsafe_plan"} else "completed_retained"
+                item = self._owned_item(path, state=state)
+                item["checkout_key"] = "checkout-key"
+                binding = {
+                    "checkout_key": "checkout-key", "owner_id": owner,
+                    "checkout_path": path, "expected_head": self.HEAD,
+                    "expected_branch": self.BRANCH,
+                    "phase": "archived" if state == "cleanup_candidate" else state,
+                    "source": {"kind": "work_lane", "id": "b" * 32},
+                }
+                item["lifecycle"]["binding"] = binding
+                item["lifecycle"]["retention"] = None
+                if state == "cleanup_candidate":
+                    item["lifecycle"]["latest_archive"] = {"owner_id": owner, "archive_id": "archive"}
+                physical = {"signed": "original"}
+                original = {**binding, "physical_checkout": physical}
+                lane = {"lane_id": "b" * 32, "receipt_sha256": "c" * 64,
+                        "worktree_receipt": {"lifecycle": original}}
+                evidence = {"evidence_sha256": "d" * 64, "lane_receipt_sha256": "c" * 64}
+                if case == "active":
+                    item["lifecycle_state"] = "managed_active_attention"
+                    binding["phase"] = "active"
+                if case == "dirty":
+                    item["status"]["dirty"] = True
+                if case == "lease":
+                    item["coordination"]["blocking"] = True
+                if case == "owner_conflict":
+                    item["lifecycle"]["retention"] = {"owner_id": "other", "retention_until_unix": int(time.time()) + 999}
+                if case == "head_drift":
+                    binding["expected_head"] = "e" * 40
+                if case == "branch_drift":
+                    binding["expected_branch"] = "other"
+                if case == "receipt_drift":
+                    lane["receipt_sha256"] = "e" * 64
+                params = {**self._parameters(tmp, apply_cleanup=True),
+                          "include_terminal_owners": case != "default"}
+                with (
+                    patch("grabowski_checkouts.checkout_inventory", return_value={"worktrees": [item]}),
+                    patch("grabowski_checkouts._binding_consistency",
+                          return_value={"consistent": case != "binding_drift"}),
+                    patch("grabowski_checkout_terminal_sources.source_terminal_evidence",
+                          side_effect=RuntimeError("source unavailable") if case == "source_error" else None,
+                          return_value=evidence),
+                    patch("grabowski_work_acquire._read_state", return_value=lane),
+                    patch("grabowski_checkouts._verify_expected_physical_checkout_identity",
+                          side_effect=RuntimeError("physical drift") if case == "physical_drift" else None),
+                    patch("grabowski_checkouts.grabowski_checkout_archive",
+                          side_effect=RuntimeError("archive failed") if case == "archive_error" else None,
+                          return_value={"archive": {"archive_id": "archive", "created_at_unix": 100,
+                                                    "retention_until_unix": 200}}) as archive,
+                    patch("grabowski_checkouts.grabowski_checkout_cleanup",
+                          side_effect=RuntimeError("cleanup failed") if case == "cleanup_error" else [
+                              {"plan": {"safe_to_apply": case != "unsafe_plan", "plan_sha256": "f" * 64, "archive_id": "archive"},
+                               "dry_run_record": {"plan_id": "plan"}},
+                              {"applied_at_unix": 300}]) as cleanup,
+                ):
+                    result = grips.run_grip("worktree-hygiene-reconcile", params,
+                                            allow_mutation=True, command_runner=FakeGit(),
+                                            github_runner=lambda *_: self.fail("terminal source needs no PR inference"))
+                status = result["receipt"]["status"]
+                if case == "archive":
+                    self.assertEqual("passed", status)
+                    archive.assert_called_once()
+                    self.assertEqual(owner, archive.call_args.kwargs["owner_id"])
+                    self.assertEqual(physical, archive.call_args.kwargs["expected_physical_identity"])
+                    cleanup.assert_not_called()
+                elif case == "cleanup":
+                    self.assertEqual("passed", status)
+                    self.assertEqual(2, cleanup.call_count)
+                    for call in cleanup.call_args_list:
+                        self.assertEqual(owner, call.kwargs["owner_id"])
+                    self.assertEqual("f" * 64, cleanup.call_args.kwargs["expected_plan_sha256"])
+                    self.assertEqual(physical, cleanup.call_args_list[0].kwargs["expected_physical_identity"])
+                    archive.assert_not_called()
+                elif case in {"archive_error", "cleanup_error"}:
+                    self.assertEqual("failed", status)
+                    self.assertTrue(result["output"]["errors"])
+                elif case == "unsafe_plan":
+                    self.assertEqual("blocked", status)
+                    self.assertEqual(1, cleanup.call_count)
+                    archive.assert_not_called()
+                else:
+                    archive.assert_not_called()
+                    cleanup.assert_not_called()
+                    if case in {"head_drift", "branch_drift", "source_error", "physical_drift", "receipt_drift", "binding_drift"}:
+                        self.assertEqual("blocked", status)
+                        self.assertTrue(result["output"]["errors"])
+
     def test_exact_merged_pr_archives_owned_clean_checkout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             checkout = str(Path(tmp) / "worktree")
