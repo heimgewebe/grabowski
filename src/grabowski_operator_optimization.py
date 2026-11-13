@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import hashlib
 import importlib
 import time
+from pathlib import Path
 from typing import Any, Callable
 
 import grabowski_consumer_surface as consumer_surface
@@ -71,6 +72,11 @@ def _repositories(value: list[str]) -> list[str]:
     for repository in value:
         if not isinstance(repository, str) or not repository or "\x00" in repository:
             raise ValueError("repository paths must be non-empty strings")
+        if not Path(repository).is_absolute():
+            raise ValueError(
+                "repository paths must be absolute local filesystem paths; "
+                "owner/repo names and short aliases are not supported"
+            )
         if repository in result:
             raise ValueError("repositories must be unique")
         result.append(repository)
