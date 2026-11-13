@@ -23155,6 +23155,7 @@ class WorktreeHygieneReconcileTests(unittest.TestCase):
                         self.assertEqual(owner, call.kwargs["owner_id"])
                     self.assertEqual("f" * 64, cleanup.call_args.kwargs["expected_plan_sha256"])
                     self.assertEqual(physical, cleanup.call_args_list[0].kwargs["expected_physical_identity"])
+                    self.assertEqual(physical, cleanup.call_args_list[1].kwargs["expected_physical_identity"])
                     archive.assert_not_called()
                 elif case in {"archive_error", "cleanup_error"}:
                     self.assertEqual("failed", status)

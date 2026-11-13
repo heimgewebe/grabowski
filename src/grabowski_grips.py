@@ -6196,6 +6196,7 @@ def _run_worktree_hygiene_reconcile(
                         plan_id=dry["dry_run_record"]["plan_id"],
                         expected_plan_sha256=plan["plan_sha256"],
                         confirmation="remove-linked-checkout",
+                        **physical_parameters,
                     )
                     cleaned.append({
                         "path": path,
