@@ -894,6 +894,10 @@ class OperatorOptimizationReportTests(unittest.TestCase):
             optimization.build_operator_optimization_report([])
         with self.assertRaises(ValueError):
             optimization.build_operator_optimization_report([REPOSITORY, REPOSITORY])
+        with self.assertRaisesRegex(ValueError, "absolute local filesystem paths"):
+            optimization.build_operator_optimization_report(["heimgewebe/grabowski"])
+        with self.assertRaisesRegex(ValueError, "absolute local filesystem paths"):
+            optimization.build_operator_optimization_report(["grabowski"])
         with self.assertRaises(ValueError):
             self.build(window="90d")
         with self.assertRaises(ValueError):
