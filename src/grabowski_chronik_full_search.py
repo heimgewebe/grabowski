@@ -25,7 +25,7 @@ Executor = Callable[[list[str], Path], dict[str, Any]]
 # Only these Chronik CLIs may run in the read-only search sandbox.
 READ_ONLY_CLIS = ("chronik_search.py", "knowledge_ledger.py")
 KNOWLEDGE_LIMIT = 20
-KNOWLEDGE_SELECTORS = ("repo", "host", "keyword", "knowledge_type")
+KNOWLEDGE_SELECTORS = ("repo", "host", "keyword", "knowledge_type", "component")
 
 
 def _sha(value: Any) -> str:

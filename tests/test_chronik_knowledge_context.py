@@ -76,6 +76,16 @@ class KnowledgeQueryTests(unittest.TestCase):
         self.assertEqual(argv[argv.index("--repo") + 1], "heimgewebe/grabowski")
         self.assertEqual(argv[argv.index("--limit") + 1], "5")
 
+    def test_component_filter_is_passed_to_chronik_cli(self):
+        result = self.run_query(
+            repo="heimgewebe/grabowski", component="repoground-postmerge")
+        self.assertTrue(result["available"])
+        argv = self.calls[0]
+        self.assertEqual(
+            argv[argv.index("--component") + 1], "repoground-postmerge")
+        self.assertEqual(
+            argv[argv.index("--repo") + 1], "heimgewebe/grabowski")
+
     def test_wrong_domain_or_invalid_integrity_is_a_gap(self):
         self.payload["ledger_snapshot"]["domain"] = "agent.ledger"
         self.assertEqual(self.run_query()["failure_code"],
@@ -172,6 +182,45 @@ class BootstrapKnowledgeContextTests(unittest.TestCase):
         self.assertEqual(section["discarded_by_target_constraints"], 1)
         self.assertLessEqual(len(section["events"][0]["statement"]),
                              module.KNOWLEDGE_STATEMENT_CHARS)
+
+    def test_component_pushdown_finds_older_incident_past_first_page(self):
+        module = self.load_module()
+        target = knowledge_event(1, component="repoground-postmerge")
+        noise = [knowledge_event(i + 2, component="unrelated")
+                 for i in range(24)]
+        calls = []
+
+        def knowledge(**kwargs):
+            calls.append(kwargs)
+            events = [*noise, target]
+            if kwargs.get("component"):
+                events = [
+                    event for event in events
+                    if event["subject"].get("component") == kwargs["component"]
+                ]
+            selected = events[:kwargs["limit"]]
+            return {
+                "available": True, "historical_only": True,
+                "matching_count": len(events),
+                "has_more": len(events) > len(selected),
+                "ledger_snapshot": {"integrity_valid": True, "sha256": "e" * 64},
+                "events": [{"event": event, "superseded_by": []}
+                           for event in selected],
+            }
+
+        context = module._chronik_first_context(
+            repo="heimgewebe/grabowski",
+            subject_component="repoground-postmerge",
+            search_fn=self.run_events, knowledge_search_fn=knowledge)
+        section = context["knowledge"]
+        self.assertEqual(calls, [{
+            "repo": "heimgewebe/grabowski",
+            "component": "repoground-postmerge", "limit": 20,
+        }])
+        self.assertEqual(section["selected_event_count"], 1)
+        self.assertEqual(section["provider_matching_count"], 1)
+        self.assertFalse(section["has_more"])
+        self.assertEqual(section["events"][0]["event_id"], target["event_id"])
 
     def test_knowledge_outage_never_changes_run_event_status(self):
         module = self.load_module()

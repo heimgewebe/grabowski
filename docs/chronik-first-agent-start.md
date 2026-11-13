@@ -33,8 +33,12 @@ Ereignisse ersetzt.
 Zusätzlich zu den Laufereignissen enthält `chronik_first.knowledge` bis zu
 acht Einträge aus dem semantischen `knowledge.ledger` (bestätigte Ursachen,
 Reparaturen, Entscheidungen, Widerlegungen, offene Probleme) zum Repository
-(`subject.repo`) oder – ohne Repository – zum Host. Explizite Komponente und
-PR-Nummer wirken als harte Einschränkung. Aktuelle Einträge stehen vor
+(`subject.repo`) oder – ohne Repository – zum Host.
+Eine explizite Zielkomponente wird über Chroniks bestehenden `--component`-
+Filter **vor** dem 20er-Seitenlimit eingeschränkt; so verschwinden ältere,
+relevante Ursachen nicht hinter fremden Komponenten. Eine PR-Nummer bleibt
+hingegen eine nachträgliche harte Einschränkung und kann auf einer begrenzten
+Kandidatenseite weiterhin Lücken ergeben. Aktuelle Einträge stehen vor
 überholten (`superseded_by` nicht leer); überholte bleiben als Historie
 sichtbar. Aussagen werden auf 400 Zeichen gekürzt, Quellfelder außerhalb der
 kompakten Auswahl werden nicht übernommen.
