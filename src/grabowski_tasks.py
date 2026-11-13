@@ -14850,6 +14850,9 @@ def grabowski_chronik_full_search(
 
     Unlike grabowski_chronik_history, this directly queries the entire ledger
     and does not silently limit exact matches to a coarse provider window.
+    Require at least one selector. limit accepts 1..20 (default 10); use cursor
+    to page. since/until require timezone-aware ISO 8601 timestamps (for
+    example 2026-11-05T00:00:00+01:00); date-only values are invalid.
     Historical evidence is never a present-state or successful-deployment claim.
     """
     operator._require_operator_capability("durable_job")
