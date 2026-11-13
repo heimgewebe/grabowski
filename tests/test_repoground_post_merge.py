@@ -5334,7 +5334,7 @@ class PublisherInventoryAdmissionTests(unittest.TestCase):
         }
 
     def test_nonmember_repos_are_not_scheduled(self) -> None:
-        for repository in ("Hall-of-Memory/memoraevents", "alexdermohr/livia"):
+        for repository in ("Hall-of-Memory/memoraevents", "example-org/nonmember-repository"):
             post_merge._publisher_authoritative_members.cache_clear()
             inventory = self.authoritative_inventory(["heimgewebe/grabowski"])
             with patch.object(post_merge, "_run_publisher", return_value=inventory) as publisher:
@@ -5496,10 +5496,10 @@ class PublisherInventoryAdmissionTests(unittest.TestCase):
         ):
             post_merge._publisher_authoritative_members.cache_clear()
             with patch.object(post_merge, "_run_publisher", return_value=payload):
-                self.assertFalse(post_merge._publisher_inventory_missing_repository("alexdermohr/livia"))
+                self.assertFalse(post_merge._publisher_inventory_missing_repository("example-org/nonmember-repository"))
         post_merge._publisher_authoritative_members.cache_clear()
         with patch.object(post_merge, "_run_publisher", side_effect=OSError("unavailable")):
-            self.assertFalse(post_merge._publisher_inventory_missing_repository("alexdermohr/livia"))
+            self.assertFalse(post_merge._publisher_inventory_missing_repository("example-org/nonmember-repository"))
 
 
 if __name__ == "__main__":
