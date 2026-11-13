@@ -278,6 +278,8 @@ def _chronik_knowledge_context(
         selectors = {"host": host}
     else:
         return {**base, "status": "skipped_no_supported_selector", "events": []}
+    if subject_component:
+        selectors["component"] = subject_component
     if knowledge_search_fn is None:
         try:
             from grabowski_tasks import chronik_knowledge_search
