@@ -1639,7 +1639,7 @@
     },
     {
       "category": "coding-memory",
-      "description": "Search the full committed Chronik ledger with exact selectors and evidence-bound pagination.\n\nUnlike grabowski_chronik_history, this directly queries the entire ledger\nand does not silently limit exact matches to a coarse provider window.\nRequire at least one selector. limit accepts 1..20 (default 10); use cursor\nto page. since/until require timezone-aware ISO 8601 timestamps (for\nexample 2026-11-05T00:00:00+01:00); date-only values are invalid.\nHistorical evidence is never a present-state or successful-deployment claim.",
+      "description": "Search a selected committed Chronik ledger with explicit corpus scope.\n\nDefault agent.ledger: complete run-event search with evidence-bound cursor;\nunlike grabowski_chronik_history, no coarse provider window. Use repo,\nhost, event_id, operation and other event filters as before.\nOptional knowledge.ledger: historical causes, repairs and decisions across\nrepositories, using repo, host, subject_component, keyword or knowledge_type.\nSemantic knowledge.ledger does not support event filters or cursor; query\nit explicitly instead of inferring 'not found' from agent.ledger.\nRequire at least one selector. limit accepts 1..20 (default 10); use cursor\nonly for agent.ledger. since/until require timezone-aware ISO 8601 timestamps\n(for example 2026-11-05T00:00:00+01:00); date-only values are invalid.\nHistorical evidence is never a present-state or successful-deployment claim.",
       "effects": [],
       "id": "grabowski_chronik_full_search",
       "purpose": "Search complete immutable Chronik ledger with evidence-bound snapshot pagination.",
@@ -3920,7 +3920,7 @@
       "src/grabowski_systemkatalog.py": "e3ec4884b3dd367b8970b3143432cab0fea5fe55963292806001f5df535c83f9",
       "src/grabowski_task_attention.py": "a16d4b045bef23bf78ad3df0c4c58d91a304dc9a83b6e757fb1b0f88754ad6f3",
       "src/grabowski_task_reconcile.py": "64dc6195c9d0cb3435d192e4715a0d4d5679b9f1904057308366f4e2f2e9bbea",
-      "src/grabowski_tasks.py": "8c87148583d6f3c6e3fa443846a2bb4529d7b81d804b0b24ebffb575f27cc756",
+      "src/grabowski_tasks.py": "dbf2cd3744aee06f47341ac5366370ff29aa7443b4c3d04fc6362585963bfc57",
       "src/grabowski_terminal_convergence.py": "8f172a65b2af1dbca3d5b226a18e82df3ca5229ca5f4ae8b2ab1792506c69195",
       "src/grabowski_text_artifact_reconcile.py": "b302be1dbb101abbf825732bfe41658c13ac64417c2a6034326e57409daa4772",
       "src/grabowski_transport_assertion.py": "20d75d1f94c1d0273108c36eed8c58aa85e55a30b73546c4ac8af8a835fb8c8e",
