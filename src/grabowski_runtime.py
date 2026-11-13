@@ -120,7 +120,13 @@ async def grabowski_current_work(
 
 @mcp.tool(name="grabowski_operator_optimization_report", annotations=grabowski_operator_core.MUTATING)
 async def grabowski_operator_optimization_report(
-    repositories: list[str],
+    repositories: Annotated[
+        list[str],
+        Field(
+            description="Absolute local repository paths; short aliases and "
+            "owner/repo names are not accepted."
+        ),
+    ],
     window: str = "7d",
     view: str = "minimal",
     top_limit: Annotated[
