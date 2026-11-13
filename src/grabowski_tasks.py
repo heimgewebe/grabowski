@@ -14845,16 +14845,44 @@ def grabowski_chronik_full_search(
     keyword: str = "",
     limit: Annotated[int, Field(ge=1, le=20, description="Maximum 20 events per page")] = 10,
     cursor: str = "",
+    ledger: Literal["agent.ledger", "knowledge.ledger"] = "agent.ledger",
+    knowledge_type: str = "",
 ) -> dict[str, Any]:
-    """Search the full committed Chronik ledger with exact selectors and evidence-bound pagination.
+    """Search a selected committed Chronik ledger with explicit corpus scope.
 
-    Unlike grabowski_chronik_history, this directly queries the entire ledger
-    and does not silently limit exact matches to a coarse provider window.
+    Default agent.ledger: complete run-event search with evidence-bound cursor;
+    unlike grabowski_chronik_history, no coarse provider window. Use repo,
+    host, event_id, operation and other event filters as before.
+    Optional knowledge.ledger: historical causes, repairs and decisions across
+    repositories, using repo, host, subject_component, keyword or knowledge_type.
+    Semantic knowledge.ledger does not support event filters or cursor; query
+    it explicitly instead of inferring 'not found' from agent.ledger.
     Require at least one selector. limit accepts 1..20 (default 10); use cursor
-    to page. since/until require timezone-aware ISO 8601 timestamps (for
-    example 2026-11-05T00:00:00+01:00); date-only values are invalid.
+    only for agent.ledger. since/until require timezone-aware ISO 8601 timestamps
+    (for example 2026-11-05T00:00:00+01:00); date-only values are invalid.
     Historical evidence is never a present-state or successful-deployment claim.
     """
+    if ledger == "knowledge.ledger":
+        # Reuse the already deployed, read-only semantic provider. No second
+        # MCP tool, authority boundary, or implicit fallback to run events.
+        if (
+            event_id or component or kind or operation or task_class or outcome
+            or pr_number is not None or bureau_task_id or run_id or task_id
+            or since or until or cursor
+        ):
+            raise ValueError(
+                "knowledge.ledger supports repo, host, subject_component, "
+                "keyword and knowledge_type, not agent-event filters or cursor"
+            )
+        return chronik_knowledge_search(
+            repo=repo, host=host, keyword=keyword,
+            knowledge_type=knowledge_type, component=subject_component,
+            limit=limit,
+        )
+    if ledger != "agent.ledger":
+        raise ValueError("ledger must be agent.ledger or knowledge.ledger")
+    if knowledge_type:
+        raise ValueError("knowledge_type requires ledger=knowledge.ledger")
     operator._require_operator_capability("durable_job")
     selectors = {
         "event_id": event_id, "repo": repo, "host": host,

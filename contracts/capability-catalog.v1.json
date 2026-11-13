@@ -1579,7 +1579,7 @@
     },
     {
       "category": "coding-memory",
-      "description": "Search the full committed Chronik ledger with exact selectors and evidence-bound pagination.\n\nUnlike grabowski_chronik_history, this directly queries the entire ledger\nand does not silently limit exact matches to a coarse provider window.\nRequire at least one selector. limit accepts 1..20 (default 10); use cursor\nto page. since/until require timezone-aware ISO 8601 timestamps (for\nexample 2026-11-05T00:00:00+01:00); date-only values are invalid.\nHistorical evidence is never a present-state or successful-deployment claim.",
+      "description": "Search a selected committed Chronik ledger with explicit corpus scope.\n\nDefault agent.ledger: complete run-event search with evidence-bound cursor;\nunlike grabowski_chronik_history, no coarse provider window. Use repo,\nhost, event_id, operation and other event filters as before.\nOptional knowledge.ledger: historical causes, repairs and decisions across\nrepositories, using repo, host, subject_component, keyword or knowledge_type.\nSemantic knowledge.ledger does not support event filters or cursor; query\nit explicitly instead of inferring 'not found' from agent.ledger.\nRequire at least one selector. limit accepts 1..20 (default 10); use cursor\nonly for agent.ledger. since/until require timezone-aware ISO 8601 timestamps\n(for example 2026-11-05T00:00:00+01:00); date-only values are invalid.\nHistorical evidence is never a present-state or successful-deployment claim.",
       "effects": [],
       "id": "grabowski_chronik_full_search",
       "purpose": "Search complete immutable Chronik ledger with evidence-bound snapshot pagination.",
