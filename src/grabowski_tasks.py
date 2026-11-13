@@ -14905,7 +14905,7 @@ def _chronik_read_only_executor(configuration: dict[str, Any]):
 
 def chronik_knowledge_search(
     repo: str = "", host: str = "", keyword: str = "",
-    knowledge_type: str = "", component: str = "", limit: int = 10,
+    knowledge_type: str = "", limit: int = 10, component: str = "",
 ) -> dict[str, Any]:
     """Internal read-only knowledge.ledger search for the agent bootstrap.
 
