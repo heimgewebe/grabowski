@@ -51,6 +51,28 @@ Laufereignisse nicht. Eine Task-ID allein ist kein Wissensselektor
 (`skipped_no_supported_selector`). Für die vollständige Wissensrecherche die
 Chronik-CLI `knowledge_ledger.py search` verwenden.
 
+### Repositorienübergreifende Ursachenrecherche ohne bekanntes Zielrepo
+
+Das vorhandene MCP-Werkzeug `grabowski_chronik_full_search` verwendet
+standardmäßig `ledger="agent.ledger"` und sucht ausschließlich
+**Laufereignisse**. Null Treffer dort sind kein Beleg, dass Chroniks
+semantisches `knowledge.ledger` keine Ursachen, Reparaturen oder Entscheidungen
+enthält. Für einen unbekannten zuständigen Repository-Bereich kann dasselbe
+read-only Werkzeug nun ausdrücklich den semantischen Korpus wählen:
+
+`grabowski_chronik_full_search(ledger="knowledge.ledger", keyword="libgit2", limit=10)`
+
+Im semantischen Modus gelten nur `repo`, `host`, `subject_component` (das
+kanonische `subject.component`), `keyword`, `knowledge_type` und ein Limit von
+1–20. Laufereignisfilter, PR-Nummer, Zeitfenster, `event_id` und Cursor werden
+abgewiesen statt still ignoriert. Es gibt keinen automatischen Wechsel zwischen
+den Ledgers, keinen zusätzlichen MCP-Toolnamen und keine Schreibbefugnis.
+Der vorhandene Knowledge-Provider liefert Snapshot-Integrität und
+`has_more`; eine begrenzte Trefferseite bedeutet weiterhin keine vollständige
+Geschichte. Für die danach benötigten aktuellen Code-/Abhängigkeitsbelege
+zuerst Git, optional die kleinste passende revisionsgebundene RepoGround-S1-
+Abfrage und für Betrieb GitHub/CI/Runtime verwenden.
+
 ## Gezielter Aufruf
 
 grabowski_agent_bootstrap(repo="heimgewebe/grabowski")
