@@ -43,6 +43,13 @@ class ChronikFullSearchToolSchemaTests(unittest.TestCase):
         self.assertEqual(properties["limit"]["minimum"], 1)
         self.assertEqual(properties["limit"]["maximum"], 20)
         self.assertEqual(properties["limit"]["default"], 10)
+        # Provider wrappers may flatten per-property constraints; the tool
+        # description must still make the real contract discoverable.
+        description = tool.description or ""
+        for fragment in ("1..20", "default 10", "cursor",
+                         "timezone-aware ISO 8601", "date-only"):
+            with self.subTest(description_fragment=fragment):
+                self.assertIn(fragment, description)
         for name in ("since", "until"):
             with self.subTest(name=name):
                 self.assertEqual(properties[name]["default"], "")
