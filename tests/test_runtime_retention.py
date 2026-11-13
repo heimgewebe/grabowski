@@ -5754,6 +5754,29 @@ class RuntimeRetentionTests(unittest.TestCase):
         self.assertTrue(result["worktree_hygiene"]["bounded"])
         self.assertTrue(result["mutated"])
 
+    def test_periodic_terminal_owner_opt_in_and_degraded_receipt(self) -> None:
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled), tempfile.TemporaryDirectory() as tmp:
+                runner = Mock(return_value={"status": "blocked", "output": {
+                    "actions": 0, "errors": [{"error": "physical identity drift"}]}})
+                result = RETENTION._apply_periodic_worktree_hygiene(
+                    repositories=[tmp], owner_id="operator:runtime-retention",
+                    allowed_checkout_roots=[tmp], max_actions=2,
+                    include_terminal_owners=enabled, grip_runner=runner)
+                self.assertEqual(enabled, runner.call_args.args[1]["include_terminal_owners"])
+                self.assertEqual("degraded", result["status"])
+                self.assertFalse(result["completed"])
+                self.assertFalse(result["mutated"])
+
+    def test_periodic_terminal_owner_action_failure_is_not_success(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(RuntimeError, "periodic worktree hygiene failed"):
+                RETENTION._apply_periodic_worktree_hygiene(
+                    repositories=[tmp], owner_id="operator:runtime-retention",
+                    allowed_checkout_roots=[tmp], max_actions=2,
+                    include_terminal_owners=True, grip_runner=Mock(return_value={
+                        "status": "failed", "output": {"errors": [{"error": "archive failed"}]}}))
+
     def test_periodic_worktree_hygiene_accepts_blocked_fail_closed_receipt(self) -> None:
         plan = {
             "plan_sha256": "f" * 64,
