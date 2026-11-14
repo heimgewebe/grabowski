@@ -1622,7 +1622,12 @@ def _github_pr_exact_head(
         if required_state == "OPEN":
             raise RuntimeError("successor handoff requires the bound PR to remain open")
         raise RuntimeError("successor handoff pending retry requires the bound PR to be merged")
-    if payload.get("headRefName") != branch:
+    published_branch = payload.get("headRefName")
+    if not isinstance(published_branch, str) or not published_branch.strip():
+        raise RuntimeError("successor handoff GitHub PR branch is missing")
+    # An already-merged PR may have been published from another branch than
+    # the predecessor's internal worktree. The exact merged head remains bound.
+    if required_state == "OPEN" and published_branch != branch:
         raise RuntimeError("successor handoff GitHub PR branch drifted")
     observed_head = payload.get("headRefOid")
     if not isinstance(observed_head, str) or observed_head.lower() != head:
@@ -1631,7 +1636,7 @@ def _github_pr_exact_head(
         "repository": github_repo,
         "pr_number": pr_number,
         "state": required_state,
-        "head_ref_name": branch,
+        "head_ref_name": published_branch,
         "head_sha": head,
     }
 

@@ -6329,6 +6329,24 @@ class WorkAcquireTests(unittest.TestCase):
         self.assertEqual("heimgewebe/grabowski", result["repository"])
         self.assertEqual("d" * 40, result["head_sha"])
 
+        wrong_open_branch = dict(published)
+        wrong_open_branch["stdout"] = json.dumps(
+            {
+                "number": 1329,
+                "state": "OPEN",
+                "headRefName": "unrelated-pr-branch",
+                "headRefOid": "d" * 40,
+            }
+        )
+        with (
+            patch.object(work_acquire, "_git_runner", return_value=origin),
+            patch.object(work_acquire.operator, "_run", return_value=wrong_open_branch),
+            self.assertRaisesRegex(RuntimeError, "PR branch drifted"),
+        ):
+            work_acquire._github_open_pr_exact_head(
+                self.repo, pr_number=1329, branch="topic-old", head="d" * 40
+            )
+
         drifted = dict(published)
         drifted["stdout"] = json.dumps(
             {
@@ -6381,6 +6399,29 @@ class WorkAcquireTests(unittest.TestCase):
                 head="d" * 40,
             )
         self.assertEqual("MERGED", result["state"])
+
+        # A merged PR can come from a different branch than the internal
+        # predecessor worktree; the published commit must still be exact.
+        different_branch = dict(published)
+        different_branch["stdout"] = json.dumps(
+            {
+                "number": 1329,
+                "state": "MERGED",
+                "headRefName": "published-pr-branch",
+                "headRefOid": "d" * 40,
+            }
+        )
+        with (
+            patch.object(work_acquire, "_git_runner", return_value=origin),
+            patch.object(work_acquire.operator, "_run", return_value=different_branch),
+        ):
+            merged = work_acquire._github_merged_pr_exact_head(
+                self.repo,
+                pr_number=1329,
+                branch="topic-old",
+                head="d" * 40,
+            )
+        self.assertEqual("published-pr-branch", merged["head_ref_name"])
 
         still_open = dict(published)
         still_open["stdout"] = json.dumps(
