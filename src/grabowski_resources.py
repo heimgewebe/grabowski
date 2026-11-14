@@ -3350,7 +3350,9 @@ def _absolute_paths_overlap(left: str, right: str) -> bool:
     return common == left or common == right
 
 
-_MERGE_GUARD_MAX_CHANGED_PATHS = 3000
+# Keep atomic merge scope capacity aligned with the signed first-party reviewer.
+# Generated release PRs may have thousands of paths; byte budgets still apply.
+_MERGE_GUARD_MAX_CHANGED_PATHS = 4608
 _MERGE_GUARD_MAX_CHANGED_PATH_BYTES = 512 * 1024
 _MERGE_GUARD_MAX_SINGLE_CHANGED_PATH_BYTES = 8 * 1024
 _MERGE_GUARD_EXACT_METADATA_MAX_PATHS = 128

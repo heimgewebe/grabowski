@@ -1954,11 +1954,29 @@ class CaptainLargePrMergeGuardTests(unittest.TestCase):
     def test_resource_normalization_supports_bounded_generated_release(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
-            paths = [str(root / f"generated-{index:04d}.txt") for index in range(1058)]
-            normalized = resources._normalize_merge_guard_changed_paths(
-                paths, repository=str(root)
+            from grabowski_self_review_execution import FIRST_PARTY_MAX_CHANGED_PATHS
+
+            # A signed review of the exact PR must not be blocked by a
+            # smaller atomic merge guard budget on that same diff.
+            self.assertEqual(
+                resources._MERGE_GUARD_MAX_CHANGED_PATHS,
+                FIRST_PARTY_MAX_CHANGED_PATHS,
             )
-            self.assertEqual(len(normalized), 1058)
+            for count in (1058, 3587, resources._MERGE_GUARD_MAX_CHANGED_PATHS):
+                paths = [str(root / f"generated-{index:04d}.txt") for index in range(count)]
+                normalized = resources._normalize_merge_guard_changed_paths(
+                    paths, repository=str(root)
+                )
+                self.assertEqual(len(normalized), count)
+            # A larger path count must not accidentally disable byte limits.
+            oversized = [
+                str(root / f"oversized-{index:04d}-{'x' * 110}.txt")
+                for index in range(resources._MERGE_GUARD_MAX_CHANGED_PATHS)
+            ]
+            with self.assertRaisesRegex(ValueError, "byte limit"):
+                resources._normalize_merge_guard_changed_paths(
+                    oversized, repository=str(root)
+                )
             too_many = [
                 str(root / f"overflow-{index:04d}.txt")
                 for index in range(resources._MERGE_GUARD_MAX_CHANGED_PATHS + 1)
