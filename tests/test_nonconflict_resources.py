@@ -42,6 +42,7 @@ if "mcp" not in sys.modules:
     sys.modules["mcp.server.fastmcp"] = fake_fastmcp
     sys.modules["mcp.types"] = fake_types
 
+import grabowski_merge_guard as merge_guard
 import grabowski_nonconflict as nonconflict
 import grabowski_resources as resources
 
@@ -126,6 +127,91 @@ class NonConflictResourceTests(unittest.TestCase):
             requested_scope=requested_scope,
             requested_scope_complete=True,
             proof_ttl_seconds=90,
+        )
+
+    def test_active_repo_guards_preserve_disjoint_bureau_and_grabowski_work(self) -> None:
+        """Two real merge guards must not block disjoint work in the other repo."""
+        bureau_repo = self.root / "bureau"
+        bureau_repo.mkdir()
+
+        def acquire_guard(
+            repository: Path, github_slug: str, *, owner: str
+        ) -> tuple[str, Path]:
+            repository_id = merge_guard._merge_guard_identifier(
+                "repository", github_slug
+            )
+            branch_id = merge_guard._merge_guard_identifier("branch", "main")
+            gate_key = f"gate:github-merge:{repository_id}:{branch_id}"
+            keys = [
+                f"component:github-repository:{repository_id}",
+                f"component:github-branch:{repository_id}:{branch_id}",
+                f"service:github-main:{repository_id}",
+                f"service:github-pr:{repository_id}:57",
+                gate_key,
+                f"deployment:github:{repository_id}:{branch_id}",
+            ]
+            changed_path = repository / "src" / "guard-change.py"
+            result = resources.acquire_merge_guard_resources(
+                owner,
+                "source-task-owner",
+                keys,
+                repository=str(repository),
+                changed_paths=[str(changed_path)],
+                purpose=f"merge guard for {github_slug}",
+                ttl_seconds=90,
+                metadata={
+                    "merge_guard": {
+                        "head_sha": "a" * 40,
+                        "diff_sha256": "b" * 64,
+                        "base_branch": "main",
+                        "head_branch": "feat/guard",
+                    }
+                },
+            )
+            self.assertIn(gate_key, result["held_resource_keys"])
+            return gate_key, changed_path
+
+        grab_gate, grab_changed = acquire_guard(
+            self.repo, "heimgewebe/grabowski", owner="captain-merge:grabowski"
+        )
+        grab_before = resources.inspect_resource(grab_gate)
+        bureau_key = f"path:{bureau_repo / 'src' / 'independent.py'}"
+        bureau_lease = resources.acquire_resources(
+            "bureau-task", [bureau_key], purpose="disjoint Bureau source work",
+            ttl_seconds=30,
+        )
+        self.assertEqual(bureau_key, bureau_lease["leases"][0]["resource_key"])
+        self.assertEqual(grab_before, resources.inspect_resource(grab_gate))
+
+        bureau_gate, bureau_changed = acquire_guard(
+            bureau_repo, "heimgewebe/bureau", owner="captain-merge:bureau"
+        )
+        bureau_before = resources.inspect_resource(bureau_gate)
+        grabowski_key = f"path:{self.repo / 'src' / 'independent.py'}"
+        grabowski_lease = resources.acquire_resources(
+            "grabowski-task", [grabowski_key],
+            purpose="disjoint Grabowski source work", ttl_seconds=30,
+        )
+        self.assertEqual(grabowski_key, grabowski_lease["leases"][0]["resource_key"])
+
+        for changed in (grab_changed, bureau_changed):
+            with self.subTest(changed=changed), self.assertRaises(
+                resources.ResourceConflict
+            ):
+                resources.acquire_resources(
+                    "overlap-task", [f"path:{changed}"],
+                    purpose="same-repository path must remain blocked",
+                    ttl_seconds=30,
+                )
+
+        self.assertEqual(grab_before, resources.inspect_resource(grab_gate))
+        self.assertEqual(bureau_before, resources.inspect_resource(bureau_gate))
+        self.assertEqual(
+            "bureau-task", resources.inspect_resource(bureau_key)["owner_id"]
+        )
+        self.assertEqual(
+            "grabowski-task",
+            resources.inspect_resource(grabowski_key)["owner_id"],
         )
 
     def test_unattested_blocking_scope_cannot_be_bypassed(self) -> None:
