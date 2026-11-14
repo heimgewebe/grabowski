@@ -971,9 +971,15 @@ def _automatic_kill_switch_clear() -> None:
         )
 
 
+def _systemd_run_executable() -> str:
+    """Prefer NixOS system profile, retain the FHS fallback elsewhere."""
+    nixos_binary = "/run/current-system/sw/bin/systemd-run"
+    return nixos_binary if os.path.isfile(nixos_binary) else "/usr/bin/systemd-run"
+
+
 def _authoritative_remote_main_head(runner: RunCommand) -> str:
     argv = [
-        "/usr/bin/systemd-run",
+        _systemd_run_executable(),
         "--system",
         "--wait",
         "--pipe",

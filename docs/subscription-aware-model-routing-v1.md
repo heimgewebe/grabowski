@@ -1,5 +1,22 @@
 # Subscription-aware model routing v1
 
+## Subscription correction (2026-11-11)
+
+The owner no longer has a Grok/SuperGrok subscription. New Grok launches are blocked, and `grok-com` is owner-disabled in the canonical catalog.
+Historical Grok route definitions remain for validating older signed review receipts.
+Older authenticated Grok model listings and receipts are historical evidence,
+not present entitlement. Automatic review and hard-case advisory selection
+must not use Grok or the xAI API. Claude Pro remains the only automatic
+external subscription-review provider.
+
+For the read-only `claude-opus-5.5-high` reviewer, an opaque remaining
+Claude Pro quota permits one bounded attempt on a signed first-party
+PR revision. Explicitly exhausted, blocked, unauthenticated, or
+cooldown states still exclude execution. This does not change writer
+routing or authorize purchased credits. A failed or missing provider
+review does not change the independent reviewer requirement from
+`false` to `true`.
+
 ## Decision
 
 Grabowski routes external model work by task fit and expected review quality **inside already-paid subscription baselines**. It does not balance traffic merely to distribute consumption across providers.

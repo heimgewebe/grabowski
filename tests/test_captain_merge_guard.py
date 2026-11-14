@@ -588,6 +588,110 @@ class RiskScaledIndependentReviewContractTests(unittest.TestCase):
         )
 
 
+class CaptainLargePrProviderCapTests(unittest.TestCase):
+    """GitHub's 3,000-file listing cap cannot gate an exact signed PR diff."""
+
+    def setUp(self) -> None:
+        self.paths = [f"releases/new/part-{i:04d}.json" for i in range(3587)]
+        self.sample = [
+            {"path": path, "changeType": "ADDED"} for path in self.paths[:100]
+        ]
+        self.params = {
+            "changed_files": len(self.paths),
+            "view_files": self.sample,
+            "base_branch": "main",
+            "pr_number": 238,
+            "base_sha": "a" * 40,
+            "head_sha": "b" * 40,
+        }
+
+    def run_large_paths(self, **overrides: object):
+        inputs = {**self.params, **overrides}
+        with mock.patch.object(
+            merge_guard, "_merge_guard_ensure_pr_objects",
+            return_value=({"available": True}, []),
+        ) as objects, mock.patch.object(
+            merge_guard, "_merge_guard_local_changed_paths",
+            return_value=(self.paths, {"source": "local-bound-git-name-only"}, []),
+        ) as local:
+            result = merge_guard._merge_guard_exact_large_pr_paths(
+                Path.cwd(), **inputs
+            )
+        self.assertEqual(objects.call_count, 1)
+        self.assertEqual(local.call_count, 1)
+        self.assertEqual(local.call_args.kwargs["head_sha"], "b" * 40)
+        return result
+
+    def test_accept_complete_local_paths_with_exact_provider_count_and_sample(self) -> None:
+        paths, receipt, errors = self.run_large_paths()
+        self.assertEqual(errors, [])
+        self.assertEqual(paths, self.paths)
+        self.assertEqual(receipt["complete_path_count"], 3587)
+        self.assertEqual(receipt["status"], "verified")
+        self.assertEqual(receipt["provider_sample_count"], 100)
+
+    def test_reject_partial_or_unverified_oversized_paths(self) -> None:
+        bad_cases = (
+            ("count mismatch", {"changed_files": 3588}, "changed_file_count_drift"),
+            ("unknown sample path", {"view_files": [
+                {"path": "untrusted/payload.json", "changeType": "ADDED"}
+            ]}, "provider_sample_drift"),
+            ("renamed sample", {"view_files": [
+                {"path": self.paths[0], "changeType": "RENAMED", "previousPath": "other"}
+            ]}, "provider_sample_drift"),
+            ("duplicate sample", {"view_files": [
+                self.sample[0], self.sample[0]
+            ]}, "provider_sample_drift"),
+            ("missing provider sample", {"view_files": []}, "sample_missing_or_invalid"),
+        )
+        for label, overrides, reason in bad_cases:
+            with self.subTest(label=label):
+                paths, receipt, errors = self.run_large_paths(**overrides)
+                self.assertEqual(paths, [])
+                self.assertEqual(receipt["status"], "blocked")
+                self.assertTrue(any(reason in e for e in errors), errors)
+
+    def test_live_binding_uses_exact_local_diff_not_provider_3000_file_list(self) -> None:
+        gh = _LargePrGh(
+            base_sha="a" * 40, head_sha="b" * 40, paths=self.paths,
+        )
+        raw = b"diff --git a/test.txt b/test.txt\n"
+        expected_sha = merge_guard.github_pr_diff_identity_sha256(raw)
+        runner = object.__new__(merge_guard.CaptainMergeGuardRunner)
+        runner.action = {
+            "target": {"repo": "heimgewebe/commonworld", "pr": 212, "base": "main"},
+        }
+        runner.parameters = {
+            "expected_head": gh.head_sha,
+            "expected_base_sha": gh.base_sha,
+            "diff_sha256": expected_sha,
+        }
+        runner.static_errors = []
+        runner.repo_path = Path.cwd()
+        runner.github_runner = gh
+        runner.receipt = {}
+        runner.execution_intent_sha256 = "1" * 64
+        runner._revalidate_codex_review = lambda _bindings, phase: []
+        with mock.patch.object(
+            merge_guard, "_merge_guard_ensure_pr_objects",
+            return_value=({"available": True}, []),
+        ), mock.patch.object(
+            merge_guard, "_merge_guard_local_changed_paths",
+            return_value=(self.paths, {"source": "local-bound-git-name-only"}, []),
+        ), mock.patch.object(
+            merge_guard, "_merge_guard_local_diff_bytes",
+            return_value=(raw, {"raw_sha256": hashlib.sha256(raw).hexdigest()}, []),
+        ):
+            bindings, errors = runner._live_bindings()
+        self.assertEqual(errors, [])
+        self.assertIsNotNone(bindings)
+        assert bindings is not None
+        self.assertEqual(bindings["changed_paths"], self.paths)
+        self.assertEqual(bindings["diff_sha256"], expected_sha)
+        self.assertEqual(runner.receipt["large_pr_paths"]["status"], "verified")
+        self.assertFalse(any(call[:2] == ("api", "--paginate") for call in gh.calls))
+
+
 class CaptainLargePrMergeGuardTests(unittest.TestCase):
     def test_github_diff_too_large_is_narrowly_detected(self) -> None:
         info = {
@@ -976,6 +1080,35 @@ class CaptainLargePrMergeGuardTests(unittest.TestCase):
             self.assertEqual(evidence["local_raw_sha256"], reviewed_sha)
             self.assertTrue(evidence["canonical_hunks_match"])
 
+            signed_raw = subprocess.check_output([
+                "git", "-C", str(repo), "diff", "--no-ext-diff",
+                "--no-textconv", "--no-renames", "--ignore-submodules=none",
+                "--raw", "--abbrev=40", "-z", base, head, "--",
+            ])
+            signed_raw_sha = hashlib.sha256(signed_raw).hexdigest()
+            self.assertNotEqual(signed_raw_sha, reviewed_sha)
+            raw_proven, raw_evidence = merge_guard._merge_guard_legacy_local_review_diff_identity(
+                repo, base_sha=base, head_sha=head,
+                expected_sha256=signed_raw_sha,
+                provider_diff=provider, changed_paths=["app.py"],
+            )
+            self.assertTrue(raw_proven, raw_evidence)
+            self.assertEqual(raw_evidence["review_identity_kind"], "first-party-raw-git-metadata")
+            self.assertEqual(raw_evidence["source_raw_metadata_sha256"], signed_raw_sha)
+            self.assertTrue(raw_evidence["raw_digest_matches_review"])
+            self.assertTrue(raw_evidence["canonical_hunks_match"])
+            altered_raw_provider = provider.replace(
+                b"+    item_11 = 123", b"+    item_11 = 999",
+            )
+            self.assertNotEqual(altered_raw_provider, provider)
+            denied_raw, denied_evidence = merge_guard._merge_guard_legacy_local_review_diff_identity(
+                repo, base_sha=base, head_sha=head,
+                expected_sha256=signed_raw_sha,
+                provider_diff=altered_raw_provider, changed_paths=["app.py"],
+            )
+            self.assertFalse(denied_raw, denied_evidence)
+            self.assertEqual(denied_evidence["reason"], "canonical_hunks_mismatch")
+
             # Local Git formatting config may change after a reviewer signed
             # the immutable raw bytes; neither knob changes committed hunks.
             for setting, hostile_value in (
@@ -1048,6 +1181,15 @@ class CaptainLargePrMergeGuardTests(unittest.TestCase):
             self.assertTrue(
                 runner.receipt["local_review_diff_equivalence"]["canonical_hunks_match"]
             )
+            runner.parameters["diff_sha256"] = signed_raw_sha
+            raw_bindings, raw_errors = runner._live_bindings()
+            self.assertEqual(raw_errors, [])
+            self.assertEqual(raw_bindings["diff_sha256"], signed_raw_sha)
+            self.assertEqual(raw_bindings["diff_identity_mode"], "local-review-diff-proven-equivalent")
+            self.assertTrue(
+                runner.receipt["local_review_diff_equivalence"]["source_raw_metadata_matches_review"]
+            )
+            runner.parameters["diff_sha256"] = reviewed_sha
 
     def test_first_party_full_index_diff_requires_exact_hunks_and_bound_commits(self) -> None:
         # Authenticated first-party reviews sign --full-index Git diff bytes.
@@ -1124,6 +1266,90 @@ class CaptainLargePrMergeGuardTests(unittest.TestCase):
                     self.assertFalse(rejected, detail)
                     self.assertEqual(detail["status"], "not_proven")
 
+    def test_http406_local_fallback_accepts_only_signed_full_index_same_hunks(self) -> None:
+        # Provider HTTP 406 supplies no patch. This uses only committed Git
+        # objects, the HEAD-attribute-pinned local fallback and the exact
+        # first-party full-index format; no caller-provided PASS is trusted.
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            _git(repo, "init", "-q")
+            _git(repo, "config", "user.email", "captain-test@example.invalid")
+            _git(repo, "config", "user.name", "Captain Test")
+            path = repo / "app.py"
+            path.write_text(
+                "def item():\n" +
+                "".join(f"    entry_{i} = {i}\n" for i in range(20)) +
+                "    return entry_5\n", encoding="utf-8",
+            )
+            _git(repo, "add", "app.py")
+            _git(repo, "commit", "-q", "-m", "base")
+            base = _git(repo, "rev-parse", "HEAD")
+            path.write_text(
+                path.read_text().replace("entry_5 = 5", "entry_5 = 155"),
+                encoding="utf-8",
+            )
+            _git(repo, "add", "app.py")
+            _git(repo, "commit", "-q", "-m", "reviewed")
+            head = _git(repo, "rev-parse", "HEAD")
+            signed = subprocess.check_output([
+                "git", "-C", str(repo), "diff", "--no-ext-diff",
+                "--no-textconv", "--no-renames", "--ignore-submodules=none",
+                "--unified=3", "--full-index", base, head, "--",
+            ])
+            signed_sha = hashlib.sha256(signed).hexdigest()
+            fallback, receipt, errors = merge_guard._merge_guard_local_diff_bytes(
+                repo, base_sha=base, head_sha=head,
+            )
+            self.assertEqual(errors, [])
+            self.assertEqual(receipt["merge_base_sha"], base)
+            self.assertNotEqual(hashlib.sha256(fallback).hexdigest(), signed_sha)
+            arguments = {
+                "base_sha": base, "head_sha": head,
+                "expected_sha256": signed_sha,
+                "fallback_diff": fallback, "fallback_receipt": receipt,
+            }
+            passed, evidence = (
+                merge_guard._merge_guard_first_party_full_index_fallback_equivalence(
+                    repo, **arguments,
+                )
+            )
+            self.assertTrue(passed, evidence)
+            self.assertEqual(evidence["proof_format"],
+                             "signed-first-party-full-index-after-github-http406")
+            self.assertTrue(evidence["canonical_hunks_match"])
+            self.assertEqual(evidence["full_index_sha256"], signed_sha)
+
+            altered = fallback.replace(b"+    entry_5 = 155", b"+    entry_5 = 955")
+            self.assertNotEqual(altered, fallback)
+            forged_receipt = {
+                **receipt, "raw_sha256": hashlib.sha256(altered).hexdigest(),
+            }
+            for label, changes, reason in (
+                ("wrong signed digest", {"expected_sha256": "f" * 64},
+                 "signed_full_index_digest_mismatch"),
+                ("tampered fallback bytes", {"fallback_diff": altered},
+                 "unbound_or_unsupported_fallback"),
+                ("tampered hunks with matching claimed receipt",
+                 {"fallback_diff": altered, "fallback_receipt": forged_receipt},
+                 "canonical_hunks_mismatch"),
+                ("wrong base in fallback", {
+                    "fallback_receipt": {**receipt, "merge_base_sha": "b" * 40},
+                }, "unbound_or_unsupported_fallback"),
+                ("unavailable head", {"head_sha": "a" * 40},
+                 "full_index_unavailable_or_unsupported"),
+                ("binary patch", {"fallback_diff": b"GIT binary patch\n"},
+                 "unbound_or_unsupported_fallback"),
+            ):
+                with self.subTest(label=label):
+                    denied, details = (
+                        merge_guard._merge_guard_first_party_full_index_fallback_equivalence(
+                            repo, **{**arguments, **changes},
+                        )
+                    )
+                    self.assertFalse(denied, details)
+                    self.assertEqual(details["status"], "not_proven")
+                    self.assertEqual(details["reason"], reason)
+
     def test_legacy_review_accepts_diverged_base_with_exact_three_dot_patch(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
@@ -1172,6 +1398,20 @@ class CaptainLargePrMergeGuardTests(unittest.TestCase):
             self.assertFalse(evidence["base_is_ancestor"])
             self.assertEqual(evidence["common_ancestor_sha"], common)
             self.assertEqual(evidence["local_raw_sha256"], review_sha)
+            # On divergent histories BASE..HEAD metadata is not the same
+            # review scope as GitHub's merge-base...HEAD textual PR patch.
+            divergent_raw = subprocess.check_output([
+                "git", "-C", str(repo), "diff", "--no-ext-diff",
+                "--no-textconv", "--no-renames", "--ignore-submodules=none",
+                "--raw", "--abbrev=40", "-z", base, head, "--",
+            ])
+            raw_ok, raw_denied = merge_guard._merge_guard_legacy_local_review_diff_identity(
+                repo, base_sha=base, head_sha=head,
+                expected_sha256=hashlib.sha256(divergent_raw).hexdigest(),
+                provider_diff=github_diff, changed_paths=["app.py"],
+            )
+            self.assertFalse(raw_ok, raw_denied)
+            self.assertEqual(raw_denied["reason"], "source_raw_review_requires_base_ancestor")
 
             gh = _RenamePrGh(change_status="modified")
             gh.base_sha = base
@@ -1526,6 +1766,48 @@ class CaptainLargePrMergeGuardTests(unittest.TestCase):
         self.assertTrue(merge_guard._merge_guard_diff_contains_binary_metadata(binary_diff))
         self.assertTrue(
             merge_guard._merge_guard_diff_contains_binary_metadata(patch_binary_diff)
+        )
+
+    def test_local_bound_binary_summary_keeps_exact_blob_oid_evidence(self) -> None:
+        temporary, repo, base_sha, _, _ = _large_git_repo(file_count=2)
+        self.addCleanup(temporary.cleanup)
+        binary = repo / "release" / "poster.bin"
+        binary.write_bytes(bytes(range(256)) * 4)
+        _git(repo, "add", "release/poster.bin")
+        _git(repo, "commit", "-q", "-m", "add binary")
+        first_head = _git(repo, "rev-parse", "HEAD")
+        first, evidence, errors = merge_guard._merge_guard_local_diff_bytes(
+            repo, base_sha=base_sha, head_sha=first_head
+        )
+        self.assertEqual(errors, [])
+        self.assertIn(b"Binary files /dev/null and b/release/poster.bin differ", first)
+        self.assertEqual(evidence["binary_metadata"]["kind"], "exact-commit-git-blob-oids")
+        self.assertEqual(evidence["binary_metadata"]["head_sha"], first_head)
+        self.assertEqual(len(evidence["binary_metadata"]["raw_object_delta_sha256"]), 64)
+
+        binary.write_bytes(bytes(range(256)) * 4 + b"working-tree-only")
+        same, same_evidence, same_errors = merge_guard._merge_guard_local_diff_bytes(
+            repo, base_sha=base_sha, head_sha=first_head
+        )
+        self.assertEqual(same_errors, [])
+        self.assertEqual(same, first)
+        self.assertEqual(same_evidence["binary_metadata"], evidence["binary_metadata"])
+
+        _git(repo, "add", "release/poster.bin")
+        _git(repo, "commit", "-q", "-m", "change binary content")
+        second_head = _git(repo, "rev-parse", "HEAD")
+        second, second_evidence, second_errors = merge_guard._merge_guard_local_diff_bytes(
+            repo, base_sha=base_sha, head_sha=second_head
+        )
+        self.assertEqual(second_errors, [])
+        self.assertNotEqual(first_head, second_head)
+        self.assertNotEqual(
+            evidence["binary_metadata"]["raw_object_delta_sha256"],
+            second_evidence["binary_metadata"]["raw_object_delta_sha256"],
+        )
+        self.assertNotEqual(
+            merge_guard.github_pr_diff_identity_sha256(first),
+            merge_guard.github_pr_diff_identity_sha256(second),
         )
 
     def test_local_bound_diff_supports_large_text_release(self) -> None:

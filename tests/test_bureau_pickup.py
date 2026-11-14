@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import hashlib
 from datetime import datetime, timedelta, timezone
 import json
 import os
@@ -1117,6 +1118,45 @@ class BureauPickupTests(unittest.TestCase):
         }
         acquisition["acquisition_sha256"] = pickup._sha256(acquisition)
         pickup._validate_acquisition(acquisition)
+
+    def test_canonical_registry_scan_hashes_more_than_16mib(self) -> None:
+        # Current signed Bureau inventory exceeds the old 16 MiB ceiling.
+        # Keep hashing every complete file instead of trusting a size-only
+        # shortcut or skipping the source identity check.
+        chunk = b"r" * (5 * 1024 * 1024)
+        paths = [f"registry/tasks/large-{n}.json" for n in range(4)]
+        with mock.patch.object(
+            pickup.bureau,
+            "_read_regular_file_snapshot",
+            return_value=mock.Mock(raw=chunk),
+        ) as read:
+            observed = pickup._observed_registry_tree_sha256(
+                self.registry_root, paths
+            )
+        expected = hashlib.sha256()
+        for item in paths:
+            encoded = Path(item).as_posix().encode("utf-8")
+            expected.update(len(encoded).to_bytes(4, "big"))
+            expected.update(encoded)
+            expected.update(len(chunk).to_bytes(8, "big"))
+            expected.update(chunk)
+        self.assertEqual(expected.hexdigest(), observed)
+        self.assertEqual(read.call_count, 4)
+
+    def test_canonical_registry_scan_still_rejects_above_32mib(self) -> None:
+        chunk = b"r" * (5 * 1024 * 1024)
+        paths = [f"registry/tasks/too-large-{n}.json" for n in range(7)]
+        self.assertEqual(pickup.MAX_REGISTRY_TREE_BYTES, 32 * 1024 * 1024)
+        with mock.patch.object(
+            pickup.bureau,
+            "_read_regular_file_snapshot",
+            return_value=mock.Mock(raw=chunk),
+        ) as read:
+            with self.assertRaisesRegex(
+                pickup.BureauPickupError, "canonical-registry-tree-too-large"
+            ):
+                pickup._observed_registry_tree_sha256(self.registry_root, paths)
+        self.assertEqual(read.call_count, 7)
 
     def managed_registry_fixture(self):
         source_commit = "a" * 40

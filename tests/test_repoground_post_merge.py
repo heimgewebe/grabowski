@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from pathlib import Path
+import json
 import sqlite3
 import subprocess
 import tempfile
@@ -175,6 +177,78 @@ class RepoGroundPostMergeConvergenceTests(unittest.TestCase):
             sleep_fn=lambda _seconds: None,
         )
 
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["reason"], "publisher_failed")
+
+    def test_publisher_warn_existing_fresh_ancestor_is_satisfied(self) -> None:
+        # A verified older Captain merge can already be included in a newer
+        # healthy, current-head bundle. Its historic publisher may say warn.
+        result = post_merge.converge(
+            repository=REPO,
+            merge_sha=MERGE,
+            publisher_runner=lambda _argv, _timeout: publisher_result("warn"),
+            freshness_reader=lambda _repo: freshness(
+                state="fresh_exact", bundle=HEAD, live=HEAD
+            ),
+            ancestry_checker=lambda _path, merge, head: (merge, head) == (MERGE, HEAD),
+            max_attempts=1,
+        )
+        self.assertEqual(result["status"], "fresh_exact")
+        self.assertEqual(result["attempts"][0]["publisher_status"], "warn")
+        self.assertTrue(result["final"]["merge_is_ancestor"])
+
+    def test_publisher_warn_stale_bundle_is_not_satisfied(self) -> None:
+        result = post_merge.converge(
+            repository=REPO,
+            merge_sha=MERGE,
+            publisher_runner=lambda _argv, _timeout: publisher_result("warn"),
+            freshness_reader=lambda _repo: freshness(
+                state="stale_head", bundle=MERGE, live=HEAD
+            ),
+            ancestry_checker=lambda _path, _merge, _head: True,
+            max_attempts=1,
+        )
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["reason"], "publisher_failed")
+
+    def test_publisher_warn_unrelated_merge_is_not_satisfied(self) -> None:
+        result = post_merge.converge(
+            repository=REPO,
+            merge_sha=MERGE,
+            publisher_runner=lambda _argv, _timeout: publisher_result("warn"),
+            freshness_reader=lambda _repo: freshness(
+                state="fresh_exact", bundle=HEAD, live=HEAD
+            ),
+            ancestry_checker=lambda _path, _merge, _head: False,
+            max_attempts=1,
+        )
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["reason"], "publisher_failed")
+
+    def test_publisher_warn_remote_mismatch_is_not_satisfied(self) -> None:
+        result = post_merge.converge(
+            repository=REPO,
+            merge_sha=MERGE,
+            publisher_runner=lambda _argv, _timeout: publisher_result("warn"),
+            freshness_reader=lambda _repo: freshness(
+                state="fresh_exact", bundle=HEAD, live=HEAD, remote="c" * 40
+            ),
+            ancestry_checker=lambda _path, _merge, _head: True,
+            max_attempts=1,
+        )
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["reason"], "publisher_failed")
+
+    def test_publisher_warn_nonzero_rc_still_fails_without_freshness_read(self) -> None:
+        result = post_merge.converge(
+            repository=REPO,
+            merge_sha=MERGE,
+            publisher_runner=lambda _argv, _timeout: publisher_result("warn", returncode=1),
+            freshness_reader=lambda _repo: (_ for _ in ()).throw(
+                AssertionError("nonzero publisher must not use freshness")
+            ),
+            max_attempts=1,
+        )
         self.assertEqual(result["status"], "failed")
         self.assertEqual(result["reason"], "publisher_failed")
 
@@ -661,6 +735,113 @@ class RepoGroundCaptainAuditFollowupTests(unittest.TestCase):
 
 class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
 
+    def test_first_run_with_verified_large_audit_starts_bounded_window(self) -> None:
+        # A new host can inherit a >100k-record verified Captain audit and
+        # have no discovery watermark yet. This must not require manual
+        # initialization of live TaskStore metadata.
+        def row(ordinal: int) -> dict:
+            return {
+                "record": {"operation": "runtime-observation", "timestamp_unix": 9_950},
+                "evidence": {
+                    "record_sha256": f"{ordinal:064x}",
+                    "global_ordinal": ordinal,
+                },
+            }
+
+        rows = [row(ordinal) for ordinal in range(1, 6)]
+        snapshot = types.SimpleNamespace(
+            total_records=5,
+            segments=(types.SimpleNamespace(
+                global_start_ordinal=1, global_end_ordinal=5,
+            ),),
+        )
+        observed_orders = []
+
+        def iter_items(_snapshot: object, *, order: str) -> object:
+            observed_orders.append(order)
+            return iter(rows if order == "asc" else list(reversed(rows)))
+
+        audit_query = types.SimpleNamespace(
+            MAX_SCAN_RECORDS=3,
+            capture_verified_audit_snapshot=lambda: snapshot,
+            _iter_snapshot_items=iter_items,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            db = Path(temporary) / "tasks.sqlite3"
+            with sqlite3.connect(db) as connection:
+                connection.execute(
+                    "CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+                )
+
+            @contextmanager
+            def database_connection():
+                connection = sqlite3.connect(db)
+                try:
+                    with connection:
+                        yield connection
+                finally:
+                    connection.close()
+
+            operator = types.SimpleNamespace(STATE_DIR=Path(temporary))
+            tasks_module = types.SimpleNamespace(
+                _database_connection=database_connection
+            )
+            with (
+                patch.dict(sys.modules, {
+                    "grabowski_audit_query": audit_query,
+                    "grabowski_operator_core": operator,
+                    "grabowski_tasks": tasks_module,
+                }),
+                patch.object(post_merge.time, "time", return_value=10_000),
+                patch.object(
+                    post_merge, "resolve_job_starter",
+                    return_value=lambda *_a, **_k: {},
+                ),
+            ):
+                first = post_merge.reconcile_recent_captain_audit_followups(
+                    lookback_seconds=100,
+                )
+                with database_connection() as connection:
+                    saved = dict(connection.execute(
+                        "SELECT key, value FROM metadata"
+                    ).fetchall())
+                self.assertEqual(
+                    json.loads(saved[post_merge.RECONCILE_DISCOVERY_METADATA_KEY]),
+                    {"schema_version": 1, "global_ordinal": 3},
+                )
+                self.assertEqual(
+                    json.loads(saved[post_merge.RECONCILE_SCAN_NEXT_METADATA_KEY]),
+                    {"schema_version": 1, "next_ordinal": 4},
+                )
+                second = post_merge.reconcile_recent_captain_audit_followups(
+                    lookback_seconds=100,
+                )
+
+            with database_connection() as connection:
+                persisted = dict(connection.execute(
+                    "SELECT key, value FROM metadata"
+                ).fetchall())
+
+        self.assertEqual(observed_orders, ["asc", "asc"])
+        self.assertEqual(first["scan_mode"], "bounded_rotation")
+        self.assertEqual(first["discovery_ordinal_before"], 0)
+        self.assertEqual(first["discovery_ordinal_after"], 3)
+        self.assertEqual(first["scanned_records"], 3)
+        self.assertEqual(first["scan_next_after"], 4)
+        self.assertTrue(first["progress_persisted"])
+        self.assertEqual(second["discovery_ordinal_before"], 3)
+        self.assertEqual(second["discovery_ordinal_after"], 5)
+        self.assertEqual(second["scanned_records"], 2)
+        self.assertTrue(second["progress_persisted"])
+        self.assertEqual(
+            json.loads(persisted[post_merge.RECONCILE_DISCOVERY_METADATA_KEY]),
+            {"schema_version": 1, "global_ordinal": 5},
+        )
+        self.assertEqual(
+            json.loads(persisted[post_merge.RECONCILE_SCAN_NEXT_METADATA_KEY]),
+            {"schema_version": 1, "next_ordinal": 6},
+        )
+
     def test_reconciler_uses_core_after_facade_split(self) -> None:
         def row(ordinal: int) -> dict:
             return {
@@ -789,6 +970,10 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
             }),
             patch.object(post_merge.time, "time", return_value=10_000),
             patch.object(post_merge, "resolve_job_starter", return_value=starter),
+            patch.object(
+                post_merge, "_publisher_inventory_missing_repository",
+                return_value=False,
+            ),
         ):
             result = post_merge.reconcile_recent_captain_audit_followups(
                 lookback_seconds=100,
@@ -1438,6 +1623,7 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
         cases = (
             ("merge_verification_not_passed", True),
             ("captain_merge_not_fast_path_eligible", True),
+            ("publisher_target_branch_not_canonical", True),
             ("durable_freshness_job_slots_exhausted", True),
             ("unrecognized_not_scheduled_reason", False),
         )
@@ -5121,6 +5307,199 @@ class RepoGroundPostMergeSchedulingTests(unittest.TestCase):
         self.assertEqual(result["unit"], "grabowski-job-unknown123456")
         self.assertIn("job_not_started", result["does_not_establish"])
         self.assertIn("merge_failure", result["does_not_establish"])
+
+
+
+class PublisherInventoryAdmissionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        post_merge._publisher_authoritative_members.cache_clear()
+        post_merge._publisher_canonical_publication_ref.cache_clear()
+
+    def tearDown(self) -> None:
+        post_merge._publisher_authoritative_members.cache_clear()
+        post_merge._publisher_canonical_publication_ref.cache_clear()
+
+    @staticmethod
+    def authoritative_inventory(members: list[str]) -> dict[str, object]:
+        return {
+            "returncode": 0,
+            "payload": {
+                "status": "ok",
+                "membership": {
+                    "schema": "repoground.fleet-membership-authority.v1",
+                    "member_count": len(members),
+                    "members": members,
+                },
+            },
+        }
+
+    def test_nonmember_repos_are_not_scheduled(self) -> None:
+        for repository in ("Hall-of-Memory/memoraevents", "example-org/nonmember-repository"):
+            post_merge._publisher_authoritative_members.cache_clear()
+            inventory = self.authoritative_inventory(["heimgewebe/grabowski"])
+            with patch.object(post_merge, "_run_publisher", return_value=inventory) as publisher:
+                self.assertTrue(post_merge._publisher_inventory_missing_repository(repository))
+                self.assertTrue(post_merge._publisher_inventory_missing_repository(repository))
+                publisher.assert_called_once_with(
+                    [str(post_merge.DEFAULT_PUBLISHER), "--inventory"], 15
+                )
+
+            request = {
+                "status": "ready",
+                "repository": repository,
+                "merge_sha": MERGE,
+                "argv": ["python3", "-B", "post-merge", "--repo", repository],
+                "cwd": "/tmp",
+            }
+            with patch.object(
+                post_merge, "captain_followup_request_from_audit", return_value=request
+            ), patch.object(
+                post_merge, "_publisher_inventory_missing_repository", return_value=True
+            ):
+                result = post_merge.schedule_from_captain_audit_completion(
+                    "d" * 64,
+                    job_starter=lambda *args, **kwargs: self.fail("must not dispatch"),
+                    python_executable=sys.executable,
+                    script_path=Path(__file__),
+                )
+            self.assertEqual("not_scheduled", result["status"])
+            self.assertEqual("publisher_inventory_missing_repository", result["reason"])
+            self.assertEqual("d" * 64, result["captain_audit_completion_sha256"])
+            self.assertIn("publication_completed", result["does_not_establish"])
+
+    @staticmethod
+    def canonical_freshness(repo: str, *, ref: str = "main") -> dict[str, object]:
+        return {
+            "repo": repo, "freshness": "fresh_exact", "freshness_status": "fresh",
+            "bundle": {"ref": ref, "git_commit": HEAD, "git_dirty": False},
+            "live_repo": {
+                "head": HEAD, "dirty": False, "source_kind": "publication_source_checkout",
+                "branch_head_observation": {
+                    "status": "observed", "basis": "git_ls_remote_origin",
+                    "returncode": 0, "ref": ref, "full_ref": f"refs/heads/{ref}",
+                    "head": HEAD,
+                },
+            },
+        }
+
+    def test_offbranch_merged_pr_is_terminal_without_publisher_job(self) -> None:
+        repo = "heimgewebe/heim-pc"
+        request = {
+            "status": "ready", "repository": repo, "merge_sha": MERGE,
+            "target_branch": "feat/nixos-seagate-primary-candidate-20261023",
+            "argv": ["python3", "-B", "post-merge", "--repo", repo], "cwd": "/tmp",
+        }
+        with (
+            patch.object(post_merge, "captain_followup_request_from_audit", return_value=request),
+            patch.object(post_merge, "_run_publisher", return_value=self.authoritative_inventory([repo])),
+            patch.object(post_merge, "_read_freshness", return_value=self.canonical_freshness(repo)) as read,
+        ):
+            result = post_merge.schedule_from_captain_audit_completion(
+                "f" * 64, job_starter=lambda *args, **kw: self.fail("must not dispatch"),
+                python_executable=sys.executable, script_path=Path(__file__),
+            )
+        self.assertEqual(result["status"], "not_scheduled")
+        self.assertEqual(result["reason"], "publisher_target_branch_not_canonical")
+        self.assertEqual(result["publication_branch"], "main")
+        self.assertIn("publication_completed", result["does_not_establish"])
+        self.assertEqual(result["captain_audit_completion_sha256"], "f" * 64)
+        read.assert_called_once_with(repo)
+
+    def test_matching_canonical_ref_keeps_publication_job(self) -> None:
+        repo = "heimgewebe/heim-pc"
+        for ref in ("main", "release/v2"):
+            self.setUp()
+            request = {
+                "status": "ready", "repository": repo, "merge_sha": MERGE,
+                "target_branch": ref, "argv": ["python3", "-B", "post-merge"],
+                "cwd": "/tmp",
+            }
+            with (
+                patch.object(post_merge, "captain_followup_request_from_audit", return_value=request),
+                patch.object(post_merge, "_run_publisher", return_value=self.authoritative_inventory([repo])),
+                patch.object(post_merge, "_read_freshness", return_value=self.canonical_freshness(repo, ref=ref)),
+            ):
+                result = post_merge.schedule_from_captain_audit_completion(
+                    "e" * 64,
+                    job_starter=lambda *args, **kw: {"unit": "grabowski-job-expected", "reused": False},
+                    python_executable=sys.executable, script_path=Path(__file__),
+                )
+            self.assertEqual(result["status"], "scheduled")
+
+    def test_stale_or_unknown_publication_must_not_exclude(self) -> None:
+        repo = "heimgewebe/heim-pc"
+        request = {
+            "status": "ready", "repository": repo, "merge_sha": MERGE,
+            "target_branch": "release/old", "argv": ["python3", "-B", "post-merge"],
+            "cwd": "/tmp",
+        }
+        fresh = self.canonical_freshness(repo)
+        for bad in (
+            None,
+            {**fresh, "freshness": "stale"},
+            {**fresh, "bundle": {**fresh["bundle"], "git_dirty": True}},
+            {**fresh, "live_repo": {**fresh["live_repo"], "branch_head_observation": {"status": "unavailable"}}},
+        ):
+            self.setUp()
+            with (
+                patch.object(post_merge, "captain_followup_request_from_audit", return_value=request),
+                patch.object(post_merge, "_run_publisher", return_value=self.authoritative_inventory([repo])),
+                patch.object(post_merge, "_read_freshness", return_value=bad),
+            ):
+                result = post_merge.schedule_from_captain_audit_completion(
+                    "a" * 64,
+                    job_starter=lambda *args, **kw: {"unit": "grabowski-job-expected", "reused": False},
+                    python_executable=sys.executable, script_path=Path(__file__),
+                )
+            self.assertEqual(result["status"], "scheduled")
+
+    def test_unknown_fleet_membership_must_not_exclude(self) -> None:
+        repo = "heimgewebe/heim-pc"
+        request = {
+            "status": "ready", "repository": repo, "merge_sha": MERGE,
+            "target_branch": "feature/old", "argv": ["python3", "-B", "post-merge"],
+            "cwd": "/tmp",
+        }
+        with (
+            patch.object(post_merge, "captain_followup_request_from_audit", return_value=request),
+            patch.object(post_merge, "_run_publisher", side_effect=OSError("inventory unavailable")),
+            patch.object(post_merge, "_read_freshness", return_value=self.canonical_freshness(repo)) as read,
+        ):
+            result = post_merge.schedule_from_captain_audit_completion(
+                "b" * 64,
+                job_starter=lambda *args, **kw: {"unit": "grabowski-job-expected", "reused": False},
+                python_executable=sys.executable, script_path=Path(__file__),
+            )
+        self.assertEqual(result["status"], "scheduled")
+        read.assert_not_called()
+
+    def test_authoritative_members_are_not_excluded(self) -> None:
+        repo = "heimgewebe/grabowski"
+        with patch.object(
+            post_merge, "_run_publisher",
+            return_value=self.authoritative_inventory([repo]),
+        ) as publisher:
+            self.assertFalse(post_merge._publisher_inventory_missing_repository(repo))
+            publisher.assert_called_once_with(
+                [str(post_merge.DEFAULT_PUBLISHER), "--inventory"], 15
+            )
+
+    def test_ambiguous_or_targeted_inventory_does_not_prove_exclusion(self) -> None:
+        for payload in (
+            {"returncode": 2, "payload": {"status": "invalid", "missing_repositories": ["other/repo"]}},
+            {"returncode": 2, "payload": {"status": "invalid"}},
+            {"returncode": 0, "payload": {"status": "ok", "repos": []}},
+            {"returncode": 1, "payload": {"status": "warn", "membership": {"schema": "repoground.fleet-membership-authority.v1"}}},
+            {"returncode": 0, "payload": {"status": "ok", "membership": {"schema": "repoground.fleet-membership-authority.v1", "members": ["heimgewebe/grabowski"], "member_count": 2}}},
+            {"returncode": 0, "payload": {"status": "ok", "membership": {"schema": "repoground.fleet-membership-authority.v1", "members": ["heimgewebe/grabowski", "heimgewebe/grabowski"], "member_count": 2}}},
+            {"returncode": 1, "payload": {"status": "error"}},
+        ):
+            post_merge._publisher_authoritative_members.cache_clear()
+            with patch.object(post_merge, "_run_publisher", return_value=payload):
+                self.assertFalse(post_merge._publisher_inventory_missing_repository("example-org/nonmember-repository"))
+        post_merge._publisher_authoritative_members.cache_clear()
+        with patch.object(post_merge, "_run_publisher", side_effect=OSError("unavailable")):
+            self.assertFalse(post_merge._publisher_inventory_missing_repository("example-org/nonmember-repository"))
 
 
 if __name__ == "__main__":

@@ -58,7 +58,9 @@ MACHINE_COMPLETION_BINDING_FIELDS = (
     "source_commit",
 )
 MAX_REQUEST_BYTES = 1024 * 1024
-MAX_REGISTRY_TREE_BYTES = 16 * 1024 * 1024
+# Hash each inventory entry with its existing safe reader, while bounding total
+# work above the size of the current legitimate canonical Bureau Registry.
+MAX_REGISTRY_TREE_BYTES = 32 * 1024 * 1024
 MAX_CLAIM_REJECTION_CODE_BYTES = 128
 MAX_CLAIM_REJECTION_VALUE_BYTES = 16 * 1024
 MIN_LEASE_TTL_SECONDS = 120

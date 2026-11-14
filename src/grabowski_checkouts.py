@@ -656,6 +656,18 @@ def _strict_inventory_readonly_scope() -> Iterator[None]:
             _INVENTORY_READ_ONLY_STACK.reset(token)
 
 
+def _finish_inventory_readonly_snapshot() -> None:
+    """Validate and release captured SQL rows before slow Git observation.
+
+    The strict reader pins DB/WAL identity only while fetching lifecycle and
+    lease rows. Holding those pins across hundreds of Git probes incorrectly
+    fails ordinary concurrent SQLite commits after the rows were captured.
+    """
+    stack = _INVENTORY_READ_ONLY_STACK.get()
+    if stack is not None:
+        stack.pop_all().close()
+
+
 def _readonly_connection(path: Path) -> sqlite3.Connection | None:
     stack = _INVENTORY_READ_ONLY_STACK.get()
     if not path.exists():
@@ -753,11 +765,15 @@ def _lifecycle_public(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _lifecycle_bindings(keys: Iterable[str]) -> dict[str, dict[str, Any]]:
+def _lifecycle_bindings(
+    keys: Iterable[str], *, connection: sqlite3.Connection | None = None,
+) -> dict[str, dict[str, Any]]:
     wanted = sorted(set(keys))
     if not wanted:
         return {}
-    connection = _readonly_connection(CHECKOUT_DB)
+    owns_connection = connection is None
+    if owns_connection:
+        connection = _readonly_connection(CHECKOUT_DB)
     if connection is None:
         return {}
     try:
@@ -768,7 +784,8 @@ def _lifecycle_bindings(keys: Iterable[str]) -> dict[str, dict[str, Any]]:
     except sqlite3.OperationalError:
         return {}
     finally:
-        connection.close()
+        if owns_connection:
+            connection.close()
     return {row["checkout_key"]: _lifecycle_public(row) for row in rows}
 
 
@@ -838,12 +855,16 @@ def _live_checkout_lease_keys(*, now: int) -> dict[str, str]:
             ).fetchall()
         return {str(row["resource_key"]): str(row["owner_id"]) for row in rows}
 
-    try:
-        return read_once()
-    except resources.ResourceSchemaInventoryChanged:
-        # SQLite can remove a checkpointed WAL between the sidecar check and
-        # its first stat; one fresh read recovers a quiescent snapshot.
-        return read_once()
+    # Resource-store WAL creation/checkpoint can turn over two sidecars while
+    # an inventory starts. Reopen the entire read, never combine partial rows.
+    # Persistent churn still propagates to the caller as an explicit partial.
+    for attempt in range(3):
+        try:
+            return read_once()
+        except resources.ResourceSchemaInventoryChanged:
+            if attempt == 2:
+                raise
+            time.sleep(0.04 * (attempt + 1))
 
 
 def _active_lifecycle_consumes_capacity(
@@ -1036,9 +1057,12 @@ def _active_capacity_projection(
     now: int,
     max_path_observations: int = MAX_ACTIVE_CAPACITY_PATH_OBSERVATIONS,
     deadline_monotonic: float | None = None,
+    connection: sqlite3.Connection | None = None,
 ) -> dict[str, Any]:
     """Read one repository's active capacity without creating state on absence."""
-    connection = _readonly_connection(CHECKOUT_DB)
+    owns_connection = connection is None
+    if owns_connection:
+        connection = _readonly_connection(CHECKOUT_DB)
     if connection is None:
         return _unavailable_active_capacity_projection()
     try:
@@ -1052,7 +1076,8 @@ def _active_capacity_projection(
     except sqlite3.OperationalError:
         return _unavailable_active_capacity_projection()
     finally:
-        connection.close()
+        if owns_connection:
+            connection.close()
 
 
 def active_capacity_projection(repo: Path) -> dict[str, Any]:
@@ -1415,11 +1440,15 @@ def _mark_checkout_archived(
     return lifecycle
 
 
-def _retention_records(keys: Iterable[str]) -> dict[str, dict[str, Any]]:
+def _retention_records(
+    keys: Iterable[str], *, connection: sqlite3.Connection | None = None,
+) -> dict[str, dict[str, Any]]:
     wanted = sorted(set(keys))
     if not wanted:
         return {}
-    connection = _readonly_connection(CHECKOUT_DB)
+    owns_connection = connection is None
+    if owns_connection:
+        connection = _readonly_connection(CHECKOUT_DB)
     if connection is None:
         return {}
     try:
@@ -1430,7 +1459,8 @@ def _retention_records(keys: Iterable[str]) -> dict[str, dict[str, Any]]:
     except sqlite3.OperationalError:
         return {}
     finally:
-        connection.close()
+        if owns_connection:
+            connection.close()
     return {row["checkout_key"]: _retention_public(row) for row in rows}
 
 def _release_retention_exact(retention: dict[str, Any]) -> bool:
@@ -1475,11 +1505,15 @@ def _archive_supersession_ids(connection: sqlite3.Connection) -> set[str]:
     }
 
 
-def _latest_archives(keys: Iterable[str]) -> dict[str, dict[str, Any]]:
+def _latest_archives(
+    keys: Iterable[str], *, connection: sqlite3.Connection | None = None,
+) -> dict[str, dict[str, Any]]:
     wanted = sorted(set(keys))
     if not wanted:
         return {}
-    connection = _readonly_connection(CHECKOUT_DB)
+    owns_connection = connection is None
+    if owns_connection:
+        connection = _readonly_connection(CHECKOUT_DB)
     if connection is None:
         return {}
     try:
@@ -1495,7 +1529,8 @@ def _latest_archives(keys: Iterable[str]) -> dict[str, dict[str, Any]]:
     except sqlite3.OperationalError:
         return {}
     finally:
-        connection.close()
+        if owns_connection:
+            connection.close()
     latest: dict[str, dict[str, Any]] = {}
     for row in rows:
         if row["archive_id"] in superseded or row["checkout_key"] in latest:
@@ -5587,6 +5622,7 @@ def _linked_checkout_coordination(
     include_tasks: bool = True,
     include_resources: bool = True,
     ignored_lease_owner_ids: Iterable[str] = (),
+    resource_leases: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     if owner_id is not None:
         _owner(owner_id)
@@ -5596,7 +5632,9 @@ def _linked_checkout_coordination(
     )
     resource_blockers: list[dict[str, Any]] = []
     if include_resources:
-        for lease in _read_resource_leases():
+        for lease in (
+            resource_leases if resource_leases is not None else _read_resource_leases()
+        ):
             if lease["owner_id"] in ignored_owners:
                 continue
             resource_key = lease["resource_key"]
@@ -6011,18 +6049,28 @@ def checkout_inventory(
         timeout_seconds=git_timeout,
     )
     keys = [record["checkout_key"] for record in records]
-    retention = _retention_records(keys)
-    bindings = _lifecycle_bindings(keys)
-    archives = _latest_archives(keys)
     now = _now()
-    active_capacity = _active_capacity_projection(
-        common_dir,
-        now=now,
-        max_path_observations=(
-            0 if bounded_observation else MAX_ACTIVE_CAPACITY_PATH_OBSERVATIONS
-        ),
-        deadline_monotonic=deadline_monotonic,
-    )
+    # One SQLite transaction for checkout metadata, retaining strict WAL/SHM
+    # admission and source identity. Release before slow Git status probes.
+    metadata_connection = _readonly_connection(CHECKOUT_DB)
+    try:
+        if metadata_connection is not None and not metadata_connection.in_transaction:
+            metadata_connection.execute("BEGIN")
+        retention = _retention_records(keys, connection=metadata_connection)
+        bindings = _lifecycle_bindings(keys, connection=metadata_connection)
+        archives = _latest_archives(keys, connection=metadata_connection)
+        active_capacity = _active_capacity_projection(
+            common_dir,
+            now=now,
+            max_path_observations=(
+                0 if bounded_observation else MAX_ACTIVE_CAPACITY_PATH_OBSERVATIONS
+            ),
+            deadline_monotonic=deadline_monotonic,
+            connection=metadata_connection,
+        )
+    finally:
+        if metadata_connection is not None:
+            metadata_connection.close()
 
     def observation_priority(record: dict[str, Any]) -> tuple[int, str]:
         key = str(record["checkout_key"])
@@ -6039,6 +6087,11 @@ def checkout_inventory(
         return rank, str(record["path"])
 
     ordered_records = sorted(records, key=observation_priority)
+    # All lifecycle and lease evidence is now in Python records. Reuse the
+    # same lease observation for every checkout instead of opening a new SQLite
+    # snapshot per worktree while Git status and remote-ref probes are running.
+    resource_leases = _read_resource_leases() if include_resources and records else []
+    _finish_inventory_readonly_snapshot()
 
     def remaining_git_timeout() -> float | None:
         if deadline_monotonic is None:
@@ -6105,6 +6158,7 @@ def checkout_inventory(
             include_processes=include_processes,
             include_tasks=include_tasks,
             include_resources=include_resources,
+            resource_leases=resource_leases,
         )
         lifecycle = {
             "retention": retention.get(record["checkout_key"]),

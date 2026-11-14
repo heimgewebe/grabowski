@@ -507,14 +507,15 @@ def _normalize_repo_query(repo: str | None) -> str | None:
             raise ValueError(
                 "repo must be a safe repository name, owner__repository, or owner/repository identity"
             )
-        canonical = f"{owner}__{repository}"
+        # GitHub repository identity is case-insensitive; publication IDs are lowercase.
+        canonical = f"{owner.lower()}__{repository.lower()}"
         return RETIRED_CANONICAL_REPOSITORY_ALIASES.get(canonical, canonical)
     safe = _safe_segment(repo)
     if safe is None:
         raise ValueError(
             "repo must be a safe repository name, owner__repository, or owner/repository identity"
         )
-    return safe
+    return safe.lower()
 
 
 def _normalize_refs(

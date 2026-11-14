@@ -6276,7 +6276,13 @@ async def _observe_and_bind_snapshot(
                     "parameters": declaration,
                     "profile": "operator",
                     "allow_mutation": True,
-                    "reason": "Bind the exact authenticated connector tool observation",
+                    # Signed ingress rejects an identical mutating request body.
+                    # Even if tools/list is unchanged, a newly sampled observer
+                    # status must have a distinct signed request identity.
+                    "reason": (
+                        "Bind authenticated connector tool observation sampled at "
+                        f"{time.time_ns()} ns"
+                    ),
                     "user_intent": _SNAPSHOT_OBSERVER_USER_INTENT,
                 }
                 # Signed ingress verifies the full public tool argument carrier.

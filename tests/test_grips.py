@@ -1,6 +1,6 @@
 from __future__ import annotations
 import asyncio
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 
@@ -8704,7 +8704,7 @@ class GripFoundationTests(unittest.TestCase):
         contract_path = Path(__file__).resolve().parents[1] / "config" / "runtime-entrypoint.json"
         contract = json.loads(contract_path.read_text())
         self.assertNotIn("agent-execution-happy-path", contract["expected_tools"])
-        self.assertEqual(206, len(contract["expected_tools"]))
+        self.assertEqual(207, len(contract["expected_tools"]))
         self.assertIn("grabowski_operational_guidance", contract["expected_tools"])
         supporting = {
             (item["module"], item["source"])
@@ -16643,6 +16643,102 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertTrue(guard["post_merge_verification_passed"])
         self.assertEqual("pushed_and_read_back", guard["exact_base_git_cas_merge"]["status"])
 
+    def test_captain_explicit_merge_plan_limit_dispatches_exact_base_cas(self) -> None:
+        original = self._exact_cas_parameters()
+        action = captain_action(
+            target={
+                "repo": "heimgewebe/grabowski",
+                "pr": 96,
+                "base": "main",
+                "merge_method": "merge",
+            }
+        )
+        action["scope"] = deepcopy(original["actions"][0]["scope"])
+        parameters = authorized_captain_run_parameters(actions=[action])
+
+        class PlanLimitedGh(FakeGh):
+            def __call__(self, repo: Path, argv: list[str]) -> dict[str, object]:
+                if any("/rules/branches/" in part for part in argv):
+                    self.calls.append(tuple(argv))
+                    return {
+                        "returncode": 1,
+                        "stdout": "",
+                        "stderr": (
+                            "gh: Upgrade to GitHub Pro or make this repository "
+                            "public to enable this feature. (HTTP 403)"
+                        ),
+                    }
+                if (
+                    argv[:2] == ["api", "repos/heimgewebe/grabowski"]
+                    and "--jq" in argv
+                    and any(".private" in arg for arg in argv)
+                ):
+                    self.calls.append(tuple(argv))
+                    return {
+                        "returncode": 0,
+                        "stdout": json.dumps(
+                            {"private": True, "allow_merge_commit": True}
+                        ),
+                        "stderr": "",
+                    }
+                return super().__call__(repo, argv)
+
+        gh = PlanLimitedGh(
+            view={
+                "number": 96,
+                "state": "OPEN",
+                "baseRefName": "main",
+                "baseRefOid": CAPTAIN_BASE_SHA,
+                "headRefName": "feat/captain",
+                "headRefOid": CAPTAIN_HEAD,
+                "isDraft": False,
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+            },
+            repo_settings={
+                "private": True,
+                "allow_merge_commit": True,
+                "allow_squash_merge": True,
+                "allow_rebase_merge": True,
+                "delete_branch_on_merge": False,
+            },
+            merge_updates_view=False,
+        )
+        closed_view = dict(gh.view, state="CLOSED", mergedAt=None, mergeCommit=None)
+
+        def fake_exact_cas(*args, on_dispatch=None, **kwargs):
+            del args, kwargs
+            if on_dispatch is not None:
+                on_dispatch()
+            gh.view = closed_view
+            return (
+                {"returncode": 0, "stdout": "merged via exact-base Git CAS\\n", "stderr": ""},
+                self._exact_cas_success_evidence(),
+            )
+
+        with patch.object(
+            merge_guard,
+            "_exact_base_git_cas_merge",
+            side_effect=fake_exact_cas,
+        ) as cas:
+            result = grips.grip_run(
+                "captain-run",
+                parameters,
+                profile="captain",
+                allow_mutation=True,
+                command_runner=FakeGit(),
+                github_runner=gh,
+            )
+
+        self.assertEqual("passed", result["receipt"]["status"], result["output"]["blocked_reasons"])
+        self.assertEqual("executed", result["output"]["decision"])
+        execution = result["output"]["executions"][0]
+        self.assertTrue(execution["verification_passed"])
+        self.assertEqual("exact_base_git_cas", execution["base_update_guard_mode"])
+        self.assertTrue(execution["merge_lease_guard"]["branch_merge_policy_revalidation"]["matched"])
+        self.assertEqual([], [c for c in gh.calls if c[:2] == ("pr", "merge")])
+        cas.assert_called_once()
+
     def test_exact_base_cas_closed_pr_reconciliation_fails_without_base_readback_proof(self) -> None:
         parameters = self._exact_cas_parameters()
         gh = FakeGh(
@@ -21751,10 +21847,28 @@ class CaptainAuthorityPathTests(unittest.TestCase):
                         )
                         connection.commit()
                 else:
+                    # Reproduce a pre-contract manually created gate row. The
+                    # generic acquisition API now rejects creating this state,
+                    # but an existing legacy row must still block a live merge.
                     gate = next(key for key in keys if key.startswith("gate:github-merge:"))
-                    resources.acquire_resources(
-                        "alex", [gate], purpose="first concurrent merge", ttl_seconds=60,
-                    )
+                    now = int(time.time())
+                    metadata_json, metadata_sha256 = resources._metadata({})
+                    with resources._database() as connection:
+                        connection.execute(
+                            """
+                            INSERT INTO leases(
+                                resource_key, owner_id, purpose,
+                                acquired_at_unix, updated_at_unix,
+                                expires_at_unix, metadata_sha256,
+                                metadata_json, reclaimed_from_owner
+                            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                            """,
+                            (
+                                gate, "alex", "historical manual merge gate",
+                                now, now, now + 60, metadata_sha256, metadata_json,
+                            ),
+                        )
+                        connection.commit()
                 gh = FakeGh(view={
                     "number": 96, "state": "OPEN", "baseRefName": "main",
                     "baseRefOid": "e" * 40, "headRefOid": CAPTAIN_HEAD,
@@ -22010,10 +22124,34 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             purpose="same repository but disjoint file",
             ttl_seconds=60,
         )
-        resources.acquire_resources(
+        # A foreign repository contributes a REAL typed, fully bound merge
+        # guard. An unbound manually created gate is intentionally rejected.
+        other_repo = Path(self._resource_tempdir.name) / "unrelated-merge-repo"
+        other_repo.mkdir()
+        other_keys = merge_guard.merge_guard_resource_keys(
+            other_repo,
+            repo_slug="heimgewebe/other",
+            pr_number=97,
+            base="main",
+            head="feat/other",
+        )
+        other_gate = next(key for key in other_keys if key.startswith("gate:github-merge:"))
+        resources.acquire_merge_guard_resources(
+            "captain-merge:foreign-other-repo",
             "foreign-other-repo",
-            ["gate:github-merge:heimgewebe-other:main"],
-            purpose="unrelated repository merge", ttl_seconds=60,
+            other_keys,
+            repository=str(other_repo),
+            changed_paths=[str(other_repo / "src" / "other.py")],
+            purpose="unrelated repository merge",
+            ttl_seconds=60,
+            metadata={
+                "merge_guard": {
+                    "head_sha": "f" * 40,
+                    "diff_sha256": "a" * 64,
+                    "base_branch": "main",
+                    "head_branch": "feat/other",
+                }
+            },
         )
         parameters = authorized_captain_run_parameters()
         gh = FakeGh(view={
@@ -22031,8 +22169,8 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertEqual(
             "foreign-same-repo", resources.inspect_resource(local_disjoint)["owner_id"]
         )
-        self.assertEqual("foreign-other-repo", resources.inspect_resource(
-            "gate:github-merge:heimgewebe-other:main"
+        self.assertEqual("captain-merge:foreign-other-repo", resources.inspect_resource(
+            other_gate
         )["owner_id"])
 
     def test_atomic_merge_guard_rejects_incomplete_or_rename_path_evidence(self) -> None:
@@ -22903,6 +23041,137 @@ class WorktreeHygieneReconcileTests(unittest.TestCase):
             "apply_cleanup": apply_cleanup,
             "confirmation": grips.WORKTREE_HYGIENE_CONFIRMATION,
         }
+
+    def test_opt_in_terminal_owners_preserve_authority_and_fail_closed(self) -> None:
+        cases = ("archive", "cleanup", "default", "active", "dirty", "lease",
+                 "owner_conflict", "head_drift", "branch_drift", "source_error",
+                 "physical_drift", "receipt_drift", "archive_error", "cleanup_error",
+                 "binding_drift", "unsafe_plan", "opened", "updated", "successor",
+                 "followup", "unknown", "no_change", "deployed", "merged_opened",
+                 "source_false", "source_absent", "merged_source_false", "owned_opened",
+                 "cleanup_opened", "merged_mismatch", "merged_ambiguous", "github_unavailable")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                path = str(Path(tmp) / "worktree")
+                owner = "lane:" + "b" * 32
+                state = "cleanup_candidate" if case in {"cleanup", "cleanup_error", "unsafe_plan", "cleanup_opened"} else "completed_retained"
+                item = self._owned_item(path, state=state)
+                item["checkout_key"] = "checkout-key"
+                binding = {
+                    "checkout_key": "checkout-key", "owner_id": owner,
+                    "checkout_path": path, "expected_head": self.HEAD,
+                    "expected_branch": self.BRANCH,
+                    "phase": "archived" if state == "cleanup_candidate" else state,
+                    "source": {"kind": "work_lane", "id": "b" * 32},
+                }
+                item["lifecycle"]["binding"] = binding
+                item["lifecycle"]["retention"] = None
+                if state == "cleanup_candidate":
+                    item["lifecycle"]["latest_archive"] = {"owner_id": owner, "archive_id": "archive"}
+                physical = {"signed": "original"}
+                original = {**binding, "physical_checkout": physical, "automatic_cleanup_authorized": True}
+                lane = {"lane_id": "b" * 32, "receipt_sha256": "c" * 64,
+                        "worktree_receipt": {"lifecycle": original}}
+                evidence = {"evidence_sha256": "d" * 64, "lane_receipt_sha256": "c" * 64,
+                            "terminal_state": "pr_merged"}
+                terminal_states = {"opened": "pr_opened", "updated": "pr_updated",
+                    "successor": "successor_handoff", "followup": "blocked_with_durable_followup",
+                    "unknown": None, "no_change": "no_change_proven", "deployed": "deployed"}
+                evidence["terminal_state"] = terminal_states.get(case, "pr_merged")
+                if case in {"merged_opened", "merged_source_false", "owned_opened", "cleanup_opened",
+                            "merged_mismatch", "merged_ambiguous", "github_unavailable"}:
+                    evidence["terminal_state"] = "pr_opened"
+                if case in {"source_false", "merged_source_false"}:
+                    original["automatic_cleanup_authorized"] = False
+                if case == "source_absent":
+                    original.pop("automatic_cleanup_authorized")
+                if case == "owned_opened":
+                    params_owner = owner
+                else:
+                    params_owner = self.OWNER
+                def github_runner(_repo, argv):
+                    if case == "github_unavailable":
+                        return {"returncode": 1, "stderr": "unavailable"}
+                    if argv[:2] == ["repo", "view"]:
+                        return {"returncode": 0, "stdout": json.dumps({"defaultBranchRef": {"name": "main"}})}
+                    pr = {"number": 77, "url": "https://github.com/heimgewebe/grabowski/pull/77",
+                          "state": "MERGED", "baseRefName": "main", "headRefName": self.BRANCH,
+                          "headRefOid": self.HEAD, "mergedAt": "2026-11-12T00:00:00Z"}
+                    if case == "merged_mismatch":
+                        pr["headRefOid"] = "0" * 40
+                    prs = [pr] if case in {"merged_opened", "merged_mismatch"} else [pr, pr] if case == "merged_ambiguous" else []
+                    return {"returncode": 0, "stdout": json.dumps(prs)}
+                if case == "active":
+                    item["lifecycle_state"] = "managed_active_attention"
+                    binding["phase"] = "active"
+                if case == "dirty":
+                    item["status"]["dirty"] = True
+                if case == "lease":
+                    item["coordination"]["blocking"] = True
+                if case == "owner_conflict":
+                    item["lifecycle"]["retention"] = {"owner_id": "other", "retention_until_unix": int(time.time()) + 999}
+                if case == "head_drift":
+                    binding["expected_head"] = "e" * 40
+                if case == "branch_drift":
+                    binding["expected_branch"] = "other"
+                if case == "receipt_drift":
+                    lane["receipt_sha256"] = "e" * 64
+                params = {**self._parameters(tmp, apply_cleanup=True),
+                          "include_terminal_owners": case != "default", "owner_id": params_owner}
+                with (
+                    patch("grabowski_checkouts.checkout_inventory", return_value={"worktrees": [item]}),
+                    patch("grabowski_checkouts._binding_consistency",
+                          return_value={"consistent": case != "binding_drift"}),
+                    patch("grabowski_checkout_terminal_sources.source_terminal_evidence",
+                          side_effect=RuntimeError("source unavailable") if case == "source_error" else None,
+                          return_value=evidence),
+                    patch("grabowski_work_acquire._read_state", return_value=lane),
+                    patch("grabowski_checkouts._verify_expected_physical_checkout_identity",
+                          side_effect=RuntimeError("physical drift") if case == "physical_drift" else None),
+                    patch("grabowski_checkouts.grabowski_checkout_archive",
+                          side_effect=RuntimeError("archive failed") if case == "archive_error" else None,
+                          return_value={"archive": {"archive_id": "archive", "created_at_unix": 100,
+                                                    "retention_until_unix": 200}}) as archive,
+                    patch("grabowski_checkouts.grabowski_checkout_cleanup",
+                          side_effect=RuntimeError("cleanup failed") if case == "cleanup_error" else [
+                              {"plan": {"safe_to_apply": case != "unsafe_plan", "plan_sha256": "f" * 64, "archive_id": "archive"},
+                               "dry_run_record": {"plan_id": "plan"}},
+                              {"applied_at_unix": 300}]) as cleanup,
+                ):
+                    result = grips.run_grip("worktree-hygiene-reconcile", params,
+                                            allow_mutation=True, command_runner=FakeGit(),
+                                            github_runner=github_runner)
+                status = result["receipt"]["status"]
+                if case in {"archive", "no_change", "deployed", "merged_opened"}:
+                    self.assertEqual("passed", status)
+                    archive.assert_called_once()
+                    self.assertEqual(owner, archive.call_args.kwargs["owner_id"])
+                    self.assertEqual(physical, archive.call_args.kwargs["expected_physical_identity"])
+                    cleanup.assert_not_called()
+                elif case == "cleanup":
+                    self.assertEqual("passed", status)
+                    self.assertEqual(2, cleanup.call_count)
+                    for call in cleanup.call_args_list:
+                        self.assertEqual(owner, call.kwargs["owner_id"])
+                    self.assertEqual("f" * 64, cleanup.call_args.kwargs["expected_plan_sha256"])
+                    self.assertEqual(physical, cleanup.call_args_list[0].kwargs["expected_physical_identity"])
+                    self.assertEqual(physical, cleanup.call_args_list[1].kwargs["expected_physical_identity"])
+                    archive.assert_not_called()
+                elif case in {"archive_error", "cleanup_error"}:
+                    self.assertEqual("failed", status)
+                    self.assertTrue(result["output"]["errors"])
+                elif case == "unsafe_plan":
+                    self.assertEqual("blocked", status)
+                    self.assertEqual(1, cleanup.call_count)
+                    archive.assert_not_called()
+                else:
+                    archive.assert_not_called()
+                    cleanup.assert_not_called()
+                    if case in {"head_drift", "branch_drift", "source_error", "physical_drift", "receipt_drift", "binding_drift", "opened", "updated", "successor", "followup",
+                                "unknown", "source_false", "source_absent", "merged_source_false", "owned_opened",
+                                "cleanup_opened", "merged_mismatch", "merged_ambiguous", "github_unavailable"}:
+                        self.assertEqual("blocked", status)
+                        self.assertTrue(result["output"]["errors"])
 
     def test_exact_merged_pr_archives_owned_clean_checkout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -24510,3 +24779,378 @@ class SagaExternalMergeCloseoutGripTests(unittest.TestCase):
         result, append = self.run_closeout()
         self.assertEqual("passed", result["status"])
         append.assert_called_once()
+
+
+class CaptainExplicitPrivatePlanLimitTests(unittest.TestCase):
+    PLAN_LIMIT_403 = (
+        "gh: Upgrade to GitHub Pro or make this repository public "
+        "to enable this feature. (HTTP 403)"
+    )
+
+    class PlanLimitedGh(FakeGh):
+        def __init__(self, error: str | None):
+            super().__init__()
+            self.rule_error = error
+
+        def __call__(self, repo: Path, argv: list[str]) -> dict[str, object]:
+            if self.rule_error is not None and any(
+                "/rules/branches/" in value for value in argv
+            ):
+                self.calls.append(tuple(argv))
+                return {"returncode": 1, "stdout": "", "stderr": self.rule_error}
+            return super().__call__(repo, argv)
+
+    def policy(self, method: str | None, error: str | None = PLAN_LIMIT_403):
+        gh = self.PlanLimitedGh(error)
+        policy, query, errors = grips._captain_repository_merge_policy(
+            Path.cwd(), gh, repo_slug="heimgewebe/infra",
+            requested_method=method, base_branch="main",
+        )
+        return policy, query, errors, gh
+
+    def guard_snapshot(self, method: str, gh: PlanLimitedGh):
+        runner = object.__new__(merge_guard.CaptainMergeGuardRunner)
+        runner.action = {
+            "target": {"repo": "heimgewebe/infra", "base": "main",
+                       "pr": 96, "merge_method": method},
+        }
+        runner.repo_path = Path.cwd()
+        runner.github_runner = gh
+        runner.receipt = {}
+        runner.branch_merge_policy_args = None
+        runner.branch_merge_policy_snapshot = None
+        args = [
+            "api", "--method", "GET", "--paginate", "--slurp", "-f",
+            "per_page=100", "repos/heimgewebe/infra/rules/branches/main",
+        ]
+        runner._capture_branch_merge_policy_snapshot(args, gh(Path.cwd(), args))
+        return runner
+
+    def test_explicit_merge_accepts_known_plan_limit(self):
+        policy, query, errors, _ = self.policy("merge")
+        self.assertEqual([], errors)
+        self.assertEqual("merge", policy["selected_method"])
+        self.assertEqual("--merge", policy["selected_flag"])
+        self.assertEqual(
+            "github_plan_limit_403",
+            policy["branch_merge_policy"]["active_rules_state"],
+        )
+        self.assertIsNone(policy["branch_merge_policy"]["merge_queue_present"])
+        self.assertTrue(query["branch_merge_rules"]["plan_limit_cas_fallback_candidate"])
+
+    def test_implicit_merge_remains_unchanged(self):
+        policy, query, errors, gh = self.policy(None)
+        self.assertEqual([], errors)
+        self.assertEqual("merge", policy["selected_method"])
+        self.assertNotIn("branch_merge_rules", query)
+        self.assertFalse(any("/rules/branches/" in v for call in gh.calls for v in call))
+
+    def test_squash_rebase_and_generic_403_remain_blocked(self):
+        for method, error in (
+            ("squash", self.PLAN_LIMIT_403),
+            ("rebase", self.PLAN_LIMIT_403),
+            ("merge", "gh: forbidden (HTTP 403)"),
+        ):
+            with self.subTest(method=method, error=error):
+                policy, _, errors, _ = self.policy(method, error)
+                self.assertIsNone(policy)
+                self.assertIn("repository_branch_merge_rules_query_failed", errors)
+
+    def test_merge_commit_permission_still_required(self):
+        gh = self.PlanLimitedGh(self.PLAN_LIMIT_403)
+        gh.repo_settings["allow_merge_commit"] = False
+        policy, _, errors = grips._captain_repository_merge_policy(
+            Path.cwd(), gh, repo_slug="heimgewebe/infra",
+            requested_method="merge", base_branch="main",
+        )
+        self.assertEqual("merge", policy["selected_method"])
+        self.assertIn("repository_merge_method_not_allowed:merge", errors)
+
+    def test_dispatch_guard_revalidates_plan_limit(self):
+        gh = self.PlanLimitedGh(self.PLAN_LIMIT_403)
+        runner = self.guard_snapshot("merge", gh)
+        self.assertEqual(
+            [{"type": "github_plan_limit_403"}],
+            runner.branch_merge_policy_snapshot,
+        )
+        self.assertEqual([], runner._revalidate_branch_merge_policy())
+        self.assertTrue(runner.receipt["branch_merge_policy_revalidation"]["matched"])
+
+    def test_dispatch_guard_blocks_plan_change_or_403_drift(self):
+        for later_error, expected in (
+            (None, "merge_guard_branch_merge_policy_drift"),
+            ("gh: forbidden (HTTP 403)", "merge_guard_branch_merge_policy_query_failed"),
+        ):
+            with self.subTest(later_error=later_error):
+                gh = self.PlanLimitedGh(self.PLAN_LIMIT_403)
+                runner = self.guard_snapshot("merge", gh)
+                gh.rule_error = later_error
+                self.assertIn(expected, runner._revalidate_branch_merge_policy())
+
+    def test_dispatch_guard_rejects_plan_limit_for_squash(self):
+        gh = self.PlanLimitedGh(self.PLAN_LIMIT_403)
+        runner = self.guard_snapshot("squash", gh)
+        self.assertIsNone(runner.branch_merge_policy_snapshot)
+        self.assertIn(
+            "merge_guard_branch_merge_policy_snapshot_missing",
+            runner._revalidate_branch_merge_policy(),
+        )
+
+
+
+class HardCaseAutoAdvisoryTests(unittest.TestCase):
+    def sample_signal(self, kind="repeated_failure"):
+        if kind == "repeated_failure":
+            return {"kind": kind, "evidence_refs": ["task-one:failure", "task-two:failure"],
+                    "error_fingerprint": "a" * 64}
+        return {"kind": kind, "evidence_refs": ["event-one:readback", "event-two:readback"]}
+
+    def sample_route(self):
+        return {
+            "reviewers": [{"route": "claude-opus-5.5-high", "harness": "claude",
+                           "route_role": "reviewer", "paid_only": False,
+                           "model": "claude-opus-5.5"}],
+            "review_fallbacks": [{"route": "grok-4.7-review-high",
+                                  "harness": "grok", "route_role": "reviewer",
+                                  "paid_only": False, "model": "grok-4.7"}],
+        }
+
+    def run_signal(self, signal, *, task_class="deep-debug", novelty="high",
+                   risk_flags=None, route=None, starter=None, store_root=None,
+                   objective="Investigate same repeated RustDesk black screen"):
+        router = types.SimpleNamespace(
+            SENSITIVE_EXTERNAL_REVIEW_RISK_FLAGS=frozenset(
+                {"credential", "customer-data", "private-context", "secrets", "user_data"}
+            ),
+            canonical_execution_route=Mock(return_value=route or self.sample_route()),
+        )
+        start = starter or Mock(return_value={
+            "competition_id": "gac-hard-case", "task_id": "task-hard-case",
+            "already_started": False,
+        })
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) if store_root is None else Path(store_root)
+            competition = types.SimpleNamespace(
+                operator=types.SimpleNamespace(_redact=lambda text: text),
+                grabowski_agent_competition_start=start,
+                _competition_root=lambda: root,
+                _competition_request_lock=lambda identifier: nullcontext(),
+                _validated_manifest=lambda identifier: json.loads(
+                    (root / identifier / "manifest.json").read_text()
+                ),
+            )
+            with patch.dict(sys.modules, {"grabowski_agent_competition": competition}):
+                result = grips._agent_execution_hard_case_advisory(
+                    signal=signal, task_class=task_class, novelty=novelty,
+                    risk_flags=(["prior-attempt-failed"] if risk_flags is None else risk_flags),
+                    router=router, repo=Path("/home/test/repo"),
+                    head="b" * 40, source_identity_sha256="c" * 64,
+                    objective=objective, duration_minutes=180, changed_files=3,
+                )
+        return result, start, router
+
+
+    def test_real_source_frontdoor_automatically_starts_bounded_contrast(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp).resolve()
+            head = "b" * 40
+            route = GripFoundationTests()._source_route_decision(executor="controller")
+            route_decision = self.sample_route()
+            router = types.SimpleNamespace(
+                SENSITIVE_EXTERNAL_REVIEW_RISK_FLAGS=frozenset(
+                    {"credential", "customer-data", "private-context", "secrets", "user_data"}
+                ),
+                canonical_execution_route=Mock(side_effect=[route, route_decision]),
+            )
+            acquisition = Mock(return_value={
+                "state": "ready", "next_action": "controller_execute",
+                "lane_id": "a" * 32, "receipt_sha256": "c" * 64,
+                "inputs": {
+                    "execution_plan": None,
+                    "source": {"kind": "direct-user", "id": "rustdesk-hardcase"},
+                    "scoped_writer": None,
+                },
+            })
+            def exact_acquire(parameters, **kwargs):
+                del kwargs
+                result = acquisition.return_value.copy()
+                result["inputs"] = {
+                    "execution_plan": parameters["execution_plan"],
+                    "source": {"kind": "direct-user", "id": "rustdesk-hardcase"},
+                    "scoped_writer": None,
+                }
+                return result
+
+            acquisition.side_effect = exact_acquire
+            work_acquire = types.SimpleNamespace(
+                acquire_work=acquisition,
+                operator=types.SimpleNamespace(
+                    _require_operator_mutation=Mock(), _require_operator_capability=Mock(),
+                    base=types.SimpleNamespace(_append_audit=Mock()),
+                ),
+            )
+            workspace = types.SimpleNamespace(grabowski_agent_workspace_create=Mock())
+            started = Mock(return_value={
+                "competition_id": "gac-auto", "task_id": "task-auto",
+                "already_started": False,
+            })
+            competition = types.SimpleNamespace(
+                operator=types.SimpleNamespace(_redact=lambda text: text),
+                grabowski_agent_competition_start=started,
+                _competition_root=lambda: repo,
+                _competition_request_lock=lambda identifier: nullcontext(),
+            )
+            parameters = {
+                "source_kind": "direct-user", "source_id": "rustdesk-hardcase",
+                "repo": str(repo), "source_revision": head,
+                "write_paths": ["src/grabowski_grips.py"],
+                "objective": "Diagnose a repeatable RustDesk black-screen runtime failure",
+                "test_argv": ["python3", "-m", "unittest", "-q"],
+                "retention_until_unix": int(time.time()) + 9000,
+                "task_class": "deep-debug", "novelty": "high",
+                "risk_flags": ["prior-attempt-failed"],
+                "hard_case_advisory": self.sample_signal(),
+                "_server_runtime_actor_identity": (
+                    grips.grabowski_merge_guard.issue_server_runtime_actor_identity(
+                        object(), profile="operator"
+                    )
+                ),
+            }
+            with (
+                patch.object(
+                    grips, "_agent_execution_frontdoor_modules",
+                    return_value=(router, __import__("grabowski_execution_plan"),
+                                  work_acquire, workspace),
+                ),
+                patch.dict(sys.modules, {"grabowski_agent_competition": competition}),
+            ):
+                result = grips._agent_execution_source_request(
+                    parameters, {"checks": []}, FakeGit(head=head)
+                )
+        self.assertEqual(result["state"], "controller_lane_ready")
+        self.assertEqual(result["hard_case_advisory"]["state"], "dispatched")
+        self.assertEqual(result["hard_case_advisory"]["competition_id"], "gac-auto")
+        self.assertEqual(result["hard_case_advisory"]["authority"], "advisory_only")
+        self.assertEqual(acquisition.call_count, 1)
+        self.assertEqual(started.call_count, 1)
+        self.assertEqual(router.canonical_execution_route.call_count, 2)
+        self.assertEqual(
+            [call.args[0] for call in router.canonical_execution_route.call_args_list],
+            ["deep-debug", "independent-review"],
+        )
+        self.assertNotIn("task-one:failure", started.call_args.kwargs["task"])
+
+
+    def test_repeated_failure_dispatches_exact_subscription_read_only_route(self):
+        result, start, router = self.run_signal(self.sample_signal())
+        self.assertEqual(result["state"], "dispatched")
+        self.assertEqual(result["route_id"], "claude-opus-5.5-high")
+        self.assertTrue(result["non_blocking"])
+        self.assertFalse(result["automatic_apply"])
+        kwargs = start.call_args.kwargs
+        self.assertEqual(kwargs["provider"], "claude")
+        self.assertEqual(kwargs["mode"], "contrast")
+        self.assertEqual(kwargs["max_budget_usd"], 0)
+        self.assertFalse(kwargs["paid_execution_authorized"])
+        self.assertEqual(kwargs["allowed_paths"], ["README.md"])
+        self.assertEqual(kwargs["context_paths"], ["README.md"])
+        self.assertEqual(kwargs["expected_head"], "b" * 40)
+        self.assertEqual(kwargs["route_id"], "claude-opus-5.5-high")
+        self.assertEqual(router.canonical_execution_route.call_count, 1)
+
+    def test_same_incident_has_stable_request_id_across_references(self):
+        one, start, _ = self.run_signal(self.sample_signal())
+        extended = self.sample_signal()
+        extended["evidence_refs"] = ["task-three:failure", "task-four:failure"]
+        two, _, _ = self.run_signal(extended)
+        self.assertEqual(one["request_id"], two["request_id"])
+        self.assertEqual(start.call_count, 1)
+
+    def test_existing_incident_reuses_original_claude_when_reranked_to_grok(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first, first_start, _ = self.run_signal(
+                self.sample_signal(), store_root=root
+            )
+            self.assertEqual(first["state"], "dispatched")
+            request_digest = hashlib.sha256(
+                first["request_id"].encode("utf-8")
+            ).hexdigest()[:10]
+            task_digest = hashlib.sha256(
+                first_start.call_args.kwargs["task"].encode("utf-8")
+            ).hexdigest()[:10]
+            identifier = f"gac-claude-contrast-{task_digest}-{request_digest}"
+            entry = root / identifier
+            entry.mkdir()
+            (entry / "manifest.json").write_text(json.dumps({
+                "request_id": first["request_id"],
+                "provider": "claude",
+                "repository": "/home/test/repo",
+                "expected_head": "b" * 40,
+                "task_id": "original-claude-task",
+                "route_contract": {"route_id": "claude-opus-5.5-high"},
+            }))
+            grok = {"reviewers": [self.sample_route()["review_fallbacks"][0]],
+                    "review_fallbacks": []}
+            duplicate = Mock()
+            second, started, router = self.run_signal(
+                self.sample_signal(), route=grok, store_root=root,
+                starter=duplicate, objective="Changed diagnosis and more logs"
+            )
+            self.assertEqual(second["state"], "reused")
+            self.assertEqual(second["competition_id"], identifier)
+            self.assertEqual(second["task_id"], "original-claude-task")
+            self.assertEqual(second["provider"], "claude")
+            duplicate.assert_not_called()
+            router.canonical_execution_route.assert_not_called()
+
+            # An incomplete first start must block a second provider, not
+            # silently reinterpret an unknown effect as a safe retry.
+            (entry / "manifest.json").unlink()
+            unresolved, _, _ = self.run_signal(
+                self.sample_signal(), route=grok, store_root=root,
+                starter=duplicate
+            )
+            self.assertEqual(unresolved["state"], "unavailable")
+            self.assertEqual(unresolved["reason"], "existing_incident_start_unresolved")
+            self.assertFalse(unresolved["retry_automatically"])
+            duplicate.assert_not_called()
+
+    def test_contradiction_and_architecture_need_strong_qualifying_context(self):
+        conflict = self.sample_signal("contradictory_evidence")
+        yes, start, _ = self.run_signal(conflict, risk_flags=["runtime"])
+        self.assertEqual(yes["state"], "dispatched")
+        no, skipped, _ = self.run_signal(conflict, novelty="low", risk_flags=["runtime"])
+        self.assertEqual(no["state"], "not-triggered")
+        skipped.assert_not_called()
+        architecture = {"kind": "material_architecture", "evidence_refs": ["commit-main-123456"]}
+        accepted, _, _ = self.run_signal(
+            architecture, task_class="architecture", risk_flags=["high-risk"])
+        self.assertEqual(accepted["state"], "dispatched")
+
+    def test_sensitive_context_never_contacts_provider(self):
+        signal = self.sample_signal()
+        result, start, router = self.run_signal(
+            signal, risk_flags=["prior-attempt-failed", "customer-data"])
+        self.assertEqual(result["state"], "withheld")
+        start.assert_not_called()
+        router.canonical_execution_route.assert_not_called()
+
+    def test_provider_failure_does_not_fail_primary_task_or_retry(self):
+        start = Mock(side_effect=RuntimeError("provider transport unavailable"))
+        result, started, _ = self.run_signal(self.sample_signal(), starter=start)
+        self.assertEqual(result["state"], "unavailable")
+        self.assertTrue(result["non_blocking"])
+        self.assertFalse(result["retry_automatically"])
+        self.assertEqual(started.call_count, 1)
+
+    def test_typed_signals_require_real_distinct_references(self):
+        validator = grips._agent_execution_validate_hard_case_advisory
+        with self.assertRaisesRegex(grips.GripPreflightError, "distinct evidence"):
+            validator({"kind": "repeated_failure", "evidence_refs": ["same", "same"],
+                       "error_fingerprint": "a" * 64})
+        with self.assertRaisesRegex(grips.GripPreflightError, "shared error"):
+            validator({"kind": "repeated_failure",
+                       "evidence_refs": ["first-task-id", "second-task-id"],
+                       "error_fingerprint": "not-a-digest"})
+        self.assertIsNone(validator(None))

@@ -168,7 +168,9 @@ _GITHUB_LOGIN_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?\Z"
 _GITHUB_ID_NOREPLY_CUTOFF = datetime(2017, 7, 19, tzinfo=timezone.utc)
 _GITHUB_SCP_REMOTE_RE = re.compile(r"(?:[^@\s]+@)?github\.com:(?P<path>[^?#\s]+)\Z", re.IGNORECASE)
 _MERGE_GUARD_TTL_SECONDS = 300
-_MERGE_GUARD_MAX_CHANGED_PATHS = 3000
+_MERGE_GUARD_MAX_CHANGED_PATHS = 10000
+# GitHub returns at most 3,000 PR file records, even with pagination.
+_MERGE_GUARD_GITHUB_PR_FILES_API_LIMIT = 3000
 _MERGE_GUARD_MAX_CHANGED_PATH_BYTES = 512 * 1024
 _MERGE_GUARD_MAX_SINGLE_CHANGED_PATH_BYTES = 8 * 1024
 _MERGE_GUARD_GITHUB_DIFF_MAX_FILES = 300
@@ -2047,7 +2049,31 @@ def _merge_guard_local_diff_bytes(
     if len(stdout) > _MERGE_GUARD_MAX_DIFF_BYTES:
         return b"", info, ["merge_guard_local_diff_exceeds_byte_limit"]
     if _merge_guard_diff_contains_binary_metadata(stdout):
-        return b"", info, ["merge_guard_local_diff_binary_unsupported"]
+        if re.search(rb"(?m)^GIT binary patch\r?$", stdout):
+            return b"", info, ["merge_guard_local_diff_binary_unsupported"]
+        # The local diff was reconstructed from the exact reviewed commits.
+        # A binary summary omits bytes, so retain their Git blob OIDs as
+        # separate evidence; the live head/base SHA must still match GitHub.
+        object_delta = _merge_guard_local_git_bytes(
+            repo_path,
+            ["diff", "--raw", "--abbrev=40", "-z", "--no-ext-diff",
+             "--no-textconv", "--no-renames", "--ignore-submodules=none",
+             merge_base, head_sha, "--"],
+            timeout=60,
+        )
+        raw_objects = object_delta["stdout_bytes"]
+        if (
+            object_delta["returncode"] != 0 or not raw_objects
+            or len(raw_objects) > 4 * _MERGE_GUARD_MAX_CHANGED_PATH_BYTES
+        ):
+            return b"", info, ["merge_guard_binary_object_delta_unavailable"]
+        info["binary_metadata"] = {
+            "kind": "exact-commit-git-blob-oids",
+            "base_sha": merge_base,
+            "head_sha": head_sha,
+            "raw_object_delta_sha256": hashlib.sha256(raw_objects).hexdigest(),
+            "raw_object_delta_bytes": len(raw_objects),
+        }
     canonical = canonicalize_github_pr_diff_identity(stdout)
     info.update(
         {
@@ -2197,13 +2223,133 @@ def _merge_guard_legacy_local_review_diff_identity(
             "raw_digest_matches_review": local_digest == expected_sha256,
             "canonical_hunks_match": local_canonical_digest == provider_canonical_digest,
         })
-        if local_digest != expected_sha256 or local_canonical_digest != provider_canonical_digest:
-            evidence["reason"] = "review_digest_or_canonical_hunks_mismatch"
+        if local_canonical_digest != provider_canonical_digest:
+            evidence["reason"] = "canonical_hunks_mismatch"
             return False, evidence
+        if local_digest != expected_sha256:
+            # Authenticated first-party reviews sign the exact NUL-delimited
+            # committed --raw Git object delta, not GitHub's textual patch.
+            # Never accept that BASE..HEAD metadata on a diverged base:
+            # GitHub's PR patch is merge-base...HEAD, a different scope.
+            if common_ancestor != base_sha:
+                evidence["reason"] = "source_raw_review_requires_base_ancestor"
+                return False, evidence
+            raw_result = _merge_guard_local_git_bytes(
+                repo_path,
+                [
+                    "diff", "--no-ext-diff", "--no-textconv", "--no-renames",
+                    "--ignore-submodules=none", "--raw", "--abbrev=40", "-z",
+                    base_sha, head_sha, "--",
+                ], timeout=60,
+            )
+            source_raw = raw_result["stdout_bytes"]
+            if (
+                raw_result["returncode"] != 0
+                or not source_raw
+                or len(source_raw) > _MERGE_GUARD_MAX_DIFF_BYTES
+            ):
+                evidence["reason"] = "source_raw_review_unavailable"
+                return False, evidence
+            source_sha256 = hashlib.sha256(source_raw).hexdigest()
+            evidence["source_raw_metadata_sha256"] = source_sha256
+            evidence["source_raw_metadata_matches_review"] = (
+                source_sha256 == expected_sha256
+            )
+            if source_sha256 != expected_sha256:
+                evidence["reason"] = "review_digest_or_canonical_hunks_mismatch"
+                return False, evidence
+            evidence["review_identity_kind"] = "first-party-raw-git-metadata"
+            evidence["raw_digest_matches_review"] = True
+        else:
+            evidence["review_identity_kind"] = "legacy-local-text"
     except (OSError, subprocess.SubprocessError, ValueError, RuntimeError) as exc:
         evidence["reason"] = f"local_evidence_unavailable:{type(exc).__name__}"
         return False, evidence
     evidence["status"] = "proven"
+    return True, evidence
+
+
+
+def _merge_guard_first_party_full_index_fallback_equivalence(
+    repo_path: Path, *, base_sha: str, head_sha: str,
+    expected_sha256: str, fallback_diff: bytes,
+    fallback_receipt: dict[str, Any] | None,
+) -> tuple[bool, dict[str, Any]]:
+    """Prove a signed full-index diff equals a HEAD-attribute-pinned 406 fallback.
+
+    GitHub refuses PR patches above its file/line limits. The already verified
+    fallback compares one exact merge-base/head object pair and pins attributes
+    to HEAD. To admit a separately signed first-party review of that same pair,
+    read its exact full-index bytes and compare the *canonical hunks* to the
+    pinned fallback. Neither the expected digest nor a matching title alone
+    grants authority. Diverged bases, unsupported binary patches, and drift
+    fail closed.
+    """
+    evidence: dict[str, Any] = {
+        "source": "first-party-full-index-versus-pinned-local-pr-diff",
+        "base_sha": base_sha,
+        "head_sha": head_sha,
+        "status": "not_proven",
+    }
+    if (
+        _SHA40_RE.fullmatch(base_sha) is None
+        or _SHA40_RE.fullmatch(head_sha) is None
+        or _SHA256_RE.fullmatch(expected_sha256) is None
+        or not isinstance(fallback_diff, bytes)
+        or not fallback_diff
+        or len(fallback_diff) > _MERGE_GUARD_MAX_DIFF_BYTES
+        or _merge_guard_diff_contains_binary_metadata(fallback_diff)
+        or not isinstance(fallback_receipt, dict)
+        or fallback_receipt.get("source") != "local-bound-git-diff"
+        or fallback_receipt.get("merge_base_sha") != base_sha
+        or fallback_receipt.get("returncode") != 0
+        or fallback_receipt.get("raw_sha256") != hashlib.sha256(fallback_diff).hexdigest()
+    ):
+        evidence["reason"] = "unbound_or_unsupported_fallback"
+        return False, evidence
+    try:
+        result = _merge_guard_local_git_bytes(
+            repo_path,
+            [
+                "-c", "diff.noprefix=false", "-c", "color.ui=never",
+                "diff", "--no-ext-diff", "--no-textconv", "--no-renames",
+                "--ignore-submodules=none", "--no-color", "--unified=3",
+                "--full-index", base_sha, head_sha, "--",
+            ],
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        evidence["reason"] = f"full_index_read_unavailable:{type(exc).__name__}"
+        return False, evidence
+    original = result.get("stdout_bytes")
+    if (
+        result.get("returncode") != 0
+        or not isinstance(original, bytes)
+        or not original
+        or len(original) > _MERGE_GUARD_MAX_DIFF_BYTES
+        or _merge_guard_diff_contains_binary_metadata(original)
+    ):
+        evidence["reason"] = "full_index_unavailable_or_unsupported"
+        return False, evidence
+    signed_sha256 = hashlib.sha256(original).hexdigest()
+    full_canonical = github_pr_diff_identity_sha256(original)
+    fallback_canonical = github_pr_diff_identity_sha256(fallback_diff)
+    evidence.update({
+        "full_index_bytes": len(original),
+        "full_index_sha256": signed_sha256,
+        "full_index_matches_signed_review": signed_sha256 == expected_sha256,
+        "full_index_canonical_sha256": full_canonical,
+        "pinned_fallback_canonical_sha256": fallback_canonical,
+        "canonical_hunks_match": full_canonical == fallback_canonical,
+    })
+    if signed_sha256 != expected_sha256:
+        evidence["reason"] = "signed_full_index_digest_mismatch"
+        return False, evidence
+    if full_canonical != fallback_canonical:
+        evidence["reason"] = "canonical_hunks_mismatch"
+        return False, evidence
+    evidence["status"] = "proven"
+    evidence["proof_format"] = "signed-first-party-full-index-after-github-http406"
     return True, evidence
 
 
@@ -2228,6 +2374,84 @@ def _merge_guard_github_diff_too_large(
         or "diff exceeded the maximum number of files" in message
     )
     return line_limit or file_limit
+
+
+def _merge_guard_exact_large_pr_paths(
+    repo_path: Path, *,
+    changed_files: int, view_files: Any, base_branch: str, pr_number: int,
+    base_sha: str, head_sha: str,
+) -> tuple[list[str], dict[str, Any], list[str]]:
+    """Prove a >3,000-file PR without trusting GitHub's truncated file listing.
+
+    The PR head/base SHA are checked against the live GitHub view by the caller.
+    Git objects must be present at those exact SHAs, and the unique merge-base
+    path set must have the provider's exact changedFiles count. The complete
+    authenticated diff is checked separately; the first provider file page is
+    only an additional disagreement detector, never the source of authority.
+    """
+    receipt: dict[str, Any] = {
+        "source": "exact-head-local-paths-after-github-files-api-cap",
+        "changed_files": changed_files,
+        "github_files_api_limit": _MERGE_GUARD_GITHUB_PR_FILES_API_LIMIT,
+        "base_sha": base_sha,
+        "head_sha": head_sha,
+    }
+    if (
+        type(changed_files) is not int
+        or not _MERGE_GUARD_GITHUB_PR_FILES_API_LIMIT < changed_files <= _MERGE_GUARD_MAX_CHANGED_PATHS
+    ):
+        return [], receipt, ["merge_guard_large_pr_count_out_of_bounds"]
+    objects, object_errors = _merge_guard_ensure_pr_objects(
+        repo_path, base_branch=base_branch, pr_number=pr_number,
+        base_sha=base_sha, head_sha=head_sha,
+    )
+    receipt["git_objects"] = objects
+    if object_errors:
+        return [], receipt, object_errors
+    paths, local_receipt, path_errors = _merge_guard_local_changed_paths(
+        repo_path, base_sha=base_sha, head_sha=head_sha,
+    )
+    receipt["local_paths"] = local_receipt
+    if path_errors:
+        return [], receipt, path_errors
+    receipt["complete_path_count"] = len(paths)
+    receipt["complete_paths_sha256"] = _sha256_json(paths)
+    errors: list[str] = []
+    if len(paths) != changed_files:
+        errors.append("merge_guard_large_pr_changed_file_count_drift")
+    if not isinstance(view_files, list) or not 1 <= len(view_files) <= 100:
+        errors.append("merge_guard_large_pr_provider_file_sample_missing_or_invalid")
+    else:
+        local_set = set(paths)
+        sampled: set[str] = set()
+        for index, item in enumerate(view_files):
+            if not isinstance(item, dict):
+                errors.append(f"merge_guard_large_pr_provider_file_invalid:{index}")
+                continue
+            path = item.get("path")
+            change_type = item.get("changeType")
+            # No provider rename/copy is silently rewritten as a local add.
+            # The small-PR path continues to handle those types explicitly.
+            if (
+                not isinstance(path, str) or not path or path.startswith("/")
+                or "\x00" in path
+                or len(path.encode("utf-8")) > _MERGE_GUARD_MAX_SINGLE_CHANGED_PATH_BYTES
+                or any(part in {"", ".", ".."} for part in path.split("/"))
+                or path in sampled or path not in local_set
+                or change_type not in {"ADDED", "MODIFIED", "DELETED"}
+            ):
+                errors.append(f"merge_guard_large_pr_provider_sample_drift:{index}")
+                continue
+            sampled.add(path)
+        receipt["provider_sample_count"] = len(view_files)
+        receipt["provider_sample_sha256"] = _sha256_json(view_files)
+    if (
+        len(_canonical_json(paths).encode("utf-8"))
+        > _MERGE_GUARD_MAX_CHANGED_PATH_BYTES
+    ):
+        errors.append("merge_guard_large_pr_changed_paths_exceed_byte_limit")
+    receipt["status"] = "verified" if not errors else "blocked"
+    return (paths if not errors else []), receipt, errors
 
 
 def _merge_guard_github_file_records(
@@ -4165,6 +4389,17 @@ class CaptainMergeGuardRunner:
         }
         errors: list[str] = []
         if info["returncode"] != 0:
+            # Snapshot the exact plan-limit state and revalidate it at
+            # dispatch; the CAS guard independently proves eligibility.
+            if (
+                self._explicit_merge_method_requested()
+                and self.action["target"]["merge_method"] == "merge"
+                and _github_rules_plan_limit_error(info["stderr"])
+            ):
+                snapshot = [{"type": "github_plan_limit_403"}]
+                evidence["active_rules_state"] = "github_plan_limit_403"
+                evidence["merge_policy_sha256"] = _sha256_json(snapshot)
+                return snapshot, evidence, []
             errors.append("merge_guard_branch_merge_policy_query_failed")
             return None, evidence, errors
         try:
@@ -5603,6 +5838,22 @@ class CaptainMergeGuardRunner:
         changed_files = viewed.get("changedFiles")
         raw_files = viewed.get("files")
         changed_paths: list[str] = []
+        large_pr_mode = (
+            type(changed_files) is int
+            and _MERGE_GUARD_GITHUB_PR_FILES_API_LIMIT < changed_files
+            <= _MERGE_GUARD_MAX_CHANGED_PATHS
+        )
+        if large_pr_mode:
+            changed_paths, large_receipt, large_errors = (
+                _merge_guard_exact_large_pr_paths(
+                    self.repo_path, changed_files=changed_files,
+                    view_files=raw_files, base_branch=expected_base,
+                    pr_number=pr_number, base_sha=base_sha,
+                    head_sha=expected_head,
+                )
+            )
+            self.receipt["large_pr_paths"] = large_receipt
+            errors.extend(large_errors)
         if type(changed_files) is not int or changed_files < 1:
             errors.append("merge_guard_changed_file_count_invalid")
         elif changed_files > _MERGE_GUARD_MAX_CHANGED_PATHS:
@@ -5615,7 +5866,7 @@ class CaptainMergeGuardRunner:
         ]
         requires_complete_file_projection = (
             type(changed_files) is int
-            and changed_files <= _MERGE_GUARD_MAX_CHANGED_PATHS
+            and changed_files <= _MERGE_GUARD_GITHUB_PR_FILES_API_LIMIT
             and (changed_files > 100 or bool(rename_or_copy_indexes))
         )
         if requires_complete_file_projection:
@@ -5634,7 +5885,11 @@ class CaptainMergeGuardRunner:
                     errors.append("merge_guard_changed_file_count_exceeds_supported_limit")
                     if isinstance(raw_files, list) and len(raw_files) > 128:
                         errors.append("merge_guard_changed_path_count_exceeds_limit")
-        if not isinstance(raw_files, list):
+        if large_pr_mode:
+            # The authenticated Git tree is complete, unlike the provider
+            # file projection capped at 3,000 entries.
+            pass
+        elif not isinstance(raw_files, list):
             errors.append("merge_guard_changed_file_list_missing")
         else:
             for index, item in enumerate(raw_files):
@@ -5790,6 +6045,29 @@ class CaptainMergeGuardRunner:
         else:
             binding_diff_sha256 = canonical_live_diff_sha256
             diff_identity_mode = "unmatched"
+        # GitHub's HTTP 406 file/line cap has no provider patch bytes.
+        # The local fallback above already proved the paths and the exact
+        # merge-base/head pair using pinned HEAD attributes. Admit the
+        # authenticated first-party full-index review only after matching its
+        # literal signed bytes AND the fallback's canonical file hunks.
+        if (
+            diff_identity_mode == "unmatched"
+            and diff_source == "local-bound-git-diff-after-github-too-large"
+        ):
+            equivalent, full_index_evidence = (
+                _merge_guard_first_party_full_index_fallback_equivalence(
+                    self.repo_path, base_sha=base_sha, head_sha=expected_head,
+                    expected_sha256=expected_diff,
+                    fallback_diff=raw_live_diff_bytes,
+                    fallback_receipt=self.receipt.get("local_diff_fallback"),
+                )
+            )
+            self.receipt["first_party_full_index_fallback_equivalence"] = (
+                full_index_evidence
+            )
+            if equivalent:
+                binding_diff_sha256 = expected_diff
+                diff_identity_mode = "first-party-full-index-pinned-fallback-proven"
         # A completed independent review may bind GitHub's per-commit
         # "--patch" mbox instead of the default cumulative PR diff. Admit
         # its digest only after proving byte-for-byte equivalent file hunks

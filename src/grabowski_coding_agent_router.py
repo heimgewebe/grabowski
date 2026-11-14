@@ -1443,6 +1443,22 @@ def _effective_pool(
     return pool
 
 
+def _bounded_opaque_claude_review(
+    route: dict[str, Any], pool_id: str, allowed: bool,
+    reasons: list[str], execution_eligible: bool,
+) -> bool:
+    """Permit only a configured read-only Claude Pro review on opaque quota."""
+    return (
+        allowed and not execution_eligible
+        and pool_id == "claude-pro"
+        and reasons == ["quota is opaque"]
+        and route.get("harness") == "claude"
+        and route.get("review_only") is True
+        and route.get("paid_only") is not True
+        and _route_uses_plan_mode(route)
+    )
+
+
 def _pool_gate(
     pool_id: str,
     catalog: dict[str, Any],
@@ -1902,6 +1918,14 @@ def _score_route(
         )
         reasons.extend(f"{pool_id}: {reason}" for reason in pool_reasons)
         scarcity = max(scarcity, pool_scarcity)
+        # Unknown Claude Pro quota is not exhaustion. A bounded, read-only
+        # review may try the subscription; this never grants writer authority
+        # or permission to consume paid API/overage.
+        if reviewer and _bounded_opaque_claude_review(
+            route, pool_id, allowed, pool_reasons, pool_execution,
+        ):
+            pool_execution = True
+            reasons.append("claude-pro: bounded read-only review attempt allowed with opaque quota")
         execution_eligible = execution_eligible and pool_execution
         if not allowed:
             return (
@@ -2457,6 +2481,16 @@ def coding_agent_pre_dispatch_admission(argv: list[str]) -> dict[str, Any]:
         allowed, reasons, scarcity, execution_eligible = _pool_gate(
             pool_id, catalog, runtime_state, critical=True
         )
+        # Score-time eligibility alone is insufficient: the exact read-only
+        # review route must also survive the last pre-dispatch pool gate.
+        if (
+            len(enabled) == 1
+            and _bounded_opaque_claude_review(
+                enabled[0], pool_id, allowed, reasons, execution_eligible,
+            )
+        ):
+            execution_eligible = True
+            reasons = [*reasons, "bounded read-only Claude Pro subscription review"]
         effective = _effective_pool(pool_id, catalog, runtime_state)
         pool_evidence.append(
             {

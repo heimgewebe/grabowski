@@ -3651,7 +3651,10 @@ def _apply_periodic_worktree_hygiene(
     allowed_checkout_roots: list[str] | tuple[str, ...] | None,
     max_actions: int,
     grip_runner: Any | None = None,
+    include_terminal_owners: bool = False,
 ) -> dict[str, Any]:
+    if not isinstance(include_terminal_owners, bool):
+        raise ValueError("include_terminal_owners must be boolean")
     repos = _normalize_periodic_paths(
         repositories,
         label="worktree_hygiene_repositories",
@@ -3727,6 +3730,7 @@ def _apply_periodic_worktree_hygiene(
                 "owner_id": owner_id,
                 "apply_cleanup": True,
                 "archive_new_candidates": True,
+                "include_terminal_owners": include_terminal_owners,
                 "allowed_checkout_roots": roots,
                 "max_actions": remaining,
                 "confirmation": "reconcile-terminal-worktrees",
@@ -3782,6 +3786,7 @@ def apply_periodic_plan(
     worktree_hygiene_allowed_roots: list[str] | tuple[str, ...] | None = None,
     max_worktree_hygiene_actions: int = 2,
     worktree_hygiene_runner: Any | None = None,
+    worktree_hygiene_include_terminal_owners: bool = False,
 ) -> dict[str, Any]:
     """Apply one bounded live retention cycle after two identical snapshots.
 
@@ -3823,6 +3828,7 @@ def apply_periodic_plan(
         allowed_checkout_roots=worktree_hygiene_allowed_roots,
         max_actions=max_worktree_hygiene_actions,
         grip_runner=worktree_hygiene_runner,
+        include_terminal_owners=worktree_hygiene_include_terminal_owners,
     )
     if not worktree_hygiene_repositories:
         return runtime_result
@@ -3862,6 +3868,10 @@ def main() -> int:
     parser.add_argument("--expected-plan-sha256")
     parser.add_argument("--provision-receipt-root", action="store_true")
     parser.add_argument("--periodic-apply", action="store_true")
+    parser.add_argument(
+        "--worktree-hygiene-include-terminal-owners", action="store_true",
+        help="include terminal worktrees under their original bound owner",
+    )
     parser.add_argument("--worktree-hygiene-repo", action="append", default=[])
     parser.add_argument(
         "--worktree-hygiene-owner",
@@ -3891,6 +3901,7 @@ def main() -> int:
                 or args.expected_receipt_sha256
                 or args.attempt is not None
                 or args.worktree_hygiene_repo
+                or args.worktree_hygiene_include_terminal_owners
                 or args.worktree_hygiene_allowed_root
             ):
                 raise ValueError(
@@ -3905,6 +3916,7 @@ def main() -> int:
                 or args.periodic_apply
                 or args.legacy_archive_status
                 or args.worktree_hygiene_repo
+                or args.worktree_hygiene_include_terminal_owners
                 or args.worktree_hygiene_allowed_root
             ):
                 raise ValueError(
@@ -3958,6 +3970,7 @@ def main() -> int:
                 max_archive_jobs=args.max_archive_jobs,
                 worktree_hygiene_repositories=args.worktree_hygiene_repo,
                 worktree_hygiene_owner=args.worktree_hygiene_owner,
+                worktree_hygiene_include_terminal_owners=args.worktree_hygiene_include_terminal_owners,
                 worktree_hygiene_allowed_roots=args.worktree_hygiene_allowed_root,
                 max_worktree_hygiene_actions=args.max_worktree_hygiene_actions,
             )
@@ -3968,7 +3981,8 @@ def main() -> int:
             )
             healthy = receipt.get("status") == "passed" and receipt.get("completed") is True
             return 0 if healthy else 2
-        if args.worktree_hygiene_repo or args.worktree_hygiene_allowed_root:
+        if (args.worktree_hygiene_repo or args.worktree_hygiene_include_terminal_owners
+                or args.worktree_hygiene_allowed_root):
             raise ValueError(
                 "worktree hygiene arguments require --periodic-apply"
             )

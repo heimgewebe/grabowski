@@ -157,7 +157,6 @@ class SubscriptionAwareRoutingTests(unittest.TestCase):
     def test_independent_subscription_review_routes_are_executable_and_advisory(self) -> None:
         expected = {
             "claude-opus-5.5-high": ("claude", "anthropic-claude-pro"),
-            "grok-4.6-review-high": ("grok", "xai-grok-4.6"),
         }
         for route_id, (harness, group) in expected.items():
             with self.subTest(route=route_id):
@@ -235,7 +234,7 @@ class SubscriptionAwareRoutingTests(unittest.TestCase):
         self.assertIn("Superseded", reviewer["disabled_reason"])
         self.assertIn("claude-opus-5.5", self.catalog["quota_pools"]["claude-pro"]["included_models_live_verified"])
 
-    def test_frontier_policy_keeps_codex_top_and_grok_independent_peer(self) -> None:
+    def test_frontier_policy_excludes_cancelled_grok_subscription(self) -> None:
         frontier = self.catalog["policy"]["frontier_model_policy"]
         self.assertEqual(frontier["escalation_route"], "codex-sol-xhigh")
         self.assertEqual(frontier["top_contrast_routes"], ["codex-sol-high"])
@@ -244,12 +243,12 @@ class SubscriptionAwareRoutingTests(unittest.TestCase):
         self.assertNotIn("antigravity-gemini-pro-review-high", frontier["upper_review_or_contrast_routes"])
         for review_id in frontier["upper_review_or_contrast_routes"]:
             self.assertTrue(self.routes[review_id]["enabled"], review_id)
-        grok_writer = self.routes["grok-4.6-high"]
-        grok_reviewer = self.routes["grok-4.6-review-high"]
-        self.assertTrue(grok_writer["enabled"])
-        self.assertEqual(grok_writer["independence_group"], "xai-grok-4.6")
-        self.assertTrue(grok_reviewer["enabled"])
-        self.assertTrue(grok_reviewer["review_only"])
+        for route_id, route in self.routes.items():
+            if route.get("harness") == "grok":
+                # Signed historical Grok review provenance remains readable.
+                self.assertTrue(route["enabled"], route_id)
+                self.assertNotIn(route_id, frontier["upper_review_or_contrast_routes"])
+        self.assertFalse(self.catalog["quota_pools"]["grok-com"]["owner_enabled"])
 
     def test_codex_has_separate_review_route_without_weakening_contrast_routes(self) -> None:
         routes = [route for route in self.catalog["routes"] if route.get("harness") == "codex"]
