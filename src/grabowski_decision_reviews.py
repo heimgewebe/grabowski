@@ -697,6 +697,8 @@ def _read_stdout_tail(
 def _unbound_stdout_has_target_result(
     directory: Path, *, parent_fd: int, aggregate_bytes: list[int],
     expected: dict[str, Any], allow_legacy_readable: bool,
+    observed_sha256: list[str] | None = None,
+    expected_prefix: tuple[int, str] | None = None,
 ) -> bool:
     """Scan complete owner-pinned ordinary stdout, not an arbitrary 8-MiB prefix.
 
@@ -738,6 +740,13 @@ def _unbound_stdout_has_target_result(
         found = False
         read_size = 0
         separator_carry = b""
+        digest = hashlib.sha256()
+        old_prefix_digest = hashlib.sha256()
+        old_prefix_size = expected_prefix[0] if expected_prefix is not None else 0
+        if expected_prefix is not None and (
+            old_prefix_size < 0 or old_prefix_size > before.st_size
+        ):
+            raise ValueError("ordinary stdout prior prefix length is invalid")
 
         def exact_target_marker(candidate: bytearray) -> bool:
             if not candidate.startswith(prefix):
@@ -754,6 +763,11 @@ def _unbound_stdout_has_target_result(
 
         while True:
             raw_chunk = os.read(fd, 65536)
+            if raw_chunk:
+                digest.update(raw_chunk)
+                start = read_size
+                if start < old_prefix_size:
+                    old_prefix_digest.update(raw_chunk[:old_prefix_size - start])
             read_size += len(raw_chunk)
             if read_size > before.st_size:
                 raise ValueError("unbound stdout grew during inspection")
@@ -795,6 +809,12 @@ def _unbound_stdout_has_target_result(
             or _review_stat_file_identity(linked) != _review_stat_file_identity(before)
         ):
             raise ValueError("unbound stdout changed during inspection")
+        if expected_prefix is not None and (
+            old_prefix_digest.hexdigest() != expected_prefix[1]
+        ):
+            raise ValueError("ordinary stdout previously inspected prefix changed")
+        if observed_sha256 is not None:
+            observed_sha256.append(digest.hexdigest())
         return found
     finally:
         os.close(fd)
@@ -803,6 +823,7 @@ def _unbound_stdout_has_target_result(
 def _unbound_review_result_visible(
     directory: Path, *, parent_fd: int, aggregate_bytes: list[int],
     expected: dict[str, Any], allow_legacy_readable_stdout: bool = False,
+    observed_sha256: list[str] | None = None,
 ) -> bool:
     """Find review evidence in a job whose valid origin now denies review status.
 
@@ -836,6 +857,7 @@ def _unbound_review_result_visible(
     return _unbound_stdout_has_target_result(
         directory, parent_fd=parent_fd, aggregate_bytes=aggregate_bytes,
         expected=expected, allow_legacy_readable=allow_legacy_readable_stdout,
+        observed_sha256=observed_sha256,
     )
 
 
@@ -2356,9 +2378,55 @@ def _review_child_file_snapshot(
     return tuple(snapshots)
 
 
+def _revalidate_ordinary_stdout_append(
+    unit: str, *, directory_fd: int,
+    before: tuple[tuple[str, tuple[int, ...] | None], ...],
+    after: tuple[tuple[str, tuple[int, ...] | None], ...],
+    original_sha256: dict[str, str], expected: dict[str, Any],
+    recheck_budget: list[int],
+) -> tuple[bool, bool]:
+    """Accept only re-scanned append data of a proven ordinary, unbound job.
+
+    Every other file identity stays unchanged. An exact PR-bound result in
+    newly appended stdout still blocks, as do rewritten earlier bytes,
+    non-append changes, vanished inodes and a second write during re-scan.
+    """
+    initial = dict(before)
+    current = dict(after)
+    old = initial.get("stdout.log")
+    new = current.get("stdout.log")
+    saved_digest = original_sha256.get(unit)
+    if (
+        saved_digest is None or old is None or new is None
+        or len(saved_digest) != 64
+        or any(current.get(key) != value for key, value in initial.items()
+               if key != "stdout.log")
+        or new[:5] != old[:5]
+        or new[5] <= old[5]
+    ):
+        return False, False
+    observed: list[str] = []
+    try:
+        found = _unbound_stdout_has_target_result(
+            Path(unit), parent_fd=directory_fd, aggregate_bytes=recheck_budget,
+            expected=expected, allow_legacy_readable=False,
+            observed_sha256=observed,
+            expected_prefix=(old[5], saved_digest),
+        )
+        if _review_child_file_snapshot(directory_fd) != after:
+            return False, False
+    except (OSError, ValueError):
+        return False, False
+    if not observed:
+        return False, False
+    original_sha256[unit] = observed[0]
+    return True, found
+
+
 def _iter_pinned_review_job_directories(
     root: Path, errors: list[str], metadata_budget: list[int], *,
     expected: dict[str, Any], unbound_stdout_budget: list[int],
+    ordinary_stdout_sha256: dict[str, str],
 ) -> Iterator[tuple[Path, int]]:
     dir_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
     try:
@@ -2380,6 +2448,7 @@ def _iter_pinned_review_job_directories(
         # Child writes do not advance the jobs root mtime. Revalidate each
         # processed child's pinned directory identity after the whole scan.
         inspected_children: list[tuple[str, tuple[int, ...], tuple[Any, ...]]] = []
+        recheck_budget = [0]
         seen = 0
         with os.scandir(root_fd) as entries:
             for entry in entries:
@@ -2578,9 +2647,21 @@ def _iter_pinned_review_job_directories(
                         ):
                             errors.append("decision_review_job_directory_changed")
                         elif job_files_before is not None:
-                            if _review_child_file_snapshot(job_fd) != job_files_before:
-                                errors.append("decision_review_job_file_changed")
-                            else:
+                            later = _review_child_file_snapshot(job_fd)
+                            if later != job_files_before:
+                                allowed, material = _revalidate_ordinary_stdout_append(
+                                    unit, directory_fd=job_fd,
+                                    before=job_files_before, after=later,
+                                    original_sha256=ordinary_stdout_sha256,
+                                    expected=expected, recheck_budget=recheck_budget,
+                                )
+                                if material:
+                                    errors.append(f"decision_review_unbound_result:{unit}")
+                                elif not allowed:
+                                    errors.append("decision_review_job_file_changed")
+                                else:
+                                    job_files_before = later
+                            if not errors:
                                 inspected_children.append((unit, (
                                     job_after.st_dev, job_after.st_ino,
                                     job_after.st_mode, job_after.st_uid,
@@ -2599,24 +2680,34 @@ def _iter_pinned_review_job_directories(
                 try:
                     child_after = os.fstat(child_fd)
                     files_after = _review_child_file_snapshot(child_fd)
+                    if (
+                        not stat.S_ISDIR(child_after.st_mode)
+                        or (
+                            child_after.st_dev, child_after.st_ino,
+                            child_after.st_mode, child_after.st_uid,
+                            child_after.st_nlink, child_after.st_mtime_ns,
+                            child_after.st_ctime_ns,
+                        ) != snapshot
+                    ):
+                        errors.append("decision_review_job_directory_changed")
+                        return
+                    if files_after != files_before:
+                        allowed, material = _revalidate_ordinary_stdout_append(
+                            unit, directory_fd=child_fd,
+                            before=files_before, after=files_after,
+                            original_sha256=ordinary_stdout_sha256,
+                            expected=expected, recheck_budget=recheck_budget,
+                        )
+                        if material:
+                            errors.append(f"decision_review_unbound_result:{unit}")
+                            return
+                        if not allowed:
+                            errors.append("decision_review_job_file_changed")
+                            return
                 finally:
                     os.close(child_fd)
             except OSError:
                 errors.append("decision_review_job_directory_changed")
-                return
-            if (
-                not stat.S_ISDIR(child_after.st_mode)
-                or (
-                    child_after.st_dev, child_after.st_ino,
-                    child_after.st_mode, child_after.st_uid,
-                    child_after.st_nlink, child_after.st_mtime_ns,
-                    child_after.st_ctime_ns,
-                ) != snapshot
-            ):
-                errors.append("decision_review_job_directory_changed")
-                return
-            if files_after != files_before:
-                errors.append("decision_review_job_file_changed")
                 return
         try:
             after = os.stat(root, follow_symlinks=False)
@@ -2768,9 +2859,11 @@ def _reconcile_once(
     unbound_stdout_budget = [0]
     external_v1_snapshots: list[tuple[Path, tuple[int, ...], tuple[int, ...] | None]] = []
     skipped_prelaunch_stubs: list[str] = []
+    ordinary_stdout_sha256: dict[str, str] = {}
     iterator = _iter_pinned_review_job_directories(
         root, errors, metadata_budget, expected=expected,
         unbound_stdout_budget=unbound_stdout_budget,
+        ordinary_stdout_sha256=ordinary_stdout_sha256,
     )
     with closing(iterator):
         for directory, directory_fd in iterator:
@@ -2830,12 +2923,18 @@ def _reconcile_once(
                 # review for a foreign revision must not conceal surviving
                 # evidence from this PR/head.
                 try:
-                    if _unbound_review_result_visible(
+                    digests: list[str] = []
+                    has_result = _unbound_review_result_visible(
                         directory, parent_fd=directory_fd,
                         aggregate_bytes=unbound_stdout_budget,
-                        expected=expected,
-                    ):
+                        expected=expected, observed_sha256=digests,
+                    )
+                    if has_result:
                         errors.append(f"decision_review_unbound_result:{directory.name}")
+                    elif binding is None and digests:
+                        # Only an authenticated, non-review origin can use
+                        # the stricter prefix-bound append re-check.
+                        ordinary_stdout_sha256[directory.name] = digests[0]
                 except (OSError, ValueError) as exc:
                     errors.append(
                         f"decision_review_unbound_evidence_invalid:"

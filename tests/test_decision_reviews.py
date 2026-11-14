@@ -3183,6 +3183,98 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
                 "decision_review" in error for error in second["errors"]
             ))
 
+    def test_late_ordinary_stdout_append_requires_unchanged_prefix_and_no_reject(self) -> None:
+        # A long-running non-review job can append output during the scan of
+        # thousands of earlier jobs. Its log is not immutable review evidence.
+        # Re-read the whole bounded file, validate the already scanned prefix,
+        # and still reject an exact-head decision appearing after first read.
+        for variant in ("append", "late_reject", "rewrite_then_append", "late_role_receipt"):
+            with self.subTest(variant=variant):
+                with tempfile.TemporaryDirectory() as temp:
+                    jobs = Path(temp) / "jobs"
+                    jobs.mkdir(mode=0o700)
+                    ordinary = jobs / "grabowski-job-aaaaaaaaa501"
+                    ordinary.mkdir(mode=0o700)
+                    scope = {
+                        "cwd": "/tmp", "argv_sha256": "e" * 64,
+                        "runtime_seconds": 60,
+                    }
+                    origin, digest = job_origin.build_origin(
+                        unit=ordinary.name, owner=f"uid:{os.getuid()}",
+                        argv_sha256="e" * 64, scope=scope,
+                        notify_on_done={"requested": False, "channels": []},
+                        created_at_unix=1_787_000_000,
+                        started_at="2026-08-18T12:00:00Z",
+                        invoker_tool="grabowski_job_start",
+                    )
+                    write_private(ordinary / "metadata.json", json.dumps({
+                        "unit": ordinary.name, "job_id": origin["job_id"],
+                        "owner": origin["owner"], "argv_sha256": origin["argv_sha256"],
+                        "scope": scope, "origin": origin, "origin_sha256": digest,
+                    }))
+                    stdout = ordinary / "stdout.log"
+                    write_private(stdout, "unrelated progress\n")
+                    write_private(ordinary / "stderr.log", "")
+                    reviewer = make_job(
+                        jobs, suffix="bbbbbbbbb502", slot="A",
+                        terminal_status="succeeded",
+                        review_result=result("A", "PASS_THIS_REVISION", 0),
+                    )
+                    old_identity = stdout.stat().st_ino
+                    original = reviews._validated_origin_binding
+                    changed = False
+
+                    def write_during_later_review(directory, *args, **kwargs):
+                        nonlocal changed
+                        if directory == reviewer and not changed:
+                            if variant == "append":
+                                with stdout.open("ab") as stream:
+                                    stream.write(b"more ordinary progress\n")
+                            elif variant == "late_reject":
+                                with stdout.open("ab") as stream:
+                                    marker = reviews.RESULT_PREFIX + json.dumps(
+                                        result("A", "REJECT_THIS_REVISION", 1)
+                                    ) + "\n"
+                                    stream.write(marker.encode("utf-8"))
+                            elif variant == "rewrite_then_append":
+                                with stdout.open("r+b") as stream:
+                                    stream.write(b"X")
+                                    stream.seek(0, os.SEEK_END)
+                                    stream.write(b"more progress\n")
+                            else:
+                                write_private(
+                                    ordinary / reviews.REVIEW_ROLE_ATTEMPT_RECEIPT_NAME,
+                                    json.dumps({"expected_head": HEAD,
+                                                "expected_base_head": BASE}),
+                                )
+                            changed = True
+                        return original(directory, *args, **kwargs)
+
+                    with mock.patch.object(
+                        reviews, "_validated_origin_binding",
+                        side_effect=write_during_later_review,
+                    ):
+                        checked = self.reconcile(jobs)
+                    self.assertTrue(changed)
+                    self.assertEqual(stdout.stat().st_ino, old_identity)
+                    if variant == "append":
+                        self.assertEqual(checked["status"], "settled")
+                        self.assertEqual(checked["errors"], [])
+                    else:
+                        self.assertEqual(checked["status"], "blocked")
+                        if variant == "late_reject":
+                            self.assertIn(
+                                f"decision_review_unbound_result:{ordinary.name}",
+                                checked["errors"],
+                            )
+                        else:
+                            self.assertTrue(any(
+                                code in checked["errors"] for code in (
+                                    "decision_review_job_file_changed",
+                                    "decision_review_job_directory_changed",
+                                )
+                            ), checked["errors"])
+
     def test_late_inplace_stdout_rewrite_blocks_first_settlement(self) -> None:
         # Unlike new directory entries, rewriting an existing stdout inode
         # leaves the containing job directory timestamps unchanged.
