@@ -555,6 +555,81 @@ class TransportGripIntegrationTests(unittest.TestCase):
         self.assertEqual(expired["status"], "blocked")
         self.assertEqual(effects, [target_arguments])
 
+    def test_mcp_execute_accepts_echoed_analytics_fields_from_original_call(self) -> None:
+        # The operator wrapper binds challenges to domain arguments without the
+        # Flowlines-injected reason/user_intent; clients echo the original call.
+        domain_arguments = {"path": "/tmp/probe.txt", "content": "probe\n"}
+        echoed_arguments = {
+            **domain_arguments,
+            "reason": "Write a probe file",
+            "user_intent": "Keep Grabowski writes working",
+        }
+        effects: list[dict[str, object]] = []
+
+        base = _load_grabowski_mcp()
+
+        async def call_tool(name, arguments, _ctx):
+            consumed = roundtrip.consume_verified(
+                client_scope=SHARED_SCOPE,
+                runtime_binding=BINDING,
+                tool_name=name,
+                arguments_sha256=roundtrip.canonical_arguments_sha256(arguments),
+            )
+            effects.append(dict(arguments))
+            return {"state": consumed["state"]}
+
+        base.mcp._tool_manager = types.SimpleNamespace(
+            get_tool=lambda _name: types.SimpleNamespace(
+                annotations=types.SimpleNamespace(readOnlyHint=False),
+                fn_metadata=types.SimpleNamespace(
+                    arg_model=types.SimpleNamespace(
+                        model_fields={"path": object(), "content": object()}
+                    )
+                ),
+            ),
+            call_tool=call_tool,
+        )
+        with mock.patch.object(roundtrip.time, "time", return_value=100):
+            begun = roundtrip.begin(
+                client_scope=SHARED_SCOPE,
+                runtime_binding=BINDING,
+                mutation_intent={
+                    "tool_name": "grabowski_create_text",
+                    "arguments_sha256": roundtrip.canonical_arguments_sha256(
+                        domain_arguments
+                    ),
+                },
+            )
+        challenge = begun["challenge_receipt_sha256"]
+
+        with (
+            mock.patch.object(roundtrip.time, "time", return_value=101),
+            mock.patch.object(base, "_require_capability"),
+            mock.patch.object(base, "_require_mutations_enabled"),
+            mock.patch.object(
+                base, "_transport_roundtrip_client_scope", return_value=SHARED_SCOPE
+            ),
+            mock.patch.object(
+                base, "_transport_roundtrip_runtime_binding", return_value=BINDING
+            ),
+        ):
+            executed = asyncio.run(
+                base._grip_run_mcp(
+                    "transport-roundtrip",
+                    {
+                        "action": "execute",
+                        "challenge_receipt_sha256": challenge,
+                        "target_tool_name": "grabowski_create_text",
+                        "target_arguments": echoed_arguments,
+                    },
+                    allow_mutation=True,
+                )
+            )
+
+        self.assertEqual(executed["status"], "passed", executed)
+        self.assertEqual(executed["output"]["state"], "executed")
+        self.assertEqual(effects, [domain_arguments])
+
     def test_mcp_execute_without_retained_target_requires_readback_when_unused_cannot_be_proven(self) -> None:
         base = _load_grabowski_mcp()
         challenge = "f" * 64
