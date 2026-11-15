@@ -329,10 +329,19 @@ def _chronik_knowledge_context(
             "evidence_refs": refs[:4] if isinstance(refs, list) else [],
             "superseded_by": superseded_by[:4] if isinstance(superseded_by, list) else [],
         })
-    # Current knowledge first; superseded entries stay visible as history.
+    # Prefer actionable insights over routine operation telemetry.
+    # The provider order is newest-first; stable sorting preserves it inside
+    # each group. Superseded history never outranks current knowledge.
+    substantive = {"root_cause", "refutation", "decision", "requirement",
+                   "repair", "open_problem"}
+
+    def low_significance(item: dict[str, Any]) -> bool:
+        return item["knowledge_type"] not in substantive
+
     current = [e for e in compact if not e["superseded_by"]]
     superseded = [e for e in compact if e["superseded_by"]]
-    ordered = (current + superseded)[:KNOWLEDGE_CONTEXT_LIMIT]
+    ordered = (sorted(current, key=low_significance)
+               + sorted(superseded, key=low_significance))[:KNOWLEDGE_CONTEXT_LIMIT]
     has_more = result.get("has_more") is True or len(compact) > KNOWLEDGE_CONTEXT_LIMIT
     return {
         **base, "status": "available", "query": selectors,

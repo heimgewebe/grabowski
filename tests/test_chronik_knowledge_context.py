@@ -222,6 +222,37 @@ class BootstrapKnowledgeContextTests(unittest.TestCase):
         self.assertFalse(section["has_more"])
         self.assertEqual(section["events"][0]["event_id"], target["event_id"])
 
+    def test_substantive_findings_precede_routine_operation_events(self):
+        module = self.load_module()
+        routine = [knowledge_event(n) for n in range(1, 10)]
+        for event in routine:
+            event["knowledge_type"] = "operation"
+            event["epistemic_status"] = "observed"
+        cause = knowledge_event(10)
+        repair = knowledge_event(11)
+        repair["knowledge_type"] = "repair"
+        items = routine + [cause, repair]
+
+        def knowledge(**kwargs):
+            return {
+                "available": True, "historical_only": True,
+                "matching_count": len(items), "has_more": False,
+                "ledger_snapshot": {"integrity_valid": True, "sha256": "e" * 64},
+                "events": [{"event": event, "superseded_by": []} for event in items],
+            }
+
+        section = module._chronik_first_context(
+            repo="heimgewebe/grabowski", search_fn=self.run_events,
+            knowledge_search_fn=knowledge)["knowledge"]
+        self.assertEqual(
+            [item["event_id"] for item in section["events"][:2]],
+            [cause["event_id"], repair["event_id"]],
+        )
+        self.assertEqual(section["selected_event_count"], module.KNOWLEDGE_CONTEXT_LIMIT)
+        self.assertTrue(section["has_more"])
+        self.assertEqual(section["context_gap"], "bounded_candidate_page_only")
+        self.assertNotIn("MUST_NOT_LEAK", json.dumps(section))
+
     def test_knowledge_outage_never_changes_run_event_status(self):
         module = self.load_module()
 
