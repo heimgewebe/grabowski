@@ -6153,7 +6153,7 @@ def _browser_start_cdp_worker(
         "schema_version": 1,
         "kind": "browser",
         "argv": argv,
-        "environment": {"HOME": str(operator.HOME)},
+        "environment": {"HOME": str(operator.HOME), "XDG_CONFIG_HOME": str(profile)},
         "xvfb_argv": None,
         "worker_id": worker_id,
     }
@@ -6196,7 +6196,7 @@ def _browser_start_bidi_worker(
         "schema_version": 1,
         "kind": "browser",
         "argv": argv,
-        "environment": {"HOME": str(operator.HOME)},
+        "environment": {"HOME": str(operator.HOME), "XDG_CONFIG_HOME": str(profile)},
         "xvfb_argv": None,
         "worker_id": worker_id,
     }

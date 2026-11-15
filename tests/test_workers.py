@@ -1220,6 +1220,9 @@ globalThis.fetch = async () => ({
         self.assertEqual(worker["state"], "running")
         self.assertIn("--remote-debugging-address=127.0.0.1", worker["argv"])
         self.assertIn("--remote-debugging-port=9222", worker["argv"])
+        record = workers._row(worker["worker_id"])
+        config = json.loads(Path(record["config_path"]).read_text(encoding="utf-8"))
+        self.assertEqual(config["environment"]["XDG_CONFIG_HOME"], worker["profile_path"])
         launch = run.call_args.args[0]
         descriptions = [item for item in launch if item.startswith("--description=")]
         self.assertEqual(1, len(descriptions))
