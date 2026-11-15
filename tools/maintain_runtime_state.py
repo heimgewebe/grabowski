@@ -513,6 +513,10 @@ def _failed_units(*, job_authority: bool = True) -> list[str]:
         fields = line.split()
         if fields:
             unit = fields[0]
+            # A failed periodic producer is never an independently resettable
+            # job, task or worker, even with future protected job authority.
+            if unit == "grabowski-runtime-retention.service":
+                continue
             # Never accept a job returned despite the restricted pattern.
             if not job_authority and JOB_UNIT.fullmatch(unit):
                 continue
@@ -1985,20 +1989,31 @@ def _archive_require_json_temp_capacity(
     prefix = f".{target_basename}." if target_basename is not None else None
     retained_temps = 0
     scanned_entries = 0
-    with os.scandir(directory_fd) as entries:
-        for entry in entries:
-            if prefix is not None and not entry.name.startswith(prefix):
-                continue
-            scanned_entries += 1
-            if prefix is None and scanned_entries > MAX_JOB_REGISTRY_ENTRIES:
-                raise RuntimeError("retained atomic temp scan bound exceeded")
-            if re.fullmatch(
-                r"\..+\.[1-9][0-9]{0,11}\.[1-9][0-9]{0,19}\.tmp",
-                entry.name,
-            ):
-                retained_temps += 1
-                if retained_temps >= MAX_RETAINED_JSON_TEMPS:
-                    raise RuntimeError("retained atomic temp bound exceeded")
+    # A caller may have advanced the pinned directory FD cursor while
+    # selecting the receipt. Reopen its current directory inode via "." to
+    # obtain an independent cursor; otherwise preflight can miss retained
+    # temps and allow a reset before the eventual receipt write fails.
+    scan_fd = os.open(
+        ".", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        dir_fd=directory_fd,
+    )
+    try:
+        with os.scandir(scan_fd) as entries:
+            for entry in entries:
+                if prefix is not None and not entry.name.startswith(prefix):
+                    continue
+                scanned_entries += 1
+                if prefix is None and scanned_entries > MAX_JOB_REGISTRY_ENTRIES:
+                    raise RuntimeError("retained atomic temp scan bound exceeded")
+                if re.fullmatch(
+                    r"\..+\.[1-9][0-9]{0,11}\.[1-9][0-9]{0,19}\.tmp",
+                    entry.name,
+                ):
+                    retained_temps += 1
+                    if retained_temps >= MAX_RETAINED_JSON_TEMPS:
+                        raise RuntimeError("retained atomic temp bound exceeded")
+    finally:
+        os.close(scan_fd)
 
 
 def _archive_restore_exchanged_target(
@@ -2040,6 +2055,7 @@ def _write_json_atomic(
     expected_existing_preimage: tuple[int, int, int, int, str] | None = None,
     pinned_parent_fd: int | None = None,
     target_scoped_temp_capacity: bool = False,
+    reserved_temp: tuple[str, int] | None = None,
 ) -> Path:
     if path.name == "runtime-deploy-index.json":
         # Linux has no atomic rename-if-inode. An EXCHANGE followed by a
@@ -2094,20 +2110,46 @@ def _write_json_atomic(
             json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2).encode("utf-8")
             + b"\n"
         )
-        _archive_require_json_temp_capacity(
-            directory_fd,
-            target_basename=path.name if target_scoped_temp_capacity else None,
-        )
-        _archive_require_unchanged_root(parent, directory_fd)
-        candidate_name = f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp"
-        descriptor = os.open(
-            candidate_name,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
-            0o600,
-            dir_fd=directory_fd,
-        )
-        # Only unlink an actually created temp. O_EXCL failure must preserve
-        # an existing private file, even if an attacker predicts the name.
+        if reserved_temp is None:
+            _archive_require_json_temp_capacity(
+                directory_fd,
+                target_basename=path.name if target_scoped_temp_capacity else None,
+            )
+            _archive_require_unchanged_root(parent, directory_fd)
+            candidate_name = f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp"
+            descriptor = os.open(
+                candidate_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                0o600,
+                dir_fd=directory_fd,
+            )
+        else:
+            # The exact temporary inode was reserved and synced before any
+            # external effect. A late capacity flood cannot strand its receipt.
+            if replace_existing or not target_scoped_temp_capacity:
+                raise RuntimeError("receipt temp reservation is create-only")
+            candidate_name, held_fd = reserved_temp
+            if (
+                not candidate_name.startswith(f".{path.name}.")
+                or not candidate_name.endswith(".tmp")
+                or "/" in candidate_name
+            ):
+                raise RuntimeError("receipt temp reservation name is invalid")
+            reserved_stat = os.fstat(held_fd)
+            current_stat = os.stat(
+                candidate_name, dir_fd=directory_fd, follow_symlinks=False
+            )
+            if (
+                not stat.S_ISREG(reserved_stat.st_mode)
+                or reserved_stat.st_nlink != 1
+                or (current_stat.st_dev, current_stat.st_ino)
+                != (reserved_stat.st_dev, reserved_stat.st_ino)
+            ):
+                raise RuntimeError("receipt temp reservation identity changed")
+            descriptor = os.dup(held_fd)
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            os.ftruncate(descriptor, 0)
+        # No temporary pathname is ever unlinked without verifying identity.
         temporary_name = candidate_name
         try:
             incoming = os.fstat(descriptor)
@@ -2116,6 +2158,14 @@ def _write_json_atomic(
         finally:
             os.close(descriptor)
         _archive_require_unchanged_root(parent, directory_fd)
+        if reserved_temp is not None:
+            published_candidate = os.stat(
+                candidate_name, dir_fd=directory_fd, follow_symlinks=False
+            )
+            if (published_candidate.st_dev, published_candidate.st_ino) != (
+                incoming.st_dev, incoming.st_ino
+            ):
+                raise RuntimeError("receipt temp reservation replaced before publication")
         if replace_existing and existing is not None:
             if expected_existing_preimage is not None:
                 # A peer can replace the index AFTER the initial validated
@@ -3177,6 +3227,19 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
         _archive_require_json_temp_capacity(
             receipt_pin_fd, target_basename=receipt_target.name,
         )
+        # Reserve the actual publication inode before reset-failed or archive.
+        # The final receipt uses this same inode, independent of later temps.
+        reserved_receipt_name = (
+            f".{receipt_target.name}.{os.getpid()}.{time.time_ns()}.tmp"
+        )
+        reserved_receipt_fd = os.open(
+            reserved_receipt_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600, dir_fd=receipt_pin_fd,
+        )
+        root_pins.callback(os.close, reserved_receipt_fd)
+        os.fsync(reserved_receipt_fd)
+        os.fsync(receipt_pin_fd)
         intent_audit = _append_intent_audit(
             plan,
             attempt=attempt,
@@ -3546,6 +3609,7 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
         receipt_path = _write_json_atomic(
             receipt_target, receipt, pinned_parent_fd=receipt_pin_fd,
             target_scoped_temp_capacity=True,
+            reserved_temp=(reserved_receipt_name, reserved_receipt_fd),
         )
         try:
             completion_audit = _append_completion_audit(receipt)
