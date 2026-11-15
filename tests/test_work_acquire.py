@@ -658,7 +658,7 @@ class WorkAcquireTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(
                 work_acquire.LeaseAcquisitionOutcomeUnknown,
-                "lease inventory source is unsafe",
+                "lease inventory native snapshot unavailable",
             ):
                 with work_acquire._native_owner_inventory_pagination_guard(
                     work_acquire.resources.list_resources
@@ -698,6 +698,9 @@ class WorkAcquireTests(unittest.TestCase):
         self.assertFalse(shm.exists(), "denied read created SQLite SHM")
 
     def test_multibatch_native_sqlite_rejects_cross_page_generation_replacement(self) -> None:
+        # The real resource store may change between bounded owner pages.
+        # Neither its ordinary immutable snapshot nor its pinned WAL snapshot
+        # may authorize an old lease generation after an intervening acquire.
         owner = "lane:" + "c" * 32
         required = ["component:snapshot-0000", "component:snapshot-1000"]
         keys = [f"component:snapshot-{i:04d}" for i in range(1001)]
@@ -711,80 +714,149 @@ class WorkAcquireTests(unittest.TestCase):
                     purpose="native owner snapshot race regression",
                     ttl_seconds=3600,
                 )
-            rogue_path = self.state / "rogue-observer.sqlite3"
-            with sqlite3.connect(rogue_path) as rogue:
-                rogue.execute("CREATE TABLE decoy (id INTEGER)")
+            originals = [
+                work_acquire.resources.inspect_resource(key) for key in required
+            ]
+            pages = []
+            native_guard = work_acquire._native_owner_inventory_pagination_guard
+            native_snapshot = work_acquire.resources._resource_readonly_snapshot
 
-            for observer_redirected in (False, True):
-                with self.subTest(observer_redirected=observer_redirected):
-                    originals = [
-                        work_acquire.resources.inspect_resource(key)
-                        for key in required
-                    ]
-                    pages = []
-                    native_guard = work_acquire._native_owner_inventory_pagination_guard
-
-                    @contextmanager
-                    def racing_guard(inventory_fn):
-                        # The redirected variant simulates the original P1:
-                        # a separate observer is opened on DB B while all owner
-                        # pages and lease mutations still use original DB A.
-                        with ExitStack() as stack:
-                            if observer_redirected:
-                                with patch.object(
-                                    work_acquire.resources,
-                                    "_connect_existing_resource_database",
-                                    side_effect=lambda: sqlite3.connect(rogue_path),
-                                ):
-                                    native_page = stack.enter_context(
-                                        native_guard(inventory_fn),
-                                    )
-                            else:
-                                native_page = stack.enter_context(
-                                    native_guard(inventory_fn),
-                                )
-                            # Legacy guard yields None and reads A via inventory_fn.
-                            # Fixed guard yields an FD-bound reader pinned to A.
-                            reader = native_page or inventory_fn
-
-                            def inject_after_first_page(**kwargs):
-                                page = reader(**kwargs)
-                                pages.append(len(page))
-                                if len(pages) == 1:
-                                    old = work_acquire.resources.inspect_resource(
-                                        required[0],
-                                    )
-                                    work_acquire.resources.release_resources(
-                                        owner, [required[0]],
-                                        expected_leases=[old],
-                                    )
-                                    new = work_acquire.resources.acquire_resources(
-                                        owner, [required[0]],
-                                        purpose="same-owner replacement generation",
-                                        ttl_seconds=3600,
-                                    )["leases"][0]
-                                    self.assertNotEqual(
-                                        old["metadata_sha256"],
-                                        new["metadata_sha256"],
-                                    )
-                                return page
-
-                            yield inject_after_first_page
-
-                    with patch.object(
-                        work_acquire, "_native_owner_inventory_pagination_guard",
-                        side_effect=racing_guard,
-                    ):
-                        with self.assertRaisesRegex(
-                            work_acquire.LeaseAcquisitionOutcomeUnknown,
-                            "inventory changed during pagination",
-                        ):
-                            work_acquire._verify_multibatch_live_lease_generations(
-                                owner_id=owner, required_keys=required,
-                                acquisitions=[{"receipt": {"leases": originals}}],
-                                inventory_fn=work_acquire.resources.list_resources,
+            @contextmanager
+            def racing_guard(inventory_fn):
+                with native_guard(inventory_fn) as reader:
+                    def inject_after_first_page(**kwargs):
+                        page = reader(**kwargs)
+                        pages.append(len(page))
+                        if len(pages) == 1:
+                            old = work_acquire.resources.inspect_resource(required[0])
+                            work_acquire.resources.release_resources(
+                                owner, [required[0]], expected_leases=[old],
                             )
-                    self.assertEqual([1000, 1], pages)
+                            new = work_acquire.resources.acquire_resources(
+                                owner, [required[0]],
+                                purpose="same-owner replacement generation",
+                                ttl_seconds=3600,
+                            )["leases"][0]
+                            self.assertNotEqual(
+                                old["metadata_sha256"], new["metadata_sha256"],
+                            )
+                        return page
+                    yield inject_after_first_page
+
+            # Verify that the real native ResourceStore snapshot, rather than
+            # an obsolete observer monkeypatch, supplied the page reader.
+            with (
+                patch.object(
+                    work_acquire.resources, "_resource_readonly_snapshot",
+                    side_effect=native_snapshot,
+                ) as shared_snapshot,
+                patch.object(
+                    work_acquire, "_native_owner_inventory_pagination_guard",
+                    side_effect=racing_guard,
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    work_acquire.LeaseAcquisitionOutcomeUnknown,
+                    "lease inventory (changed during pagination|native snapshot unavailable)",
+                ):
+                    work_acquire._verify_multibatch_live_lease_generations(
+                        owner_id=owner, required_keys=required,
+                        acquisitions=[{"receipt": {"leases": originals}}],
+                        inventory_fn=work_acquire.resources.list_resources,
+                    )
+            shared_snapshot.assert_called_once()
+            self.assertEqual([1000, 1], pages)
+
+    def test_native_owner_inventory_reuses_shared_wal_sidecar_admission(self) -> None:
+        # The previous /proc/self/fd URI verified only the DB main inode and
+        # ignored which WAL/SHM identities SQLite had actually attached.
+        # The existing ResourceStore reader owns this sidecar validation.
+        owner = "lane:" + "a" * 32
+        database = self.state / "native-owner-wal-sidecars.sqlite3"
+        with patch.object(work_acquire.resources, "RESOURCE_DB", database):
+            work_acquire.resources.acquire_resources(
+                owner, ["component:wal-native"], purpose="wal sidecar reader proof",
+                ttl_seconds=3600,
+            )
+            # Keeping a normal writer connection open retains the existing
+            # WAL/SHM pair while the native reader opens its own snapshot.
+            with sqlite3.connect(database) as keeper:
+                keeper.execute("PRAGMA journal_mode=WAL")
+                keeper.execute("SELECT count(*) FROM leases").fetchall()
+                self.assertTrue(Path(str(database) + "-wal").exists())
+                self.assertTrue(Path(str(database) + "-shm").exists())
+                original_reader = (
+                    work_acquire.resources.sqlite_store.inventory_native_wal_readonly_sqlite
+                )
+                with patch.object(
+                    work_acquire.resources.sqlite_store,
+                    "inventory_native_wal_readonly_sqlite",
+                    wraps=original_reader,
+                ) as common_reader:
+                    with work_acquire._native_owner_inventory_pagination_guard(
+                        work_acquire.resources.list_resources,
+                    ) as page:
+                        observed = page(
+                            owner_id=owner, include_expired=False, limit=2,
+                        )
+                    self.assertEqual(
+                        [item["resource_key"] for item in observed],
+                        ["component:wal-native"],
+                    )
+                common_reader.assert_called_once()
+
+    def test_native_owner_inventory_detects_interleaved_wal_generation_change(self) -> None:
+        # SQLite PRAGMA data_version is pinned during BEGIN. A change by
+        # another connection becomes visible only AFTER COMMIT ends the reader
+        # snapshot. Catch real WAL generation replacement, not a mocked DB.
+        owner = "lane:" + "b" * 32
+        database = self.state / "native-interleaved-wal.sqlite3"
+        with patch.object(work_acquire.resources, "RESOURCE_DB", database):
+            work_acquire.resources.acquire_resources(
+                owner, ["component:wal-alpha", "component:wal-beta"],
+                purpose="pinned WAL generation test", ttl_seconds=3600,
+            )
+            with sqlite3.connect(database) as keeper:
+                keeper.execute("PRAGMA journal_mode=WAL")
+                keeper.execute("SELECT count(*) FROM leases").fetchall()
+                self.assertTrue(Path(str(database) + "-wal").exists())
+                with self.assertRaisesRegex(
+                    work_acquire.LeaseAcquisitionOutcomeUnknown,
+                    "lease inventory changed during pagination",
+                ):
+                    with work_acquire._native_owner_inventory_pagination_guard(
+                        work_acquire.resources.list_resources,
+                    ) as page:
+                        first = page(
+                            owner_id=owner, include_expired=False, limit=1,
+                        )
+                        self.assertEqual(
+                            [row["resource_key"] for row in first],
+                            ["component:wal-alpha"],
+                        )
+                        old = work_acquire.resources.inspect_resource(
+                            "component:wal-alpha"
+                        )
+                        work_acquire.resources.release_resources(
+                            owner, ["component:wal-alpha"],
+                            expected_leases=[old],
+                        )
+                        new = work_acquire.resources.acquire_resources(
+                            owner, ["component:wal-alpha"],
+                            purpose="reacquired within live WAL reader",
+                            ttl_seconds=3600,
+                        )["leases"][0]
+                        self.assertNotEqual(
+                            old["metadata_sha256"], new["metadata_sha256"],
+                        )
+                        second = page(
+                            owner_id=owner, include_expired=False, limit=1,
+                            start_after_key="component:wal-alpha",
+                        )
+                        self.assertEqual(
+                            [row["resource_key"] for row in second],
+                            ["component:wal-beta"],
+                        )
 
     def test_multibatch_readback_pages_after_full_8192_byte_key(self) -> None:
         owner = "lane:" + "e" * 32

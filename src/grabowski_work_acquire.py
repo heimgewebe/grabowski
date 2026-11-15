@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import closing, contextmanager
+from contextlib import contextmanager
 import fcntl
 import hashlib
 import json
@@ -3356,62 +3356,31 @@ def _group_evidence_fields(
 def _native_owner_inventory_pagination_guard(
     inventory_fn: Callable[..., Any],
 ) -> Iterator[Callable[..., Any]]:
-    """Read native owner pages from one inode-bound connection; deny live changes."""
+    """Observe owner pages in the existing coherent ResourceStore WAL snapshot.
+
+    A native transaction pins one image across pages, and its WAL/SHM source
+    checks are shared with the existing ResourceStore reader. A proc-fd URI
+    does NOT make SQLite sidecars follow the pinned database inode, so do not
+    maintain a second, misleading /proc/self/fd based authority contract.
+    As in ResourceStore, an actively hostile same-UID path swap is outside
+    the snapshot's trust boundary.
+    """
     if inventory_fn is not resources.list_resources:
-        # Test-injected inventories retain their caller-defined semantics.
+        # Test-injected inventories retain their own pagination contract.
         yield inventory_fn
         return
+
+    # Multi-batch acquisitions already occurred: a subsequent kill switch
+    # must stop all further effects before opening an observer.
     operator._require_operator_mutation("resource_lease")
-    flags = os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(resources.RESOURCE_DB, flags)
     try:
-        pinned = os.fstat(descriptor)
-        identity = (pinned.st_dev, pinned.st_ino)
-        if (
-            not stat.S_ISREG(pinned.st_mode)
-            or pinned.st_uid != os.geteuid()
-            or pinned.st_nlink != 1
-            or pinned.st_mode & 0o022
-        ):
-            raise LeaseAcquisitionOutcomeUnknown("lease inventory source is unsafe")
-
-        def verify_source() -> None:
-            observed = os.stat(resources.RESOURCE_DB, follow_symlinks=False)
-            if (
-                not stat.S_ISREG(observed.st_mode)
-                or (observed.st_dev, observed.st_ino) != identity
-            ):
-                raise LeaseAcquisitionOutcomeUnknown(
-                    "lease inventory source changed during pagination"
-                )
-
-        verify_source()
-        # SQLite resolves the proc-fd URI to the file held by our descriptor;
-        # a path rename cannot redirect this reader to a replacement store.
-        uri = f"file:/proc/self/fd/{descriptor}?mode=ro"
-        with closing(sqlite3.connect(uri, uri=True, timeout=10, isolation_level=None)) as observer:
-            observer.row_factory = sqlite3.Row
-            observer.execute("PRAGMA query_only=ON")
-            observer.execute("PRAGMA trusted_schema=OFF")
-            attached = observer.execute("PRAGMA database_list").fetchall()
-            if len(attached) != 1 or attached[0][1] != "main":
-                raise LeaseAcquisitionOutcomeUnknown(
-                    "lease inventory opened SQLite source is ambiguous"
-                )
-            opened = os.stat(attached[0][2], follow_symlinks=False)
-            if (
-                not stat.S_ISREG(opened.st_mode)
-                or (opened.st_dev, opened.st_ino) != identity
-            ):
-                raise LeaseAcquisitionOutcomeUnknown(
-                    "lease inventory opened SQLite source identity differs"
-                )
-            verify_source()
-            original_version = observer.execute("PRAGMA data_version").fetchone()
-            if original_version is None or type(original_version[0]) is not int:
+        with resources._resource_readonly_snapshot() as observer:
+            initial_version = observer.execute("PRAGMA data_version").fetchone()
+            if initial_version is None or type(initial_version[0]) is not int:
                 raise LeaseAcquisitionOutcomeUnknown(
                     "lease inventory revision cannot be established"
                 )
+            observed_at_unix = resources._now()
 
             def pinned_page(
                 *, owner_id: str, include_expired: bool, limit: int,
@@ -3431,7 +3400,7 @@ def _native_owner_inventory_pagination_guard(
                     raise LeaseAcquisitionOutcomeUnknown(
                         "lease inventory page contract is invalid"
                     )
-                args: list[Any] = [resources._owner(owner_id), resources._now()]
+                args: list[Any] = [resources._owner(owner_id), observed_at_unix]
                 where = (
                     "owner_id=? AND typeof(expires_at_unix)='integer' "
                     "AND expires_at_unix>?"
@@ -3447,18 +3416,28 @@ def _native_owner_inventory_pagination_guard(
                 return [resources._public(row) for row in rows]
 
             yield pinned_page
-            updated_version = observer.execute("PRAGMA data_version").fetchone()
-            verify_source()
+            # A read transaction masks external data_version increments until
+            # it ends. Compare AFTER ending it, or a concurrent lease reacquire
+            # can masquerade as an unchanged multi-page inventory.
+            if observer.in_transaction:
+                observer.execute("COMMIT")
+            final_version = observer.execute("PRAGMA data_version").fetchone()
             if (
-                updated_version is None
-                or type(updated_version[0]) is not int
-                or updated_version[0] != original_version[0]
+                final_version is None
+                or type(final_version[0]) is not int
+                or final_version[0] != initial_version[0]
             ):
                 raise LeaseAcquisitionOutcomeUnknown(
                     "lease inventory changed during pagination"
                 )
-    finally:
-        os.close(descriptor)
+    except (sqlite3.Error, OSError, RuntimeError, ValueError) as exc:
+        if isinstance(exc, LeaseAcquisitionOutcomeUnknown):
+            raise
+        # Once any lease was acquired, ambiguous data or source failures may
+        # never be reported as a definite safe-to-retry acquisition failure.
+        raise LeaseAcquisitionOutcomeUnknown(
+            "lease inventory native snapshot unavailable"
+        ) from exc
 
 
 def _verify_multibatch_live_lease_generations(
