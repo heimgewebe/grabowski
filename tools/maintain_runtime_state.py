@@ -87,19 +87,6 @@ def _protected_job_retention_authority() -> bool:
     return False
 
 
-def _protected_retention_receipt_authority() -> bool:
-    """No independently protected receipt reservation/commit transaction exists.
-
-    A same-UID writer can fill the receipt temp budget AFTER preflight but
-    BEFORE final publication, even if the scanned directory FD is pinned.
-    Without an OS-protected transaction the completed systemd effect could
-    lack its terminal receipt. Do not make this a mutable environment switch.
-    Job and task/worker effects must fail closed until protected authority
-    is implemented and proven independently.
-    """
-    return False
-
-
 def _canonical_json(value: Any) -> bytes:
     return json.dumps(
         value,
@@ -1331,10 +1318,7 @@ def build_plan(
     planned_jobs_root_identity = (root_stat.st_dev, root_stat.st_ino)
     jobs_root = _private_directory(jobs_root)
     _archive_require_unchanged_root(jobs_root, pinned.jobs_fd)
-    authorized_receipt_effects = _protected_retention_receipt_authority()
-    authorized_job_effects = (
-        _protected_job_retention_authority() and authorized_receipt_effects
-    )
+    authorized_job_effects = _protected_job_retention_authority()
     if receipt_root.is_symlink() or (
         authorized_job_effects and archive_root.is_symlink()
     ):
@@ -1627,9 +1611,6 @@ def build_plan(
             reset_units.append(unit)
             continue
         if TASK_UNIT.fullmatch(unit):
-            if not authorized_receipt_effects:
-                block(unit, "automatic task reset requires protected receipt authority")
-                continue
             state = _task_state(unit, task_db)
             if state in TERMINAL_TASK_STATES:
                 reset_units.append(unit)
@@ -1637,9 +1618,6 @@ def build_plan(
                 block(unit, f"task state is not proven terminal: {state}")
             continue
         if WORKER_UNIT.fullmatch(unit):
-            if not authorized_receipt_effects:
-                block(unit, "automatic worker reset requires protected receipt authority")
-                continue
             try:
                 evidence = _worker_reset_evidence(
                     unit,
@@ -2077,6 +2055,7 @@ def _write_json_atomic(
     expected_existing_preimage: tuple[int, int, int, int, str] | None = None,
     pinned_parent_fd: int | None = None,
     target_scoped_temp_capacity: bool = False,
+    reserved_temp: tuple[str, int] | None = None,
 ) -> Path:
     if path.name == "runtime-deploy-index.json":
         # Linux has no atomic rename-if-inode. An EXCHANGE followed by a
@@ -2131,20 +2110,46 @@ def _write_json_atomic(
             json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2).encode("utf-8")
             + b"\n"
         )
-        _archive_require_json_temp_capacity(
-            directory_fd,
-            target_basename=path.name if target_scoped_temp_capacity else None,
-        )
-        _archive_require_unchanged_root(parent, directory_fd)
-        candidate_name = f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp"
-        descriptor = os.open(
-            candidate_name,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
-            0o600,
-            dir_fd=directory_fd,
-        )
-        # Only unlink an actually created temp. O_EXCL failure must preserve
-        # an existing private file, even if an attacker predicts the name.
+        if reserved_temp is None:
+            _archive_require_json_temp_capacity(
+                directory_fd,
+                target_basename=path.name if target_scoped_temp_capacity else None,
+            )
+            _archive_require_unchanged_root(parent, directory_fd)
+            candidate_name = f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp"
+            descriptor = os.open(
+                candidate_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                0o600,
+                dir_fd=directory_fd,
+            )
+        else:
+            # The exact temporary inode was reserved and synced before any
+            # external effect. A late capacity flood cannot strand its receipt.
+            if replace_existing or not target_scoped_temp_capacity:
+                raise RuntimeError("receipt temp reservation is create-only")
+            candidate_name, held_fd = reserved_temp
+            if (
+                not candidate_name.startswith(f".{path.name}.")
+                or not candidate_name.endswith(".tmp")
+                or "/" in candidate_name
+            ):
+                raise RuntimeError("receipt temp reservation name is invalid")
+            reserved_stat = os.fstat(held_fd)
+            current_stat = os.stat(
+                candidate_name, dir_fd=directory_fd, follow_symlinks=False
+            )
+            if (
+                not stat.S_ISREG(reserved_stat.st_mode)
+                or reserved_stat.st_nlink != 1
+                or (current_stat.st_dev, current_stat.st_ino)
+                != (reserved_stat.st_dev, reserved_stat.st_ino)
+            ):
+                raise RuntimeError("receipt temp reservation identity changed")
+            descriptor = os.dup(held_fd)
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            os.ftruncate(descriptor, 0)
+        # No temporary pathname is ever unlinked without verifying identity.
         temporary_name = candidate_name
         try:
             incoming = os.fstat(descriptor)
@@ -2153,6 +2158,14 @@ def _write_json_atomic(
         finally:
             os.close(descriptor)
         _archive_require_unchanged_root(parent, directory_fd)
+        if reserved_temp is not None:
+            published_candidate = os.stat(
+                candidate_name, dir_fd=directory_fd, follow_symlinks=False
+            )
+            if (published_candidate.st_dev, published_candidate.st_ino) != (
+                incoming.st_dev, incoming.st_ino
+            ):
+                raise RuntimeError("receipt temp reservation replaced before publication")
         if replace_existing and existing is not None:
             if expected_existing_preimage is not None:
                 # A peer can replace the index AFTER the initial validated
@@ -3161,12 +3174,6 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
         raise RuntimeError(
             "automatic job archive/reset requires protected root/index authority"
         )
-    if (
-        plan["archive_jobs"] or plan["reset_failed_units"]
-    ) and not _protected_retention_receipt_authority():
-        raise RuntimeError(
-            "automatic retention effects require protected receipt publication authority"
-        )
     source = str(SRC)
     if source not in sys.path:
         sys.path.insert(0, source)
@@ -3220,6 +3227,19 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
         _archive_require_json_temp_capacity(
             receipt_pin_fd, target_basename=receipt_target.name,
         )
+        # Reserve the actual publication inode before reset-failed or archive.
+        # The final receipt uses this same inode, independent of later temps.
+        reserved_receipt_name = (
+            f".{receipt_target.name}.{os.getpid()}.{time.time_ns()}.tmp"
+        )
+        reserved_receipt_fd = os.open(
+            reserved_receipt_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600, dir_fd=receipt_pin_fd,
+        )
+        root_pins.callback(os.close, reserved_receipt_fd)
+        os.fsync(reserved_receipt_fd)
+        os.fsync(receipt_pin_fd)
         intent_audit = _append_intent_audit(
             plan,
             attempt=attempt,
@@ -3589,6 +3609,7 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
         receipt_path = _write_json_atomic(
             receipt_target, receipt, pinned_parent_fd=receipt_pin_fd,
             target_scoped_temp_capacity=True,
+            reserved_temp=(reserved_receipt_name, reserved_receipt_fd),
         )
         try:
             completion_audit = _append_completion_audit(receipt)

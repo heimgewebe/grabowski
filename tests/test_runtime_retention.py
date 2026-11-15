@@ -24,7 +24,6 @@ SPEC.loader.exec_module(RETENTION)
 # Production always refuses unsafe job effects until a privileged
 # root/index transaction actually exists; never patch this reference.
 PRODUCTION_JOB_RETENTION_AUTHORITY = RETENTION._protected_job_retention_authority
-PRODUCTION_RECEIPT_RETENTION_AUTHORITY = RETENTION._protected_retention_receipt_authority
 
 
 class RuntimeRetentionTests(unittest.TestCase):
@@ -37,13 +36,6 @@ class RuntimeRetentionTests(unittest.TestCase):
         )
         self._simulated_protected_authority = grant.start()
         self.addCleanup(grant.stop)
-        # Positive reset/archive fixtures also simulate an independently
-        # protected receipt finalization authority. Production never has it.
-        receipt_grant = patch.object(
-            RETENTION, "_protected_retention_receipt_authority", return_value=True
-        )
-        self._simulated_protected_receipt_authority = receipt_grant.start()
-        self.addCleanup(receipt_grant.stop)
 
     def _task_db(self, path: Path, unit: str, state: str) -> Path:
         connection = sqlite3.connect(path)
@@ -4382,11 +4374,9 @@ class RuntimeRetentionTests(unittest.TestCase):
                 )
 
     def test_receipt_temp_race_after_reset_cannot_leave_unreceipted_effect(self) -> None:
-        # Inject a same-UID temp-capacity race after the preflight but during
-        # the mocked external reset. An actual reset must never be followed by
-        # an unreceipted failure to publish the terminal evidence.
+        # Inject competing receipt temps during the external reset.
+        # The pre-reserved receipt inode must still publish the final proof.
         self._simulated_protected_authority.return_value = False
-        self._simulated_protected_receipt_authority.return_value = False
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             jobs, archive, receipts = root / "jobs", root / "archive", root / "receipts"
@@ -4418,7 +4408,6 @@ class RuntimeRetentionTests(unittest.TestCase):
                         )).write_text("")
                 return Mock(returncode=0, stdout="", stderr="")
 
-            result = None
             with (
                 patch.dict("sys.modules", {
                     "grabowski_self_deploy": deploy, "grabowski_mcp": base,
@@ -4426,75 +4415,50 @@ class RuntimeRetentionTests(unittest.TestCase):
                 patch.object(RETENTION, "_run", side_effect=inject_after_reset),
                 patch.object(RETENTION, "MAX_RETAINED_JSON_TEMPS", 3),
             ):
-                try:
-                    result = RETENTION.apply_plan(
-                        plan, expected_plan_sha256=plan["plan_sha256"]
-                    )
-                except RuntimeError:
-                    pass
-            # A future protected reservation may complete the reset, but a
-            # bare preflight alone cannot justify an unreceipted reset.
-            self.assertTrue(
-                not resets or (
-                    result is not None
-                    and bool(result.get("completed"))
-                    and Path(result["receipt_path"]).is_file()
-                ),
-                "external task reset completed without durable final receipt",
-            )
+                result = RETENTION.apply_plan(
+                    plan, expected_plan_sha256=plan["plan_sha256"]
+                )
+            self.assertEqual(resets, [[
+                "systemctl", "--user", "reset-failed", task_unit
+            ]])
+            self.assertTrue(result["completed"])
+            self.assertTrue(result["mutated"])
+            receipt = Path(result["receipt_path"])
+            self.assertTrue(receipt.is_file())
+            published = json.loads(receipt.read_text(encoding="utf-8"))
+            self.assertEqual(published["receipt_sha256"], result["receipt_sha256"])
 
-    def test_missing_receipt_authority_blocks_reset_on_stale_plan(self) -> None:
-        # A preexisting/forged plan cannot make task or worker resets eligible
-        # after protected receipt authority has been withdrawn.
+    def test_reserved_receipt_inodes_are_checked_before_publication(self) -> None:
+        # An unrelated same-UID swap must never redirect receipt bytes.
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            jobs, archive, receipts = root / "jobs", root / "archive", root / "receipts"
-            for directory in (jobs, archive, receipts):
-                directory.mkdir(mode=0o700)
-            unit = "grabowski-task-" + "b" * 24 + "-a1.service"
-            task_db = self._task_db(root / "tasks.sqlite3", unit, "failed")
-            plan = RETENTION.build_plan(
-                minimum_job_age_seconds=50, now=1000,
-                jobs_root=jobs, archive_root=archive, receipt_root=receipts,
-                task_db=task_db, failed_units=[unit], unit_states={},
-            )
-            self.assertEqual(plan["reset_failed_units"], [unit])
-            self._simulated_protected_receipt_authority.return_value = False
-            reset = Mock()
-            with patch.object(RETENTION, "_run", reset):
+            target = root / "sample.json"
+            name = ".sample.json.1.1234.tmp"
+            parent_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            held_fd = None
+            try:
+                held_fd = os.open(
+                    name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o600, dir_fd=parent_fd,
+                )
+                os.unlink(name, dir_fd=parent_fd)
+                replacement = root / name
+                replacement.write_text("foreign", encoding="utf-8")
                 with self.assertRaisesRegex(
-                    RuntimeError, "protected receipt publication authority"
+                    RuntimeError, "receipt temp reservation identity changed"
                 ):
-                    RETENTION.apply_plan(
-                        plan, expected_plan_sha256=plan["plan_sha256"]
+                    RETENTION._write_json_atomic(
+                        target, {"value": 1}, pinned_parent_fd=parent_fd,
+                        target_scoped_temp_capacity=True,
+                        reserved_temp=(name, held_fd),
                     )
-            reset.assert_not_called()
-            self.assertEqual(list(receipts.iterdir()), [])
-
-    def test_unprotected_receipt_planner_preserves_terminal_task_state(self) -> None:
-        self._simulated_protected_authority.return_value = False
-        self._simulated_protected_receipt_authority.return_value = False
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            jobs, archive, receipts = root / "jobs", root / "archive", root / "receipts"
-            for directory in (jobs, archive, receipts):
-                directory.mkdir(mode=0o700)
-            unit = "grabowski-task-" + "c" * 24 + "-a1.service"
-            task_db = self._task_db(root / "tasks.sqlite3", unit, "failed")
-            plan = RETENTION.build_plan(
-                minimum_job_age_seconds=50, now=1000,
-                jobs_root=jobs, archive_root=archive, receipt_root=receipts,
-                task_db=task_db, failed_units=[unit], unit_states={},
-            )
-            self.assertEqual(plan["reset_failed_units"], [])
-            self.assertEqual(plan["archive_jobs"], [])
-            self.assertTrue(any(
-                row["unit"] == unit and "protected receipt authority" in row["reason"]
-                for row in plan["blocked"]
-            ))
-
-    def test_production_has_no_receipt_effect_authority(self) -> None:
-        self.assertIs(PRODUCTION_RECEIPT_RETENTION_AUTHORITY(), False)
+                self.assertFalse(target.exists())
+                self.assertEqual(replacement.read_text(encoding="utf-8"), "foreign")
+            finally:
+                if held_fd is not None:
+                    os.close(held_fd)
+                os.close(parent_fd)
 
     def test_receipt_temp_capacity_scan_restarts_advanced_directory_cursor(self) -> None:
         # The plan may have scanned the same pinned directory FD earlier.
