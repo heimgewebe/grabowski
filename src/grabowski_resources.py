@@ -3350,7 +3350,9 @@ def _absolute_paths_overlap(left: str, right: str) -> bool:
     return common == left or common == right
 
 
-_MERGE_GUARD_MAX_CHANGED_PATHS = 3000
+# Keep atomic merge scope capacity aligned with the signed first-party reviewer.
+# Generated release PRs may have thousands of paths; byte budgets still apply.
+_MERGE_GUARD_MAX_CHANGED_PATHS = 4608
 _MERGE_GUARD_MAX_CHANGED_PATH_BYTES = 512 * 1024
 _MERGE_GUARD_MAX_SINGLE_CHANGED_PATH_BYTES = 8 * 1024
 _MERGE_GUARD_EXACT_METADATA_MAX_PATHS = 128
@@ -6099,6 +6101,11 @@ def acquire_resources(
     owner = _owner(owner_id)
     task_owner_match = re.fullmatch(r"task:([0-9a-f]{24})", owner)
     keys = normalize_resource_keys(resource_keys)
+    if any(key.startswith("gate:github-merge:") for key in keys):
+        raise PermissionError(
+            "GitHub merge gates require acquire_merge_guard_resources; "
+            "generic acquisitions cannot create unbound merge guards"
+        )
     lease_purpose = _purpose(purpose)
     ttl = _ttl(ttl_seconds)
     if metadata is not None and not isinstance(metadata, dict):

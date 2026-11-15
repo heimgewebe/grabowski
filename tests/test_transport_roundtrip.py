@@ -392,6 +392,85 @@ class TransportRoundtripTests(_TransportHarness):
             second_consumed["consumption_receipt_sha256"],
         )
 
+    def test_connector_capability_concurrent_challenges_preserve_ack_and_atomic_execution(self) -> None:
+        # One connector principal serves multiple chat sessions. The second
+        # begin must not replace the first challenge or its verified receipt.
+        connector = {"kind": "connector_capability", "label": "primary-test"}
+        first_intent = self.intent("first-write", "connector-first")
+        second_intent = self.intent("second-write", "connector-second")
+        first = self.begin(scope=connector, mutation_intent=first_intent)
+        second = self.begin(scope=connector, now=101, mutation_intent=second_intent)
+        self.assertNotEqual(
+            first["challenge_receipt_sha256"],
+            second["challenge_receipt_sha256"],
+        )
+        self.assertEqual(second["pending_challenge_count"], 2)
+        self.assertEqual(second["pool_mode"], "bounded-shared-capability-pool")
+
+        # Preserve the tested stable-connector three-call handshake. A
+        # different pending operation must survive both ACK and consumption.
+        first_ack = self.acknowledge(
+            first["challenge_receipt_sha256"], scope=connector, now=102
+        )
+        self.assertTrue(first_ack["mutation_gate_open"])
+        self.assertEqual(first_ack["pending_challenge_count"], 1)
+        second_reserved = self.reserve(
+            second["challenge_receipt_sha256"],
+            scope=connector,
+            mutation_intent=second_intent,
+            now=103,
+        )
+        self.assertTrue(second_reserved["execution_capability_bound"])
+        with self.assertRaises(roundtrip.TransportAtomicExecutionRequired):
+            roundtrip.consume_verified(
+                client_scope=connector,
+                runtime_binding=BINDING,
+                now_unix=104,
+                **second_intent,
+            )
+        first_consumed = roundtrip.consume_verified(
+            client_scope=connector,
+            runtime_binding=BINDING,
+            now_unix=104,
+            **first_intent,
+        )
+        second_consumed, second_execution = self.consume_reserved(
+            second["challenge_receipt_sha256"],
+            scope=connector,
+            mutation_intent=second_intent,
+            now=105,
+        )
+        self.assertTrue(first_consumed["consumption_receipt_sha256"])
+        self.assertEqual(
+            second_execution["consumption_receipt_sha256"],
+            second_consumed["consumption_receipt_sha256"],
+        )
+        with self.assertRaises(roundtrip.TransportRoundtripRequired):
+            roundtrip.consume_verified(
+                client_scope=connector,
+                runtime_binding=BINDING,
+                now_unix=106,
+                **first_intent,
+            )
+
+    def test_same_connector_intent_never_discloses_another_pending_challenge(self) -> None:
+        connector = {"kind": "connector_capability", "label": "primary-test"}
+        intent = self.intent("same-write", "same-arguments")
+        first = self.begin(scope=connector, mutation_intent=intent)
+        second = self.begin(scope=connector, mutation_intent=intent, now=101)
+        self.assertNotEqual(
+            first["challenge_receipt_sha256"],
+            second["challenge_receipt_sha256"],
+        )
+        status = roundtrip.status(
+            client_scope=connector,
+            runtime_binding=BINDING,
+            now_unix=102,
+        )
+        self.assertEqual(status["state"], "pooled")
+        self.assertIsNone(status["challenge_receipt_sha256"])
+        self.assertIsNone(status["target_tool_name"])
+
     def test_two_independent_shared_handshakes_each_admit_once(self) -> None:
         first = self.begin(scope=SHARED_SCOPE)
         second = self.begin(scope=SHARED_SCOPE, now=101)

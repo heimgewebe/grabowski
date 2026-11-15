@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import ctypes
+from datetime import datetime, timezone
 import fcntl
 import json
 import os
@@ -54,7 +55,7 @@ SHA256 = re.compile(r"[a-f0-9]{64}\Z")
 ID = re.compile(r"[a-f0-9]{32}\Z")
 REF = re.compile(r"(?P<path>[A-Za-z0-9_.@+/\[\]-]+)(?::(?P<source_revision>[a-f0-9]{40}))?:L(?P<start>[1-9][0-9]{0,6})(?:-L(?P<end>[1-9][0-9]{0,6}))?\Z")
 FIRST_PARTY_ALLOWED_REPO = re.compile(
-    r"(?:heimgewebe/[A-Za-z0-9_.-]+|alexdermohr/(?:kleinanzeiger|machtverflechtungen)|(?:Hall-of-Memory|hall-of-memory)/memoraevents)\Z"
+    r"(?:heimgewebe/[A-Za-z0-9_.-]+|alexdermohr/(?:kleinanzeiger|machtverflechtungen|magic)|(?:Hall-of-Memory|hall-of-memory)/memoraevents)\Z"
 )
 # Previously authorized repositories remain in the authenticated review history.
 # Admission of NEW sessions still uses FIRST_PARTY_ALLOWED_REPO. A historical
@@ -1969,7 +1970,9 @@ def _load_first_party_axes(
             record.get("issuer"), expected_tool=FIRST_PARTY_TOOL_SUBMIT,
         )
         if (
-            set(record) != {
+            # Old signed axis records remain readable. New records bind the
+            # precise read set under the same lock as the signed submission.
+            set(record) - {"sealed_read_ids"} != {
                 "schema_version", "kind", "session_id", "binding_sha256",
                 "axis", "report", "report_sha256", "issuer", "submitted_at_unix",
             }
@@ -1987,6 +1990,24 @@ def _load_first_party_axes(
         ):
             raise ReviewExecutionRejected("first-party axis receipt invalid or replayed")
         request_ids.add(issuer["request_id"])
+        if "sealed_read_ids" in record:
+            sealed = record["sealed_read_ids"]
+            axis_reads = {item["read_id"]: item for item in reads if item["axis"] == axis}
+            if (
+                not isinstance(sealed, list)
+                or any(
+                    not isinstance(read_id, str)
+                    or FIRST_PARTY_READ_ID_RE.fullmatch(read_id) is None
+                    for read_id in sealed
+                )
+                or sealed != sorted(set(sealed))
+                or any(
+                    read_id not in axis_reads
+                    or axis_reads[read_id]["observed_at_unix"] > record["submitted_at_unix"]
+                    for read_id in sealed
+                )
+            ):
+                raise ReviewExecutionRejected("first-party sealed axis reads invalid")
         report = _validate_first_party_report(
             record["report"], axis=axis, reads=reads,
             binding=session["binding"], prior_observations=observations,
@@ -2366,6 +2387,9 @@ def submit_first_party_axis_review(
             "session_id": session_id, "binding_sha256": session["binding_sha256"],
             "axis": axis, "report": normalized, "report_sha256": _digest(normalized),
             "issuer": authenticated, "submitted_at_unix": submitted_at,
+            # Exact under-lock snapshot. Unix-second timestamps alone cannot
+            # distinguish a read made before vs. after this signed submission.
+            "sealed_read_ids": sorted(item["read_id"] for item in reads if item["axis"] == axis),
         }
         axis_path = session_root / "axes" / (axis + ".json")
         if axis_path.exists():
@@ -2397,8 +2421,13 @@ def verified_first_party_semantic_review_passes(
     root_owned_signers: bool = True,
     now_unix: int | None = None,
     axes_to_review: tuple[str, ...] = REQUIRED_AXES,
+    legacy_seal_cutoff_unix: int | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Verify five signed controller reports and every persisted source read."""
+    if legacy_seal_cutoff_unix is not None and (
+        type(legacy_seal_cutoff_unix) is not int or legacy_seal_cutoff_unix < 0
+    ):
+        raise ReviewExecutionRejected("first-party legacy audit cutoff invalid")
     expected = _first_party_binding(binding)
     if axes_to_review != REQUIRED_AXES:
         raise ReviewExecutionRejected("first-party semantic method scope invalid")
@@ -2505,19 +2534,42 @@ def verified_first_party_semantic_review_passes(
         session, session_root, signers=signers,
         root_owned_signers=root_owned_signers, repository=repository,
     )
-    # No review PASS from a single authentic but incomplete diff excerpt.
-    # Every line of the immutable base/head delta must have been returned to
-    # the enrolled controller across the signed source-read receipts.
+    axes = _load_first_party_axes(
+        session, session_root, reads=reads, signers=signers,
+        root_owned_signers=root_owned_signers,
+    )
+    if set(axes) != set(axes_to_review):
+        raise ReviewExecutionRejected("first-party semantic axis coverage incomplete")
+    # A late signed read remains integrity-checked, but cannot fill a missing
+    # canonical diff range after the axis verdict has already been signed.
+    # New axes pin exact read IDs. Historic axes have only signed timestamps;
+    # their audited cutoff is retained for legacy receipt verification.
+    bound_diff_ranges: list[tuple[int, int]] = []
+    for item in reads:
+        if item["read_kind"] != "diff":
+            continue
+        record = axes.get(item["axis"])
+        if record is None:
+            continue
+        sealed_ids = record.get("sealed_read_ids")
+        if sealed_ids is not None:
+            if item["read_id"] not in sealed_ids:
+                continue
+        else:
+            cutoff = (
+                legacy_seal_cutoff_unix
+                if legacy_seal_cutoff_unix is not None
+                else record["submitted_at_unix"]
+            )
+            if item["observed_at_unix"] > cutoff:
+                continue
+        bound_diff_ranges.append((item["start_line"], item["end_line"]))
     try:
         diff_line_count = len(diff.decode("utf-8").splitlines(keepends=True))
     except UnicodeError as exc:
         raise ReviewExecutionRejected("first-party canonical diff not text") from exc
     next_unseen = 1
-    ranges = sorted(
-        (item["start_line"], item["end_line"])
-        for item in reads if item["read_kind"] == "diff"
-    )
-    for first, last in ranges:
+    for first, last in sorted(bound_diff_ranges):
         if first > next_unseen:
             break
         next_unseen = max(next_unseen, last + 1)
@@ -2525,12 +2577,6 @@ def verified_first_party_semantic_review_passes(
             break
     if next_unseen <= diff_line_count:
         raise ReviewExecutionRejected("first-party canonical diff coverage incomplete")
-    axes = _load_first_party_axes(
-        session, session_root, reads=reads, signers=signers,
-        root_owned_signers=root_owned_signers,
-    )
-    if set(axes) != set(axes_to_review):
-        raise ReviewExecutionRejected("first-party semantic axis coverage incomplete")
     _assert_prior_first_party_material_findings_resolved(
         session, axes, root=root, repository=repository,
         signers=signers, root_owned_signers=root_owned_signers,
@@ -2549,6 +2595,15 @@ def verified_first_party_semantic_review_passes(
             "n": sequence, "axis": axis, "summary": report["summary"],
             "evidence_refs": report["evidence_refs"], "material_findings": 0,
         }
+        sealed_ids = (
+            set(record["sealed_read_ids"]) if "sealed_read_ids" in record
+            else None  # Legacy signed records lack an immutable read-ID list.
+        )
+        if (
+            sealed_ids is None and legacy_seal_cutoff_unix is not None
+            and legacy_seal_cutoff_unix < record["submitted_at_unix"]
+        ):
+            raise ReviewExecutionRejected("legacy audit predates signed axis submission")
         accepted[axis] = {
             "phase": phase,
             "provenance_kind": "first_party_authenticated_controller",
@@ -2558,8 +2613,20 @@ def verified_first_party_semantic_review_passes(
                 "issuer_principal_sha256": _digest(session["issuer_principal"]),
                 "axis_receipt_sha256": hashlib.sha256(_canonical(record)).hexdigest(),
                 "axis_report_sha256": record["report_sha256"],
+                # Bind the source-read provenance to the signed axis
+                # submission. Later authenticated replay reads must remain
+                # integrity-checked but cannot alter an immutable PASS audit.
                 "source_reads_sha256": _digest(sorted(
-                    item["data_sha256"] for item in reads if item["axis"] == axis
+                    item["data_sha256"] for item in reads
+                    if item["axis"] == axis
+                    and (
+                        item["read_id"] in sealed_ids if sealed_ids is not None
+                        else item["observed_at_unix"] <= (
+                            legacy_seal_cutoff_unix
+                            if legacy_seal_cutoff_unix is not None
+                            else record["submitted_at_unix"]
+                        )
+                    )
                 )),
                 "canonical_diff_sha256": session["canonical_diff_sha256"],
             },
@@ -3001,6 +3068,7 @@ def _verify(
             signers=signers, root_owned_signers=root_owned_signers,
             now_unix=now_unix, axes_to_review=tuple(axes),
         )
+        legacy_semantic_reviews: dict[str, dict[str, Any]] | None = None
         for phase, ref in zip(phases, refs, strict=True):
             axis = phase.get("axis") if isinstance(phase, dict) else None
             semantic = semantic_reviews.get(axis)
@@ -3024,9 +3092,47 @@ def _verify(
                 **semantic["provenance"],
             }
             if ref != expected_ref:
-                raise ReviewExecutionRejected(
-                    "direct first-party audit proof differs from signed records"
-                )
+                # Historical signed axes had no read-ID snapshot. The old
+                # sealer included signed reads after axis submission but
+                # before the audit was generated. Verify that exact window,
+                # never a freely supplied hash or unchecked source record.
+                if (
+                    not isinstance(ref, dict)
+                    or {k: v for k, v in ref.items() if k != "source_reads_sha256"}
+                    != {k: v for k, v in expected_ref.items() if k != "source_reads_sha256"}
+                ):
+                    raise ReviewExecutionRejected(
+                        "direct first-party audit proof differs from signed records"
+                    )
+                if legacy_semantic_reviews is None:
+                    stamped = audit.get("generated_at")
+                    try:
+                        if not isinstance(stamped, str):
+                            raise ValueError("missing audit timestamp")
+                        generated = datetime.fromisoformat(stamped)
+                        if generated.tzinfo is None or generated.utcoffset() is None:
+                            raise ValueError("naive audit timestamp")
+                        seal_cutoff = int(generated.astimezone(timezone.utc).timestamp())
+                        if seal_cutoff < 0 or seal_cutoff > now_unix + 300:
+                            raise ValueError("audit timestamp outside observed window")
+                    except (TypeError, ValueError, OverflowError, OSError) as exc:
+                        raise ReviewExecutionRejected(
+                            "first-party legacy audit timestamp invalid"
+                        ) from exc
+                    legacy_semantic_reviews = verified_first_party_semantic_review_passes(
+                        semantic_binding, repository=repository, root=first_party_root,
+                        signers=signers, root_owned_signers=root_owned_signers,
+                        now_unix=now_unix, axes_to_review=tuple(axes),
+                        legacy_seal_cutoff_unix=seal_cutoff,
+                    )
+                legacy = legacy_semantic_reviews.get(axis)
+                if not isinstance(legacy, dict) or ref != {
+                    **expected_ref,
+                    "source_reads_sha256": legacy["provenance"]["source_reads_sha256"],
+                }:
+                    raise ReviewExecutionRejected(
+                        "direct first-party audit proof differs from signed records"
+                    )
         return
     signer = _allowed_signers(signers, root_owned=root_owned_signers)
     if repository is None:

@@ -1076,6 +1076,124 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
                     self.assertEqual(outcome["status"], "settled")
                     self.assertEqual(outcome["errors"], [])
 
+    def test_monotonic_private_nonreview_root_additions_trigger_full_rescan(self) -> None:
+        # Concurrent RepoGround registration and root-level private receipts
+        # must not block unrelated finished reviews if the full second scan
+        # verifies the newly added entries and all original directory inodes.
+        for addition in ("rgpm-job", "private-receipt"):
+            with self.subTest(addition=addition), tempfile.TemporaryDirectory() as temporary:
+                jobs = Path(temporary) / "jobs"
+                jobs.mkdir(mode=0o700)
+                initial = make_job(
+                    jobs, suffix="a88888888888", slot="A",
+                    terminal_status="succeeded",
+                    review_result=result("A", "PASS_THIS_REVISION", 0),
+                )
+                original = reviews._read_private_json
+                added = False
+
+                def create_during_first_read(path, *args, **kwargs):
+                    nonlocal added
+                    if not added and Path(path) == initial / "metadata.json":
+                        added = True
+                        if addition == "rgpm-job":
+                            (jobs / "grabowski-job-rgpm-0123456789abcdef-00").mkdir(
+                                mode=0o700
+                            )
+                        else:
+                            receipt = jobs / ".other-workflow-receipt.json"
+                            receipt.write_text("{}", encoding="utf-8")
+                            receipt.chmod(0o600)
+                    return original(path, *args, **kwargs)
+
+                with mock.patch.object(
+                    reviews, "_read_private_json",
+                    side_effect=create_during_first_read,
+                ):
+                    checked = self.reconcile(jobs)
+                self.assertTrue(added)
+                self.assertEqual(checked["status"], "settled", repr(checked["errors"]))
+                self.assertEqual(checked["errors"], [])
+                self.assertEqual(checked["attempt_count"], 1)
+
+    def test_private_receipt_addition_cannot_mask_new_material_reject(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            jobs = Path(temporary) / "jobs"
+            jobs.mkdir(mode=0o700)
+            initial = make_job(
+                jobs, suffix="a88888888888", slot="A",
+                terminal_status="succeeded",
+                review_result=result("A", "PASS_THIS_REVISION", 0),
+            )
+            original = reviews._read_private_json
+            added = False
+
+            def publish_reject_with_receipt(path, *args, **kwargs):
+                nonlocal added
+                if not added and Path(path) == initial / "metadata.json":
+                    added = True
+                    receipt = jobs / ".unrelated-private-receipt.json"
+                    receipt.write_text("{}", encoding="utf-8")
+                    receipt.chmod(0o600)
+                    make_job(
+                        jobs, suffix="b99999999999", slot="B",
+                        terminal_status="succeeded",
+                        review_result=result("B", "REJECT_THIS_REVISION", 1),
+                    )
+                return original(path, *args, **kwargs)
+
+            with mock.patch.object(
+                reviews, "_read_private_json", side_effect=publish_reject_with_receipt,
+            ):
+                checked = self.reconcile(jobs)
+        self.assertTrue(added)
+        self.assertEqual(checked["status"], "blocked")
+        self.assertTrue(any(
+            error.startswith("decision_review_material_reject:b:")
+            for error in checked["errors"]
+        ), checked["errors"])
+
+    def test_unsafe_noncanonical_root_additions_remain_hard_blocking(self) -> None:
+        # A new suspicious name or non-private object can never be mistaken
+        # for a benign unrelated workflow and silently admitted.
+        for addition in ("public-file", "malformed-job-file", "symlink"):
+            with self.subTest(addition=addition), tempfile.TemporaryDirectory() as temporary:
+                jobs = Path(temporary) / "jobs"
+                jobs.mkdir(mode=0o700)
+                initial = make_job(
+                    jobs, suffix="a88888888888", slot="A",
+                    terminal_status="succeeded",
+                    review_result=result("A", "PASS_THIS_REVISION", 0),
+                )
+                original = reviews._read_private_json
+                added = False
+
+                def create_during_first_read(path, *args, **kwargs):
+                    nonlocal added
+                    if not added and Path(path) == initial / "metadata.json":
+                        added = True
+                        if addition == "symlink":
+                            (jobs / ".review-alias").symlink_to(initial)
+                        else:
+                            name = (
+                                "grabowski-job-not-a-real-job"
+                                if addition == "malformed-job-file"
+                                else ".world-readable-workflow.json"
+                            )
+                            target = jobs / name
+                            target.write_text("{}", encoding="utf-8")
+                            target.chmod(0o600 if addition == "malformed-job-file" else 0o644)
+                    return original(path, *args, **kwargs)
+
+                with mock.patch.object(
+                    reviews, "_read_private_json",
+                    side_effect=create_during_first_read,
+                ):
+                    checked = self.reconcile(jobs)
+                self.assertTrue(added)
+                self.assertEqual(checked["status"], "blocked")
+                self.assertIn("decision_review_jobs_root_changed", checked["errors"])
+
     def test_v2_claude_429_blocks_until_exact_later_same_slot_pass(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             jobs = Path(temporary) / "jobs"
@@ -3064,6 +3182,98 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
             self.assertTrue(any(
                 "decision_review" in error for error in second["errors"]
             ))
+
+    def test_late_ordinary_stdout_append_requires_unchanged_prefix_and_no_reject(self) -> None:
+        # A long-running non-review job can append output during the scan of
+        # thousands of earlier jobs. Its log is not immutable review evidence.
+        # Re-read the whole bounded file, validate the already scanned prefix,
+        # and still reject an exact-head decision appearing after first read.
+        for variant in ("append", "late_reject", "rewrite_then_append", "late_role_receipt"):
+            with self.subTest(variant=variant):
+                with tempfile.TemporaryDirectory() as temp:
+                    jobs = Path(temp) / "jobs"
+                    jobs.mkdir(mode=0o700)
+                    ordinary = jobs / "grabowski-job-aaaaaaaaa501"
+                    ordinary.mkdir(mode=0o700)
+                    scope = {
+                        "cwd": "/tmp", "argv_sha256": "e" * 64,
+                        "runtime_seconds": 60,
+                    }
+                    origin, digest = job_origin.build_origin(
+                        unit=ordinary.name, owner=f"uid:{os.getuid()}",
+                        argv_sha256="e" * 64, scope=scope,
+                        notify_on_done={"requested": False, "channels": []},
+                        created_at_unix=1_787_000_000,
+                        started_at="2026-08-18T12:00:00Z",
+                        invoker_tool="grabowski_job_start",
+                    )
+                    write_private(ordinary / "metadata.json", json.dumps({
+                        "unit": ordinary.name, "job_id": origin["job_id"],
+                        "owner": origin["owner"], "argv_sha256": origin["argv_sha256"],
+                        "scope": scope, "origin": origin, "origin_sha256": digest,
+                    }))
+                    stdout = ordinary / "stdout.log"
+                    write_private(stdout, "unrelated progress\n")
+                    write_private(ordinary / "stderr.log", "")
+                    reviewer = make_job(
+                        jobs, suffix="bbbbbbbbb502", slot="A",
+                        terminal_status="succeeded",
+                        review_result=result("A", "PASS_THIS_REVISION", 0),
+                    )
+                    old_identity = stdout.stat().st_ino
+                    original = reviews._validated_origin_binding
+                    changed = False
+
+                    def write_during_later_review(directory, *args, **kwargs):
+                        nonlocal changed
+                        if directory == reviewer and not changed:
+                            if variant == "append":
+                                with stdout.open("ab") as stream:
+                                    stream.write(b"more ordinary progress\n")
+                            elif variant == "late_reject":
+                                with stdout.open("ab") as stream:
+                                    marker = reviews.RESULT_PREFIX + json.dumps(
+                                        result("A", "REJECT_THIS_REVISION", 1)
+                                    ) + "\n"
+                                    stream.write(marker.encode("utf-8"))
+                            elif variant == "rewrite_then_append":
+                                with stdout.open("r+b") as stream:
+                                    stream.write(b"X")
+                                    stream.seek(0, os.SEEK_END)
+                                    stream.write(b"more progress\n")
+                            else:
+                                write_private(
+                                    ordinary / reviews.REVIEW_ROLE_ATTEMPT_RECEIPT_NAME,
+                                    json.dumps({"expected_head": HEAD,
+                                                "expected_base_head": BASE}),
+                                )
+                            changed = True
+                        return original(directory, *args, **kwargs)
+
+                    with mock.patch.object(
+                        reviews, "_validated_origin_binding",
+                        side_effect=write_during_later_review,
+                    ):
+                        checked = self.reconcile(jobs)
+                    self.assertTrue(changed)
+                    self.assertEqual(stdout.stat().st_ino, old_identity)
+                    if variant == "append":
+                        self.assertEqual(checked["status"], "settled")
+                        self.assertEqual(checked["errors"], [])
+                    else:
+                        self.assertEqual(checked["status"], "blocked")
+                        if variant == "late_reject":
+                            self.assertIn(
+                                f"decision_review_unbound_result:{ordinary.name}",
+                                checked["errors"],
+                            )
+                        else:
+                            self.assertTrue(any(
+                                code in checked["errors"] for code in (
+                                    "decision_review_job_file_changed",
+                                    "decision_review_job_directory_changed",
+                                )
+                            ), checked["errors"])
 
     def test_late_inplace_stdout_rewrite_blocks_first_settlement(self) -> None:
         # Unlike new directory entries, rewriting an existing stdout inode

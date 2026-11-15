@@ -979,6 +979,35 @@ class ClientSnapshotTests(unittest.TestCase):
             self.assertEqual(declaration["observed_tools"], artifact)
             self.assertEqual(declaration["observed_tool_count"], len(names))
 
+            # A later tools/list + status observation of the SAME catalog
+            # is a legitimate renewal, not a replay of the original request.
+            # The signed request body must distinguish these observations.
+            with mock.patch.object(
+                snapshot.time, "time_ns", return_value=1_800_000_000_000_000_000
+            ):
+                renewed = asyncio.run(
+                    snapshot._observe_and_bind_snapshot(
+                        mcp_url="http://127.0.0.1:18181/mcp",
+                        session_id="session-schema",
+                        connector_capability=connector_capability,
+                        timeout_seconds=1.0,
+                    )
+                )
+            self.assertEqual(renewed["state"], "renewed")
+            self.assertEqual(len(declarations), 2)
+            self.assertEqual(
+                declarations[0]["parameters"], declarations[1]["parameters"]
+            )
+            self.assertNotEqual(
+                declarations[0]["reason"], declarations[1]["reason"]
+            )
+            self.assertIn(
+                "1800000000000000000", declarations[1]["reason"]
+            )
+            self.assertEqual(
+                request_metas, [{"client_id": snapshot.AUTO_REFRESH_CLIENT_ID}] * 4
+            )
+
             schema_match = False
             with self.assertRaisesRegex(
                 snapshot.ClientSnapshotError,

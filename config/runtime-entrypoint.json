@@ -122,6 +122,7 @@
     "grabowski_task_resume",
     "grabowski_task_list",
     "grabowski_chronik_outbox_import",
+    "grabowski_chronik_full_search",
     "grabowski_chronik_history",
     "grabowski_operator_historical_recall",
     "grabowski_task_reconcile_check",
@@ -405,6 +406,10 @@
       "source": "src/grabowski_coding_agent_router.py"
     },
     {
+      "module": "grabowski_critical_review_dispatch",
+      "source": "src/grabowski_critical_review_dispatch.py"
+    },
+    {
       "module": "grabowski_capabilities",
       "source": "src/grabowski_capabilities.py"
     },
@@ -527,6 +532,10 @@
     {
       "module": "grabowski_chronik",
       "source": "src/grabowski_chronik.py"
+    },
+    {
+      "module": "grabowski_chronik_full_search",
+      "source": "src/grabowski_chronik_full_search.py"
     },
     {
       "module": "grabowski_recovery",

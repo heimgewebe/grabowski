@@ -5945,6 +5945,9 @@ def _run_worktree_hygiene_reconcile(
         )
     max_actions = parameters.get("max_actions", WORKTREE_HYGIENE_MAX_ACTIONS)
     archive_new_candidates = parameters.get("archive_new_candidates", True)
+    include_terminal_owners = parameters.get("include_terminal_owners", False)
+    if not isinstance(include_terminal_owners, bool):
+        raise GripPreflightError("include_terminal_owners must be boolean")
     if not isinstance(archive_new_candidates, bool):
         raise GripPreflightError("archive_new_candidates must be boolean")
     allowed_checkout_roots_raw = parameters.get("allowed_checkout_roots")
@@ -5992,6 +5995,14 @@ def _run_worktree_hygiene_reconcile(
         if observed_owner == owner_id:
             candidates.append({**item, "_hygiene_owner_mode": "owned"})
             continue
+        if (
+            include_terminal_owners
+            and observed_owner is not None
+            and item.get("lifecycle_state") in {"completed_retained", "cleanup_candidate"}
+        ):
+            candidates.append({**item, "_hygiene_owner_mode": "bound_terminal",
+                               "_hygiene_owner_id": observed_owner})
+            continue
         if observed_owner is None and item.get("lifecycle_state") == "unclassified_clean":
             candidates.append({**item, "_hygiene_owner_mode": "adopt_unowned_after_terminal_proof"})
             continue
@@ -6008,206 +6019,307 @@ def _run_worktree_hygiene_reconcile(
     default_branch: str | None = None
     default_branch_error: dict[str, Any] | None = None
     actions = 0
+    errors: list[dict[str, str]] = []
 
     for item in candidates:
-        path = str(item.get("path"))
-        state = str(item.get("lifecycle_state"))
-        owner_mode = str(item.get("_hygiene_owner_mode"))
-        head = item.get("head")
-        branch = item.get("branch")
-        lifecycle = item.get("lifecycle") if isinstance(item.get("lifecycle"), dict) else {}
-        archive = lifecycle.get("latest_archive") if isinstance(lifecycle.get("latest_archive"), dict) else None
+        try:
+            path = str(item.get("path"))
+            state = str(item.get("lifecycle_state"))
+            owner_mode = str(item.get("_hygiene_owner_mode"))
+            candidate_owner = str(item.get("_hygiene_owner_id") or owner_id)
+            physical_parameters: dict[str, Any] = {}
+            head = item.get("head")
+            branch = item.get("branch")
+            lifecycle = item.get("lifecycle") if isinstance(item.get("lifecycle"), dict) else {}
+            archive = lifecycle.get("latest_archive") if isinstance(lifecycle.get("latest_archive"), dict) else None
 
-        if actions >= max_actions:
-            skipped.append({"path": path, "reason": "max_actions_reached", "state": state})
-            continue
-        checkout_path = Path(path).expanduser().resolve(strict=False)
-        if allowed_checkout_roots and not any(
-            checkout_path == root or checkout_path.is_relative_to(root)
-            for root in allowed_checkout_roots
-        ):
-            skipped.append({"path": path, "reason": "outside_allowed_checkout_roots", "state": state})
-            continue
-        if item.get("is_main"):
-            skipped.append({"path": path, "reason": "main_worktree", "state": state})
-            continue
-        if item.get("status", {}).get("dirty") is not False:
-            skipped.append({"path": path, "reason": "dirty_or_unobservable", "state": state})
-            continue
-        if item.get("coordination", {}).get("blocking"):
-            skipped.append({"path": path, "reason": "active_coordination", "state": state})
-            continue
-
-        if state == "cleanup_candidate" and archive is not None:
-            retention = (
-                lifecycle.get("retention")
-                if isinstance(lifecycle.get("retention"), dict)
-                else None
-            )
-            retention_until_unix = (
-                retention.get("retention_until_unix")
-                if isinstance(retention, dict)
-                else None
-            )
-            if (
-                isinstance(retention_until_unix, int)
-                and retention_until_unix > now
-            ):
-                skipped.append({
-                    "path": path,
-                    "reason": "active_retention_not_elapsed",
-                    "state": state,
-                    "retention_until_unix": retention_until_unix,
-                })
+            if actions >= max_actions:
+                skipped.append({"path": path, "reason": "max_actions_reached", "state": state})
                 continue
-            dry = grabowski_checkouts.grabowski_checkout_cleanup(
-                repo=str(repo),
-                checkout_path=path,
-                owner_id=owner_id,
-                dry_run=True,
-                archive_id=archive.get("archive_id"),
-                expected_head=head,
-                expected_branch=branch,
-            )
-            plan = dry["plan"]
-            actions += 1
-            cleanup_plans.append({
-                "path": path,
-                "plan_id": dry["dry_run_record"]["plan_id"],
-                "plan_sha256": plan["plan_sha256"],
-                "safe_to_apply": plan["safe_to_apply"],
-            })
-            if apply_cleanup and plan["safe_to_apply"] is True:
-                if actions >= max_actions:
+            checkout_path = Path(path).expanduser().resolve(strict=False)
+            if allowed_checkout_roots and not any(
+                checkout_path == root or checkout_path.is_relative_to(root)
+                for root in allowed_checkout_roots
+            ):
+                skipped.append({"path": path, "reason": "outside_allowed_checkout_roots", "state": state})
+                continue
+            if item.get("is_main"):
+                skipped.append({"path": path, "reason": "main_worktree", "state": state})
+                continue
+            if item.get("status", {}).get("dirty") is not False:
+                skipped.append({"path": path, "reason": "dirty_or_unobservable", "state": state})
+                continue
+            if item.get("coordination", {}).get("blocking"):
+                skipped.append({"path": path, "reason": "active_coordination", "state": state})
+                continue
+
+            if include_terminal_owners and state in {"completed_retained", "cleanup_candidate"}:
+                try:
+                    binding = lifecycle.get("binding")
+                    if not isinstance(binding, dict) or (
+                        binding.get("owner_id") != candidate_owner
+                        or binding.get("expected_head") != head
+                        or binding.get("expected_branch") != branch
+                        or binding.get("checkout_path") != path
+                        or binding.get("checkout_key") != item.get("checkout_key")
+                        or binding.get("phase") != ("archived" if state == "cleanup_candidate" else "completed_retained")
+                    ):
+                        raise RuntimeError("terminal owner binding differs from checkout")
+                    consistency = grabowski_checkouts._binding_consistency(item, lifecycle, exists=True)
+                    if consistency["consistent"] is not True:
+                        raise RuntimeError("terminal lifecycle binding is inconsistent")
+                    import grabowski_checkout_terminal_sources as terminal_sources
+                    import grabowski_work_acquire as work_acquire
+
+                    if item.get("coordination", {}).get("blocking") is not False:
+                        raise RuntimeError("coordination state unavailable")
+                    source_terminal = terminal_sources.source_terminal_evidence(binding)
+                    source = binding.get("source", {})
+                    if source.get("kind") != "work_lane":
+                        raise RuntimeError("original physical receipt unavailable for source")
+                    lane = work_acquire._read_state(work_acquire._state_root() / f"{source['id']}.json")
+                    if (not isinstance(lane, dict) or lane.get("lane_id") != source["id"]
+                            or lane.get("receipt_sha256") != source_terminal.get("lane_receipt_sha256")):
+                        raise RuntimeError("terminal source receipt changed")
+                    original = lane.get("worktree_receipt", {}).get("lifecycle", {})
+                    physical = original.get("physical_checkout")
+                    if (
+                        original.get("owner_id") != candidate_owner
+                        or original.get("checkout_key") != item.get("checkout_key")
+                        or original.get("checkout_path") != path
+                        or original.get("expected_branch") != branch
+                        or not isinstance(physical, dict)
+                    ):
+                        raise RuntimeError("original physical receipt binding differs")
+                    grabowski_checkouts._verify_expected_physical_checkout_identity(Path(path), physical)
+                    physical_parameters = {"expected_physical_identity": physical}
+                    # Operator opt-in never overrides the original source permission.
+                    # A signed closeout alone can still describe ongoing PR work.
+                    reason = None
+                    terminal_state = source_terminal.get("terminal_state")
+                    if original.get("automatic_cleanup_authorized") is not True:
+                        reason = "source_automatic_cleanup_not_authorized"
+                    elif terminal_state in {"pr_opened", "pr_updated"}:
+                        if candidate_pr_queries >= WORKTREE_HYGIENE_MAX_CANDIDATES:
+                            reason = "github_query_bound_reached"
+                        else:
+                            if default_branch is None and default_branch_error is None:
+                                default_evidence = _lookup_default_branch(repo, github_runner)
+                                github_queries += 1
+                                if default_evidence.get("status") == "available":
+                                    default_branch = str(default_evidence["name"])
+                                else:
+                                    default_branch_error = default_evidence
+                            if default_branch is None:
+                                reason = "default_branch_not_proven"
+                            else:
+                                merged = _lookup_merged_pr_for_checkout(
+                                    repo, branch=branch, head=head,
+                                    default_branch=default_branch, github_runner=github_runner,
+                                )
+                                github_queries += 1
+                                candidate_pr_queries += 1
+                                if merged.get("status") != "exact_merged":
+                                    reason = "terminal_owner_exact_merge_not_proven"
+                                else:
+                                    source_terminal = {**source_terminal, "merged_pr": merged}
+                    elif terminal_state not in {"pr_merged", "deployed", "no_change_proven"}:
+                        reason = "terminal_owner_work_not_final"
+                    if reason is not None:
+                        skipped.append({"path": path, "reason": reason, "state": state})
+                        errors.append({"path": path, "error": reason})
+                        continue
+                except (ValueError, RuntimeError, PermissionError, OSError) as exc:
+                    errors.append({"path": path, "error": str(exc)})
+                    continue
+
+            if include_terminal_owners and ((state == "cleanup_candidate" and archived)
+                    or (state != "cleanup_candidate" and cleanup_plans)):
+                skipped.append({"path": path, "reason": "separate_archive_cleanup_invocations", "state": state})
+                continue
+
+            if state == "cleanup_candidate" and archive is not None:
+                retention = (
+                    lifecycle.get("retention")
+                    if isinstance(lifecycle.get("retention"), dict)
+                    else None
+                )
+                retention_until_unix = (
+                    retention.get("retention_until_unix")
+                    if isinstance(retention, dict)
+                    else None
+                )
+                if (
+                    isinstance(retention_until_unix, int)
+                    and retention_until_unix > now
+                ):
                     skipped.append({
                         "path": path,
-                        "reason": "cleanup_apply_deferred_by_action_bound",
+                        "reason": "active_retention_not_elapsed",
+                        "state": state,
+                        "retention_until_unix": retention_until_unix,
+                    })
+                    continue
+                dry = grabowski_checkouts.grabowski_checkout_cleanup(
+                    repo=str(repo),
+                    checkout_path=path,
+                    owner_id=candidate_owner,
+                    dry_run=True,
+                    archive_id=archive.get("archive_id"),
+                    expected_head=head,
+                    expected_branch=branch,
+                    **physical_parameters,
+                )
+                plan = dry["plan"]
+                if include_terminal_owners and plan["safe_to_apply"] is not True:
+                    errors.append({"path": path, "error": "cleanup plan is not safe to apply"})
+                actions += 1
+                cleanup_plans.append({
+                    "path": path,
+                    "plan_id": dry["dry_run_record"]["plan_id"],
+                    "plan_sha256": plan["plan_sha256"],
+                    "safe_to_apply": plan["safe_to_apply"],
+                })
+                if apply_cleanup and plan["safe_to_apply"] is True:
+                    if actions >= max_actions:
+                        skipped.append({
+                            "path": path,
+                            "reason": "cleanup_apply_deferred_by_action_bound",
+                            "state": state,
+                        })
+                        continue
+                    applied = grabowski_checkouts.grabowski_checkout_cleanup(
+                        repo=str(repo),
+                        checkout_path=path,
+                        owner_id=candidate_owner,
+                        dry_run=False,
+                        plan_id=dry["dry_run_record"]["plan_id"],
+                        expected_plan_sha256=plan["plan_sha256"],
+                        confirmation="remove-linked-checkout",
+                        **physical_parameters,
+                    )
+                    cleaned.append({
+                        "path": path,
+                        "archive_id": plan["archive_id"],
+                        "plan_id": dry["dry_run_record"]["plan_id"],
+                        "plan_sha256": plan["plan_sha256"],
+                        "applied_at_unix": applied["applied_at_unix"],
+                    })
+                    actions += 1
+                continue
+
+            if state not in ({"retained", "unclassified_clean", "completed_retained"} if include_terminal_owners else {"retained", "unclassified_clean"}):
+                skipped.append({"path": path, "reason": "state_not_archive_candidate", "state": state})
+                continue
+            if not archive_new_candidates:
+                skipped.append({
+                    "path": path,
+                    "reason": "new_archive_disabled",
+                    "state": state,
+                })
+                continue
+            if not isinstance(branch, str) or not branch or not isinstance(head, str):
+                skipped.append({"path": path, "reason": "branch_or_head_unavailable", "state": state})
+                continue
+            if physical_parameters:
+                terminal = source_terminal
+            else:
+                if candidate_pr_queries >= WORKTREE_HYGIENE_MAX_CANDIDATES:
+                    skipped.append({
+                        "path": path,
+                        "reason": "github_query_bound_reached",
                         "state": state,
                     })
                     continue
-                applied = grabowski_checkouts.grabowski_checkout_cleanup(
-                    repo=str(repo),
-                    checkout_path=path,
-                    owner_id=owner_id,
-                    dry_run=False,
-                    plan_id=dry["dry_run_record"]["plan_id"],
-                    expected_plan_sha256=plan["plan_sha256"],
-                    confirmation="remove-linked-checkout",
+                if default_branch is None and default_branch_error is None:
+                    default_branch_evidence = _lookup_default_branch(repo, github_runner)
+                    github_queries += 1
+                    if default_branch_evidence.get("status") == "available":
+                        default_branch = str(default_branch_evidence["name"])
+                    else:
+                        default_branch_error = default_branch_evidence
+                if default_branch is None:
+                    skipped.append({
+                        "path": path,
+                        "reason": "default_branch_not_proven",
+                        "state": state,
+                        "terminal_evidence": default_branch_error,
+                    })
+                    continue
+                candidate_pr_queries += 1
+                github_queries += 1
+                terminal = _lookup_merged_pr_for_checkout(
+                    repo,
+                    branch=branch,
+                    head=head,
+                    default_branch=default_branch,
+                    github_runner=github_runner,
                 )
-                cleaned.append({
-                    "path": path,
-                    "archive_id": plan["archive_id"],
-                    "plan_id": dry["dry_run_record"]["plan_id"],
-                    "plan_sha256": plan["plan_sha256"],
-                    "applied_at_unix": applied["applied_at_unix"],
-                })
-                actions += 1
-            continue
-
-        if state not in {"retained", "unclassified_clean"}:
-            skipped.append({"path": path, "reason": "state_not_archive_candidate", "state": state})
-            continue
-        if not archive_new_candidates:
-            skipped.append({
-                "path": path,
-                "reason": "new_archive_disabled",
-                "state": state,
-            })
-            continue
-        if not isinstance(branch, str) or not branch or not isinstance(head, str):
-            skipped.append({"path": path, "reason": "branch_or_head_unavailable", "state": state})
-            continue
-        if candidate_pr_queries >= WORKTREE_HYGIENE_MAX_CANDIDATES:
-            skipped.append({
-                "path": path,
-                "reason": "github_query_bound_reached",
-                "state": state,
-            })
-            continue
-        if default_branch is None and default_branch_error is None:
-            default_branch_evidence = _lookup_default_branch(repo, github_runner)
-            github_queries += 1
-            if default_branch_evidence.get("status") == "available":
-                default_branch = str(default_branch_evidence["name"])
-            else:
-                default_branch_error = default_branch_evidence
-        if default_branch is None:
-            skipped.append({
-                "path": path,
-                "reason": "default_branch_not_proven",
-                "state": state,
-                "terminal_evidence": default_branch_error,
-            })
-            continue
-        candidate_pr_queries += 1
-        github_queries += 1
-        terminal = _lookup_merged_pr_for_checkout(
-            repo,
-            branch=branch,
-            head=head,
-            default_branch=default_branch,
-            github_runner=github_runner,
-        )
-        if terminal.get("status") != "exact_merged":
-            skipped.append({
-                "path": path,
-                "reason": "terminality_not_proven",
-                "state": state,
-                "terminal_evidence": terminal,
-            })
-            continue
-        if owner_mode == "adopt_unowned_after_terminal_proof":
-            adopted_unowned_count += 1
-        retention = lifecycle.get("retention") if isinstance(lifecycle.get("retention"), dict) else {}
-        existing_until = retention.get("retention_until_unix")
-        archive_now = int(time.time())
-        retention_until = (
-            existing_until
-            if isinstance(existing_until, int) and existing_until > archive_now
-            else archive_now + WORKTREE_HYGIENE_ARCHIVE_HANDOFF_SECONDS
-        )
-        result = grabowski_checkouts.grabowski_checkout_archive(
-            repo=str(repo),
-            checkout_path=path,
-            owner_id=owner_id,
-            purpose=(
-                "terminal worktree hygiene: exact merged PR "
-                f"#{terminal['number']} head {head}"
-            ),
-            retention_until_unix=retention_until,
-            expected_head=head,
-            expected_branch=branch,
-        )
-        archive_record = result.get("archive") if isinstance(result, dict) else None
-        if not isinstance(archive_record, dict):
-            raise GripActionError("checkout archive returned no structured archive record")
-        archive_created_at = archive_record.get("created_at_unix")
-        archive_retention_until = archive_record.get("retention_until_unix")
-        if (
-            isinstance(archive_created_at, bool)
-            or not isinstance(archive_created_at, int)
-            or isinstance(archive_retention_until, bool)
-            or not isinstance(archive_retention_until, int)
-        ):
-            raise GripActionError(
-                "checkout archive receipt lacks bounded cleanup timing evidence"
+                if terminal.get("status") != "exact_merged":
+                    skipped.append({
+                        "path": path,
+                        "reason": "terminality_not_proven",
+                        "state": state,
+                        "terminal_evidence": terminal,
+                    })
+                    continue
+            if owner_mode == "adopt_unowned_after_terminal_proof":
+                adopted_unowned_count += 1
+            retention = lifecycle.get("retention") if isinstance(lifecycle.get("retention"), dict) else {}
+            existing_until = retention.get("retention_until_unix")
+            archive_now = int(time.time())
+            retention_until = (
+                existing_until
+                if isinstance(existing_until, int) and existing_until > archive_now
+                else archive_now + WORKTREE_HYGIENE_ARCHIVE_HANDOFF_SECONDS
             )
-        cleanup_available_at = max(
-            archive_created_at
-            + grabowski_checkouts.CHECKOUT_CLEANUP_GRACE_SECONDS,
-            archive_retention_until,
-        )
-        archived.append({
-            "path": path,
-            "archive_id": archive_record["archive_id"],
-            "head": head,
-            "branch": branch,
-            "merged_pr": terminal,
-            "ownership_mode": owner_mode,
-            "cleanup_not_before_unix": cleanup_available_at,
-            "cleanup_available_at_unix": cleanup_available_at,
-        })
-        actions += 1
+            result = grabowski_checkouts.grabowski_checkout_archive(
+                repo=str(repo),
+                checkout_path=path,
+                owner_id=candidate_owner,
+                purpose=(
+                    "terminal worktree hygiene: exact merged PR "
+                    f"{terminal.get('number', terminal.get('evidence_sha256'))} head {head}"
+                ),
+                retention_until_unix=retention_until,
+                expected_head=head,
+                expected_branch=branch,
+                **physical_parameters,
+            )
+            archive_record = result.get("archive") if isinstance(result, dict) else None
+            if not isinstance(archive_record, dict):
+                raise GripActionError("checkout archive returned no structured archive record")
+            archive_created_at = archive_record.get("created_at_unix")
+            archive_retention_until = archive_record.get("retention_until_unix")
+            if (
+                isinstance(archive_created_at, bool)
+                or not isinstance(archive_created_at, int)
+                or isinstance(archive_retention_until, bool)
+                or not isinstance(archive_retention_until, int)
+            ):
+                raise GripActionError(
+                    "checkout archive receipt lacks bounded cleanup timing evidence"
+                )
+            cleanup_available_at = max(
+                archive_created_at
+                + grabowski_checkouts.CHECKOUT_CLEANUP_GRACE_SECONDS,
+                archive_retention_until,
+            )
+            archived.append({
+                "path": path,
+                "archive_id": archive_record["archive_id"],
+                "head": head,
+                "branch": branch,
+                "merged_pr": terminal,
+                "ownership_mode": owner_mode,
+                "cleanup_not_before_unix": cleanup_available_at,
+                "cleanup_available_at_unix": cleanup_available_at,
+            })
+            actions += 1
+        except (ValueError, RuntimeError, PermissionError, OSError, KeyError, TypeError) as exc:
+            errors.append({"path": str(item.get("path")), "error": str(exc), "action_failed": "true"})
+            break  # Unknown mutation outcome: stop this invocation; never retry here.
+
 
     _check(
         receipt,
@@ -6219,6 +6331,7 @@ def _run_worktree_hygiene_reconcile(
         ),
     )
     _check(receipt, "bounded_actions", "pass", f"actions={actions} max={max_actions}")
+    _check(receipt, "candidate_errors", "fail" if errors else "pass", f"errors={len(errors)}")
     _check(
         receipt,
         "fail_closed_skips",
@@ -6226,6 +6339,9 @@ def _run_worktree_hygiene_reconcile(
         f"skipped={len(skipped)} ownership_conflicts={len(ownership_conflicts)}",
     )
     return {
+        "receipt_status": ("failed" if any(e.get("action_failed") for e in errors) else "blocked" if errors else "passed"),
+        "errors": errors,
+        "include_terminal_owners": include_terminal_owners,
         "owner_id": owner_id,
         "repository": str(repo),
         "apply_cleanup": apply_cleanup,
@@ -6247,7 +6363,7 @@ def _run_worktree_hygiene_reconcile(
             "permission_to_delete_branches",
             "terminality_without_exact_merged_pr_or_existing_archive",
             "cleanup_without_matching_recovery_archive_or_fresh_dry_run",
-            "authority_over_foreign_owners",
+            "owner_takeover",
         ],
     }
 
@@ -8838,6 +8954,7 @@ _AGENT_EXECUTION_SOURCE_FIELDS = frozenset(
         "effect_profile",
         "review_objective",
         "runtime_seconds",
+        "hard_case_advisory",
     }
 )
 _AGENT_EXECUTION_CONTINUATION_ENV = "GRABOWSKI_AEF_CONTINUATION"
@@ -8905,6 +9022,173 @@ def _agent_execution_int_parameter(
 def _agent_execution_slug(value: str, *, maximum: int = 28) -> str:
     normalized = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
     return (normalized or "source")[:maximum].rstrip("-") or "source"
+
+
+
+def _agent_execution_validate_hard_case_advisory(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict) or value.get("kind") not in {
+        "repeated_failure", "contradictory_evidence", "material_architecture"
+    }:
+        raise GripPreflightError("hard_case_advisory.kind is invalid")
+    fields = {"kind", "evidence_refs"}
+    if value["kind"] == "repeated_failure":
+        fields.add("error_fingerprint")
+    if set(value) != fields:
+        raise GripPreflightError("hard_case_advisory has invalid fields")
+    refs = value.get("evidence_refs")
+    minimum = 1 if value["kind"] == "material_architecture" else 2
+    if (
+        not isinstance(refs, list) or not minimum <= len(refs) <= 8
+        or any(not isinstance(ref, str) or not 8 <= len(ref) <= 256
+               or any(ord(ch) < 32 or ord(ch) == 127 for ch in ref) for ref in refs)
+        or len(set(refs)) != len(refs)
+    ):
+        raise GripPreflightError("hard_case_advisory requires distinct evidence references")
+    if value["kind"] == "repeated_failure" and not _is_sha256_hex(value["error_fingerprint"]):
+        raise GripPreflightError("repeated_failure requires a shared error SHA-256")
+    return dict(value)
+
+
+def _agent_execution_hard_case_advisory(
+    *, signal: dict[str, Any], task_class: str, novelty: str,
+    risk_flags: list[str], router: Any, repo: Path, head: str,
+    source_identity_sha256: str, objective: str, duration_minutes: int,
+    changed_files: int,
+) -> dict[str, Any]:
+    kind = signal["kind"]
+    flags = set(risk_flags)
+    qualified = (
+        (kind == "repeated_failure" and "prior-attempt-failed" in flags
+         and task_class in {"deep-debug", "complex-patch", "architecture", "migration"})
+        or (kind == "contradictory_evidence" and novelty == "high"
+            and task_class in {"deep-debug", "complex-patch", "architecture", "migration"})
+        or (kind == "material_architecture" and novelty == "high"
+            and "high-risk" in flags and task_class in {"architecture", "migration"})
+    )
+    base = {
+        "schema_version": 1, "signal": kind,
+        "evidence_refs_sha256": sha256_json(signal["evidence_refs"]),
+        "authority": "advisory_only", "non_blocking": True,
+        "automatic_apply": False,
+    }
+    if not qualified:
+        return {**base, "state": "not-triggered", "reason": "unqualified_signal"}
+    if flags.intersection(router.SENSITIVE_EXTERNAL_REVIEW_RISK_FLAGS):
+        return {**base, "state": "withheld", "reason": "sensitive_context"}
+    try:
+        import grabowski_agent_competition as competition
+        redact = getattr(competition.operator, "_redact", None)
+        if not callable(redact) or redact(objective) != objective:
+            return {**base, "state": "withheld", "reason": "objective_redaction_required"}
+        # The canonical Candidate identity also hashes provider and prompt.
+        # A stable request_id alone would not prevent a second Claude/Grok
+        # start after route availability or the objective changes. Reuse the
+        # existing create-only candidate directory as the durable claim.
+        request_id = "hardcase-" + sha256_json({
+            "source": source_identity_sha256, "signal": kind,
+            "error": signal.get("error_fingerprint"),
+        })[:32]
+
+        request_digest = hashlib.sha256(request_id.encode("utf-8")).hexdigest()[:10]
+        # Use the candidate store's existing request flock, with a reserved
+        # identifier that never denotes an actual provider task.
+        request_lock = f"gac-claude-contrast-0000000000-{request_digest}"
+        with competition._competition_request_lock(request_lock):
+            for entry in competition._competition_root().iterdir():
+                if not re.fullmatch(
+                    rf"gac-(?:claude|antigravity|opencode|openhands|agy|codex|grok)"
+                    rf"-(?:competitor|contrast)-[0-9a-f]{{10}}-{request_digest}",
+                    entry.name,
+                ):
+                    continue
+                # Existing persisted or ambiguous start always wins over a
+                # newly ranked route. Never retry an uncertain prior effect.
+                if entry.is_symlink() or not entry.is_dir():
+                    return {**base, "state": "unavailable",
+                            "reason": "existing_incident_candidate_unsafe",
+                            "retry_automatically": False}
+                try:
+                    previous = competition._validated_manifest(entry.name)
+                except Exception:
+                    return {**base, "state": "unavailable",
+                            "reason": "existing_incident_start_unresolved",
+                            "competition_id": entry.name,
+                            "retry_automatically": False}
+                if (
+                    previous.get("request_id") != request_id
+                    or previous.get("repository") != str(repo)
+                    or previous.get("expected_head") != head
+                ):
+                    return {**base, "state": "unavailable",
+                            "reason": "incident_claim_identity_collision",
+                            "retry_automatically": False}
+                original_route = previous.get("route_contract")
+                return {
+                    **base, "state": "reused",
+                    "provider": previous.get("provider"),
+                    "route_id": (
+                        original_route.get("route_id")
+                        if isinstance(original_route, dict) else None
+                    ),
+                    "request_id": request_id,
+                    "competition_id": entry.name,
+                    "task_id": previous.get("task_id"),
+                    "readback_tool": "grabowski_agent_competition_status",
+                    "does_not_establish": ["provider_success", "review_authority"],
+                }
+            choice = router.canonical_execution_route(
+                "independent-review", changed_files=changed_files,
+                duration_minutes=duration_minutes, novelty=novelty,
+                risk_flags=risk_flags, latency_priority=False, need_review=True,
+                verification_policy="independent_review", effect_profile="candidate",
+            )
+            candidates = [*choice.get("reviewers", []), *choice.get("review_fallbacks", [])]
+            reviewer = next(
+                (c for c in candidates if isinstance(c, dict)
+                 and c.get("harness") == "claude"
+                 and c.get("route_role") == "reviewer"
+                 and c.get("paid_only") is not True
+                 and isinstance(c.get("route"), str)), None
+            )
+            if reviewer is None:
+                return {**base, "state": "unavailable", "reason": "no_subscription_route"}
+            prompt = (
+                "Independent READ-ONLY technical second opinion in German. "
+                "Do not execute commands or modify any files. Separate supported facts, "
+                "alternative hypotheses, discriminating tests and a smallest reversible "
+                "repair. No API credits or paid fallback. Task: " + objective
+            )
+            started = competition.grabowski_agent_competition_start(
+                request_id=request_id, provider=reviewer["harness"],
+                mode="contrast", repository=str(repo), expected_head=head,
+                task=prompt, allowed_paths=["README.md"], context_paths=["README.md"],
+                forbidden_paths=[], primary_summary="Hard-case: " + kind,
+                timeout_seconds=360, max_budget_usd=0, require_hard_budget=True,
+                route_id=reviewer["route"], paid_execution_authorized=False,
+            )
+            if (not isinstance(started, dict) or not started.get("competition_id")
+                    or not started.get("task_id")):
+                return {**base, "state": "unavailable",
+                        "reason": "candidate_start_receipt_incomplete",
+                        "retry_automatically": False}
+            return {
+                **base, "state": "reused" if started.get("already_started") else "dispatched",
+                "provider": reviewer["harness"], "model": reviewer.get("model"),
+                "route_id": reviewer["route"], "request_id": request_id,
+                "competition_id": started.get("competition_id"),
+                "task_id": started.get("task_id"),
+                "readback_tool": "grabowski_agent_competition_status",
+                "does_not_establish": ["provider_success", "review_authority"],
+            }
+    except Exception as exc:
+        return {
+            **base, "state": "unavailable",
+            "reason": "start_unavailable_or_outcome_unknown",
+            "error_type": type(exc).__name__,
+            "retry_automatically": False,
+        }
 
 
 def _agent_execution_route_command(
@@ -9101,6 +9385,9 @@ def _agent_execution_source_request(
     if novelty not in {"low", "medium", "high"}:
         raise GripPreflightError("novelty must be low, medium or high")
     risk_flags = _string_list_parameter(parameters, "risk_flags")
+    hard_case_signal = _agent_execution_validate_hard_case_advisory(
+        parameters.get("hard_case_advisory")
+    )
     verification_policy = parameters.get("verification_policy", "independent_review")
     if verification_policy not in {
         "deterministic", "self_review", "independent_review",
@@ -9219,6 +9506,13 @@ def _agent_execution_source_request(
             "stop": True,
         }
     controller_actor = _agent_execution_controller_actor(parameters)
+    if hard_case_signal is not None:
+        frontdoor["hard_case_advisory"] = _agent_execution_hard_case_advisory(
+            signal=hard_case_signal, task_class=task_class.strip(), novelty=novelty,
+            risk_flags=risk_flags, router=router, repo=repo, head=source_revision,
+            source_identity_sha256=source_identity_sha256, objective=objective,
+            duration_minutes=duration_minutes, changed_files=len(write_paths),
+        )
     if route.get("executor") == "controller":
         if route.get("direct_work_required") is not True:
             raise GripPreflightError(
@@ -15486,7 +15780,23 @@ def _captain_repository_merge_policy(
         )
         info["branch_merge_rules"] = branch_query
         if branch_errors or branch_policy is None:
-            return None, info, branch_errors or ["repository_branch_merge_policy_unavailable"]
+            # Explicit merge commits have the same CAS semantics as implicit
+            # merge selection when GitHub paywalls branch rules.
+            if not (
+                requested_method == "merge"
+                and grabowski_merge_guard._github_rules_plan_limit_error(
+                    str(branch_query.get("stderr") or "")
+                )
+            ):
+                return None, info, branch_errors or ["repository_branch_merge_policy_unavailable"]
+            branch_policy = {
+                "base_branch": base_branch,
+                "active_rules_state": "github_plan_limit_403",
+                "pull_request_allowed_methods": None,
+                "merge_queue_present": None,
+                "merge_queue_method": None,
+            }
+            info["branch_merge_rules"]["plan_limit_cas_fallback_candidate"] = True
 
     if requested_entry is not None:
         selected_method, selected_field, selected_flag = requested_entry

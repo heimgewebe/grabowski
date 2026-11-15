@@ -745,6 +745,128 @@ def observed_repo(*records: dict) -> dict:
 
 
 class CheckoutBindingLiveIntegrationTests(unittest.TestCase):
+    def test_public_wal_tools_are_not_readonly_transport_bypasses(self) -> None:
+        import ast
+
+        runtime = Path(__file__).resolve().parents[1] / "src" / "grabowski_runtime.py"
+        module = ast.parse(runtime.read_text(encoding="utf-8"))
+        tool_names = {
+            "grabowski_current_work",
+            "grabowski_checkout_binding_reconciliation",
+            "grabowski_operator_optimization_report",
+        }
+        functions = {
+            item.name: item
+            for item in module.body
+            if isinstance(item, ast.AsyncFunctionDef) and item.name in tool_names
+        }
+        self.assertEqual(set(functions), tool_names)
+        for name, function in functions.items():
+            with self.subTest(tool=name):
+                decorators = [
+                    entry
+                    for entry in function.decorator_list
+                    if isinstance(entry, ast.Call)
+                    and isinstance(entry.func, ast.Attribute)
+                    and entry.func.attr == "tool"
+                ]
+                self.assertEqual(len(decorators), 1)
+                annotations = [
+                    keyword.value
+                    for keyword in decorators[0].keywords
+                    if keyword.arg == "annotations"
+                ]
+                self.assertEqual(len(annotations), 1)
+                self.assertEqual(
+                    ast.unparse(annotations[0]), "grabowski_operator_core.MUTATING"
+                )
+
+    def test_public_no_wal_does_not_request_mutation_admission(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            database = Path(temp) / "checkouts.sqlite3"
+            create_checkout_db(database)
+            observed = collect_lifecycle_bindings_from_db(
+                database,
+                _wal_mutation_admission=lambda _shm_path: (_ for _ in ()).throw(
+                    AssertionError("no WAL must not require mutation admission")
+                ),
+            )
+            self.assertEqual(observed["snapshot_mode"], "immutable-file")
+            self.assertEqual(observed["bindings"], [])
+
+    def test_public_wal_reconciliation_uses_scoped_admission_and_current_frames(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            database = Path(temp) / "checkouts.sqlite3"
+            create_checkout_db(database)
+            keeper = sqlite3.connect(database)
+            try:
+                self.assertEqual(
+                    keeper.execute("PRAGMA journal_mode=WAL").fetchone()[0], "wal"
+                )
+                keeper.execute("PRAGMA wal_autocheckpoint=0")
+                keeper.execute(
+                    "INSERT INTO metadata(key, value) VALUES('wal-keeper', 'live')"
+                )
+                keeper.commit()
+                insert_binding(
+                    database, checkout_key="key-active-wal", checkout_path=CHECKOUT,
+                )
+                wal = Path(str(database) + "-wal")
+                self.assertGreater(wal.stat().st_size, 0)
+                self.assertTrue(Path(str(database) + "-shm").is_file())
+                main_before = database.read_bytes()
+                wal_before = wal.read_bytes()
+
+                # The strict caller remains genuinely no-write and fails
+                # before a native SQLite reader can update -shm read marks.
+                with self.assertRaisesRegex(
+                    CheckoutBindingDatabaseError, "Strict read-only snapshot unavailable",
+                ):
+                    collect_lifecycle_bindings_from_db(database)
+                with self.assertRaisesRegex(PermissionError, "denied read-mark"):
+                    collect_lifecycle_bindings_from_db(
+                        database,
+                        _wal_mutation_admission=lambda _shm_path: (_ for _ in ()).throw(
+                            PermissionError("denied read-mark")
+                        ),
+                    )
+
+                admissions: list[str] = []
+                snapshot = collect_lifecycle_bindings_from_db(
+                    database,
+                    _wal_mutation_admission=lambda shm_path: admissions.append(str(shm_path)),
+                )
+                self.assertEqual(snapshot["snapshot_mode"], "native-ro-wal")
+                self.assertEqual(
+                    [row["checkout_key"] for row in snapshot["bindings"]],
+                    ["key-active-wal"],
+                )
+                with mock.patch(
+                    "grabowski_checkout_binding_reconciler.collect_git_worktrees_for_repos",
+                    return_value={
+                        "worktrees": [],
+                        "observable_repo_paths": [REPO],
+                        "observations": [{"requested_repo_path": REPO}],
+                        "errors": [],
+                        "errors_truncated": False,
+                    },
+                ):
+                    result = reconcile_checkout_bindings(
+                        db_path=database,
+                        repository_filters=[REPO],
+                        limit=1,
+                        _wal_mutation_admission=lambda shm_path: admissions.append(str(shm_path)),
+                    )
+                self.assertEqual(admissions, [str(database) + "-shm"] * 2)
+                self.assertEqual(result["count"], 1)
+                self.assertEqual(result["total_count"], 1)
+                self.assertEqual(result["bindings"][0]["checkout_key"], "key-active-wal")
+                self.assertEqual(result["bindings"][0]["state"], "orphaned_binding")
+                self.assertEqual(database.read_bytes(), main_before)
+                self.assertEqual(wal.read_bytes(), wal_before)
+            finally:
+                keeper.close()
+
     def test_native_admission_recovers_wal_created_during_immutable_read(self) -> None:
         """A real writer can start WAL after the initial no-sidecar decision."""
         import grabowski_checkout_binding_reconciler as reconciler
@@ -1173,7 +1295,7 @@ class CheckoutBindingLiveIntegrationTests(unittest.TestCase):
                 {item.name: item.read_bytes() for item in Path(tmp).iterdir()},
             )
 
-    def test_current_work_checkout_reconciliation_rejects_wal_before_any_temp_write(self) -> None:
+    def test_current_work_checkout_reconciliation_admits_wal_without_temp_files(self) -> None:
         import grabowski_current_work_surface as current_work_surface
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -1187,12 +1309,35 @@ class CheckoutBindingLiveIntegrationTests(unittest.TestCase):
                 keeper.execute("PRAGMA wal_autocheckpoint=0")
                 keeper.execute("PRAGMA user_version=1")
                 keeper.commit()
-                self.assertTrue(Path(str(path) + "-wal").is_file())
-                before = {item.name: item.read_bytes() for item in Path(tmp).iterdir()}
+                wal = Path(str(path) + "-wal")
+                self.assertTrue(wal.is_file())
+                main_before = path.read_bytes()
+                wal_before = wal.read_bytes()
+                admissions: list[str] = []
                 with (
                     mock.patch(
                         "grabowski_checkout_binding_reconciler._database_path",
                         return_value=path,
+                    ),
+                    mock.patch(
+                        "grabowski_checkout_binding_reconciler.collect_git_worktrees_for_repos",
+                        return_value={
+                            "worktrees": [],
+                            "observable_repo_paths": [REPO],
+                            "observations": [{"requested_repo_path": REPO}],
+                            "errors": [],
+                            "errors_truncated": False,
+                        },
+                    ),
+                    mock.patch.object(
+                        current_work_surface, "_operator",
+                        return_value=mock.Mock(
+                            _require_operator_mutation=(
+                                lambda capability, **kwargs: admissions.append(
+                                    (capability, kwargs.get("path"), kwargs.get("host"))
+                                )
+                            ),
+                        ),
                     ),
                     mock.patch.object(
                         sqlite_store.tempfile,
@@ -1200,16 +1345,17 @@ class CheckoutBindingLiveIntegrationTests(unittest.TestCase):
                         side_effect=AssertionError("no temporary snapshot allowed"),
                     ) as temp_dir,
                 ):
-                    with self.assertRaisesRegex(
-                        CheckoutBindingDatabaseError,
-                        "Strict read-only snapshot unavailable",
-                    ):
-                        current_work_surface._reconciliation_payload([REPO])
+                    result = current_work_surface._reconciliation_payload([REPO])
                 temp_dir.assert_not_called()
+                self.assertEqual(result["total_count"], 0)
+                self.assertTrue(result["task_checkout_presence_complete"])
                 self.assertEqual(
-                    before,
-                    {item.name: item.read_bytes() for item in Path(tmp).iterdir()},
+                    admissions,
+                    [("resource_lease", str(path) + "-shm", "heim-pc")] * 2,
                 )
+                # Native SQLite may touch -shm, never durable DB/WAL contents.
+                self.assertEqual(path.read_bytes(), main_before)
+                self.assertEqual(wal.read_bytes(), wal_before)
             finally:
                 keeper.close()
 

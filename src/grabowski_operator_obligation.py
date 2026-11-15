@@ -867,6 +867,45 @@ def _normalize_convergence_receipt(
         raise OperatorObligationInputError(
             "convergence assessment id does not match its bound request"
         )
+
+    direct_ref = closure.get("operator_obligation_ref")
+    if direct_ref is not None:
+        if request.get("schema_version") != 2 or closure.get("bureau_task_ref") is not None:
+            raise OperatorObligationInputError(
+                "direct-user convergence source must be a single v2 work authority"
+            )
+        try:
+            opened, open_sha256 = _read_private_json(
+                _record_path(obligation_id, "open.json")
+            )
+        except (OSError, OperatorObligationIntegrityError) as exc:
+            raise OperatorObligationInputError(
+                "direct-user convergence open record is not available"
+            ) from exc
+        _validate_open_record(opened, expected_id=obligation_id)
+        expected_ref = (
+            f"grabowski:operator-obligation:{obligation_id}@sha256:{open_sha256}"
+        )
+        if direct_ref != expected_ref:
+            raise OperatorObligationInputError(
+                "direct-user convergence ref does not bind this exact open record"
+            )
+        observation = request.get("observation")
+        source_refs = (
+            observation.get("source_refs")
+            if isinstance(observation, dict)
+            else None
+        )
+        if not isinstance(source_refs, list) or sum(
+            1 for item in source_refs
+            if isinstance(item, dict)
+            and item.get("kind") == "operator_obligation"
+            and item.get("ref") == expected_ref
+            and item.get("subject_sha256") == open_sha256
+        ) != 1:
+            raise OperatorObligationInputError(
+                "direct-user convergence observation is not bound to the open record"
+            )
     return binding
 
 

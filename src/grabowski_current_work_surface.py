@@ -14,7 +14,9 @@ MAX_SOURCE_LEASES = current_work.MAX_LEASES
 MAX_SOURCE_WORKERS = current_work.MAX_WORKERS
 CURRENT_TASK_STATES = ("launching", "running", "interrupted", "outcome_unknown")
 CURRENT_WORK_GIT_TIMEOUT_SECONDS = 1.0
-CURRENT_WORK_CHECKOUT_OBSERVATION_BUDGET_SECONDS = 4.0
+# Bounded full-worktree observation needs headroom beyond idle Git-probe timings.
+# Retain a finite limit; unavailable probes remain explicitly partial.
+CURRENT_WORK_CHECKOUT_OBSERVATION_BUDGET_SECONDS = 16.0
 CURRENT_WORK_CHECKOUT_MAX_WORKTREES: int | None = None
 CURRENT_WORK_MAX_PARALLEL_SOURCES = 2
 
@@ -25,6 +27,13 @@ def _module(name: str) -> Any:
 
 def _operator() -> Any:
     return _module("grabowski_operator_core")
+
+
+def _checkout_wal_admission(shm_path: Path) -> None:
+    # A native WAL read can update this exact SHM path; honor path freezes.
+    _operator()._require_operator_mutation(
+        "resource_lease", path=str(shm_path), host="heim-pc"
+    )
 
 
 def _require_repositories(repositories: list[str]) -> list[str]:
@@ -55,6 +64,24 @@ def _source_error(source: str, exc: Exception) -> dict[str, str]:
     }
 
 
+def _transient_sqlite_snapshot_change(source: str, exc: Exception) -> bool:
+    # A checkpoint can remove WAL/SHM between preflight and reader entry.
+    # Only these exact snapshot errors justify one completely new observation.
+    classes = {
+        "resources": ("grabowski_resources", "ResourceSchemaInventoryChanged"),
+        "tasks": ("grabowski_tasks", "TaskSchemaInventoryChanged"),
+        "attention": ("grabowski_tasks", "TaskSchemaInventoryChanged"),
+    }
+    target = classes.get(source)
+    if target is None:
+        return False
+    try:
+        changed_type = getattr(_module(target[0]), target[1])
+    except (ImportError, AttributeError):
+        return False
+    return isinstance(changed_type, type) and isinstance(exc, changed_type)
+
+
 def _attempt_source(
     source: str,
     capability: str,
@@ -64,7 +91,23 @@ def _attempt_source(
 ) -> Any:
     try:
         _operator()._require_operator_capability(capability)
-        return loader()
+        # Attention starts after checkout/binding observation and can overlap
+        # a second transient WAL creation/checkpoint on the task store. Retry
+        # its whole read at most twice; no individual snapshot is reused.
+        attempts = 3 if source == "attention" else 2
+        for attempt in range(attempts):
+            try:
+                return loader()
+            except Exception as exc:
+                if (
+                    attempt + 1 == attempts
+                    or not _transient_sqlite_snapshot_change(source, exc)
+                ):
+                    raise
+                # The reader has closed its failed transaction before here.
+                # Short bounded spacing avoids racing the same sidecar turnover.
+                if source == "attention":
+                    time.sleep(0.04 * (attempt + 1))
     except Exception as exc:  # Each unavailable source remains explicit and partial.
         errors.append(_source_error(source, exc))
         return default
@@ -171,12 +214,22 @@ def _attention_payload(
 
 def _resources_payload() -> dict[str, Any]:
     resources = _module("grabowski_resources")
-    leases = resources.list_resources(
-        include_expired=False,
-        limit=MAX_SOURCE_LEASES,
-        read_only=True,
-    )
-    total = resources.count_resources(include_expired=False, read_only=True)
+    # Use one transaction and one expiry cutoff for both values.  Separate
+    # list/count snapshots may disagree when a lease is renewed mid-read.
+    now = resources._now()
+    live_filter = "typeof(expires_at_unix)='integer' AND expires_at_unix>?"
+    with resources._resource_readonly_snapshot() as connection:
+        rows = connection.execute(
+            "SELECT * FROM leases WHERE " + live_filter
+            + " ORDER BY resource_key LIMIT ?",
+            (now, MAX_SOURCE_LEASES),
+        ).fetchall()
+        count_row = connection.execute(
+            "SELECT COUNT(*) AS count FROM leases WHERE " + live_filter,
+            (now,),
+        ).fetchone()
+    leases = [resources._public(row) for row in rows]
+    total = int(count_row["count"])
     return {
         "leases": leases,
         "count": total,
@@ -343,7 +396,9 @@ def _task_checkout_presence(
     for retention in retentions:
         add(retention)
 
-    database_after = reconciler.collect_lifecycle_bindings_from_db()
+    database_after = reconciler.collect_lifecycle_bindings_from_db(
+        _wal_mutation_admission=_checkout_wal_admission,
+    )
     if database_after.get("snapshot_sha256") != expected_database_sha256:
         raise RuntimeError(
             "checkout lifecycle database changed during current_work observation"
@@ -361,12 +416,30 @@ def _task_checkout_presence(
 
 def _reconciliation_payload(repositories: list[str]) -> dict[str, Any]:
     reconciler = _module("grabowski_checkout_binding_reconciler")
-    database_snapshot = reconciler.collect_lifecycle_bindings_from_db()
+    database_snapshot = reconciler.collect_lifecycle_bindings_from_db(
+        _wal_mutation_admission=_checkout_wal_admission,
+    )
+    # Public reconciliation stays paginated at 100 rows. Current Work can
+    # consume the existing single-snapshot admission path while the result
+    # fits its own bounded evidence capacity; no second Git scan is needed.
+    bindings = database_snapshot.get("bindings")
+    complete_snapshot = (
+        isinstance(bindings, list)
+        and all(
+            isinstance(row, dict) and isinstance(row.get("repo_path"), str)
+            for row in bindings
+        )
+        and sum(
+            str(Path(row["repo_path"]).expanduser().resolve(strict=False)) in repositories
+            for row in bindings
+        ) <= current_work.MAX_WORKTREES
+    )
     payload = reconciler.reconcile_checkout_bindings(
         repository_filters=repositories,
         limit=reconciler.MAX_PAGE_LIMIT,
         git_timeout_seconds=CURRENT_WORK_GIT_TIMEOUT_SECONDS,
         _database_snapshot=database_snapshot,
+        _single_complete_snapshot=complete_snapshot,
     )
     (
         task_checkout_presence,

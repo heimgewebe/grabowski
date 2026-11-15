@@ -45,6 +45,244 @@ def task_payload() -> dict:
 
 
 class CurrentWorkSurfaceTests(unittest.TestCase):
+    def test_resources_payload_uses_one_snapshot_and_one_expiry_cutoff(self) -> None:
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        connection.execute(
+            "CREATE TABLE leases (resource_key TEXT, expires_at_unix INTEGER)"
+        )
+        connection.executemany(
+            "INSERT INTO leases VALUES (?, ?)",
+            [("live-a", 101), ("live-b", 102), ("expired", 99)],
+        )
+        snapshot_opens: list[int] = []
+
+        def snapshot():
+            snapshot_opens.append(1)
+            return nullcontext(connection)
+
+        resources = SimpleNamespace(
+            _resource_readonly_snapshot=snapshot,
+            _now=lambda: 100,
+            _public=lambda row: dict(row),
+        )
+        with patch.object(surface, "_module", return_value=resources):
+            with patch.object(surface, "MAX_SOURCE_LEASES", 1):
+                result = surface._resources_payload()
+        self.assertEqual(snapshot_opens, [1])
+        self.assertEqual(result["count"], 2)
+        self.assertEqual([row["resource_key"] for row in result["leases"]], ["live-a"])
+        self.assertTrue(result["truncated"])
+        connection.close()
+
+    def test_transient_sqlite_checkpoint_race_reobserves_only_affected_source(self) -> None:
+        cases = [
+            ("resources", "resource_lease", checkouts_module.resources.ResourceSchemaInventoryChanged),
+            ("tasks", "durable_job", checkouts_module.tasks.TaskSchemaInventoryChanged),
+            ("attention", "durable_job", checkouts_module.tasks.TaskSchemaInventoryChanged),
+        ]
+        for source, capability, changed in cases:
+            with self.subTest(source=source):
+                reads: list[int] = []
+                admissions: list[str] = []
+                errors: list[dict] = []
+
+                def read():
+                    reads.append(1)
+                    if len(reads) == 1:
+                        raise changed("sidecar rotated before SQLite snapshot")
+                    return {"source": source, "complete": True}
+
+                operator = SimpleNamespace(
+                    _require_operator_capability=admissions.append,
+                )
+                with patch.object(surface, "_operator", return_value=operator):
+                    result = surface._attempt_source(
+                        source, capability, read, errors, {"complete": False},
+                    )
+                self.assertEqual(result, {"source": source, "complete": True})
+                self.assertEqual(reads, [1, 1], "one complete fresh retry")
+                self.assertEqual(admissions, [capability])
+                self.assertEqual(errors, [])
+
+    def test_attention_two_checkpoint_turnovers_reobserve_fresh_third_snapshot(self) -> None:
+        attempts: list[int] = []
+        admissions: list[str] = []
+        errors: list[dict] = []
+
+        def read():
+            attempts.append(1)
+            if len(attempts) < 3:
+                raise checkouts_module.tasks.TaskSchemaInventoryChanged(
+                    "Task WAL/SHM rotated before completed snapshot"
+                )
+            return {"records": ["valid"], "pagination": {"has_more": False}}
+
+        with (
+            patch.object(
+                surface, "_operator",
+                return_value=SimpleNamespace(
+                    _require_operator_capability=admissions.append
+                ),
+            ),
+            patch.object(surface.time, "sleep") as pause,
+        ):
+            result = surface._attempt_source(
+                "attention", "durable_job", read,
+                errors, {"records": [], "pagination": {"has_more": True}},
+            )
+
+        self.assertEqual(result["records"], ["valid"])
+        self.assertEqual(attempts, [1, 1, 1])
+        self.assertEqual(admissions, ["durable_job"])
+        self.assertEqual(errors, [])
+        self.assertEqual([call.args[0] for call in pause.call_args_list], [0.04, 0.08])
+
+    def test_attention_unrelated_error_after_checkpoint_does_not_retry_again(self) -> None:
+        attempts: list[int] = []
+        errors: list[dict] = []
+
+        def read():
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise checkouts_module.tasks.TaskSchemaInventoryChanged("WAL turnover")
+            raise PermissionError("new untrusted condition")
+
+        with (
+            patch.object(
+                surface, "_operator",
+                return_value=SimpleNamespace(_require_operator_capability=lambda _: None),
+            ),
+            patch.object(surface.time, "sleep") as pause,
+        ):
+            result = surface._attempt_source(
+                "attention", "durable_job", read, errors, {"partial": True},
+            )
+
+        self.assertEqual(result, {"partial": True})
+        self.assertEqual(attempts, [1, 1])
+        self.assertEqual(errors, [{"source": "attention", "error": "PermissionError"}])
+        pause.assert_called_once_with(0.04)
+
+    def test_persistent_sqlite_snapshot_change_stays_explicitly_partial(self) -> None:
+        for source, changed in [
+            ("resources", checkouts_module.resources.ResourceSchemaInventoryChanged),
+            ("tasks", checkouts_module.tasks.TaskSchemaInventoryChanged),
+            ("attention", checkouts_module.tasks.TaskSchemaInventoryChanged),
+        ]:
+            with self.subTest(source=source):
+                reads: list[int] = []
+                errors: list[dict] = []
+
+                def failing_read():
+                    reads.append(1)
+                    raise changed("moving SQLite WAL")
+
+                operator = SimpleNamespace(
+                    _require_operator_capability=lambda _cap: None,
+                )
+                with patch.object(surface, "_operator", return_value=operator):
+                    result = surface._attempt_source(
+                        source, "durable_job", failing_read, errors, {"partial": True},
+                    )
+                self.assertEqual(result, {"partial": True})
+                self.assertEqual(
+                    reads,
+                    [1, 1, 1] if source == "attention" else [1, 1],
+                    "persistently changing WAL remains bounded and explicitly partial",
+                )
+                self.assertEqual(
+                    errors, [{"source": source, "error": changed.__name__}],
+                )
+
+    def test_other_failure_and_denied_capability_do_not_retry(self) -> None:
+        errors: list[dict] = []
+        reads: list[int] = []
+
+        def unexpected_failure():
+            reads.append(1)
+            raise RuntimeError("not a WAL snapshot race")
+
+        operator = SimpleNamespace(_require_operator_capability=lambda _cap: None)
+        with patch.object(surface, "_operator", return_value=operator):
+            result = surface._attempt_source(
+                "resources", "resource_lease", unexpected_failure,
+                errors, {"partial": True},
+            )
+        self.assertEqual(result, {"partial": True})
+        self.assertEqual(reads, [1])
+        self.assertEqual(errors, [{"source": "resources", "error": "RuntimeError"}])
+
+        def denied(_capability):
+            raise PermissionError("capability unavailable")
+
+        with patch.object(
+            surface, "_operator",
+            return_value=SimpleNamespace(_require_operator_capability=denied),
+        ):
+            result = surface._attempt_source(
+                "tasks", "durable_job", unexpected_failure,
+                errors, {"partial": True},
+            )
+        self.assertEqual(result, {"partial": True})
+        self.assertEqual(reads, [1], "denied access cannot trigger a read")
+        self.assertEqual(errors[-1], {"source": "tasks", "error": "PermissionError"})
+
+    def test_reconciliation_uses_complete_snapshot_only_within_projection_bound(self) -> None:
+        # Ordinary public reconciliation remains limited to 100 rows; the
+        # internal Current Work snapshot must not arbitrarily lose row 101.
+        for count, foreign_count in (
+            (0, 0), (100, 0), (101, 0),
+            (surface.current_work.MAX_WORKTREES, 0),
+            (surface.current_work.MAX_WORKTREES + 1, 0),
+            (313, 1200),
+        ):
+            with self.subTest(binding_count=count, foreign_count=foreign_count):
+                database = {
+                    "snapshot_sha256": "a" * 64,
+                    "bindings": (
+                        [{"checkout_key": f"row-{index}", "repo_path": REPOSITORY}
+                         for index in range(count)]
+                        + [{"checkout_key": f"foreign-{index}",
+                            "repo_path": "/home/alex/repos/other"}
+                           for index in range(foreign_count)]
+                    ),
+                    "retentions": [],
+                }
+                calls: list[dict] = []
+
+                def reconcile(**kwargs: object) -> dict:
+                    calls.append(kwargs)
+                    complete = kwargs["_single_complete_snapshot"]
+                    scoped = [row for row in database["bindings"]
+                              if row["repo_path"] == REPOSITORY]
+                    rows = scoped if complete else scoped[:100]
+                    return {
+                        "bindings": rows,
+                        "total_count": count,
+                        "pagination": {"has_more": len(rows) < count},
+                    }
+
+                reconciler = SimpleNamespace(
+                    MAX_PAGE_LIMIT=100,
+                    collect_lifecycle_bindings_from_db=lambda **_kwargs: database,
+                    reconcile_checkout_bindings=reconcile,
+                )
+                with (
+                    patch.object(surface, "_module", return_value=reconciler),
+                    patch.object(surface, "_task_checkout_presence",
+                                 return_value=({}, True)),
+                ):
+                    result = surface._reconciliation_payload([REPOSITORY])
+
+                within_bound = count <= surface.current_work.MAX_WORKTREES
+                self.assertEqual(calls[0]["_single_complete_snapshot"], within_bound)
+                self.assertIs(calls[0]["_database_snapshot"], database)
+                self.assertEqual(calls[0]["limit"], 100)
+                self.assertEqual(len(result["bindings"]),
+                                 count if within_bound else 100)
+                self.assertEqual(result["pagination"]["has_more"], not within_bound)
+
     def test_reconciliation_payload_adds_complete_task_checkout_presence(self) -> None:
         database = {
             "snapshot_sha256": "a" * 64,
@@ -71,8 +309,9 @@ class CurrentWorkSurfaceTests(unittest.TestCase):
         database_reads = 0
         reconciliation_snapshots: list[object] = []
 
-        def collect_database() -> dict:
+        def collect_database(*, _wal_mutation_admission=None) -> dict:
             nonlocal database_reads
+            self.assertTrue(callable(_wal_mutation_admission))
             database_reads += 1
             return database
 
@@ -181,7 +420,7 @@ class CurrentWorkSurfaceTests(unittest.TestCase):
             "retentions": [],
         }
         reconciler = SimpleNamespace(
-            collect_lifecycle_bindings_from_db=lambda: database,
+            collect_lifecycle_bindings_from_db=lambda **_kwargs: database,
             collect_git_worktrees_for_repos=lambda targets, **_kwargs: (
                 observed_targets.append(list(targets))
                 or {
@@ -226,7 +465,7 @@ class CurrentWorkSurfaceTests(unittest.TestCase):
             "retentions": [],
         }
         reconciler = SimpleNamespace(
-            collect_lifecycle_bindings_from_db=lambda: database,
+            collect_lifecycle_bindings_from_db=lambda **_kwargs: database,
             collect_git_worktrees_for_repos=lambda *_args, **_kwargs: (
                 (_ for _ in ()).throw(
                     AssertionError("Git observation must not exceed repository bound")
@@ -264,7 +503,7 @@ class CurrentWorkSurfaceTests(unittest.TestCase):
             "retentions": [],
         }
         reconciler = SimpleNamespace(
-            collect_lifecycle_bindings_from_db=lambda: database,
+            collect_lifecycle_bindings_from_db=lambda **_kwargs: database,
             collect_git_worktrees_for_repos=lambda _targets, **_kwargs: {
                 "worktrees": [{"checkout_key": "checkout-bound"}],
                 "observable_repo_paths": [requested, REPOSITORY],
@@ -947,7 +1186,7 @@ class CurrentWorkSurfaceTests(unittest.TestCase):
         reconciler = SimpleNamespace(
             MAX_PAGE_LIMIT=100,
             reconcile_checkout_bindings=reconcile,
-            collect_lifecycle_bindings_from_db=lambda: {
+            collect_lifecycle_bindings_from_db=lambda **_kwargs: {
                 "snapshot_sha256": "a" * 64,
             },
         )

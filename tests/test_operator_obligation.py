@@ -227,6 +227,100 @@ class OperatorObligationTests(unittest.TestCase):
         receipt["receipt_sha256"] = obligation._sha256(receipt)
         result["receipt_sha256"] = receipt["receipt_sha256"]
 
+    def _direct_convergence_receipt(
+        self, *,
+        referenced_id: str | None = None,
+        referenced_sha256: str | None = None,
+        source_bound: bool = True,
+        with_bureau: bool = False,
+    ) -> dict[str, object]:
+        obligation_id = "goo-example-work-0001"
+        opened = obligation.open_obligation(self._open_parameters(obligation_id))
+        assert isinstance(opened["open_file_sha256"], str)
+        actual_sha256 = opened["open_file_sha256"]
+        source_sha256 = referenced_sha256 or actual_sha256
+        reference = (
+            f"grabowski:operator-obligation:{referenced_id or obligation_id}"
+            f"@sha256:{source_sha256}"
+        )
+        result = self._convergence_receipt(obligation_id)
+        output = result["output"]
+        assert isinstance(output, dict)
+        path = Path(output["request_path"])
+        request = json.loads(path.read_text(encoding="utf-8"))
+        request["schema_version"] = 2
+        request["closure"]["schema_version"] = 2
+        request["closure"]["operator_obligation_ref"] = reference
+        if with_bureau:
+            request["closure"]["bureau_task_ref"] = "bureau:task:REAL-1"
+        request["observation"] = {
+            "source_refs": [{
+                "kind": "operator_obligation" if source_bound else "unrelated",
+                "ref": reference,
+                "subject_sha256": source_sha256,
+            }]
+        }
+        raw = json.dumps(
+            request, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        path.write_bytes(raw)
+        output["request_sha256"] = hashlib.sha256(raw).hexdigest()
+        receipt = result["receipt"]
+        assert isinstance(receipt, dict)
+        receipt["parameters_sha256"] = obligation._sha256({
+            "request_path": str(path),
+            "expected_request_sha256": output["request_sha256"],
+            "expected_protocol_head": output["protocol_head"],
+        })
+        self._rehash_grip_result(result)
+        return result
+
+    def test_direct_user_systemic_receipt_binds_actual_create_only_open_record(self) -> None:
+        receipt = self._direct_convergence_receipt()
+        result = obligation.validate_completion_classification(
+            {
+                "convergence_required": True,
+                "reason": "systemic",
+                "convergence_receipt": receipt,
+            },
+            obligation_id="goo-example-work-0001",
+        )
+        self.assertTrue(result["convergence_required"])
+        self.assertEqual("systemic", result["reason"])
+
+    def test_direct_user_systemic_receipt_rejects_fake_origin_even_if_rehashed(self) -> None:
+        cases = (
+            {"referenced_id": "goo-other-work-0001"},
+            {"referenced_sha256": "f" * 64},
+            {"source_bound": False},
+            {"with_bureau": True},
+        )
+        for case in cases:
+            with self.subTest(case=case):
+                receipt = self._direct_convergence_receipt(**case)
+                with self.assertRaises(obligation.OperatorObligationInputError):
+                    obligation.validate_completion_classification(
+                        {
+                            "convergence_required": True,
+                            "reason": "systemic",
+                            "convergence_receipt": receipt,
+                        },
+                        obligation_id="goo-example-work-0001",
+                    )
+
+    def test_direct_user_systemic_receipt_refuses_missing_open_record(self) -> None:
+        receipt = self._direct_convergence_receipt()
+        (self.root / "goo-example-work-0001" / "open.json").unlink()
+        with self.assertRaises(obligation.OperatorObligationInputError):
+            obligation.validate_completion_classification(
+                {
+                    "convergence_required": True,
+                    "reason": "systemic",
+                    "convergence_receipt": receipt,
+                },
+                obligation_id="goo-example-work-0001",
+            )
+
     def test_open_is_private_idempotent_and_requires_continuation(self) -> None:
         first = obligation.open_obligation(self._open_parameters())
         second = obligation.open_obligation(self._open_parameters())

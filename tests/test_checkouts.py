@@ -140,6 +140,26 @@ class CheckoutLifecycleTests(unittest.TestCase):
         attempts.clear()
 
         @contextmanager
+        def checkpointed_twice():
+            attempts.append(1)
+            if len(attempts) < 3:
+                raise checkouts.resources.ResourceSchemaInventoryChanged(
+                    "Second WAL turnover during checkout live-lease read"
+                )
+            with original() as connection:
+                yield connection
+
+        with (
+            patch.object(checkouts.resources, "_resource_readonly_snapshot", checkpointed_twice),
+            patch.object(checkouts.time, "sleep") as pause,
+        ):
+            self.assertEqual(checkouts._live_checkout_lease_keys(now=int(time.time())), {})
+        self.assertEqual(len(attempts), 3)
+        self.assertEqual([call.args[0] for call in pause.call_args_list], [0.04, 0.08])
+
+        attempts.clear()
+
+        @contextmanager
         def persistently_changed():
             attempts.append(1)
             raise checkouts.resources.ResourceSchemaInventoryChanged(
@@ -150,7 +170,25 @@ class CheckoutLifecycleTests(unittest.TestCase):
         with patch.object(checkouts.resources, "_resource_readonly_snapshot", persistently_changed):
             with self.assertRaises(checkouts.resources.ResourceSchemaInventoryChanged):
                 checkouts._live_checkout_lease_keys(now=int(time.time()))
-        self.assertEqual(len(attempts), 2)
+        self.assertEqual(len(attempts), 3)
+
+    def test_live_lease_snapshot_does_not_retry_permission_error(self) -> None:
+        from contextlib import closing, contextmanager
+
+        with closing(checkouts.resources._database()) as connection:
+            connection.execute("SELECT 1 FROM leases").fetchone()
+        attempts: list[int] = []
+
+        @contextmanager
+        def denied():
+            attempts.append(1)
+            raise PermissionError("no snapshot permission")
+            yield
+
+        with patch.object(checkouts.resources, "_resource_readonly_snapshot", denied):
+            with self.assertRaises(PermissionError):
+                checkouts._live_checkout_lease_keys(now=int(time.time()))
+        self.assertEqual(attempts, [1])
 
     def test_rereserving_stale_checkout_cannot_exceed_live_capacity(self) -> None:
         """Reacquiring a lease for a retained row must not create a 17th writer."""
@@ -6112,6 +6150,145 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self.assertIsNone(status["dirty"])
         self.assertIsNone(status["returncode"])
         self.assertEqual(status["error"], "git status timed out")
+
+    def test_strict_inventory_releases_sqlite_snapshot_before_git_probes(self) -> None:
+        binding = self._managed_binding()
+        original_status = checkouts._worktree_status
+        committed_after_snapshot = False
+
+        def concurrent_status(record, *, timeout_seconds):
+            nonlocal committed_after_snapshot
+            if not committed_after_snapshot:
+                writer = checkouts._database()
+                try:
+                    writer.execute(
+                        "UPDATE retention SET updated_at_unix=updated_at_unix+1 "
+                        "WHERE checkout_key=?",
+                        (binding["checkout_key"],),
+                    )
+                    writer.commit()
+                finally:
+                    writer.close()
+                committed_after_snapshot = True
+            return original_status(record, timeout_seconds=timeout_seconds)
+
+        with patch.object(checkouts, "_worktree_status", side_effect=concurrent_status):
+            with checkouts._strict_inventory_readonly_scope():
+                inventory = checkouts.checkout_inventory(
+                    self.repo,
+                    include_processes=False,
+                    include_tasks=False,
+                    include_resources=False,
+                )
+        self.assertTrue(committed_after_snapshot)
+        self.assertFalse(inventory["truncated"])
+        self.assertEqual(inventory["observed_worktree_count"], 2)
+
+    def test_checkout_inventory_reuses_one_checkout_metadata_connection(self) -> None:
+        binding = self._managed_binding()
+        original = checkouts._readonly_connection
+        opened: list[Path] = []
+
+        def counted_reader(path: Path):
+            if path == self.checkout_db:
+                opened.append(path)
+            return original(path)
+
+        with patch.object(checkouts, "_readonly_connection", side_effect=counted_reader):
+            with checkouts._strict_inventory_readonly_scope():
+                inventory = checkouts.checkout_inventory(
+                    self.repo,
+                    include_processes=False,
+                    include_tasks=False,
+                    include_resources=False,
+                )
+        self.assertEqual(opened, [self.checkout_db])
+        self.assertEqual(inventory["observed_worktree_count"], 2)
+        self.assertFalse(inventory["truncated"])
+        linked = next(
+            row for row in inventory["worktrees"]
+            if row["path"] == str(self.checkout)
+        )
+        self.assertEqual(
+            linked["lifecycle"]["binding"]["checkout_key"],
+            binding["checkout_key"],
+        )
+        self.assertTrue(inventory["active_capacity"]["available"])
+
+    def test_checkout_inventory_metadata_is_one_wal_snapshot_during_writer_commit(self) -> None:
+        binding = self._managed_binding()
+        key = binding["checkout_key"]
+        writer = checkouts._database()
+        try:
+            writer.execute("PRAGMA wal_autocheckpoint=0")
+            writer.execute("CREATE TABLE snapshot_reader_probe(value INTEGER)")
+            writer.execute("INSERT INTO snapshot_reader_probe VALUES (1)")
+            writer.commit()
+            self.assertTrue(Path(str(self.checkout_db) + "-wal").is_file())
+            self.assertTrue(Path(str(self.checkout_db) + "-shm").is_file())
+            original = checkouts._retention_records
+            old_version = writer.execute(
+                "SELECT updated_at_unix FROM lifecycle_bindings WHERE checkout_key=?",
+                (key,),
+            ).fetchone()[0]
+            writer_committed = False
+
+            def commit_after_first_metadata_read(keys, *, connection=None):
+                nonlocal writer_committed
+                selected = original(keys, connection=connection)
+                if not writer_committed:
+                    # The retention read pinned the WAL snapshot; an authorized
+                    # writer can commit independently without changing that view.
+                    writer.execute(
+                        "UPDATE lifecycle_bindings "
+                        "SET updated_at_unix=updated_at_unix+1 WHERE checkout_key=?",
+                        (key,),
+                    )
+                    writer.commit()
+                    writer_committed = True
+                return selected
+
+            with patch.object(
+                checkouts, "_retention_records",
+                side_effect=commit_after_first_metadata_read,
+            ):
+                with checkouts._strict_inventory_readonly_scope():
+                    inventory = checkouts.checkout_inventory(
+                        self.repo,
+                        include_processes=False,
+                        include_tasks=False,
+                        include_resources=False,
+                    )
+            self.assertTrue(writer_committed)
+            current_version = writer.execute(
+                "SELECT updated_at_unix FROM lifecycle_bindings WHERE checkout_key=?",
+                (key,),
+            ).fetchone()[0]
+            self.assertEqual(current_version, old_version + 1)
+            linked = next(
+                row for row in inventory["worktrees"]
+                if row["path"] == str(self.checkout)
+            )
+            self.assertEqual(
+                linked["lifecycle"]["binding"]["updated_at_unix"],
+                old_version,
+                "metadata cannot mix pre- and post-commit WAL rows",
+            )
+        finally:
+            writer.close()
+
+    def test_checkout_inventory_reuses_one_lease_snapshot_for_all_worktrees(self) -> None:
+        with patch.object(
+            checkouts, "_read_resource_leases", return_value=[]
+        ) as read_leases:
+            inventory = checkouts.checkout_inventory(
+                self.repo,
+                include_processes=False,
+                include_tasks=False,
+                include_resources=True,
+            )
+        self.assertEqual(inventory["observed_worktree_count"], 2)
+        read_leases.assert_called_once_with()
 
     def test_bounded_inventory_does_not_probe_expired_capacity_paths(self) -> None:
         binding = self._managed_binding()

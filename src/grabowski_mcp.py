@@ -167,10 +167,10 @@ AGENT_INSTRUCTION_RULES: tuple[tuple[str, str], ...] = (
     ),
     (
         "selective-repoground-retrieval",
-        "Known file/symbol: typed Git/file read first; no RepoGround preflight. "
-        "Unknown callers, impacts/tests or history/cross-repo: bounded "
-        "RepoGround query on fresh bundle; verify citations in Git. "
-        "Stale/unavailable/low coverage: Git fallback; optional."
+        "Git first: code/diffs/pins/history/cross-repo; no RepoGround "
+        "preflight. Published S1/snapshot/gaps: optional revision-pinned "
+        "RepoGround read; check manifest/artifact/pack/evidence SHA. "
+        "No bundle=unknown; historical!=live; S1!=runtime; Git fallback."
     ),
 )
 
@@ -721,7 +721,7 @@ TOOL_CAPABILITY_REQUIREMENTS = {
     "grabowski_git": ("git_cli",),
     "grabowski_git_branch": ("git_cli",),
     "grabowski_checkout_inventory": ("git_cli",),
-    "grabowski_checkout_binding_reconciliation": (),
+    "grabowski_checkout_binding_reconciliation": ("resource_lease",),
     "grabowski_checkout_binding_terminal_preview": ("git_cli", "github_cli", "resource_lease"),
     "grabowski_checkout_binding_terminal_apply": (
         "git_cli",
@@ -782,6 +782,7 @@ TOOL_CAPABILITY_REQUIREMENTS = {
     "grabowski_task_resume": ("durable_job",),
     "grabowski_task_list": ("durable_job",),
     "grabowski_chronik_outbox_import": ("durable_job",),
+    "grabowski_chronik_full_search": ("durable_job",),
     "grabowski_chronik_history": ("durable_job",),
     "grabowski_operator_historical_recall": ("durable_job",),
     "grabowski_task_archive_list": ("file_read",),
@@ -894,6 +895,7 @@ OPERATOR_CAPABILITY_REQUIREMENT_TOOLS = {
     "grabowski_git",
     "grabowski_git_branch",
     "grabowski_checkout_inventory",
+    "grabowski_checkout_binding_reconciliation",
     "grabowski_checkout_binding_terminal_preview",
     "grabowski_checkout_binding_terminal_apply",
     "grabowski_checkout_binding_identity_rebind_preview",
@@ -944,6 +946,7 @@ OPERATOR_CAPABILITY_REQUIREMENT_TOOLS = {
     "grabowski_task_resume",
     "grabowski_task_list",
     "grabowski_chronik_outbox_import",
+    "grabowski_chronik_full_search",
     "grabowski_chronik_history",
     "grabowski_operator_historical_recall",
     "grabowski_task_reconcile_check",
@@ -7378,7 +7381,13 @@ def grabowski_self_review_session_start(
         _store_plan(plan)
     else:
         plan = _load_plan(review_batch_id)
-    return self_review_execution.start_first_party_review_session(plan, issuer)
+    response = self_review_execution.start_first_party_review_session(plan, issuer)
+    if workspace_id is None:
+        # The signed five-axis session already exists. Provider unavailability
+        # is advisory, never grounds to undo or block the first-party review.
+        from grabowski_critical_review_dispatch import maybe_start_claude_review
+        response["claude_advisory"] = maybe_start_claude_review(plan)
+    return response
 
 
 @mcp.tool(
@@ -15712,6 +15721,29 @@ def _validate_transport_roundtrip_target_tool(tool_name: Any) -> str:
     return tool_name
 
 
+def _transport_domain_target_arguments(
+    tool_name: Any, target_arguments: Any
+) -> Any:
+    """Hash and dispatch the same domain arguments the challenge was bound to.
+
+    The operator wrapper issues challenges over arguments without the
+    Flowlines-injected ``reason``/``user_intent`` fields, while clients echo
+    the original call verbatim. Strip them here so both sides agree.
+    """
+
+    if not isinstance(tool_name, str) or not isinstance(target_arguments, dict):
+        return target_arguments
+    manager = getattr(mcp, "_tool_manager", None)
+    tool = manager.get_tool(tool_name) if manager is not None else None
+    if tool is None:
+        return target_arguments
+    import grabowski_flowlines
+
+    return grabowski_flowlines._strip_analytics_arguments(
+        tool, tool_name, target_arguments
+    )
+
+
 async def _dispatch_atomic_transport_target(
     target_tool_name: str,
     target_arguments: dict[str, Any],
@@ -15764,8 +15796,20 @@ async def _grip_run_mcp(
     """Run one allowlisted Grabowski grip and return its receipt-bound result."""
 
     _require_capability(grabowski_grips.grip_required_capability(name))
-    effective_parameters = parameters
     retained_claim_challenge: str | None = None
+    if (
+        name == "transport-roundtrip"
+        and isinstance(parameters, dict)
+        and isinstance(parameters.get("target_arguments"), dict)
+    ):
+        parameters = {
+            **parameters,
+            "target_arguments": _transport_domain_target_arguments(
+                parameters.get("target_tool_name"),
+                parameters["target_arguments"],
+            ),
+        }
+    effective_parameters = parameters
     if name == "transport-roundtrip" and isinstance(parameters, dict):
         if parameters.get("action") == "begin":
             try:

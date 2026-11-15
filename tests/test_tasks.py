@@ -185,6 +185,11 @@ class TaskTests(unittest.TestCase):
         os.chmod(self.root / "state", 0o700)
         self.audit_log = self.root / "state" / "write-audit.jsonl"
         self.audit_patch = patch.object(tasks.base, "AUDIT_LOG", self.audit_log)
+        self.chronik_state_root_patch = patch.dict(
+            os.environ,
+            {tasks.chronik.STATE_ROOT_ENV: str(self.root / "state")},
+        )
+        self.chronik_state_root_patch.start()
         self.audit_patch.start()
         self.db_patch.start()
         self.outcomes_patch.start()
@@ -196,6 +201,7 @@ class TaskTests(unittest.TestCase):
         self.start_counter = 0
 
     def tearDown(self) -> None:
+        self.chronik_state_root_patch.stop()
         self.admission_patch.stop()
         self.resource_patch.stop()
         self.capture_script_root_patch.stop()
@@ -205,6 +211,12 @@ class TaskTests(unittest.TestCase):
         self.db_patch.stop()
         self.audit_patch.stop()
         self.temporary.cleanup()
+
+    def test_default_chronik_state_root_is_private_to_task_fixture(self) -> None:
+        self.assertEqual(tasks.chronik.state_root(), self.root / "state")
+        self.assertEqual(
+            os.environ[tasks.chronik.STATE_ROOT_ENV], str(self.root / "state")
+        )
 
     def _archive_and_project_tasks(self, task_ids: list[str]) -> dict[str, object]:
         lifecycle_evidence = tasks.lifecycle_projection.effect_plan.lifecycle_evidence
@@ -2474,6 +2486,29 @@ class TaskTests(unittest.TestCase):
             tasks.CHRONIK_RETAINED_SOURCE_EXPECTATION_KEY,
             tasks._public(ambiguous)["launcher"],
         )
+
+        # The same attempt can first be blocked and then fail definitively.
+        # Neither event may replace the other's retained audit expectation.
+        for terminal_state in ("failed", "timed_out"):
+            with (
+                patch.object(tasks, "_terminal_projection", return_value={"attempt": 2}) as projection,
+                patch.object(
+                    tasks.resources,
+                    "begin_task_terminalization",
+                    side_effect=RuntimeError("capture terminal marker"),
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "capture terminal marker"):
+                    tasks._set_state(task["task_id"], terminal_state, attempt=2)
+            expected_terminal = {
+                **marker_2, "event_kind": f"agent.run.{terminal_state}",
+            }
+            self.assertEqual(
+                projection.call_args.kwargs["launcher"][
+                    tasks.CHRONIK_RETAINED_SOURCE_EXPECTATION_KEY
+                ],
+                [marker, marker_2, expected_terminal],
+            )
 
     def test_chronik_context_derives_repository_from_canonical_repo_claim(self) -> None:
         result = {"returncode": 0, "stdout": "git@github.com:heimgewebe/chronik.git\n", "stderr": "", "timed_out": False}
@@ -18242,7 +18277,7 @@ else:
             pr_number=None,
             bureau_task_id="",
             agent_run_id="",
-            since="",
+            since=tasks.OPERATOR_HISTORICAL_RECALL_ACTIVE_NIXOS_SINCE,
             limit=1,
         )
         self.assertTrue(result["available"])
@@ -18255,6 +18290,24 @@ else:
             result["result_reference"]["ledger_snapshot_sha256"],
             "b" * 64,
         )
+
+    def test_historical_recall_explicit_legacy_since_overrides_default_epoch(self) -> None:
+        with (
+            patch.object(tasks.operator, "_require_operator_capability"),
+            patch.object(tasks, "grabowski_chronik_history", return_value={}) as provider,
+            patch.object(
+                tasks.recall, "export_chronik_history_recall",
+                return_value={"available": True, "returned": 0},
+            ) as export,
+        ):
+            result = tasks.grabowski_operator_historical_recall(
+                repo="heimgewebe/grabowski",
+                since="2026-07-01T00:00:00Z",
+                limit=3,
+            )
+        self.assertEqual(provider.call_args.kwargs["since"], "2026-07-01T00:00:00Z")
+        export.assert_called_once_with({}, limit=3)
+        self.assertTrue(result["available"])
 
     def test_historical_recall_forwards_exact_target_selectors(self) -> None:
         history = {

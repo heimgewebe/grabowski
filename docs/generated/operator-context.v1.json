@@ -626,10 +626,12 @@
     {
       "category": "operations-observability",
       "description": "Project global operator work plus repository-filtered Git surfaces without blocking the MCP event loop.",
-      "effects": [],
+      "effects": [
+        "sqlite-wal-shm-sidecar-write"
+      ],
       "id": "grabowski_current_work",
-      "purpose": "Project bounded global operator work from task, attention, lease, worker and physical sources plus repository-filtered checkout evidence, with mixed scope explicit and no second lifecycle truth.",
-      "read_only": true,
+      "purpose": "Project global operator work and repository-filtered checkout evidence; active SQLite WAL reads may update admitted SHM read marks.",
+      "read_only": null,
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_current_work"
@@ -655,10 +657,12 @@
     {
       "category": "operations-observability",
       "description": "Audit bounded operator friction without blocking the MCP event loop.",
-      "effects": [],
+      "effects": [
+        "sqlite-wal-shm-sidecar-write"
+      ],
       "id": "grabowski_operator_optimization_report",
-      "purpose": "Compose bounded audit, friction, execution-outcome and current-work evidence into a manual read-only optimization report.",
-      "read_only": true,
+      "purpose": "Compose audit, friction, execution-outcome and current-work evidence; transitive active WAL reads may update admitted SHM read marks.",
+      "read_only": null,
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_operator_optimization_report"
@@ -899,10 +903,12 @@
     {
       "category": "checkout-lifecycle",
       "description": "Compare checkout bindings without blocking the MCP event loop.",
-      "effects": [],
+      "effects": [
+        "sqlite-wal-shm-sidecar-write"
+      ],
       "id": "grabowski_checkout_binding_reconciliation",
-      "purpose": "Classify durable checkout lifecycle bindings against current canonical Git worktree observations without creating mutation authority.",
-      "read_only": true,
+      "purpose": "Classify durable checkout bindings against canonical Git observations; active WAL reads require admitted SQLite SHM read-mark writes.",
+      "read_only": null,
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_checkout_binding_reconciliation"
@@ -1630,6 +1636,17 @@
       "reversibility": "append-only-observation",
       "risk_class": "medium",
       "tool": "grabowski_chronik_outbox_import"
+    },
+    {
+      "category": "coding-memory",
+      "description": "Search a selected committed Chronik ledger with explicit corpus scope.\n\nDefault agent.ledger: complete run-event search with evidence-bound cursor;\nunlike grabowski_chronik_history, no coarse provider window. Use repo,\nhost, event_id, operation and other event filters as before.\nOptional knowledge.ledger: historical causes, repairs and decisions across\nrepositories, using repo, host, subject_component, keyword or knowledge_type.\nSemantic knowledge.ledger does not support event filters or cursor; query\nit explicitly instead of inferring 'not found' from agent.ledger.\nRequire at least one selector. limit accepts 1..20 (default 10); use cursor\nonly for agent.ledger. since/until require timezone-aware ISO 8601 timestamps\n(for example 2026-11-05T00:00:00+01:00); date-only values are invalid.\nHistorical evidence is never a present-state or successful-deployment claim.",
+      "effects": [],
+      "id": "grabowski_chronik_full_search",
+      "purpose": "Search complete immutable Chronik ledger with evidence-bound snapshot pagination.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_chronik_full_search"
     },
     {
       "category": "coding-memory",
@@ -3079,6 +3096,7 @@
       "grabowski_task_resume",
       "grabowski_task_list",
       "grabowski_chronik_outbox_import",
+      "grabowski_chronik_full_search",
       "grabowski_chronik_history",
       "grabowski_operator_historical_recall",
       "grabowski_task_reconcile_check",
@@ -3412,6 +3430,10 @@
         "source": "src/grabowski_coding_agent_router.py"
       },
       {
+        "module": "grabowski_critical_review_dispatch",
+        "source": "src/grabowski_critical_review_dispatch.py"
+      },
+      {
         "module": "grabowski_capabilities",
         "source": "src/grabowski_capabilities.py"
       },
@@ -3534,6 +3556,10 @@
       {
         "module": "grabowski_chronik",
         "source": "src/grabowski_chronik.py"
+      },
+      {
+        "module": "grabowski_chronik_full_search",
+        "source": "src/grabowski_chronik_full_search.py"
       },
       {
         "module": "grabowski_recovery",
@@ -3757,7 +3783,7 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "e894771c674ecb89d8261217bf5350beaf370fad28b150e053a11ac5221c4811"
+      "sha256": "fa35f718ca3fe770b81d8138d41736a2091a3cbaf5486fb47619407b32a445b5"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -3765,12 +3791,12 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "23851f3e6deab58099ba689712a5f85d688077427a45c6dde9da9466ababac75"
+      "sha256": "e4854ca1a9f5aa848e91d3973ae37154c41676f21a88ba3414a03b743474e59e"
     },
     "runtime_source_digest_contract": "mcp-tool-surface-v1",
     "runtime_sources": {
       "src/der_kleine_maulwurf_operator.py": "e924d54aa1e0b1d6dbcdc0390515f7f5f4aa4b22c055af674278aea1772bcbce",
-      "src/grabowski_agent_bootstrap.py": "30d9764e86f6e2ef8ff5d52c77e84832259412db7194390b4c42e06e196b403d",
+      "src/grabowski_agent_bootstrap.py": "5f658ed75dd53bf14d9d527b6c1e30fa4fd06d0b731b48a3c2599759ef6b54a7",
       "src/grabowski_agent_competition.py": "55edc7fbda06aa37f996af83ae8e919ab8e1f0fba79438a6aca8dfbf7f28c4a5",
       "src/grabowski_agent_role.py": "41e18f20608fb675d1bbc2953d934522f5404b0140fc1f590d56ff5d9e4e46ec",
       "src/grabowski_agent_sandbox.py": "0d669bea9919bcfb43c912e6866a4466ab59198899f08f3353498d8be2241487",
@@ -3800,6 +3826,7 @@
       "src/grabowski_checkout_terminal_sources.py": "56e65c901e7b5ba5a6b9d764617b709cff14dc1d3d852244beff5ac5cadce32b",
       "src/grabowski_checkouts.py": "b765e63544a072a0b0ab24d1f7a06670173642f44c45356783492cbdbf52a4f8",
       "src/grabowski_chronik.py": "68785720fc9dac258b493011f99d5568ef1ca5543e21eee853e6d8e6c1616c17",
+      "src/grabowski_chronik_full_search.py": "6dbf23eff07d04b6e602ff8f440eb7ff4bc64cc3258e68d1cd16221c983e3688",
       "src/grabowski_client_snapshot.py": "777d9aa6d4bd964e7fdbb923d82586d186f9e0340e51b8e4b1140cae1e863eec",
       "src/grabowski_codex_preflight.py": "3a90bb4ba8118f178b3ae5ed517d2a18c1eff36f985fbf2a4ac2bc3dc5f27b76",
       "src/grabowski_coding_agent_catalog_data.py": "2e9b3163bf93f58f5c2848813e51d1cf0f13c59dc071eb678a11657c4bb645a2",
@@ -3811,6 +3838,7 @@
       "src/grabowski_consumer_surface.py": "f007b746c61f89f207b5477d02bc7b8e621b8e6b75810cfc05e437d1bcfdc249",
       "src/grabowski_context_fabric.py": "dda7f6bf1fcc8346df98a323bc545c047548e3f333f317e98838f2f15ae875e0",
       "src/grabowski_convergence.py": "9f12a1397767a088bd20c500d307014a870547d9435587a2d04f5a43afb31e19",
+      "src/grabowski_critical_review_dispatch.py": "17395dfc892af036e8c76d0c0b8010cbf93addb7d896cd9cbe9c80be31249732",
       "src/grabowski_current_work.py": "d41765110381118767800c6c332305c2d74d600ffdd8da981e45a6fb1960fdf2",
       "src/grabowski_current_work_surface.py": "1b48a548e25fd1f9adb44d7b7d69edb36886078f75865913d7d3c507a950fe73",
       "src/grabowski_decision_reviews.py": "764a4fac2827bcca7293d02d38c9e9eea70ac6b364a25c0d4f6c9d9173f9821c",
@@ -3880,7 +3908,7 @@
       "src/grabowski_repoground_catalog.py": "b8ea8d611a37bb287ae8836790c6aa7abf29c08dcccf252492fb355c9f9ba58f",
       "src/grabowski_repoground_post_merge.py": "6907ea6de2a66209975d3b835fe4bf70683a35bffdcbe479182e9ae010954a5a",
       "src/grabowski_resources.py": "28fee9a0fe8f04c0d99e218ee64ef536f30db9a525d6efe5859cd0184fe81a43",
-      "src/grabowski_runtime.py": "783a6ed8635da45733a80ed9872a5afcd33aedf638f567fea464e4ab623ff182",
+      "src/grabowski_runtime.py": "d3c1aa17cd080c22ad5dfe412a5ff99099a6c79fa47f6d06c059f726bc0b3dfb",
       "src/grabowski_runtime_contract.py": "4528ec08c1019a2b773a7e05250f4842ca2403d1c9171b19ef98a63c6e588054",
       "src/grabowski_runtime_extensions.py": "4bbaabe4120acc6879297e85d3664c69193fe0a9850e48522d1839b7844b2297",
       "src/grabowski_self_deploy.py": "1c2bd7e9800a1d98fa8d4f456dd33759b66c3d6b4523e63012a31684c86c3db1",
@@ -3892,7 +3920,7 @@
       "src/grabowski_systemkatalog.py": "e3ec4884b3dd367b8970b3143432cab0fea5fe55963292806001f5df535c83f9",
       "src/grabowski_task_attention.py": "a16d4b045bef23bf78ad3df0c4c58d91a304dc9a83b6e757fb1b0f88754ad6f3",
       "src/grabowski_task_reconcile.py": "64dc6195c9d0cb3435d192e4715a0d4d5679b9f1904057308366f4e2f2e9bbea",
-      "src/grabowski_tasks.py": "52c70dd3238b0938612b65ceffa13d7ec50e8ecdcfe7c18aaf56cdeb90579cd9",
+      "src/grabowski_tasks.py": "dbf2cd3744aee06f47341ac5366370ff29aa7443b4c3d04fc6362585963bfc57",
       "src/grabowski_terminal_convergence.py": "8f172a65b2af1dbca3d5b226a18e82df3ca5229ca5f4ae8b2ab1792506c69195",
       "src/grabowski_text_artifact_reconcile.py": "b302be1dbb101abbf825732bfe41658c13ac64417c2a6034326e57409daa4772",
       "src/grabowski_transport_assertion.py": "20d75d1f94c1d0273108c36eed8c58aa85e55a30b73546c4ac8af8a835fb8c8e",

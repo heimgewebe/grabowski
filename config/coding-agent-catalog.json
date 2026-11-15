@@ -831,9 +831,7 @@
         "codex-sol-medium",
         "claude-opus-5.5-high",
         "codex-terra-high",
-        "claude-sonnet-5-high",
-        "grok-4.6-review-high",
-        "grok-4.7-review-high"
+        "claude-sonnet-5-high"
       ],
       "paid_contrast_routes": [
         "claude-fable-5-contrast-high"
@@ -1134,7 +1132,9 @@
         "plan": "SuperGrok"
       },
       "server_reported_usage_cost_semantics": "subscription-pool-consumption-not-incremental-charge-authority",
-      "server_cost_does_not_authorize_overage": true
+      "server_cost_does_not_authorize_overage": true,
+      "owner_enabled": false,
+      "blocked_reason": "No active Grok/SuperGrok subscription (owner, 2026-11-11); historical entitlement is not a current access grant."
     },
     "jules-account": {
       "conservative_daily_tasks": 15,

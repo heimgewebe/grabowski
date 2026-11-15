@@ -496,6 +496,34 @@ class RepoGroundCatalogResolverTests(CatalogFixture):
         )
         self.assertEqual("alice__demo", slashed["selected"][0]["repo_id"])
 
+    def test_github_repository_name_case_does_not_hide_canonical_bundle(self) -> None:
+        self.write_canonical(
+            repo="semantah",
+            run_dir="20260718T120000Z-semantah",
+            created_at="2026-07-18T12:00:00Z",
+        )
+        canonical = catalog.resolve_catalog(
+            self.canonical, self.legacy, repo="heimgewebe/semantah"
+        )
+        self.assertTrue(canonical["available"])
+        for spelling in ("heimgewebe/semantAH", "HEIMGEWEBE__SEMANTAH", "semantAH"):
+            with self.subTest(spelling=spelling):
+                resolved = catalog.resolve_catalog(
+                    self.canonical, self.legacy, repo=spelling
+                )
+                self.assertTrue(resolved["available"])
+                self.assertEqual(
+                    canonical["selected"][0]["manifest_sha256"],
+                    resolved["selected"][0]["manifest_sha256"],
+                )
+                self.assertEqual(
+                    "heimgewebe__semantah", resolved["selected"][0]["repo_id"]
+                )
+        foreign = catalog.resolve_catalog(
+            self.canonical, self.legacy, repo="another-owner/semantAH"
+        )
+        self.assertFalse(foreign["available"])
+
     def test_malformed_owner_slash_repo_identity_fails_before_scanning(self) -> None:
         for repo in ("/demo", "alice/", "alice/demo/extra"):
             with self.subTest(repo=repo), patch.object(

@@ -28,6 +28,7 @@ IMMUTABLE_BOUNDARIES = (
 )
 
 ENTRY_SEQUENCE = (
+    "read_chronik_history_for_explicit_target_if_available",
     "read_live_runtime_and_connector_snapshot",
     "read_repository_head_dirty_state_and_leases",
     "classify_one_next_operation",
@@ -44,8 +45,10 @@ ENTRY_SEQUENCE = (
 HISTORICAL_RECALL = {
     "authority": "advisory_historical_evidence_only",
     "tool": "grabowski_operator_historical_recall",
-    "mode": "selective_before_execution",
-    "trigger_profiles": ["pr", "bureau", "deployment"],
+    "exact_search_tool": "grabowski_chronik_full_search",
+    "exact_search_selectors": ["pr_number", "bureau_task_id", "run_id", "task_id", "event_id"],
+    "mode": "target_first_fail_open_then_selective_patterns",
+    "trigger_profiles": ["repository", "service_status", "failure_continuation", "pr", "bureau", "deployment"],
     "trigger_signals": [
         "retry",
         "recovery",
@@ -53,22 +56,24 @@ HISTORICAL_RECALL = {
         "re_review",
         "repeat_deploy",
     ],
-    "skip_for": [
-        "trivial_read",
-        "status_only_without_repeat_signal",
-        "one_off_discovery_without_repeat_signal",
-    ],
+    "skip_for": ["unbound_nonproject_task", "trivial_read_without_relevant_target"],
     "selection_order": [
+        "read_chronik_first_for_explicit_target_before_live_interpretation",
         "bind_target_from_fresh_live_context",
-        "prefer_exact_available_chronik_filters",
-        "read_bounded_historical_recall",
+        "prefer_full_search_for_exact_or_cross_project_history",
+        "filter_host_scoped_project_events_by_subject_component_not_source_repo",
+        "check_exhaustive_integrity_before_concluding_no_record",
+        "use_bounded_historical_recall_only_for_pattern_summaries",
         "discard_nonmatching_or_unbound_history",
         "continue_from_fresh_live_truth",
     ],
     "requirements": [
-        "fresh_live_truth_precedes_history",
+        "bound_chronik_first_precedes_live_status_interpretation",
+        "fresh_live_truth_precedes_every_effect",
         "history_must_be_evidence_bound",
         "history_must_remain_historical_only",
+        "full_search_cursors_are_bound_to_snapshot_and_must_restart_when_stale",
+        "missing_record_is_not_evidence_that_work_never_occurred",
         "fresh_owning_authority_must_be_rechecked_before_effect",
     ],
     "does_not_establish": [
@@ -133,6 +138,36 @@ REUSE_BEFORE_BUILD = {
         "transfer_path",
         "provider_integration",
         "cloud_fallback",
+    ],
+}
+
+
+
+HARD_CASE_ADVISORY = {
+    "schema_version": 1,
+    "mode": "source_frontdoor_auto_dispatch",
+    "scope": "agent-execution-happy-path Source mode; other operator paths remain explicit",
+    "signal_field": "hard_case_advisory",
+    "signal_kinds": ["repeated_failure", "contradictory_evidence", "material_architecture"],
+    "evidence_requirement": "distinct source-bound references; shared error_fingerprint for repeated_failure",
+    "route_selection": "canonical independent-review model ranking for selection only",
+    "execution_tool": "grabowski_agent_competition_start",
+    "output_readback": "grabowski_agent_competition_status",
+    "eligible_providers": ["claude"],
+    "max_budget_usd": 0,
+    "paid_execution_authorized": False,
+    "one_request_id_per_source_kind_and_error_fingerprint": True,
+    "no_additional_review_gate": True,
+    "continue_primary_work_on_unavailability": True,
+    "unknown_provider_start_is_not_retried": True,
+    "context": "only committed, redaction-checked README.md",
+    "authority": "advisory_only",
+    "does_not_establish": [
+        "automatic_detection_in_every_external_thread",
+        "successful_provider_response",
+        "mandatory_external_review",
+        "model_optimality",
+        "authorization_for_paid_fallback",
     ],
 }
 
@@ -216,6 +251,360 @@ def call_shape_check(
     return result
 
 
+
+KNOWLEDGE_CONTEXT_LIMIT = 8
+KNOWLEDGE_STATEMENT_CHARS = 400
+
+
+def _chronik_knowledge_context(
+    *, repo: str, host: str, subject_component: str,
+    pr_number: int | None, knowledge_search_fn: Any,
+) -> dict[str, Any]:
+    """Compact semantic knowledge (causes, repairs, decisions) for the target.
+
+    Independent of the agent.ledger result: a knowledge outage is an explicit
+    gap and never changes the run-event status.
+    """
+    base = {
+        "ledger": "knowledge.ledger", "historical_only": True,
+        "does_not_establish": [
+            "current_git_ci_or_runtime_state", "production_verification",
+            "unrecorded_knowledge",
+        ],
+    }
+    if repo:
+        selectors = {"repo": repo}
+    elif host:
+        selectors = {"host": host}
+    else:
+        return {**base, "status": "skipped_no_supported_selector", "events": []}
+    if subject_component:
+        selectors["component"] = subject_component
+    if knowledge_search_fn is None:
+        try:
+            from grabowski_tasks import chronik_knowledge_search
+        except Exception as exc:
+            return {**base, "status": "knowledge_context_unavailable",
+                    "failure_code": type(exc).__name__, "events": []}
+        knowledge_search_fn = chronik_knowledge_search
+    try:
+        # Fetch the full bounded page: client-side constraints may drop items.
+        result = knowledge_search_fn(**selectors, limit=20)
+    except Exception as exc:
+        return {**base, "status": "knowledge_context_unavailable",
+                "failure_code": type(exc).__name__, "events": []}
+    snapshot = result.get("ledger_snapshot") if isinstance(result, dict) else None
+    if (not isinstance(result, dict) or result.get("available") is not True
+        or result.get("historical_only") is not True
+        or not isinstance(snapshot, dict)
+        or snapshot.get("integrity_valid") is not True):
+        return {**base, "status": "knowledge_context_unavailable",
+                "failure_code": (result.get("failure_code") if isinstance(result, dict)
+                                 else None) or "knowledge_not_verified",
+                "events": []}
+    compact: list[dict[str, Any]] = []
+    discarded = 0
+    for item in result.get("events") or []:
+        event = item.get("event") if isinstance(item, dict) else None
+        if not isinstance(event, dict):
+            continue
+        subject = event.get("subject") if isinstance(event.get("subject"), dict) else {}
+        # Explicit target fields are constraints, as for run events.
+        if ((host and repo and subject.get("host") not in {host, None})
+            or (subject_component and subject.get("component") != subject_component)
+            or (pr_number is not None and subject.get("pr_number") != pr_number)):
+            discarded += 1
+            continue
+        statement = event.get("statement") if isinstance(event.get("statement"), str) else ""
+        if len(statement) > KNOWLEDGE_STATEMENT_CHARS:
+            statement = statement[:KNOWLEDGE_STATEMENT_CHARS - 1] + "…"
+        refs = event.get("evidence_refs")
+        superseded_by = item.get("superseded_by")
+        compact.append({
+            "event_id": event.get("event_id"),
+            "observed_at": event.get("ts"),
+            "knowledge_type": event.get("knowledge_type"),
+            "epistemic_status": event.get("epistemic_status"),
+            "statement": statement,
+            "evidence_refs": refs[:4] if isinstance(refs, list) else [],
+            "superseded_by": superseded_by[:4] if isinstance(superseded_by, list) else [],
+        })
+    # Current knowledge first; superseded entries stay visible as history.
+    current = [e for e in compact if not e["superseded_by"]]
+    superseded = [e for e in compact if e["superseded_by"]]
+    ordered = (current + superseded)[:KNOWLEDGE_CONTEXT_LIMIT]
+    has_more = result.get("has_more") is True or len(compact) > KNOWLEDGE_CONTEXT_LIMIT
+    return {
+        **base, "status": "available", "query": selectors,
+        "events": ordered, "selected_event_count": len(ordered),
+        "provider_matching_count": result.get("matching_count"),
+        "discarded_by_target_constraints": discarded,
+        "has_more": has_more,
+        "context_gap": "bounded_candidate_page_only" if has_more else None,
+        "snapshot_sha256": snapshot.get("sha256"),
+        "result_sha256": result.get("result_sha256"),
+        "full_search": "knowledge_ledger.py search (Chronik CLI)",
+    }
+
+
+def _chronik_first_context(
+    *, repo: str = "", host: str = "", subject_component: str = "",
+    pr_number: int | None = None, task_id: str = "", search_fn: Any = None,
+    knowledge_search_fn: Any = None,
+) -> dict[str, Any]:
+    """Read bounded Chronik evidence without losing host-scoped project history.
+
+    Run events (agent.ledger) and semantic knowledge (knowledge.ledger) are
+    read separately; the ``knowledge`` section never alters run-event status.
+    """
+    context = _chronik_run_event_context(
+        repo=repo, host=host, subject_component=subject_component,
+        pr_number=pr_number, task_id=task_id, search_fn=search_fn,
+    )
+    if context.get("status") == "skipped_unbound_target":
+        return context
+    # Injected run-event search without knowledge provider = isolated test of
+    # the run-event path; never fall through to the live provider then.
+    if search_fn is not None and knowledge_search_fn is None:
+        context["knowledge"] = {"ledger": "knowledge.ledger",
+                                "status": "not_requested", "events": []}
+        return context
+    context["knowledge"] = _chronik_knowledge_context(
+        repo=repo, host=host, subject_component=subject_component,
+        pr_number=pr_number, knowledge_search_fn=knowledge_search_fn,
+    )
+    return context
+
+
+def _chronik_run_event_context(
+    *, repo: str = "", host: str = "", subject_component: str = "",
+    pr_number: int | None = None, task_id: str = "", search_fn: Any = None,
+) -> dict[str, Any]:
+    """Read bounded agent.ledger evidence without losing host-scoped project history."""
+    targets = {"repo": repo, "host": host, "subject_component": subject_component, "task_id": task_id}
+    filters: dict[str, Any] = {}
+    for key, value in targets.items():
+        if not isinstance(value, str) or len(value) > 160 or "\x00" in value:
+            raise ValueError(f"invalid Chronik target {key}")
+        if value:
+            filters[key] = value
+    if pr_number is not None:
+        if type(pr_number) is not int or not 1 <= pr_number <= 2_147_483_647:
+            raise ValueError("invalid Chronik PR number")
+        if not repo and not subject_component:
+            raise ValueError("Chronik PR number needs repository/component binding")
+        filters["pr_number"] = pr_number
+    base = {
+        "schema_version": 1,
+        "historical_only": True,
+        "authority": "chronik_advisory_historical_evidence",
+        "filters": filters,
+        "does_not_establish": [
+            "current_git_ci_or_runtime_state", "safe_retry",
+            "merge_or_deployment_authority", "task_completion",
+        ],
+    }
+    if not filters:
+        return {**base, "status": "skipped_unbound_target", "events": []}
+
+    # repo matches source.repo OR subject.repo in the Chronik provider.
+    # Host-scoped producer events identify the project by subject.component,
+    # not subject.repo. Both scopes must be searched separately.
+    queries: list[tuple[str, dict[str, Any]]] = []
+    if repo and not task_id:
+        repository_query: dict[str, Any] = {"repo": repo}
+        # An explicit component selector is a constraint, not a hint.
+        if subject_component:
+            repository_query["subject_component"] = subject_component
+        if pr_number is not None:
+            repository_query["pr_number"] = pr_number
+        if host:
+            repository_query["host"] = host
+        queries.append(("repository", repository_query))
+        component_query: dict[str, Any] = {
+            "subject_component": subject_component or repo.split("/", 1)[-1],
+        }
+        if host:
+            component_query["host"] = host
+        if pr_number is not None:
+            component_query["pr_number"] = pr_number
+        queries.append(("host_component", component_query))
+    elif repo and task_id:
+        # A unique task crosses host/repository scopes; preserve explicit constraints.
+        exact_task_query: dict[str, Any] = {"task_id": task_id}
+        if pr_number is not None:
+            exact_task_query["pr_number"] = pr_number
+        if subject_component:
+            exact_task_query["subject_component"] = subject_component
+        if host:
+            exact_task_query["host"] = host
+        queries.append(("exact_task", exact_task_query))
+    else:
+        queries.append(("exact_target", filters))
+
+    if search_fn is None:
+        try:
+            from grabowski_tasks import grabowski_chronik_full_search
+        except Exception as exc:
+            return {
+                **base, "status": "historical_context_unavailable",
+                "failure_code": type(exc).__name__,
+                "failed_scope": "provider_import", "events": [],
+            }
+        search_fn = grabowski_chronik_full_search
+
+    results: list[tuple[str, dict[str, Any]]] = []
+    for scope, query in queries:
+        try:
+            result = search_fn(**query, limit=10)
+        except Exception as exc:
+            return {
+                **base, "status": "historical_context_unavailable",
+                "failure_code": type(exc).__name__, "failed_scope": scope,
+                "events": [],
+            }
+        if not isinstance(result, dict) or result.get("available") is not True:
+            failure = result.get("failure") if isinstance(result, dict) else None
+            return {
+                **base, "status": "historical_context_unavailable",
+                "failure_code": (
+                    result.get("failure_code")
+                    or (failure.get("code") if isinstance(failure, dict) else None)
+                    or "provider_unavailable"
+                ) if isinstance(result, dict) else "invalid_provider_result",
+                "failed_scope": scope, "events": [],
+            }
+        snapshot = result.get("ledger_snapshot")
+        if (
+            result.get("historical_only") is not True
+            or result.get("search_exhaustive") is not True
+            or not isinstance(snapshot, dict)
+            or snapshot.get("integrity_valid") is not True
+            or snapshot.get("invalid_record_count") != 0
+        ):
+            return {
+                **base, "status": "historical_context_unavailable",
+                "failure_code": "historical_evidence_not_verified",
+                "failed_scope": scope, "events": [],
+            }
+        results.append((scope, result))
+
+    compact: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    discarded = 0
+    heuristic_host_matches = 0
+    for scope, result in results:
+        for index, item in enumerate((result.get("events") or [])[:10]):
+            if not isinstance(item, dict) or not isinstance(item.get("event"), dict):
+                continue
+            event = item["event"]
+            subject = event.get("subject") if isinstance(event.get("subject"), dict) else {}
+            match_basis = "exact_target"
+            # A named host is an exact boundary, including for exact-task
+            # lookups; never let the unattributed fallback admit another host.
+            if host and subject.get("host") != host:
+                discarded += 1
+                continue
+            if pr_number is not None and subject.get("pr_number") != pr_number:
+                discarded += 1
+                continue
+            if subject_component and subject.get("component") != subject_component:
+                discarded += 1
+                continue
+            if repo:
+                if (
+                    subject.get("scope") == "repository"
+                    and subject.get("repo") == repo
+                    and (not subject_component or subject.get("component") == subject_component)
+                ):
+                    match_basis = "subject_repository"
+                elif (
+                    subject.get("scope") == "host"
+                    and subject.get("repo") is None
+                    and subject.get("component") == (
+                        subject_component or repo.split("/", 1)[-1]
+                    )
+                    and (not host or subject.get("host") == host)
+                    and (pr_number is None or subject.get("pr_number") == pr_number)
+                ):
+                    match_basis = "host_component_heuristic"
+                elif scope == "exact_task" and subject.get("repo") is None:
+                    # Keep exact task evidence, but never claim repo attribution.
+                    match_basis = "exact_task_unattributed"
+                else:
+                    discarded += 1
+                    continue
+            elif host and subject.get("host") not in {host, None}:
+                discarded += 1
+                continue
+            key = (
+                item.get("event_ref") or event.get("event_id")
+                or item.get("canonical_event_sha256")
+                or f"{scope}:{index}"
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            data = event.get("data") if isinstance(event.get("data"), dict) else {}
+            source = event.get("source") if isinstance(event.get("source"), dict) else {}
+            refs = event.get("evidence_refs")
+            compact.append({
+                "event_ref": item.get("event_ref"),
+                "canonical_event_sha256": item.get("canonical_event_sha256"),
+                "observed_at": event.get("ts"),
+                "kind": event.get("kind"),
+                "operation": data.get("operation"),
+                "outcome": data.get("result"),
+                "task_class": data.get("task_class"),
+                "source_run_id": source.get("run_id"),
+                "evidence_refs": refs[:4] if isinstance(refs, list) else [],
+                "match_basis": match_basis,
+            })
+            if match_basis in {"host_component_heuristic", "exact_task_unattributed"}:
+                heuristic_host_matches += 1
+
+    snapshots = {
+        scope: result["ledger_snapshot"].get("sha256")
+        for scope, result in results
+    }
+    snapshot_values = list(snapshots.values())
+    snapshots_consistent = len(set(snapshot_values)) <= 1
+    any_more = any(result.get("has_more") is True for _, result in results)
+    selection_truncated = len(compact) > 10
+    context_gap = (
+        "ledger_snapshot_changed_between_scopes" if not snapshots_consistent
+        else "bounded_candidate_page_only" if any_more or selection_truncated
+        else "host_component_attribution_heuristic" if heuristic_host_matches
+        else None
+    )
+    completed = context_gap is None
+    provider_counts = {
+        scope: result.get("matching_count") for scope, result in results
+    }
+    provider_result_hashes = {
+        scope: result.get("result_sha256") for scope, result in results
+    }
+    return {
+        **base, "status": "available", "events": compact[:10],
+        "selected_event_count": len(compact[:10]),
+        "matching_count": len(compact) if completed else None,
+        "provider_matching_count": (
+            sum(value for value in provider_counts.values() if type(value) is int)
+        ),
+        "provider_matching_counts": provider_counts,
+        "discarded_source_only_matches": discarded,
+        "selection_complete": completed,
+        "context_gap": context_gap,
+        "has_more": any_more or selection_truncated,
+        "snapshot_sha256": snapshot_values[0] if snapshots_consistent else None,
+        "scope_snapshot_sha256": snapshots,
+        # A multi-query aggregate is NOT a canonical provider result receipt.
+        "result_sha256": results[0][1].get("result_sha256") if len(results) == 1 else None,
+        "scope_result_sha256": provider_result_hashes,
+        "scope_queries": [scope for scope, _ in queries],
+    }
+
+
 def _workspace_metrics_snapshot(limit: int) -> dict[str, Any]:
     """Defer heavyweight workspace observation from the synchronous entry capsule.
 
@@ -252,7 +641,7 @@ def _workspace_metrics_snapshot(limit: int) -> dict[str, Any]:
     return {**body, "snapshot_sha256": _stable_sha256(body)}
 
 
-def agent_bootstrap(*, friction_limit: int = 100, outcome_limit: int = 200) -> dict[str, Any]:
+def agent_bootstrap(*, friction_limit: int = 100, outcome_limit: int = 200, repo: str = "", host: str = "", subject_component: str = "", pr_number: int | None = None, task_id: str = "") -> dict[str, Any]:
     if isinstance(friction_limit, bool) or not isinstance(friction_limit, int):
         raise ValueError("friction_limit must be an integer")
     if isinstance(outcome_limit, bool) or not isinstance(outcome_limit, int):
@@ -262,6 +651,7 @@ def agent_bootstrap(*, friction_limit: int = 100, outcome_limit: int = 200) -> d
     if not 1 <= outcome_limit <= 1000:
         raise ValueError("outcome_limit must be between 1 and 1000")
 
+    chronik_first = _chronik_first_context(repo=repo, host=host, subject_component=subject_component, pr_number=pr_number, task_id=task_id)
     friction = grabowski_friction.friction_summary(limit=friction_limit)
     governor = grabowski_friction.execution_governor_summary(limit=outcome_limit)
     workspace_metrics = _workspace_metrics_snapshot(
@@ -302,8 +692,10 @@ def agent_bootstrap(*, friction_limit: int = 100, outcome_limit: int = 200) -> d
         "adaptive_mode": "shadow" if adaptive_enabled else "disabled_fail_closed",
         "automatic_live_routing_enabled": False,
         "entry_sequence": list(ENTRY_SEQUENCE),
+        "chronik_first": chronik_first,
         "adler_sidecar": ADLER_SIDECAR,
         "historical_recall": HISTORICAL_RECALL,
+        "hard_case_advisory": HARD_CASE_ADVISORY,
         "reuse_before_build": REUSE_BEFORE_BUILD,
         "call_rules": {
             "one_independent_intent_per_call": True,
@@ -407,9 +799,9 @@ def agent_bootstrap(*, friction_limit: int = 100, outcome_limit: int = 200) -> d
 
 
 @mcp.tool(name="grabowski_agent_bootstrap", annotations=READ_ONLY)
-def grabowski_agent_bootstrap(friction_limit: int = 100, outcome_limit: int = 200) -> dict[str, Any]:
+def grabowski_agent_bootstrap(friction_limit: int = 100, outcome_limit: int = 200, repo: str = "", host: str = "", subject_component: str = "", pr_number: int | None = None, task_id: str = "") -> dict[str, Any]:
     """Return a bounded adaptive agent entry capsule for the current runtime evidence."""
-    return agent_bootstrap(friction_limit=friction_limit, outcome_limit=outcome_limit)
+    return agent_bootstrap(friction_limit=friction_limit, outcome_limit=outcome_limit, repo=repo, host=host, subject_component=subject_component, pr_number=pr_number, task_id=task_id)
 
 
 @mcp.tool(name="grabowski_call_shape_check", annotations=READ_ONLY)

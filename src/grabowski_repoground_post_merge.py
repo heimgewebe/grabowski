@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime
+from functools import lru_cache
 import hashlib
 import os
 import stat as statmod
@@ -467,6 +468,9 @@ def _publisher_command(publisher: Path, repository: str) -> list[str]:
         "--repo",
         repository,
         "--if-changed",
+        # Fleet watch units disable optional authenticated Git/CI handoff.
+        # Captain follow-ups must use the same source-publication policy.
+        "--no-authenticated-events",
         "--retention",
         "3",
     ]
@@ -782,6 +786,36 @@ def converge(
                 }
             sleep_fn(busy_sleep_seconds)
             continue
+
+        if returncode == 0 and publisher_status == "warn":
+            # The publisher can warn on an older, already superseded Captain
+            # merge even though today's canonical bundle is fresh_exact and
+            # the historical merge is an ancestor of the observed remote head.
+            # Reuse the existing strict freshness/remote/ancestry proof before
+            # classifying this immutable obligation as a failed publication.
+            # Missing or mismatched evidence must retain the original failure.
+            try:
+                current = freshness_reader(repository)
+                exact, projection = _fresh_exact(
+                    current,
+                    merge_sha=merge_sha,
+                    target_branch=target_branch,
+                    ancestry_checker=ancestry_checker,
+                )
+            except (OSError, subprocess.SubprocessError, RepoGroundPostMergeError) as exc:
+                attempt_record["freshness_check_error"] = type(exc).__name__
+            else:
+                attempt_record["freshness"] = projection
+                if exact:
+                    return {
+                        "kind": "grabowski.repoground_post_merge_freshness",
+                        "schema_version": 1,
+                        "status": "fresh_exact",
+                        "repository": repository,
+                        "merge_sha": merge_sha,
+                        "attempts": attempts,
+                        "final": projection,
+                    }
 
         if returncode != 0 or publisher_status not in {"ok", "success"}:
             return {
@@ -1719,6 +1753,108 @@ def captain_followup_request_from_audit(
     )
 
 
+@lru_cache(maxsize=1)
+def _publisher_authoritative_members() -> frozenset[str] | None:
+    """Read the authoritative fleet membership once per reconcile process.
+
+    Targeted inventory is explicitly non-authoritative and includes local
+    checkout repos excluded from the real fleet. Unknown is not exclusion.
+    """
+    try:
+        inventory = _run_publisher([str(DEFAULT_PUBLISHER), "--inventory"], 15)
+    except (OSError, subprocess.SubprocessError, RepoGroundPostMergeError, ValueError):
+        return None
+    if not isinstance(inventory, dict) or inventory.get("returncode") != 0:
+        return None
+    payload = inventory.get("payload")
+    if not isinstance(payload, dict) or payload.get("status") != "ok":
+        return None
+    membership = payload.get("membership")
+    if not isinstance(membership, dict) or (
+        membership.get("schema") != "repoground.fleet-membership-authority.v1"
+    ):
+        return None
+    members = membership.get("members")
+    if not isinstance(members, list) or (
+        any(not isinstance(repo, str) or not REPOSITORY_RE.fullmatch(repo) for repo in members)
+        or type(membership.get("member_count")) is not int
+        or membership["member_count"] != len(members)
+        or len(set(members)) != len(members)
+    ):
+        return None
+    return frozenset(members)
+
+
+def _publisher_inventory_missing_repository(repository: str) -> bool:
+    members = _publisher_authoritative_members()
+    return members is not None and repository not in members
+
+
+@lru_cache(maxsize=64)
+def _publisher_canonical_publication_ref(repository: str) -> str | None:
+    """Read one current, remote-bound fleet publication branch per reconcile pass.
+
+    A merge into a different branch cannot be proven by publishing the
+    canonical branch. Unknown or stale publication evidence never excludes.
+    """
+    try:
+        current = _read_freshness(repository)
+    except (
+        OSError, subprocess.SubprocessError, RepoGroundPostMergeError,
+        ValueError, TypeError, RuntimeError,
+    ):
+        return None
+    if (
+        not isinstance(current, dict)
+        or current.get("repo") != repository
+        or current.get("freshness") != "fresh_exact"
+        or current.get("freshness_status") != "fresh"
+    ):
+        return None
+    bundle = current.get("bundle")
+    live = current.get("live_repo")
+    if not isinstance(bundle, dict) or not isinstance(live, dict):
+        return None
+    observed = live.get("branch_head_observation")
+    ref = bundle.get("ref")
+    head = bundle.get("git_commit")
+    if (
+        not isinstance(ref, str)
+        or not ref
+        or not isinstance(head, str)
+        or SHA40_RE.fullmatch(head) is None
+        or bundle.get("git_dirty") is not False
+        or live.get("dirty") is not False
+        or live.get("source_kind") != "publication_source_checkout"
+        or live.get("head") != head
+        or not isinstance(observed, dict)
+        or observed.get("status") != "observed"
+        or observed.get("basis") != "git_ls_remote_origin"
+        or observed.get("returncode") != 0
+        or observed.get("ref") != ref
+        or observed.get("full_ref") != f"refs/heads/{ref}"
+        or observed.get("head") != head
+    ):
+        return None
+    return ref
+
+
+def _publisher_canonical_target_mismatch(request: dict[str, Any]) -> str | None:
+    if request.get("status") != "ready":
+        return None
+    repository = request["repository"]
+    members = _publisher_authoritative_members()
+    if members is None or repository not in members:
+        return None
+    target_branch = request.get("target_branch")
+    if not isinstance(target_branch, str):
+        return None
+    canonical_ref = _publisher_canonical_publication_ref(repository)
+    if canonical_ref is None or target_branch == canonical_ref:
+        return None
+    return canonical_ref
+
+
 def schedule_from_captain_audit_completion(
     completion_record_sha256: str,
     *,
@@ -1728,17 +1864,55 @@ def schedule_from_captain_audit_completion(
     runtime_seconds: int = DEFAULT_JOB_RUNTIME_SECONDS,
     verified_snapshot: Any | None = None,
 ) -> dict[str, Any]:
+    # The operator is long-lived; only the verified reconciliation pass may
+    # reuse an observed canonical ref. Direct Captain actions always refresh.
+    if verified_snapshot is None:
+        _publisher_canonical_publication_ref.cache_clear()
     request = captain_followup_request_from_audit(
         completion_record_sha256,
         python_executable=python_executable,
         script_path=script_path,
         verified_snapshot=verified_snapshot,
     )
-    result = schedule_followup_request(
-        request,
-        job_starter=job_starter,
-        runtime_seconds=runtime_seconds,
-    )
+    if (
+        request.get("status") == "ready"
+        and _publisher_inventory_missing_repository(request["repository"])
+    ):
+        result = {
+            **_followup_base(
+                status="not_scheduled",
+                reason="publisher_inventory_missing_repository",
+                repository=request["repository"],
+                merge_sha=request.get("merge_sha"),
+            ),
+            "does_not_establish": [
+                "publication_completed",
+                "freshness_converged",
+                "future_fleet_membership",
+            ],
+        }
+    elif canonical_ref := _publisher_canonical_target_mismatch(request):
+        result = {
+            **_followup_base(
+                status="not_scheduled",
+                reason="publisher_target_branch_not_canonical",
+                repository=request["repository"],
+                merge_sha=request.get("merge_sha"),
+            ),
+            "target_branch": request["target_branch"],
+            "publication_branch": canonical_ref,
+            "does_not_establish": [
+                "publication_completed",
+                "target_branch_freshness_converged",
+                "future_publisher_ref",
+            ],
+        }
+    else:
+        result = schedule_followup_request(
+            request,
+            job_starter=job_starter,
+            runtime_seconds=runtime_seconds,
+        )
     result["captain_audit_completion_sha256"] = completion_record_sha256
     return result
 
@@ -2471,6 +2645,8 @@ def reconcile_recent_captain_audit_followups(
     if type(limit) is not int or not 1 <= limit <= 100:
         raise RepoGroundPostMergeError("reconcile limit is out of bounds")
 
+    # No cached remote publication authority crosses separate audit passes.
+    _publisher_canonical_publication_ref.cache_clear()
     discovery_started_monotonic = time.monotonic()
 
     import grabowski_audit_query
@@ -2489,6 +2665,10 @@ def reconcile_recent_captain_audit_followups(
         if callable(getattr(cursor_tasks, "_database_connection", None)):
             scan_next_before = _load_reconcile_scan_next(cursor_tasks)
 
+    # Keep the *stored* preimage for the SQLite CAS. A missing metadata row is
+    # None, even if we later use ordinal zero as the effective scan boundary.
+    discovery_ordinal_cas_before = discovery_ordinal_before
+
     since_unix = int(time.time()) - lookback_seconds
     snapshot = grabowski_audit_query.capture_verified_audit_snapshot()
     max_scan_records = grabowski_audit_query.MAX_SCAN_RECORDS
@@ -2497,6 +2677,21 @@ def reconcile_recent_captain_audit_followups(
         or max_scan_records < 1
     ):
         raise RepoGroundPostMergeError("Captain audit reconciliation scan bound is invalid")
+
+    # An uninitialized durable discovery cursor on a pre-existing large ledger
+    # must use the same verified, bounded oldest-first windows as an explicit
+    # ordinal-zero watermark. Otherwise the first run scans past the limit and
+    # fails forever until someone manually edits TaskStore metadata. No
+    # unsigned/segmentless or non-persistent source is admitted to this path.
+    if (
+        discovery_ordinal_before is None
+        and cursor_tasks is not None
+        and type(getattr(snapshot, "total_records", None)) is int
+        and snapshot.total_records > max_scan_records
+        and isinstance(getattr(snapshot, "segments", None), tuple)
+        and snapshot.segments
+    ):
+        discovery_ordinal_before = 0
 
     # Bootstrap with the bounded wall-clock lookback, then resume from a durable
     # audit ordinal. Once the watermark exists, outages cannot age an unseen
@@ -2743,6 +2938,8 @@ def reconcile_recent_captain_audit_followups(
                         outcome["reason"] in {
                             "merge_verification_not_passed",
                             "captain_merge_not_fast_path_eligible",
+                            "publisher_inventory_missing_repository",
+                            "publisher_target_branch_not_canonical",
                         }
                         or (
                             outcome["reason"] == "durable_freshness_job_slots_exhausted"
@@ -2829,7 +3026,7 @@ def reconcile_recent_captain_audit_followups(
             # Existing mocked legacy unit fixtures without a database retain
             # their original signature; actual TaskStore persistence is CAS.
             if callable(getattr(cursor_tasks, "_database_connection", None)):
-                progress_args["expected_discovery_ordinal"] = discovery_ordinal_before
+                progress_args["expected_discovery_ordinal"] = discovery_ordinal_cas_before
                 progress_args["expected_cursor"] = cursor_before
                 progress_args["expected_scan_next_ordinal"] = scan_next_before
             _save_reconcile_progress(cursor_tasks, **progress_args)

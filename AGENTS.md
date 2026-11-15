@@ -13,6 +13,29 @@ Vor jeder Mutation müssen mindestens vorliegen:
 - Stop-Kriterium,
 - Rückrollpfad.
 
+## Chronik First – historische Evidenz vor Heimgewebe-Arbeit
+
+Bei jedem neuen relevanten Heimgewebe-Arbeitsauftrag, bei Statusfragen und bei
+Fortsetzung einer früheren Diagnose zuerst die bestehende schreibfreie
+grabowski_chronik_full_search gezielt auf das Repository, den Host, die
+Komponente, den PR oder die Aufgabe anwenden. Die Repository-Slugform muss
+vollständig sein (beispielsweise heimgewebe/grabowski). Belegte frühere
+Erkenntnisse und Fehlschläge vor erneuter Untersuchung berücksichtigen.
+Der Bootstrap liefert dafür neben Laufereignissen (`agent.ledger`) auch
+Wissenseinträge (`chronik_first.knowledge` aus `knowledge.ledger`: Ursachen,
+Reparaturen, Entscheidungen, Widerlegungen); diese zuerst lesen.
+
+Danach den Ist-Zustand über Git, GitHub, CI, Runtime oder andere zuständige
+Live-Primärquellen frisch prüfen. Chronik ist historische Evidenz, kein
+Deploymentnachweis und keine Mutations- oder Retry-Autorität. Bei Ausfall den
+fehlenden Historienabgleich transparent machen und regulär weiterarbeiten.
+Bei sachfremden Aufgaben keine Chronik-Abfrage. Grabowski ist alleiniger
+autorisierter Writer/Operator.
+
+Der Agent-Bootstrap kann bei expliziter Zielbindung einen wirklichen
+historischen Kurzkontext abrufen. Dokumentation:
+docs/chronik-first-agent-start.md.
+
 ## Adaptive Einstiegskapsel
 
 Für konkrete Statusfragen nur den engsten fachlich zuständigen, **nachweislich schreibfreien** Zugriff verwenden. Eine `READ_ONLY`-Annotation allein ist kein Nachweis: **Vor jedem Werkzeugaufruf** dessen mögliche direkte, bedingte und transitive Schreibeffekte prüfen. `grabowski_task_status` kann Task-Zustand und Leases ändern, `grabowski_task_list` Terminalisierungs-Recovery ausführen und `grabowski_resource_list` die Ressourcen-Datenbank anlegen oder migrieren. **Diese Werkzeuge sind keine schreibfreien Statusleser.** Für sie sowie jedes andere Werkzeug mit möglichen Schreibeffekten gelten **vor jedem Aufruf** sämtliche für diese Effekte erforderlichen Arbeits-, Lease-, Audit-, Kill-Switch- und Mutations-Gates – unabhängig davon, ob der Aufruf als Statusabfrage bezeichnet wird. Fehlt eine Voraussetzung, **nicht aufrufen**; stattdessen einen nachweislich schreibfreien und zulässigen Zugriff wählen oder die Abfrage abbrechen. `grabowski_context(profile="concise")` dient der quellenübergreifenden Orientierung, `grabowski_current_work` der kombinierten Arbeitslage aus Tasks, Leases, Checkouts und Prozessen; für beide gelten dieselben Prüfregeln, ihre Bezeichnung macht sie nicht schreibfrei. Eine Statusabfrage erteilt niemals Mutationsfreigabe. Review-, Captain- und Deployment-Gates bleiben zusätzlich an die jeweils von ihnen erfassten Aktionen gebunden.
@@ -83,3 +106,40 @@ erfolgen.
 - A canonical lane-backed `scoped_writer` is distinct from an advisory competitor or contrast agent. It may mutate only when the canonical route selects `executor=scoped_writer`, declares `route_role=scoped-writer`, sets `execution_eligible_if_separately_authorized=true`, is not `contrast_only`, and the exact Work Lane grants the requested write scope. Competition and `contrast_only` routes remain advisory.
 - Generate a contrast matrix from bound receipts. Convert shared risks and tests into deterministic validation; investigate divergent boundaries instead of voting by majority.
 - External agreement is not proof of correctness, and no automatic winner selection is permitted.
+
+
+### Automatic hard-case second opinion: existing Source frontdoor
+
+For each nontrivial source-bound task, independently assess repeated failures,
+conflicting primary observations, and material architecture risk *before* reusing
+a failed approach. Never wait for another user prompt solely to request a
+read-only second perspective.
+
+When invoking agent-execution-happy-path in Source mode, provide the optional
+hard_case_advisory signal only when grounded in real event/readback evidence:
+
+- repeated_failure: kind, two distinct evidence_refs for failures with the
+  same normalized error identity, and one actual error_fingerprint (SHA-256).
+  Include the existing prior-attempt-failed risk flag. Never synthesize receipts.
+- contradictory_evidence: kind and two distinct evidence_refs from materially
+  inconsistent current observations. Use novelty=high.
+- material_architecture: kind and at least one concrete evidence_ref for a
+  high-novelty architecture or migration decision with the high-risk flag.
+
+The normal Source frontdoor selects the best eligible subscription-backed Claude
+or Grok reviewer through the existing canonical model router and starts one
+idempotent, advisory-only contrast Candidate. The contract fixes
+max_budget_usd=0 and paid_execution_authorized=false. It exports only the
+committed, redaction-checked README, not arbitrary workspaces, credentials
+or private context. It never imposes a mandatory external PR review, selects
+a winning patch, mutates a repository, or introduces a provider usage quota.
+
+Read the returned competition_id with grabowski_agent_competition_status
+before acting on any findings. A start receipt is not a completed second
+opinion. Unavailable or ambiguous provider starts must be surfaced as such;
+continue safe primary work and never blindly repeat unknown effects.
+
+For ordinary investigations or existing threads that do not enter the AEF
+Source frontdoor, the controller must still classify the same evidence and
+call the existing advisory starter when warranted. The source-frontdoor
+dispatch is automated but does not guarantee invocation in unrelated tools.

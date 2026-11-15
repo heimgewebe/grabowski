@@ -82,6 +82,25 @@ reason = process_only
 
 behauptet dagegen keine systemische Konvergenz und benötigt deshalb keinen Consumer-Receipt.
 
+## Direkte Nutzeraufträge in v2
+
+Für eine direkt autorisierte Grabowski-Obligation ist kein Bureau-Task
+erforderlich. Das additive v2-Protokoll erlaubt stattdessen
+`closure.operator_obligation_ref` mit
+`grabowski:operator-obligation:<id>@sha256:<open-file-sha256>`.
+Im Assessment muss `observation.source_refs` exakt diese
+`operator_obligation`-Quelle mit demselben SHA-256 tragen.
+
+Der zustandslose Protokoll-Evaluator bestätigt nur, dass die
+übermittelten Evidenzen strukturell zusammenpassen. Bevor Grabowski
+ein systemisches `completed` annimmt, liest der Consumer seine
+eigene private create-only `open.json` nochmals, prüft ID, Owner-,
+Inode- und Record-Integrität und verlangt die **identische**
+Open-File-SHA und die exakt gebundene Source-Referenz.
+Eine andere Obligation, eine fehlende Datei, ein anderer Digest oder
+ein gleichzeitiger Bureau-Task führen fail-closed zum Blocker.
+Der bisherige Bureau-Task-Closure-Pfad bleibt vollständig erhalten.
+
 ## Scope-Grenze
 
 Diese technische Erzwingung gilt für den systemischen `operator-obligation-close`. Daraus folgt nicht, dass jede Task-, Workspace-, Archiv-, Lease- oder Cleanup-Fläche ebenfalls ein eigenes Konvergenzgate erhalten soll.

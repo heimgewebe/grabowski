@@ -1,7 +1,7 @@
 # Agent Run Events Runbook
 
-Status: experimental
-Scope: optional Grabowski task lifecycle events for Chronik
+Status: selective production capture
+Scope: automatic actionable Grabowski terminal failures and optional lifecycle events for Chronik
 
 ## These / Antithese / Synthese
 
@@ -9,7 +9,7 @@ Scope: optional Grabowski task lifecycle events for Chronik
 
 **Antithese:** Enabling this globally would turn a useful observation seam into quiet infrastructure coupling.
 
-**Synthese:** Use the writer as an explicit, local observation seam. Target identity comes from canonical task resource claims, never from parsing argv or logs.
+**Synthese:** Capture only redacted failed/timed-out/unknown outcomes by default; keep successful lifecycle events behind explicit task opt-in. Target identity comes from canonical task resource claims when the task opted in, never from parsing argv or logs.
 
 ## Preconditions
 
@@ -24,7 +24,7 @@ Before any activation experiment:
 
 ## Switches
 
-The writer is off unless this variable is set to a truthy value:
+The full lifecycle writer remains opt-in; without opt-in only `failed`, `timed_out` and `outcome_unknown` are recorded. A truthy global variable explicitly enables the larger event set:
 
 ```text
 GRABOWSKI_CHRONIK_AGENT_RUN_OUTBOX=1
@@ -40,7 +40,7 @@ If no state root is given, events use the normal Grabowski state root. Do not us
 
 ## Activation model
 
-The global environment switches are still available for isolated writer smoke tests, but they are not the preferred path for real tasks. A real `grabowski_task_start` smoke should use task-local opt-in parameters so the writer decision is persisted with the task record and does not depend on service-level environment.
+The global environment switches remain available for isolated full-lifecycle smoke tests, but they are not the preferred path for real tasks. A `grabowski_task_start` that needs start/completion or additional cancellation signals should use task-local opt-in parameters so the decision is persisted and does not depend on service-level environment. The three default failure outcomes do not need either switch.
 
 Use these task parameters for a real smoke:
 
@@ -63,7 +63,7 @@ Every new event carries bounded `operation` and `task_class` fields. `chronik_op
 
 ### High-value admission
 
-The producer deliberately does not persist every successful task transition. Terminal execution failures (`agent.run.failed`, `agent.run.cancelled`, `agent.run.timed_out`, and `agent.run.signalled`) and the safety-block outcome `agent.run.blocked` are always retained, including their bounded `operation` and `task_class`; blocked events retain their blocker code. `agent.run.started` and successful `agent.run.completed` are written only when the persisted operation is one of the source-defined high-value set: `deploy`, `merge`, or `recovery`. Routine successful `implement`, `review`, `runtime_verify`, and `other` transitions remain in the durable task/runtime evidence that already owns current execution truth and are not duplicated into Chronik history.
+The producer deliberately does not persist every successful task transition. Without opt-in, only terminal `failed`, `timed_out`, and `outcome_unknown` (mapped to `agent.run.blocked`) produce an outbox event. Ordinary completion, cancellation and signal-based shutdown do not. For opted-in tasks, terminal execution failures (`agent.run.failed`, `agent.run.cancelled`, `agent.run.timed_out`, and `agent.run.signalled`) and the safety-block outcome `agent.run.blocked` are retained, including their bounded `operation` and `task_class`; blocked events retain their blocker code. `agent.run.started` and successful `agent.run.completed` are written only when the persisted operation is one of the source-defined high-value set: `deploy`, `merge`, or `recovery`. Routine successful `implement`, `review`, `runtime_verify`, and `other` transitions remain in the durable task/runtime evidence that already owns current execution truth and are not duplicated into Chronik history.
 
 This is an admission rule for new outbox writes, not a migration rule. `build_event()` remains able to reconstruct valid historical `agent.run.*` payloads, and existing Chronik records are never rewritten or deleted by this filter. Adding another high-value lifecycle operation therefore requires an explicit source and regression-test change; arbitrary caller strings cannot expand the set.
 
@@ -115,7 +115,7 @@ Check that the default outbox is still empty unless a deliberate experiment has 
 find "$HOME/.local/state/grabowski/chronik-outbox" -type f -name '*.jsonl' 2>/dev/null | wc -l
 ```
 
-Expected result: routine successful task churn does not create files. High-value `deploy`/`merge`/`recovery` events or terminal failure/block events may legitimately leave an outbox source until normal import/compaction consumes it.
+Expected result: routine successful task churn does not create files. The three default terminal failures, opted-in high-value `deploy`/`merge`/`recovery` events, or additional opted-in failures may legitimately leave an outbox source until normal import/compaction consumes it.
 
 ## Explicit non-goals
 
@@ -130,7 +130,7 @@ This runbook does not authorize:
 
 ## Escalation rule
 
-A real `grabowski_task_start` activation smoke is allowed only with `chronik_outbox=True` and a temporary `chronik_outbox_state_root`. Do not use service-level environment for this smoke unless the task-local seam is broken and the service-level path has its own explicit revert plan.
+A real `grabowski_task_start` full-lifecycle opt-in smoke is allowed only with `chronik_outbox=True` and a temporary `chronik_outbox_state_root`. Do not use service-level environment for this smoke unless the task-local seam is broken and the service-level path has its own explicit revert plan.
 
 ## Exit criteria
 
@@ -144,7 +144,7 @@ Stop the experiment if any of these happen:
 
 ## Current decision
 
-Default state remains off. The writer is a diagnostic seam, not a dependency.
+Default state is failure-only for `failed`, `timed_out`, and `outcome_unknown`. All other event admission remains opt-in. A failure to write Chronik must not block the owning task; Chronik is a diagnostic seam, not an execution dependency.
 
 ## Explicit coding-memory import and history
 
