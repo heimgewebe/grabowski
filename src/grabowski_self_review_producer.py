@@ -576,18 +576,25 @@ def plan_first_party_review(
     release_binding: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Freeze a source-only plan for the authenticated first-party reviewer."""
-    if purpose != "pull_request" or release_binding is not None:
+    if purpose not in {"pull_request", "post_merge_release"} or (
+        (purpose == "post_merge_release") != (release_binding is not None)
+    ):
         raise provenance.ReviewExecutionRejected(
-            "first-party direct plan supports pull requests only"
+            "first-party direct review purpose and release binding do not match"
         )
     real, repo_slug = _managed_repository_identity(repo)
     candidate = {
         "repo": repo_slug, "pr": pr, "base_sha": base_sha,
         "head_sha": head_sha, "diff_sha256": diff_sha256,
         "review_batch_id": secrets.token_hex(16), "review_purpose": purpose,
+        **({"release_binding": release_binding} if purpose == "post_merge_release" else {}),
     }
     binding = _binding(candidate)
     raw_identity = _current_source(real, binding)
+    if purpose == "post_merge_release" and binding["diff_sha256"] != raw_identity:
+        raise provenance.ReviewExecutionRejected(
+            "first-party release must bind the full serving-to-target raw diff"
+        )
     return {
         "schema_version": 1,
         "kind": "grabowski_first_party_review_plan",
@@ -781,6 +788,24 @@ def _review_report(phase: Any, *, axis: str, sequence: int, head: str, base: str
     }
 
 
+def _review_audit_destination(
+    binding: dict[str, Any], receipts: Path,
+) -> tuple[Path, str]:
+    """One create-only release/PR audit index for both signed review modes."""
+    if binding["review_purpose"] == "post_merge_release":
+        release = binding["release_binding"]
+        index = {
+            "repo": binding["repo"], "review_pr": binding["pr"],
+            "serving_head": binding["base_sha"], "target_head": binding["head_sha"],
+            "diff_sha256": binding["diff_sha256"],
+            "serving_release_id": release["serving_release_id"],
+            "serving_tree": release["serving_tree"],
+            "target_tree": release["target_tree"],
+        }
+        return R3_ROOT, provenance._digest(index) + ".json"
+    return receipts / "batches", binding["review_batch_id"] + ".json"
+
+
 def _seal_review(
     plan: dict[str, Any],
     task_ids: dict[str, str],
@@ -948,20 +973,7 @@ def _seal_review(
         repository=repository, now_unix=int(__import__("time").time()),
         root_owned_signers=root_owned_signers, capture_root=capture_root,
     )
-    if binding["review_purpose"] == "post_merge_release":
-        release_index = {
-            "repo": binding["repo"], "review_pr": binding["pr"],
-            "serving_head": binding["base_sha"], "target_head": binding["head_sha"],
-            "diff_sha256": binding["diff_sha256"],
-            "serving_release_id": binding["release_binding"]["serving_release_id"],
-            "serving_tree": binding["release_binding"]["serving_tree"],
-            "target_tree": binding["release_binding"]["target_tree"],
-        }
-        index_name = provenance._digest(release_index) + ".json"
-        dest_root = R3_ROOT
-    else:
-        index_name = binding["review_batch_id"] + ".json"
-        dest_root = receipts / "batches"
+    dest_root, index_name = _review_audit_destination(binding, receipts)
     index_fd = _ensure_private_root(dest_root)
     try:
         _create_only(index_fd, index_name, provenance._canonical(audit))
@@ -1101,10 +1113,9 @@ def _seal_first_party_review(
         root_owned_signers=root_owned_signers,
         first_party_root=first_party_root,
     )
-    destination = receipts / "batches"
+    destination, name = _review_audit_destination(binding, receipts)
     descriptor = _ensure_private_root(destination)
     try:
-        name = binding["review_batch_id"] + ".json"
         _create_only(descriptor, name, provenance._canonical(audit))
         os.fsync(descriptor)
     finally:
@@ -1250,6 +1261,12 @@ def main(argv: list[str] | None = None) -> int:
     for name in ("repo", "base", "head", "diff"):
         first_party.add_argument("--" + name, required=True)
     first_party.add_argument("--pr", type=int, required=True)
+    first_party.add_argument(
+        "--purpose", choices=("pull_request", "post_merge_release"),
+        default="pull_request",
+    )
+    for name in ("serving-release-id", "serving-tree", "target-tree"):
+        first_party.add_argument("--" + name)
     existing = commands.add_parser("seal", help="Sign real completed task executions only")
     existing.add_argument("--batch-id", required=True)
     existing.add_argument("--task-ids-json", required=True)
@@ -1294,9 +1311,21 @@ def main(argv: list[str] | None = None) -> int:
             ],
         }
     elif args.operation == "plan-firstparty":
+        release = None
+        if args.purpose == "post_merge_release":
+            release = {
+                "serving_release_id": args.serving_release_id,
+                "serving_tree": args.serving_tree,
+                "target_tree": args.target_tree,
+            }
+        elif any(x is not None for x in (
+            args.serving_release_id, args.serving_tree, args.target_tree,
+        )):
+            raise provenance.ReviewExecutionRejected("PR review may not include release fields")
         new_plan = plan_first_party_review(
             repo=Path(args.repo), pr=args.pr, base_sha=args.base,
             head_sha=args.head, diff_sha256=args.diff,
+            purpose=args.purpose, release_binding=release,
         )
         _require_live_pr(new_plan["binding"])
         _store_plan(new_plan)

@@ -1492,6 +1492,101 @@ class FirstPartySemanticReviewTests(unittest.TestCase):
                 serving_tree=release["serving_tree"], target_tree=release["target_tree"],
             )
 
+    def test_direct_first_party_release_seals_authentic_five_axis_r3(self) -> None:
+        import grabowski_release_admission as admission
+
+        _technical, release, diff = self._signed_release_plan()
+        plan = producer.plan_first_party_review(
+            repo=self.repo, pr=1649, base_sha=self.base, head_sha=self.head,
+            diff_sha256=diff, purpose="post_merge_release",
+            release_binding=release,
+        )
+        self.assertEqual("grabowski_first_party_review_plan", plan["kind"])
+        self.assertEqual("post_merge_release", plan["binding"]["review_purpose"])
+        self.assertEqual(release, plan["binding"]["release_binding"])
+        self.assertNotIn("tasks", plan)
+
+        started = self._start_plan(plan)
+        for number, axis in enumerate(review.REQUIRED_AXES, 1):
+            self._submit_axis(started, axis, number)
+        r3_root = self.root / "release-r3-audits"
+        with mock.patch.object(producer, "R3_ROOT", r3_root):
+            audit, receipts = self._seal_direct(plan)
+        self.assertEqual([], self._receipt_errors(audit, receipts))
+        release_index = {
+            "repo": "heimgewebe/grabowski", "review_pr": 1649,
+            "serving_head": self.base, "target_head": self.head,
+            "diff_sha256": diff,
+            "serving_release_id": release["serving_release_id"],
+            "serving_tree": release["serving_tree"],
+            "target_tree": release["target_tree"],
+        }
+        destination = r3_root / (producer.provenance._digest(release_index) + ".json")
+        self.assertTrue(destination.is_file())
+        self.assertEqual(audit, json.loads(destination.read_text(encoding="utf-8")))
+        self.assertEqual("post_merge_release", audit["review_purpose"])
+        self.assertEqual(release, audit["release_binding"])
+
+        # Inject only hermetic paths; run the actual signed-receipt verifier
+        # against the real signed source reads and axis reports.
+        with (
+            mock.patch.object(admission, "RELEASE_SELF_REVIEW_ROOT", r3_root),
+            mock.patch.object(
+                review, "review_receipt_errors",
+                side_effect=lambda payload: self._receipt_errors(payload, receipts),
+            ),
+        ):
+            accepted = admission.validate_authenticated_self_release_review(
+                serving_head=self.base, target_head=self.head,
+                diff_sha256=diff, review_pr=1649,
+                serving_release_id=release["serving_release_id"],
+                serving_tree=release["serving_tree"],
+                target_tree=release["target_tree"],
+            )
+        self.assertEqual("server_self", accepted["review_mode"])
+        self.assertEqual(5, accepted["self_review_pass_count"])
+        self.assertTrue(accepted["signed_task_origin_proven"])
+
+        # Rotation of the same release index cannot overwrite a signed PASS.
+        with mock.patch.object(producer, "R3_ROOT", r3_root), self.assertRaises(
+            FileExistsError
+        ):
+            self._seal_direct(plan)
+
+    def test_direct_release_plan_requires_matching_purpose_and_full_delta(self) -> None:
+        _technical, release, diff = self._signed_release_plan()
+        common = {
+            "repo": self.repo, "pr": 1649,
+            "base_sha": self.base, "head_sha": self.head,
+            "diff_sha256": diff,
+        }
+        with self.assertRaisesRegex(
+            review.ReviewExecutionRejected, "purpose and release binding"
+        ):
+            producer.plan_first_party_review(
+                **common, purpose="post_merge_release",
+            )
+        with self.assertRaisesRegex(
+            review.ReviewExecutionRejected, "purpose and release binding"
+        ):
+            producer.plan_first_party_review(
+                **common, purpose="pull_request", release_binding=release,
+            )
+        with self.assertRaisesRegex(
+            review.ReviewExecutionRejected, "full serving-to-target raw diff"
+        ):
+            producer.plan_first_party_review(
+                **{**common, "diff_sha256": "a" * 64},
+                purpose="post_merge_release", release_binding=release,
+            )
+        with self.assertRaisesRegex(
+            review.ReviewExecutionRejected, "release"
+        ):
+            producer.plan_first_party_review(
+                **common, purpose="post_merge_release",
+                release_binding={**release, "target_tree": "invalid"},
+            )
+
     def test_release_without_historical_session_allows_independent_pass(self) -> None:
         _plan, release, diff = self._signed_release_plan()
         self.assertEqual(
