@@ -3837,19 +3837,10 @@ def _check_active_merge_guard_conflicts(
             raise ResourceConflict(
                 row["resource_key"], row["owner_id"], row["expires_at_unix"]
             )
-        changed_paths = (
-            None
-            if repository is None
-            else _merge_guard_changed_paths_from_row(row, repository=repository)
-        )
-        guarded_branches = _merge_guard_branch_names(row_metadata)
+        # Global effects and metadata integrity matter for every active guard.
+        # Repository-specific detail is validated only when work targets its repo.
         effect_resource_keys = _merge_guard_effect_resource_keys(row_metadata)
-        if (
-            repository is None
-            or changed_paths is None
-            or guarded_branches is None
-            or effect_resource_keys is None
-        ):
+        if repository is None or effect_resource_keys is None:
             raise ResourceConflict(
                 row["resource_key"], row["owner_id"], row["expires_at_unix"]
             )
@@ -3868,6 +3859,27 @@ def _check_active_merge_guard_conflicts(
             is not None
         ]
         repo_scope_same_repository = bool(requested_repo_scopes)
+        same_repository = (
+            repo_scope_same_repository
+            or (
+                requested_scope is not None
+                and requested_scope["repository"] == repository
+            )
+            or any(
+                _path_is_within_repository(f"path:{path}", repository)
+                for path in requested_paths
+            )
+        )
+        if not same_repository:
+            continue
+        changed_paths = _merge_guard_changed_paths_from_row(
+            row, repository=repository
+        )
+        guarded_branches = _merge_guard_branch_names(row_metadata)
+        if changed_paths is None or guarded_branches is None:
+            raise ResourceConflict(
+                row["resource_key"], row["owner_id"], row["expires_at_unix"]
+            )
         repo_scope_overlap = False
         merge_pull_request = _merge_guard_pull_request(row_metadata)
         for key in keys:
@@ -3901,19 +3913,6 @@ def _check_active_merge_guard_conflicts(
                 guarded_branches=guarded_branches,
             ):
                 repo_scope_overlap = True
-        same_repository = (
-            repo_scope_same_repository
-            or (
-                requested_scope is not None
-                and requested_scope["repository"] == repository
-            )
-            or any(
-                _path_is_within_repository(f"path:{path}", repository)
-                for path in requested_paths
-            )
-        )
-        if not same_repository:
-            continue
         path_overlap = _paths_overlap_any(requested_paths, changed_paths)
         scope_mutating = (
             requested_scope is not None

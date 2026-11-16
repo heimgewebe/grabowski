@@ -214,6 +214,82 @@ class NonConflictResourceTests(unittest.TestCase):
             resources.inspect_resource(grabowski_key)["owner_id"],
         )
 
+    def test_foreign_guard_invalid_local_detail_does_not_block_bureau(self) -> None:
+        # The guard's repository/effect binding remains valid. Only the
+        # repository-local changed-path/branch information is invalid.
+        bureau_repo = self.root / "bureau"
+        bureau_repo.mkdir()
+        repo_id = merge_guard._merge_guard_identifier(
+            "repository", "heimgewebe/grabowski"
+        )
+        branch_id = merge_guard._merge_guard_identifier("branch", "main")
+        gate = f"gate:github-merge:{repo_id}:{branch_id}"
+        keys = [
+            f"component:github-repository:{repo_id}",
+            f"component:github-branch:{repo_id}:{branch_id}",
+            f"service:github-main:{repo_id}",
+            f"service:github-pr:{repo_id}:57",
+            gate,
+            f"deployment:github:{repo_id}:{branch_id}",
+        ]
+        changed_path = self.repo / "src" / "guard-change.py"
+        resources.acquire_merge_guard_resources(
+            "captain-merge:grabowski", "source-task-owner", keys,
+            repository=str(self.repo), changed_paths=[str(changed_path)],
+            purpose="repo-bound active merge", ttl_seconds=90,
+            metadata={"merge_guard": {
+                "head_sha": "a" * 40, "diff_sha256": "b" * 64,
+                "base_branch": "main", "head_branch": "feat/guard",
+            }},
+        )
+        with sqlite3.connect(self.database) as connection:
+            row = connection.execute(
+                "SELECT metadata_json FROM leases WHERE resource_key=?", (gate,)
+            ).fetchone()
+            data = json.loads(row[0])
+            data["merge_guard"]["head_branch"] = None
+            data["merge_guard"]["changed_paths"] = None
+            serialized, digest = resources._metadata(data)
+            connection.execute(
+                "UPDATE leases SET metadata_json=?, metadata_sha256=? "
+                "WHERE resource_key=?",
+                (serialized, digest, gate),
+            )
+        old_guard = resources.inspect_resource(gate)
+        bureau_key = f"path:{bureau_repo / 'src' / 'independent.py'}"
+        acquired = resources.acquire_resources(
+            "bureau-task", [bureau_key],
+            purpose="disjoint Bureau work", ttl_seconds=30,
+        )
+        self.assertEqual(bureau_key, acquired["leases"][0]["resource_key"])
+        self.assertEqual(old_guard, resources.inspect_resource(gate))
+        with self.assertRaises(resources.ResourceConflict):
+            resources.acquire_resources(
+                "grabowski-task", [f"path:{changed_path}"],
+                purpose="same repo with invalid guard", ttl_seconds=30,
+            )
+
+        # A foreign guard with invalid global-effect binding still cannot be
+        # assumed disjoint, even if its local repository is different.
+        with sqlite3.connect(self.database) as connection:
+            row = connection.execute(
+                "SELECT metadata_json FROM leases WHERE resource_key=?", (gate,)
+            ).fetchone()
+            data = json.loads(row[0])
+            data["merge_guard"]["effect_resource_keys_sha256"] = "0" * 64
+            serialized, digest = resources._metadata(data)
+            connection.execute(
+                "UPDATE leases SET metadata_json=?, metadata_sha256=? "
+                "WHERE resource_key=?",
+                (serialized, digest, gate),
+            )
+        with self.assertRaises(resources.ResourceConflict):
+            resources.acquire_resources(
+                "another-bureau-task",
+                [f"path:{bureau_repo / 'src' / 'another.py'}"],
+                purpose="global-effect proof missing", ttl_seconds=30,
+            )
+
     def test_unattested_blocking_scope_cannot_be_bypassed(self) -> None:
         scope = self.scope("a")
         resources.acquire_resources(
