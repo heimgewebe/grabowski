@@ -295,6 +295,57 @@ class ServerReviewProducerTests(unittest.TestCase):
         self.assertNotIn("signer", stdout.getvalue())
         self.assertEqual(str(self.repo), str(planner.call_args.kwargs["repo"]))
 
+    def test_first_party_cli_routes_postmerge_release_through_existing_plan(self):
+        release = {
+            "serving_release_id": "test-release-r3",
+            "serving_tree": "a" * 40,
+            "target_tree": "b" * 40,
+        }
+        plan = {key: value for key, value in self.plan.items() if key != "tasks"}
+        plan["kind"] = "grabowski_first_party_review_plan"
+        stdout = io.StringIO()
+        command = [
+            "plan-firstparty", "--repo", str(self.repo), "--base", self.base,
+            "--head", self.head, "--diff", "a" * 64, "--pr", "1649",
+            "--purpose", "post_merge_release",
+            "--serving-release-id", release["serving_release_id"],
+            "--serving-tree", release["serving_tree"],
+            "--target-tree", release["target_tree"],
+        ]
+        with (
+            mock.patch.object(
+                producer, "plan_first_party_review", return_value=plan,
+            ) as planner,
+            mock.patch.object(producer, "_require_live_pr"),
+            mock.patch.object(producer, "_store_plan"),
+            redirect_stdout(stdout),
+        ):
+            self.assertEqual(0, producer.main(command))
+        self.assertEqual("post_merge_release", planner.call_args.kwargs["purpose"])
+        self.assertEqual(release, planner.call_args.kwargs["release_binding"])
+        self.assertEqual(
+            "first_party_planned_not_executed",
+            json.loads(stdout.getvalue())["status"],
+        )
+        self.assertNotIn("release_binding", stdout.getvalue())
+
+    def test_first_party_cli_refuses_release_fields_for_ordinary_pr(self):
+        with (
+            mock.patch.object(producer, "plan_first_party_review") as planner,
+            mock.patch.object(producer, "_store_plan") as store,
+            self.assertRaisesRegex(
+                execute.ReviewExecutionRejected,
+                "PR review may not include release fields",
+            ),
+        ):
+            producer.main([
+                "plan-firstparty", "--repo", str(self.repo), "--base", self.base,
+                "--head", self.head, "--diff", "a" * 64, "--pr", "1649",
+                "--serving-release-id", "unbound",
+            ])
+        planner.assert_not_called()
+        store.assert_not_called()
+
     def test_first_party_seal_cli_emits_no_private_audit_path(self):
         direct_plan = {
             key: value for key, value in self.plan.items() if key != "tasks"
