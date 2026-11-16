@@ -1751,6 +1751,14 @@ class TaskAttentionTests(unittest.TestCase):
         _archive, record_sha256, _store = attention._task_archive_source_binding(record)
         with (
             patch.object(
+                tasks, "_resolve_task_dispatch_host",
+                return_value=("local", LOCAL_HOST, False),
+            ),
+            patch.object(
+                tasks.operator, "_run",
+                return_value=self._startable_local_unit_show(),
+            ),
+            patch.object(
                 tasks.resources, "acquire_resources",
                 side_effect=AssertionError("output-cleanup lease was acquired"),
             ) as lease,
@@ -1782,6 +1790,14 @@ class TaskAttentionTests(unittest.TestCase):
     def test_automatic_archived_output_reconcile_holds_without_retirement(self) -> None:
         _records, projection, manifest = self._automatic_cleanup_fixture(1)
         with (
+            patch.object(
+                tasks, "_resolve_task_dispatch_host",
+                return_value=("local", LOCAL_HOST, False),
+            ),
+            patch.object(
+                tasks.operator, "_run",
+                return_value=self._startable_local_unit_show(),
+            ),
             patch.object(tasks, "_task_current_projection", return_value=projection),
             patch.object(
                 lifecycle_archive, "verify_task_archive_segment",
@@ -2011,11 +2027,40 @@ class TaskAttentionTests(unittest.TestCase):
         self.assertTrue(result["cycle_completed"])
         self.assertIsNone(result["cursor_after"])
 
-    def test_new_archive_requires_independent_retirement_before_external_probe(self) -> None:
+    @staticmethod
+    def _retired_local_unit_show() -> dict[str, object]:
+        return {
+            "returncode": 0,
+            "stdout": (
+                "LoadState=not-found\n"
+                "ActiveState=inactive\n"
+                "SubState=dead\n"
+                "CanStart=no\n"
+                "FragmentPath=\n"
+            ),
+            "stderr": "",
+            "timed_out": False,
+            "outcome_unknown": False,
+        }
+
+    @classmethod
+    def _startable_local_unit_show(cls) -> dict[str, object]:
+        result = cls._retired_local_unit_show()
+        result["stdout"] = str(result["stdout"]).replace(
+            "LoadState=not-found", "LoadState=loaded"
+        ).replace("CanStart=no", "CanStart=yes")
+        return result
+
+    def test_new_archive_refuses_startable_local_unit_before_process_probe(self) -> None:
         record = self._completed_task()
         before = self.database.read_bytes()
+        startable = self._startable_local_unit_show()
         with (
-            patch.object(tasks, "_observe", side_effect=AssertionError("must not probe")) as probe,
+            patch.object(
+                tasks, "_resolve_task_dispatch_host",
+                return_value=("local", LOCAL_HOST, False),
+            ) as host,
+            patch.object(tasks.operator, "_run", return_value=startable) as user_show,
             patch.object(
                 attention, "_assert_no_live_task_process",
                 side_effect=AssertionError("must not observe processes"),
@@ -2026,7 +2071,8 @@ class TaskAttentionTests(unittest.TestCase):
             ),
         ):
             attention.execute_closeout_archive(self._archive_parameters(record))
-        probe.assert_not_called()
+        host.assert_called_once_with(record["host"])
+        user_show.assert_called_once()
         process.assert_not_called()
         self.assertEqual(before, self.database.read_bytes())
         self.assertFalse(self.archive_root.exists())
@@ -2048,7 +2094,7 @@ class TaskAttentionTests(unittest.TestCase):
                         ),
                     ) as host,
                     patch.object(
-                        tasks, "_observe", side_effect=AssertionError("must not probe")
+                        tasks.operator, "_run", side_effect=AssertionError("must not probe")
                     ) as probe,
                     self.assertRaisesRegex(
                         attention.TaskAttentionConflictError,
@@ -2056,11 +2102,144 @@ class TaskAttentionTests(unittest.TestCase):
                     ),
                 ):
                     attention.execute_closeout_archive(self._archive_parameters(record))
-                host.assert_not_called()
+                if remote:
+                    host.assert_called_once_with(record["host"])
+                else:
+                    host.assert_not_called()
                 probe.assert_not_called()
                 self.assertEqual(before, self.database.read_bytes())
                 self.assertFalse(self.archive_root.exists())
                 self.assertFalse(self.projection_root.exists())
+
+    def test_local_user_transient_unit_archive_works_without_extra_review(self) -> None:
+        record = self._completed_task()
+        parameters = self._archive_parameters(record)
+        with (
+            patch.object(
+                tasks, "_resolve_task_dispatch_host",
+                return_value=("local", LOCAL_HOST, False),
+            ),
+            patch.object(
+                tasks.operator, "_run", return_value=self._retired_local_unit_show()
+            ) as user_show,
+            patch.object(
+                tasks, "_observe",
+                return_value=self._inactive_process_observation(),
+            ),
+        ):
+            result = attention.execute_closeout_archive(parameters)
+        self.assertFalse(result["already_archived"])
+        self.assertEqual("released", result["resource_release"]["status"])
+        self.assertTrue(result["archive_effect_receipt_sha256"])
+        self.assertGreaterEqual(user_show.call_count, 3)
+        for call in user_show.call_args_list:
+            self.assertEqual(
+                ["systemctl", "--user", "show", record["authoritative_unit"]],
+                call.args[0][:4],
+            )
+        self.assertTrue(self.archive_root.is_dir())
+        self.assertTrue(self.projection_root.is_dir())
+
+    def test_local_archive_rejects_historical_remote_binding_after_fleet_remap(self) -> None:
+        record = self._completed_task()
+        launcher = json.loads(record["launcher_json"])
+        launcher[tasks.TASK_OUTPUT_REMOTE_TARGET_BINDING_KEY] = "old-ssh-host"
+        record["launcher_json"] = json.dumps(launcher, sort_keys=True)
+        with (
+            patch.object(
+                tasks, "_resolve_task_dispatch_host",
+                return_value=("local", LOCAL_HOST, False),
+            ),
+            patch.object(
+                tasks.fleet, "fleet_host", return_value=LOCAL_HOST,
+            ),
+            patch.object(
+                tasks.operator, "_run",
+                side_effect=AssertionError("remote target must not be probed as local"),
+            ) as user_show,
+            self.assertRaises(attention.TaskArchiveRetirementPending),
+        ):
+            attention._require_host_authenticated_archive_retirement(record)
+        user_show.assert_not_called()
+
+    def test_local_archive_aborts_if_unit_becomes_startable_before_effect(self) -> None:
+        record = self._completed_task()
+        parameters = self._archive_parameters(record)
+        with (
+            patch.object(
+                tasks, "_resolve_task_dispatch_host",
+                return_value=("local", LOCAL_HOST, False),
+            ),
+            patch.object(
+                tasks.operator, "_run",
+                side_effect=[
+                    self._retired_local_unit_show(),
+                    self._startable_local_unit_show(),
+                ],
+            ) as user_show,
+            patch.object(
+                tasks, "_observe",
+                return_value=self._inactive_process_observation(),
+            ),
+            self.assertRaises(attention.TaskArchiveRetirementPending),
+        ):
+            attention.execute_closeout_archive(parameters)
+        self.assertEqual(2, user_show.call_count)
+        self.assertFalse(self.archive_root.exists())
+        self.assertFalse(self.projection_root.exists())
+        self.assertEqual("completed", tasks._row_raw(record["task_id"])["state"])
+
+    def test_local_archive_aborts_projection_on_late_unit_restart(self) -> None:
+        record = self._completed_task()
+        parameters = self._archive_parameters(record)
+        with (
+            patch.object(
+                tasks, "_resolve_task_dispatch_host",
+                return_value=("local", LOCAL_HOST, False),
+            ),
+            patch.object(
+                tasks.operator, "_run",
+                side_effect=[
+                    self._retired_local_unit_show(),
+                    self._retired_local_unit_show(),
+                    self._startable_local_unit_show(),
+                ],
+            ) as user_show,
+            patch.object(
+                tasks, "_observe",
+                return_value=self._inactive_process_observation(),
+            ),
+            self.assertRaises(attention.TaskArchiveRetirementPending),
+        ):
+            attention.execute_closeout_archive(parameters)
+        self.assertEqual(3, user_show.call_count)
+        self.assertTrue(self.archive_root.is_dir())
+        self.assertFalse(self.projection_root.exists())
+        self.assertEqual("completed", tasks._row_raw(record["task_id"])["state"])
+
+    def test_local_archive_refuses_ambiguous_nonrestart_evidence(self) -> None:
+        record = self._completed_task()
+        original = self._retired_local_unit_show()
+        cases = (
+            {"stdout": str(original["stdout"]).replace("CanStart=no", "CanStart=yes")},
+            {"stdout": str(original["stdout"]).replace("FragmentPath=\n", "FragmentPath=/tmp/task.service\n")},
+            {"stdout": str(original["stdout"]).replace("ActiveState=inactive", "ActiveState=active")},
+            {"stdout": str(original["stdout"]).replace("LoadState=not-found", "LoadState=loaded")},
+            {"returncode": 1},
+            {"outcome_unknown": True},
+            {"stdout": "LoadState=not-found\nActiveState=inactive\n"},
+        )
+        with patch.object(
+            tasks, "_resolve_task_dispatch_host",
+            return_value=("local", LOCAL_HOST, False),
+        ):
+            for overrides in cases:
+                with self.subTest(overrides=overrides), patch.object(
+                    tasks.operator, "_run",
+                    return_value={**original, **overrides},
+                ), self.assertRaises(attention.TaskArchiveRetirementPending):
+                    attention._require_host_authenticated_archive_retirement(record)
+        self.assertFalse(self.archive_root.exists())
 
     def test_existing_archive_replay_does_not_need_new_retirement(self) -> None:
         record = self._completed_task()
@@ -2223,6 +2402,14 @@ class TaskAttentionTests(unittest.TestCase):
         )
         try:
             with (
+                patch.object(
+                    tasks, "_resolve_task_dispatch_host",
+                    return_value=("local", LOCAL_HOST, False),
+                ),
+                patch.object(
+                    tasks.operator, "_run",
+                    return_value=self._startable_local_unit_show(),
+                ),
                 patch.object(
                     attention, "_release_owned_archive_resources",
                     side_effect=AssertionError("premature lease release"),

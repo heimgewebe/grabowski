@@ -2752,17 +2752,80 @@ def reconcile_archived_task_outputs(
             )
 
 
-def _require_host_authenticated_archive_retirement(_record: dict[str, Any]) -> None:
-    """Deny NEW immutable archives until independent restart exclusion exists.
+def _require_host_authenticated_archive_retirement(record: dict[str, Any]) -> None:
+    """Admit a retired *local user* transient unit; keep SSH/root held (#1556).
 
-    A terminal TaskStore row, today's Fleet route, inactive systemd status and
-    same-UID launch markers cannot prove that historical task attempts will
-    never restart. Existing archive replay is handled before this gate.
-    No external host or root probe is allowed as a substitute for this proof.
+    A unit that is merely inactive is not retired: it could still be started.
+    The systemd user manager must report that the exact task unit is absent,
+    cannot be started and has no installed fragment. Archive classification
+    separately rechecks task/receipt, process and lease identities.
     """
-    raise TaskArchiveRetirementPending(
-        "independently authenticated task retirement proof is required (#1556)"
-    )
+    message = "independently authenticated task retirement proof is required (#1556)"
+
+    if (
+        record.get("execution_backend") != "systemd-user"
+        or record.get("systemd_scope") != "user"
+        or tasks._is_root_systemd_backend(record)
+        or record.get("state") not in tasks.TASK_STATE_PROJECTIONS["terminal"]
+        or not all(
+            isinstance(record.get(key), str)
+            and SHA256_RE.fullmatch(record[key]) is not None
+            for key in ("terminalization_sha256", "lifecycle_receipt_sha256")
+        )
+    ):
+        raise TaskArchiveRetirementPending(message)
+
+    try:
+        _host, target, _alias = tasks._resolve_task_dispatch_host(str(record["host"]))
+        if target.get("transport") != "local" or target.get("target") != "local":
+            raise TaskArchiveRetirementPending(message)
+        # Current Fleet routing alone is not historical identity: a former
+        # SSH endpoint could have been remapped to local after task creation.
+        if tasks._task_output_remote_target(record) is not None:
+            raise TaskArchiveRetirementPending(message)
+        unit = tasks._authoritative_unit(record)
+        if (
+            unit != record.get("unit")
+            or unit != tasks._task_unit(str(record["task_id"]), int(record["attempt"]))
+        ):
+            raise TaskArchiveRetirementPending(message)
+        result = tasks.operator._run(
+            [
+                "systemctl", "--user", "show", unit, "--no-pager",
+                "--property=LoadState", "--property=ActiveState",
+                "--property=SubState", "--property=CanStart",
+                "--property=FragmentPath",
+            ],
+            cwd=tasks.operator.HOME,
+            timeout_seconds=30,
+            max_output_bytes=8192,
+        )
+        if (
+            result.get("returncode") != 0
+            or result.get("timed_out") is True
+            or result.get("outcome_unknown") is True
+        ):
+            raise TaskArchiveRetirementPending(message)
+        properties = dict(
+            line.split("=", 1)
+            for line in str(result.get("stdout", "")).splitlines()
+            if "=" in line
+        )
+        if any(
+            properties.get(key) != expected
+            for key, expected in (
+                ("LoadState", "not-found"),
+                ("ActiveState", "inactive"),
+                ("SubState", "dead"),
+                ("CanStart", "no"),
+                ("FragmentPath", ""),
+            )
+        ):
+            raise TaskArchiveRetirementPending(message)
+    except TaskArchiveRetirementPending:
+        raise
+    except (OSError, RuntimeError, ValueError, TypeError, KeyError, PermissionError) as exc:
+        raise TaskArchiveRetirementPending(message) from exc
 
 
 def execute_closeout_archive(parameters: dict[str, Any]) -> dict[str, Any]:
@@ -3002,6 +3065,7 @@ def execute_closeout_archive(parameters: dict[str, Any]) -> dict[str, Any]:
             minimum_age_seconds=int(value["minimum_age_seconds"]),
             now_unix=int(time.time()),
         )
+        _require_host_authenticated_archive_retirement(revalidated_record)
         revalidated_classification = _task_archive_classification(
             revalidated_record,
             expected_lifecycle_receipt_sha256=str(
@@ -3074,6 +3138,7 @@ def execute_closeout_archive(parameters: dict[str, Any]) -> dict[str, Any]:
                 raise TaskAttentionConflictError(
                     "task archive record changed during projection revalidation"
                 )
+            _require_host_authenticated_archive_retirement(projection_revalidated_record)
             projection_current_classification = _task_archive_classification(
                 projection_revalidated_record,
                 expected_lifecycle_receipt_sha256=str(
