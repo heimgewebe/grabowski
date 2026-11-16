@@ -2162,6 +2162,75 @@ class TaskAttentionTests(unittest.TestCase):
             attention._require_host_authenticated_archive_retirement(record)
         user_show.assert_not_called()
 
+    def test_local_resumed_task_retirement_checks_each_attempt(self) -> None:
+        record = dict(self._completed_task())
+        record["attempt"] = 3
+        record["unit"] = tasks._task_unit(record["task_id"], 3)
+        record["authoritative_unit"] = record["unit"]
+        with (
+            patch.object(
+                tasks, "_resolve_task_dispatch_host",
+                return_value=("local", LOCAL_HOST, False),
+            ),
+            patch.object(
+                tasks.operator, "_run",
+                return_value=self._retired_local_unit_show(),
+            ) as user_show,
+        ):
+            attention._require_host_authenticated_archive_retirement(record)
+        self.assertEqual(3, user_show.call_count)
+        self.assertEqual(
+            [tasks._task_unit(record["task_id"], attempt) for attempt in (1, 2, 3)],
+            [call.args[0][3] for call in user_show.call_args_list],
+        )
+
+    def test_local_resumed_task_retirement_blocks_live_earlier_attempt(self) -> None:
+        record = dict(self._completed_task())
+        record["attempt"] = 3
+        record["unit"] = tasks._task_unit(record["task_id"], 3)
+        record["authoritative_unit"] = record["unit"]
+        with (
+            patch.object(
+                tasks, "_resolve_task_dispatch_host",
+                return_value=("local", LOCAL_HOST, False),
+            ),
+            patch.object(
+                tasks.operator, "_run",
+                side_effect=[
+                    self._retired_local_unit_show(),
+                    self._startable_local_unit_show(),
+                ],
+            ) as user_show,
+            self.assertRaises(attention.TaskArchiveRetirementPending),
+        ):
+            attention._require_host_authenticated_archive_retirement(record)
+        self.assertEqual(2, user_show.call_count)
+        self.assertEqual(
+            [tasks._task_unit(record["task_id"], attempt) for attempt in (1, 2)],
+            [call.args[0][3] for call in user_show.call_args_list],
+        )
+        self.assertFalse(self.archive_root.exists())
+
+    def test_local_resumed_task_retirement_bounded_fail_closed(self) -> None:
+        record = dict(self._completed_task())
+        record["attempt"] = attention.MAX_LOCAL_ARCHIVE_RETIREMENT_ATTEMPTS + 1
+        record["unit"] = tasks._task_unit(record["task_id"], record["attempt"])
+        record["authoritative_unit"] = record["unit"]
+        with (
+            patch.object(
+                tasks, "_resolve_task_dispatch_host",
+                side_effect=AssertionError("must reject before routing"),
+            ) as host,
+            patch.object(
+                tasks.operator, "_run",
+                side_effect=AssertionError("must reject before probing"),
+            ) as user_show,
+            self.assertRaises(attention.TaskArchiveRetirementPending),
+        ):
+            attention._require_host_authenticated_archive_retirement(record)
+        host.assert_not_called()
+        user_show.assert_not_called()
+
     def test_local_archive_aborts_if_unit_becomes_startable_before_effect(self) -> None:
         record = self._completed_task()
         parameters = self._archive_parameters(record)

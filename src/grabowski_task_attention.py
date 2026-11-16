@@ -98,6 +98,7 @@ TASK_OUTPUT_CLEANUP_ATTEMPT_CURSOR_METADATA_PREFIX = (
     "task_output_cleanup_attempt_cursor_v1:"
 )
 TASK_OUTPUT_CLEANUP_ATTEMPT_BATCH_SIZE = 3
+MAX_LOCAL_ARCHIVE_RETIREMENT_ATTEMPTS = 32
 TASK_OUTPUT_CLEANUP_TASK_LEASE_TTL_SECONDS = 15 * 60
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 AUTHORITY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@/+\-]{0,255}\Z")
@@ -2767,6 +2768,8 @@ def _require_host_authenticated_archive_retirement(record: dict[str, Any]) -> No
         or record.get("systemd_scope") != "user"
         or tasks._is_root_systemd_backend(record)
         or record.get("state") not in tasks.TASK_STATE_PROJECTIONS["terminal"]
+        or type(record.get("attempt")) is not int
+        or not 1 <= record["attempt"] <= MAX_LOCAL_ARCHIVE_RETIREMENT_ATTEMPTS
         or not all(
             isinstance(record.get(key), str)
             and SHA256_RE.fullmatch(record[key]) is not None
@@ -2789,39 +2792,43 @@ def _require_host_authenticated_archive_retirement(record: dict[str, Any]) -> No
             or unit != tasks._task_unit(str(record["task_id"]), int(record["attempt"]))
         ):
             raise TaskArchiveRetirementPending(message)
-        result = tasks.operator._run(
-            [
-                "systemctl", "--user", "show", unit, "--no-pager",
-                "--property=LoadState", "--property=ActiveState",
-                "--property=SubState", "--property=CanStart",
-                "--property=FragmentPath",
-            ],
-            cwd=tasks.operator.HOME,
-            timeout_seconds=30,
-            max_output_bytes=8192,
-        )
-        if (
-            result.get("returncode") != 0
-            or result.get("timed_out") is True
-            or result.get("outcome_unknown") is True
-        ):
-            raise TaskArchiveRetirementPending(message)
-        properties = dict(
-            line.split("=", 1)
-            for line in str(result.get("stdout", "")).splitlines()
-            if "=" in line
-        )
-        if any(
-            properties.get(key) != expected
-            for key, expected in (
-                ("LoadState", "not-found"),
-                ("ActiveState", "inactive"),
-                ("SubState", "dead"),
-                ("CanStart", "no"),
-                ("FragmentPath", ""),
+        # Task-wide archive/projection hides all attempts. A stopped final unit
+        # does not establish that an earlier a1..a(N-1) unit is also retired.
+        for attempt in range(1, record["attempt"] + 1):
+            attempt_unit = tasks._task_unit(str(record["task_id"]), attempt)
+            result = tasks.operator._run(
+                [
+                    "systemctl", "--user", "show", attempt_unit, "--no-pager",
+                    "--property=LoadState", "--property=ActiveState",
+                    "--property=SubState", "--property=CanStart",
+                    "--property=FragmentPath",
+                ],
+                cwd=tasks.operator.HOME,
+                timeout_seconds=30,
+                max_output_bytes=8192,
             )
-        ):
-            raise TaskArchiveRetirementPending(message)
+            if (
+                result.get("returncode") != 0
+                or result.get("timed_out") is True
+                or result.get("outcome_unknown") is True
+            ):
+                raise TaskArchiveRetirementPending(message)
+            properties = dict(
+                line.split("=", 1)
+                for line in str(result.get("stdout", "")).splitlines()
+                if "=" in line
+            )
+            if any(
+                properties.get(key) != expected
+                for key, expected in (
+                    ("LoadState", "not-found"),
+                    ("ActiveState", "inactive"),
+                    ("SubState", "dead"),
+                    ("CanStart", "no"),
+                    ("FragmentPath", ""),
+                )
+            ):
+                raise TaskArchiveRetirementPending(message)
     except TaskArchiveRetirementPending:
         raise
     except (OSError, RuntimeError, ValueError, TypeError, KeyError, PermissionError) as exc:
