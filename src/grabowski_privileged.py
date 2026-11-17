@@ -242,6 +242,26 @@ def _normalize_power_argv(argv: list[str]) -> list[str]:
     return normalized
 
 
+def _defer_reboot_until_after_tool_response(argv: list[str]) -> tuple[list[str], bool]:
+    """Let the operator acknowledge NixOS reboot before shutting it down.
+
+    A synchronous reboot severs the MCP transport before its response. A
+    retried call after reconnect gets a fresh broker request ID and can reboot
+    the new session again. Systemd's --when returns promptly before shutdown
+    without adding a timer, a lease or a persistent guard.
+    """
+    if (
+        argv[0] == "/run/current-system/sw/bin/systemctl"
+        and argv[1:] in (
+            ["reboot"],
+            ["reboot", "--no-wall"],
+            ["--no-wall", "reboot"],
+        )
+    ):
+        return [argv[0], "--when=+30s", *argv[1:]], True
+    return argv, False
+
+
 def _normalize_power_cwd(cwd: str | None) -> str:
     value = "/" if cwd is None else cwd
     if not isinstance(value, str) or not value:
@@ -2012,7 +2032,8 @@ def grabowski_power_run(
 ) -> dict[str, Any]:
     """Run one audited root command through the canonical root-owned broker."""
     operator._require_operator_mutation("power_execute")
-    command = _normalize_power_argv(argv)
+    requested_command = _normalize_power_argv(argv)
+    command, reboot_deferred = _defer_reboot_until_after_tool_response(requested_command)
     working_directory = _normalize_power_cwd(cwd)
     timeout = _normalize_power_timeout(timeout_seconds)
     output_limit = _normalize_power_output_limit(max_output_bytes)
@@ -2099,6 +2120,8 @@ def grabowski_power_run(
         "request_id": reference["request_id"],
         "reference_sha256": reference["reference_sha256"],
         "argv_sha256": getattr(operator, "_argv_hash", lambda value: _canonical_sha256(value))(command),
+        "requested_argv_sha256": _canonical_sha256(requested_command),
+        "reboot_deferred": reboot_deferred,
         "cwd_sha256": hashlib.sha256(working_directory.encode("utf-8")).hexdigest(),
         "broker_client_returncode": broker_client_returncode,
         "broker_client_timed_out": client_timed_out,
@@ -2118,6 +2141,9 @@ def grabowski_power_run(
         "broker_client_returncode": broker_client_returncode,
         "broker_client_timed_out": client_timed_out,
         "broker_response": parsed,
+        "reboot_scheduled": reboot_deferred and success,
+        "reboot_schedule_delay_seconds": 30 if reboot_deferred and success else None,
+        "reboot_completed": False if reboot_deferred else None,
         "stdout": None if parsed is not None else stdout,
         "stderr": stderr,
         "stdout_truncated": stdout_truncated,

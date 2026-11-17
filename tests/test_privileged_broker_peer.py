@@ -590,6 +590,71 @@ class PrivilegedBrokerPeerTests(unittest.TestCase):
         sent = json.loads(fake.sent.decode("utf-8"))
         self.assertEqual(sent["action"], privileged_client.POWER_ACTION)
 
+    def test_nixos_reboot_is_deferred_without_changing_other_root_commands(self) -> None:
+        systemctl = "/run/current-system/sw/bin/systemctl"
+        for arguments in (["reboot"], ["reboot", "--no-wall"], ["--no-wall", "reboot"]):
+            original = [systemctl, *arguments]
+            scheduled, deferred = privileged_client._defer_reboot_until_after_tool_response(
+                original
+            )
+            self.assertTrue(deferred)
+            self.assertEqual([systemctl, "--when=+30s", *arguments], scheduled)
+            self.assertEqual([systemctl, *arguments], original)
+
+        for original in (
+            [systemctl, "--when=+30s", "reboot", "--no-wall"],
+            [systemctl, "reboot", "--force"],
+            [systemctl, "restart", "grabowski-operator.service"],
+            ["/run/current-system/sw/bin/ls", "/var/lib/grabowski"],
+        ):
+            effective, deferred = privileged_client._defer_reboot_until_after_tool_response(
+                original
+            )
+            self.assertFalse(deferred)
+            self.assertEqual(original, effective)
+
+    def test_power_client_acknowledges_deferred_reboot_before_boot(self) -> None:
+        systemctl = "/run/current-system/sw/bin/systemctl"
+        original = [systemctl, "reboot", "--no-wall"]
+        expected = [systemctl, "--when=+30s", "reboot", "--no-wall"]
+        response = json.dumps(
+            {"returncode": 0, "timed_out": False, "stdout": "", "stderr": ""}
+        ).encode("utf-8")
+        fake = mock.MagicMock()
+        fake.__enter__.return_value = fake
+        fake.recv.side_effect = [response, b""]
+        with (
+            mock.patch.object(
+                privileged_client, "grabowski_privileged_broker_status",
+                return_value={"ready": True},
+            ),
+            mock.patch.object(privileged_client.socket, "socket", return_value=fake),
+            mock.patch.object(privileged_client, "_append_operator_audit") as audit,
+            mock.patch.object(privileged_client.operator, "_require_operator_mutation"),
+        ):
+            result = privileged_client.grabowski_power_run(
+                original, justification="deferred reboot transport proof"
+            )
+
+        sent = json.loads(fake.sendall.call_args.args[0].decode("utf-8"))
+        target = json.loads(sent["target"])
+        self.assertEqual(expected, target["argv"])
+        self.assertTrue(result["success"])
+        self.assertTrue(result["reboot_scheduled"])
+        self.assertEqual(30, result["reboot_schedule_delay_seconds"])
+        self.assertIs(result["reboot_completed"], False)
+        audit.assert_called_once()
+        record = audit.call_args.args[0]
+        self.assertTrue(record["reboot_deferred"])
+        self.assertEqual(
+            privileged_client._canonical_sha256(original),
+            record["requested_argv_sha256"],
+        )
+        self.assertEqual(
+            privileged_client._canonical_sha256(expected),
+            record["argv_sha256"],
+        )
+
     def test_power_run_rejects_direct_github_merge_before_broker_use(self) -> None:
         with self.assertRaisesRegex(PermissionError, "Captain pr-merge"):
             privileged_client._normalize_power_argv(
