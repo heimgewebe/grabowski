@@ -5822,7 +5822,7 @@ class CaptainMergeGuardRunner:
         if viewed.get("mergeable") != "MERGEABLE":
             errors.append("merge_guard_mergeable_not_confirmed")
         merge_state_status = viewed.get("mergeStateStatus")
-        if merge_state_status == "UNSTABLE":
+        if merge_state_status in {"UNSTABLE", "BLOCKED"}:
             required_checks = required_pr_checks_probe(
                 self.repo_path,
                 self.github_runner,
@@ -5832,6 +5832,9 @@ class CaptainMergeGuardRunner:
             self.receipt["required_checks_probe"] = required_checks
             if required_checks.get("status") != "green":
                 errors.append("merge_guard_required_checks_not_green_for_unstable_merge_state")
+            elif (merge_state_status == "BLOCKED"
+                  and required_checks.get("required_check_count", 0) < 1):
+                errors.append("merge_guard_required_checks_absent_for_blocked_merge_state")
         elif merge_state_status != "CLEAN":
             errors.append("merge_guard_merge_state_not_clean")
 
@@ -6238,7 +6241,7 @@ class CaptainMergeGuardRunner:
             if viewed.get(field) != expected_value:
                 errors.append(f"merge_guard_dispatch_revalidation_drift:{field}")
         dispatch_merge_state = viewed.get("mergeStateStatus")
-        if dispatch_merge_state == "UNSTABLE":
+        if dispatch_merge_state in {"UNSTABLE", "BLOCKED"}:
             required_checks = required_pr_checks_probe(
                 self.repo_path,
                 self.github_runner,
@@ -6249,6 +6252,11 @@ class CaptainMergeGuardRunner:
             if required_checks.get("status") != "green":
                 errors.append(
                     "merge_guard_dispatch_required_checks_not_green_for_unstable_merge_state"
+                )
+            elif (dispatch_merge_state == "BLOCKED"
+                  and required_checks.get("required_check_count", 0) < 1):
+                errors.append(
+                    "merge_guard_dispatch_required_checks_absent_for_blocked_merge_state"
                 )
         elif dispatch_merge_state != "CLEAN":
             errors.append("merge_guard_dispatch_revalidation_drift:mergeStateStatus")
