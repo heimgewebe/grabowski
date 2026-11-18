@@ -15371,7 +15371,7 @@ def _captain_pr_merge_preflight_errors(
         errors.append("pr_base_sha_does_not_match_expected_base_sha_before_execution")
     if viewed.get("mergeable") != "MERGEABLE":
         errors.append("pr_mergeable_not_confirmed_before_execution")
-    if viewed.get("mergeStateStatus") not in {"CLEAN", "UNSTABLE"}:
+    if viewed.get("mergeStateStatus") not in {"CLEAN", "UNSTABLE", "BLOCKED"}:
         errors.append("pr_merge_state_not_clean_before_execution")
     return errors
 
@@ -15449,7 +15449,7 @@ def _captain_pr_merge_preflight_view(
             expected_base_sha=expected_base_sha,
         )
         required_checks_probe: dict[str, Any] | None = None
-        if not last_errors and viewed.get("mergeStateStatus") == "UNSTABLE":
+        if not last_errors and viewed.get("mergeStateStatus") in {"UNSTABLE", "BLOCKED"}:
             _, required_checks_probe, required_check_errors = _captain_required_pr_checks(
                 repo_path,
                 github_runner,
@@ -15457,6 +15457,13 @@ def _captain_pr_merge_preflight_view(
                 pr_number=pr_number,
             )
             last_errors.extend(required_check_errors)
+            if (viewed.get("mergeStateStatus") == "BLOCKED"
+                    and required_checks_probe.get("status") == "green"
+                    and required_checks_probe.get("required_check_count", 0) < 1):
+                # Do not accept a non-clean GitHub state without at least one
+                # enforced required check to verify. The provider may still
+                # reject for reviews or other rules; no --admin is ever used.
+                last_errors.append("pr_required_checks_absent_for_blocked_merge_state")
         if not last_errors:
             summary = {
                 "attempt_count": len(attempts),
