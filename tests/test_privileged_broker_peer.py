@@ -592,13 +592,23 @@ class PrivilegedBrokerPeerTests(unittest.TestCase):
 
     def test_nixos_reboot_is_deferred_without_changing_other_root_commands(self) -> None:
         systemctl = "/run/current-system/sw/bin/systemctl"
-        for arguments in (["reboot"], ["reboot", "--no-wall"], ["--no-wall", "reboot"]):
+        for arguments in (
+            ["reboot"],
+            ["reboot", "--no-wall"],
+            ["--no-wall", "reboot"],
+            ["reboot", "--no-block"],
+            ["--no-block", "reboot"],
+            ["reboot", "--no-block", "--no-wall"],
+            ["--no-wall", "--no-block", "reboot"],
+        ):
             original = [systemctl, *arguments]
             scheduled, deferred = privileged_client._defer_reboot_until_after_tool_response(
                 original
             )
             self.assertTrue(deferred)
-            self.assertEqual([systemctl, "--when=+30s", *arguments], scheduled)
+            expected = [systemctl, "--when=+30s"]
+            expected.extend(arg for arg in arguments if arg != "--no-block")
+            self.assertEqual(expected, scheduled)
             self.assertEqual([systemctl, *arguments], original)
 
         for original in (
@@ -615,8 +625,8 @@ class PrivilegedBrokerPeerTests(unittest.TestCase):
 
     def test_power_client_acknowledges_deferred_reboot_before_boot(self) -> None:
         systemctl = "/run/current-system/sw/bin/systemctl"
-        original = [systemctl, "reboot", "--no-wall"]
-        expected = [systemctl, "--when=+30s", "reboot", "--no-wall"]
+        original = [systemctl, "reboot", "--no-block"]
+        expected = [systemctl, "--when=+30s", "reboot"]
         response = json.dumps(
             {"returncode": 0, "timed_out": False, "stdout": "", "stderr": ""}
         ).encode("utf-8")
