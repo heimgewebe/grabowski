@@ -2261,6 +2261,30 @@
         "risk_class": "low",
         "tool": "report_outcome"
       }
+    },
+    "grabowski_bureau_task_find": {
+      "evidence_refs": [
+        "bureau:GRABOWSKI-OPERATOR-SURFACE-V1-FU-CHATGPT-BUREAU-TASK-FIND-20261119",
+        "grabowski-task:b32fa348470144fb97612027",
+        "grabowski-task:b3f96e2966fc4f84bc6e3101",
+        "tests:test_bureau_intake_adapter.py"
+      ],
+      "exception_detail": {
+        "claim": "A repository-scoped task lookup is a bounded read-only consumer of Bureau's existing effective frontier, not a new TaskSpec, Queue or Claim authority.",
+        "evidence": "Productive Bureau frontier returned 410 rows and 1,152,477 bytes in 12.94 s. The new typed adapter returned bounded task records, preserved cancelled/ready/verified effective states and exact claim reasons, and never granted mutation/claim authority."
+      },
+      "justification_kind": "material_call_shape",
+      "operation_alternative_considered": "Bureau what-now omits an exact Task-ID lookup and reports only limited advisory candidates. A generic shell/terminal call exposes a broader command surface and requires full JSON postprocessing; extending the candidate-assess API would mix candidate identity with unrelated task selection.",
+      "rationale": "ChatGPT requires a typed, current, repository-scoped Task Finder with bounded responses and explicit non-claims. It reuses Bureau frontier and Grabowski's existing read-only managed launcher, reducing repeated CLI discovery and full Registry payloads.",
+      "tool_contract": {
+        "tool": "grabowski_bureau_task_find",
+        "category": "bureau",
+        "authority_class": "read",
+        "risk_class": "low",
+        "read_only": true,
+        "effects": [],
+        "reversibility": "not-applicable"
+      }
     }
   },
   "baseline": {
