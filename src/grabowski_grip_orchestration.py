@@ -858,7 +858,9 @@ def _mechanic_action(
     }
 
 
-def build_plan(saga_kind: Any, target: Any, idempotency_key: Any) -> dict[str, Any]:
+def build_plan(
+    saga_kind: Any, target: Any, idempotency_key: Any, *, legacy_pr_readiness: bool = False
+) -> dict[str, Any]:
     kind, normalized = normalize_target(saga_kind, target)
     key = _idempotency_key(idempotency_key)
     mechanic_actions: list[dict[str, Any]] = []
@@ -876,7 +878,7 @@ def build_plan(saga_kind: Any, target: Any, idempotency_key: Any) -> dict[str, A
         # A Bureau-bound Saga already verifies its live run/lease. Captain-run
         # independently revalidates the exact PR, diff, CI and review evidence.
         # Only stand-alone Sagas retain the legacy readiness preparation step.
-        if bureau_run_id is None:
+        if bureau_run_id is None or legacy_pr_readiness:
             mechanic_actions.append(
                 _mechanic_action(
                     "pr-check-readiness",
@@ -1070,7 +1072,25 @@ def validate_plan(value: Any) -> dict[str, Any]:
     }
     if set(plan) != expected:
         raise SagaError("saga plan shape is not canonical")
-    rebuilt = build_plan(plan.get("saga_kind"), plan.get("target"), plan.get("idempotency_key"))
+    # Honor immutable v1 plans issued before Bureau-bound PR readiness became
+    # optional. Only the exact legacy shape can pass the normal full-plan
+    # reconstruction/hash comparison; new plans never add this extra step.
+    old_bureau_pr_plan = (
+        plan.get("saga_kind") == "pr-settlement"
+        and isinstance(plan.get("target"), Mapping)
+        and plan["target"].get("bureau_run_id") is not None
+        and isinstance(plan.get("mechanic_actions"), list)
+        and any(
+            isinstance(action, Mapping) and action.get("action") == "pr-check-readiness"
+            for action in plan["mechanic_actions"]
+        )
+    )
+    rebuilt = build_plan(
+        plan.get("saga_kind"),
+        plan.get("target"),
+        plan.get("idempotency_key"),
+        legacy_pr_readiness=old_bureau_pr_plan,
+    )
     if plan != rebuilt:
         raise SagaError("saga plan identity drifted")
     phase_names = tuple(item.get("name") for item in plan["phases"] if isinstance(item, dict))

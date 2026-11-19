@@ -346,6 +346,29 @@ class SagaContractTests(unittest.TestCase):
         self.assertEqual(self.self_review_audit(), readiness["parameters"]["self_review_audit"])
         self.assertEqual(plan, sagas.validate_plan(plan))
 
+    def test_existing_bureau_pr_v1_plan_remains_valid(self) -> None:
+        legacy = sagas.build_plan(
+            "pr-settlement",
+            self.pr_target(),
+            "legacy-bureau-readiness",
+            legacy_pr_readiness=True,
+        )
+        self.assertEqual(
+            ["bureau-pickup-status", "pr-check-readiness"],
+            [item["action"] for item in legacy["mechanic_actions"]],
+        )
+        self.assertEqual(legacy, sagas.validate_plan(legacy))
+        run = sagas.build_run_receipt(
+            legacy, self.mechanic_result(legacy, passed=True)
+        )
+        self.assertEqual("captain_required", run["state"])
+        self.assertEqual(run, sagas.validate_run_receipt(run, plan_value=legacy))
+        # A legacy shape is not a license to weaken immutable action binding.
+        altered = copy.deepcopy(legacy)
+        altered["mechanic_actions"][1]["parameters"]["expected_head"] = "f" * 40
+        with self.assertRaisesRegex(sagas.SagaError, "identity drifted"):
+            sagas.validate_plan(altered)
+
     def test_pr_plan_requires_diff_bound_self_review_evidence(self) -> None:
         for field in ("expected_diff_sha256", "self_review_audit"):
             target = self.pr_target()

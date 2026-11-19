@@ -52,6 +52,8 @@ Otherwise:
 
 - `pr-check-readiness` for the exact repository checkout (stand-alone compatibility path).
 
+Previously issued `OperatorSagaPlan.v1` records containing both steps remain valid with their exact old action list and original plan hash. Fresh Bureau-bound plans omit the duplicate probe; a legacy plan is not silently rewritten or granted merge authority.
+
 These are executed through `mechanic-loop`. `saga-run` validates that the child set is an exact ordered prefix of the planned actions and that returned target/scope/receipt bindings match the plan. It cannot dispatch `captain-run`.
 
 ### Apply boundary
