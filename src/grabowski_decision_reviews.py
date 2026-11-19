@@ -822,7 +822,8 @@ def _unbound_stdout_has_target_result(
 
 def _unbound_review_result_visible(
     directory: Path, *, parent_fd: int, aggregate_bytes: list[int],
-    expected: dict[str, Any], allow_legacy_readable_stdout: bool = False,
+    metadata_budget: list[int], expected: dict[str, Any],
+    allow_legacy_readable_stdout: bool = False,
     observed_sha256: list[str] | None = None,
 ) -> bool:
     """Find review evidence in a job whose valid origin now denies review status.
@@ -836,7 +837,7 @@ def _unbound_review_result_visible(
         receipt = _read_private_json(
             directory / REVIEW_ROLE_ATTEMPT_RECEIPT_NAME,
             MAX_ROLE_RECEIPT_BYTES, parent_fd=parent_fd,
-            aggregate_metadata_bytes=aggregate_bytes,
+            aggregate_metadata_bytes=metadata_budget,
         )
     except FileNotFoundError:
         pass
@@ -2527,6 +2528,7 @@ def _iter_pinned_review_job_directories(
                                 if _unbound_review_result_visible(
                                     root / entry.name, parent_fd=foreign_fd,
                                     aggregate_bytes=unbound_stdout_budget,
+                                    metadata_budget=metadata_budget,
                                     expected=expected,
                                     allow_legacy_readable_stdout=True,
                                 ):
@@ -2588,7 +2590,8 @@ def _iter_pinned_review_job_directories(
                     try:
                         if _unbound_review_result_visible(
                             root / entry.name, parent_fd=foreign_fd,
-                            aggregate_bytes=unbound_stdout_budget, expected=expected,
+                            aggregate_bytes=unbound_stdout_budget,
+                            metadata_budget=metadata_budget, expected=expected,
                             allow_legacy_readable_stdout=True,
                         ):
                             errors.append(f"decision_review_unbound_result:{entry.name}")
@@ -2927,6 +2930,7 @@ def _reconcile_once(
                     has_result = _unbound_review_result_visible(
                         directory, parent_fd=directory_fd,
                         aggregate_bytes=unbound_stdout_budget,
+                        metadata_budget=metadata_budget,
                         expected=expected, observed_sha256=digests,
                     )
                     if has_result:

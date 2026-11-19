@@ -3367,6 +3367,54 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
                 second["errors"],
             )
 
+    def test_role_receipt_metadata_does_not_consume_stdout_budget(self) -> None:
+        # Each independent bounded stream fits; their sum must not spuriously
+        # block unrelated future PRs as the historical job inventory grows.
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp) / "grabowski-job-rgpm-0123456789abcdef-01"
+            directory.mkdir(mode=0o700)
+            receipt = json.dumps({"expected_head": "0" * 40, "payload": "r" * 1500})
+            stdout = "ordinary non-review output " + "s" * 1450 + "\\n"
+            write_private(directory / reviews.REVIEW_ROLE_ATTEMPT_RECEIPT_NAME, receipt)
+            write_private(directory / "stdout.log", stdout)
+            self.assertGreater(len(receipt.encode()) + len(stdout.encode()), 2048)
+            self.assertLess(len(receipt.encode()), 2048)
+            self.assertLess(len(stdout.encode()), 2048)
+            metadata_budget, stdout_budget = [0], [0]
+            descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                with mock.patch.object(reviews, "MAX_TOTAL_METADATA_BYTES", 2048):
+                    matched = reviews._unbound_review_result_visible(
+                        directory, parent_fd=descriptor,
+                        aggregate_bytes=stdout_budget,
+                        metadata_budget=metadata_budget,
+                        expected={"head_sha": "a" * 40, "base_sha": "b" * 40},
+                    )
+            finally:
+                os.close(descriptor)
+            self.assertFalse(matched)
+            self.assertEqual(metadata_budget, [len(receipt.encode())])
+            self.assertEqual(stdout_budget, [len(stdout.encode())])
+
+    def test_role_receipt_own_metadata_budget_still_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp) / "grabowski-job-rgpm-0123456789abcdef-01"
+            directory.mkdir(mode=0o700)
+            write_private(directory / reviews.REVIEW_ROLE_ATTEMPT_RECEIPT_NAME,
+                          json.dumps({"expected_head": "0" * 40, "payload": "r" * 1500}))
+            write_private(directory / "stdout.log", "ordinary output")
+            descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                with mock.patch.object(reviews, "MAX_TOTAL_METADATA_BYTES", 1024):
+                    with self.assertRaises(reviews.ReviewMetadataBudgetExceeded):
+                        reviews._unbound_review_result_visible(
+                            directory, parent_fd=descriptor,
+                            aggregate_bytes=[0], metadata_budget=[0],
+                            expected={"head_sha": "a" * 40, "base_sha": "b" * 40},
+                        )
+            finally:
+                os.close(descriptor)
+
     def test_foreign_role_receipts_share_bounded_aggregate(self) -> None:
         # Individually bounded role receipts must not bypass the total read
         # budget merely because each belongs to an ordinary/foreign job.
