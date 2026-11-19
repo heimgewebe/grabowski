@@ -911,6 +911,65 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
         self.assertIn("decision_review_metadata_aggregate_budget_exceeded", checked["errors"])
         self.assertEqual(checked["attempt_count"], 0)
 
+    def test_unbound_stdout_growth_does_not_exhaust_metadata_budget(self) -> None:
+        # The owner has years of ordinary jobs. Their output must never
+        # consume the aggregate metadata/receipt budget of an unrelated PR.
+        for material_reject in (False, True):
+            with self.subTest(material_reject=material_reject):
+                with tempfile.TemporaryDirectory() as tmp:
+                    jobs = Path(tmp) / "jobs"
+                    jobs.mkdir(mode=0o700)
+                    make_job(
+                        jobs, suffix="aaaaaaaaa991", slot="A",
+                        terminal_status="succeeded",
+                        review_result=result("A", "PASS_THIS_REVISION", 0),
+                    )
+                    ordinary = jobs / "grabowski-job-bbbbbbbbb992"
+                    ordinary.mkdir(mode=0o700)
+                    scope = {
+                        "cwd": "/tmp", "argv_sha256": "e" * 64,
+                        "runtime_seconds": 60,
+                    }
+                    origin, digest = job_origin.build_origin(
+                        unit=ordinary.name, owner=f"uid:{os.getuid()}",
+                        argv_sha256="e" * 64, scope=scope,
+                        notify_on_done={"requested": False, "channels": []},
+                        created_at_unix=1_787_000_000,
+                        started_at="2026-08-18T12:00:00Z",
+                        invoker_tool="grabowski_job_start",
+                    )
+                    write_private(ordinary / "metadata.json", json.dumps({
+                        "unit": ordinary.name, "job_id": origin["job_id"],
+                        "owner": origin["owner"],
+                        "argv_sha256": origin["argv_sha256"],
+                        "scope": scope, "origin": origin,
+                        "origin_sha256": digest,
+                    }))
+                    stdout = ordinary / "stdout.log"
+                    with stdout.open("wb") as stream:
+                        stream.write(b"ordinary history\n" * 512)
+                        if material_reject:
+                            stream.write(
+                                (reviews.RESULT_PREFIX + json.dumps(
+                                    result("A", "REJECT_THIS_REVISION", 1)
+                                ) + "\n").encode("utf-8")
+                            )
+                    stdout.chmod(0o600)
+                    # The cap is larger than all JSON but smaller than the
+                    # ordinary stdout; the latter has its own per-file bound.
+                    with mock.patch.object(reviews, "MAX_TOTAL_METADATA_BYTES", 4096):
+                        checked = self.reconcile(jobs)
+                self.assertEqual(
+                    checked["status"], "blocked" if material_reject else "settled"
+                )
+                if material_reject:
+                    self.assertIn(
+                        f"decision_review_unbound_result:{ordinary.name}",
+                        checked["errors"],
+                    )
+                else:
+                    self.assertEqual(checked["errors"], [])
+
     def test_v2_oauth_401_without_model_work_is_infrastructure_not_review(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             jobs = Path(temporary) / "jobs"

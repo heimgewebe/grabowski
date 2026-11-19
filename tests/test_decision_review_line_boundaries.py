@@ -141,7 +141,8 @@ class DecisionReviewLineBoundaryTests(unittest.TestCase):
                 )
         finally:
             os.close(descriptor)
-        self.assertEqual(original_budget + len(payload), budget[0])
+        # Ordinary stdout is not charged against the metadata/receipt budget.
+        self.assertEqual(original_budget, budget[0])
         self.assertEqual(original_hash, hashlib.sha256((directory / "stdout.log").read_bytes()).hexdigest())
         return found
 
@@ -250,15 +251,17 @@ class DecisionReviewLineBoundaryTests(unittest.TestCase):
                 payload = separator.encode("utf-8") + reviews.RESULT_PREFIX.encode() + b"invalid-json"
                 self.assertFalse(self._scan(payload))
 
-    def test_marker_and_aggregate_byte_budgets_still_fail_closed(self) -> None:
+    def test_marker_limit_and_metadata_budget_are_independent(self) -> None:
         oversized = reviews.RESULT_PREFIX.encode() + b" " * reviews.MAX_UNBOUND_MARKER_BYTES
         for name, separator in LINE_SEPARATORS.items():
             with self.subTest(separator=name):
                 with self.assertRaisesRegex(ValueError, "marker exceeds bounded size"):
                     self._scan(oversized + separator.encode("utf-8"))
+        # The old aggregate assertion confused stdout with metadata.
+        # The marker is still inspected even if the unrelated JSON budget
+        # is almost exhausted, without incrementing that budget.
         budget = [reviews.MAX_TOTAL_METADATA_BYTES - len(self.marker) + 1]
-        with self.assertRaises(reviews.ReviewMetadataBudgetExceeded):
-            self._scan(self.marker, aggregate=budget)
+        self.assertTrue(self._scan(self.marker, aggregate=budget))
 
     def test_stdout_authority_checks_remain_strict(self) -> None:
         payload = b"progress\r" + self.marker + b"\r"

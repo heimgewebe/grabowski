@@ -727,12 +727,10 @@ def _unbound_stdout_has_target_result(
             raise ValueError("unbound stdout is not one owner-private regular file")
         if before.st_size > MAX_UNBOUND_STDOUT_BYTES:
             raise ValueError("unbound stdout exceeds bounded inspection budget")
-        total_budget = aggregate_bytes[0] + before.st_size
-        if total_budget > MAX_TOTAL_METADATA_BYTES:
-            raise ReviewMetadataBudgetExceeded(
-                "decision review unbound stdout aggregate budget exceeded"
-            )
-        aggregate_bytes[0] = total_budget
+        # The aggregate limit protects metadata/receipts, not ordinary job
+        # output. Stdout is already bounded per file and scanned in chunks.
+        # Charging all unrelated historical stdout against one global limit
+        # eventually blocks every new PR as the job archive grows.
 
         prefix = RESULT_PREFIX.encode("ascii")
         line = bytearray()
