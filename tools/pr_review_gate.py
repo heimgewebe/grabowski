@@ -111,6 +111,7 @@ BOOTSTRAP_EXPECTED_CHECK_NAMES_BY_REPO = {
     "heimgewebe/audio": ("safety",),
     "heimgewebe/asr": ("validate (3.10)", "validate (3.12)"),
     "heimgewebe/chronik": ("repo-root", "templates"),
+    "heimgewebe/gegner": ("pytest",),
     "heimgewebe/hauski": ("Detect changes",),
     "heimgewebe/hauski-audio": ("scan",),
     "hall-of-memory/hall-of-memory": ("verify",),

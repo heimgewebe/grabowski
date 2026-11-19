@@ -695,6 +695,75 @@ jobs:
             ["validate (3.11)", "validate (3.12)"],
         )
 
+    def test_gegner_bootstrap_requires_actual_pytest_check(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            with mock.patch.object(
+                pr_review_gate, "_required_check_catalog_text_at_revision",
+                return_value=None,
+            ) as read_catalog, mock.patch.object(
+                pr_review_gate, "_workflow_text_at_revision",
+                side_effect=AssertionError("must use source-owned required check"),
+            ):
+                names = pr_review_gate.expected_check_names_for_repo(
+                    Path(raw), repo_name="heimgewebe/gegner",
+                    head_sha="a" * 40, base_sha="b" * 40,
+                )
+            self.assertEqual(names, ("pytest",))
+            self.assertEqual(read_catalog.call_count, 2)
+
+    def test_gegner_head_cannot_replace_bootstrap_or_fake_green_check(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            with mock.patch.object(
+                pr_review_gate, "_required_check_catalog_text_at_revision",
+                side_effect=['{"schema_version":1,"required_checks":["fake-green"]}', None],
+            ):
+                names = pr_review_gate.expected_check_names_for_repo(
+                    Path(raw), repo_name="heimgewebe/gegner",
+                    head_sha="a" * 40, base_sha="b" * 40,
+                )
+            self.assertEqual(names, ("pytest",))
+        state = {
+            "repoName": "heimgewebe/gegner",
+            "pr_diff_bypass": True,
+            "pr_diff_bypass_reason": "isolated required-check evaluator fixture",
+            "pr": {
+                "number": 3, "state": "OPEN", "isDraft": False,
+                "mergeStateStatus": "CLEAN", "mergeable": "MERGEABLE",
+                "headRefOid": "a" * 40, "baseRefOid": "b" * 40,
+                "changedFiles": 1, "additions": 1, "deletions": 0,
+                "files": [{"path": "README.md"}],
+                "reviews": [], "latestReviews": [], "comments": [],
+            },
+            "checks": [],
+            "reviewComments": [],
+        }
+        bad_checks = [
+            [],
+            [{"name": "fake-green", "bucket": "pass"}],
+            [{"name": "pytest", "bucket": "failure"}],
+            [{"name": "pytest", "bucket": "pending"}],
+            [{"name": "pytest", "bucket": "skipping"}],
+            [{"name": "pytest", "bucket": "pass"}, {"name": "pytest", "bucket": "failure"}],
+        ]
+        for checks in bad_checks:
+            with self.subTest(checks=checks):
+                state["checks"] = checks
+                result = pr_review_gate.evaluate_review_gate(
+                    state, expected_check_names=names,
+                )
+                self.assertEqual(result["verdict"], "BLOCK")
+                self.assertIn(
+                    "expected check(s) missing or non-green: pytest",
+                    result["failures"],
+                )
+        state["checks"] = [{"name": "pytest", "bucket": "pass"}]
+        good = pr_review_gate.evaluate_review_gate(
+            state, expected_check_names=names,
+        )
+        self.assertNotIn(
+            "expected check(s) missing or non-green: pytest", good["failures"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
