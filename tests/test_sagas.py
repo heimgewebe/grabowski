@@ -320,20 +320,31 @@ class SagaContractTests(unittest.TestCase):
             [item["name"] for item in plan["phases"]],
         )
         self.assertEqual(
-            ["bureau-pickup-status", "pr-check-readiness"],
+            ["bureau-pickup-status"],
             [item["action"] for item in plan["mechanic_actions"]],
         )
         self.assertEqual("captain-run", plan["captain_handoff"]["grip"])
         self.assertEqual("pr-merge", plan["captain_handoff"]["action"])
         self.assertEqual(HEAD, plan["expected_identity"]["expected_head"])
-        readiness = plan["mechanic_actions"][1]
-        self.assertEqual("pr-check-readiness", readiness["action"])
-        self.assertEqual(HEAD, readiness["parameters"]["expected_head"])
-        self.assertEqual(DIFF, readiness["parameters"]["expected_diff_sha256"])
-        self.assertEqual(self.self_review_audit(), readiness["parameters"]["self_review_audit"])
+        # A Bureau-bound PR does not need a second readiness check; only the
+        # live Bureau run is prepared here. Captain-run owns PR/CI/review truth.
         self.assertEqual(DIFF, plan["expected_identity"]["expected_diff_sha256"])
         self.assertEqual(plan, sagas.validate_plan(plan))
         self.assertIn("cross-system-atomicity", plan["does_not_establish"])
+
+    def test_standalone_pr_plan_keeps_existing_readiness_probe(self) -> None:
+        target = self.pr_target()
+        target["bureau_run_id"] = None
+        plan = sagas.build_plan("pr-settlement", target, "standalone-readiness")
+        self.assertEqual(
+            ["pr-check-readiness"],
+            [item["action"] for item in plan["mechanic_actions"]],
+        )
+        readiness = plan["mechanic_actions"][0]
+        self.assertEqual(HEAD, readiness["parameters"]["expected_head"])
+        self.assertEqual(DIFF, readiness["parameters"]["expected_diff_sha256"])
+        self.assertEqual(self.self_review_audit(), readiness["parameters"]["self_review_audit"])
+        self.assertEqual(plan, sagas.validate_plan(plan))
 
     def test_pr_plan_requires_diff_bound_self_review_evidence(self) -> None:
         for field in ("expected_diff_sha256", "self_review_audit"):
@@ -393,7 +404,9 @@ class SagaContractTests(unittest.TestCase):
         self.assertEqual("blocked", blocked["receipt_status"])
 
     def test_pr_prepare_requires_semantic_readiness_not_wrapper_pass(self) -> None:
-        plan = sagas.build_plan("pr-settlement", self.pr_target(), "semantic-readiness")
+        target = self.pr_target()
+        target["bureau_run_id"] = None
+        plan = sagas.build_plan("pr-settlement", target, "semantic-readiness")
         blocked_outputs = (
             {
                 "ready": False,

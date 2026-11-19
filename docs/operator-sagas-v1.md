@@ -46,11 +46,11 @@ The Captain-result recovery path accepts only `VerifiedCaptainAuditResultRef.v1`
 
 If `bureau_run_id` is provided:
 
-- `bureau-pickup-status` for the exact run.
+- `bureau-pickup-status` for the exact run; the extra `pr-check-readiness` probe is omitted. The live Captain executor independently verifies the current PR, diff, CI and review evidence before mutation.
 
-Always:
+Otherwise:
 
-- `pr-check-readiness` for the exact repository checkout.
+- `pr-check-readiness` for the exact repository checkout (stand-alone compatibility path).
 
 These are executed through `mechanic-loop`. `saga-run` validates that the child set is an exact ordered prefix of the planned actions and that returned target/scope/receipt bindings match the plan. It cannot dispatch `captain-run`.
 

@@ -873,23 +873,27 @@ def build_plan(saga_kind: Any, target: Any, idempotency_key: Any) -> dict[str, A
                     receipt_name="bureau-pickup-status",
                 )
             )
-        mechanic_actions.append(
-            _mechanic_action(
-                "pr-check-readiness",
-                parameters={
-                    "repo": normalized["repository_path"],
-                    "expected_head": normalized["expected_head"],
-                    "expected_diff_sha256": normalized["expected_diff_sha256"],
-                    "self_review_audit": normalized["self_review_audit"],
-                },
-                target={
-                    "repository": normalized["repository"],
-                    "pr": normalized["pr"],
-                    "expected_head": normalized["expected_head"],
-                },
-                receipt_name="pr-check-readiness",
+        # A Bureau-bound Saga already verifies its live run/lease. Captain-run
+        # independently revalidates the exact PR, diff, CI and review evidence.
+        # Only stand-alone Sagas retain the legacy readiness preparation step.
+        if bureau_run_id is None:
+            mechanic_actions.append(
+                _mechanic_action(
+                    "pr-check-readiness",
+                    parameters={
+                        "repo": normalized["repository_path"],
+                        "expected_head": normalized["expected_head"],
+                        "expected_diff_sha256": normalized["expected_diff_sha256"],
+                        "self_review_audit": normalized["self_review_audit"],
+                    },
+                    target={
+                        "repository": normalized["repository"],
+                        "pr": normalized["pr"],
+                        "expected_head": normalized["expected_head"],
+                    },
+                    receipt_name="pr-check-readiness",
+                )
             )
-        )
         captain_target = {
             "repo": normalized["repository"],
             "pr": normalized["pr"],
