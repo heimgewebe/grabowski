@@ -48,7 +48,7 @@ TERMINAL_TASK_STATES = {
 MAX_FAILED_UNITS = 2_000
 MAX_JOB_SCAN_ENTRIES = 2_000
 # Rotate bounded job windows without adding a cursor store or widening review scans.
-JOB_SCAN_WINDOW_SECONDS = 30 * 60
+JOB_SCAN_WINDOW_SECONDS = 60 * 60
 MAX_JOB_REGISTRY_ENTRIES = 100_000
 MAX_ARCHIVE_JOBS_PER_PLAN = 128
 MAX_JOB_RUNTIME_SECONDS = 2_592_000
@@ -1509,7 +1509,7 @@ def build_plan(
     # A fixed alphabetical prefix starves later jobs forever if its members
     # carry permanent review evidence. Each bounded time slot chooses the next
     # page; failed jobs remain force-included independently of this page.
-    # A 5-minute periodic timer revisits every page even when all earlier jobs
+    # The installed hourly calendar timer revisits every page even when all earlier jobs
     # must remain in the source root.
     job_scan_window_count = max(
         1, (len(registry_entries) + MAX_JOB_SCAN_ENTRIES - 1) // MAX_JOB_SCAN_ENTRIES

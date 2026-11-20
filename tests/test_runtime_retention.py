@@ -2006,10 +2006,10 @@ class RuntimeRetentionTests(unittest.TestCase):
             with patch.object(RETENTION, "MAX_JOB_SCAN_ENTRIES", 2):
                 first = RETENTION.build_plan(now=1_000, **kwargs)
                 repeated = RETENTION.build_plan(now=1_001, **kwargs)
-                next_window = RETENTION.build_plan(now=1_900, **kwargs)
-                after_cycle = RETENTION.build_plan(now=3_700, **kwargs)
+                next_window = RETENTION.build_plan(now=3_700, **kwargs)
+                after_cycle = RETENTION.build_plan(now=7_300, **kwargs)
                 forced_failed = RETENTION.build_plan(
-                    now=1_900,
+                    now=3_700,
                     **{**kwargs, "failed_units": [names[0] + ".service"]},
                 )
             self.assertEqual(first["job_scan_window_count"], 2)
@@ -2046,12 +2046,39 @@ class RuntimeRetentionTests(unittest.TestCase):
             "blocked": [],
         }
         with patch.object(RETENTION, "build_plan", return_value=plan) as build:
-            with patch.object(RETENTION.time, "time", side_effect=[1_799, 1_800]):
+            with patch.object(RETENTION.time, "time", side_effect=[3_599, 3_600]):
                 result = RETENTION.apply_periodic_plan()
         self.assertTrue(result["completed"])
         self.assertEqual(build.call_count, 2)
         for call in build.call_args_list:
-            self.assertEqual(call.kwargs["now"], 1_799)
+            self.assertEqual(call.kwargs["now"], 3_599)
+
+    def test_hourly_retention_timer_visits_all_pages_not_just_even_ones(self) -> None:
+        # With 11 jobs and a two-name cap there are six pages. A half-hour
+        # slot would alias with the real hourly NixOS timer and miss odd pages.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs = root / "jobs"
+            states = {}
+            for index in range(11):
+                name = f"grabowski-job-{index + 1:012x}"
+                self._job(jobs, name, 100)
+                states[name + ".service"] = self._state(name + ".service")
+            with patch.object(RETENTION, "MAX_JOB_SCAN_ENTRIES", 2):
+                indices = [
+                    RETENTION.build_plan(
+                        now=1_800 + hour * 3_600,
+                        minimum_job_age_seconds=50,
+                        jobs_root=jobs,
+                        archive_root=root / "archive",
+                        receipt_root=root / "receipts",
+                        task_db=root / "missing.sqlite3",
+                        failed_units=[],
+                        unit_states=states,
+                    )["job_scan_window_index"]
+                    for hour in range(6)
+                ]
+            self.assertEqual(indices, [0, 1, 2, 3, 4, 5])
 
     def test_reserved_repoground_jobs_enter_typed_retention_and_failed_reset(self) -> None:
         job_name = "grabowski-job-rgpm-" + "a" * 16 + "-01"
