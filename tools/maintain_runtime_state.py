@@ -76,15 +76,14 @@ LEGACY_SELF_DEPLOY_REASON = (
 
 
 def _protected_job_retention_authority() -> bool:
-    """No protected root/index transaction exists for automatic job effects.
+    """Trusted-owner authority: same-UID hostile processes are not the boundary.
 
-    Same-UID owner/mode checks and in-process FD pins cannot authenticate an
-    already replaced jobs/archive root or serialize an index reservation with
-    an archive rename. Until a separately privileged implementation exists,
-    automatic job moves and systemd job resets must remain disabled.
-    This is not a runtime configuration switch or a security attestation.
+    Existing pinned-FD, no-replace, deployment-index, receipts and audit checks
+    still protect against accidental drift, corruption and data loss. Jobs
+    carrying any decision-review evidence are ineligible for retention below.
+    This is not a claim of resistance to a compromised same-UID process.
     """
-    return False
+    return True
 
 
 def _canonical_json(value: Any) -> bytes:
@@ -353,6 +352,16 @@ def provision_receipt_root(*, receipt_root: Path = RECEIPT_ROOT) -> dict[str, An
         "status": "passed",
         "path": str(root),
     }
+
+
+def provision_archive_root(*, archive_root: Path = ARCHIVE_ROOT) -> dict[str, Any]:
+    """Provision a private archive root *before* constructing an effect plan.
+
+    Use the existing no-follow, parent-FD-pinned provisioner. Never create an
+    archive output directory from a plan whose root identity was absent.
+    """
+    result = provision_receipt_root(receipt_root=archive_root)
+    return {**result, "operation": "grabowski-retention-archive-root-provision"}
 
 
 def _pinned_output_root_fd(plan: "_PinnedRetentionPlan", kind: str) -> int:
@@ -1284,6 +1293,99 @@ class _PinnedRetentionPlan(dict):
                 setattr(self, field, -1)
 
 
+DECISION_REVIEW_RESULT_MARKER = b"GRABOWSKI_DECISION_REVIEW_V1="
+
+
+def _job_contains_decision_review_evidence(job_fd: int, *, job_name: str) -> bool:
+    """Keep all review and ambiguous marker evidence in the live scan root.
+
+    Review reconciliation also examines stdout of *ordinary* jobs for a late
+    material REJECT. Merely checking decision_bound_review would hide these.
+    Inspect the pinned job inode, never a pathname that can be substituted.
+    """
+    try:
+        raw, _ = _archive_pinned_json_preimage(job_fd, "metadata.json")
+    except OSError as exc:
+        raise RuntimeError("archive source file is unavailable: metadata.json") from exc
+    try:
+        metadata = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("job metadata cannot establish review-free provenance") from exc
+    if not isinstance(metadata, dict):
+        raise RuntimeError("job metadata is not an object")
+    # Captain treats missing, forged or mismatched job origins as potentially
+    # hiding a review. Retention must obey exactly the same provenance rule;
+    # never turn a Captain fail-closed condition into a clean merge by moving it.
+    source = str(SRC)
+    if source not in sys.path:
+        sys.path.insert(0, source)
+    import grabowski_job_origin as job_origin
+
+    try:
+        origin = job_origin.validate_origin(
+            metadata.get("origin"), metadata.get("origin_sha256"),
+            expected_unit=job_name,
+        )
+    except ValueError:
+        return True
+    for key in ("unit", "job_id", "owner", "argv_sha256", "scope"):
+        if metadata.get(key) != origin.get(key):
+            return True
+    if "decision_bound_review" in origin["scope"]:
+        return True
+    for receipt_name in ("review-role-attempt.json", "review-role-receipt.json"):
+        try:
+            os.stat(receipt_name, dir_fd=job_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            return True
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+    marker = DECISION_REVIEW_RESULT_MARKER
+    for name in ("stdout.log", "stderr.log"):
+        try:
+            descriptor = os.open(name, flags, dir_fd=job_fd)
+        except FileNotFoundError:
+            # Captain raises decision_review_unbound_evidence_invalid when
+            # ordinary stdout is missing; removing this job would erase that
+            # fail-closed condition even with an otherwise valid origin.
+            if name == "stdout.log":
+                return True
+            continue
+        try:
+            before = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_nlink != 1
+                or before.st_uid != os.getuid()
+                or stat.S_IMODE(before.st_mode) & 0o077
+                or before.st_size > MAX_ARCHIVE_FILE_BYTES
+            ):
+                raise RuntimeError("job log cannot establish review-free provenance")
+            remaining, suffix = before.st_size, b""
+            while remaining:
+                chunk = os.read(descriptor, min(1024 * 1024, remaining))
+                if not chunk:
+                    raise RuntimeError("job log changed during review-evidence scan")
+                window = suffix + chunk
+                if marker in window:
+                    return True
+                suffix = window[-(len(marker) - 1):]
+                remaining -= len(chunk)
+            after = os.fstat(descriptor)
+            if (
+                before.st_dev, before.st_ino, before.st_size,
+                before.st_mtime_ns, before.st_ctime_ns,
+            ) != (
+                after.st_dev, after.st_ino, after.st_size,
+                after.st_mtime_ns, after.st_ctime_ns,
+            ):
+                raise RuntimeError("job log changed during review-evidence scan")
+        finally:
+            os.close(descriptor)
+    return False
+
+
 def build_plan(
     *,
     minimum_job_age_seconds: int = 86_400,
@@ -1534,6 +1636,14 @@ def build_plan(
                 pinned.jobs_fd, source_dir.name, source_dir
             )
             try:
+                if _job_contains_decision_review_evidence(source_fd, job_name=record["job_name"]):
+                    archive_blocked_units.add(record["unit"])
+                    # A complete review is intentionally retained, not a
+                    # maintenance error. Only failed-unit reset requests
+                    # need an explicit blocked diagnosis.
+                    if record["unit"] in failed:
+                        block(record["unit"], "decision-review evidence must remain in live jobs")
+                    continue
                 _archive_require_json_temp_capacity(source_fd)
                 _archive_require_child_bound(
                     pinned.jobs_fd, source_dir.name, source_fd, source_dir
@@ -2561,6 +2671,10 @@ def _prepare_archives(
         if source_pins is not None:
             source_pins.callback(os.close, source_fd)
         try:
+            if _job_contains_decision_review_evidence(source_fd, job_name=record["job_name"]):
+                raise RuntimeError(
+                    "decision-review evidence appeared before archive; preserve source"
+                )
             # The metadata used for terminal/age authorization must be from
             # THIS source inode. A same-UID peer can rename the basename
             # between the earlier record read and this source open.
@@ -3986,6 +4100,10 @@ def main() -> int:
                 raise ValueError(
                     "--periodic-apply is incompatible with explicit apply arguments"
                 )
+            # A fresh installation has no archive leaf. Provision its pinned
+            # private inode before the two retention plans, never during apply.
+            if _protected_job_retention_authority():
+                provision_archive_root()
             receipt = apply_periodic_plan(
                 minimum_job_age_seconds=args.minimum_job_age_seconds,
                 max_archive_jobs=args.max_archive_jobs,
