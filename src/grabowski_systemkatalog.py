@@ -343,11 +343,14 @@ def _decode_text(payload: bytes, *, label: str) -> str:
         ) from exc
 
 
-def _git_text(root: Path, arguments: list[str]) -> str:
+def _git_text(
+    root: Path, arguments: list[str], *, isolated_git_config: bool = False,
+) -> str:
     completed = _run(
         ["git", "-C", str(root), *arguments],
         cwd=root,
         timeout_seconds=GIT_TIMEOUT_SECONDS,
+        **({"isolated_git_config": True} if isolated_git_config else {}),
     )
     if completed.returncode != 0:
         raise SystemkatalogAdapterError(
@@ -362,21 +365,27 @@ def _git_text(root: Path, arguments: list[str]) -> str:
     return _decode_text(completed.stdout, label="git_stdout").strip()
 
 
-def _repository_identity(root: Path) -> dict[str, Any]:
-    head = _git_text(root, ["rev-parse", "--verify", "HEAD"])
+def _repository_identity(
+    root: Path, *, isolated_git_config: bool = False,
+) -> dict[str, Any]:
+    git_options = {"isolated_git_config": True} if isolated_git_config else {}
+    head = _git_text(root, ["rev-parse", "--verify", "HEAD"], **git_options)
     if len(head) != 40 or any(character not in "0123456789abcdef" for character in head):
         raise SystemkatalogAdapterError(
             "git_head_invalid",
             "the configured Systemkatalog HEAD is not a full SHA-1 object id",
         )
-    status = _git_text(root, ["status", "--porcelain=v1", "--untracked-files=normal"])
+    status = _git_text(
+        root, ["status", "--porcelain=v1", "--untracked-files=normal"],
+        **git_options,
+    )
     if status:
         raise SystemkatalogAdapterError(
             "repository_dirty",
             "the configured Systemkatalog repository has uncommitted state",
             details={"status_sha256": _sha256(status.encode("utf-8"))},
         )
-    origin = _git_text(root, ["remote", "get-url", "origin"])
+    origin = _git_text(root, ["remote", "get-url", "origin"], **git_options)
     if origin.rstrip("/") not in ALLOWED_ORIGINS:
         raise SystemkatalogAdapterError(
             "origin_unexpected",
@@ -454,8 +463,10 @@ def _validated_read_root(
                     "stderr_sha256": _sha256(completed.stderr),
                 },
             )
-        snapshot_repository = _repository_identity(snapshot)
-        snapshot_origin = _git_text(snapshot, ["remote", "get-url", "origin"])
+        snapshot_repository = _repository_identity(snapshot, isolated_git_config=True)
+        snapshot_origin = _git_text(
+            snapshot, ["remote", "get-url", "origin"], isolated_git_config=True
+        )
         if snapshot_origin != CANONICAL_MAIN_CLONE_URL:
             raise SystemkatalogAdapterError(
                 "canonical_snapshot_origin_mismatch",
@@ -652,7 +663,9 @@ def query_systemkatalog(
         normalized_value = _bounded_value(normalized_operation, value)
         configured_root = _configured_root()
         with _validated_read_root(configured_root) as (root, selected_identity):
-            repository = _repository_identity(root)
+            snapshot_source = root != configured_root
+            git_options = {"isolated_git_config": True} if snapshot_source else {}
+            repository = _repository_identity(root, **git_options)
             if repository != selected_identity:
                 raise SystemkatalogAdapterError(
                     "repository_changed",
@@ -676,8 +689,9 @@ def query_systemkatalog(
                 argv,
                 cwd=root,
                 timeout_seconds=QUERY_TIMEOUT_SECONDS,
+                **git_options,
             )
-            post_repository = _repository_identity(root)
+            post_repository = _repository_identity(root, **git_options)
             if post_repository != selected_identity:
                 raise SystemkatalogAdapterError(
                     "repository_changed",

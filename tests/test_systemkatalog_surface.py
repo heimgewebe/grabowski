@@ -276,6 +276,82 @@ class SystemkatalogSurfaceTests(unittest.TestCase):
             result = surface.query_systemkatalog("system", "grabowski")
         self.assertEqual(result["adapter_error"]["code"], "query_script_missing")
 
+    def test_clean_default_main_query_reports_local_tracking_basis(self) -> None:
+        payload = self.payload(operation="authority-matrix", value=None)
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+            surface, "_configured_root", return_value=self.root
+        ), mock.patch.object(
+            surface, "_repository_identity", return_value=self.repository_identity
+        ), mock.patch.object(
+            surface, "_git_text", side_effect=["main", HEAD, "main", HEAD]
+        ), mock.patch.object(
+            surface, "_regular_file_identity", return_value=self.script_identity
+        ), mock.patch.object(
+            surface, "_run", return_value=self.completed(payload)
+        ) as run:
+            result = surface.query_systemkatalog("authority-matrix")
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(
+            result["adapter_identity"]["source_freshness_basis"],
+            "local_origin_main_tracking_equal",
+        )
+        self.assertEqual(run.call_count, 1)
+
+    def test_post_query_default_main_branch_switch_fails_closed(self) -> None:
+        payload = self.payload(operation="authority-matrix", value=None)
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+            surface, "_configured_root", return_value=self.root
+        ), mock.patch.object(
+            surface, "_repository_identity", return_value=self.repository_identity
+        ), mock.patch.object(
+            surface, "_git_text", side_effect=["main", HEAD, "chore/unexpected"]
+        ), mock.patch.object(
+            surface, "_regular_file_identity", return_value=self.script_identity
+        ), mock.patch.object(
+            surface, "_run", return_value=self.completed(payload)
+        ):
+            result = surface.query_systemkatalog("authority-matrix")
+        self.assertEqual(result["adapter_error"]["code"], "repository_changed")
+
+    def test_post_query_default_main_tracking_movement_fails_closed(self) -> None:
+        payload = self.payload(operation="authority-matrix", value=None)
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+            surface, "_configured_root", return_value=self.root
+        ), mock.patch.object(
+            surface, "_repository_identity", return_value=self.repository_identity
+        ), mock.patch.object(
+            surface, "_git_text", side_effect=["main", HEAD, "main", "f" * 40]
+        ), mock.patch.object(
+            surface, "_regular_file_identity", return_value=self.script_identity
+        ), mock.patch.object(
+            surface, "_run", return_value=self.completed(payload)
+        ):
+            result = surface.query_systemkatalog("authority-matrix")
+        self.assertEqual(result["adapter_error"]["code"], "repository_changed")
+
+    def test_snapshot_origin_uses_isolated_config_even_when_global_rewrites(self) -> None:
+        failure = surface.SystemkatalogAdapterError("repository_dirty", "dirty")
+        examined: list[bool] = []
+        def origin(root: Path, args: list[str], *, isolated_git_config: bool = False):
+            if root != self.root:
+                examined.append(isolated_git_config)
+                return (
+                    surface.CANONICAL_MAIN_CLONE_URL
+                    if isolated_git_config else "git@github.com:heimgewebe/systemkatalog.git"
+                )
+            return surface.CANONICAL_MAIN_CLONE_URL
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+            surface, "_repository_identity", side_effect=[failure, self.repository_identity]
+        ), mock.patch.object(
+            surface, "_git_text", side_effect=origin
+        ), mock.patch.object(
+            surface, "_run", return_value=self.completed({})
+        ):
+            with surface._validated_read_root(self.root) as (read_root, identity):
+                self.assertNotEqual(read_root, self.root)
+                self.assertEqual(identity, self.repository_identity)
+        self.assertEqual(examined, [True])
+
     def test_source_change_between_selection_and_first_read_fails_closed(self) -> None:
         selected = self.repository_identity
         changed = {**selected, "head": "f" * 40}
@@ -322,7 +398,7 @@ class SystemkatalogSurfaceTests(unittest.TestCase):
 
     def test_dirty_default_uses_disposable_canonical_main(self) -> None:
         failure = surface.SystemkatalogAdapterError("repository_dirty", "dirty")
-        def identity(root: Path):
+        def identity(root: Path, **_kwargs: object):
             if root == self.root: raise failure
             return self.repository_identity
         with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
