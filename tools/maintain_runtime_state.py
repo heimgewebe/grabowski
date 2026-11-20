@@ -1615,7 +1615,11 @@ def build_plan(
             try:
                 if _job_contains_decision_review_evidence(source_fd):
                     archive_blocked_units.add(record["unit"])
-                    block(record["unit"], "decision-review evidence must remain in live jobs")
+                    # A complete review is intentionally retained, not a
+                    # maintenance error. Only failed-unit reset requests
+                    # need an explicit blocked diagnosis.
+                    if record["unit"] in failed:
+                        block(record["unit"], "decision-review evidence must remain in live jobs")
                     continue
                 _archive_require_json_temp_capacity(source_fd)
                 _archive_require_child_bound(

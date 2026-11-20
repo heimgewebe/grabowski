@@ -4024,6 +4024,28 @@ class RuntimeRetentionTests(unittest.TestCase):
                 self.assertTrue((source / "metadata.json").exists())
                 self.assertFalse((root / "archive" / name).exists())
 
+    def test_protected_healthy_review_is_noop_not_maintenance_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs = root / "jobs"
+            name = "grabowski-job-aaaaaaaaaaaa"
+            unit = name + ".service"
+            source = self._job(jobs, name, 100)
+            (source / "stdout.log").write_bytes(
+                b"GRABOWSKI_DECISION_REVIEW_V1=REJECT_THIS_REVISION\\n"
+            )
+            plan = RETENTION.build_plan(
+                minimum_job_age_seconds=50, now=1000,
+                jobs_root=jobs, archive_root=root / "archive",
+                receipt_root=root / "receipts",
+                task_db=root / "missing.sqlite3", failed_units=[],
+                unit_states={unit: self._state(unit)},
+            )
+            self.assertEqual(plan["archive_jobs"], [])
+            self.assertEqual(plan["reset_failed_units"], [])
+            self.assertEqual(plan["blocked"], [])
+            self.assertTrue((source / "stdout.log").exists())
+
     def test_trusted_owner_can_plan_review_free_terminal_archive(self) -> None:
         self.assertTrue(PRODUCTION_JOB_RETENTION_AUTHORITY())
         with tempfile.TemporaryDirectory() as temporary:
