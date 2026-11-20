@@ -193,6 +193,7 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_bureau_acceptance_authenticate` | bureau | no | medium | Authenticate one exact digest- and revision-bound manual Bureau acceptance item through Bureau's canonical StateStore journal contract. |
 | `grabowski_bureau_candidate_record` | bureau | no | medium | Record one source-bound candidate through Bureau's canonical append-only operator intake contract. |
 | `grabowski_bureau_candidate_assess` | bureau | yes | low | Assess one explicitly typed operator-intake candidate or event against current Registry and Live Register truth; task and initiative values are binding checks, never selectors. |
+| `grabowski_bureau_task_find` | bureau | yes | low | Find StateStore-effective Bureau tasks by repository, task ID, title and state without acquiring claims or implying live PR/lease truth. |
 | `grabowski_bureau_task_propose` | bureau | no | medium | Create one immutable reviewed Bureau task proposal artifact without Registry or Queue mutation. |
 | `grabowski_bureau_task_review` | bureau | no | medium | Review one exact Bureau proposal digest and create reviewed-plan approval evidence without Registry, Queue or publication mutation. |
 | `grabowski_bureau_task_publish_preview` | bureau | yes | low | Validate one Bureau task proposal and return exact publication resources without effects. |

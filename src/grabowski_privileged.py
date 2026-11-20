@@ -250,15 +250,18 @@ def _defer_reboot_until_after_tool_response(argv: list[str]) -> tuple[list[str],
     the new session again. Systemd's --when returns promptly before shutdown
     without adding a timer, a lease or a persistent guard.
     """
+    arguments = argv[1:]
     if (
         argv[0] == "/run/current-system/sw/bin/systemctl"
-        and argv[1:] in (
-            ["reboot"],
-            ["reboot", "--no-wall"],
-            ["--no-wall", "reboot"],
-        )
+        and arguments.count("reboot") == 1
+        and len(arguments) <= 3
+        and len(set(arguments)) == len(arguments)
+        and all(arg in {"reboot", "--no-wall", "--no-block"} for arg in arguments)
     ):
-        return [argv[0], "--when=+30s", *argv[1:]], True
+        # --when already returns before the reboot: --no-block is redundant
+        # and previously bypassed deferral, allowing a repeated request to reboot again.
+        scheduled = [arg for arg in arguments if arg != "--no-block"]
+        return [argv[0], "--when=+30s", *scheduled], True
     return argv, False
 
 
