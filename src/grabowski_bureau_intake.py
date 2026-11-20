@@ -1061,6 +1061,7 @@ def _invoke_bureau(
     mutation: bool = False,
     required_readback: list[str] | None = None,
     include_runtime_identity: bool = False,
+    allow_list: bool = False,
 ) -> dict[str, Any]:
     readback = sorted(set(required_readback or []))
     contract_identity = _bureau_contract_identity(arguments)
@@ -1187,6 +1188,8 @@ def _invoke_bureau(
             bureau_contract_identity=contract_identity,
         )
     payload = value.get("result", value)
+    if allow_list and isinstance(payload, list):
+        payload = {"items": payload}
     if not isinstance(payload, dict):
         return _adapter_failure(
             "bureau-output-invalid",
@@ -1358,6 +1361,150 @@ def grabowski_bureau_candidate_record(
             }
     _audit("bureau-candidate-record", payload, request_sha256=request_id)
     return {**payload, "adapter_request_sha256": request_id}
+
+
+@mcp.tool(name="grabowski_bureau_task_find", annotations=READ_ONLY)
+def grabowski_bureau_task_find(
+    repo: str,
+    task_id: str = "",
+    query: str = "",
+    state: str = "",
+    limit: StrictInt = 10,
+) -> dict[str, Any]:
+    """Find StateStore-effective Bureau tasks in one repository.
+
+    This is a bounded read-only projection, not an atomic claim or live PR/lease
+    assessment. Use grabowski_bureau_pickup_execute for claim authority.
+    """
+    if not isinstance(repo, str) or not BUREAU_REPO_SLUG_RE.fullmatch(repo.strip()):
+        raise ValueError("repo must be one Bureau repository alias")
+    selected_repo = repo.strip().lower()
+    if not isinstance(task_id, str) or len(task_id) > 200 or "\x00" in task_id:
+        raise ValueError("task_id must be bounded text")
+    selected_id = task_id.strip()
+    if not isinstance(query, str) or len(query) > 160 or "\x00" in query:
+        raise ValueError("query must be bounded text")
+    selected_query = query.strip().casefold()
+    states = {
+        "",
+        "inbox",
+        "planned",
+        "ready",
+        "blocked",
+        "stale",
+        "verified",
+        "cancelled",
+        "superseded",
+    }
+    if not isinstance(state, str) or state not in states:
+        raise ValueError("state must be one known Bureau task state")
+    if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 25:
+        raise ValueError("limit must be an integer between 1 and 25")
+
+    resource = f"repo.{selected_repo}"
+    arguments = ["--json", "--json-envelope", "frontier", "--resource", resource]
+    for capability in (
+        "repository", "shell", "bureau", "grabowski", "github", "python",
+        "testing", "resource-leases", "rollback", "deployment", "audit",
+    ):
+        arguments.extend(["--capability", capability])
+    result = _invoke_bureau(arguments, allow_list=True)
+    if (
+        result.get("status") == "failed"
+        or result.get("kind") == "grabowski_bureau_intake_adapter_failure"
+    ):
+        return result
+    rows = result.get("items")
+    if not isinstance(rows, list) or any(
+        not isinstance(row, dict)
+        or not isinstance(row.get("task_id"), str)
+        or not isinstance(row.get("effective_state"), str)
+        for row in rows
+    ):
+        return _adapter_failure("bureau-task-find-result-invalid", retryable=False)
+
+    matches = []
+    for index, row in enumerate(rows):
+        current_id = row["task_id"]
+        title = row.get("title")
+        if not isinstance(title, str):
+            title = ""
+        effective_state = row["effective_state"]
+        if selected_id and current_id != selected_id:
+            continue
+        if selected_query and selected_query not in f"{current_id} {title}".casefold():
+            continue
+        if state and effective_state != state:
+            continue
+        claim_reasons = row.get("claim_reasons", row.get("reasons", []))
+        if not isinstance(claim_reasons, list):
+            claim_reasons = ["upstream-reasons-invalid"]
+        reason_text = " ".join(str(item).casefold() for item in claim_reasons)
+        if effective_state in {"verified", "cancelled", "superseded"}:
+            next_action = "terminal; do not claim"
+        elif "invalid acceptance contract" in reason_text:
+            next_action = "repair or retire the invalid acceptance contract before claim"
+        elif "active run for task" in reason_text:
+            next_action = "inspect the existing task-bound run"
+        elif effective_state == "ready":
+            next_action = "attempt task-bound atomic pickup with fresh PR/lease checks"
+        else:
+            next_action = "review current state and dependencies"
+        matches.append(
+            (
+                index,
+                {
+                    "task_id": current_id,
+                    "title": title,
+                    "effective_state": effective_state,
+                    "advisory_eligible": row.get("eligible") is True,
+                    "claim_reasons": [str(reason) for reason in claim_reasons[:12]],
+                    "queue_lane": row.get("queue_lane"),
+                    "claim_resources": (
+                        row.get("claim_resources", [])[:12]
+                        if isinstance(row.get("claim_resources"), list)
+                        else []
+                    ),
+                    "next_action": next_action,
+                    "advisory_pr_observation": (
+                        "unavailable"
+                        if "open pr guard failure" in reason_text
+                        else "not_established"
+                    ),
+                },
+            )
+        )
+    state_order = {
+        "ready": 0, "planned": 1, "blocked": 2, "inbox": 3,
+        "stale": 4, "verified": 5, "cancelled": 6, "superseded": 7,
+    }
+    matches.sort(
+        key=lambda pair: (state_order.get(pair[1]["effective_state"], 8), pair[0])
+    )
+    return {
+        "schema_version": 1,
+        "kind": "grabowski_bureau_task_find",
+        "status": "ok" if matches else "not_found",
+        "repo": selected_repo,
+        "resource": resource,
+        "filters": {"task_id": selected_id, "query": query.strip(), "state": state},
+        "matching_count": len(matches),
+        "returned_count": min(len(matches), limit),
+        "truncated": len(matches) > limit,
+        "tasks": [item for _, item in matches[:limit]],
+        "read_only": True,
+        "advisory_only": True,
+        "upstream": "bureau.frontier (StateStore-effective task projection)",
+        "bureau_contract_identity": result.get("bureau_contract_identity"),
+        "does_not_establish": [
+            "atomic claimability",
+            "live GitHub PR nonconflict",
+            "current Grabowski lease availability",
+            "task completion",
+            "mutation authority",
+            "deployment correctness",
+        ],
+    }
 
 
 @mcp.tool(name="grabowski_bureau_candidate_assess", annotations=READ_ONLY)

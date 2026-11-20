@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "fa35f718ca3fe770b81d8138d41736a2091a3cbaf5486fb47619407b32a445b5",
+  "capability_source_sha256": "8ad69beda5873c8bcb79676ab7be19591ce746f4905c58bf91f66d672bd82221",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "e4854ca1a9f5aa848e91d3973ae37154c41676f21a88ba3414a03b743474e59e",
+  "contract_sha256": "07fba47985cb36ef626c025d88fd78ac57bf2c6d92df79419d6034befb9ccd89",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -1968,6 +1968,17 @@
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_bureau_candidate_assess"
+    },
+    {
+      "category": "bureau",
+      "description": "Find StateStore-effective Bureau tasks in one repository.\n\nThis is a bounded read-only projection, not an atomic claim or live PR/lease\nassessment. Use grabowski_bureau_pickup_execute for claim authority.",
+      "effects": [],
+      "id": "grabowski_bureau_task_find",
+      "purpose": "Find StateStore-effective Bureau tasks by repository, task ID, title and state without acquiring claims or implying live PR/lease truth.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_bureau_task_find"
     },
     {
       "category": "bureau",
