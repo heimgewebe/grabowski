@@ -1522,6 +1522,16 @@ TOOL_PROFILES.update(
             "effects": [],
             "reversibility": "not-applicable",
         },
+        "grabowski_bureau_task_find": {
+            "category": "bureau",
+            "purpose": (
+                "Find StateStore-effective Bureau tasks by repository, task ID, "
+                "title and state without acquiring claims or implying live PR/lease truth."
+            ),
+            "risk_class": "low",
+            "effects": [],
+            "reversibility": "not-applicable",
+        },
         "grabowski_bureau_task_propose": {
             "category": "bureau",
             "purpose": "Create one immutable reviewed Bureau task proposal artifact without Registry or Queue mutation.",
