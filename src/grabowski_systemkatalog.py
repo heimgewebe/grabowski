@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -11,7 +12,7 @@ import stat
 import subprocess
 import tempfile
 import sys
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Iterator, Literal
 
 from pydantic import Field
 
@@ -29,6 +30,8 @@ DEFAULT_ROOT = Path.home() / "repos" / "systemkatalog"
 QUERY_SCRIPT = Path("scripts/systemkatalog_query.py")
 QUERY_TIMEOUT_SECONDS = 15
 GIT_TIMEOUT_SECONDS = 5
+SNAPSHOT_TIMEOUT_SECONDS = 30
+CANONICAL_MAIN_CLONE_URL = "https://github.com/heimgewebe/systemkatalog.git"
 MAX_STDOUT_BYTES = 1024 * 1024
 MAX_STDERR_BYTES = 64 * 1024
 MAX_SCRIPT_BYTES = 1024 * 1024
@@ -378,6 +381,60 @@ def _repository_identity(root: Path) -> dict[str, Any]:
     }
 
 
+@contextmanager
+def _validated_read_root(configured_root: Path) -> Iterator[Path]:
+    """Use a clean configured checkout or a disposable canonical main clone.
+
+    A dirty default checkout is another writer's work. Never reset, stash,
+    switch or fetch into it merely to answer a read-only catalog query.
+    """
+    try:
+        _repository_identity(configured_root)
+    except SystemkatalogAdapterError as error:
+        if error.code != "repository_dirty" or ROOT_ENVIRONMENT in os.environ:
+            raise
+    else:
+        if (
+            ROOT_ENVIRONMENT in os.environ
+            or configured_root != DEFAULT_ROOT
+            or _git_text(configured_root, ["branch", "--show-current"]) == "main"
+        ):
+            yield configured_root
+            return
+
+    origin = _git_text(configured_root, ["remote", "get-url", "origin"])
+    if origin.rstrip("/") not in ALLOWED_ORIGINS:
+        raise SystemkatalogAdapterError(
+            "origin_unexpected",
+            "the configured Systemkatalog origin does not match the canonical repository",
+            details={"origin_sha256": _sha256(origin.encode("utf-8"))},
+        )
+
+    with tempfile.TemporaryDirectory(prefix="grabowski-systemkatalog-query-") as directory:
+        snapshot = Path(directory) / "systemkatalog"
+        completed = _run(
+            [
+                "git", "-c", "core.hooksPath=/dev/null",
+                "clone", "--quiet", "--depth", "1",
+                "--single-branch", "--branch", "main", "--",
+                CANONICAL_MAIN_CLONE_URL, str(snapshot),
+            ],
+            cwd=Path(directory),
+            timeout_seconds=SNAPSHOT_TIMEOUT_SECONDS,
+        )
+        if completed.returncode != 0:
+            raise SystemkatalogAdapterError(
+                "canonical_snapshot_unavailable",
+                "a fresh canonical Systemkatalog main snapshot could not be loaded",
+                details={
+                    "returncode": completed.returncode,
+                    "stderr_sha256": _sha256(completed.stderr),
+                },
+            )
+        _repository_identity(snapshot)
+        yield snapshot
+
+
 def _validate_payload(
     payload: Any,
     *,
@@ -564,88 +621,89 @@ def query_systemkatalog(
     try:
         normalized_value = _bounded_value(normalized_operation, value)
         root = _configured_root()
-        repository = _repository_identity(root)
-        script = _regular_file_identity(root / QUERY_SCRIPT)
-        argv = [
-            sys.executable,
-            script["path"],
-            "--root",
-            str(root),
-            normalized_operation,
-        ]
-        if normalized_value is not None:
-            argv.append(normalized_value)
-        completed = _run(
-            argv,
-            cwd=root,
-            timeout_seconds=QUERY_TIMEOUT_SECONDS,
-        )
-        post_repository = _repository_identity(root)
-        if post_repository != repository:
-            raise SystemkatalogAdapterError(
-                "repository_changed",
-                "the Systemkatalog repository identity changed during the query",
-                details={
-                    "before_head": repository.get("head"),
-                    "after_head": post_repository.get("head"),
+        with _validated_read_root(root) as root:
+            repository = _repository_identity(root)
+            script = _regular_file_identity(root / QUERY_SCRIPT)
+            argv = [
+                sys.executable,
+                script["path"],
+                "--root",
+                str(root),
+                normalized_operation,
+            ]
+            if normalized_value is not None:
+                argv.append(normalized_value)
+            completed = _run(
+                argv,
+                cwd=root,
+                timeout_seconds=QUERY_TIMEOUT_SECONDS,
+            )
+            post_repository = _repository_identity(root)
+            if post_repository != repository:
+                raise SystemkatalogAdapterError(
+                    "repository_changed",
+                    "the Systemkatalog repository identity changed during the query",
+                    details={
+                        "before_head": repository.get("head"),
+                        "after_head": post_repository.get("head"),
+                    },
+                )
+            post_script = _regular_file_identity(root / QUERY_SCRIPT)
+            if post_script != script:
+                raise SystemkatalogAdapterError(
+                    "query_script_changed",
+                    "the Systemkatalog query script identity changed during the query",
+                    details={
+                        "before_sha256": script.get("sha256"),
+                        "after_sha256": post_script.get("sha256"),
+                    },
+                )
+            if completed.returncode not in {0, 3}:
+                raise SystemkatalogAdapterError(
+                    "query_failed",
+                    "Systemkatalog query exited outside its typed contract",
+                    details={
+                        "returncode": completed.returncode,
+                        "stderr_sha256": _sha256(completed.stderr),
+                    },
+                )
+            stdout = _decode_text(completed.stdout, label="query_stdout")
+            try:
+                decoded = json.loads(stdout)
+            except json.JSONDecodeError as exc:
+                raise SystemkatalogAdapterError(
+                    "query_json_invalid",
+                    "Systemkatalog query output is not valid JSON",
+                    details={"stdout_sha256": _sha256(completed.stdout)},
+                ) from exc
+            payload = _validate_payload(
+                decoded,
+                operation=normalized_operation,
+                value=normalized_value,
+                head=repository["head"],
+                returncode=completed.returncode,
+            )
+            combined_nonclaims = list(
+                dict.fromkeys(
+                    [*payload["doesNotEstablish"], *ADAPTER_DOES_NOT_ESTABLISH]
+                )
+            )
+            return {
+                "schema_version": SCHEMA_VERSION,
+                "kind": RESULT_KIND,
+                "status": payload["status"],
+                "operation": normalized_operation,
+                "value": normalized_value,
+                "adapter_identity": {
+                    "repository": repository,
+                    "query_script": script,
+                    "argv_sha256": _argv_sha256(argv),
+                    "timeout_seconds": QUERY_TIMEOUT_SECONDS,
+                    "max_stdout_bytes": MAX_STDOUT_BYTES,
                 },
-            )
-        post_script = _regular_file_identity(root / QUERY_SCRIPT)
-        if post_script != script:
-            raise SystemkatalogAdapterError(
-                "query_script_changed",
-                "the Systemkatalog query script identity changed during the query",
-                details={
-                    "before_sha256": script.get("sha256"),
-                    "after_sha256": post_script.get("sha256"),
-                },
-            )
-        if completed.returncode not in {0, 3}:
-            raise SystemkatalogAdapterError(
-                "query_failed",
-                "Systemkatalog query exited outside its typed contract",
-                details={
-                    "returncode": completed.returncode,
-                    "stderr_sha256": _sha256(completed.stderr),
-                },
-            )
-        stdout = _decode_text(completed.stdout, label="query_stdout")
-        try:
-            decoded = json.loads(stdout)
-        except json.JSONDecodeError as exc:
-            raise SystemkatalogAdapterError(
-                "query_json_invalid",
-                "Systemkatalog query output is not valid JSON",
-                details={"stdout_sha256": _sha256(completed.stdout)},
-            ) from exc
-        payload = _validate_payload(
-            decoded,
-            operation=normalized_operation,
-            value=normalized_value,
-            head=repository["head"],
-            returncode=completed.returncode,
-        )
-        combined_nonclaims = list(
-            dict.fromkeys(
-                [*payload["doesNotEstablish"], *ADAPTER_DOES_NOT_ESTABLISH]
-            )
-        )
-        return {
-            "schema_version": SCHEMA_VERSION,
-            "kind": RESULT_KIND,
-            "status": payload["status"],
-            "operation": normalized_operation,
-            "value": normalized_value,
-            "adapter_identity": {
-                "repository": repository,
-                "query_script": script,
-                "argv_sha256": _argv_sha256(argv),
-                "timeout_seconds": QUERY_TIMEOUT_SECONDS,
-                "max_stdout_bytes": MAX_STDOUT_BYTES,
-            },
-            "systemkatalog": payload,
-            "does_not_establish": combined_nonclaims,
-        }
+                "systemkatalog": payload,
+                "does_not_establish": combined_nonclaims,
+            }
     except SystemkatalogAdapterError as exc:
         return _failure(normalized_operation, value, exc)
     except Exception as exc:  # pragma: no cover - defensive fail-closed boundary

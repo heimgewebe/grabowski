@@ -274,13 +274,72 @@ class SystemkatalogSurfaceTests(unittest.TestCase):
             "repository_dirty",
             "dirty",
         )
-        with mock.patch.object(surface, "_configured_root", return_value=self.root), mock.patch.object(
-            surface,
-            "_repository_identity",
-            side_effect=failure,
+        with mock.patch.dict(os.environ, {surface.ROOT_ENVIRONMENT: str(self.root)}), mock.patch.object(
+            surface, "_configured_root", return_value=self.root
+        ), mock.patch.object(
+            surface, "_repository_identity", side_effect=failure,
         ):
             result = surface.query_systemkatalog("system", "grabowski")
         self.assertEqual(result["adapter_error"]["code"], "repository_dirty")
+
+    def test_dirty_default_uses_disposable_canonical_main(self) -> None:
+        failure = surface.SystemkatalogAdapterError("repository_dirty", "dirty")
+        def identity(root: Path):
+            if root == self.root: raise failure
+            return self.repository_identity
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+            surface, "_repository_identity", side_effect=identity
+        ), mock.patch.object(
+            surface, "_git_text", return_value=surface.CANONICAL_MAIN_CLONE_URL
+        ), mock.patch.object(surface, "_run", return_value=self.completed({})) as run:
+            with surface._validated_read_root(self.root) as root:
+                self.assertNotEqual(root, self.root)
+                self.assertTrue(root.parent.name.startswith("grabowski-systemkatalog-query-"))
+                self.assertEqual(root.name, "systemkatalog")
+        argv=run.call_args.args[0]
+        self.assertIn("--depth", argv)
+        self.assertIn("main", argv)
+        self.assertIn(surface.CANONICAL_MAIN_CLONE_URL, argv)
+
+    def test_clean_nonmain_default_does_not_become_false_catalog_authority(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+            surface, "DEFAULT_ROOT", self.root
+        ), mock.patch.object(
+            surface, "_repository_identity", return_value=self.repository_identity
+        ), mock.patch.object(
+            surface, "_git_text",
+            side_effect=["chore/unfinished-catalog-update", surface.CANONICAL_MAIN_CLONE_URL]
+        ), mock.patch.object(surface, "_run", return_value=self.completed({})) as run:
+            with surface._validated_read_root(self.root) as root:
+                self.assertNotEqual(root, self.root)
+        self.assertEqual(run.call_count, 1)
+
+    def test_disposable_clone_failure_is_typed(self) -> None:
+        failure = surface.SystemkatalogAdapterError("repository_dirty", "dirty")
+        failed = subprocess.CompletedProcess(args=["git","clone"],returncode=128,stdout=b"",stderr=b"offline")
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+            surface, "_configured_root", return_value=self.root
+        ), mock.patch.object(
+            surface, "_repository_identity", side_effect=failure
+        ), mock.patch.object(
+            surface, "_git_text", return_value=surface.CANONICAL_MAIN_CLONE_URL
+        ), mock.patch.object(surface, "_run", return_value=failed) as run:
+            result=surface.query_systemkatalog("authority-matrix")
+        self.assertEqual(result["adapter_error"]["code"], "canonical_snapshot_unavailable")
+        self.assertEqual(run.call_count,1)
+
+    def test_dirty_untrusted_origin_does_not_clone(self) -> None:
+        failure = surface.SystemkatalogAdapterError("repository_dirty", "dirty")
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+            surface, "_configured_root", return_value=self.root
+        ), mock.patch.object(
+            surface, "_repository_identity", side_effect=failure
+        ), mock.patch.object(
+            surface, "_git_text", return_value="git@example.invalid:other/catalog.git"
+        ), mock.patch.object(surface, "_run") as run:
+            result=surface.query_systemkatalog("authority-matrix")
+        self.assertEqual(result["adapter_error"]["code"], "origin_unexpected")
+        run.assert_not_called()
 
     def test_timeout_failure_is_preserved(self) -> None:
         failure = surface.SystemkatalogAdapterError(
@@ -306,7 +365,7 @@ class SystemkatalogSurfaceTests(unittest.TestCase):
         with mock.patch.object(surface, "_configured_root", return_value=self.root), mock.patch.object(
             surface,
             "_repository_identity",
-            side_effect=[self.repository_identity, changed],
+            side_effect=[self.repository_identity, self.repository_identity, changed],
         ), mock.patch.object(
             surface,
             "_regular_file_identity",
