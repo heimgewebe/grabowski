@@ -66,6 +66,11 @@ class SystemkatalogSurfaceTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
+        self.environment = mock.patch.dict(
+            os.environ, {surface.ROOT_ENVIRONMENT: str(self.root)}
+        )
+        self.environment.start()
+        self.addCleanup(self.environment.stop)
         self.script = self.root / surface.QUERY_SCRIPT
         self.script.parent.mkdir(parents=True)
         self.script.write_text("print('test')\n", encoding="utf-8")
@@ -172,6 +177,8 @@ class SystemkatalogSurfaceTests(unittest.TestCase):
             result = surface.query_systemkatalog("system", " grabowski ")
         self.assertEqual(result["status"], "ok")
         self.assertEqual(result["systemkatalog"], payload)
+        self.assertEqual(result["adapter_identity"]["source_kind"], "configured_checkout")
+        self.assertFalse(result["adapter_identity"]["source_ephemeral"])
         self.assertEqual(result["adapter_identity"]["repository"]["head"], HEAD)
         self.assertEqual(
             result["adapter_identity"]["query_script"]["sha256"],
@@ -308,11 +315,87 @@ class SystemkatalogSurfaceTests(unittest.TestCase):
             surface, "_repository_identity", return_value=self.repository_identity
         ), mock.patch.object(
             surface, "_git_text",
-            side_effect=["chore/unfinished-catalog-update", surface.CANONICAL_MAIN_CLONE_URL]
+            side_effect=[
+                "chore/unfinished-catalog-update",
+                surface.CANONICAL_MAIN_CLONE_URL,
+                surface.CANONICAL_MAIN_CLONE_URL,
+            ]
         ), mock.patch.object(surface, "_run", return_value=self.completed({})) as run:
             with surface._validated_read_root(self.root) as root:
                 self.assertNotEqual(root, self.root)
         self.assertEqual(run.call_count, 1)
+
+    def test_clean_main_uses_local_tracking_match_without_network(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+            surface, "_repository_identity", return_value=self.repository_identity
+        ), mock.patch.object(
+            surface, "_git_text", side_effect=["main", HEAD]
+        ) as git, mock.patch.object(surface, "_run") as run:
+            with surface._validated_read_root(self.root) as read_root:
+                self.assertEqual(read_root, self.root)
+        self.assertEqual(git.call_count, 2)
+        run.assert_not_called()
+
+    def test_clean_main_with_divergent_tracking_uses_canonical_snapshot(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+            surface, "_repository_identity", return_value=self.repository_identity
+        ), mock.patch.object(
+            surface, "_git_text",
+            side_effect=[
+                "main", "f" * 40,
+                surface.CANONICAL_MAIN_CLONE_URL,
+                surface.CANONICAL_MAIN_CLONE_URL,
+            ]
+        ), mock.patch.object(surface, "_run", return_value=self.completed({})) as run:
+            with surface._validated_read_root(self.root) as read_root:
+                self.assertNotEqual(read_root, self.root)
+        self.assertEqual(run.call_count, 1)
+
+    def test_explicit_clean_nonmain_root_avoids_unrequested_clone(self) -> None:
+        with mock.patch.object(
+            surface, "_repository_identity", return_value=self.repository_identity
+        ), mock.patch.object(surface, "_run") as run, mock.patch.object(
+            surface, "_git_text"
+        ) as git:
+            with surface._validated_read_root(self.root) as read_root:
+                self.assertEqual(read_root, self.root)
+        run.assert_not_called()
+        git.assert_not_called()
+
+    def test_disposable_snapshot_wrong_origin_fails_closed(self) -> None:
+        failure = surface.SystemkatalogAdapterError("repository_dirty", "dirty")
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+            surface, "_repository_identity", side_effect=[failure, self.repository_identity]
+        ), mock.patch.object(
+            surface, "_git_text",
+            side_effect=[
+                surface.CANONICAL_MAIN_CLONE_URL,
+                "https://example.invalid/untrusted.git",
+            ]
+        ), mock.patch.object(
+            surface, "_run", return_value=self.completed({})
+        ):
+            result = surface.query_systemkatalog("authority-matrix")
+        self.assertEqual(result["adapter_error"]["code"], "canonical_snapshot_origin_mismatch")
+
+    def test_disposable_clone_timeout_preserves_typed_failure(self) -> None:
+        failure = surface.SystemkatalogAdapterError("repository_dirty", "dirty")
+        timeout = surface.SystemkatalogAdapterError(
+            "subprocess_timeout", "timeout", details={"timeout_seconds": 30}
+        )
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+            surface, "_repository_identity", side_effect=failure
+        ), mock.patch.object(
+            surface, "_git_text", return_value=surface.CANONICAL_MAIN_CLONE_URL
+        ), mock.patch.object(surface, "_run", side_effect=timeout):
+            result = surface.query_systemkatalog("authority-matrix")
+        self.assertEqual(result["adapter_error"]["code"], "subprocess_timeout")
+
+    def test_subprocess_git_config_does_not_inherit_credential_rewrites(self) -> None:
+        environment = surface._subprocess_environment()
+        self.assertEqual(environment["GIT_CONFIG_GLOBAL"], "/dev/null")
+        self.assertEqual(environment["GIT_CONFIG_NOSYSTEM"], "1")
+        self.assertEqual(environment["GIT_TERMINAL_PROMPT"], "0")
 
     def test_disposable_clone_failure_is_typed(self) -> None:
         failure = surface.SystemkatalogAdapterError("repository_dirty", "dirty")

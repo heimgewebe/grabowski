@@ -232,6 +232,11 @@ def _subprocess_environment() -> dict[str, str]:
         "LC_ALL": "C.UTF-8",
         "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
         "PYTHONDONTWRITEBYTECODE": "1",
+        # A public canonical snapshot must not inherit user/system Git rewrites
+        # or block for interactive SSH/credential prompts.
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_TERMINAL_PROMPT": "0",
     }
 
 
@@ -389,18 +394,28 @@ def _validated_read_root(configured_root: Path) -> Iterator[Path]:
     switch or fetch into it merely to answer a read-only catalog query.
     """
     try:
-        _repository_identity(configured_root)
+        repository = _repository_identity(configured_root)
     except SystemkatalogAdapterError as error:
         if error.code != "repository_dirty" or ROOT_ENVIRONMENT in os.environ:
             raise
     else:
-        if (
-            ROOT_ENVIRONMENT in os.environ
-            or configured_root != DEFAULT_ROOT
-            or _git_text(configured_root, ["branch", "--show-current"]) == "main"
-        ):
+        if ROOT_ENVIRONMENT in os.environ:
+            # Explicit roots are pinned by the caller, not silently replaced.
             yield configured_root
             return
+        if _git_text(configured_root, ["branch", "--show-current"]) == "main":
+            try:
+                tracking_head = _git_text(
+                    configured_root, ["rev-parse", "--verify", "refs/remotes/origin/main"]
+                )
+            except SystemkatalogAdapterError as error:
+                if error.code != "git_identity_failed":
+                    raise
+                tracking_head = None
+            if tracking_head == repository["head"]:
+                # Locally synchronized, not proof of current external GitHub state.
+                yield configured_root
+                return
 
     origin = _git_text(configured_root, ["remote", "get-url", "origin"])
     if origin.rstrip("/") not in ALLOWED_ORIGINS:
@@ -432,6 +447,13 @@ def _validated_read_root(configured_root: Path) -> Iterator[Path]:
                 },
             )
         _repository_identity(snapshot)
+        snapshot_origin = _git_text(snapshot, ["remote", "get-url", "origin"])
+        if snapshot_origin != CANONICAL_MAIN_CLONE_URL:
+            raise SystemkatalogAdapterError(
+                "canonical_snapshot_origin_mismatch",
+                "the temporary Systemkatalog snapshot has an unexpected origin",
+                details={"origin_sha256": _sha256(snapshot_origin.encode("utf-8"))},
+            )
         yield snapshot
 
 
@@ -620,8 +642,8 @@ def query_systemkatalog(
     normalized_operation = operation.strip() if isinstance(operation, str) else ""
     try:
         normalized_value = _bounded_value(normalized_operation, value)
-        root = _configured_root()
-        with _validated_read_root(root) as root:
+        configured_root = _configured_root()
+        with _validated_read_root(configured_root) as root:
             repository = _repository_identity(root)
             script = _regular_file_identity(root / QUERY_SCRIPT)
             argv = [
@@ -697,6 +719,21 @@ def query_systemkatalog(
                 "adapter_identity": {
                     "repository": repository,
                     "query_script": script,
+                    "source_kind": (
+                        "canonical_main_snapshot" if root != configured_root
+                        else "configured_checkout"
+                    ),
+                    "source_ephemeral": root != configured_root,
+                    "source_freshness_basis": (
+                        "remote_main_at_clone" if root != configured_root
+                        else (
+                            "caller_pinned_checkout" if ROOT_ENVIRONMENT in os.environ
+                            else "local_origin_main_tracking_equal"
+                        )
+                    ),
+                    "canonical_snapshot_url": (
+                        CANONICAL_MAIN_CLONE_URL if root != configured_root else None
+                    ),
                     "argv_sha256": _argv_sha256(argv),
                     "timeout_seconds": QUERY_TIMEOUT_SECONDS,
                     "max_stdout_bytes": MAX_STDOUT_BYTES,
