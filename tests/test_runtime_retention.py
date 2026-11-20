@@ -1974,6 +1974,85 @@ class RuntimeRetentionTests(unittest.TestCase):
             self.assertFalse(plan["archive_inventory_complete"])
             self.assertEqual(plan["reset_failed_units"], [task_unit])
 
+    def test_scan_rotates_past_permanently_protected_review_prefix(self) -> None:
+        # Regression for PR1794: two review records permanently survive in the
+        # live root. The late ordinary job must nevertheless enter a plan.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs = root / "jobs"
+            names = (
+                "grabowski-job-000000000001",
+                "grabowski-job-000000000002",
+                "grabowski-job-ffffffffffff",
+            )
+            states = {}
+            for name in names:
+                self._job(jobs, name, 100)
+                states[name + ".service"] = self._state(name + ".service")
+            for name in names[:2]:
+                (jobs / name / "stdout.log").write_bytes(
+                    b"GRABOWSKI_DECISION_REVIEW_V1=REJECT_THIS_REVISION\\n"
+                )
+            kwargs = {
+                "minimum_job_age_seconds": 50,
+                "max_archive_jobs": 2,
+                "jobs_root": jobs,
+                "archive_root": root / "archive",
+                "receipt_root": root / "receipts",
+                "task_db": root / "missing.sqlite3",
+                "failed_units": [],
+                "unit_states": states,
+            }
+            with patch.object(RETENTION, "MAX_JOB_SCAN_ENTRIES", 2):
+                first = RETENTION.build_plan(now=1_000, **kwargs)
+                repeated = RETENTION.build_plan(now=1_001, **kwargs)
+                next_window = RETENTION.build_plan(now=1_900, **kwargs)
+                after_cycle = RETENTION.build_plan(now=3_700, **kwargs)
+                forced_failed = RETENTION.build_plan(
+                    now=1_900,
+                    **{**kwargs, "failed_units": [names[0] + ".service"]},
+                )
+            self.assertEqual(first["job_scan_window_count"], 2)
+            self.assertEqual(first["job_scan_window_index"], 0)
+            self.assertEqual(repeated["job_scan_window_index"], 0)
+            self.assertEqual(first["archive_jobs"], [])
+            self.assertEqual(repeated["archive_jobs"], [])
+            self.assertEqual(next_window["job_scan_window_index"], 1)
+            self.assertEqual(
+                [item["unit"] for item in next_window["archive_jobs"]],
+                [names[-1] + ".service"],
+            )
+            self.assertEqual(after_cycle["job_scan_window_index"], 0)
+            self.assertEqual(after_cycle["archive_jobs"], [])
+            self.assertTrue((jobs / names[0] / "stdout.log").is_file())
+            self.assertTrue((jobs / names[1] / "stdout.log").is_file())
+            self.assertEqual(next_window["job_scan_deferred_count"], 2)
+            self.assertEqual(
+                [item["unit"] for item in forced_failed["archive_jobs"]],
+                [names[-1] + ".service"],
+            )
+            self.assertNotIn(names[0] + ".service", forced_failed["reset_failed_units"])
+            self.assertTrue(any(
+                row["unit"] == names[0] + ".service"
+                and "decision-review evidence" in row["reason"]
+                for row in forced_failed["blocked"]
+            ))
+
+    def test_periodic_pins_one_clock_snapshot_for_both_plans(self) -> None:
+        plan = {
+            "plan_sha256": "a" * 64,
+            "reset_failed_units": [],
+            "archive_jobs": [],
+            "blocked": [],
+        }
+        with patch.object(RETENTION, "build_plan", return_value=plan) as build:
+            with patch.object(RETENTION.time, "time", side_effect=[1_799, 1_800]):
+                result = RETENTION.apply_periodic_plan()
+        self.assertTrue(result["completed"])
+        self.assertEqual(build.call_count, 2)
+        for call in build.call_args_list:
+            self.assertEqual(call.kwargs["now"], 1_799)
+
     def test_reserved_repoground_jobs_enter_typed_retention_and_failed_reset(self) -> None:
         job_name = "grabowski-job-rgpm-" + "a" * 16 + "-01"
         unit = job_name + ".service"
