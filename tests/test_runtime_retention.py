@@ -4040,8 +4040,8 @@ class RuntimeRetentionTests(unittest.TestCase):
                 self.assertTrue((source / "metadata.json").exists())
                 self.assertFalse((root / "archive" / name).exists())
 
-    def test_missing_forged_or_mismatched_origin_never_archived(self) -> None:
-        for case in ("missing", "invalid_sha", "mirrored_scope"):
+    def test_missing_forged_or_mismatched_origin_or_stdout_never_archived(self) -> None:
+        for case in ("missing", "invalid_sha", "mirrored_scope", "missing_stdout"):
             with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 jobs = root / "jobs"
@@ -4054,8 +4054,12 @@ class RuntimeRetentionTests(unittest.TestCase):
                     del value["origin"]
                 elif case == "invalid_sha":
                     value["origin_sha256"] = "0" * 64
-                else:
+                elif case == "mirrored_scope":
                     value["scope"] = {"unexpected": "drift"}
+                else:
+                    # Valid ordinary origin, but Captain cannot prove the
+                    # absence of unbound review results without stdout.log.
+                    (source / "stdout.log").unlink()
                 metadata.write_text(json.dumps(value), encoding="utf-8")
                 metadata.chmod(0o600)
                 plan = RETENTION.build_plan(

@@ -1336,6 +1336,11 @@ def _job_contains_decision_review_evidence(job_fd: int, *, job_name: str) -> boo
         try:
             descriptor = os.open(name, flags, dir_fd=job_fd)
         except FileNotFoundError:
+            # Captain raises decision_review_unbound_evidence_invalid when
+            # ordinary stdout is missing; removing this job would erase that
+            # fail-closed condition even with an otherwise valid origin.
+            if name == "stdout.log":
+                return True
             continue
         try:
             before = os.fstat(descriptor)
