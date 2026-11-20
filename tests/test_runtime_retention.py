@@ -4690,6 +4690,44 @@ class RuntimeRetentionTests(unittest.TestCase):
             self.assertEqual(other.stat().st_mode & 0o777, 0o755)
             self.assertEqual(list(other.iterdir()), [])
 
+
+    def test_archive_root_provision_before_periodic_plan_is_safe_and_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs = root / "jobs"
+            name = "grabowski-job-aaaaaaaaaaaa"
+            unit = name + ".service"
+            self._job(jobs, name, 100)
+            archive = root / "archive"
+            archive.rmdir()  # Fresh installation has no archive leaf.
+            self.assertFalse(archive.exists())
+            first = RETENTION.provision_archive_root(archive_root=archive)
+            self.assertTrue(first["created"])
+            self.assertEqual(first["operation"], "grabowski-retention-archive-root-provision")
+            self.assertEqual(archive.stat().st_mode & 0o777, 0o700)
+            plan = RETENTION.build_plan(
+                minimum_job_age_seconds=50, now=1000,
+                jobs_root=jobs, archive_root=archive, receipt_root=root / "receipts",
+                task_db=root / "missing.sqlite3", failed_units=[],
+                unit_states={unit: self._state(unit)},
+            )
+            self.assertEqual([item["unit"] for item in plan["archive_jobs"]], [unit])
+            second = RETENTION.provision_archive_root(archive_root=archive)
+            self.assertFalse(second["created"])
+            self.assertEqual(archive.stat().st_mode & 0o777, 0o700)
+
+    def test_archive_root_provision_rejects_existing_symlink_without_touching_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            outside = root / "outside"
+            outside.mkdir(mode=0o700)
+            archive = root / "archive"
+            archive.symlink_to(outside, target_is_directory=True)
+            with self.assertRaises((OSError, RuntimeError)):
+                RETENTION.provision_archive_root(archive_root=archive)
+            self.assertTrue(archive.is_symlink())
+            self.assertEqual(list(outside.iterdir()), [])
+
     def test_manual_check_and_apply_provision_before_hash_bound_plan(self) -> None:
         source = (ROOT / "Makefile").read_text(encoding="utf-8")
         for target in ("runtime-retention-check", "runtime-retention-apply"):
@@ -6060,6 +6098,8 @@ class RuntimeRetentionTests(unittest.TestCase):
                 with patch.object(
                     RETENTION.sys, "argv", argv
                 ), patch.object(
+                    RETENTION, "provision_archive_root", return_value={"created": False}
+                ) as archive_provision, patch.object(
                     RETENTION, "apply_periodic_plan", return_value=receipt
                 ), patch.object(
                     RETENTION, "build_plan", return_value=plan
@@ -6069,6 +6109,10 @@ class RuntimeRetentionTests(unittest.TestCase):
                     RETENTION.sys, "stdout", new_callable=io.StringIO
                 ) as output:
                     code = RETENTION.main()
+                if mode == "periodic":
+                    archive_provision.assert_called_once_with()
+                else:
+                    archive_provision.assert_not_called()
                 self.assertEqual(code, 2)
                 self.assertEqual(json.loads(output.getvalue()), receipt)
 

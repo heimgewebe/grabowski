@@ -354,6 +354,16 @@ def provision_receipt_root(*, receipt_root: Path = RECEIPT_ROOT) -> dict[str, An
     }
 
 
+def provision_archive_root(*, archive_root: Path = ARCHIVE_ROOT) -> dict[str, Any]:
+    """Provision a private archive root *before* constructing an effect plan.
+
+    Use the existing no-follow, parent-FD-pinned provisioner. Never create an
+    archive output directory from a plan whose root identity was absent.
+    """
+    result = provision_receipt_root(receipt_root=archive_root)
+    return {**result, "operation": "grabowski-retention-archive-root-provision"}
+
+
 def _pinned_output_root_fd(plan: "_PinnedRetentionPlan", kind: str) -> int:
     """Pin archive/receipt root before first use; never adopt a new pathname."""
     if kind not in {"archive", "receipt"}:
@@ -4090,6 +4100,10 @@ def main() -> int:
                 raise ValueError(
                     "--periodic-apply is incompatible with explicit apply arguments"
                 )
+            # A fresh installation has no archive leaf. Provision its pinned
+            # private inode before the two retention plans, never during apply.
+            if _protected_job_retention_authority():
+                provision_archive_root()
             receipt = apply_periodic_plan(
                 minimum_job_age_seconds=args.minimum_job_age_seconds,
                 max_archive_jobs=args.max_archive_jobs,
