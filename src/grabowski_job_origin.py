@@ -48,13 +48,15 @@ DECISION_REVIEW_ORDER_ROOT = (
 )
 DECISION_REVIEW_JOBS_ROOT = Path.home() / ".local" / "state" / "grabowski" / "jobs"
 DECISION_REVIEW_ORDER_MAX_BYTES = 4096
-# Streaming typed job history remains hard-bounded; protected retention still required.
-DECISION_REVIEW_ORDER_MAX_JOB_DIRECTORIES = 16_384  # All entries, bounded
-DECISION_REVIEW_ORDER_MAX_REVIEW_JOBS = 10_000  # Authenticated reviews
+# Streaming typed job history remains hard-bounded. The caps bound scan time,
+# not memory (files are read one at a time), and hitting one blocks every new
+# decision review start. Keep them far above the real, unretained archive.
+DECISION_REVIEW_ORDER_MAX_JOB_DIRECTORIES = 262_144  # All entries, bounded
+DECISION_REVIEW_ORDER_MAX_REVIEW_JOBS = 160_000  # Authenticated reviews
 _DECISION_REVIEW_UNIT_RE = re.compile(r"grabowski-job-[0-9a-f]{12}\Z")
 _RGPM_UNIT_RE = re.compile(r"grabowski-job-rgpm-[0-9a-f]{16}-[0-9]{2}\Z")
 DECISION_REVIEW_ORDER_MAX_METADATA_BYTES = 256 * 1024
-DECISION_REVIEW_ORDER_MAX_TOTAL_METADATA_BYTES = 128 * 1024 * 1024
+DECISION_REVIEW_ORDER_MAX_TOTAL_METADATA_BYTES = 2 * 1024 * 1024 * 1024
 DECISION_REVIEW_ORDER_MAX_NS = (1 << 63) - 1
 _DECISION_REVIEW_REPO_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 _DECISION_REVIEW_SHA40_RE = re.compile(r"[0-9a-f]{40}\Z")

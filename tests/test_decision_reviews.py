@@ -872,7 +872,7 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             jobs = Path(temp) / "jobs"
             jobs.mkdir(mode=0o700)
-            for number in range(10_010):
+            for number in range(16_400):  # beyond the former 16_384 wall
                 (jobs / f"grabowski-job-{number:012x}").mkdir(mode=0o700)
             make_job(jobs, suffix="fffffffffff0", slot="A", terminal_status="succeeded",
                      review_result=result("A", "PASS_THIS_REVISION", 0))

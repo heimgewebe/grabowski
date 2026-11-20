@@ -140,7 +140,7 @@ class DecisionReviewLogicalClockTests(unittest.TestCase):
                 )
                 os.chmod(metadata, 0o600)
                 next(job_origin.DECISION_REVIEW_ORDER_ROOT.glob("*.json")).unlink()
-                for number in range(10_010):
+                for number in range(16_400):  # beyond the former 16_384 wall
                     (jobs / f"grabowski-job-{number:012x}").mkdir(mode=0o700)
                 current, _ = build("eeeeeeeeeeee", 1_900_000_000_100_000_000)
         self.assertEqual(current["scope"]["started_at_unix_ns"],

@@ -34,9 +34,14 @@ _STDOUT_LINE_SEPARATOR_RE = re.compile(
 # Full scan (including late material REJECTs) is already bounded by all job
 # directories and aggregate metadata bytes; an extra global review-attempt
 # cap cannot safely terminate an unrelated PR before the full scan completes.
-MAX_JOB_DIRECTORIES = 16_384  # Hard cap on *all* scanned directory entries
+# These aggregate caps bound scan *time*, not memory: every file is read,
+# checked and dropped one at a time under its own per-file cap. The job archive
+# grows without retention (11.7k jobs / 77 MiB metadata on 2026-11-19), and
+# reaching a cap blocks every Captain merge fleet-wide. Keep them far above
+# the real archive so they only stop pathological growth.
+MAX_JOB_DIRECTORIES = 262_144  # Hard cap on *all* scanned directory entries
 MAX_METADATA_BYTES = 256 * 1024
-MAX_TOTAL_METADATA_BYTES = 128 * 1024 * 1024
+MAX_TOTAL_METADATA_BYTES = 2 * 1024 * 1024 * 1024
 MAX_FINALIZATION_BYTES = 256 * 1024
 MAX_STDOUT_TAIL_BYTES = 256 * 1024
 # Non-review origins must not conceal review results retained in their job logs.
