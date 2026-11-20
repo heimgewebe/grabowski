@@ -1315,12 +1315,13 @@ def _job_contains_decision_review_evidence(job_fd: int) -> bool:
             raise RuntimeError("job scope cannot establish review-free provenance")
         if "decision_bound_review" in scope:
             return True
-    try:
-        os.stat("review-role-attempt.json", dir_fd=job_fd, follow_symlinks=False)
-    except FileNotFoundError:
-        pass
-    else:
-        return True
+    for receipt_name in ("review-role-attempt.json", "review-role-receipt.json"):
+        try:
+            os.stat(receipt_name, dir_fd=job_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            return True
     flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
     marker = DECISION_REVIEW_RESULT_MARKER
     for name in ("stdout.log", "stderr.log"):

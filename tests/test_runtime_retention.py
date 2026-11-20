@@ -3975,7 +3975,7 @@ class RuntimeRetentionTests(unittest.TestCase):
         # the origin is not an authenticated DecisionReview. All such evidence
         # must remain visible to the Captain full scan after retention.
         self.assertTrue(PRODUCTION_JOB_RETENTION_AUTHORITY())
-        for case in ("bound_scope", "bound_origin", "unbound_marker", "split_marker", "role_receipt"):
+        for case in ("bound_scope", "bound_origin", "unbound_marker", "split_marker", "role_attempt", "role_receipt"):
             with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 jobs = root / "jobs"
@@ -4001,9 +4001,13 @@ class RuntimeRetentionTests(unittest.TestCase):
                         b"x" * (1024 * 1024 - 4)
                         + b"GRABOWSKI_DECISION_REVIEW_V1=REJECT_THIS_REVISION\\n"
                     )
-                elif case == "role_receipt":
-                    (source / "review-role-attempt.json").write_text("{}", encoding="utf-8")
-                    (source / "review-role-attempt.json").chmod(0o600)
+                elif case in ("role_attempt", "role_receipt"):
+                    name = (
+                        "review-role-attempt.json" if case == "role_attempt"
+                        else "review-role-receipt.json"
+                    )
+                    (source / name).write_text("{}", encoding="utf-8")
+                    (source / name).chmod(0o600)
                 plan = RETENTION.build_plan(
                     minimum_job_age_seconds=50, now=1000,
                     jobs_root=jobs, archive_root=root / "archive",
