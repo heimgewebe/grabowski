@@ -842,6 +842,7 @@ TOOL_CAPABILITY_REQUIREMENTS = {
     "grabowski_bureau_acceptance_authenticate": ("bureau_mutation",),
     "grabowski_bureau_candidate_record": ("bureau_mutation",),
     "grabowski_bureau_candidate_assess": (),
+    "grabowski_bureau_task_find": (),
     "grabowski_bureau_task_propose": ("bureau_mutation",),
     "grabowski_bureau_task_review": ("bureau_mutation",),
     "grabowski_bureau_task_publish_preview": (),

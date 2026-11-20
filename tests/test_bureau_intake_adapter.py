@@ -2521,6 +2521,99 @@ class BureauFailureIdentityTests(unittest.TestCase):
         )
 
 
+class BureauTaskFinderTests(unittest.TestCase):
+    def _rows(self):
+        return [
+            {
+                "task_id": "T010",
+                "title": "Old planned source",
+                "effective_state": "cancelled",
+                "eligible": False,
+                "claim_reasons": ["state is cancelled"],
+                "claim_resources": ["repo.grabowski"],
+            },
+            {
+                "task_id": "T011",
+                "title": "Invalid legacy acceptance",
+                "effective_state": "ready",
+                "eligible": False,
+                "claim_reasons": ["invalid acceptance contract"],
+            },
+            {
+                "task_id": "T017",
+                "title": "Candidate intake",
+                "effective_state": "verified",
+                "eligible": False,
+                "claim_reasons": ["state is verified"],
+            },
+        ]
+
+    def test_state_store_truth_overrides_stale_registry_state(self):
+        with mock.patch.object(
+            intake, "_invoke_bureau", return_value={"items": self._rows()}
+        ) as invoke:
+            result = intake.grabowski_bureau_task_find("grabowski", task_id="T010")
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["tasks"][0]["effective_state"], "cancelled")
+        self.assertFalse(result["tasks"][0]["advisory_eligible"])
+        self.assertIn("frontier", invoke.call_args.args[0])
+        self.assertEqual(invoke.call_args.kwargs, {"allow_list": True})
+        self.assertIn("repo.grabowski", invoke.call_args.args[0])
+
+    def test_ready_first_and_bounded_results_are_not_claims(self):
+        with mock.patch.object(
+            intake, "_invoke_bureau", return_value={"items": self._rows()}
+        ):
+            result = intake.grabowski_bureau_task_find("grabowski", limit=2)
+        self.assertEqual([x["task_id"] for x in result["tasks"]], ["T011", "T017"])
+        self.assertIn("repair or retire", result["tasks"][0]["next_action"])
+        self.assertEqual(result["tasks"][1]["next_action"], "terminal; do not claim")
+        self.assertTrue(result["truncated"])
+        self.assertEqual(result["matching_count"], 3)
+        self.assertTrue(result["advisory_only"])
+        self.assertIn("atomic claimability", result["does_not_establish"])
+
+    def test_filters_and_no_match(self):
+        with mock.patch.object(
+            intake, "_invoke_bureau", return_value={"items": self._rows()}
+        ):
+            found = intake.grabowski_bureau_task_find(
+                "grabowski", query="candidate", state="verified"
+            )
+            missing = intake.grabowski_bureau_task_find(
+                "grabowski", task_id="nonexistent"
+            )
+        self.assertEqual([t["task_id"] for t in found["tasks"]], ["T017"])
+        self.assertEqual(missing["status"], "not_found")
+        self.assertEqual(missing["returned_count"], 0)
+
+    def test_invalid_input_and_upstream_failure_do_not_claim_success(self):
+        with mock.patch.object(intake, "_invoke_bureau") as invoke:
+            for kw in (
+                {"repo": "../secret"},
+                {"repo": "grabowski", "limit": 0},
+                {"repo": "grabowski", "state": "done"},
+                {"repo": "grabowski", "query": "a" + chr(0) + "b"},
+            ):
+                with self.assertRaises(ValueError):
+                    intake.grabowski_bureau_task_find(**kw)
+            invoke.assert_not_called()
+        failure = {
+            "kind": "grabowski_bureau_intake_adapter_failure",
+            "status": "failed",
+            "code": "bureau-runtime-unavailable",
+        }
+        with mock.patch.object(intake, "_invoke_bureau", return_value=failure):
+            self.assertEqual(
+                intake.grabowski_bureau_task_find("grabowski")["code"],
+                "bureau-runtime-unavailable",
+            )
+        with mock.patch.object(intake, "_invoke_bureau", return_value={"items": [{}]}):
+            self.assertEqual(
+                intake.grabowski_bureau_task_find("grabowski")["code"],
+                "bureau-task-find-result-invalid",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
