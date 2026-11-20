@@ -225,19 +225,23 @@ def _regular_file_identity(path: Path) -> dict[str, Any]:
         os.close(descriptor)
 
 
-def _subprocess_environment() -> dict[str, str]:
-    return {
+def _subprocess_environment(*, isolated_git_config: bool = False) -> dict[str, str]:
+    environment = {
         "HOME": str(Path.home()),
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
         "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
         "PYTHONDONTWRITEBYTECODE": "1",
-        # A public canonical snapshot must not inherit user/system Git rewrites
-        # or block for interactive SSH/credential prompts.
-        "GIT_CONFIG_NOSYSTEM": "1",
-        "GIT_CONFIG_GLOBAL": "/dev/null",
-        "GIT_TERMINAL_PROMPT": "0",
     }
+    if isolated_git_config:
+        # Isolate only public snapshot acquisition; caller-pinned Git sources
+        # retain their ordinary safe.directory and ignore configuration.
+        environment.update(
+            GIT_CONFIG_NOSYSTEM="1",
+            GIT_CONFIG_GLOBAL="/dev/null",
+            GIT_TERMINAL_PROMPT="0",
+        )
+    return environment
 
 
 def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
@@ -268,6 +272,7 @@ def _run(
     *,
     cwd: Path,
     timeout_seconds: int | float,
+    isolated_git_config: bool = False,
 ) -> subprocess.CompletedProcess[bytes]:
     if (
         isinstance(timeout_seconds, bool)
@@ -283,7 +288,7 @@ def _run(
             process = subprocess.Popen(
                 argv,
                 cwd=cwd,
-                env=_subprocess_environment(),
+                env=_subprocess_environment(isolated_git_config=isolated_git_config),
                 stdin=subprocess.DEVNULL,
                 stdout=stdout_file,
                 stderr=stderr_file,
@@ -387,7 +392,9 @@ def _repository_identity(root: Path) -> dict[str, Any]:
 
 
 @contextmanager
-def _validated_read_root(configured_root: Path) -> Iterator[Path]:
+def _validated_read_root(
+    configured_root: Path,
+) -> Iterator[tuple[Path, dict[str, Any]]]:
     """Use a clean configured checkout or a disposable canonical main clone.
 
     A dirty default checkout is another writer's work. Never reset, stash,
@@ -401,7 +408,7 @@ def _validated_read_root(configured_root: Path) -> Iterator[Path]:
     else:
         if ROOT_ENVIRONMENT in os.environ:
             # Explicit roots are pinned by the caller, not silently replaced.
-            yield configured_root
+            yield configured_root, repository
             return
         if _git_text(configured_root, ["branch", "--show-current"]) == "main":
             try:
@@ -414,7 +421,7 @@ def _validated_read_root(configured_root: Path) -> Iterator[Path]:
                 tracking_head = None
             if tracking_head == repository["head"]:
                 # Locally synchronized, not proof of current external GitHub state.
-                yield configured_root
+                yield configured_root, repository
                 return
 
     origin = _git_text(configured_root, ["remote", "get-url", "origin"])
@@ -436,6 +443,7 @@ def _validated_read_root(configured_root: Path) -> Iterator[Path]:
             ],
             cwd=Path(directory),
             timeout_seconds=SNAPSHOT_TIMEOUT_SECONDS,
+            isolated_git_config=True,
         )
         if completed.returncode != 0:
             raise SystemkatalogAdapterError(
@@ -446,7 +454,7 @@ def _validated_read_root(configured_root: Path) -> Iterator[Path]:
                     "stderr_sha256": _sha256(completed.stderr),
                 },
             )
-        _repository_identity(snapshot)
+        snapshot_repository = _repository_identity(snapshot)
         snapshot_origin = _git_text(snapshot, ["remote", "get-url", "origin"])
         if snapshot_origin != CANONICAL_MAIN_CLONE_URL:
             raise SystemkatalogAdapterError(
@@ -454,7 +462,7 @@ def _validated_read_root(configured_root: Path) -> Iterator[Path]:
                 "the temporary Systemkatalog snapshot has an unexpected origin",
                 details={"origin_sha256": _sha256(snapshot_origin.encode("utf-8"))},
             )
-        yield snapshot
+        yield snapshot, snapshot_repository
 
 
 def _validate_payload(
@@ -643,8 +651,17 @@ def query_systemkatalog(
     try:
         normalized_value = _bounded_value(normalized_operation, value)
         configured_root = _configured_root()
-        with _validated_read_root(configured_root) as root:
+        with _validated_read_root(configured_root) as (root, selected_identity):
             repository = _repository_identity(root)
+            if repository != selected_identity:
+                raise SystemkatalogAdapterError(
+                    "repository_changed",
+                    "the Systemkatalog source changed after selection",
+                    details={
+                        "before_head": selected_identity.get("head"),
+                        "after_head": repository.get("head"),
+                    },
+                )
             script = _regular_file_identity(root / QUERY_SCRIPT)
             argv = [
                 sys.executable,
@@ -661,15 +678,27 @@ def query_systemkatalog(
                 timeout_seconds=QUERY_TIMEOUT_SECONDS,
             )
             post_repository = _repository_identity(root)
-            if post_repository != repository:
+            if post_repository != selected_identity:
                 raise SystemkatalogAdapterError(
                     "repository_changed",
                     "the Systemkatalog repository identity changed during the query",
                     details={
-                        "before_head": repository.get("head"),
+                        "before_head": selected_identity.get("head"),
                         "after_head": post_repository.get("head"),
                     },
                 )
+            if root == configured_root and ROOT_ENVIRONMENT not in os.environ:
+                # The original main/tracking selection must still apply after
+                # the query, even if a writer switched branches without moving HEAD.
+                if (
+                    _git_text(root, ["branch", "--show-current"]) != "main"
+                    or _git_text(root, ["rev-parse", "--verify", "refs/remotes/origin/main"])
+                    != selected_identity["head"]
+                ):
+                    raise SystemkatalogAdapterError(
+                        "repository_changed",
+                        "the default Systemkatalog main binding changed during the query",
+                    )
             post_script = _regular_file_identity(root / QUERY_SCRIPT)
             if post_script != script:
                 raise SystemkatalogAdapterError(
