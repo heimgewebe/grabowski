@@ -9,11 +9,16 @@ import os
 from pathlib import Path
 import sqlite3
 import tempfile
+import sys
 import types
 import unittest
 from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT / "src") not in sys.path:
+    sys.path.insert(0, str(ROOT / "src"))
+import grabowski_job_origin as job_origin
+
 SPEC = importlib.util.spec_from_file_location(
     "maintain_runtime_state_test", ROOT / "tools" / "maintain_runtime_state.py"
 )
@@ -99,18 +104,29 @@ class RuntimeRetentionTests(unittest.TestCase):
             index.chmod(0o600)
         directory = root / name
         directory.mkdir(mode=0o700)
+        metadata_payload = {
+            "unit": name,
+            "created_at_unix": created_at,
+            "runtime_seconds": runtime_seconds,
+        }
+        if (
+            job_origin.UNIT_RE.fullmatch(name)
+            and isinstance(created_at, int) and not isinstance(created_at, bool)
+            and created_at >= 0
+        ):
+            origin, origin_sha256 = job_origin.build_origin(
+                unit=name, owner=f"uid:{os.getuid()}", argv_sha256="0" * 64,
+                scope={}, notify_on_done={"requested": False, "channels": []},
+                created_at_unix=created_at, started_at="1970-01-01T00:00:00Z",
+                invoker_tool="grabowski_task_start",
+            )
+            metadata_payload.update({
+                **{key: origin[key] for key in
+                   ("job_id", "owner", "argv_sha256", "scope")},
+                "origin": origin, "origin_sha256": origin_sha256,
+            })
         for path, content in (
-            (
-                directory / "metadata.json",
-                json.dumps(
-                    {
-                        "unit": name,
-                        "created_at_unix": created_at,
-                        "runtime_seconds": runtime_seconds,
-                    }
-                )
-                + "\n",
-            ),
+            (directory / "metadata.json", json.dumps(metadata_payload) + "\n"),
             (directory / "stdout.log", "done\n"),
             (directory / "stderr.log", ""),
         ):
@@ -4021,6 +4037,36 @@ class RuntimeRetentionTests(unittest.TestCase):
                     item["unit"] == unit and "decision-review evidence" in item["reason"]
                     for item in plan["blocked"]
                 ), plan["blocked"])
+                self.assertTrue((source / "metadata.json").exists())
+                self.assertFalse((root / "archive" / name).exists())
+
+    def test_missing_forged_or_mismatched_origin_never_archived(self) -> None:
+        for case in ("missing", "invalid_sha", "mirrored_scope"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                jobs = root / "jobs"
+                name = "grabowski-job-aaaaaaaaaaaa"
+                unit = name + ".service"
+                source = self._job(jobs, name, 100)
+                metadata = source / "metadata.json"
+                value = json.loads(metadata.read_text(encoding="utf-8"))
+                if case == "missing":
+                    del value["origin"]
+                elif case == "invalid_sha":
+                    value["origin_sha256"] = "0" * 64
+                else:
+                    value["scope"] = {"unexpected": "drift"}
+                metadata.write_text(json.dumps(value), encoding="utf-8")
+                metadata.chmod(0o600)
+                plan = RETENTION.build_plan(
+                    minimum_job_age_seconds=50, now=1000,
+                    jobs_root=jobs, archive_root=root / "archive",
+                    receipt_root=root / "receipts",
+                    task_db=root / "missing.sqlite3", failed_units=[],
+                    unit_states={unit: self._state(unit)},
+                )
+                self.assertEqual(plan["archive_jobs"], [])
+                self.assertEqual(plan["reset_failed_units"], [])
                 self.assertTrue((source / "metadata.json").exists())
                 self.assertFalse((root / "archive" / name).exists())
 

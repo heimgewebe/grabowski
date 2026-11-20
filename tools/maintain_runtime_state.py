@@ -1286,7 +1286,7 @@ class _PinnedRetentionPlan(dict):
 DECISION_REVIEW_RESULT_MARKER = b"GRABOWSKI_DECISION_REVIEW_V1="
 
 
-def _job_contains_decision_review_evidence(job_fd: int) -> bool:
+def _job_contains_decision_review_evidence(job_fd: int, *, job_name: str) -> bool:
     """Keep all review and ambiguous marker evidence in the live scan root.
 
     Review reconciliation also examines stdout of *ordinary* jobs for a late
@@ -1303,18 +1303,26 @@ def _job_contains_decision_review_evidence(job_fd: int) -> bool:
         raise RuntimeError("job metadata cannot establish review-free provenance") from exc
     if not isinstance(metadata, dict):
         raise RuntimeError("job metadata is not an object")
-    for origin in (metadata, metadata.get("origin")):
-        if origin is None:
-            continue
-        if not isinstance(origin, dict):
-            raise RuntimeError("job origin cannot establish review-free provenance")
-        scope = origin.get("scope")
-        if scope is None:
-            continue
-        if not isinstance(scope, dict):
-            raise RuntimeError("job scope cannot establish review-free provenance")
-        if "decision_bound_review" in scope:
+    # Captain treats missing, forged or mismatched job origins as potentially
+    # hiding a review. Retention must obey exactly the same provenance rule;
+    # never turn a Captain fail-closed condition into a clean merge by moving it.
+    source = str(SRC)
+    if source not in sys.path:
+        sys.path.insert(0, source)
+    import grabowski_job_origin as job_origin
+
+    try:
+        origin = job_origin.validate_origin(
+            metadata.get("origin"), metadata.get("origin_sha256"),
+            expected_unit=job_name,
+        )
+    except ValueError:
+        return True
+    for key in ("unit", "job_id", "owner", "argv_sha256", "scope"):
+        if metadata.get(key) != origin.get(key):
             return True
+    if "decision_bound_review" in origin["scope"]:
+        return True
     for receipt_name in ("review-role-attempt.json", "review-role-receipt.json"):
         try:
             os.stat(receipt_name, dir_fd=job_fd, follow_symlinks=False)
@@ -1613,7 +1621,7 @@ def build_plan(
                 pinned.jobs_fd, source_dir.name, source_dir
             )
             try:
-                if _job_contains_decision_review_evidence(source_fd):
+                if _job_contains_decision_review_evidence(source_fd, job_name=record["job_name"]):
                     archive_blocked_units.add(record["unit"])
                     # A complete review is intentionally retained, not a
                     # maintenance error. Only failed-unit reset requests
@@ -2648,7 +2656,7 @@ def _prepare_archives(
         if source_pins is not None:
             source_pins.callback(os.close, source_fd)
         try:
-            if _job_contains_decision_review_evidence(source_fd):
+            if _job_contains_decision_review_evidence(source_fd, job_name=record["job_name"]):
                 raise RuntimeError(
                     "decision-review evidence appeared before archive; preserve source"
                 )
