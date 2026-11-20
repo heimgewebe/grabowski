@@ -365,6 +365,8 @@ class SystemkatalogSurfaceTests(unittest.TestCase):
     def test_disposable_snapshot_wrong_origin_fails_closed(self) -> None:
         failure = surface.SystemkatalogAdapterError("repository_dirty", "dirty")
         with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+            surface, "_configured_root", return_value=self.root
+        ), mock.patch.object(
             surface, "_repository_identity", side_effect=[failure, self.repository_identity]
         ), mock.patch.object(
             surface, "_git_text",
@@ -384,6 +386,8 @@ class SystemkatalogSurfaceTests(unittest.TestCase):
             "subprocess_timeout", "timeout", details={"timeout_seconds": 30}
         )
         with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+            surface, "_configured_root", return_value=self.root
+        ), mock.patch.object(
             surface, "_repository_identity", side_effect=failure
         ), mock.patch.object(
             surface, "_git_text", return_value=surface.CANONICAL_MAIN_CLONE_URL
