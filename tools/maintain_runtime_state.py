@@ -47,6 +47,8 @@ TERMINAL_TASK_STATES = {
 }
 MAX_FAILED_UNITS = 2_000
 MAX_JOB_SCAN_ENTRIES = 2_000
+# Rotate bounded job windows without adding a cursor store or widening review scans.
+JOB_SCAN_WINDOW_SECONDS = 60 * 60
 MAX_JOB_REGISTRY_ENTRIES = 100_000
 MAX_ARCHIVE_JOBS_PER_PLAN = 128
 MAX_JOB_RUNTIME_SECONDS = 2_592_000
@@ -1504,14 +1506,32 @@ def build_plan(
     pending_deploy_job = (
         deploy_index["pending_unit"] if deploy_index is not None else None
     )
-    primary_entries = registry_entries[:MAX_JOB_SCAN_ENTRIES]
+    # A fixed alphabetical prefix starves later jobs forever if its members
+    # carry permanent review evidence. Each bounded time slot chooses the next
+    # page; failed jobs remain force-included independently of this page.
+    # The installed hourly calendar timer revisits every page even when all earlier jobs
+    # must remain in the source root.
+    job_scan_window_count = max(
+        1, (len(registry_entries) + MAX_JOB_SCAN_ENTRIES - 1) // MAX_JOB_SCAN_ENTRIES
+    )
+    job_scan_window_index = (
+        (observed_now // JOB_SCAN_WINDOW_SECONDS) % job_scan_window_count
+        if authorized_job_effects else 0
+    )
+    job_scan_start = job_scan_window_index * MAX_JOB_SCAN_ENTRIES
+    primary_entries = registry_entries[
+        job_scan_start:job_scan_start + MAX_JOB_SCAN_ENTRIES
+    ]
     failed_job_names = {
         unit.removesuffix(".service")
         for unit in failed
         if JOB_UNIT.fullmatch(unit)
     }
     selected_by_name = {entry.name: entry for entry in primary_entries}
-    for entry in registry_entries[MAX_JOB_SCAN_ENTRIES:]:
+    # A rotated page is not necessarily the alphabetical prefix. Force
+    # failed units from the entire discovered registry, including names
+    # lexically before the selected page.
+    for entry in registry_entries:
         if entry.name in failed_job_names:
             selected_by_name[entry.name] = entry
     entries = sorted(selected_by_name.values(), key=lambda entry: entry.name)
@@ -1769,6 +1789,8 @@ def build_plan(
         "job_registry_entry_count": len(registry_entries),
         "job_registry_discovery_truncated": job_registry_discovery_truncated,
         "job_scan_count": len(entries),
+        "job_scan_window_index": job_scan_window_index,
+        "job_scan_window_count": job_scan_window_count,
         "job_scan_truncated": job_scan_truncated,
         "job_scan_deferred_count": job_scan_deferred_count,
         "archive_inventory_complete": not job_scan_truncated,
@@ -3932,13 +3954,18 @@ def apply_periodic_plan(
     as a successful no-op so repeated timer runs remain idempotent without
     manufacturing duplicate terminal receipts.
     """
+    # One clock snapshot binds both periodic plans to the same scan window.
+    # A slot boundary during revalidation must not manufacture plan drift.
+    cycle_now = int(time.time())
     preview = build_plan(
         minimum_job_age_seconds=minimum_job_age_seconds,
         max_archive_jobs=max_archive_jobs,
+        now=cycle_now,
     )
     current = build_plan(
         minimum_job_age_seconds=minimum_job_age_seconds,
         max_archive_jobs=max_archive_jobs,
+        now=cycle_now,
     )
     if current["plan_sha256"] != preview["plan_sha256"]:
         raise RuntimeError("retention plan drifted between periodic snapshots")
