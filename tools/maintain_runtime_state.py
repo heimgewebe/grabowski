@@ -76,15 +76,14 @@ LEGACY_SELF_DEPLOY_REASON = (
 
 
 def _protected_job_retention_authority() -> bool:
-    """No protected root/index transaction exists for automatic job effects.
+    """Trusted-owner authority: same-UID hostile processes are not the boundary.
 
-    Same-UID owner/mode checks and in-process FD pins cannot authenticate an
-    already replaced jobs/archive root or serialize an index reservation with
-    an archive rename. Until a separately privileged implementation exists,
-    automatic job moves and systemd job resets must remain disabled.
-    This is not a runtime configuration switch or a security attestation.
+    Existing pinned-FD, no-replace, deployment-index, receipts and audit checks
+    still protect against accidental drift, corruption and data loss. Jobs
+    carrying any decision-review evidence are ineligible for retention below.
+    This is not a claim of resistance to a compromised same-UID process.
     """
-    return False
+    return True
 
 
 def _canonical_json(value: Any) -> bytes:
@@ -1284,6 +1283,85 @@ class _PinnedRetentionPlan(dict):
                 setattr(self, field, -1)
 
 
+DECISION_REVIEW_RESULT_MARKER = b"GRABOWSKI_DECISION_REVIEW_V1="
+
+
+def _job_contains_decision_review_evidence(job_fd: int) -> bool:
+    """Keep all review and ambiguous marker evidence in the live scan root.
+
+    Review reconciliation also examines stdout of *ordinary* jobs for a late
+    material REJECT. Merely checking decision_bound_review would hide these.
+    Inspect the pinned job inode, never a pathname that can be substituted.
+    """
+    try:
+        raw, _ = _archive_pinned_json_preimage(job_fd, "metadata.json")
+    except OSError as exc:
+        raise RuntimeError("archive source file is unavailable: metadata.json") from exc
+    try:
+        metadata = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("job metadata cannot establish review-free provenance") from exc
+    if not isinstance(metadata, dict):
+        raise RuntimeError("job metadata is not an object")
+    for origin in (metadata, metadata.get("origin")):
+        if origin is None:
+            continue
+        if not isinstance(origin, dict):
+            raise RuntimeError("job origin cannot establish review-free provenance")
+        scope = origin.get("scope")
+        if scope is None:
+            continue
+        if not isinstance(scope, dict):
+            raise RuntimeError("job scope cannot establish review-free provenance")
+        if "decision_bound_review" in scope:
+            return True
+    try:
+        os.stat("review-role-attempt.json", dir_fd=job_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        pass
+    else:
+        return True
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+    marker = DECISION_REVIEW_RESULT_MARKER
+    for name in ("stdout.log", "stderr.log"):
+        try:
+            descriptor = os.open(name, flags, dir_fd=job_fd)
+        except FileNotFoundError:
+            continue
+        try:
+            before = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_nlink != 1
+                or before.st_uid != os.getuid()
+                or stat.S_IMODE(before.st_mode) & 0o077
+                or before.st_size > MAX_ARCHIVE_FILE_BYTES
+            ):
+                raise RuntimeError("job log cannot establish review-free provenance")
+            remaining, suffix = before.st_size, b""
+            while remaining:
+                chunk = os.read(descriptor, min(1024 * 1024, remaining))
+                if not chunk:
+                    raise RuntimeError("job log changed during review-evidence scan")
+                window = suffix + chunk
+                if marker in window:
+                    return True
+                suffix = window[-(len(marker) - 1):]
+                remaining -= len(chunk)
+            after = os.fstat(descriptor)
+            if (
+                before.st_dev, before.st_ino, before.st_size,
+                before.st_mtime_ns, before.st_ctime_ns,
+            ) != (
+                after.st_dev, after.st_ino, after.st_size,
+                after.st_mtime_ns, after.st_ctime_ns,
+            ):
+                raise RuntimeError("job log changed during review-evidence scan")
+        finally:
+            os.close(descriptor)
+    return False
+
+
 def build_plan(
     *,
     minimum_job_age_seconds: int = 86_400,
@@ -1534,6 +1612,10 @@ def build_plan(
                 pinned.jobs_fd, source_dir.name, source_dir
             )
             try:
+                if _job_contains_decision_review_evidence(source_fd):
+                    archive_blocked_units.add(record["unit"])
+                    block(record["unit"], "decision-review evidence must remain in live jobs")
+                    continue
                 _archive_require_json_temp_capacity(source_fd)
                 _archive_require_child_bound(
                     pinned.jobs_fd, source_dir.name, source_fd, source_dir
@@ -2561,6 +2643,10 @@ def _prepare_archives(
         if source_pins is not None:
             source_pins.callback(os.close, source_fd)
         try:
+            if _job_contains_decision_review_evidence(source_fd):
+                raise RuntimeError(
+                    "decision-review evidence appeared before archive; preserve source"
+                )
             # The metadata used for terminal/age authorization must be from
             # THIS source inode. A same-UID peer can rename the basename
             # between the earlier record read and this source open.

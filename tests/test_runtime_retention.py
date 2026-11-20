@@ -3970,8 +3970,75 @@ class RuntimeRetentionTests(unittest.TestCase):
                 )
             self.assertTrue((jobs / genuine_name / "metadata.json").is_file())
 
-    def test_production_job_archive_and_reset_fail_closed_without_broker(self) -> None:
-        self.assertFalse(PRODUCTION_JOB_RETENTION_AUTHORITY())
+    def test_review_evidence_never_archived_or_reset_with_trusted_owner(self) -> None:
+        # Ordinary-job stdout can contain a material REJECT marker even when
+        # the origin is not an authenticated DecisionReview. All such evidence
+        # must remain visible to the Captain full scan after retention.
+        self.assertTrue(PRODUCTION_JOB_RETENTION_AUTHORITY())
+        for case in ("bound_scope", "bound_origin", "unbound_marker", "split_marker", "role_receipt"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                jobs = root / "jobs"
+                name = "grabowski-job-aaaaaaaaaaaa"
+                unit = name + ".service"
+                source = self._job(jobs, name, 100)
+                metadata = source / "metadata.json"
+                if case in ("bound_scope", "bound_origin"):
+                    value = json.loads(metadata.read_text(encoding="utf-8"))
+                    scope = {"decision_bound_review": {"repo": "heimgewebe/grabowski"}}
+                    if case == "bound_scope":
+                        value["scope"] = scope
+                    else:
+                        value["origin"] = {"scope": scope}
+                    metadata.write_text(json.dumps(value), encoding="utf-8")
+                    metadata.chmod(0o600)
+                elif case == "unbound_marker":
+                    (source / "stdout.log").write_bytes(
+                        b"ordinary output\\nGRABOWSKI_DECISION_REVIEW_V1={\\\"verdict\\\":\\\"REJECT_THIS_REVISION\\\"}\\n"
+                    )
+                elif case == "split_marker":
+                    (source / "stdout.log").write_bytes(
+                        b"x" * (1024 * 1024 - 4)
+                        + b"GRABOWSKI_DECISION_REVIEW_V1=REJECT_THIS_REVISION\\n"
+                    )
+                elif case == "role_receipt":
+                    (source / "review-role-attempt.json").write_text("{}", encoding="utf-8")
+                    (source / "review-role-attempt.json").chmod(0o600)
+                plan = RETENTION.build_plan(
+                    minimum_job_age_seconds=50, now=1000,
+                    jobs_root=jobs, archive_root=root / "archive",
+                    receipt_root=root / "receipts",
+                    task_db=root / "missing.sqlite3", failed_units=[unit],
+                    unit_states={unit: self._state(unit)},
+                )
+                self.assertEqual(plan["archive_jobs"], [])
+                self.assertNotIn(unit, plan["reset_failed_units"])
+                self.assertTrue(any(
+                    item["unit"] == unit and "decision-review evidence" in item["reason"]
+                    for item in plan["blocked"]
+                ), plan["blocked"])
+                self.assertTrue((source / "metadata.json").exists())
+                self.assertFalse((root / "archive" / name).exists())
+
+    def test_trusted_owner_can_plan_review_free_terminal_archive(self) -> None:
+        self.assertTrue(PRODUCTION_JOB_RETENTION_AUTHORITY())
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs = root / "jobs"
+            name = "grabowski-job-aaaaaaaaaaaa"
+            unit = name + ".service"
+            self._job(jobs, name, 100)
+            plan = RETENTION.build_plan(
+                minimum_job_age_seconds=50, now=1000,
+                jobs_root=jobs, archive_root=root / "archive",
+                receipt_root=root / "receipts",
+                task_db=root / "missing.sqlite3", failed_units=[],
+                unit_states={unit: self._state(unit)},
+            )
+            self.assertEqual([item["unit"] for item in plan["archive_jobs"]], [unit])
+
+    def test_job_archive_and_reset_fail_closed_when_owner_authority_revoked(self) -> None:
+        self.assertTrue(PRODUCTION_JOB_RETENTION_AUTHORITY())
         self._simulated_protected_authority.return_value = False
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
