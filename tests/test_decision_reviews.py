@@ -3334,6 +3334,129 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
                                 )
                             ), checked["errors"])
 
+    def test_late_ordinary_stderr_append_is_prefix_bound_and_cannot_hide_reject(self) -> None:
+        # Real non-review jobs may stream stderr throughout a long fleet scan.
+        # Ordinary append is not a review decision; a rewritten old prefix,
+        # appended exact-head REJECT, or changed role receipt still hard-blocks.
+        for variant in ("append", "append_both", "late_reject", "rewrite_then_append"):
+            with self.subTest(variant=variant):
+                with tempfile.TemporaryDirectory() as temp:
+                    jobs = Path(temp) / "jobs"
+                    jobs.mkdir(mode=0o700)
+                    ordinary = jobs / "grabowski-job-aaaaaaaaa501"
+                    ordinary.mkdir(mode=0o700)
+                    scope = {
+                        "cwd": "/tmp", "argv_sha256": "e" * 64,
+                        "runtime_seconds": 60,
+                    }
+                    origin, digest = job_origin.build_origin(
+                        unit=ordinary.name, owner=f"uid:{os.getuid()}",
+                        argv_sha256="e" * 64, scope=scope,
+                        notify_on_done={"requested": False, "channels": []},
+                        created_at_unix=1_787_000_000,
+                        started_at="2026-08-18T12:00:00Z",
+                        invoker_tool="grabowski_job_start",
+                    )
+                    write_private(ordinary / "metadata.json", json.dumps({
+                        "unit": ordinary.name, "job_id": origin["job_id"],
+                        "owner": origin["owner"],
+                        "argv_sha256": origin["argv_sha256"],
+                        "scope": scope, "origin": origin, "origin_sha256": digest,
+                    }))
+                    stdout = ordinary / "stdout.log"
+                    stderr = ordinary / "stderr.log"
+                    write_private(stdout, "unrelated stdout\n")
+                    write_private(stderr, "unrelated diagnostic\n")
+                    reviewer = make_job(
+                        jobs, suffix="bbbbbbbbb502", slot="A",
+                        terminal_status="succeeded",
+                        review_result=result("A", "PASS_THIS_REVISION", 0),
+                    )
+                    initial_inode = stderr.stat().st_ino
+                    original = reviews._validated_origin_binding
+                    changed = False
+
+                    def append_during_later_review(directory, *args, **kwargs):
+                        nonlocal changed
+                        if directory == reviewer and not changed:
+                            if variant in {"append", "append_both"}:
+                                with stderr.open("ab") as stream:
+                                    stream.write(b"progress after initial scan\n")
+                                if variant == "append_both":
+                                    with stdout.open("ab") as stream:
+                                        stream.write(b"other stdout progress\n")
+                            elif variant == "late_reject":
+                                with stderr.open("ab") as stream:
+                                    marker = reviews.RESULT_PREFIX + json.dumps(
+                                        result("A", "REJECT_THIS_REVISION", 1)
+                                    ) + "\n"
+                                    stream.write(marker.encode("utf-8"))
+                            else:
+                                with stderr.open("r+b") as stream:
+                                    stream.write(b"X")
+                                    stream.seek(0, os.SEEK_END)
+                                    stream.write(b"apparent normal progress\n")
+                            changed = True
+                        return original(directory, *args, **kwargs)
+
+                    with mock.patch.object(
+                        reviews, "_validated_origin_binding",
+                        side_effect=append_during_later_review,
+                    ):
+                        checked = self.reconcile(jobs)
+                    self.assertTrue(changed)
+                    self.assertEqual(stderr.stat().st_ino, initial_inode)
+                    if variant in {"append", "append_both"}:
+                        self.assertEqual(checked["status"], "settled", checked)
+                        self.assertEqual(checked["errors"], [])
+                    elif variant == "late_reject":
+                        self.assertEqual(checked["status"], "blocked")
+                        self.assertIn(
+                            f"decision_review_unbound_result:{ordinary.name}",
+                            checked["errors"],
+                        )
+                    else:
+                        self.assertEqual(checked["status"], "blocked")
+                        self.assertIn(
+                            "decision_review_job_file_changed", checked["errors"],
+                        )
+
+    def test_late_review_bound_stderr_append_still_blocks(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            jobs = Path(temp) / "jobs"
+            jobs.mkdir(mode=0o700)
+            earlier = make_job(
+                jobs, suffix="aaaaaaaaa501", slot="A",
+                terminal_status="succeeded",
+                review_result=result("A", "PASS_THIS_REVISION", 0),
+            )
+            later = make_job(
+                jobs, suffix="bbbbbbbbb502", slot="B",
+                terminal_status="succeeded",
+                review_result=result("B", "PASS_THIS_REVISION", 0),
+            )
+            original = reviews._validated_origin_binding
+            changed = False
+
+            def mutate_bound_review(directory, *args, **kwargs):
+                nonlocal changed
+                if directory == later and not changed:
+                    with (earlier / "stderr.log").open("ab") as stream:
+                        stream.write(b"changed bound review output\n")
+                    changed = True
+                return original(directory, *args, **kwargs)
+
+            with mock.patch.object(
+                reviews, "_validated_origin_binding",
+                side_effect=mutate_bound_review,
+            ):
+                checked = self.reconcile(jobs)
+            self.assertTrue(changed)
+            self.assertEqual(checked["status"], "blocked")
+            self.assertIn(
+                "decision_review_job_file_changed", checked["errors"],
+            )
+
     def test_late_inplace_stdout_rewrite_blocks_first_settlement(self) -> None:
         # Unlike new directory entries, rewriting an existing stdout inode
         # leaves the containing job directory timestamps unchanged.
