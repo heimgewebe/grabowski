@@ -518,7 +518,7 @@ _COMPLETE_SIGNAL_FIELDS = frozenset({
     "operation", "timestamp", "record_sha256", "plan_sha256", "attempt",
     "receipt_sha256", "intent_record_sha256", "reconciliation_kind",
     "completed", "retention_effect_retried", "outcome_unknown",
-    "launcher_outcome_unknown", "recovery_required", "task_id",
+    "launcher_outcome_unknown", "launcher_returncode", "recovery_required", "task_id",
     "authoritative_unit", "unit",
 })
 
@@ -568,6 +568,65 @@ def _audit_complete_signal_records(
         raise RuntimeError("verified audit signal scan did not cover the full chain")
     return selected
 
+
+def _audit_rootbroker_preclaim_refusal_proven(row: dict[str, Any]) -> bool:
+    """Reduce a persisted, request-bound root refusal to a no-dispatch fact.
+
+    Do not classify generic failed starts, denied status reads, ambiguous
+    broker responses or a caller's asserted flag as evidence of no effect.
+    The caller separately verifies the exact terminal TaskStore projection.
+    """
+    if row.get("state") != "failed" or row.get("execution_backend") != "systemd-root-broker":
+        return False
+    raw = row.get("launcher_json")
+    if not isinstance(raw, str):
+        return False
+    try:
+        launcher = json.loads(raw)
+    except (ValueError, TypeError):
+        return False
+    if not isinstance(launcher, dict):
+        return False
+    invoked = launcher.get("privileged_broker")
+    if not isinstance(invoked, dict):
+        return False
+    refusal = invoked.get("broker_response")
+    if not isinstance(refusal, dict) or set(refusal) != {
+        "schema_version", "kind", "request_id", "reference_sha256",
+        "action", "phase", "claim_started", "dispatch_started", "reason_code",
+    }:
+        return False
+    request = invoked.get("request_id")
+    reference = invoked.get("reference_sha256")
+    return bool(
+        launcher.get("pre_effect_refused") is True
+        and launcher.get("launch_not_dispatched") is True
+        and launcher.get("outcome_unknown") is False
+        and type(launcher.get("returncode")) is int
+        and launcher["returncode"] == 1
+        and launcher.get("timed_out") is False
+        and launcher.get("stdout_truncated") is False
+        and launcher.get("stderr_truncated") is False
+        and type(invoked.get("broker_client_returncode")) is int
+        and invoked["broker_client_returncode"] == 1
+        and invoked.get("broker_client_timed_out") is False
+        and invoked.get("stdout_truncated") is False
+        and invoked.get("stderr_truncated") is False
+        and isinstance(request, str)
+        and re.fullmatch(r"[0-9a-f]{32}", request) is not None
+        and isinstance(reference, str)
+        and re.fullmatch(r"[0-9a-f]{64}", reference) is not None
+        and refusal.get("schema_version") == 1
+        and type(refusal["schema_version"]) is int
+        and refusal.get("kind") == "grabowski.root_task_systemd_pre_effect_refusal.v1"
+        and refusal.get("request_id") == request
+        and refusal.get("reference_sha256") == reference
+        and refusal.get("action") == "operator_root_task_systemd_unit"
+        and refusal.get("phase") == "pre_claim"
+        and refusal.get("claim_started") is False
+        and refusal.get("dispatch_started") is False
+        and refusal.get("reason_code") in {"action_resolution", "peer_authority"}
+    )
 
 def _prepare_audit_records(
     records: list[dict[str, Any]],
@@ -1873,6 +1932,11 @@ def grabowski_audit_projection(
             "terminalization_sha256": row.get("terminalization_sha256"),
             "terminalized_at_unix": row.get("terminalized_at_unix"),
             "terminal_evidence_valid": terminal_evidence_valid,
+            "created_at_unix": row.get("created_at_unix"),
+            "pre_effect_refusal_proven": (
+                terminal_evidence_valid
+                and _audit_rootbroker_preclaim_refusal_proven(row)
+            ),
         }
 
     # Audit record timestamps are not an append-order invariant: the append
