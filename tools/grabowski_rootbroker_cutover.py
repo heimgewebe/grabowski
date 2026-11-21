@@ -10,6 +10,7 @@ import fcntl
 import hashlib
 import json
 import os
+import pwd
 import re
 from pathlib import Path, PurePosixPath
 import signal
@@ -2985,12 +2986,13 @@ def _restore_preimages(
 
 
 def _operator_username(runner: RunCommand) -> str:
-    argv = ["/usr/bin/id", "-nu", "1000"]
-    completed = runner(argv)
-    if completed.returncode != 0:
-        detail = (completed.stderr or completed.stdout or "uid lookup failed").strip()
-        raise CutoverError(f"operator account uid 1000 is unavailable: {detail[:500]}")
-    if completed.stdout not in {"alex", "alex\n"}:
+    # Resolve the host's real NSS identity without assuming /usr/bin/id;
+    # on NixOS /usr is read-only and that executable can be absent.
+    try:
+        username = pwd.getpwuid(1000).pw_name
+    except (KeyError, OSError) as exc:
+        raise CutoverError("operator account uid 1000 is unavailable") from exc
+    if username != "alex":
         raise CutoverError("operator account identity differs from host contract")
     return "alex"
 
