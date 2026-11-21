@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import secrets
 import shlex
+import shutil
 import stat
 import subprocess
 import threading
@@ -7804,33 +7805,57 @@ def _deployment_schedule_preflight(
 
 
 def _public_git_main_fallback() -> str:
-    """Read exact public main via Git when anonymous GitHub REST is rate-limited.
+    """Verify the fixed public GitHub main ref outside all local Git config.
 
-    The fixed HTTPS upload-pack target avoids the shared anonymous API quota;
-    no local ref, credential helper or mutable workspace ref is authoritative.
+    Repository/global URL insteadOf rewriting may target a stale mirror.
+    Run Git outside any checkout with only the explicit environment below so
+    the actual HTTPS target stays public GitHub.
     """
-    result = _git_result(
-        CANONICAL_REPOSITORY,
+    git_bin = shutil.which("git")
+    if not isinstance(git_bin, str) or not Path(git_bin).is_absolute():
+        raise RuntimeError("fresh public GitHub main Git executable unavailable")
+    argv = [
+        git_bin,
         "-c", "credential.helper=",
         "-c", "http.extraHeader=",
-        "-c", "core.askPass=/bin/false",
+        "-c", "protocol.file.allow=never",
         "ls-remote", "--exit-code", "--refs",
         PUBLIC_GITHUB_REPOSITORY_URL, PUBLIC_GITHUB_MAIN_REF,
-        max_output_bytes=PUBLIC_GITHUB_LOOKUP_MAX_BYTES,
-    )
+    ]
+    try:
+        completed = subprocess.run(
+            argv, cwd="/", check=False, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=PUBLIC_GITHUB_LOOKUP_TIMEOUT_SECONDS,
+            env={
+                "PATH": "/usr/bin:/bin",
+                "HOME": "/dev/null",
+                "XDG_CONFIG_HOME": "/dev/null",
+                "LANG": "C.UTF-8",
+                "LC_ALL": "C.UTF-8",
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_SYSTEM": "/dev/null",
+                "GIT_CONFIG_GLOBAL": "/dev/null",
+                "GIT_CONFIG_COUNT": "0",
+                "GIT_TERMINAL_PROMPT": "0",
+            },
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError("fresh public GitHub main Git fallback failed") from exc
     if (
-        type(result.get("returncode")) is not int
-        or result["returncode"] != 0
-        or result.get("timed_out") is not False
-        or result.get("stdout_truncated") is not False
-        or result.get("stderr_truncated") is not False
-        or result.get("stderr") != ""
-        or not isinstance(result.get("stdout"), str)
+        type(completed.returncode) is not int
+        or completed.returncode != 0
+        or not isinstance(completed.stdout, bytes)
+        or not isinstance(completed.stderr, bytes)
+        or len(completed.stdout) > PUBLIC_GITHUB_LOOKUP_MAX_BYTES
+        or len(completed.stderr) > PUBLIC_GITHUB_LOOKUP_MAX_BYTES
+        or completed.stderr
     ):
         raise RuntimeError("fresh public GitHub main Git fallback failed")
+    output = completed.stdout.decode("ascii", errors="strict")
     match = re.fullmatch(
         r"([0-9a-f]{40})\t" + re.escape(PUBLIC_GITHUB_MAIN_REF) + r"\n?",
-        result["stdout"],
+        output,
     )
     if match is None:
         raise RuntimeError("fresh public GitHub main Git fallback returned invalid ref")
