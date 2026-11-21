@@ -367,6 +367,14 @@ class FakeRunner:
 
 
 class RootbrokerCutoverTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # Simulated systemd cutovers must not depend on the CI host's UID 1000.
+        host_account = patch.object(
+            cutover.pwd, "getpwuid", return_value=SimpleNamespace(pw_name="alex")
+        )
+        host_account.start()
+        self.addCleanup(host_account.stop)
+
     def test_fatal_error_projection_is_bounded_stderr_and_preserves_stdout_json(self) -> None:
         message = "first\nsecond " + ("x" * 2000)
         failure = cutover.CutoverError(message)
@@ -2553,6 +2561,13 @@ class RootbrokerCutoverTests(unittest.TestCase):
 
 
 class BackupMountReconcileCutoverContractTests(unittest.TestCase):
+    def setUp(self) -> None:
+        host_account = patch.object(
+            cutover.pwd, "getpwuid", return_value=SimpleNamespace(pw_name="alex")
+        )
+        host_account.start()
+        self.addCleanup(host_account.stop)
+
     def test_reconcile_action_and_helper_are_commit_bound(self) -> None:
         observed = cutover._local_backup_ntfs_actions_from_repository(
             ROOT, expected_head=HEAD, runner=FakeRunner()
