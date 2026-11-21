@@ -581,7 +581,7 @@
     },
     {
       "category": "operations-observability",
-      "description": "Project verified audit-chain records into bounded operational trends.",
+      "description": "Read bounded audit trends; optionally scan the full chain for 7d signals.\n\ncomplete_signals is an explicit slower, read-only operation. It does not\nchange the bounded trend summaries or claim full all-time coverage.",
       "effects": [],
       "id": "grabowski_audit_projection",
       "purpose": "Derive bounded source-bound operational trends from the verified audit chain.",
@@ -3911,7 +3911,7 @@
       "src/grabowski_privileged.py": "dbe6fc34230ac20f9ed611049ce1332785a26874bd5ccb45a1133599b4cf5a55",
       "src/grabowski_privileged_broker.py": "d43c37ffa9fa154ae7ce53b6c3620b72cff62ecf0eabbf14f60639097f526829",
       "src/grabowski_provenance_recovery.py": "b507add38c5fdaf9ad4248f0e2cc5bf7570f1a62415a06e1bf171d44f26e0730",
-      "src/grabowski_read_surface.py": "6ab24e3ff6d04ddef35c8fc1b7a176804208313bf9c3cd7234c5dde4755783bf",
+      "src/grabowski_read_surface.py": "18283bc899cd1eb38bae207be7ec23888e09d5b37cc6d93632c7c0e6a923f4cd",
       "src/grabowski_recall.py": "386afec03e078b6a7934b0744eb17edb1ae97b0addde982c34c544d0c1b74413",
       "src/grabowski_recovery.py": "0ed22cef9bc1f41b18e4f40b4cedf0492a78469b9d02ffd2747481c337b43013",
       "src/grabowski_redaction.py": "d1f394aa11e3feb6c8b37e39dfad3b445a2b6fee343f1ff60dd6ac48ca854e84",
