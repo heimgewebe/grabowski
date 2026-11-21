@@ -7802,6 +7802,41 @@ def _deployment_schedule_preflight(
     }
 
 
+
+def _public_git_main_fallback() -> str:
+    """Read exact public main via Git when anonymous GitHub REST is rate-limited.
+
+    The fixed HTTPS upload-pack target avoids the shared anonymous API quota;
+    no local ref, credential helper or mutable workspace ref is authoritative.
+    """
+    result = _git_result(
+        CANONICAL_REPOSITORY,
+        "-c", "credential.helper=",
+        "-c", "http.extraHeader=",
+        "-c", "core.askPass=/bin/false",
+        "ls-remote", "--exit-code", "--refs",
+        PUBLIC_GITHUB_REPOSITORY_URL, PUBLIC_GITHUB_MAIN_REF,
+        max_output_bytes=PUBLIC_GITHUB_LOOKUP_MAX_BYTES,
+    )
+    if (
+        type(result.get("returncode")) is not int
+        or result["returncode"] != 0
+        or result.get("timed_out") is not False
+        or result.get("stdout_truncated") is not False
+        or result.get("stderr_truncated") is not False
+        or result.get("stderr") != ""
+        or not isinstance(result.get("stdout"), str)
+    ):
+        raise RuntimeError("fresh public GitHub main Git fallback failed")
+    match = re.fullmatch(
+        r"([0-9a-f]{40})\t" + re.escape(PUBLIC_GITHUB_MAIN_REF) + r"\n?",
+        result["stdout"],
+    )
+    if match is None:
+        raise RuntimeError("fresh public GitHub main Git fallback returned invalid ref")
+    return match.group(1)
+
+
 def _fresh_public_github_main(expected_head: str) -> str:
     if re.fullmatch(r"[0-9a-f]{40}", expected_head) is None:
         raise ValueError("public GitHub main verification requires one full SHA-1 commit id")
@@ -7835,6 +7870,20 @@ def _fresh_public_github_main(expected_head: str) -> str:
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError("fresh public GitHub main lookup exceeded wall-clock deadline") from exc
     if completed.returncode != 0:
+        # Anonymous REST 403/429 can mean a shared GitHub API quota, not a
+        # changed protected branch. Re-read only the fixed HTTPS Git ref.
+        if (
+            completed.returncode == 1
+            and completed.stdout == b""
+            and isinstance(completed.stderr, bytes)
+            and len(completed.stderr) <= PUBLIC_GITHUB_LOOKUP_MAX_BYTES
+            and any(
+                f"RuntimeError: unexpected HTTP status {code}".encode("ascii")
+                in completed.stderr
+                for code in (403, 429)
+            )
+        ):
+            return _public_git_main_fallback()
         raise RuntimeError(
             "fresh public GitHub main lookup failed: "
             f"helper exit {completed.returncode}"

@@ -6438,6 +6438,65 @@ class SelfDeployToolTests(unittest.TestCase):
                 REAL_FRESH_PUBLIC_GITHUB_MAIN(expected)
         self.assertEqual(run.call_args.kwargs["timeout"], SELF_DEPLOY.PUBLIC_GITHUB_LOOKUP_TIMEOUT_SECONDS)
 
+    def test_public_github_main_rate_limit_uses_exact_git_ref(self) -> None:
+        expected = "d" * 40
+        for status in (403, 429):
+            with self.subTest(status=status):
+                failure = subprocess.CompletedProcess(
+                    [], 1, stdout=b"",
+                    stderr=f"RuntimeError: unexpected HTTP status {status}\n".encode(),
+                )
+                remote = _result(f"{expected}\t{SELF_DEPLOY.PUBLIC_GITHUB_MAIN_REF}\n")
+                with (
+                    patch.object(SELF_DEPLOY.subprocess, "run", return_value=failure),
+                    patch.object(SELF_DEPLOY, "_git_result", return_value=remote) as git,
+                ):
+                    observed = REAL_FRESH_PUBLIC_GITHUB_MAIN(expected)
+                self.assertEqual(observed, expected)
+                arguments = git.call_args.args[1:]
+                self.assertIn("ls-remote", arguments)
+                self.assertIn("credential.helper=", arguments)
+                self.assertIn("http.extraHeader=", arguments)
+                self.assertEqual(arguments[-2:], (
+                    SELF_DEPLOY.PUBLIC_GITHUB_REPOSITORY_URL,
+                    SELF_DEPLOY.PUBLIC_GITHUB_MAIN_REF,
+                ))
+
+    def test_public_github_main_rate_limit_propagates_newer_ref(self) -> None:
+        expected, newer = "d" * 40, "e" * 40
+        failure = subprocess.CompletedProcess(
+            [], 1, stdout=b"",
+            stderr=b"RuntimeError: unexpected HTTP status 403\n",
+        )
+        with (
+            patch.object(SELF_DEPLOY.subprocess, "run", return_value=failure),
+            patch.object(SELF_DEPLOY, "_git_result", return_value=_result(
+                f"{newer}\t{SELF_DEPLOY.PUBLIC_GITHUB_MAIN_REF}\n"
+            )),
+        ):
+            self.assertEqual(REAL_FRESH_PUBLIC_GITHUB_MAIN(expected), newer)
+
+    def test_public_github_main_git_fallback_fail_closed(self) -> None:
+        expected = "d" * 40
+        failure = subprocess.CompletedProcess(
+            [], 1, stdout=b"",
+            stderr=b"RuntimeError: unexpected HTTP status 403\n",
+        )
+        variants = (
+            _result(f"{expected}\trefs/heads/other\n"),
+            _result(f"{expected}\trefs/heads/main\n" * 2),
+            _result(returncode=1),
+            {**_result(f"{expected}\trefs/heads/main\n"), "stdout_truncated": True},
+        )
+        for result in variants:
+            with (
+                self.subTest(result=result),
+                patch.object(SELF_DEPLOY.subprocess, "run", return_value=failure),
+                patch.object(SELF_DEPLOY, "_git_result", return_value=result),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "Git fallback"):
+                    REAL_FRESH_PUBLIC_GITHUB_MAIN(expected)
+
     def test_public_github_main_lookup_rejects_helper_failure(self) -> None:
         expected = "d" * 40
         completed = subprocess.CompletedProcess([], 1, stdout=b"", stderr=b"unexpected HTTP status 302")
