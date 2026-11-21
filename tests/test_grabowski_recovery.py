@@ -372,7 +372,8 @@ class NativeNixOSResticProofTests(unittest.TestCase):
         return {
             "valid": True,
             "snapshot_id": "c" * 8,
-            "service_start_unix": self.now - 75,
+            "snapshot_saved_at_unix": self.now - 45,
+            "service_start_unix": self.now - 35,  # last prune/check, not backup start
             "timestamp_unix": self.now - 30,
         }
 
@@ -464,6 +465,23 @@ class NativeNixOSResticProofTests(unittest.TestCase):
                 )
             self.assertEqual((mode, reused, start), ("new", None, None))
 
+
+    def test_multi_execstart_snapshot_predates_last_maintenance_command(self) -> None:
+        # The latest service-start timestamp belongs to prune/check, while
+        # the independently journal-verified snapshot-saved event is earlier.
+        proof = dict(self._root_proof(), snapshot_time_unix=self.now - 620)
+        backup = dict(
+            self._current_full_backup(),
+            snapshot_saved_at_unix=self.now - 570,
+            service_start_unix=self.now - 35,
+            timestamp_unix=self.now - 30,
+        )
+        with patch.object(
+            recovery, "_nixos_native_backup_service_fresh", return_value=backup
+        ):
+            recovery._require_current_nixos_backup_proof(proof)
+        self.assertGreater(backup["service_start_unix"] - proof["snapshot_time_unix"], 120)
+
     def test_reuse_refuses_systemd_status_change_before_publication(self) -> None:
         changed = self._completed_root_unit().replace(
             "ActiveState=inactive", "ActiveState=activating"
@@ -488,7 +506,8 @@ class NativeNixOSResticProofTests(unittest.TestCase):
             {"snapshot_id": "d" * 8},
             {"valid": False},
             {"timestamp_unix": self.now - 120},
-            {"service_start_unix": self.now - 15},
+            {"snapshot_saved_at_unix": self.now - 120},
+            {"snapshot_saved_at_unix": self.now + 1},
         ):
             backup = dict(self._current_full_backup(), **change)
             with self.subTest(change=change), patch.object(

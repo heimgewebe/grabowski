@@ -1781,15 +1781,17 @@ def _require_current_nixos_backup_proof(proof: dict[str, Any]) -> None:
     if backup.get("valid") is not True:
         raise RuntimeError("NixOS root proof has no current completed backup")
     saved_id = backup.get("snapshot_id")
-    begin = backup.get("service_start_unix")
+    saved_at = backup.get("snapshot_saved_at_unix")
     finished = backup.get("timestamp_unix")
+    # A multi-ExecStart oneshot reports the start time of its final
+    # prune/check command, not of its original snapshot. Bind the proof to
+    # the independently journal-verified snapshot-saved event instead.
     if (not isinstance(saved_id, str)
             or re.fullmatch(r"[0-9a-f]{8,64}", saved_id) is None
             or not proof["snapshot_id"].startswith(saved_id)
-            or type(begin) is not int or type(finished) is not int
-            or not (0 < begin <= finished <= proof["started_at_unix"]
-                    <= proof["completed_at_unix"]
-                    and begin - 120 <= proof["snapshot_time_unix"] <= finished)):
+            or type(saved_at) is not int or type(finished) is not int
+            or not (0 < proof["snapshot_time_unix"] <= saved_at <= finished
+                    <= proof["started_at_unix"] <= proof["completed_at_unix"])):
         raise RuntimeError("NixOS root proof differs from latest completed backup")
 
 
