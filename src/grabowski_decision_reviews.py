@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import closing, contextmanager
+from contextlib import ExitStack, closing, contextmanager
 from functools import lru_cache
 import fcntl
 import hashlib
@@ -3348,6 +3348,8 @@ def reconcile(
     malformed provenance or changed/remapped prior directory. Three racing
     scans without stability remain a hard block, never a presumed PASS.
     """
+    # Release admission may already hold the exclusive Retention/deploy lock.
+    # Its historical reconciliation must never acquire that lock again.
     result: dict[str, Any] = {}
     for _ in range(3):
         result = _reconcile_once(
@@ -3370,3 +3372,54 @@ def reconcile(
         ):
             return result
     return result
+
+def reconcile_for_captain(
+    *,
+    repo: str,
+    pr: int,
+    head_sha: str,
+    base_sha: str,
+    diff_sha256: str,
+    equivalent_diff_sha256s: list[str] | tuple[str, ...] | None = None,
+    defer_diff_identity: bool = False,
+    jobs_root: Path | None = None,
+) -> dict[str, Any]:
+    """PR Captain-only complete scan coordinated with hourly Retention.
+
+    Deployment admission already holds the same exclusive lock and instead
+    calls the plain reconcile() function without reacquisition.
+    """
+    def _scan_to_stability() -> dict[str, Any]:
+        return reconcile(
+            repo=repo, pr=pr, head_sha=head_sha, base_sha=base_sha,
+            diff_sha256=diff_sha256,
+            equivalent_diff_sha256s=equivalent_diff_sha256s,
+            defer_diff_identity=defer_diff_identity, jobs_root=jobs_root,
+        )
+
+    # Test fixtures use isolated roots; only the canonical production jobs
+    # root is shared with the real hourly Retention archive worker.
+    if jobs_root is not None and Path(jobs_root) != JOBS_ROOT:
+        return _scan_to_stability()
+
+    # Retention already holds this existing exclusive lock around the pinned
+    # atomic job moves. Protect the ENTIRE job inventory, including the late
+    # material-REJECT rechecks, with the same lock. Do not treat a vanished
+    # inode as safe, and never accept a partial scan.
+    from grabowski_self_deploy import _deploy_schedule_lock
+
+    # Archive batches can exceed the deploy lock's existing 10s bounded wait.
+    # Retry only acquisition timeouts (not audit errors). Six attempts bound
+    # the total wait to about one minute; a persistent busy lock fails closed.
+    for attempt in range(6):
+        with ExitStack() as acquired:
+            try:
+                acquired.enter_context(_deploy_schedule_lock())
+            except TimeoutError:
+                if attempt == 5:
+                    raise
+                continue
+            # A timeout or IO failure from the review scan itself is NOT
+            # Retention contention: propagate it without a second inventory.
+            return _scan_to_stability()
+    raise AssertionError("unreachable archive-lock retry state")

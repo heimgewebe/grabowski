@@ -14367,7 +14367,7 @@ def _captain_independent_review_gate(
     reconciliation: dict[str, Any] | None = None
     if not errors:
         try:
-            reconciliation = grabowski_merge_guard.decision_reviews.reconcile(
+            reconciliation = grabowski_merge_guard.decision_reviews.reconcile_for_captain(
                 repo=repo,
                 pr=pr,
                 head_sha=head,

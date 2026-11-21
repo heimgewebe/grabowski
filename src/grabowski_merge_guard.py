@@ -6538,7 +6538,7 @@ class CaptainMergeGuardRunner:
             equivalent_review_diff_sha256s = _verified_decision_review_diff_aliases(
                 bindings, self.receipt.get("live_diff")
             )
-            decision_reconciliation = decision_reviews.reconcile(
+            decision_reconciliation = decision_reviews.reconcile_for_captain(
                 repo=str(bindings["repository"]),
                 pr=int(bindings["pull_request"]),
                 head_sha=str(bindings["head_sha"]),
