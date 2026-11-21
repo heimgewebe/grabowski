@@ -504,13 +504,20 @@ def _archive_file_shape_preflight(
         os.close(fd)
 
 
-def _failed_units(*, job_authority: bool = True) -> list[str]:
+def _failed_units(*, job_authority: bool = True, retention_only: bool = False) -> list[str]:
     # Without protected archive/reset authority, failed job units accumulate.
     # Ask systemd only for independently actionable task/worker failures.
     if not isinstance(job_authority, bool):
         raise ValueError("job_authority must be boolean")
     command = ["systemctl", "--user", "--failed", "--no-legend", "--plain"]
-    if not job_authority:
+    if retention_only:
+        # Limit collection at systemd as well, before the failed-unit cap.
+        command = [
+            "systemctl", "--user", "list-units", "--failed", "--no-legend", "--plain",
+            "grabowski-job-*.service", "grabowski-task-*.service",
+            "grabowski-browser-worker-*.service", "grabowski-gui-worker-*.service",
+        ]
+    elif not job_authority:
         command = [
             "systemctl", "--user", "list-units", "--failed", "--no-legend", "--plain",
             "grabowski-task-*.service", "grabowski-browser-worker-*.service",
@@ -1401,6 +1408,7 @@ def build_plan(
     resource_db: Path = RESOURCE_DB,
     failed_units: list[str] | None = None,
     unit_states: dict[str, dict[str, str]] | None = None,
+    retention_failed_units_only: bool = False,
 ) -> dict[str, Any]:
     if (
         isinstance(minimum_job_age_seconds, bool)
@@ -1466,13 +1474,25 @@ def build_plan(
         _archive_require_unchanged_root(receipt_root, pinned.receipt_fd)
     observed_now = int(time.time()) if now is None else now
     failed = (
-        _failed_units(job_authority=authorized_job_effects)
+        _failed_units(
+            job_authority=authorized_job_effects,
+            retention_only=retention_failed_units_only,
+        )
         if failed_units is None else sorted(set(failed_units))
     )
     if not authorized_job_effects:
         # Even caller-supplied job failures cannot exhaust the independent
         # task/worker budget or enable any protected job effect.
         failed = [unit for unit in failed if not JOB_UNIT.fullmatch(unit)]
+    if retention_failed_units_only:
+        # The hourly retention worker cannot repair unrelated systemd units.
+        # Keep every failed Grabowski job/task/worker visible and actionable.
+        failed = [
+            unit for unit in failed
+            if JOB_UNIT.fullmatch(unit)
+            or TASK_UNIT.fullmatch(unit)
+            or WORKER_UNIT.fullmatch(unit)
+        ]
     if len(failed) > MAX_FAILED_UNITS:
         raise RuntimeError("failed-unit inventory exceeds the bounded scan")
 
@@ -3961,11 +3981,13 @@ def apply_periodic_plan(
         minimum_job_age_seconds=minimum_job_age_seconds,
         max_archive_jobs=max_archive_jobs,
         now=cycle_now,
+        retention_failed_units_only=True,
     )
     current = build_plan(
         minimum_job_age_seconds=minimum_job_age_seconds,
         max_archive_jobs=max_archive_jobs,
         now=cycle_now,
+        retention_failed_units_only=True,
     )
     if current["plan_sha256"] != preview["plan_sha256"]:
         raise RuntimeError("retention plan drifted between periodic snapshots")

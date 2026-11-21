@@ -2052,6 +2052,56 @@ class RuntimeRetentionTests(unittest.TestCase):
         self.assertEqual(build.call_count, 2)
         for call in build.call_args_list:
             self.assertEqual(call.kwargs["now"], 3_599)
+            self.assertIs(call.kwargs["retention_failed_units_only"], True)
+
+    def test_periodic_failed_unit_query_is_scoped_at_systemd(self) -> None:
+        # Foreign services cannot exhaust the bounded inventory before filtering.
+        with patch.object(
+            RETENTION, "_run", return_value=Mock(returncode=0, stdout="", stderr="")
+        ) as runner:
+            self.assertEqual(
+                RETENTION._failed_units(job_authority=True, retention_only=True), []
+            )
+        argv = runner.call_args.args[0]
+        self.assertEqual(argv[:5], [
+            "systemctl", "--user", "list-units", "--failed", "--no-legend"
+        ])
+        self.assertIn("grabowski-job-*.service", argv)
+        self.assertIn("grabowski-task-*.service", argv)
+        self.assertIn("grabowski-browser-worker-*.service", argv)
+        self.assertIn("grabowski-gui-worker-*.service", argv)
+
+    def test_periodic_failed_unit_scope_preserves_grabowski_blockers(self) -> None:
+        # Unrelated user-systemd failures must not break an hourly archive.
+        # Failures of Grabowski jobs/tasks/workers remain part of the plan.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs = root / "jobs"
+            name = "grabowski-job-" + "a" * 12
+            self._job(jobs, name, 100)
+            job_unit = name + ".service"
+            task_unit = "grabowski-task-" + "b" * 24 + "-a1.service"
+            task_db = self._task_db(root / "tasks.sqlite3", task_unit, "running")
+            kwargs = {
+                "now": 300,
+                "jobs_root": jobs,
+                "archive_root": root / "archive",
+                "receipt_root": root / "receipts",
+                "task_db": task_db,
+                "failed_units": ["bureau-status-capsule.service", task_unit],
+                "unit_states": {job_unit: self._state(job_unit)},
+            }
+            diagnostic = RETENTION.build_plan(**kwargs)
+            periodic = RETENTION.build_plan(
+                **kwargs, retention_failed_units_only=True
+            )
+        diagnostic_units = {item["unit"] for item in diagnostic["blocked"]}
+        periodic_units = {item["unit"] for item in periodic["blocked"]}
+        self.assertIn("bureau-status-capsule.service", diagnostic_units)
+        self.assertNotIn("bureau-status-capsule.service", periodic_units)
+        self.assertIn(task_unit, diagnostic_units)
+        self.assertIn(task_unit, periodic_units)
+        self.assertEqual(diagnostic["archive_jobs"], periodic["archive_jobs"])
 
     def test_hourly_retention_timer_visits_all_pages_not_just_even_ones(self) -> None:
         # With 11 jobs and a two-name cap there are six pages. A half-hour
