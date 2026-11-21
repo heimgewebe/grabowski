@@ -81,6 +81,26 @@ class AgentInstructionsTests(unittest.TestCase):
             grabowski_mcp.AGENT_INSTRUCTIONS,
         )
 
+    def test_captain_merge_route_is_discoverable_from_agent_and_tool(self) -> None:
+        github_rule = dict(grabowski_mcp.AGENT_INSTRUCTION_RULES)[
+            "github-connector-first"
+        ]
+        for token in (
+            "grip_run",
+            "captain-run",
+            "profile=captain",
+            "allow_mutation=true",
+        ):
+            self.assertIn(token, github_rule)
+        grip_description = grabowski_mcp._grip_run_mcp.__doc__ or ""
+        for token in (
+            "Captain PR-merge", "captain-preflight", "captain-run",
+            'profile="captain"', "allow_mutation=True", "pr-merge",
+            "execution_intent", "grip_list", "direct GitHub merge",
+        ):
+            with self.subTest(token=token):
+                self.assertIn(token, grip_description)
+
     def test_mandatory_outcome_tool_is_available_in_core_profile(self) -> None:
         profiles = json.loads(
             (ROOT / "contracts/publication-profiles.v1.json").read_text(encoding="utf-8")

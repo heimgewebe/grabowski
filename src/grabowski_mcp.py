@@ -127,11 +127,11 @@ AGENT_INSTRUCTION_RULES: tuple[tuple[str, str], ...] = (
     ),
     (
         "github-connector-first",
-        "Platform GitHub connector first for GitHub PR reads and typed PR "
-        "mutations; local gh only on observed connector unavailability or "
-        "authorization failure. No GHA helper workflows, observer lanes or "
-        "coordination leases for local gh auth/keyring. Merges require "
-        "expected_head_sha, GitHub rulesets/branch protection; read back state."
+        "Platform GitHub connector first: GitHub PR reads/typed PR mutations. "
+        "local gh: observed connector unavailability/authorization failure. "
+        "No GHA helper workflows/observer lanes/coordination leases; "
+        "local gh auth/keyring. grip_run name=captain-run profile=captain "
+        "allow_mutation=true. Merges require expected_head_sha; read back state."
     ),
     (
         "goal-fidelity-before-continuation",
@@ -15794,7 +15794,17 @@ async def _grip_run_mcp(
     allow_mutation: bool = False,
     ctx: Context | None = None,
 ) -> dict[str, Any]:
-    """Run one allowlisted Grabowski grip and return its receipt-bound result."""
+    """Run a Grabowski grip, including the existing Captain PR-merge interface.
+
+    Captain is not a standalone MCP merge tool. Check its live contract via
+    grip_list(profile="captain"). For read-only merge gates call
+    grip_run(name="captain-preflight", profile="captain",
+    parameters={"actions": [...]}). For an authorized merge call
+    grip_run(name="captain-run", profile="captain", allow_mutation=True,
+    parameters={...}) with one pr-merge action, exact head/base, review,
+    diff and CI evidence, and fresh execution_intent. Never replace a
+    prescribed Captain merge with a direct GitHub merge.
+    """
 
     _require_capability(grabowski_grips.grip_required_capability(name))
     retained_claim_challenge: str | None = None
