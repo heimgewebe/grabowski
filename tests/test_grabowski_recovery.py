@@ -360,6 +360,162 @@ class NativeNixOSResticProofTests(unittest.TestCase):
             "repository_check_valid": True,
         }
 
+
+    def _completed_root_unit(self) -> str:
+        return (
+            "LoadState=loaded\nActiveState=inactive\nJob=\n"
+            "Result=success\nExecMainStatus=0\n"
+            f"ExecMainStartTimestamp=@{self.now - 25}\n"
+        )
+
+    def _current_full_backup(self) -> dict[str, object]:
+        return {
+            "valid": True,
+            "snapshot_id": "c" * 8,
+            "snapshot_saved_at_unix": self.now - 45,
+            "service_start_unix": self.now - 35,  # last prune/check, not backup start
+            "timestamp_unix": self.now - 30,
+        }
+
+    def test_recovery_joins_existing_root_systemd_job_without_new_start(self) -> None:
+        status = {
+            "returncode": 0, "stdout": (
+                "LoadState=loaded\nActiveState=activating\nJob=4717\n"
+                "Result=success\nExecMainStatus=0\n"
+                f"ExecMainStartTimestamp=@{self.now - 15}.250000\n"
+            ),
+        }
+        with patch.object(recovery.operator, "_run", return_value=status) as run, patch.object(
+            recovery, "_nixos_root_proof_read"
+        ) as read, patch.object(
+            recovery, "_nixos_native_backup_service_fresh"
+        ) as backup:
+            mode, proof, start = recovery._nixos_existing_root_proof(
+                now=self.now, expected_backup_uuid=self.target["backup_uuid"]
+            )
+        self.assertEqual(mode, "join")
+        self.assertIsNone(proof)
+        self.assertEqual(start, (self.now - 15) * 1_000_000_000 + 250_000_000)
+        run.assert_called_once()
+        read.assert_not_called()
+        backup.assert_not_called()
+
+    def test_recovery_rejects_inflight_unit_with_unprovable_start(self) -> None:
+        for timestamp in ("", "n/a", f"@{self.now - 5000}", f"@{self.now + 20}"):
+            with self.subTest(timestamp=timestamp), patch.object(
+                recovery.operator, "_run", return_value={
+                    "returncode": 0, "stdout": (
+                        "LoadState=loaded\nActiveState=activating\nJob=4717\n"
+                        "Result=success\nExecMainStatus=0\n"
+                        f"ExecMainStartTimestamp={timestamp}\n"
+                    ),
+                },
+            ), patch.object(recovery, "_nixos_root_proof_read") as read:
+                with self.assertRaisesRegex(RuntimeError, "start|interval"):
+                    recovery._nixos_existing_root_proof(
+                        now=self.now, expected_backup_uuid=self.target["backup_uuid"]
+                    )
+                read.assert_not_called()
+
+    def test_completed_fresh_root_proof_is_reused_only_for_last_backup(self) -> None:
+        proof = self._root_proof()
+        with patch.object(recovery.operator, "_run", return_value={
+            "returncode": 0, "stdout": self._completed_root_unit(),
+        }) as run, patch.object(
+            recovery, "_nixos_root_proof_read", return_value=proof
+        ) as read, patch.object(
+            recovery, "_nixos_native_backup_service_fresh",
+            return_value=self._current_full_backup(),
+        ):
+            mode, observed, start = recovery._nixos_existing_root_proof(
+                now=self.now, expected_backup_uuid=self.target["backup_uuid"]
+            )
+        self.assertEqual(mode, "reuse")
+        self.assertEqual(observed, proof)
+        self.assertIsNone(start)
+        self.assertEqual(run.call_count, 2)
+        read.assert_called_once_with(
+            not_before_unix=self.now - 4800,
+            not_before_mtime_ns=1,
+            now=self.now,
+            expected_backup_uuid=self.target["backup_uuid"],
+        )
+
+    def test_old_or_wrong_root_receipt_requires_new_broker_proof(self) -> None:
+        for condition in ("stale", "other-snapshot", "no-complete-backup"):
+            proof = self._root_proof()
+            backup = self._current_full_backup()
+            if condition == "other-snapshot":
+                backup["snapshot_id"] = "e" * 8
+            elif condition == "no-complete-backup":
+                backup["valid"] = False
+            with self.subTest(condition=condition), patch.object(
+                recovery.operator, "_run", return_value={
+                    "returncode": 0, "stdout": self._completed_root_unit()
+                },
+            ), patch.object(
+                recovery, "_nixos_root_proof_read",
+                side_effect=RuntimeError("stale") if condition == "stale" else None,
+                return_value=None if condition == "stale" else proof,
+            ), patch.object(
+                recovery, "_nixos_native_backup_service_fresh", return_value=backup
+            ):
+                mode, reused, start = recovery._nixos_existing_root_proof(
+                    now=self.now, expected_backup_uuid=self.target["backup_uuid"]
+                )
+            self.assertEqual((mode, reused, start), ("new", None, None))
+
+
+    def test_multi_execstart_snapshot_predates_last_maintenance_command(self) -> None:
+        # The latest service-start timestamp belongs to prune/check, while
+        # the independently journal-verified snapshot-saved event is earlier.
+        proof = dict(self._root_proof(), snapshot_time_unix=self.now - 620)
+        backup = dict(
+            self._current_full_backup(),
+            snapshot_saved_at_unix=self.now - 570,
+            service_start_unix=self.now - 35,
+            timestamp_unix=self.now - 30,
+        )
+        with patch.object(
+            recovery, "_nixos_native_backup_service_fresh", return_value=backup
+        ):
+            recovery._require_current_nixos_backup_proof(proof)
+        self.assertGreater(backup["service_start_unix"] - proof["snapshot_time_unix"], 120)
+
+    def test_reuse_refuses_systemd_status_change_before_publication(self) -> None:
+        changed = self._completed_root_unit().replace(
+            "ActiveState=inactive", "ActiveState=activating"
+        )
+        with patch.object(recovery.operator, "_run", side_effect=[
+            {"returncode": 0, "stdout": self._completed_root_unit()},
+            {"returncode": 0, "stdout": changed},
+        ]), patch.object(
+            recovery, "_nixos_root_proof_read", return_value=self._root_proof()
+        ), patch.object(
+            recovery, "_nixos_native_backup_service_fresh",
+            return_value=self._current_full_backup(),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "changed"):
+                recovery._nixos_existing_root_proof(
+                    now=self.now, expected_backup_uuid=self.target["backup_uuid"]
+                )
+
+    def test_current_backup_identity_cannot_be_substituted(self) -> None:
+        proof = self._root_proof()
+        for change in (
+            {"snapshot_id": "d" * 8},
+            {"valid": False},
+            {"timestamp_unix": self.now - 120},
+            {"snapshot_saved_at_unix": self.now - 120},
+            {"snapshot_saved_at_unix": self.now + 1},
+        ):
+            backup = dict(self._current_full_backup(), **change)
+            with self.subTest(change=change), patch.object(
+                recovery, "_nixos_native_backup_service_fresh", return_value=backup
+            ):
+                with self.assertRaisesRegex(RuntimeError, "root proof"):
+                    recovery._require_current_nixos_backup_proof(proof)
+
     def test_root_owned_proof_payload_rejects_stale_or_invalid_sources(self) -> None:
         proof = self._root_proof()
         self.assertEqual(
@@ -687,6 +843,9 @@ class NativeNixOSResticProofTests(unittest.TestCase):
                 with patch.object(
                     recovery.operator, "STATE_DIR", Path(tmp)
                 ), patch.object(
+                    recovery, "_nixos_existing_root_proof",
+                    return_value=("new", None, None),
+                ), patch.object(
                     recovery.privileged, "start_nixos_root_restic_unit_reference",
                     side_effect=failure,
                 ) as broker_start, patch.object(
@@ -709,6 +868,9 @@ class NativeNixOSResticProofTests(unittest.TestCase):
         digest = "a" * 64
         with tempfile.TemporaryDirectory() as tmp, patch.object(
             recovery.operator, "STATE_DIR", Path(tmp)
+        ), patch.object(
+            recovery, "_nixos_existing_root_proof",
+            return_value=("new", None, None),
         ), patch.object(
             recovery.time, "time", return_value=self.now
         ), patch.object(
@@ -753,6 +915,89 @@ class NativeNixOSResticProofTests(unittest.TestCase):
         )
         self.assertEqual(result["restore_sha256"], "d" * 64)
         self.assertTrue(result["root_proof"]["validated"])
+
+
+    def test_joined_root_recovery_publishes_without_second_broker_start(self) -> None:
+        import tempfile
+        proof = self._root_proof()
+        digest = "a" * 64
+        joined_ns = (self.now - 10) * 1_000_000_000
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            recovery.operator, "STATE_DIR", Path(tmp)
+        ), patch.object(
+            recovery.time, "time", return_value=self.now
+        ), patch.object(
+            recovery.time, "time_ns", return_value=self.now * 1_000_000_000
+        ), patch.object(
+            recovery, "_nixos_existing_root_proof",
+            return_value=("join", None, joined_ns),
+        ), patch.object(
+            recovery.privileged, "start_nixos_root_restic_unit_reference"
+        ) as broker_start, patch.object(
+            recovery, "_await_nixos_root_proof", return_value=proof
+        ) as await_proof, patch.object(
+            recovery, "_require_current_nixos_backup_proof"
+        ) as latest, patch.object(
+            recovery, "_timer_probe", return_value={"ok": True}
+        ), patch.object(
+            recovery, "_write_server_marker",
+            return_value={"source_record_sha256": digest}
+        ), patch.object(
+            recovery.privileged, "publish_recovery_marker_reference",
+            return_value={"success": True}
+        ), patch.object(
+            recovery, "_canonical_server_marker",
+            return_value={"valid": True, "source_record_sha256": digest,
+                          "record_sha256": "b" * 64}
+        ), patch.object(
+            recovery, "_server_source_marker", return_value={"valid": True}
+        ), patch.object(recovery.base, "_append_audit"):
+            result = recovery._nixos_local_recovery_probe_locked(self.target)
+        self.assertEqual(result["root_proof"]["mode"], "join")
+        broker_start.assert_not_called()
+        await_proof.assert_called_once_with(
+            started_at_unix=self.now - 10,
+            not_before_mtime_ns=joined_ns,
+            expected_backup_uuid=self.target["backup_uuid"],
+        )
+        latest.assert_called_once_with(proof)
+
+    def test_recent_completed_root_proof_publishes_without_new_restic(self) -> None:
+        import tempfile
+        proof = self._root_proof()
+        digest = "a" * 64
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            recovery.operator, "STATE_DIR", Path(tmp)
+        ), patch.object(
+            recovery.time, "time", return_value=self.now
+        ), patch.object(
+            recovery.time, "time_ns", return_value=self.now * 1_000_000_000
+        ), patch.object(
+            recovery, "_nixos_existing_root_proof",
+            return_value=("reuse", proof, None),
+        ), patch.object(
+            recovery.privileged, "start_nixos_root_restic_unit_reference"
+        ) as broker_start, patch.object(
+            recovery, "_await_nixos_root_proof"
+        ) as await_proof, patch.object(
+            recovery, "_timer_probe", return_value={"ok": True}
+        ), patch.object(
+            recovery, "_write_server_marker",
+            return_value={"source_record_sha256": digest}
+        ), patch.object(
+            recovery.privileged, "publish_recovery_marker_reference",
+            return_value={"success": True}
+        ), patch.object(
+            recovery, "_canonical_server_marker",
+            return_value={"valid": True, "source_record_sha256": digest,
+                          "record_sha256": "b" * 64}
+        ), patch.object(
+            recovery, "_server_source_marker", return_value={"valid": True}
+        ), patch.object(recovery.base, "_append_audit"):
+            result = recovery._nixos_local_recovery_probe_locked(self.target)
+        self.assertEqual(result["root_proof"]["mode"], "reuse")
+        broker_start.assert_not_called()
+        await_proof.assert_not_called()
 
     def test_valid_nixos_source_replaces_only_legacy_local_marker(self) -> None:
         source = {
