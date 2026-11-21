@@ -3348,29 +3348,54 @@ def reconcile(
     malformed provenance or changed/remapped prior directory. Three racing
     scans without stability remain a hard block, never a presumed PASS.
     """
+    # Release admission may already hold the exclusive Retention/deploy lock.
+    # Its historical reconciliation must never acquire that lock again.
+    result: dict[str, Any] = {}
+    for _ in range(3):
+        result = _reconcile_once(
+            repo=repo, pr=pr, head_sha=head_sha, base_sha=base_sha,
+            diff_sha256=diff_sha256,
+            equivalent_diff_sha256s=equivalent_diff_sha256s,
+            defer_diff_identity=defer_diff_identity, jobs_root=jobs_root,
+        )
+        errors = result.get("errors", [])
+        if "decision_review_jobs_root_addition_race" not in errors:
+            return result
+        if any(
+            error != "decision_review_jobs_root_addition_race"
+            and not error.startswith((
+                "decision_review_slot_without_pass:",
+                "decision_review_named_provider_slot_without_independent_pass:",
+                "decision_review_infrastructure_not_superseded:",
+            ))
+            for error in errors
+        ):
+            return result
+    return result
+
+def reconcile_for_captain(
+    *,
+    repo: str,
+    pr: int,
+    head_sha: str,
+    base_sha: str,
+    diff_sha256: str,
+    equivalent_diff_sha256s: list[str] | tuple[str, ...] | None = None,
+    defer_diff_identity: bool = False,
+    jobs_root: Path | None = None,
+) -> dict[str, Any]:
+    """PR Captain-only complete scan coordinated with hourly Retention.
+
+    Deployment admission already holds the same exclusive lock and instead
+    calls the plain reconcile() function without reacquisition.
+    """
     def _scan_to_stability() -> dict[str, Any]:
-        result: dict[str, Any] = {}
-        for _ in range(3):
-            result = _reconcile_once(
-                repo=repo, pr=pr, head_sha=head_sha, base_sha=base_sha,
-                diff_sha256=diff_sha256,
-                equivalent_diff_sha256s=equivalent_diff_sha256s,
-                defer_diff_identity=defer_diff_identity, jobs_root=jobs_root,
-            )
-            errors = result.get("errors", [])
-            if "decision_review_jobs_root_addition_race" not in errors:
-                return result
-            if any(
-                error != "decision_review_jobs_root_addition_race"
-                and not error.startswith((
-                    "decision_review_slot_without_pass:",
-                    "decision_review_named_provider_slot_without_independent_pass:",
-                    "decision_review_infrastructure_not_superseded:",
-                ))
-                for error in errors
-            ):
-                return result
-        return result
+        return reconcile(
+            repo=repo, pr=pr, head_sha=head_sha, base_sha=base_sha,
+            diff_sha256=diff_sha256,
+            equivalent_diff_sha256s=equivalent_diff_sha256s,
+            defer_diff_identity=defer_diff_identity, jobs_root=jobs_root,
+        )
 
     # Test fixtures use isolated roots; only the canonical production jobs
     # root is shared with the real hourly Retention archive worker.

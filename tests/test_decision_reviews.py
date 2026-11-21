@@ -419,6 +419,40 @@ def stamp_claude_oauth_401(directory: Path, *, envelope_updates: dict | None = N
 
 
 class DecisionReviewReconciliationTests(unittest.TestCase):
+    @staticmethod
+    def captain_reconcile(jobs: Path) -> dict:
+        return reviews.reconcile_for_captain(
+            repo=REPO, pr=PR, head_sha=HEAD, base_sha=BASE,
+            diff_sha256=DIFF, jobs_root=jobs,
+        )
+
+    def test_release_admission_scan_does_not_reacquire_held_schedule_lock(self) -> None:
+        # Release scheduling already holds the exclusive Retention/deploy lock.
+        # Its plain DecisionReview reconciliation must not reacquire it and
+        # deadlock while it scans the very same canonical production jobs root.
+        with tempfile.TemporaryDirectory() as temporary:
+            jobs = Path(temporary) / "jobs"
+            jobs.mkdir(mode=0o700)
+            attempts = [0]
+
+            @contextmanager
+            def would_deadlock():
+                attempts[0] += 1
+                raise TimeoutError("outer release scheduler already holds lock")
+                yield  # pragma: no cover
+
+            fake_deploy = ModuleType("grabowski_self_deploy")
+            fake_deploy._deploy_schedule_lock = would_deadlock
+            with mock.patch.dict(sys.modules, {"grabowski_self_deploy": fake_deploy}), \
+                    mock.patch.object(reviews, "JOBS_ROOT", jobs):
+                outcome = reviews.reconcile(
+                    repo=REPO, pr=PR, head_sha=HEAD, base_sha=BASE,
+                    diff_sha256=DIFF,
+                )
+            self.assertEqual(outcome["status"], "not_applicable")
+            self.assertEqual(outcome["errors"], [])
+            self.assertEqual(attempts, [0])
+
     def test_retention_lock_covers_complete_review_scan(self) -> None:
         # Hourly Retention already holds this schedule lock while atomically
         # moving ordinary jobs. A Captain inventory scan must hold it too.
@@ -447,7 +481,7 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
             with mock.patch.dict(sys.modules, {"grabowski_self_deploy": fake_deploy}), \
                     mock.patch.object(reviews, "JOBS_ROOT", jobs), \
                     mock.patch.object(reviews, "_reconcile_once", side_effect=scan):
-                outcome = self.reconcile(jobs)
+                outcome = self.captain_reconcile(jobs)
             self.assertEqual(outcome["status"], "not_applicable")
             self.assertEqual(observed, ["acquired", "full_scan", "released"])
 
@@ -471,7 +505,7 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
             fake_deploy._deploy_schedule_lock = existing_lock
             with mock.patch.dict(sys.modules, {"grabowski_self_deploy": fake_deploy}), \
                     mock.patch.object(reviews, "JOBS_ROOT", jobs):
-                outcome = self.reconcile(jobs)
+                outcome = self.captain_reconcile(jobs)
             self.assertEqual(attempts, [3])
             self.assertEqual(outcome["status"], "blocked")
             self.assertIn("decision_review_job_inventory_unverifiable", outcome["errors"])
@@ -498,7 +532,7 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
                         side_effect=TimeoutError("review child read timed out"),
                     ):
                 with self.assertRaisesRegex(TimeoutError, "review child read timed out"):
-                    self.reconcile(jobs)
+                    self.captain_reconcile(jobs)
             self.assertEqual(entered, [1])
 
     def test_retention_lock_timeout_stays_fail_closed(self) -> None:
@@ -519,7 +553,7 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
             with mock.patch.dict(sys.modules, {"grabowski_self_deploy": fake_deploy}), \
                     mock.patch.object(reviews, "JOBS_ROOT", jobs):
                 with self.assertRaisesRegex(TimeoutError, "retention lock busy"):
-                    self.reconcile(jobs)
+                    self.captain_reconcile(jobs)
             self.assertEqual(attempts, [6])
 
     def test_rgpm_signed_v2_review_pass_cannot_grant_captain_authority(self) -> None:
