@@ -2839,6 +2839,30 @@ class CompleteAuditSignalTests(unittest.TestCase):
         self.assertEqual(full["signal_projection"]["source_binding"]["audit_snapshot_sha256"], "f" * 64)
         self.assertNotIn("not-public", json.dumps(full))
 
+    def test_complete_signal_cutoff_is_fixed_before_snapshot(self):
+        now, rows, snapshot, status = self.fixture()
+        order = []
+
+        def clock():
+            order.append("clock")
+            return now
+
+        def capture():
+            order.append("capture")
+            return snapshot
+
+        with (
+            patch.object(read_surface.time, "time", side_effect=clock),
+            patch.object(read_surface.audit_query, "capture_verified_audit_snapshot",
+                         side_effect=capture),
+            patch.object(read_surface, "_audit_projection_records_snapshot",
+                         return_value=(rows[-2:], status)),
+            patch.object(read_surface.base, "_verify_audit_log", return_value=status),
+        ):
+            result = read_surface.grabowski_audit_projection(complete_signals=True)
+        self.assertEqual(order[:2], ["clock", "capture"])
+        self.assertEqual(result["signal_projection"]["as_of_unix"], now)
+
     def test_full_signal_scan_rejects_missing_segment_records(self):
         now, _rows, snapshot, _status = self.fixture()
         snapshot.segments[0].records += 1

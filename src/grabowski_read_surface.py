@@ -1790,6 +1790,9 @@ def grabowski_audit_projection(
         raise ValueError(f"top_limit must be between 1 and {MAX_AUDIT_PROJECTION_TOP}")
     if not isinstance(complete_signals, bool):
         raise ValueError("complete_signals must be boolean")
+    # The full scan is anchored at invocation, not the later end of its
+    # verification pass. A concurrent append must not backdate the cutoff.
+    requested_as_of_unix = int(time.time()) if complete_signals else None
     try:
         full_snapshot = (
             audit_query.capture_verified_audit_snapshot()
@@ -1814,7 +1817,9 @@ def grabowski_audit_projection(
     ):
         raise RuntimeError("Audit snapshot binding mismatch")
     prepared_records = _prepare_audit_records(records)
-    as_of_unix = int(time.time())
+    as_of_unix = (
+        int(time.time()) if requested_as_of_unix is None else requested_as_of_unix
+    )
     windows: list[dict[str, Any]] = []
     private_windows: dict[str, dict[str, Any]] = {}
     for label, seconds in AUDIT_PROJECTION_WINDOWS:
