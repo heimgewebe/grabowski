@@ -2880,5 +2880,106 @@ class CompleteAuditSignalTests(unittest.TestCase):
             read_surface.grabowski_audit_projection(complete_signals=1)
 
 
+class VerifiedRootbrokerPreclaimReaderTests(unittest.TestCase):
+    def fixture(self):
+        request = "a" * 32
+        reference = "b" * 64
+        return {
+            "state": "failed", "execution_backend": "systemd-root-broker",
+            "launcher_json": json.dumps({
+                "returncode": 1, "pre_effect_refused": True,
+                "launch_not_dispatched": True, "outcome_unknown": False,
+                "timed_out": False, "stdout_truncated": False,
+                "stderr_truncated": False,
+                "privileged_broker": {
+                    "request_id": request, "reference_sha256": reference,
+                    "broker_client_returncode": 1,
+                    "broker_client_timed_out": False,
+                    "stdout_truncated": False, "stderr_truncated": False,
+                    "broker_response": {
+                        "schema_version": 1,
+                        "kind": "grabowski.root_task_systemd_pre_effect_refusal.v1",
+                        "request_id": request, "reference_sha256": reference,
+                        "action": "operator_root_task_systemd_unit",
+                        "phase": "pre_claim", "claim_started": False,
+                        "dispatch_started": False, "reason_code": "action_resolution",
+                    },
+                },
+            }),
+        }
+
+    def test_exact_request_bound_root_preclaim_is_proven_no_dispatch(self):
+        row = self.fixture()
+        self.assertTrue(read_surface._audit_rootbroker_preclaim_refusal_proven(row))
+        launcher = json.loads(row["launcher_json"])
+        launcher["privileged_broker"]["broker_response"]["reason_code"] = "peer_authority"
+        row["launcher_json"] = json.dumps(launcher)
+        self.assertTrue(read_surface._audit_rootbroker_preclaim_refusal_proven(row))
+
+    def test_false_or_ambiguous_root_preclaim_never_proves_no_dispatch(self):
+        from copy import deepcopy
+
+        base = self.fixture()
+        variants = {
+            "other_backend": ("execution_backend", "systemd-user"),
+            "task_completed": ("state", "completed"),
+            "corrupt_launcher": ("launcher_json", "{"),
+            "missing_launcher": ("launcher_json", None),
+        }
+        for name, (field, value) in variants.items():
+            with self.subTest(name=name):
+                row = deepcopy(base)
+                row[field] = value
+                self.assertFalse(read_surface._audit_rootbroker_preclaim_refusal_proven(row))
+        mutations = {
+            "self_asserted_only": (("privileged_broker",), None),
+            "response_kind": (("privileged_broker", "broker_response", "kind"), "not-a-refusal"),
+            "response_extra": (("privileged_broker", "broker_response", "malformed"), True),
+            "claimed": (("privileged_broker", "broker_response", "claim_started"), True),
+            "dispatched": (("privileged_broker", "broker_response", "dispatch_started"), True),
+            "not_preclaim": (("privileged_broker", "broker_response", "phase"), "post_dispatch"),
+            "not_start": (("privileged_broker", "broker_response", "action"), "show"),
+            "wrong_request": (("privileged_broker", "broker_response", "request_id"), "c" * 32),
+            "wrong_reference": (("privileged_broker", "broker_response", "reference_sha256"), "c" * 64),
+            "malformed_ref": (("privileged_broker", "reference_sha256"), "not-sha"),
+            "error_code_other": (("privileged_broker", "broker_response", "reason_code"), "unknown"),
+            "invoker_failed": (("privileged_broker", "broker_client_returncode"), 2),
+            "invoker_timeout": (("privileged_broker", "broker_client_timed_out"), True),
+            "invoker_truncated": (("privileged_broker", "stdout_truncated"), True),
+            "ambiguous_return": (("outcome_unknown",), True),
+            "no_pre_effect_proof": (("pre_effect_refused",), False),
+            "not_dispatched_unknown": (("launch_not_dispatched",), False),
+            "launcher_timeout": (("timed_out",), True),
+            "launcher_returncode": (("returncode",), 0),
+            "launcher_boolean_rc": (("returncode",), True),
+        }
+        for name, (parts, value) in mutations.items():
+            with self.subTest(name=name):
+                row = deepcopy(base)
+                launcher = json.loads(row["launcher_json"])
+                obj = launcher
+                for part in parts[:-1]:
+                    obj = obj[part]
+                obj[parts[-1]] = value
+                row["launcher_json"] = json.dumps(launcher)
+                self.assertFalse(read_surface._audit_rootbroker_preclaim_refusal_proven(row))
+
+    def test_complete_signal_reducer_carries_original_launcher_returncode(self):
+        self.assertIn("launcher_returncode", read_surface._COMPLETE_SIGNAL_FIELDS)
+        now = 1_800_000_000
+        record = {
+            "operation": "task-start",
+            "record_sha256": "a" * 64,
+            "timestamp": datetime.fromtimestamp(now - 20, tz=timezone.utc).isoformat(),
+            "recovery_required": True, "launcher_outcome_unknown": False,
+            "launcher_returncode": 1,
+        }
+        raw = (json.dumps(record, sort_keys=True) + "\n").encode()
+        segment = types.SimpleNamespace(path=Path("/tmp/verified-preclaim-fixture.jsonl"), records=1, captured_data=raw)
+        snap = types.SimpleNamespace(segments=(segment,), total_records=1)
+        selected = read_surface._audit_complete_signal_records(snap, as_of_unix=now)
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(selected[0][0]["launcher_returncode"], 1)
+
 if __name__ == "__main__":
     unittest.main()
