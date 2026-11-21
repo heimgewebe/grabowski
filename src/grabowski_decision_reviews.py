@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import closing, contextmanager
+from contextlib import ExitStack, closing, contextmanager
 from functools import lru_cache
 import fcntl
 import hashlib
@@ -3387,10 +3387,14 @@ def reconcile(
     # Retry only acquisition timeouts (not audit errors). Six attempts bound
     # the total wait to about one minute; a persistent busy lock fails closed.
     for attempt in range(6):
-        try:
-            with _deploy_schedule_lock():
-                return _scan_to_stability()
-        except TimeoutError:
-            if attempt == 5:
-                raise
+        with ExitStack() as acquired:
+            try:
+                acquired.enter_context(_deploy_schedule_lock())
+            except TimeoutError:
+                if attempt == 5:
+                    raise
+                continue
+            # A timeout or IO failure from the review scan itself is NOT
+            # Retention contention: propagate it without a second inventory.
+            return _scan_to_stability()
     raise AssertionError("unreachable archive-lock retry state")

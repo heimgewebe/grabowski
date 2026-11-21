@@ -476,6 +476,31 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
             self.assertEqual(outcome["status"], "blocked")
             self.assertIn("decision_review_job_inventory_unverifiable", outcome["errors"])
 
+    def test_retention_lock_does_not_retry_inner_scan_timeouts(self) -> None:
+        # Only acquisition contention is retryable. An audit/IO failure after
+        # the lock was acquired must propagate without a second inventory.
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs = Path(tmp) / "jobs"
+            jobs.mkdir(mode=0o700)
+            entered = [0]
+
+            @contextmanager
+            def existing_lock():
+                entered[0] += 1
+                yield
+
+            fake_deploy = ModuleType("grabowski_self_deploy")
+            fake_deploy._deploy_schedule_lock = existing_lock
+            with mock.patch.dict(sys.modules, {"grabowski_self_deploy": fake_deploy}), \
+                    mock.patch.object(reviews, "JOBS_ROOT", jobs), \
+                    mock.patch.object(
+                        reviews, "_reconcile_once",
+                        side_effect=TimeoutError("review child read timed out"),
+                    ):
+                with self.assertRaisesRegex(TimeoutError, "review child read timed out"):
+                    self.reconcile(jobs)
+            self.assertEqual(entered, [1])
+
     def test_retention_lock_timeout_stays_fail_closed(self) -> None:
         # Never skip a Review scan to allow a merge after lock contention.
         with tempfile.TemporaryDirectory() as tmp:
