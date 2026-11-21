@@ -47,6 +47,8 @@ TERMINAL_TASK_STATES = {
 }
 MAX_FAILED_UNITS = 2_000
 MAX_JOB_SCAN_ENTRIES = 2_000
+# Rotate bounded job windows without adding a cursor store or widening review scans.
+JOB_SCAN_WINDOW_SECONDS = 60 * 60
 MAX_JOB_REGISTRY_ENTRIES = 100_000
 MAX_ARCHIVE_JOBS_PER_PLAN = 128
 MAX_JOB_RUNTIME_SECONDS = 2_592_000
@@ -76,15 +78,14 @@ LEGACY_SELF_DEPLOY_REASON = (
 
 
 def _protected_job_retention_authority() -> bool:
-    """No protected root/index transaction exists for automatic job effects.
+    """Trusted-owner authority: same-UID hostile processes are not the boundary.
 
-    Same-UID owner/mode checks and in-process FD pins cannot authenticate an
-    already replaced jobs/archive root or serialize an index reservation with
-    an archive rename. Until a separately privileged implementation exists,
-    automatic job moves and systemd job resets must remain disabled.
-    This is not a runtime configuration switch or a security attestation.
+    Existing pinned-FD, no-replace, deployment-index, receipts and audit checks
+    still protect against accidental drift, corruption and data loss. Jobs
+    carrying any decision-review evidence are ineligible for retention below.
+    This is not a claim of resistance to a compromised same-UID process.
     """
-    return False
+    return True
 
 
 def _canonical_json(value: Any) -> bytes:
@@ -355,6 +356,16 @@ def provision_receipt_root(*, receipt_root: Path = RECEIPT_ROOT) -> dict[str, An
     }
 
 
+def provision_archive_root(*, archive_root: Path = ARCHIVE_ROOT) -> dict[str, Any]:
+    """Provision a private archive root *before* constructing an effect plan.
+
+    Use the existing no-follow, parent-FD-pinned provisioner. Never create an
+    archive output directory from a plan whose root identity was absent.
+    """
+    result = provision_receipt_root(receipt_root=archive_root)
+    return {**result, "operation": "grabowski-retention-archive-root-provision"}
+
+
 def _pinned_output_root_fd(plan: "_PinnedRetentionPlan", kind: str) -> int:
     """Pin archive/receipt root before first use; never adopt a new pathname."""
     if kind not in {"archive", "receipt"}:
@@ -493,13 +504,20 @@ def _archive_file_shape_preflight(
         os.close(fd)
 
 
-def _failed_units(*, job_authority: bool = True) -> list[str]:
+def _failed_units(*, job_authority: bool = True, retention_only: bool = False) -> list[str]:
     # Without protected archive/reset authority, failed job units accumulate.
     # Ask systemd only for independently actionable task/worker failures.
     if not isinstance(job_authority, bool):
         raise ValueError("job_authority must be boolean")
     command = ["systemctl", "--user", "--failed", "--no-legend", "--plain"]
-    if not job_authority:
+    if retention_only:
+        # Limit collection at systemd as well, before the failed-unit cap.
+        command = [
+            "systemctl", "--user", "list-units", "--failed", "--no-legend", "--plain",
+            "grabowski-job-*.service", "grabowski-task-*.service",
+            "grabowski-browser-worker-*.service", "grabowski-gui-worker-*.service",
+        ]
+    elif not job_authority:
         command = [
             "systemctl", "--user", "list-units", "--failed", "--no-legend", "--plain",
             "grabowski-task-*.service", "grabowski-browser-worker-*.service",
@@ -1284,6 +1302,99 @@ class _PinnedRetentionPlan(dict):
                 setattr(self, field, -1)
 
 
+DECISION_REVIEW_RESULT_MARKER = b"GRABOWSKI_DECISION_REVIEW_V1="
+
+
+def _job_contains_decision_review_evidence(job_fd: int, *, job_name: str) -> bool:
+    """Keep all review and ambiguous marker evidence in the live scan root.
+
+    Review reconciliation also examines stdout of *ordinary* jobs for a late
+    material REJECT. Merely checking decision_bound_review would hide these.
+    Inspect the pinned job inode, never a pathname that can be substituted.
+    """
+    try:
+        raw, _ = _archive_pinned_json_preimage(job_fd, "metadata.json")
+    except OSError as exc:
+        raise RuntimeError("archive source file is unavailable: metadata.json") from exc
+    try:
+        metadata = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("job metadata cannot establish review-free provenance") from exc
+    if not isinstance(metadata, dict):
+        raise RuntimeError("job metadata is not an object")
+    # Captain treats missing, forged or mismatched job origins as potentially
+    # hiding a review. Retention must obey exactly the same provenance rule;
+    # never turn a Captain fail-closed condition into a clean merge by moving it.
+    source = str(SRC)
+    if source not in sys.path:
+        sys.path.insert(0, source)
+    import grabowski_job_origin as job_origin
+
+    try:
+        origin = job_origin.validate_origin(
+            metadata.get("origin"), metadata.get("origin_sha256"),
+            expected_unit=job_name,
+        )
+    except ValueError:
+        return True
+    for key in ("unit", "job_id", "owner", "argv_sha256", "scope"):
+        if metadata.get(key) != origin.get(key):
+            return True
+    if "decision_bound_review" in origin["scope"]:
+        return True
+    for receipt_name in ("review-role-attempt.json", "review-role-receipt.json"):
+        try:
+            os.stat(receipt_name, dir_fd=job_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            return True
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+    marker = DECISION_REVIEW_RESULT_MARKER
+    for name in ("stdout.log", "stderr.log"):
+        try:
+            descriptor = os.open(name, flags, dir_fd=job_fd)
+        except FileNotFoundError:
+            # Captain raises decision_review_unbound_evidence_invalid when
+            # ordinary stdout is missing; removing this job would erase that
+            # fail-closed condition even with an otherwise valid origin.
+            if name == "stdout.log":
+                return True
+            continue
+        try:
+            before = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_nlink != 1
+                or before.st_uid != os.getuid()
+                or stat.S_IMODE(before.st_mode) & 0o077
+                or before.st_size > MAX_ARCHIVE_FILE_BYTES
+            ):
+                raise RuntimeError("job log cannot establish review-free provenance")
+            remaining, suffix = before.st_size, b""
+            while remaining:
+                chunk = os.read(descriptor, min(1024 * 1024, remaining))
+                if not chunk:
+                    raise RuntimeError("job log changed during review-evidence scan")
+                window = suffix + chunk
+                if marker in window:
+                    return True
+                suffix = window[-(len(marker) - 1):]
+                remaining -= len(chunk)
+            after = os.fstat(descriptor)
+            if (
+                before.st_dev, before.st_ino, before.st_size,
+                before.st_mtime_ns, before.st_ctime_ns,
+            ) != (
+                after.st_dev, after.st_ino, after.st_size,
+                after.st_mtime_ns, after.st_ctime_ns,
+            ):
+                raise RuntimeError("job log changed during review-evidence scan")
+        finally:
+            os.close(descriptor)
+    return False
+
+
 def build_plan(
     *,
     minimum_job_age_seconds: int = 86_400,
@@ -1297,6 +1408,7 @@ def build_plan(
     resource_db: Path = RESOURCE_DB,
     failed_units: list[str] | None = None,
     unit_states: dict[str, dict[str, str]] | None = None,
+    retention_failed_units_only: bool = False,
 ) -> dict[str, Any]:
     if (
         isinstance(minimum_job_age_seconds, bool)
@@ -1362,13 +1474,25 @@ def build_plan(
         _archive_require_unchanged_root(receipt_root, pinned.receipt_fd)
     observed_now = int(time.time()) if now is None else now
     failed = (
-        _failed_units(job_authority=authorized_job_effects)
+        _failed_units(
+            job_authority=authorized_job_effects,
+            retention_only=retention_failed_units_only,
+        )
         if failed_units is None else sorted(set(failed_units))
     )
     if not authorized_job_effects:
         # Even caller-supplied job failures cannot exhaust the independent
         # task/worker budget or enable any protected job effect.
         failed = [unit for unit in failed if not JOB_UNIT.fullmatch(unit)]
+    if retention_failed_units_only:
+        # The hourly retention worker cannot repair unrelated systemd units.
+        # Keep every failed Grabowski job/task/worker visible and actionable.
+        failed = [
+            unit for unit in failed
+            if JOB_UNIT.fullmatch(unit)
+            or TASK_UNIT.fullmatch(unit)
+            or WORKER_UNIT.fullmatch(unit)
+        ]
     if len(failed) > MAX_FAILED_UNITS:
         raise RuntimeError("failed-unit inventory exceeds the bounded scan")
 
@@ -1402,14 +1526,32 @@ def build_plan(
     pending_deploy_job = (
         deploy_index["pending_unit"] if deploy_index is not None else None
     )
-    primary_entries = registry_entries[:MAX_JOB_SCAN_ENTRIES]
+    # A fixed alphabetical prefix starves later jobs forever if its members
+    # carry permanent review evidence. Each bounded time slot chooses the next
+    # page; failed jobs remain force-included independently of this page.
+    # The installed hourly calendar timer revisits every page even when all earlier jobs
+    # must remain in the source root.
+    job_scan_window_count = max(
+        1, (len(registry_entries) + MAX_JOB_SCAN_ENTRIES - 1) // MAX_JOB_SCAN_ENTRIES
+    )
+    job_scan_window_index = (
+        (observed_now // JOB_SCAN_WINDOW_SECONDS) % job_scan_window_count
+        if authorized_job_effects else 0
+    )
+    job_scan_start = job_scan_window_index * MAX_JOB_SCAN_ENTRIES
+    primary_entries = registry_entries[
+        job_scan_start:job_scan_start + MAX_JOB_SCAN_ENTRIES
+    ]
     failed_job_names = {
         unit.removesuffix(".service")
         for unit in failed
         if JOB_UNIT.fullmatch(unit)
     }
     selected_by_name = {entry.name: entry for entry in primary_entries}
-    for entry in registry_entries[MAX_JOB_SCAN_ENTRIES:]:
+    # A rotated page is not necessarily the alphabetical prefix. Force
+    # failed units from the entire discovered registry, including names
+    # lexically before the selected page.
+    for entry in registry_entries:
         if entry.name in failed_job_names:
             selected_by_name[entry.name] = entry
     entries = sorted(selected_by_name.values(), key=lambda entry: entry.name)
@@ -1534,6 +1676,14 @@ def build_plan(
                 pinned.jobs_fd, source_dir.name, source_dir
             )
             try:
+                if _job_contains_decision_review_evidence(source_fd, job_name=record["job_name"]):
+                    archive_blocked_units.add(record["unit"])
+                    # A complete review is intentionally retained, not a
+                    # maintenance error. Only failed-unit reset requests
+                    # need an explicit blocked diagnosis.
+                    if record["unit"] in failed:
+                        block(record["unit"], "decision-review evidence must remain in live jobs")
+                    continue
                 _archive_require_json_temp_capacity(source_fd)
                 _archive_require_child_bound(
                     pinned.jobs_fd, source_dir.name, source_fd, source_dir
@@ -1659,6 +1809,8 @@ def build_plan(
         "job_registry_entry_count": len(registry_entries),
         "job_registry_discovery_truncated": job_registry_discovery_truncated,
         "job_scan_count": len(entries),
+        "job_scan_window_index": job_scan_window_index,
+        "job_scan_window_count": job_scan_window_count,
         "job_scan_truncated": job_scan_truncated,
         "job_scan_deferred_count": job_scan_deferred_count,
         "archive_inventory_complete": not job_scan_truncated,
@@ -2561,6 +2713,10 @@ def _prepare_archives(
         if source_pins is not None:
             source_pins.callback(os.close, source_fd)
         try:
+            if _job_contains_decision_review_evidence(source_fd, job_name=record["job_name"]):
+                raise RuntimeError(
+                    "decision-review evidence appeared before archive; preserve source"
+                )
             # The metadata used for terminal/age authorization must be from
             # THIS source inode. A same-UID peer can rename the basename
             # between the earlier record read and this source open.
@@ -3818,13 +3974,20 @@ def apply_periodic_plan(
     as a successful no-op so repeated timer runs remain idempotent without
     manufacturing duplicate terminal receipts.
     """
+    # One clock snapshot binds both periodic plans to the same scan window.
+    # A slot boundary during revalidation must not manufacture plan drift.
+    cycle_now = int(time.time())
     preview = build_plan(
         minimum_job_age_seconds=minimum_job_age_seconds,
         max_archive_jobs=max_archive_jobs,
+        now=cycle_now,
+        retention_failed_units_only=True,
     )
     current = build_plan(
         minimum_job_age_seconds=minimum_job_age_seconds,
         max_archive_jobs=max_archive_jobs,
+        now=cycle_now,
+        retention_failed_units_only=True,
     )
     if current["plan_sha256"] != preview["plan_sha256"]:
         raise RuntimeError("retention plan drifted between periodic snapshots")
@@ -3986,6 +4149,10 @@ def main() -> int:
                 raise ValueError(
                     "--periodic-apply is incompatible with explicit apply arguments"
                 )
+            # A fresh installation has no archive leaf. Provision its pinned
+            # private inode before the two retention plans, never during apply.
+            if _protected_job_retention_authority():
+                provision_archive_root()
             receipt = apply_periodic_plan(
                 minimum_job_age_seconds=args.minimum_job_age_seconds,
                 max_archive_jobs=args.max_archive_jobs,

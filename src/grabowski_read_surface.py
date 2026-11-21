@@ -440,9 +440,12 @@ def _audit_timestamp_unix(value: Any) -> int | None:
 
 
 
-def _audit_projection_records_snapshot() -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Return at most the newest verified audit scan window without full materialization."""
-    snapshot = audit_query.capture_verified_audit_snapshot()
+def _audit_projection_records_snapshot(
+    snapshot: audit_query.VerifiedAuditSnapshot | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Return the bounded newest suffix of a verified audit snapshot."""
+    if snapshot is None:
+        snapshot = audit_query.capture_verified_audit_snapshot()
     newest_first: list[dict[str, Any]] = []
     for segment in reversed(snapshot.segments):
         data = audit_query._load_snapshot_segment(segment)
@@ -498,6 +501,132 @@ def _audit_projection_records_snapshot() -> tuple[list[dict[str, Any]], dict[str
         **capacity,
     }
 
+
+
+# An explicit, slower signal-only read may use the verified complete chain.
+# Retain only operations needed by the seven-day signal engine: the complete
+# history of transition records plus current-window uncertain outcomes.
+# In particular, append order is not event-time order: never stop upon seeing
+# an old timestamp or declare a suffix complete from its oldest record.
+MAX_COMPLETE_SIGNAL_RETAINED_RECORDS = 100_000
+_COMPLETE_SIGNAL_TRANSITIONS = frozenset(
+    operation
+    for pair in audit_signal.AUDIT_TRANSITION_PAIRS
+    for operation in pair
+) | {audit_signal.RETENTION_COMPLETION_AUDIT_RECONCILIATION_OPERATION}
+_COMPLETE_SIGNAL_FIELDS = frozenset({
+    "operation", "timestamp", "record_sha256", "plan_sha256", "attempt",
+    "receipt_sha256", "intent_record_sha256", "reconciliation_kind",
+    "completed", "retention_effect_retried", "outcome_unknown",
+    "launcher_outcome_unknown", "launcher_returncode", "recovery_required", "task_id",
+    "authoritative_unit", "unit",
+})
+
+
+def _audit_complete_signal_records(
+    snapshot: audit_query.VerifiedAuditSnapshot, *, as_of_unix: int
+) -> list[tuple[dict[str, Any], int | None]]:
+    """Read all verified audit segments but retain only signal-relevant fields."""
+    since_unix = as_of_unix - audit_signal.AUDIT_SIGNAL_WINDOW_SECONDS
+    selected: list[tuple[dict[str, Any], int | None]] = []
+    scanned = 0
+    for segment in snapshot.segments:
+        lines = audit_query._load_snapshot_segment(segment).splitlines()
+        if len(lines) != segment.records:
+            raise RuntimeError("verified audit segment record count changed during signal scan")
+        for raw_line in lines:
+            scanned += 1
+            try:
+                record = json.loads(raw_line)
+            except (ValueError, UnicodeDecodeError) as exc:
+                raise RuntimeError("verified audit record decode invariant violated") from exc
+            if not isinstance(record, dict):
+                raise RuntimeError("verified audit chain yielded a non-object record")
+            operation = record.get("operation")
+            transition = operation in _COMPLETE_SIGNAL_TRANSITIONS
+            uncertain = (
+                record.get("outcome_unknown") is True
+                or record.get("launcher_outcome_unknown") is True
+                or record.get("recovery_required") is True
+            )
+            if not transition and not uncertain:
+                continue
+            timestamp = _audit_timestamp_unix(record.get("timestamp"))
+            if timestamp is None or timestamp > as_of_unix:
+                continue
+            if not transition and timestamp < since_unix:
+                continue
+            reduced = {key: record[key] for key in _COMPLETE_SIGNAL_FIELDS if key in record}
+            if audit_signal._audit_record_evidence_sha256(reduced) is None:
+                reduced[audit_signal.AUDIT_EVIDENCE_RECORD_SHA256_FIELD] = (
+                    audit_query._record_evidence_digest(record, raw_line)
+                )
+            selected.append((reduced, timestamp))
+            if len(selected) > MAX_COMPLETE_SIGNAL_RETAINED_RECORDS:
+                raise RuntimeError("complete signal scan exceeded the retained-record budget")
+    if scanned != snapshot.total_records:
+        raise RuntimeError("verified audit signal scan did not cover the full chain")
+    return selected
+
+
+def _audit_rootbroker_preclaim_refusal_proven(row: dict[str, Any]) -> bool:
+    """Reduce a persisted, request-bound root refusal to a no-dispatch fact.
+
+    Do not classify generic failed starts, denied status reads, ambiguous
+    broker responses or a caller's asserted flag as evidence of no effect.
+    The caller separately verifies the exact terminal TaskStore projection.
+    """
+    if row.get("state") != "failed" or row.get("execution_backend") != "systemd-root-broker":
+        return False
+    raw = row.get("launcher_json")
+    if not isinstance(raw, str):
+        return False
+    try:
+        launcher = json.loads(raw)
+    except (ValueError, TypeError):
+        return False
+    if not isinstance(launcher, dict):
+        return False
+    invoked = launcher.get("privileged_broker")
+    if not isinstance(invoked, dict):
+        return False
+    refusal = invoked.get("broker_response")
+    if not isinstance(refusal, dict) or set(refusal) != {
+        "schema_version", "kind", "request_id", "reference_sha256",
+        "action", "phase", "claim_started", "dispatch_started", "reason_code",
+    }:
+        return False
+    request = invoked.get("request_id")
+    reference = invoked.get("reference_sha256")
+    return bool(
+        launcher.get("pre_effect_refused") is True
+        and launcher.get("launch_not_dispatched") is True
+        and launcher.get("outcome_unknown") is False
+        and type(launcher.get("returncode")) is int
+        and launcher["returncode"] == 1
+        and launcher.get("timed_out") is False
+        and launcher.get("stdout_truncated") is False
+        and launcher.get("stderr_truncated") is False
+        and type(invoked.get("broker_client_returncode")) is int
+        and invoked["broker_client_returncode"] == 1
+        and invoked.get("broker_client_timed_out") is False
+        and invoked.get("stdout_truncated") is False
+        and invoked.get("stderr_truncated") is False
+        and isinstance(request, str)
+        and re.fullmatch(r"[0-9a-f]{32}", request) is not None
+        and isinstance(reference, str)
+        and re.fullmatch(r"[0-9a-f]{64}", reference) is not None
+        and refusal.get("schema_version") == 1
+        and type(refusal["schema_version"]) is int
+        and refusal.get("kind") == "grabowski.root_task_systemd_pre_effect_refusal.v1"
+        and refusal.get("request_id") == request
+        and refusal.get("reference_sha256") == reference
+        and refusal.get("action") == "operator_root_task_systemd_unit"
+        and refusal.get("phase") == "pre_claim"
+        and refusal.get("claim_started") is False
+        and refusal.get("dispatch_started") is False
+        and refusal.get("reason_code") in {"action_resolution", "peer_authority"}
+    )
 
 def _prepare_audit_records(
     records: list[dict[str, Any]],
@@ -1704,8 +1833,13 @@ def grabowski_audit_projection(
     view: str = "minimal",
     top_limit: AuditProjectionTopLimit = 10,
     fields: list[str] | None = None,
+    complete_signals: bool = False,
 ) -> dict[str, Any]:
-    """Project verified audit-chain records into bounded operational trends."""
+    """Read bounded audit trends; optionally scan the full chain for 7d signals.
+
+    complete_signals is an explicit slower, read-only operation. It does not
+    change the bounded trend summaries or claim full all-time coverage.
+    """
     selected_view = consumer_surface.normalize_view(view)
     if (
         isinstance(top_limit, bool)
@@ -1713,8 +1847,20 @@ def grabowski_audit_projection(
         or not 1 <= top_limit <= MAX_AUDIT_PROJECTION_TOP
     ):
         raise ValueError(f"top_limit must be between 1 and {MAX_AUDIT_PROJECTION_TOP}")
+    if not isinstance(complete_signals, bool):
+        raise ValueError("complete_signals must be boolean")
+    # The full scan is anchored at invocation, not the later end of its
+    # verification pass. A concurrent append must not backdate the cutoff.
+    requested_as_of_unix = int(time.time()) if complete_signals else None
     try:
-        records, snapshot_status = _audit_projection_records_snapshot()
+        full_snapshot = (
+            audit_query.capture_verified_audit_snapshot()
+            if complete_signals else None
+        )
+        if full_snapshot is None:
+            records, snapshot_status = _audit_projection_records_snapshot()
+        else:
+            records, snapshot_status = _audit_projection_records_snapshot(full_snapshot)
     except (OSError, PermissionError, RuntimeError, ValueError) as exc:
         raise RuntimeError(f"Audit log verification failed: {exc}") from exc
     binding = _audit_snapshot_binding(records)
@@ -1730,13 +1876,9 @@ def grabowski_audit_projection(
     ):
         raise RuntimeError("Audit snapshot binding mismatch")
     prepared_records = _prepare_audit_records(records)
-    after = base._verify_audit_log(base.AUDIT_LOG)
-    if not after.get("valid"):
-        raise RuntimeError(
-            f"Audit log verification failed after projection: {after.get('error') or 'unknown'}"
-        )
-
-    as_of_unix = int(time.time())
+    as_of_unix = (
+        int(time.time()) if requested_as_of_unix is None else requested_as_of_unix
+    )
     windows: list[dict[str, Any]] = []
     private_windows: dict[str, dict[str, Any]] = {}
     for label, seconds in AUDIT_PROJECTION_WINDOWS:
@@ -1790,6 +1932,11 @@ def grabowski_audit_projection(
             "terminalization_sha256": row.get("terminalization_sha256"),
             "terminalized_at_unix": row.get("terminalized_at_unix"),
             "terminal_evidence_valid": terminal_evidence_valid,
+            "created_at_unix": row.get("created_at_unix"),
+            "pre_effect_refusal_proven": (
+                terminal_evidence_valid
+                and _audit_rootbroker_preclaim_refusal_proven(row)
+            ),
         }
 
     # Audit record timestamps are not an append-order invariant: the append
@@ -1798,14 +1945,34 @@ def grabowski_audit_projection(
     # because its oldest visible timestamp predates the window boundary.  Keep
     # absence/clear claims fail-closed whenever the verified chain was truncated.
     signal_window_complete = not scan_truncated
+    signal_records = prepared_records
+    signal_binding = binding
+    if complete_signals and scan_truncated:
+        assert full_snapshot is not None
+        try:
+            signal_records = _audit_complete_signal_records(
+                full_snapshot, as_of_unix=as_of_unix
+            )
+        except (OSError, PermissionError, RuntimeError, ValueError) as exc:
+            raise RuntimeError(f"Verified complete signal scan failed: {exc}") from exc
+        signal_window_complete = True
+        signal_binding = {
+            "snapshot_sha256": full_snapshot.chain_content_sha256,
+            "last_record_sha256": full_snapshot.last_record_sha256,
+        }
     signal_projection = audit_signal.build_projection(
-        prepared_records,
+        signal_records,
         as_of_unix=as_of_unix,
-        audit_source_binding=binding,
+        audit_source_binding=signal_binding,
         audit_window_complete=signal_window_complete,
         runtime_status_provider=getattr(base, "grabowski_status", None),
         task_terminal_provider=task_terminal_provider,
     )
+    after = base._verify_audit_log(base.AUDIT_LOG)
+    if not after.get("valid"):
+        raise RuntimeError(
+            f"Audit log verification failed after projection: {after.get('error') or 'unknown'}"
+        )
     advanced = (
         after.get("last_record_sha256") != binding["last_record_sha256"]
         or after.get("total_records") != total_records
@@ -1911,6 +2078,17 @@ def grabowski_audit_projection(
             ),
         ],
     }
+    if complete_signals:
+        payload["source_binding"]["signal_scan"] = {
+            "scope": "full_verified_chain" if scan_truncated else "bounded_full_chain",
+            "window_complete": signal_window_complete,
+            "scanned_records": total_records if scan_truncated else scanned_records,
+            "retained_signal_records": len(signal_records),
+            "chain_content_sha256": (
+                full_snapshot.chain_content_sha256 if full_snapshot is not None else None
+            ),
+            "summary_remains_truncated": scan_truncated,
+        }
     payload["findings_sha256"] = _audit_findings_sha256(
         [
             private_windows[label]

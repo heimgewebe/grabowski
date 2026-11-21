@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import closing, contextmanager
+from contextlib import ExitStack, closing, contextmanager
 from functools import lru_cache
 import fcntl
 import hashlib
@@ -704,8 +704,9 @@ def _unbound_stdout_has_target_result(
     expected: dict[str, Any], allow_legacy_readable: bool,
     observed_sha256: list[str] | None = None,
     expected_prefix: tuple[int, str] | None = None,
+    log_name: str = "stdout.log",
 ) -> bool:
-    """Scan complete owner-pinned ordinary stdout, not an arbitrary 8-MiB prefix.
+    """Scan complete owner-pinned ordinary log, not an arbitrary 8-MiB prefix.
 
     Memory use is bounded by one chunk and a candidate review marker. A giant
     unrelated line is skipped rather than buffered. An oversized candidate,
@@ -718,8 +719,10 @@ def _unbound_stdout_has_target_result(
         or stat.S_IMODE(parent.st_mode) & 0o077
     ):
         raise ValueError("unbound review evidence parent is not owner-private")
+    if log_name not in {"stdout.log", "stderr.log"}:
+        raise ValueError("unbound log name is not admitted")
     flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
-    fd = os.open("stdout.log", flags, dir_fd=parent_fd)
+    fd = os.open(log_name, flags, dir_fd=parent_fd)
     try:
         before = os.fstat(fd)
         mode = stat.S_IMODE(before.st_mode)
@@ -805,7 +808,7 @@ def _unbound_stdout_has_target_result(
         if maybe_marker and exact_target_marker(line):
             found = True
         after = os.fstat(fd)
-        linked = os.stat("stdout.log", dir_fd=parent_fd, follow_symlinks=False)
+        linked = os.stat(log_name, dir_fd=parent_fd, follow_symlinks=False)
         if (
             read_size != before.st_size
             or _review_stat_file_identity(after) != _review_stat_file_identity(before)
@@ -2385,51 +2388,60 @@ def _revalidate_ordinary_stdout_append(
     unit: str, *, directory_fd: int,
     before: tuple[tuple[str, tuple[int, ...] | None], ...],
     after: tuple[tuple[str, tuple[int, ...] | None], ...],
-    original_sha256: dict[str, str], expected: dict[str, Any],
-    recheck_budget: list[int],
+    original_sha256: dict[str, str], original_stderr_sha256: dict[str, str],
+    expected: dict[str, Any], recheck_budget: list[int],
 ) -> tuple[bool, bool]:
-    """Accept only re-scanned append data of a proven ordinary, unbound job.
+    """Admit only prefix-verified append to ordinary stdout and/or stderr.
 
-    Every other file identity stays unchanged. An exact PR-bound result in
-    newly appended stdout still blocks, as do rewritten earlier bytes,
-    non-append changes, vanished inodes and a second write during re-scan.
+    Every other file remains immutable. Scan each changed log for a newly
+    published exact-PR decision; an altered prefix or a second write blocks.
     """
     initial = dict(before)
     current = dict(after)
-    old = initial.get("stdout.log")
-    new = current.get("stdout.log")
-    saved_digest = original_sha256.get(unit)
-    if (
-        saved_digest is None or old is None or new is None
-        or len(saved_digest) != 64
-        or any(current.get(key) != value for key, value in initial.items()
-               if key != "stdout.log")
-        or new[:5] != old[:5]
-        or new[5] <= old[5]
-    ):
+    changed = {name for name in initial if current.get(name) != initial[name]}
+    if not changed or not changed <= {"stdout.log", "stderr.log"}:
         return False, False
-    observed: list[str] = []
+    hashes = {
+        "stdout.log": original_sha256,
+        "stderr.log": original_stderr_sha256,
+    }
+    updated: dict[str, str] = {}
+    material = False
     try:
-        found = _unbound_stdout_has_target_result(
-            Path(unit), parent_fd=directory_fd, aggregate_bytes=recheck_budget,
-            expected=expected, allow_legacy_readable=False,
-            observed_sha256=observed,
-            expected_prefix=(old[5], saved_digest),
-        )
+        for name in sorted(changed):
+            old = initial[name]
+            new = current[name]
+            saved_digest = hashes[name].get(unit)
+            if (
+                saved_digest is None or old is None or new is None
+                or len(saved_digest) != 64 or new[:5] != old[:5]
+                or new[5] <= old[5]
+            ):
+                return False, False
+            observed: list[str] = []
+            material |= _unbound_stdout_has_target_result(
+                Path(unit), parent_fd=directory_fd,
+                aggregate_bytes=recheck_budget, expected=expected,
+                allow_legacy_readable=False, observed_sha256=observed,
+                expected_prefix=(old[5], saved_digest), log_name=name,
+            )
+            if not observed:
+                return False, False
+            updated[name] = observed[0]
         if _review_child_file_snapshot(directory_fd) != after:
             return False, False
     except (OSError, ValueError):
         return False, False
-    if not observed:
-        return False, False
-    original_sha256[unit] = observed[0]
-    return True, found
+    for name, digest in updated.items():
+        hashes[name][unit] = digest
+    return True, material
 
 
 def _iter_pinned_review_job_directories(
     root: Path, errors: list[str], metadata_budget: list[int], *,
     expected: dict[str, Any], unbound_stdout_budget: list[int],
     ordinary_stdout_sha256: dict[str, str],
+    ordinary_stderr_sha256: dict[str, str],
 ) -> Iterator[tuple[Path, int]]:
     dir_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
     try:
@@ -2656,6 +2668,7 @@ def _iter_pinned_review_job_directories(
                                     unit, directory_fd=job_fd,
                                     before=job_files_before, after=later,
                                     original_sha256=ordinary_stdout_sha256,
+                                    original_stderr_sha256=ordinary_stderr_sha256,
                                     expected=expected, recheck_budget=recheck_budget,
                                 )
                                 if material:
@@ -2699,6 +2712,7 @@ def _iter_pinned_review_job_directories(
                             unit, directory_fd=child_fd,
                             before=files_before, after=files_after,
                             original_sha256=ordinary_stdout_sha256,
+                            original_stderr_sha256=ordinary_stderr_sha256,
                             expected=expected, recheck_budget=recheck_budget,
                         )
                         if material:
@@ -2863,10 +2877,12 @@ def _reconcile_once(
     external_v1_snapshots: list[tuple[Path, tuple[int, ...], tuple[int, ...] | None]] = []
     skipped_prelaunch_stubs: list[str] = []
     ordinary_stdout_sha256: dict[str, str] = {}
+    ordinary_stderr_sha256: dict[str, str] = {}
     iterator = _iter_pinned_review_job_directories(
         root, errors, metadata_budget, expected=expected,
         unbound_stdout_budget=unbound_stdout_budget,
         ordinary_stdout_sha256=ordinary_stdout_sha256,
+        ordinary_stderr_sha256=ordinary_stderr_sha256,
     )
     with closing(iterator):
         for directory, directory_fd in iterator:
@@ -2938,6 +2954,24 @@ def _reconcile_once(
                         # Only an authenticated, non-review origin can use
                         # the stricter prefix-bound append re-check.
                         ordinary_stdout_sha256[directory.name] = digests[0]
+                        stderr_digests: list[str] = []
+                        try:
+                            has_stderr_result = _unbound_stdout_has_target_result(
+                                directory, parent_fd=directory_fd,
+                                aggregate_bytes=unbound_stdout_budget,
+                                expected=expected, allow_legacy_readable=False,
+                                observed_sha256=stderr_digests,
+                                log_name="stderr.log",
+                            )
+                        except FileNotFoundError:
+                            pass  # Historical ordinary jobs may lack stderr.
+                        else:
+                            if has_stderr_result:
+                                errors.append(
+                                    f"decision_review_unbound_result:{directory.name}"
+                                )
+                            elif stderr_digests:
+                                ordinary_stderr_sha256[directory.name] = stderr_digests[0]
                 except (OSError, ValueError) as exc:
                     errors.append(
                         f"decision_review_unbound_evidence_invalid:"
@@ -3319,6 +3353,8 @@ def reconcile(
     malformed provenance or changed/remapped prior directory. Three racing
     scans without stability remain a hard block, never a presumed PASS.
     """
+    # Release admission may already hold the exclusive Retention/deploy lock.
+    # Its historical reconciliation must never acquire that lock again.
     result: dict[str, Any] = {}
     for _ in range(3):
         result = _reconcile_once(
@@ -3341,3 +3377,54 @@ def reconcile(
         ):
             return result
     return result
+
+def reconcile_for_captain(
+    *,
+    repo: str,
+    pr: int,
+    head_sha: str,
+    base_sha: str,
+    diff_sha256: str,
+    equivalent_diff_sha256s: list[str] | tuple[str, ...] | None = None,
+    defer_diff_identity: bool = False,
+    jobs_root: Path | None = None,
+) -> dict[str, Any]:
+    """PR Captain-only complete scan coordinated with hourly Retention.
+
+    Deployment admission already holds the same exclusive lock and instead
+    calls the plain reconcile() function without reacquisition.
+    """
+    def _scan_to_stability() -> dict[str, Any]:
+        return reconcile(
+            repo=repo, pr=pr, head_sha=head_sha, base_sha=base_sha,
+            diff_sha256=diff_sha256,
+            equivalent_diff_sha256s=equivalent_diff_sha256s,
+            defer_diff_identity=defer_diff_identity, jobs_root=jobs_root,
+        )
+
+    # Test fixtures use isolated roots; only the canonical production jobs
+    # root is shared with the real hourly Retention archive worker.
+    if jobs_root is not None and Path(jobs_root) != JOBS_ROOT:
+        return _scan_to_stability()
+
+    # Retention already holds this existing exclusive lock around the pinned
+    # atomic job moves. Protect the ENTIRE job inventory, including the late
+    # material-REJECT rechecks, with the same lock. Do not treat a vanished
+    # inode as safe, and never accept a partial scan.
+    from grabowski_self_deploy import _deploy_schedule_lock
+
+    # Archive batches can exceed the deploy lock's existing 10s bounded wait.
+    # Retry only acquisition timeouts (not audit errors). Six attempts bound
+    # the total wait to about one minute; a persistent busy lock fails closed.
+    for attempt in range(6):
+        with ExitStack() as acquired:
+            try:
+                acquired.enter_context(_deploy_schedule_lock())
+            except TimeoutError:
+                if attempt == 5:
+                    raise
+                continue
+            # A timeout or IO failure from the review scan itself is NOT
+            # Retention contention: propagate it without a second inventory.
+            return _scan_to_stability()
+    raise AssertionError("unreachable archive-lock retry state")

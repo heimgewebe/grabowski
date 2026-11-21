@@ -367,6 +367,14 @@ class FakeRunner:
 
 
 class RootbrokerCutoverTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # Simulated systemd cutovers must not depend on the CI host's UID 1000.
+        host_account = patch.object(
+            cutover.pwd, "getpwuid", return_value=SimpleNamespace(pw_name="alex")
+        )
+        host_account.start()
+        self.addCleanup(host_account.stop)
+
     def test_fatal_error_projection_is_bounded_stderr_and_preserves_stdout_json(self) -> None:
         message = "first\nsecond " + ("x" * 2000)
         failure = cutover.CutoverError(message)
@@ -412,22 +420,28 @@ class RootbrokerCutoverTests(unittest.TestCase):
                 {"success": False, "error": "boom"},
             )
 
-    def test_operator_username_is_runner_observed_and_fails_closed_on_drift(self) -> None:
-        calls: list[list[str]] = []
-
-        def matching_runner(argv: list[str]) -> subprocess.CompletedProcess[str]:
-            calls.append(list(argv))
-            return _completed(argv, stdout="alex\n")
-
-        self.assertEqual(cutover._operator_username(matching_runner), "alex")
-        self.assertEqual(calls, [["/usr/bin/id", "-nu", "1000"]])
-
-        with self.assertRaisesRegex(
-            cutover.CutoverError, "identity differs from host contract"
-        ):
-            cutover._operator_username(
-                lambda argv: _completed(argv, stdout="runner\n")
+    def test_operator_username_resolves_nss_without_usr_bin_id(self) -> None:
+        # NixOS does not guarantee /usr/bin/id; real NSS remains authoritative.
+        with patch.object(cutover.pwd, "getpwuid", return_value=SimpleNamespace(pw_name="alex")) as lookup:
+            self.assertEqual(
+                cutover._operator_username(
+                    lambda argv: self.fail("external id binary must not be called")
+                ), "alex",
             )
+        lookup.assert_called_once_with(1000)
+
+        with patch.object(cutover.pwd, "getpwuid", return_value=SimpleNamespace(pw_name="runner")):
+            with self.assertRaisesRegex(cutover.CutoverError, "identity differs from host contract"):
+                cutover._operator_username(
+                    lambda argv: self.fail("runner must not be used")
+                )
+        for error in (KeyError(1000), OSError("NSS unavailable")):
+            with self.subTest(error=type(error).__name__):
+                with patch.object(cutover.pwd, "getpwuid", side_effect=error):
+                    with self.assertRaisesRegex(cutover.CutoverError, "uid 1000 is unavailable"):
+                        cutover._operator_username(
+                            lambda argv: self.fail("runner must not be used")
+                        )
 
     def test_automatic_staged_helper_path_is_commit_bound(self) -> None:
         with patch.object(cutover, "AUTOMATIC_STAGING_ROOT", Path("/root/staging")):
@@ -2547,6 +2561,13 @@ class RootbrokerCutoverTests(unittest.TestCase):
 
 
 class BackupMountReconcileCutoverContractTests(unittest.TestCase):
+    def setUp(self) -> None:
+        host_account = patch.object(
+            cutover.pwd, "getpwuid", return_value=SimpleNamespace(pw_name="alex")
+        )
+        host_account.start()
+        self.addCleanup(host_account.stop)
+
     def test_reconcile_action_and_helper_are_commit_bound(self) -> None:
         observed = cutover._local_backup_ntfs_actions_from_repository(
             ROOT, expected_head=HEAD, runner=FakeRunner()

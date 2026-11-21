@@ -9,11 +9,16 @@ import os
 from pathlib import Path
 import sqlite3
 import tempfile
+import sys
 import types
 import unittest
 from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT / "src") not in sys.path:
+    sys.path.insert(0, str(ROOT / "src"))
+import grabowski_job_origin as job_origin
+
 SPEC = importlib.util.spec_from_file_location(
     "maintain_runtime_state_test", ROOT / "tools" / "maintain_runtime_state.py"
 )
@@ -99,18 +104,29 @@ class RuntimeRetentionTests(unittest.TestCase):
             index.chmod(0o600)
         directory = root / name
         directory.mkdir(mode=0o700)
+        metadata_payload = {
+            "unit": name,
+            "created_at_unix": created_at,
+            "runtime_seconds": runtime_seconds,
+        }
+        if (
+            job_origin.UNIT_RE.fullmatch(name)
+            and isinstance(created_at, int) and not isinstance(created_at, bool)
+            and created_at >= 0
+        ):
+            origin, origin_sha256 = job_origin.build_origin(
+                unit=name, owner=f"uid:{os.getuid()}", argv_sha256="0" * 64,
+                scope={}, notify_on_done={"requested": False, "channels": []},
+                created_at_unix=created_at, started_at="1970-01-01T00:00:00Z",
+                invoker_tool="grabowski_task_start",
+            )
+            metadata_payload.update({
+                **{key: origin[key] for key in
+                   ("job_id", "owner", "argv_sha256", "scope")},
+                "origin": origin, "origin_sha256": origin_sha256,
+            })
         for path, content in (
-            (
-                directory / "metadata.json",
-                json.dumps(
-                    {
-                        "unit": name,
-                        "created_at_unix": created_at,
-                        "runtime_seconds": runtime_seconds,
-                    }
-                )
-                + "\n",
-            ),
+            (directory / "metadata.json", json.dumps(metadata_payload) + "\n"),
             (directory / "stdout.log", "done\n"),
             (directory / "stderr.log", ""),
         ):
@@ -1957,6 +1973,162 @@ class RuntimeRetentionTests(unittest.TestCase):
             self.assertEqual(plan["job_scan_deferred_count"], 1)
             self.assertFalse(plan["archive_inventory_complete"])
             self.assertEqual(plan["reset_failed_units"], [task_unit])
+
+    def test_scan_rotates_past_permanently_protected_review_prefix(self) -> None:
+        # Regression for PR1794: two review records permanently survive in the
+        # live root. The late ordinary job must nevertheless enter a plan.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs = root / "jobs"
+            names = (
+                "grabowski-job-000000000001",
+                "grabowski-job-000000000002",
+                "grabowski-job-ffffffffffff",
+            )
+            states = {}
+            for name in names:
+                self._job(jobs, name, 100)
+                states[name + ".service"] = self._state(name + ".service")
+            for name in names[:2]:
+                (jobs / name / "stdout.log").write_bytes(
+                    b"GRABOWSKI_DECISION_REVIEW_V1=REJECT_THIS_REVISION\\n"
+                )
+            kwargs = {
+                "minimum_job_age_seconds": 50,
+                "max_archive_jobs": 2,
+                "jobs_root": jobs,
+                "archive_root": root / "archive",
+                "receipt_root": root / "receipts",
+                "task_db": root / "missing.sqlite3",
+                "failed_units": [],
+                "unit_states": states,
+            }
+            with patch.object(RETENTION, "MAX_JOB_SCAN_ENTRIES", 2):
+                first = RETENTION.build_plan(now=1_000, **kwargs)
+                repeated = RETENTION.build_plan(now=1_001, **kwargs)
+                next_window = RETENTION.build_plan(now=3_700, **kwargs)
+                after_cycle = RETENTION.build_plan(now=7_300, **kwargs)
+                forced_failed = RETENTION.build_plan(
+                    now=3_700,
+                    **{**kwargs, "failed_units": [names[0] + ".service"]},
+                )
+            self.assertEqual(first["job_scan_window_count"], 2)
+            self.assertEqual(first["job_scan_window_index"], 0)
+            self.assertEqual(repeated["job_scan_window_index"], 0)
+            self.assertEqual(first["archive_jobs"], [])
+            self.assertEqual(repeated["archive_jobs"], [])
+            self.assertEqual(next_window["job_scan_window_index"], 1)
+            self.assertEqual(
+                [item["unit"] for item in next_window["archive_jobs"]],
+                [names[-1] + ".service"],
+            )
+            self.assertEqual(after_cycle["job_scan_window_index"], 0)
+            self.assertEqual(after_cycle["archive_jobs"], [])
+            self.assertTrue((jobs / names[0] / "stdout.log").is_file())
+            self.assertTrue((jobs / names[1] / "stdout.log").is_file())
+            self.assertEqual(next_window["job_scan_deferred_count"], 2)
+            self.assertEqual(
+                [item["unit"] for item in forced_failed["archive_jobs"]],
+                [names[-1] + ".service"],
+            )
+            self.assertNotIn(names[0] + ".service", forced_failed["reset_failed_units"])
+            self.assertTrue(any(
+                row["unit"] == names[0] + ".service"
+                and "decision-review evidence" in row["reason"]
+                for row in forced_failed["blocked"]
+            ))
+
+    def test_periodic_pins_one_clock_snapshot_for_both_plans(self) -> None:
+        plan = {
+            "plan_sha256": "a" * 64,
+            "reset_failed_units": [],
+            "archive_jobs": [],
+            "blocked": [],
+        }
+        with patch.object(RETENTION, "build_plan", return_value=plan) as build:
+            with patch.object(RETENTION.time, "time", side_effect=[3_599, 3_600]):
+                result = RETENTION.apply_periodic_plan()
+        self.assertTrue(result["completed"])
+        self.assertEqual(build.call_count, 2)
+        for call in build.call_args_list:
+            self.assertEqual(call.kwargs["now"], 3_599)
+            self.assertIs(call.kwargs["retention_failed_units_only"], True)
+
+    def test_periodic_failed_unit_query_is_scoped_at_systemd(self) -> None:
+        # Foreign services cannot exhaust the bounded inventory before filtering.
+        with patch.object(
+            RETENTION, "_run", return_value=Mock(returncode=0, stdout="", stderr="")
+        ) as runner:
+            self.assertEqual(
+                RETENTION._failed_units(job_authority=True, retention_only=True), []
+            )
+        argv = runner.call_args.args[0]
+        self.assertEqual(argv[:5], [
+            "systemctl", "--user", "list-units", "--failed", "--no-legend"
+        ])
+        self.assertIn("grabowski-job-*.service", argv)
+        self.assertIn("grabowski-task-*.service", argv)
+        self.assertIn("grabowski-browser-worker-*.service", argv)
+        self.assertIn("grabowski-gui-worker-*.service", argv)
+
+    def test_periodic_failed_unit_scope_preserves_grabowski_blockers(self) -> None:
+        # Unrelated user-systemd failures must not break an hourly archive.
+        # Failures of Grabowski jobs/tasks/workers remain part of the plan.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs = root / "jobs"
+            name = "grabowski-job-" + "a" * 12
+            self._job(jobs, name, 100)
+            job_unit = name + ".service"
+            task_unit = "grabowski-task-" + "b" * 24 + "-a1.service"
+            task_db = self._task_db(root / "tasks.sqlite3", task_unit, "running")
+            kwargs = {
+                "now": 300,
+                "jobs_root": jobs,
+                "archive_root": root / "archive",
+                "receipt_root": root / "receipts",
+                "task_db": task_db,
+                "failed_units": ["bureau-status-capsule.service", task_unit],
+                "unit_states": {job_unit: self._state(job_unit)},
+            }
+            diagnostic = RETENTION.build_plan(**kwargs)
+            periodic = RETENTION.build_plan(
+                **kwargs, retention_failed_units_only=True
+            )
+        diagnostic_units = {item["unit"] for item in diagnostic["blocked"]}
+        periodic_units = {item["unit"] for item in periodic["blocked"]}
+        self.assertIn("bureau-status-capsule.service", diagnostic_units)
+        self.assertNotIn("bureau-status-capsule.service", periodic_units)
+        self.assertIn(task_unit, diagnostic_units)
+        self.assertIn(task_unit, periodic_units)
+        self.assertEqual(diagnostic["archive_jobs"], periodic["archive_jobs"])
+
+    def test_hourly_retention_timer_visits_all_pages_not_just_even_ones(self) -> None:
+        # With 11 jobs and a two-name cap there are six pages. A half-hour
+        # slot would alias with the real hourly NixOS timer and miss odd pages.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs = root / "jobs"
+            states = {}
+            for index in range(11):
+                name = f"grabowski-job-{index + 1:012x}"
+                self._job(jobs, name, 100)
+                states[name + ".service"] = self._state(name + ".service")
+            with patch.object(RETENTION, "MAX_JOB_SCAN_ENTRIES", 2):
+                indices = [
+                    RETENTION.build_plan(
+                        now=1_800 + hour * 3_600,
+                        minimum_job_age_seconds=50,
+                        jobs_root=jobs,
+                        archive_root=root / "archive",
+                        receipt_root=root / "receipts",
+                        task_db=root / "missing.sqlite3",
+                        failed_units=[],
+                        unit_states=states,
+                    )["job_scan_window_index"]
+                    for hour in range(6)
+                ]
+            self.assertEqual(indices, [0, 1, 2, 3, 4, 5])
 
     def test_reserved_repoground_jobs_enter_typed_retention_and_failed_reset(self) -> None:
         job_name = "grabowski-job-rgpm-" + "a" * 16 + "-01"
@@ -3970,8 +4142,135 @@ class RuntimeRetentionTests(unittest.TestCase):
                 )
             self.assertTrue((jobs / genuine_name / "metadata.json").is_file())
 
-    def test_production_job_archive_and_reset_fail_closed_without_broker(self) -> None:
-        self.assertFalse(PRODUCTION_JOB_RETENTION_AUTHORITY())
+    def test_review_evidence_never_archived_or_reset_with_trusted_owner(self) -> None:
+        # Ordinary-job stdout can contain a material REJECT marker even when
+        # the origin is not an authenticated DecisionReview. All such evidence
+        # must remain visible to the Captain full scan after retention.
+        self.assertTrue(PRODUCTION_JOB_RETENTION_AUTHORITY())
+        for case in ("bound_scope", "bound_origin", "unbound_marker", "split_marker", "role_attempt", "role_receipt"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                jobs = root / "jobs"
+                name = "grabowski-job-aaaaaaaaaaaa"
+                unit = name + ".service"
+                source = self._job(jobs, name, 100)
+                metadata = source / "metadata.json"
+                if case in ("bound_scope", "bound_origin"):
+                    value = json.loads(metadata.read_text(encoding="utf-8"))
+                    scope = {"decision_bound_review": {"repo": "heimgewebe/grabowski"}}
+                    if case == "bound_scope":
+                        value["scope"] = scope
+                    else:
+                        value["origin"] = {"scope": scope}
+                    metadata.write_text(json.dumps(value), encoding="utf-8")
+                    metadata.chmod(0o600)
+                elif case == "unbound_marker":
+                    (source / "stdout.log").write_bytes(
+                        b"ordinary output\\nGRABOWSKI_DECISION_REVIEW_V1={\\\"verdict\\\":\\\"REJECT_THIS_REVISION\\\"}\\n"
+                    )
+                elif case == "split_marker":
+                    (source / "stdout.log").write_bytes(
+                        b"x" * (1024 * 1024 - 4)
+                        + b"GRABOWSKI_DECISION_REVIEW_V1=REJECT_THIS_REVISION\\n"
+                    )
+                elif case in ("role_attempt", "role_receipt"):
+                    name = (
+                        "review-role-attempt.json" if case == "role_attempt"
+                        else "review-role-receipt.json"
+                    )
+                    (source / name).write_text("{}", encoding="utf-8")
+                    (source / name).chmod(0o600)
+                plan = RETENTION.build_plan(
+                    minimum_job_age_seconds=50, now=1000,
+                    jobs_root=jobs, archive_root=root / "archive",
+                    receipt_root=root / "receipts",
+                    task_db=root / "missing.sqlite3", failed_units=[unit],
+                    unit_states={unit: self._state(unit)},
+                )
+                self.assertEqual(plan["archive_jobs"], [])
+                self.assertNotIn(unit, plan["reset_failed_units"])
+                self.assertTrue(any(
+                    item["unit"] == unit and "decision-review evidence" in item["reason"]
+                    for item in plan["blocked"]
+                ), plan["blocked"])
+                self.assertTrue((source / "metadata.json").exists())
+                self.assertFalse((root / "archive" / name).exists())
+
+    def test_missing_forged_or_mismatched_origin_or_stdout_never_archived(self) -> None:
+        for case in ("missing", "invalid_sha", "mirrored_scope", "missing_stdout"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                jobs = root / "jobs"
+                name = "grabowski-job-aaaaaaaaaaaa"
+                unit = name + ".service"
+                source = self._job(jobs, name, 100)
+                metadata = source / "metadata.json"
+                value = json.loads(metadata.read_text(encoding="utf-8"))
+                if case == "missing":
+                    del value["origin"]
+                elif case == "invalid_sha":
+                    value["origin_sha256"] = "0" * 64
+                elif case == "mirrored_scope":
+                    value["scope"] = {"unexpected": "drift"}
+                else:
+                    # Valid ordinary origin, but Captain cannot prove the
+                    # absence of unbound review results without stdout.log.
+                    (source / "stdout.log").unlink()
+                metadata.write_text(json.dumps(value), encoding="utf-8")
+                metadata.chmod(0o600)
+                plan = RETENTION.build_plan(
+                    minimum_job_age_seconds=50, now=1000,
+                    jobs_root=jobs, archive_root=root / "archive",
+                    receipt_root=root / "receipts",
+                    task_db=root / "missing.sqlite3", failed_units=[],
+                    unit_states={unit: self._state(unit)},
+                )
+                self.assertEqual(plan["archive_jobs"], [])
+                self.assertEqual(plan["reset_failed_units"], [])
+                self.assertTrue((source / "metadata.json").exists())
+                self.assertFalse((root / "archive" / name).exists())
+
+    def test_protected_healthy_review_is_noop_not_maintenance_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs = root / "jobs"
+            name = "grabowski-job-aaaaaaaaaaaa"
+            unit = name + ".service"
+            source = self._job(jobs, name, 100)
+            (source / "stdout.log").write_bytes(
+                b"GRABOWSKI_DECISION_REVIEW_V1=REJECT_THIS_REVISION\\n"
+            )
+            plan = RETENTION.build_plan(
+                minimum_job_age_seconds=50, now=1000,
+                jobs_root=jobs, archive_root=root / "archive",
+                receipt_root=root / "receipts",
+                task_db=root / "missing.sqlite3", failed_units=[],
+                unit_states={unit: self._state(unit)},
+            )
+            self.assertEqual(plan["archive_jobs"], [])
+            self.assertEqual(plan["reset_failed_units"], [])
+            self.assertEqual(plan["blocked"], [])
+            self.assertTrue((source / "stdout.log").exists())
+
+    def test_trusted_owner_can_plan_review_free_terminal_archive(self) -> None:
+        self.assertTrue(PRODUCTION_JOB_RETENTION_AUTHORITY())
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs = root / "jobs"
+            name = "grabowski-job-aaaaaaaaaaaa"
+            unit = name + ".service"
+            self._job(jobs, name, 100)
+            plan = RETENTION.build_plan(
+                minimum_job_age_seconds=50, now=1000,
+                jobs_root=jobs, archive_root=root / "archive",
+                receipt_root=root / "receipts",
+                task_db=root / "missing.sqlite3", failed_units=[],
+                unit_states={unit: self._state(unit)},
+            )
+            self.assertEqual([item["unit"] for item in plan["archive_jobs"]], [unit])
+
+    def test_job_archive_and_reset_fail_closed_when_owner_authority_revoked(self) -> None:
+        self.assertTrue(PRODUCTION_JOB_RETENTION_AUTHORITY())
         self._simulated_protected_authority.return_value = False
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -4546,6 +4845,44 @@ class RuntimeRetentionTests(unittest.TestCase):
             self.assertTrue(link.is_symlink())
             self.assertEqual(other.stat().st_mode & 0o777, 0o755)
             self.assertEqual(list(other.iterdir()), [])
+
+
+    def test_archive_root_provision_before_periodic_plan_is_safe_and_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs = root / "jobs"
+            name = "grabowski-job-aaaaaaaaaaaa"
+            unit = name + ".service"
+            self._job(jobs, name, 100)
+            archive = root / "archive"
+            archive.rmdir()  # Fresh installation has no archive leaf.
+            self.assertFalse(archive.exists())
+            first = RETENTION.provision_archive_root(archive_root=archive)
+            self.assertTrue(first["created"])
+            self.assertEqual(first["operation"], "grabowski-retention-archive-root-provision")
+            self.assertEqual(archive.stat().st_mode & 0o777, 0o700)
+            plan = RETENTION.build_plan(
+                minimum_job_age_seconds=50, now=1000,
+                jobs_root=jobs, archive_root=archive, receipt_root=root / "receipts",
+                task_db=root / "missing.sqlite3", failed_units=[],
+                unit_states={unit: self._state(unit)},
+            )
+            self.assertEqual([item["unit"] for item in plan["archive_jobs"]], [unit])
+            second = RETENTION.provision_archive_root(archive_root=archive)
+            self.assertFalse(second["created"])
+            self.assertEqual(archive.stat().st_mode & 0o777, 0o700)
+
+    def test_archive_root_provision_rejects_existing_symlink_without_touching_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            outside = root / "outside"
+            outside.mkdir(mode=0o700)
+            archive = root / "archive"
+            archive.symlink_to(outside, target_is_directory=True)
+            with self.assertRaises((OSError, RuntimeError)):
+                RETENTION.provision_archive_root(archive_root=archive)
+            self.assertTrue(archive.is_symlink())
+            self.assertEqual(list(outside.iterdir()), [])
 
     def test_manual_check_and_apply_provision_before_hash_bound_plan(self) -> None:
         source = (ROOT / "Makefile").read_text(encoding="utf-8")
@@ -5917,6 +6254,8 @@ class RuntimeRetentionTests(unittest.TestCase):
                 with patch.object(
                     RETENTION.sys, "argv", argv
                 ), patch.object(
+                    RETENTION, "provision_archive_root", return_value={"created": False}
+                ) as archive_provision, patch.object(
                     RETENTION, "apply_periodic_plan", return_value=receipt
                 ), patch.object(
                     RETENTION, "build_plan", return_value=plan
@@ -5926,6 +6265,10 @@ class RuntimeRetentionTests(unittest.TestCase):
                     RETENTION.sys, "stdout", new_callable=io.StringIO
                 ) as output:
                     code = RETENTION.main()
+                if mode == "periodic":
+                    archive_provision.assert_called_once_with()
+                else:
+                    archive_provision.assert_not_called()
                 self.assertEqual(code, 2)
                 self.assertEqual(json.loads(output.getvalue()), receipt)
 

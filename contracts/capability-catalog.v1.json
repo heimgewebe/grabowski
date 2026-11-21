@@ -521,7 +521,7 @@
     },
     {
       "category": "operations-observability",
-      "description": "Project verified audit-chain records into bounded operational trends.",
+      "description": "Read bounded audit trends; optionally scan the full chain for 7d signals.\n\ncomplete_signals is an explicit slower, read-only operation. It does not\nchange the bounded trend summaries or claim full all-time coverage.",
       "effects": [],
       "id": "grabowski_audit_projection",
       "purpose": "Derive bounded source-bound operational trends from the verified audit chain.",

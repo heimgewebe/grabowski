@@ -228,6 +228,111 @@ class AuditSignalTests(unittest.TestCase):
                     self.assertEqual(uncertain["observed_count"], 1)
                     self.assertEqual(uncertain["details"]["terminally_resolved_count"], 0)
 
+    def test_typed_preclaim_refusals_resolve_only_effect_uncertainty(self) -> None:
+        now = 1_800_000_000
+        rows = []
+        provider = {}
+        for index, task_id in enumerate(("a" * 24, "b" * 24)):
+            unit = f"grabowski-task-{task_id}-a1.service"
+            timestamp = now - 500 + index * 20
+            # A task-start audit can be recorded one second AFTER the broker
+            # pre-effect refusal was already terminalized. Exact identity and
+            # the authenticated no-dispatch response, not timestamp order,
+            # settle whether the task ever had an effect.
+            rows.append(({
+                "operation": "task-start",
+                "record_sha256": f"{index + 1:064x}",
+                "task_id": task_id,
+                "authoritative_unit": unit,
+                "recovery_required": True,
+                "launcher_outcome_unknown": False,
+                "launcher_returncode": 1,
+            }, timestamp))
+            provider[task_id] = {
+                "task_id": task_id, "attempt": 1, "state": "failed",
+                "authoritative_unit": unit,
+                "lifecycle_receipt_sha256": "c" * 64,
+                "terminalization_sha256": "d" * 64,
+                "terminalized_at_unix": timestamp - index,
+                "created_at_unix": timestamp - index - 1,
+                "terminal_evidence_valid": True,
+                "pre_effect_refusal_proven": True,
+            }
+        with patch.dict(sys.modules, {"grabowski_friction": None}, clear=False):
+            result = signal.build_projection(
+                rows, as_of_unix=now, audit_source_binding={},
+                task_terminal_provider=provider.get,
+            )
+        item = result["signals"][0]
+        self.assertEqual((item["status"], item["severity"], item["count"]), ("clear", "none", 0))
+        self.assertEqual(item["observed_count"], 2)
+        self.assertEqual(item["details"]["terminally_resolved_count"], 2)
+        self.assertEqual(item["details"]["unresolved_current_count"], 0)
+        self.assertEqual(len(item["evidence_refs"]), 2)
+        for resolution in item["details"]["terminal_resolutions"]:
+            self.assertEqual(resolution["state"], "failed")
+            self.assertEqual(
+                resolution["resolution_kind"], "verified_rootbroker_preclaim_no_dispatch"
+            )
+        self.assertEqual(provider["a" * 24]["state"], "failed")
+        self.assertIn("safe_retry", item["does_not_establish"])
+
+    def test_preclaim_false_positive_variants_stay_critical(self) -> None:
+        from copy import deepcopy
+
+        now = 1_800_000_000
+        task_id = "a" * 24
+        unit = f"grabowski-task-{task_id}-a1.service"
+        audit = {
+            "operation": "task-start", "record_sha256": "b" * 64,
+            "task_id": task_id, "authoritative_unit": unit,
+            "recovery_required": True, "launcher_outcome_unknown": False,
+            "launcher_returncode": 1,
+        }
+        terminal = {
+            "task_id": task_id, "attempt": 1, "state": "failed",
+            "authoritative_unit": unit, "lifecycle_receipt_sha256": "c" * 64,
+            "terminalization_sha256": "d" * 64, "terminalized_at_unix": now - 500,
+            "created_at_unix": now - 501, "terminal_evidence_valid": True,
+            "pre_effect_refusal_proven": True,
+        }
+        cases = {
+            "wrong_task_id": ({"task_id": "f" * 24}, {}),
+            "wrong_attempt": ({}, {"attempt": 2}),
+            "wrong_authoritative_unit": ({}, {"authoritative_unit": unit.replace("-a1", "-a2")}),
+            "missing_terminal_receipt": ({}, {"lifecycle_receipt_sha256": None}),
+            "unverified_terminal": ({}, {"terminal_evidence_valid": False}),
+            "failed_without_proven_refusal": ({}, {"pre_effect_refusal_proven": False}),
+            "missing_proven_refusal": ({}, {"pre_effect_refusal_proven": None}),
+            "unknown_launch": ({"launcher_outcome_unknown": True}, {}),
+            "unknown_effect": ({"outcome_unknown": True}, {}),
+            "not_a_root_task_start": ({"operation": "task-cancel"}, {}),
+            "missing_recovery_required": ({"recovery_required": False, "outcome_unknown": True}, {}),
+            "unknown_launcher_returncode": ({"launcher_returncode": None}, {}),
+            "bad_launcher_returncode": ({"launcher_returncode": 0}, {}),
+            "boolean_launcher_returncode": ({"launcher_returncode": True}, {}),
+            "earlier_than_created": ({}, {"created_at_unix": now - 400}),
+            "terminal_before_created": ({}, {"terminalized_at_unix": now - 503}),
+            "missing_created": ({}, {"created_at_unix": None}),
+            "bad_terminal_sha": ({}, {"terminalization_sha256": "0"}),
+            "other_failed_state": ({}, {"state": "outcome_unknown"}),
+        }
+        with patch.dict(sys.modules, {"grabowski_friction": None}, clear=False):
+            for name, (record_diff, terminal_diff) in cases.items():
+                with self.subTest(name=name):
+                    record = {**deepcopy(audit), **record_diff}
+                    state = {**deepcopy(terminal), **terminal_diff}
+                    result = signal.build_projection(
+                        [(record, now - 500)], as_of_unix=now,
+                        audit_source_binding={},
+                        task_terminal_provider=lambda _task_id, current=state: current,
+                    )
+                    uncertain = result["signals"][0]
+                    self.assertEqual(uncertain["count"], 1)
+                    self.assertEqual(uncertain["status"], "observed")
+                    self.assertEqual(uncertain["severity"], "critical")
+                    self.assertEqual(uncertain["details"]["terminally_resolved_count"], 0)
+
     def test_uncertain_outcome_provider_failure_preserves_critical_signal(self) -> None:
         now = 1_800_000_000
         task_id = "4" * 24

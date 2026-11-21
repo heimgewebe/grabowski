@@ -2762,5 +2762,224 @@ class BureauFailureIdentityProjectionTests(unittest.TestCase):
 
 
 
+class CompleteAuditSignalTests(unittest.TestCase):
+    """The opt-in read must not confuse event time with append order."""
+
+    def fixture(self):
+        now = 1_800_000_000
+
+        def record(operation, seconds_ago, digest, **extra):
+            return {
+                "operation": operation,
+                "timestamp": datetime.fromtimestamp(
+                    now - seconds_ago, tz=timezone.utc
+                ).isoformat(),
+                "record_sha256": digest * 64,
+                **extra,
+            }
+
+        rows = [
+            record("task-start", 60, "1", outcome_unknown=True, secret="not-public"),
+            record("runtime-state-retention-intent", 604_900, "2",
+                   plan_sha256="a" * 64, attempt=1),
+            record("runtime-state-retention-complete", 100, "3",
+                   plan_sha256="a" * 64, attempt=1, receipt_sha256="b" * 64),
+            record("runtime-state-retention-intent", 700, "4",
+                   plan_sha256="c" * 64, attempt=1),
+            # Recent events live in the omitted prefix; the newest suffix
+            # happens to have older caller-provided timestamps.
+            record("resource-acquire", 800_000, "5"),
+            record("task-start", 700_000, "6"),
+        ]
+        raw = b"".join(
+            json.dumps(item, sort_keys=True).encode() + b'\n' for item in rows
+        )
+        segment = types.SimpleNamespace(
+            path=Path("/tmp/verified-audit-test-segment.jsonl"),
+            records=len(rows), captured_data=raw,
+        )
+        snapshot = types.SimpleNamespace(
+            segments=(segment,), total_records=len(rows),
+            chain_content_sha256="f" * 64,
+            last_record_sha256="6" * 64,
+        )
+        status = {
+            "valid": True, "total_records": len(rows), "scanned_records": 2,
+            "scan_truncated": True, "total_legacy_records": 0,
+            "last_record_sha256": "6" * 64, "archived_segment_count": 0,
+            "audit_writable": True,
+        }
+        return now, rows, snapshot, status
+
+    def test_complete_signal_scan_recovers_omitted_nonmonotone_events(self):
+        now, rows, snapshot, status = self.fixture()
+        with (
+            patch.object(read_surface.audit_query, "capture_verified_audit_snapshot",
+                         return_value=snapshot),
+            patch.object(read_surface, "_audit_projection_records_snapshot",
+                         return_value=(rows[-2:], status)),
+            patch.object(read_surface.base, "_verify_audit_log", return_value=status),
+            patch.object(read_surface.time, "time", return_value=now),
+        ):
+            baseline = read_surface.grabowski_audit_projection()
+            full = read_surface.grabowski_audit_projection(complete_signals=True)
+        base_signals = {s["id"]: s for s in baseline["signal_projection"]["signals"]}
+        full_signals = {s["id"]: s for s in full["signal_projection"]["signals"]}
+        self.assertEqual(base_signals["transition_gap"]["status"], "indeterminate")
+        self.assertEqual(full_signals["transition_gap"]["status"], "observed")
+        self.assertEqual(full_signals["transition_gap"]["count"], 1)
+        self.assertEqual(full_signals["uncertain_outcome"]["count"], 1)
+        self.assertEqual(full_signals["uncertain_outcome"]["status"], "observed")
+        self.assertNotIn("signal_scan", baseline["source_binding"])
+        self.assertEqual(full["source_binding"]["signal_scan"]["scanned_records"], 6)
+        self.assertEqual(full["source_binding"]["signal_scan"]["retained_signal_records"], 4)
+        self.assertTrue(full["source_binding"]["signal_scan"]["window_complete"])
+        self.assertTrue(full["source_binding"]["scan_truncated"])
+        self.assertFalse(full["windows"][1]["coverage_complete"])
+        self.assertEqual(full["signal_projection"]["source_binding"]["audit_snapshot_sha256"], "f" * 64)
+        self.assertNotIn("not-public", json.dumps(full))
+
+    def test_complete_signal_cutoff_is_fixed_before_snapshot(self):
+        now, rows, snapshot, status = self.fixture()
+        order = []
+
+        def clock():
+            order.append("clock")
+            return now
+
+        def capture():
+            order.append("capture")
+            return snapshot
+
+        with (
+            patch.object(read_surface.time, "time", side_effect=clock),
+            patch.object(read_surface.audit_query, "capture_verified_audit_snapshot",
+                         side_effect=capture),
+            patch.object(read_surface, "_audit_projection_records_snapshot",
+                         return_value=(rows[-2:], status)),
+            patch.object(read_surface.base, "_verify_audit_log", return_value=status),
+        ):
+            result = read_surface.grabowski_audit_projection(complete_signals=True)
+        self.assertEqual(order[:2], ["clock", "capture"])
+        self.assertEqual(result["signal_projection"]["as_of_unix"], now)
+
+    def test_full_signal_scan_rejects_missing_segment_records(self):
+        now, _rows, snapshot, _status = self.fixture()
+        snapshot.segments[0].records += 1
+        with self.assertRaisesRegex(RuntimeError, "record count changed"):
+            read_surface._audit_complete_signal_records(snapshot, as_of_unix=now)
+
+    def test_full_signal_scan_respects_retained_record_budget(self):
+        now, _rows, snapshot, _status = self.fixture()
+        with patch.object(read_surface, "MAX_COMPLETE_SIGNAL_RETAINED_RECORDS", 3):
+            with self.assertRaisesRegex(RuntimeError, "retained-record budget"):
+                read_surface._audit_complete_signal_records(snapshot, as_of_unix=now)
+
+    def test_full_signal_scan_rejects_boolean_like_integer(self):
+        with self.assertRaisesRegex(ValueError, "complete_signals must be boolean"):
+            read_surface.grabowski_audit_projection(complete_signals=1)
+
+
+class VerifiedRootbrokerPreclaimReaderTests(unittest.TestCase):
+    def fixture(self):
+        request = "a" * 32
+        reference = "b" * 64
+        return {
+            "state": "failed", "execution_backend": "systemd-root-broker",
+            "launcher_json": json.dumps({
+                "returncode": 1, "pre_effect_refused": True,
+                "launch_not_dispatched": True, "outcome_unknown": False,
+                "timed_out": False, "stdout_truncated": False,
+                "stderr_truncated": False,
+                "privileged_broker": {
+                    "request_id": request, "reference_sha256": reference,
+                    "broker_client_returncode": 1,
+                    "broker_client_timed_out": False,
+                    "stdout_truncated": False, "stderr_truncated": False,
+                    "broker_response": {
+                        "schema_version": 1,
+                        "kind": "grabowski.root_task_systemd_pre_effect_refusal.v1",
+                        "request_id": request, "reference_sha256": reference,
+                        "action": "operator_root_task_systemd_unit",
+                        "phase": "pre_claim", "claim_started": False,
+                        "dispatch_started": False, "reason_code": "action_resolution",
+                    },
+                },
+            }),
+        }
+
+    def test_exact_request_bound_root_preclaim_is_proven_no_dispatch(self):
+        row = self.fixture()
+        self.assertTrue(read_surface._audit_rootbroker_preclaim_refusal_proven(row))
+        launcher = json.loads(row["launcher_json"])
+        launcher["privileged_broker"]["broker_response"]["reason_code"] = "peer_authority"
+        row["launcher_json"] = json.dumps(launcher)
+        self.assertTrue(read_surface._audit_rootbroker_preclaim_refusal_proven(row))
+
+    def test_false_or_ambiguous_root_preclaim_never_proves_no_dispatch(self):
+        from copy import deepcopy
+
+        base = self.fixture()
+        variants = {
+            "other_backend": ("execution_backend", "systemd-user"),
+            "task_completed": ("state", "completed"),
+            "corrupt_launcher": ("launcher_json", "{"),
+            "missing_launcher": ("launcher_json", None),
+        }
+        for name, (field, value) in variants.items():
+            with self.subTest(name=name):
+                row = deepcopy(base)
+                row[field] = value
+                self.assertFalse(read_surface._audit_rootbroker_preclaim_refusal_proven(row))
+        mutations = {
+            "self_asserted_only": (("privileged_broker",), None),
+            "response_kind": (("privileged_broker", "broker_response", "kind"), "not-a-refusal"),
+            "response_extra": (("privileged_broker", "broker_response", "malformed"), True),
+            "claimed": (("privileged_broker", "broker_response", "claim_started"), True),
+            "dispatched": (("privileged_broker", "broker_response", "dispatch_started"), True),
+            "not_preclaim": (("privileged_broker", "broker_response", "phase"), "post_dispatch"),
+            "not_start": (("privileged_broker", "broker_response", "action"), "show"),
+            "wrong_request": (("privileged_broker", "broker_response", "request_id"), "c" * 32),
+            "wrong_reference": (("privileged_broker", "broker_response", "reference_sha256"), "c" * 64),
+            "malformed_ref": (("privileged_broker", "reference_sha256"), "not-sha"),
+            "error_code_other": (("privileged_broker", "broker_response", "reason_code"), "unknown"),
+            "invoker_failed": (("privileged_broker", "broker_client_returncode"), 2),
+            "invoker_timeout": (("privileged_broker", "broker_client_timed_out"), True),
+            "invoker_truncated": (("privileged_broker", "stdout_truncated"), True),
+            "ambiguous_return": (("outcome_unknown",), True),
+            "no_pre_effect_proof": (("pre_effect_refused",), False),
+            "not_dispatched_unknown": (("launch_not_dispatched",), False),
+            "launcher_timeout": (("timed_out",), True),
+            "launcher_returncode": (("returncode",), 0),
+            "launcher_boolean_rc": (("returncode",), True),
+        }
+        for name, (parts, value) in mutations.items():
+            with self.subTest(name=name):
+                row = deepcopy(base)
+                launcher = json.loads(row["launcher_json"])
+                obj = launcher
+                for part in parts[:-1]:
+                    obj = obj[part]
+                obj[parts[-1]] = value
+                row["launcher_json"] = json.dumps(launcher)
+                self.assertFalse(read_surface._audit_rootbroker_preclaim_refusal_proven(row))
+
+    def test_complete_signal_reducer_carries_original_launcher_returncode(self):
+        self.assertIn("launcher_returncode", read_surface._COMPLETE_SIGNAL_FIELDS)
+        now = 1_800_000_000
+        record = {
+            "operation": "task-start",
+            "record_sha256": "a" * 64,
+            "timestamp": datetime.fromtimestamp(now - 20, tz=timezone.utc).isoformat(),
+            "recovery_required": True, "launcher_outcome_unknown": False,
+            "launcher_returncode": 1,
+        }
+        raw = (json.dumps(record, sort_keys=True) + "\n").encode()
+        segment = types.SimpleNamespace(path=Path("/tmp/verified-preclaim-fixture.jsonl"), records=1, captured_data=raw)
+        snap = types.SimpleNamespace(segments=(segment,), total_records=1)
+        selected = read_surface._audit_complete_signal_records(snap, as_of_unix=now)
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(selected[0][0]["launcher_returncode"], 1)
+
 if __name__ == "__main__":
     unittest.main()

@@ -1133,7 +1133,7 @@ def _uncertain_terminal_resolution(
     audit_timestamp_unix: int | None,
     task_terminal_provider: Any,
 ) -> dict[str, Any] | None:
-    """Resolve current uncertainty only from exact later completed-task evidence."""
+    """Resolve uncertainty from exact completed tasks or proven no-dispatch refusals."""
     if task_terminal_provider is None or not callable(task_terminal_provider):
         return None
     if (
@@ -1165,7 +1165,7 @@ def _uncertain_terminal_resolution(
         or isinstance(attempt, bool)
         or not isinstance(attempt, int)
         or attempt != audit_attempt
-        or current.get("state") != "completed"
+        or current.get("state") not in {"completed", "failed"}
         or current.get("terminal_evidence_valid") is not True
     ):
         return None
@@ -1177,18 +1177,43 @@ def _uncertain_terminal_resolution(
     if (
         isinstance(terminalized_at, bool)
         or not isinstance(terminalized_at, int)
-        or terminalized_at < audit_timestamp_unix
+        or terminalized_at < 0
     ):
         return None
-    return {
+    state = current["state"]
+    if state == "failed":
+        # The task-start audit may be appended a second after its terminal
+        # pre-claim refusal. Event timestamps are not a lifecycle ordering
+        # guarantee; the immutable task/attempt/unit and terminal receipt are.
+        created = current.get("created_at_unix")
+        if (
+            record.get("operation") != "task-start"
+            or record.get("recovery_required") is not True
+            or record.get("outcome_unknown") is True
+            or record.get("launcher_outcome_unknown") is not False
+            or type(record.get("launcher_returncode")) is not int
+            or record["launcher_returncode"] != 1
+            or audit_unit != f"grabowski-task-{task_id}-a{attempt}.service"
+            or current.get("pre_effect_refusal_proven") is not True
+            or type(created) is not int
+            or not 0 <= created <= terminalized_at
+            or audit_timestamp_unix < created
+        ):
+            return None
+    elif terminalized_at < audit_timestamp_unix:
+        return None
+    result = {
         "task_id": task_id,
         "attempt": attempt,
-        "state": "completed",
+        "state": state,
         "authoritative_unit": current_unit,
         "lifecycle_receipt_sha256": lifecycle_receipt,
         "terminalization_sha256": terminalization,
         "terminalized_at_unix": terminalized_at,
     }
+    if state == "failed":
+        result["resolution_kind"] = "verified_rootbroker_preclaim_no_dispatch"
+    return result
 
 
 def build_projection(
@@ -1236,6 +1261,10 @@ def build_projection(
             "task_id": item["task_id"],
             "attempt": item["attempt"],
             "state": item["state"],
+            **(
+                {"resolution_kind": item["resolution_kind"]}
+                if "resolution_kind" in item else {}
+            ),
             "lifecycle_receipt_sha256": item["lifecycle_receipt_sha256"],
             "terminalization_sha256": item["terminalization_sha256"],
             "terminalized_at_unix": item["terminalized_at_unix"],
