@@ -412,22 +412,28 @@ class RootbrokerCutoverTests(unittest.TestCase):
                 {"success": False, "error": "boom"},
             )
 
-    def test_operator_username_is_runner_observed_and_fails_closed_on_drift(self) -> None:
-        calls: list[list[str]] = []
-
-        def matching_runner(argv: list[str]) -> subprocess.CompletedProcess[str]:
-            calls.append(list(argv))
-            return _completed(argv, stdout="alex\n")
-
-        self.assertEqual(cutover._operator_username(matching_runner), "alex")
-        self.assertEqual(calls, [["/usr/bin/id", "-nu", "1000"]])
-
-        with self.assertRaisesRegex(
-            cutover.CutoverError, "identity differs from host contract"
-        ):
-            cutover._operator_username(
-                lambda argv: _completed(argv, stdout="runner\n")
+    def test_operator_username_resolves_nss_without_usr_bin_id(self) -> None:
+        # NixOS does not guarantee /usr/bin/id; real NSS remains authoritative.
+        with patch.object(cutover.pwd, "getpwuid", return_value=SimpleNamespace(pw_name="alex")) as lookup:
+            self.assertEqual(
+                cutover._operator_username(
+                    lambda argv: self.fail("external id binary must not be called")
+                ), "alex",
             )
+        lookup.assert_called_once_with(1000)
+
+        with patch.object(cutover.pwd, "getpwuid", return_value=SimpleNamespace(pw_name="runner")):
+            with self.assertRaisesRegex(cutover.CutoverError, "identity differs from host contract"):
+                cutover._operator_username(
+                    lambda argv: self.fail("runner must not be used")
+                )
+        for error in (KeyError(1000), OSError("NSS unavailable")):
+            with self.subTest(error=type(error).__name__):
+                with patch.object(cutover.pwd, "getpwuid", side_effect=error):
+                    with self.assertRaisesRegex(cutover.CutoverError, "uid 1000 is unavailable"):
+                        cutover._operator_username(
+                            lambda argv: self.fail("runner must not be used")
+                        )
 
     def test_automatic_staged_helper_path_is_commit_bound(self) -> None:
         with patch.object(cutover, "AUTOMATIC_STAGING_ROOT", Path("/root/staging")):
