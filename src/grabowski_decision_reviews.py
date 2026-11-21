@@ -3348,25 +3348,49 @@ def reconcile(
     malformed provenance or changed/remapped prior directory. Three racing
     scans without stability remain a hard block, never a presumed PASS.
     """
-    result: dict[str, Any] = {}
-    for _ in range(3):
-        result = _reconcile_once(
-            repo=repo, pr=pr, head_sha=head_sha, base_sha=base_sha,
-            diff_sha256=diff_sha256,
-            equivalent_diff_sha256s=equivalent_diff_sha256s,
-            defer_diff_identity=defer_diff_identity, jobs_root=jobs_root,
-        )
-        errors = result.get("errors", [])
-        if "decision_review_jobs_root_addition_race" not in errors:
-            return result
-        if any(
-            error != "decision_review_jobs_root_addition_race"
-            and not error.startswith((
-                "decision_review_slot_without_pass:",
-                "decision_review_named_provider_slot_without_independent_pass:",
-                "decision_review_infrastructure_not_superseded:",
-            ))
-            for error in errors
-        ):
-            return result
-    return result
+    def _scan_to_stability() -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for _ in range(3):
+            result = _reconcile_once(
+                repo=repo, pr=pr, head_sha=head_sha, base_sha=base_sha,
+                diff_sha256=diff_sha256,
+                equivalent_diff_sha256s=equivalent_diff_sha256s,
+                defer_diff_identity=defer_diff_identity, jobs_root=jobs_root,
+            )
+            errors = result.get("errors", [])
+            if "decision_review_jobs_root_addition_race" not in errors:
+                return result
+            if any(
+                error != "decision_review_jobs_root_addition_race"
+                and not error.startswith((
+                    "decision_review_slot_without_pass:",
+                    "decision_review_named_provider_slot_without_independent_pass:",
+                    "decision_review_infrastructure_not_superseded:",
+                ))
+                for error in errors
+            ):
+                return result
+        return result
+
+    # Test fixtures use isolated roots; only the canonical production jobs
+    # root is shared with the real hourly Retention archive worker.
+    if jobs_root is not None and Path(jobs_root) != JOBS_ROOT:
+        return _scan_to_stability()
+
+    # Retention already holds this existing exclusive lock around the pinned
+    # atomic job moves. Protect the ENTIRE job inventory, including the late
+    # material-REJECT rechecks, with the same lock. Do not treat a vanished
+    # inode as safe, and never accept a partial scan.
+    from grabowski_self_deploy import _deploy_schedule_lock
+
+    # Archive batches can exceed the deploy lock's existing 10s bounded wait.
+    # Retry only acquisition timeouts (not audit errors). Six attempts bound
+    # the total wait to about one minute; a persistent busy lock fails closed.
+    for attempt in range(6):
+        try:
+            with _deploy_schedule_lock():
+                return _scan_to_stability()
+        except TimeoutError:
+            if attempt == 5:
+                raise
+    raise AssertionError("unreachable archive-lock retry state")

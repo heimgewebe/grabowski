@@ -1,4 +1,6 @@
+from contextlib import contextmanager
 from pathlib import Path
+from types import ModuleType
 import hashlib
 import json
 import os
@@ -417,6 +419,84 @@ def stamp_claude_oauth_401(directory: Path, *, envelope_updates: dict | None = N
 
 
 class DecisionReviewReconciliationTests(unittest.TestCase):
+    def test_retention_lock_covers_complete_review_scan(self) -> None:
+        # Hourly Retention already holds this schedule lock while atomically
+        # moving ordinary jobs. A Captain inventory scan must hold it too.
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs = Path(tmp) / "jobs"
+            jobs.mkdir(mode=0o700)
+            observed: list[str] = []
+
+            @contextmanager
+            def existing_lock():
+                observed.append("acquired")
+                try:
+                    yield
+                finally:
+                    observed.append("released")
+
+            real_scan = reviews._reconcile_once
+
+            def scan(**kwargs):
+                self.assertEqual(observed, ["acquired"])
+                observed.append("full_scan")
+                return real_scan(**kwargs)
+
+            fake_deploy = ModuleType("grabowski_self_deploy")
+            fake_deploy._deploy_schedule_lock = existing_lock
+            with mock.patch.dict(sys.modules, {"grabowski_self_deploy": fake_deploy}), \
+                    mock.patch.object(reviews, "JOBS_ROOT", jobs), \
+                    mock.patch.object(reviews, "_reconcile_once", side_effect=scan):
+                outcome = self.reconcile(jobs)
+            self.assertEqual(outcome["status"], "not_applicable")
+            self.assertEqual(observed, ["acquired", "full_scan", "released"])
+
+    def test_retention_lock_waits_bounded_and_keeps_unsafe_inventory_blocking(self) -> None:
+        # A live hourly archive can hold the existing exclusive lock for
+        # ~30 seconds; two 10s acquire timeouts must not become a fake PASS.
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs = Path(tmp) / "jobs"
+            jobs.mkdir(mode=0o700)
+            (jobs / ("grabowski-job-" + "1" * 12)).symlink_to(tmp)
+            attempts = [0]
+
+            @contextmanager
+            def existing_lock():
+                attempts[0] += 1
+                if attempts[0] <= 2:
+                    raise TimeoutError("retention lock busy")
+                yield
+
+            fake_deploy = ModuleType("grabowski_self_deploy")
+            fake_deploy._deploy_schedule_lock = existing_lock
+            with mock.patch.dict(sys.modules, {"grabowski_self_deploy": fake_deploy}), \
+                    mock.patch.object(reviews, "JOBS_ROOT", jobs):
+                outcome = self.reconcile(jobs)
+            self.assertEqual(attempts, [3])
+            self.assertEqual(outcome["status"], "blocked")
+            self.assertIn("decision_review_job_inventory_unverifiable", outcome["errors"])
+
+    def test_retention_lock_timeout_stays_fail_closed(self) -> None:
+        # Never skip a Review scan to allow a merge after lock contention.
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs = Path(tmp) / "jobs"
+            jobs.mkdir(mode=0o700)
+            attempts = [0]
+
+            @contextmanager
+            def existing_lock():
+                attempts[0] += 1
+                raise TimeoutError("retention lock busy")
+                yield  # pragma: no cover
+
+            fake_deploy = ModuleType("grabowski_self_deploy")
+            fake_deploy._deploy_schedule_lock = existing_lock
+            with mock.patch.dict(sys.modules, {"grabowski_self_deploy": fake_deploy}), \
+                    mock.patch.object(reviews, "JOBS_ROOT", jobs):
+                with self.assertRaisesRegex(TimeoutError, "retention lock busy"):
+                    self.reconcile(jobs)
+            self.assertEqual(attempts, [6])
+
     def test_rgpm_signed_v2_review_pass_cannot_grant_captain_authority(self) -> None:
         # Construct a valid foreign-namespace reviewer under the old, widened
         # unit matcher.  The actual reconciler must never accept that PASS.
