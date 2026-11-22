@@ -6245,6 +6245,30 @@ class RuntimeRetentionTests(unittest.TestCase):
                     original.rename(target)
                 self.assertTrue((jobs / name / "metadata.json").is_file())
 
+    def test_periodic_apply_replans_one_complete_pair_after_registry_drift(self) -> None:
+        first = {
+            "plan_sha256": "a" * 64,
+            "reset_failed_units": ["grabowski-task-" + "a" * 24 + "-a1.service"],
+            "archive_jobs": [],
+        }
+        drifted = {**first, "plan_sha256": "b" * 64}
+        stable = {**first, "plan_sha256": "c" * 64}
+        applied = {"completed": True, "status": "passed", "mutated": True}
+        with patch.object(
+            RETENTION, "build_plan",
+            side_effect=[first, drifted, stable, stable],
+        ) as build, patch.object(
+            RETENTION, "apply_plan", return_value=applied,
+        ) as apply:
+            result = RETENTION.apply_periodic_plan()
+        self.assertEqual(result, applied)
+        self.assertEqual(build.call_count, 4)
+        self.assertEqual(build.call_args_list[0].kwargs["now"], build.call_args_list[1].kwargs["now"])
+        self.assertEqual(build.call_args_list[2].kwargs["now"], build.call_args_list[3].kwargs["now"])
+        apply.assert_called_once_with(
+            stable, expected_plan_sha256=stable["plan_sha256"]
+        )
+
     def test_periodic_apply_rejects_plan_drift_before_mutation(self) -> None:
         first = {
             "plan_sha256": "a" * 64,
@@ -6257,11 +6281,12 @@ class RuntimeRetentionTests(unittest.TestCase):
             "archive_jobs": [],
         }
         with patch.object(
-            RETENTION, "build_plan", side_effect=[first, second]
-        ), patch.object(RETENTION, "apply_plan") as apply:
+            RETENTION, "build_plan", side_effect=[first, second, first, second]
+        ) as build, patch.object(RETENTION, "apply_plan") as apply:
             with self.assertRaisesRegex(RuntimeError, "drifted"):
                 RETENTION.apply_periodic_plan()
         apply.assert_not_called()
+        self.assertEqual(build.call_count, 4)
 
     def test_periodic_apply_stable_noop_is_idempotent(self) -> None:
         plan = {

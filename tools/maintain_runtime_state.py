@@ -3995,20 +3995,25 @@ def apply_periodic_plan(
     """
     # One clock snapshot binds both periodic plans to the same scan window.
     # A slot boundary during revalidation must not manufacture plan drift.
-    cycle_now = int(time.time())
-    preview = build_plan(
-        minimum_job_age_seconds=minimum_job_age_seconds,
-        max_archive_jobs=max_archive_jobs,
-        now=cycle_now,
-        retention_failed_units_only=True,
-    )
-    current = build_plan(
-        minimum_job_age_seconds=minimum_job_age_seconds,
-        max_archive_jobs=max_archive_jobs,
-        now=cycle_now,
-        retention_failed_units_only=True,
-    )
-    if current["plan_sha256"] != preview["plan_sha256"]:
+    # Concurrent job registration can shift the scan window between reads.
+    # Discard both plans and rebind one complete pair; never apply a stale plan.
+    for _ in range(2):
+        cycle_now = int(time.time())
+        preview = build_plan(
+            minimum_job_age_seconds=minimum_job_age_seconds,
+            max_archive_jobs=max_archive_jobs,
+            now=cycle_now,
+            retention_failed_units_only=True,
+        )
+        current = build_plan(
+            minimum_job_age_seconds=minimum_job_age_seconds,
+            max_archive_jobs=max_archive_jobs,
+            now=cycle_now,
+            retention_failed_units_only=True,
+        )
+        if current["plan_sha256"] == preview["plan_sha256"]:
+            break
+    else:
         raise RuntimeError("retention plan drifted between periodic snapshots")
     blocked = current.get("blocked", [])
     if not current["reset_failed_units"] and not current["archive_jobs"]:
