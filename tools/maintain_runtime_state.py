@@ -2409,13 +2409,29 @@ def _reset_failed(unit: str) -> dict[str, Any]:
     ):
         raise RuntimeError(f"retention reset unit is outside the typed contract: {unit}")
     result = _run(["systemctl", "--user", "reset-failed", unit])
-    return {
+    observation = {
         "unit": unit,
         "returncode": result.returncode,
         "stderr_sha256": hashlib.sha256(
             result.stderr.encode("utf-8", errors="replace")
         ).hexdigest(),
     }
+    # A failed transient task may have been unloaded between plan and reset.
+    # Do not disguise other reset errors, and never alter the task ledger.
+    if (
+        result.returncode == 1
+        and TASK_UNIT.fullmatch(unit)
+        and result.stderr
+        == f"Failed to reset failed state of unit {unit}: Unit {unit} not loaded.\n"
+    ):
+        state = _systemd_unit_states([unit])[unit]
+        if (
+            state.get("LoadState") == "not-found"
+            and state.get("ActiveState") == "inactive"
+            and state.get("SubState") == "dead"
+        ):
+            observation["already_unloaded"] = True
+    return observation
 
 
 def _redacted_reset_failure(
@@ -3727,7 +3743,10 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
             finally:
                 if live_fd is not None:
                     os.close(live_fd)
-        failed_resets = [item for item in reset_results if item["returncode"] != 0]
+        failed_resets = [
+            item for item in reset_results
+            if item["returncode"] != 0 and not item.get("already_unloaded", False)
+        ]
         receipt = {
             "schema_version": 3,
             "operation": "grabowski-runtime-state-retention",
@@ -3976,20 +3995,25 @@ def apply_periodic_plan(
     """
     # One clock snapshot binds both periodic plans to the same scan window.
     # A slot boundary during revalidation must not manufacture plan drift.
-    cycle_now = int(time.time())
-    preview = build_plan(
-        minimum_job_age_seconds=minimum_job_age_seconds,
-        max_archive_jobs=max_archive_jobs,
-        now=cycle_now,
-        retention_failed_units_only=True,
-    )
-    current = build_plan(
-        minimum_job_age_seconds=minimum_job_age_seconds,
-        max_archive_jobs=max_archive_jobs,
-        now=cycle_now,
-        retention_failed_units_only=True,
-    )
-    if current["plan_sha256"] != preview["plan_sha256"]:
+    # Concurrent job registration can shift the scan window between reads.
+    # Discard both plans and rebind one complete pair; never apply a stale plan.
+    for _ in range(2):
+        cycle_now = int(time.time())
+        preview = build_plan(
+            minimum_job_age_seconds=minimum_job_age_seconds,
+            max_archive_jobs=max_archive_jobs,
+            now=cycle_now,
+            retention_failed_units_only=True,
+        )
+        current = build_plan(
+            minimum_job_age_seconds=minimum_job_age_seconds,
+            max_archive_jobs=max_archive_jobs,
+            now=cycle_now,
+            retention_failed_units_only=True,
+        )
+        if current["plan_sha256"] == preview["plan_sha256"]:
+            break
+    else:
         raise RuntimeError("retention plan drifted between periodic snapshots")
     blocked = current.get("blocked", [])
     if not current["reset_failed_units"] and not current["archive_jobs"]:
