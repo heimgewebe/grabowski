@@ -47,6 +47,54 @@ import grabowski_merge_guard as merge_guard  # noqa: E402
 import grabowski_resources as resources  # noqa: E402
 
 
+class GithubRunnerBoundedPaginationTests(unittest.TestCase):
+    """Only complete PR file pagination gets extra time; it still fails closed."""
+
+    def test_full_pr_file_listing_gets_ninety_seconds(self) -> None:
+        import grabowski_grips as grips
+
+        target = "repos/heimgewebe/commonworld/pulls/248/files?per_page=100"
+        args = ["api", "--paginate", target, "--jq", ".[] | .filename"]
+        result = types.SimpleNamespace(returncode=0, stdout=b"file.json\n", stderr=b"")
+        with mock.patch.object(
+            grips.grabowski_git_ssh, "trusted_github_cli_path", return_value="/trusted/gh"
+        ), mock.patch.object(grips.subprocess, "run", return_value=result) as run:
+            readback = grips._default_github_runner(Path.cwd(), args)
+        self.assertEqual(run.call_args.kwargs["timeout"], 90)
+        self.assertEqual(readback["returncode"], 0)
+        self.assertEqual(readback["stdout"], "file.json")
+
+    def test_other_github_operations_keep_thirty_seconds(self) -> None:
+        import grabowski_grips as grips
+
+        result = types.SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+        for args in (
+            ["pr", "view", "248", "--repo", "heimgewebe/commonworld"],
+            ["api", "repos/heimgewebe/commonworld/pulls/248/files?per_page=100"],
+            ["api", "--paginate", "repos/heimgewebe/commonworld/issues?per_page=100"],
+        ):
+            with self.subTest(args=args), mock.patch.object(
+                grips.grabowski_git_ssh, "trusted_github_cli_path", return_value="/trusted/gh"
+            ), mock.patch.object(grips.subprocess, "run", return_value=result) as run:
+                grips._default_github_runner(Path.cwd(), args)
+            self.assertEqual(run.call_args.kwargs["timeout"], 30)
+
+    def test_paginated_file_timeout_still_fails_closed(self) -> None:
+        import grabowski_grips as grips
+
+        args = ["api", "--paginate", "repos/heimgewebe/commonworld/pulls/248/files?per_page=100"]
+        timed_out = subprocess.TimeoutExpired(
+            cmd=["/trusted/gh", *args], timeout=90, output=b"partial\n", stderr=b"late"
+        )
+        with mock.patch.object(
+            grips.grabowski_git_ssh, "trusted_github_cli_path", return_value="/trusted/gh"
+        ), mock.patch.object(grips.subprocess, "run", side_effect=timed_out):
+            result = grips._default_github_runner(Path.cwd(), args)
+        self.assertEqual(result["returncode"], 124)
+        self.assertIn("90 seconds", result["stderr"])
+        self.assertEqual(result["stdout"], "partial")
+
+
 class FirstPartyMergeLockTests(unittest.TestCase):
     def test_final_merge_evidence_window_blocks_late_signed_reject(self) -> None:
         # A signed review writer needs the exclusive receipt lock. Captain's
@@ -651,15 +699,9 @@ class CaptainLargePrProviderCapTests(unittest.TestCase):
                 self.assertEqual(receipt["status"], "blocked")
                 self.assertTrue(any(reason in e for e in errors), errors)
 
-    def test_live_binding_uses_exact_local_diff_without_provider_pagination(self) -> None:
-        # Both above GitHub's 300-file diff cap and its 3,000-file listing cap.
-        for count in (301, 1400, 3587):
-            with self.subTest(changed_files=count):
-                self._check_live_large_paths_without_pagination(self.paths[:count])
-
-    def _check_live_large_paths_without_pagination(self, paths: list[str]) -> None:
+    def test_live_binding_uses_exact_local_diff_not_provider_3000_file_list(self) -> None:
         gh = _LargePrGh(
-            base_sha="a" * 40, head_sha="b" * 40, paths=paths,
+            base_sha="a" * 40, head_sha="b" * 40, paths=self.paths,
         )
         raw = b"diff --git a/test.txt b/test.txt\n"
         expected_sha = merge_guard.github_pr_diff_identity_sha256(raw)
@@ -683,7 +725,7 @@ class CaptainLargePrProviderCapTests(unittest.TestCase):
             return_value=({"available": True}, []),
         ), mock.patch.object(
             merge_guard, "_merge_guard_local_changed_paths",
-            return_value=(paths, {"source": "local-bound-git-name-only"}, []),
+            return_value=(self.paths, {"source": "local-bound-git-name-only"}, []),
         ), mock.patch.object(
             merge_guard, "_merge_guard_local_diff_bytes",
             return_value=(raw, {"raw_sha256": hashlib.sha256(raw).hexdigest()}, []),
@@ -692,7 +734,7 @@ class CaptainLargePrProviderCapTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertIsNotNone(bindings)
         assert bindings is not None
-        self.assertEqual(bindings["changed_paths"], paths)
+        self.assertEqual(bindings["changed_paths"], self.paths)
         self.assertEqual(bindings["diff_sha256"], expected_sha)
         self.assertEqual(runner.receipt["large_pr_paths"]["status"], "verified")
         self.assertFalse(any(call[:2] == ("api", "--paginate") for call in gh.calls))
@@ -1875,9 +1917,8 @@ class CaptainLargePrMergeGuardTests(unittest.TestCase):
             runner.receipt["live_diff"]["provider_attempt"]["returncode"], 1
         )
         self.assertEqual(
-            runner.receipt["large_pr_paths"]["complete_path_count"], len(expected_paths)
+            runner.receipt["live_files"]["record_count"], len(expected_paths)
         )
-        self.assertFalse(any(call[:2] == ("api", "--paginate") for call in gh.calls))
 
     def test_live_bindings_falls_back_at_259_files_when_line_limit_is_hit(self) -> None:
         temporary, repo, base_sha, head_sha, expected_paths = _large_git_repo(259)

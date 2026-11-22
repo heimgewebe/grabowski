@@ -2145,6 +2145,16 @@ def _default_github_runner(repo: Path, argv: list[str]) -> dict[str, Any]:
     ):
         env.pop(key, None)
     env.update({"GH_PROMPT_DISABLED": "1", "GIT_TERMINAL_PROMPT": "0", "GIT_PAGER": "cat", "PAGER": "cat"})
+    # A complete PR file list can take multiple pages. Give only this known
+    # read-only endpoint more time; rename and full-file checks stay intact.
+    paginated_pr_files = (
+        len(argv) >= 3
+        and argv[:2] == ["api", "--paginate"]
+        and argv[2].startswith("repos/")
+        and "/pulls/" in argv[2]
+        and argv[2].endswith("/files?per_page=100")
+    )
+    timeout_seconds = 90 if paginated_pr_files else 30
     try:
         completed = subprocess.run(
             command,
@@ -2152,14 +2162,14 @@ def _default_github_runner(repo: Path, argv: list[str]) -> dict[str, Any]:
             text=False,
             capture_output=True,
             check=False,
-            timeout=30,
+            timeout=timeout_seconds,
             env=env,
         )
     except subprocess.TimeoutExpired as exc:
         stdout_bytes = exc.stdout if isinstance(exc.stdout, bytes) else b""
         stderr_bytes = exc.stderr if isinstance(exc.stderr, bytes) else b""
         partial_stderr = stderr_bytes.decode("utf-8", errors="replace").rstrip("\n")
-        timeout_message = "gh command timed out after 30 seconds"
+        timeout_message = f"gh command timed out after {timeout_seconds} seconds"
         if partial_stderr:
             timeout_message += f"; partial stderr: {partial_stderr}"
         return {
