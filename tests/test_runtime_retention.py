@@ -907,6 +907,53 @@ class RuntimeRetentionTests(unittest.TestCase):
                 ).fetchone()[0]
             self.assertEqual(stored, "failed")
 
+    def test_task_reset_revalidates_changed_task_state(self) -> None:
+        # A task that resumed after the single snapshot cannot be reset.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.chmod(0o700)
+            jobs = root / "jobs"
+            jobs.mkdir(mode=0o700)
+            archive, receipts = root / "archive", root / "receipts"
+            archive.mkdir(mode=0o700)
+            receipts.mkdir(mode=0o700)
+            unit = "grabowski-task-" + "d" * 24 + "-a1.service"
+            db = self._task_db(root / "tasks.sqlite3", unit, "failed")
+            plan = RETENTION.build_plan(
+                jobs_root=jobs, archive_root=archive, receipt_root=receipts,
+                task_db=db, failed_units=[unit], unit_states={},
+            )
+            self.assertEqual(plan["reset_failed_units"], [unit])
+            with sqlite3.connect(db) as connection:
+                connection.execute(
+                    "UPDATE tasks SET state = 'running' WHERE unit = ?", (unit,)
+                )
+            fake_deploy = types.ModuleType("grabowski_self_deploy")
+            fake_deploy.DEPLOY_INDEX_FILENAME = "runtime-deploy-index.json"
+            fake_deploy._deploy_schedule_lock = lambda: nullcontext()
+            fake_base = types.ModuleType("grabowski_mcp")
+            fake_base._append_audit = Mock()
+            fake_base._require_mutations_enabled = Mock()
+            fake_base._require_capability = Mock()
+            with patch.dict("sys.modules", {
+                "grabowski_self_deploy": fake_deploy,
+                "grabowski_mcp": fake_base,
+            }), patch.object(RETENTION, "_run") as reset:
+                with self.assertRaisesRegex(
+                    RuntimeError, "retention reset phase did not complete"
+                ):
+                    RETENTION.apply_plan(
+                        plan, expected_plan_sha256=plan["plan_sha256"]
+                    )
+            reset.assert_not_called()
+            records = list(receipts.glob("*.json"))
+            self.assertEqual(len(records), 1)
+            result = json.loads(records[0].read_text())
+            self.assertEqual(result["status"], "degraded")
+            self.assertFalse(result["completed"])
+            self.assertEqual(result["reset_failures"][0]["stage"], "task_revalidation")
+            self.assertEqual(result["archived_jobs"], [])
+
     def test_task_reset_preserves_durable_failed_state(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -2125,7 +2172,7 @@ class RuntimeRetentionTests(unittest.TestCase):
                 for row in forced_failed["blocked"]
             ))
 
-    def test_periodic_pins_one_clock_snapshot_for_both_plans(self) -> None:
+    def test_periodic_pins_one_clock_snapshot_for_one_plan(self) -> None:
         plan = {
             "plan_sha256": "a" * 64,
             "reset_failed_units": [],
@@ -2136,10 +2183,9 @@ class RuntimeRetentionTests(unittest.TestCase):
             with patch.object(RETENTION.time, "time", side_effect=[3_599, 3_600]):
                 result = RETENTION.apply_periodic_plan()
         self.assertTrue(result["completed"])
-        self.assertEqual(build.call_count, 2)
-        for call in build.call_args_list:
-            self.assertEqual(call.kwargs["now"], 3_599)
-            self.assertIs(call.kwargs["retention_failed_units_only"], True)
+        build.assert_called_once()
+        self.assertEqual(build.call_args.kwargs["now"], 3_599)
+        self.assertIs(build.call_args.kwargs["retention_failed_units_only"], True)
 
     def test_periodic_failed_unit_query_is_scoped_at_systemd(self) -> None:
         # Foreign services cannot exhaust the bounded inventory before filtering.
@@ -6245,48 +6291,49 @@ class RuntimeRetentionTests(unittest.TestCase):
                     original.rename(target)
                 self.assertTrue((jobs / name / "metadata.json").is_file())
 
-    def test_periodic_apply_replans_one_complete_pair_after_registry_drift(self) -> None:
-        first = {
+    def test_periodic_apply_does_not_replan_for_unrelated_job_registration(self) -> None:
+        # The selected live plan remains the authority; a newly registered
+        # unrelated job cannot block 128 already bounded archive candidates.
+        plan = {
             "plan_sha256": "a" * 64,
             "reset_failed_units": ["grabowski-task-" + "a" * 24 + "-a1.service"],
             "archive_jobs": [],
+            "blocked": [],
         }
-        drifted = {**first, "plan_sha256": "b" * 64}
-        stable = {**first, "plan_sha256": "c" * 64}
         applied = {"completed": True, "status": "passed", "mutated": True}
-        with patch.object(
-            RETENTION, "build_plan",
-            side_effect=[first, drifted, stable, stable],
-        ) as build, patch.object(
-            RETENTION, "apply_plan", return_value=applied,
+        registrations = []
+
+        def build(**kwargs):
+            registrations.append("unrelated job registered after this scan")
+            return plan
+
+        with patch.object(RETENTION, "build_plan", side_effect=build) as make, patch.object(
+            RETENTION, "apply_plan", return_value=applied
         ) as apply:
             result = RETENTION.apply_periodic_plan()
         self.assertEqual(result, applied)
-        self.assertEqual(build.call_count, 4)
-        self.assertEqual(build.call_args_list[0].kwargs["now"], build.call_args_list[1].kwargs["now"])
-        self.assertEqual(build.call_args_list[2].kwargs["now"], build.call_args_list[3].kwargs["now"])
+        self.assertEqual(registrations, ["unrelated job registered after this scan"])
+        make.assert_called_once()
+        self.assertTrue(make.call_args.kwargs["retention_failed_units_only"])
         apply.assert_called_once_with(
-            stable, expected_plan_sha256=stable["plan_sha256"]
+            plan, expected_plan_sha256=plan["plan_sha256"]
         )
 
-    def test_periodic_apply_rejects_plan_drift_before_mutation(self) -> None:
-        first = {
-            "plan_sha256": "a" * 64,
-            "reset_failed_units": ["grabowski-task-" + "a" * 24 + "-a1.service"],
+    def test_periodic_apply_cannot_use_detached_self_hashed_plan(self) -> None:
+        # Losing the old global comparison cannot authorize arbitrary input.
+        record = {
+            "reset_failed_units": ["grabowski-task-" + "b" * 24 + "-a1.service"],
             "archive_jobs": [],
+            "blocked": [],
         }
-        second = {
-            "plan_sha256": "b" * 64,
-            "reset_failed_units": first["reset_failed_units"],
-            "archive_jobs": [],
-        }
+        detached = {**record, "plan_sha256": RETENTION._sha256(record)}
         with patch.object(
-            RETENTION, "build_plan", side_effect=[first, second, first, second]
-        ) as build, patch.object(RETENTION, "apply_plan") as apply:
-            with self.assertRaisesRegex(RuntimeError, "drifted"):
+            RETENTION, "build_plan", return_value=detached
+        ) as build, patch.object(RETENTION, "_run") as reset:
+            with self.assertRaisesRegex(RuntimeError, "trusted in-process root custody"):
                 RETENTION.apply_periodic_plan()
-        apply.assert_not_called()
-        self.assertEqual(build.call_count, 4)
+        build.assert_called_once()
+        reset.assert_not_called()
 
     def test_periodic_apply_stable_noop_is_idempotent(self) -> None:
         plan = {
@@ -6295,7 +6342,7 @@ class RuntimeRetentionTests(unittest.TestCase):
             "archive_jobs": [],
         }
         with patch.object(
-            RETENTION, "build_plan", side_effect=[plan, plan, plan, plan]
+            RETENTION, "build_plan", side_effect=[plan, plan]
         ), patch.object(RETENTION, "apply_plan") as apply:
             first = RETENTION.apply_periodic_plan()
             second = RETENTION.apply_periodic_plan()
