@@ -2409,13 +2409,29 @@ def _reset_failed(unit: str) -> dict[str, Any]:
     ):
         raise RuntimeError(f"retention reset unit is outside the typed contract: {unit}")
     result = _run(["systemctl", "--user", "reset-failed", unit])
-    return {
+    observation = {
         "unit": unit,
         "returncode": result.returncode,
         "stderr_sha256": hashlib.sha256(
             result.stderr.encode("utf-8", errors="replace")
         ).hexdigest(),
     }
+    # A failed transient task may have been unloaded between plan and reset.
+    # Do not disguise other reset errors, and never alter the task ledger.
+    if (
+        result.returncode == 1
+        and TASK_UNIT.fullmatch(unit)
+        and result.stderr
+        == f"Failed to reset failed state of unit {unit}: Unit {unit} not loaded.\n"
+    ):
+        state = _systemd_unit_states([unit])[unit]
+        if (
+            state.get("LoadState") == "not-found"
+            and state.get("ActiveState") == "inactive"
+            and state.get("SubState") == "dead"
+        ):
+            observation["already_unloaded"] = True
+    return observation
 
 
 def _redacted_reset_failure(
@@ -3727,7 +3743,10 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
             finally:
                 if live_fd is not None:
                     os.close(live_fd)
-        failed_resets = [item for item in reset_results if item["returncode"] != 0]
+        failed_resets = [
+            item for item in reset_results
+            if item["returncode"] != 0 and not item.get("already_unloaded", False)
+        ]
         receipt = {
             "schema_version": 3,
             "operation": "grabowski-runtime-state-retention",

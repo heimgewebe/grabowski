@@ -820,6 +820,93 @@ class RuntimeRetentionTests(unittest.TestCase):
                 self.assertEqual(plan["reset_failed_units"], [])
                 self.assertIn("not proven terminal", plan["blocked"][0]["reason"])
 
+    def test_unloaded_transient_task_reset_is_noop_with_original_returncode(self) -> None:
+        unit = "grabowski-task-" + "d" * 24 + "-a1.service"
+        stderr = (
+            f"Failed to reset failed state of unit {unit}: "
+            f"Unit {unit} not loaded.\n"
+        )
+        with patch.object(
+            RETENTION, "_run", return_value=Mock(returncode=1, stderr=stderr)
+        ) as reset, patch.object(
+            RETENTION, "_systemd_unit_states",
+            return_value={unit: self._state(unit)},
+        ) as show:
+            outcome = RETENTION._reset_failed(unit)
+        reset.assert_called_once_with(["systemctl", "--user", "reset-failed", unit])
+        show.assert_called_once_with([unit])
+        self.assertEqual(outcome["returncode"], 1)
+        self.assertTrue(outcome["already_unloaded"])
+        self.assertEqual(outcome["stderr_sha256"], hashlib.sha256(stderr.encode()).hexdigest())
+
+    def test_unloaded_task_reset_must_not_mask_real_failure(self) -> None:
+        unit = "grabowski-task-" + "d" * 24 + "-a1.service"
+        missing = (
+            f"Failed to reset failed state of unit {unit}: "
+            f"Unit {unit} not loaded.\n"
+        )
+        for stderr, state in (
+            ("Access denied\n", self._state(unit)),
+            (missing, self._state(unit, active="failed", load="loaded", result="exit-code")),
+        ):
+            with self.subTest(stderr=stderr, state=state), patch.object(
+                RETENTION, "_run", return_value=Mock(returncode=1, stderr=stderr)
+            ), patch.object(
+                RETENTION, "_systemd_unit_states", return_value={unit: state}
+            ):
+                outcome = RETENTION._reset_failed(unit)
+            self.assertEqual(outcome["returncode"], 1)
+            self.assertNotIn("already_unloaded", outcome)
+
+    def test_unloaded_transient_task_reset_preserves_failed_ledger_and_completes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.chmod(0o700)
+            jobs = root / "jobs"
+            jobs.mkdir(mode=0o700)
+            (root / "archive").mkdir(mode=0o700)
+            (root / "receipts").mkdir(mode=0o700)
+            unit = "grabowski-task-" + "d" * 24 + "-a1.service"
+            task_db = self._task_db(root / "tasks.sqlite3", unit, "failed")
+            plan = RETENTION.build_plan(
+                jobs_root=jobs, archive_root=root / "archive",
+                receipt_root=root / "receipts", task_db=task_db,
+                failed_units=[unit], unit_states={},
+            )
+            self.assertEqual(plan["reset_failed_units"], [unit])
+            fake_deploy = types.ModuleType("grabowski_self_deploy")
+            fake_deploy.DEPLOY_INDEX_FILENAME = "runtime-deploy-index.json"
+            fake_deploy._deploy_schedule_lock = lambda: nullcontext()
+            fake_base = types.ModuleType("grabowski_mcp")
+            fake_base._append_audit = Mock()
+            fake_base._require_mutations_enabled = Mock()
+            fake_base._require_capability = Mock()
+            stderr = (
+                f"Failed to reset failed state of unit {unit}: "
+                f"Unit {unit} not loaded.\n"
+            )
+            with patch.dict("sys.modules", {
+                "grabowski_self_deploy": fake_deploy,
+                "grabowski_mcp": fake_base,
+            }), patch.object(
+                RETENTION, "_run", return_value=Mock(returncode=1, stderr=stderr)
+            ), patch.object(
+                RETENTION, "_systemd_unit_states",
+                return_value={unit: self._state(unit)},
+            ):
+                receipt = RETENTION.apply_plan(
+                    plan, expected_plan_sha256=plan["plan_sha256"]
+                )
+            self.assertTrue(receipt["completed"])
+            self.assertEqual(receipt["status"], "passed")
+            self.assertEqual(receipt["reset_failed"][0]["returncode"], 1)
+            self.assertTrue(receipt["reset_failed"][0]["already_unloaded"])
+            with sqlite3.connect(task_db) as connection:
+                stored = connection.execute(
+                    "SELECT state FROM tasks WHERE unit = ?", (unit,)
+                ).fetchone()[0]
+            self.assertEqual(stored, "failed")
+
     def test_task_reset_preserves_durable_failed_state(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
