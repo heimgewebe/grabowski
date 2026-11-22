@@ -2437,7 +2437,7 @@ def _reset_failed(unit: str) -> dict[str, Any]:
 def _redacted_reset_failure(
     *, unit: str, stage: str, error: BaseException
 ) -> dict[str, str]:
-    if stage not in {"worker_revalidation", "reset_command", "deployment_index_recovery"}:
+    if stage not in {"task_revalidation", "worker_revalidation", "reset_command", "deployment_index_recovery"}:
         raise RuntimeError("retention reset failure stage is invalid")
     return {
         "unit": unit,
@@ -3688,6 +3688,19 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
                         )
                     )
                     continue
+            if TASK_UNIT.fullmatch(unit):
+                # Recheck this target after planning, rather than holding all
+                # unrelated job registrations stable between global scans.
+                try:
+                    if _task_state(unit, Path(plan["task_db"])) not in TERMINAL_TASK_STATES:
+                        raise RuntimeError("task is no longer terminal before reset")
+                except (RuntimeError, OSError, KeyError, sqlite3.Error) as exc:
+                    reset_failures.append(
+                        _redacted_reset_failure(
+                            unit=unit, stage="task_revalidation", error=exc
+                        )
+                    )
+                    continue
             if WORKER_UNIT.fullmatch(unit):
                 try:
                     _prepare_worker_resets(plan, units=[unit])
@@ -3984,37 +3997,21 @@ def apply_periodic_plan(
     worktree_hygiene_runner: Any | None = None,
     worktree_hygiene_include_terminal_owners: bool = False,
 ) -> dict[str, Any]:
-    """Apply one bounded live retention cycle after two identical snapshots.
+    """Apply one bounded, in-process pinned retention plan.
 
-    The periodic path deliberately keeps the existing plan-hash contract: it
-    builds the live plan twice and refuses every mutation when those hashes
-    differ. The normal apply path then performs its existing pre-mutation
-    revalidation and receipt/audit writes. A stable actionless plan is returned
-    as a successful no-op so repeated timer runs remain idempotent without
-    manufacturing duplicate terminal receipts.
+    Concurrent unrelated job registrations can alter an entire registry scan
+    while its selected archive candidates remain unchanged. Comparing two
+    full plans (and retrying the comparison) created false hourly failures.
+    Instead, use the single trusted plan's hash and held root descriptors.
+    apply_plan still revalidates each selected job, worker and task before
+    any effect, including live systemd state and root/index identity.
     """
-    # One clock snapshot binds both periodic plans to the same scan window.
-    # A slot boundary during revalidation must not manufacture plan drift.
-    # Concurrent job registration can shift the scan window between reads.
-    # Discard both plans and rebind one complete pair; never apply a stale plan.
-    for _ in range(2):
-        cycle_now = int(time.time())
-        preview = build_plan(
-            minimum_job_age_seconds=minimum_job_age_seconds,
-            max_archive_jobs=max_archive_jobs,
-            now=cycle_now,
-            retention_failed_units_only=True,
-        )
-        current = build_plan(
-            minimum_job_age_seconds=minimum_job_age_seconds,
-            max_archive_jobs=max_archive_jobs,
-            now=cycle_now,
-            retention_failed_units_only=True,
-        )
-        if current["plan_sha256"] == preview["plan_sha256"]:
-            break
-    else:
-        raise RuntimeError("retention plan drifted between periodic snapshots")
+    current = build_plan(
+        minimum_job_age_seconds=minimum_job_age_seconds,
+        max_archive_jobs=max_archive_jobs,
+        now=int(time.time()),
+        retention_failed_units_only=True,
+    )
     blocked = current.get("blocked", [])
     if not current["reset_failed_units"] and not current["archive_jobs"]:
         runtime_result = {
@@ -4028,7 +4025,7 @@ def apply_periodic_plan(
         }
     else:
         runtime_result = apply_plan(
-            current, expected_plan_sha256=preview["plan_sha256"]
+            current, expected_plan_sha256=current["plan_sha256"]
         )
     hygiene_result = _apply_periodic_worktree_hygiene(
         repositories=worktree_hygiene_repositories,
