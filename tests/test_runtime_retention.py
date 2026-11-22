@@ -954,6 +954,72 @@ class RuntimeRetentionTests(unittest.TestCase):
             self.assertEqual(result["reset_failures"][0]["stage"], "task_revalidation")
             self.assertEqual(result["archived_jobs"], [])
 
+    def test_task_reset_sqlite_error_after_first_effect_keeps_partial_receipt(self) -> None:
+        # A locked/unreadable task DB must not erase evidence of earlier resets.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.chmod(0o700)
+            jobs = root / "jobs"
+            jobs.mkdir(mode=0o700)
+            archive, receipts = root / "archive", root / "receipts"
+            archive.mkdir(mode=0o700)
+            receipts.mkdir(mode=0o700)
+            first_unit = "grabowski-task-" + "a" * 24 + "-a1.service"
+            second_unit = "grabowski-task-" + "b" * 24 + "-a1.service"
+            db = self._task_db(root / "tasks.sqlite3", first_unit, "failed")
+            with sqlite3.connect(db) as connection:
+                connection.execute(
+                    "INSERT INTO tasks(unit, state) VALUES (?, ?)",
+                    (second_unit, "failed"),
+                )
+            plan = RETENTION.build_plan(
+                jobs_root=jobs, archive_root=archive, receipt_root=receipts,
+                task_db=db, failed_units=[first_unit, second_unit],
+                unit_states={},
+            )
+            self.assertEqual(plan["reset_failed_units"], [first_unit, second_unit])
+            original_task_state = RETENTION._task_state
+
+            def task_state(unit, task_db):
+                if unit == second_unit:
+                    raise sqlite3.OperationalError("database is locked")
+                return original_task_state(unit, task_db)
+
+            fake_deploy = types.ModuleType("grabowski_self_deploy")
+            fake_deploy.DEPLOY_INDEX_FILENAME = "runtime-deploy-index.json"
+            fake_deploy._deploy_schedule_lock = lambda: nullcontext()
+            fake_base = types.ModuleType("grabowski_mcp")
+            fake_base._append_audit = Mock()
+            fake_base._require_mutations_enabled = Mock()
+            fake_base._require_capability = Mock()
+            with patch.dict("sys.modules", {
+                "grabowski_self_deploy": fake_deploy,
+                "grabowski_mcp": fake_base,
+            }), patch.object(
+                RETENTION, "_task_state", side_effect=task_state
+            ), patch.object(
+                RETENTION, "_run", return_value=Mock(returncode=0, stderr="")
+            ) as reset:
+                with self.assertRaisesRegex(
+                    RuntimeError, "retention reset phase did not complete"
+                ):
+                    RETENTION.apply_plan(
+                        plan, expected_plan_sha256=plan["plan_sha256"]
+                    )
+            reset.assert_called_once_with(
+                ["systemctl", "--user", "reset-failed", first_unit]
+            )
+            receipts_written = list(receipts.glob("*.json"))
+            self.assertEqual(len(receipts_written), 1)
+            record = json.loads(receipts_written[0].read_text())
+            self.assertEqual(record["status"], "degraded")
+            self.assertFalse(record["completed"])
+            self.assertEqual(len(record["reset_failed"]), 1)
+            self.assertEqual(len(record["reset_failures"]), 1)
+            self.assertEqual(record["reset_failures"][0]["unit"], second_unit)
+            self.assertEqual(record["reset_failures"][0]["stage"], "task_revalidation")
+            self.assertEqual(fake_base._append_audit.call_count, 2)
+
     def test_task_reset_preserves_durable_failed_state(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

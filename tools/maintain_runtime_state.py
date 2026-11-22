@@ -3694,7 +3694,7 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
                 try:
                     if _task_state(unit, Path(plan["task_db"])) not in TERMINAL_TASK_STATES:
                         raise RuntimeError("task is no longer terminal before reset")
-                except (RuntimeError, OSError, KeyError) as exc:
+                except (RuntimeError, OSError, KeyError, sqlite3.Error) as exc:
                     reset_failures.append(
                         _redacted_reset_failure(
                             unit=unit, stage="task_revalidation", error=exc
