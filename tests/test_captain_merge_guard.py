@@ -651,9 +651,15 @@ class CaptainLargePrProviderCapTests(unittest.TestCase):
                 self.assertEqual(receipt["status"], "blocked")
                 self.assertTrue(any(reason in e for e in errors), errors)
 
-    def test_live_binding_uses_exact_local_diff_not_provider_3000_file_list(self) -> None:
+    def test_live_binding_uses_exact_local_diff_without_provider_pagination(self) -> None:
+        # Both above GitHub's 300-file diff cap and its 3,000-file listing cap.
+        for count in (301, 1400, 3587):
+            with self.subTest(changed_files=count):
+                self._check_live_large_paths_without_pagination(self.paths[:count])
+
+    def _check_live_large_paths_without_pagination(self, paths: list[str]) -> None:
         gh = _LargePrGh(
-            base_sha="a" * 40, head_sha="b" * 40, paths=self.paths,
+            base_sha="a" * 40, head_sha="b" * 40, paths=paths,
         )
         raw = b"diff --git a/test.txt b/test.txt\n"
         expected_sha = merge_guard.github_pr_diff_identity_sha256(raw)
@@ -677,7 +683,7 @@ class CaptainLargePrProviderCapTests(unittest.TestCase):
             return_value=({"available": True}, []),
         ), mock.patch.object(
             merge_guard, "_merge_guard_local_changed_paths",
-            return_value=(self.paths, {"source": "local-bound-git-name-only"}, []),
+            return_value=(paths, {"source": "local-bound-git-name-only"}, []),
         ), mock.patch.object(
             merge_guard, "_merge_guard_local_diff_bytes",
             return_value=(raw, {"raw_sha256": hashlib.sha256(raw).hexdigest()}, []),
@@ -686,7 +692,7 @@ class CaptainLargePrProviderCapTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertIsNotNone(bindings)
         assert bindings is not None
-        self.assertEqual(bindings["changed_paths"], self.paths)
+        self.assertEqual(bindings["changed_paths"], paths)
         self.assertEqual(bindings["diff_sha256"], expected_sha)
         self.assertEqual(runner.receipt["large_pr_paths"]["status"], "verified")
         self.assertFalse(any(call[:2] == ("api", "--paginate") for call in gh.calls))
@@ -1869,8 +1875,9 @@ class CaptainLargePrMergeGuardTests(unittest.TestCase):
             runner.receipt["live_diff"]["provider_attempt"]["returncode"], 1
         )
         self.assertEqual(
-            runner.receipt["live_files"]["record_count"], len(expected_paths)
+            runner.receipt["large_pr_paths"]["complete_path_count"], len(expected_paths)
         )
+        self.assertFalse(any(call[:2] == ("api", "--paginate") for call in gh.calls))
 
     def test_live_bindings_falls_back_at_259_files_when_line_limit_is_hit(self) -> None:
         temporary, repo, base_sha, head_sha, expected_paths = _large_git_repo(259)

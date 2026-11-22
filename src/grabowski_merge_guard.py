@@ -2381,8 +2381,9 @@ def _merge_guard_exact_large_pr_paths(
     changed_files: int, view_files: Any, base_branch: str, pr_number: int,
     base_sha: str, head_sha: str,
 ) -> tuple[list[str], dict[str, Any], list[str]]:
-    """Prove a >3,000-file PR without trusting GitHub's truncated file listing.
+    """Prove a >300-file PR using exact local paths and GitHub's bounded sample.
 
+    GitHub PR diff ends at 300 files; its files API is capped at 3,000.
     The PR head/base SHA are checked against the live GitHub view by the caller.
     Git objects must be present at those exact SHAs, and the unique merge-base
     path set must have the provider's exact changedFiles count. The complete
@@ -2390,7 +2391,7 @@ def _merge_guard_exact_large_pr_paths(
     only an additional disagreement detector, never the source of authority.
     """
     receipt: dict[str, Any] = {
-        "source": "exact-head-local-paths-after-github-files-api-cap",
+        "source": "exact-head-local-paths-after-github-diff-cap",
         "changed_files": changed_files,
         "github_files_api_limit": _MERGE_GUARD_GITHUB_PR_FILES_API_LIMIT,
         "base_sha": base_sha,
@@ -2398,7 +2399,7 @@ def _merge_guard_exact_large_pr_paths(
     }
     if (
         type(changed_files) is not int
-        or not _MERGE_GUARD_GITHUB_PR_FILES_API_LIMIT < changed_files <= _MERGE_GUARD_MAX_CHANGED_PATHS
+        or not _MERGE_GUARD_GITHUB_DIFF_MAX_FILES < changed_files <= _MERGE_GUARD_MAX_CHANGED_PATHS
     ):
         return [], receipt, ["merge_guard_large_pr_count_out_of_bounds"]
     objects, object_errors = _merge_guard_ensure_pr_objects(
@@ -5843,7 +5844,7 @@ class CaptainMergeGuardRunner:
         changed_paths: list[str] = []
         large_pr_mode = (
             type(changed_files) is int
-            and _MERGE_GUARD_GITHUB_PR_FILES_API_LIMIT < changed_files
+            and _MERGE_GUARD_GITHUB_DIFF_MAX_FILES < changed_files
             <= _MERGE_GUARD_MAX_CHANGED_PATHS
         )
         if large_pr_mode:
@@ -5869,6 +5870,7 @@ class CaptainMergeGuardRunner:
         ]
         requires_complete_file_projection = (
             type(changed_files) is int
+            and not large_pr_mode
             and changed_files <= _MERGE_GUARD_GITHUB_PR_FILES_API_LIMIT
             and (changed_files > 100 or bool(rename_or_copy_indexes))
         )
