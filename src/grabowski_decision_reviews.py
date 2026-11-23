@@ -700,6 +700,7 @@ def _unbound_stdout_has_target_result(
     observed_sha256: list[str] | None = None,
     expected_prefix: tuple[int, str] | None = None,
     log_name: str = "stdout.log",
+    observed_size: list[int] | None = None,
 ) -> bool:
     """Scan complete owner-pinned ordinary log, not an arbitrary 8-MiB prefix.
 
@@ -816,6 +817,8 @@ def _unbound_stdout_has_target_result(
             raise ValueError("ordinary stdout previously inspected prefix changed")
         if observed_sha256 is not None:
             observed_sha256.append(digest.hexdigest())
+        if observed_size is not None:
+            observed_size.append(read_size)
         return found
     finally:
         os.close(fd)
@@ -825,6 +828,7 @@ def _unbound_review_result_visible(
     directory: Path, *, parent_fd: int, aggregate_bytes: list[int],
     expected: dict[str, Any], allow_legacy_readable_stdout: bool = False,
     observed_sha256: list[str] | None = None,
+    observed_size: list[int] | None = None,
 ) -> bool:
     """Find review evidence in a job whose valid origin now denies review status.
 
@@ -858,7 +862,7 @@ def _unbound_review_result_visible(
     return _unbound_stdout_has_target_result(
         directory, parent_fd=parent_fd, aggregate_bytes=aggregate_bytes,
         expected=expected, allow_legacy_readable=allow_legacy_readable_stdout,
-        observed_sha256=observed_sha256,
+        observed_sha256=observed_sha256, observed_size=observed_size,
     )
 
 
@@ -2432,12 +2436,109 @@ def _revalidate_ordinary_stdout_append(
     return True, material
 
 
+NON_TARGET_RECHECK_ATTEMPTS = 8
+_NON_TARGET_RECEIPT_NAMES = (REVIEW_ROLE_ATTEMPT_RECEIPT_NAME, "review-role-receipt.json")
+
+
+def _recheck_non_target_job(
+    root: Path, root_fd: int, unit: str, *, identity: tuple[int, int],
+    files_before: tuple[tuple[str, tuple[int, ...] | None], ...],
+    record: dict[str, Any], expected: dict[str, Any],
+    metadata_budget: list[int], unbound_budget: list[int],
+) -> str | None:
+    """Re-read ONE authenticated non-target job that progressed mid-scan.
+
+    Ordinary jobs and reviews of other revisions legitimately publish
+    metadata, finalization receipts and log output while a Captain scan of
+    the whole archive runs. Their immutable origin cannot become a decision
+    for this PR/head. Instead of blocking the merge, re-validate only this
+    job: same directory inode, same origin digest, still non-target, role
+    receipts untouched, logs append-only (prefix-verified where known) and
+    no exact-target decision marker anywhere. Returns None when harmless,
+    "material" for a surfaced target decision, otherwise a short reason.
+    """
+    dir_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+    initial = dict(files_before)
+    origin_sha256 = record.get("origin_sha256")
+    prefixes: dict[str, tuple[int, str]] = dict(record.get("prefixes", {}))
+    reason = "unstable"
+    for _ in range(NON_TARGET_RECHECK_ATTEMPTS):
+        try:
+            fd = os.open(unit, dir_flags, dir_fd=root_fd)
+        except OSError:
+            return "directory_vanished"
+        try:
+            st = os.fstat(fd)
+            if (
+                not stat.S_ISDIR(st.st_mode)
+                or st.st_uid != os.geteuid()
+                or stat.S_IMODE(st.st_mode) & 0o077
+                or (st.st_dev, st.st_ino) != identity
+            ):
+                return "directory_replaced"
+            snapshot = _review_child_file_snapshot(fd)
+            current = dict(snapshot)
+            if any(current[name] != initial[name] for name in _NON_TARGET_RECEIPT_NAMES):
+                return "role_receipt_changed"
+            for name in ("stdout.log", "stderr.log"):
+                old, new = initial[name], current[name]
+                if old is not None and (
+                    new is None or new[:5] != old[:5] or new[5] < old[5]
+                ):
+                    return "log_not_append_only"
+            try:
+                raw_metadata = _read_private_json(
+                    root / unit / "metadata.json", MAX_METADATA_BYTES,
+                    parent_fd=fd, aggregate_metadata_bytes=metadata_budget,
+                )
+            except FileNotFoundError:
+                if origin_sha256 is not None or not _exact_empty_prelaunch_stub(fd):
+                    return "metadata_missing"
+            else:
+                metadata, binding, _provenance = _validated_origin_binding(
+                    root / unit, raw_metadata=raw_metadata, parent_fd=fd,
+                    expected=expected,
+                )
+                if origin_sha256 is not None and metadata.get("origin_sha256") != origin_sha256:
+                    return "origin_changed"
+                if binding is not None and _binding_matches_pr_head(binding, expected):
+                    return "became_target_review"
+                for name in ("stdout.log", "stderr.log"):
+                    if current[name] is None:
+                        continue
+                    digests: list[str] = []
+                    sizes: list[int] = []
+                    if _unbound_stdout_has_target_result(
+                        root / unit, parent_fd=fd, aggregate_bytes=unbound_budget,
+                        expected=expected, allow_legacy_readable=False,
+                        observed_sha256=digests, observed_size=sizes,
+                        expected_prefix=prefixes.get(name), log_name=name,
+                    ):
+                        return "material"
+                    prefixes[name] = (sizes[0], digests[0])
+            if _review_child_file_snapshot(fd) == snapshot:
+                return None
+        except (OSError, ValueError) as exc:
+            # A log growing during the read or a racing metadata replace is
+            # retried; a persistently changed prefix fails after the bound.
+            reason = f"unverifiable_{type(exc).__name__}"
+        finally:
+            os.close(fd)
+    return reason
+
+
 def _iter_pinned_review_job_directories(
     root: Path, errors: list[str], metadata_budget: list[int], *,
     expected: dict[str, Any], unbound_stdout_budget: list[int],
     ordinary_stdout_sha256: dict[str, str],
     ordinary_stderr_sha256: dict[str, str],
+    non_target_jobs: dict[str, dict[str, Any]] | None = None,
 ) -> Iterator[tuple[Path, int]]:
+    # Units the consumer authenticated as NOT bound to this PR/head (ordinary
+    # jobs, other revisions' reviews, prelaunch stubs). Their mid-scan
+    # progress is deferred to a per-job recheck instead of blocking.
+    non_target = {} if non_target_jobs is None else non_target_jobs
+    deferred: dict[str, tuple[str, tuple[int, int], tuple[Any, ...]]] = {}
     dir_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
     try:
         root_fd = os.open(root, dir_flags)
@@ -2651,11 +2752,12 @@ def _iter_pinned_review_job_directories(
                 try:
                     if job_stat is not None:
                         job_after = os.fstat(job_fd)
+                        drift: str | None = None
                         if (
                             job_after.st_mtime_ns != job_stat.st_mtime_ns
                             or job_after.st_ctime_ns != job_stat.st_ctime_ns
                         ):
-                            errors.append("decision_review_job_directory_changed")
+                            drift = "decision_review_job_directory_changed"
                         elif job_files_before is not None:
                             later = _review_child_file_snapshot(job_fd)
                             if later != job_files_before:
@@ -2669,10 +2771,17 @@ def _iter_pinned_review_job_directories(
                                 if material:
                                     errors.append(f"decision_review_unbound_result:{unit}")
                                 elif not allowed:
-                                    errors.append("decision_review_job_file_changed")
+                                    drift = "decision_review_job_file_changed"
                                 else:
                                     job_files_before = later
-                            if not errors:
+                        if drift is not None:
+                            if unit in non_target and job_files_before is not None:
+                                deferred[unit] = (
+                                    drift, (expected_dev, expected_ino), job_files_before,
+                                )
+                            else:
+                                errors.append(drift)
+                        elif not errors:
                                 inspected_children.append((unit, (
                                     job_after.st_dev, job_after.st_ino,
                                     job_after.st_mode, job_after.st_uid,
@@ -2691,15 +2800,22 @@ def _iter_pinned_review_job_directories(
                 try:
                     child_after = os.fstat(child_fd)
                     files_after = _review_child_file_snapshot(child_fd)
-                    if (
-                        not stat.S_ISDIR(child_after.st_mode)
-                        or (
-                            child_after.st_dev, child_after.st_ino,
-                            child_after.st_mode, child_after.st_uid,
-                            child_after.st_nlink, child_after.st_mtime_ns,
-                            child_after.st_ctime_ns,
-                        ) != snapshot
-                    ):
+                    same_inode = (
+                        stat.S_ISDIR(child_after.st_mode)
+                        and (child_after.st_dev, child_after.st_ino) == snapshot[:2]
+                    )
+                    if not same_inode or (
+                        child_after.st_dev, child_after.st_ino,
+                        child_after.st_mode, child_after.st_uid,
+                        child_after.st_nlink, child_after.st_mtime_ns,
+                        child_after.st_ctime_ns,
+                    ) != snapshot:
+                        if same_inode and unit in non_target:
+                            deferred[unit] = (
+                                "decision_review_job_directory_changed",
+                                snapshot[:2], files_before,
+                            )
+                            continue
                         errors.append("decision_review_job_directory_changed")
                         return
                     if files_after != files_before:
@@ -2714,12 +2830,35 @@ def _iter_pinned_review_job_directories(
                             errors.append(f"decision_review_unbound_result:{unit}")
                             return
                         if not allowed:
+                            if unit in non_target:
+                                deferred[unit] = (
+                                    "decision_review_job_file_changed",
+                                    snapshot[:2], files_before,
+                                )
+                                continue
                             errors.append("decision_review_job_file_changed")
                             return
                 finally:
                     os.close(child_fd)
             except OSError:
                 errors.append("decision_review_job_directory_changed")
+                return
+        # Bounded per-job rechecks for progressed non-target jobs. Any
+        # failure keeps the original hard drift code plus the exact unit.
+        for unit in sorted(deferred):
+            drift, identity, files_before = deferred[unit]
+            outcome = _recheck_non_target_job(
+                root, root_fd, unit, identity=identity,
+                files_before=files_before, record=non_target[unit],
+                expected=expected, metadata_budget=metadata_budget,
+                unbound_budget=unbound_stdout_budget,
+            )
+            if outcome == "material":
+                errors.append(f"decision_review_unbound_result:{unit}")
+                return
+            if outcome is not None:
+                errors.append(drift)
+                errors.append(f"decision_review_non_target_recheck_failed:{unit}:{outcome}")
                 return
         try:
             after = os.stat(root, follow_symlinks=False)
@@ -2873,11 +3012,13 @@ def _reconcile_once(
     skipped_prelaunch_stubs: list[str] = []
     ordinary_stdout_sha256: dict[str, str] = {}
     ordinary_stderr_sha256: dict[str, str] = {}
+    non_target_jobs: dict[str, dict[str, Any]] = {}
     iterator = _iter_pinned_review_job_directories(
         root, errors, metadata_budget, expected=expected,
         unbound_stdout_budget=unbound_stdout_budget,
         ordinary_stdout_sha256=ordinary_stdout_sha256,
         ordinary_stderr_sha256=ordinary_stderr_sha256,
+        non_target_jobs=non_target_jobs,
     )
     with closing(iterator):
         for directory, directory_fd in iterator:
@@ -2891,6 +3032,9 @@ def _reconcile_once(
                 except FileNotFoundError:
                     if _exact_empty_prelaunch_stub(directory_fd):
                         skipped_prelaunch_stubs.append(directory.name)
+                        non_target_jobs[directory.name] = {
+                            "origin_sha256": None, "prefixes": {},
+                        }
                         continue
                     raise
                 raw_scope = raw_metadata.get("scope")
@@ -2938,11 +3082,23 @@ def _reconcile_once(
                 # evidence from this PR/head.
                 try:
                     digests: list[str] = []
+                    sizes: list[int] = []
                     has_result = _unbound_review_result_visible(
                         directory, parent_fd=directory_fd,
                         aggregate_bytes=unbound_stdout_budget,
                         expected=expected, observed_sha256=digests,
+                        observed_size=sizes,
                     )
+                    record: dict[str, Any] = {
+                        "origin_sha256": metadata.get("origin_sha256"),
+                        "prefixes": {},
+                    }
+                    if digests and sizes:
+                        record["prefixes"]["stdout.log"] = (sizes[0], digests[0])
+                    if not has_result and isinstance(record["origin_sha256"], str):
+                        # Authenticated non-target: later progress of this
+                        # job is re-checked per job instead of blocking.
+                        non_target_jobs[directory.name] = record
                     if has_result:
                         errors.append(f"decision_review_unbound_result:{directory.name}")
                     elif binding is None and digests:
@@ -2950,13 +3106,14 @@ def _reconcile_once(
                         # the stricter prefix-bound append re-check.
                         ordinary_stdout_sha256[directory.name] = digests[0]
                         stderr_digests: list[str] = []
+                        stderr_sizes: list[int] = []
                         try:
                             has_stderr_result = _unbound_stdout_has_target_result(
                                 directory, parent_fd=directory_fd,
                                 aggregate_bytes=unbound_stdout_budget,
                                 expected=expected, allow_legacy_readable=False,
                                 observed_sha256=stderr_digests,
-                                log_name="stderr.log",
+                                log_name="stderr.log", observed_size=stderr_sizes,
                             )
                         except FileNotFoundError:
                             pass  # Historical ordinary jobs may lack stderr.
@@ -2967,6 +3124,10 @@ def _reconcile_once(
                                 )
                             elif stderr_digests:
                                 ordinary_stderr_sha256[directory.name] = stderr_digests[0]
+                                if directory.name in non_target_jobs and stderr_sizes:
+                                    non_target_jobs[directory.name]["prefixes"][
+                                        "stderr.log"
+                                    ] = (stderr_sizes[0], stderr_digests[0])
                 except (OSError, ValueError) as exc:
                     errors.append(
                         f"decision_review_unbound_evidence_invalid:"
