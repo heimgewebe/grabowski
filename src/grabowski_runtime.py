@@ -228,11 +228,22 @@ def grabowski_merge_delivery_record(
     )
 
 
+def _failure_alternative_allowed(name: str, arguments: dict[str, object]) -> bool:
+    """Do not recommend a route that the current connector cannot use."""
+    try:
+        grabowski_mcp._transport_authorize_connector_tool(mcp.get_context(), name, arguments)
+    except Exception:
+        return False
+    return True
+
+
 def main() -> None:
     grabowski_flowlines.configure_flowlines_observability(
         mcp,
         READ_ONLY,
         verified_identity_resolver=grabowski_mcp._flowlines_verified_identity,
+        failure_classifier=grabowski_friction.classify_friction_event,
+        failure_alternative_allowed=_failure_alternative_allowed,
     )
     grabowski_operator_core.main()
 

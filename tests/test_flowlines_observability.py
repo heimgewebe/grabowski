@@ -147,6 +147,171 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(unmet_array["items"].get("minLength"), 1)
         self.assertEqual(unmet_array["items"].get("maxLength"), 512)
 
+    async def test_failure_navigation_preserves_error_and_runs_without_export(self) -> None:
+        mcp = FastMCP("grabowski-test")
+
+        @mcp.tool(name="validate", annotations=READ_ONLY)
+        def validate(value: int) -> dict[str, int]:
+            return {"value": value}
+
+        classes = {"ci_contract": "contract_error", "unknown": "unknown"}
+        flowlines.configure_flowlines_observability(
+            mcp, READ_ONLY, load_environment_exporter=False,
+            failure_classifier=lambda event: classes[event["kind"]],
+        )
+        args = {"value": "not-an-int", "reason": "probe", "user_intent": "validate"}
+        result = await self.call(mcp, name="validate", arguments=args)
+        self.assertTrue(result.root.isError)
+        nav = result.root.meta["grabowski/failure_navigation"]
+        self.assertEqual(nav["failure_class"], "contract_error")
+        self.assertEqual(nav["error_code"], "input-validation-failed")
+        self.assertFalse(nav["retry_unchanged"])
+        self.assertIn("validation error", result.root.content[0].text)
+        self.assertEqual(result.root.structuredContent["failure_navigation"], nav)
+        self.assertEqual(json.loads(result.root.content[-1].text)["failure_navigation"], nav)
+
+    async def test_failure_navigation_exact_git_drift_keeps_receipt_and_narrows(self) -> None:
+        mcp = FastMCP("grabowski-test")
+        receipt = {
+            "kind": "grabowski_git_branch_mutation_receipt", "status": "reconcile_required",
+            "reason": "git-preimage-drift-before-effect", "repository": "/repo",
+            "effect_attempted": False, "retry_allowed": False, "receipt_sha256": "a" * 64,
+        }
+        observed = {"branch_mutation": receipt, "returncode": None}
+        calls = []
+        allowed = True
+
+        @mcp.tool(name="grabowski_git", annotations=ToolAnnotations(readOnlyHint=False))
+        def git(repo: str) -> dict[str, object]:
+            calls.append(repo)
+            return observed
+
+        @mcp.tool(name="grabowski_git_status", annotations=READ_ONLY)
+        def status(repo: str, include_branch_preimage: bool = False) -> dict:
+            raise AssertionError("navigation must not invoke another tool")
+
+        flowlines.configure_flowlines_observability(
+            mcp, READ_ONLY, tracer=self.tracer,
+            failure_classifier=lambda event: {"fail_closed_gate": "policy_gate"}[event["kind"]],
+            failure_alternative_allowed=lambda name, args: allowed and name == "grabowski_git_status"
+            and args == {"repo": "/repo", "include_branch_preimage": True},
+        )
+        result = await self.call(
+            mcp, name="grabowski_git",
+            arguments={"repo": "/repo", "reason": "probe", "user_intent": "inspect"},
+            meta=self.meta(),
+        )
+        self.assertFalse(result.root.isError)
+        self.assertEqual(result.root.structuredContent, observed)
+        nav = result.root.meta["grabowski/failure_navigation"]
+        self.assertEqual(nav["alternative_tool"], "grabowski_git_status")
+        self.assertEqual(nav["evidence_ref"], "sha256:" + "a" * 64)
+        self.assertFalse(nav["authority_changed"])
+        self.assertFalse(nav["retry_unchanged"])
+        self.assertEqual(calls, ["/repo"])
+        self.assertEqual(json.loads(result.root.content[-1].text)["failure_navigation"], nav)
+        # A mismatched target must not propose a broader read.
+        result = await self.call(
+            mcp, name="grabowski_git",
+            arguments={"repo": "/other", "reason": "probe", "user_intent": "inspect"},
+            meta=self.meta(),
+        )
+        self.assertIsNone(result.root.meta["grabowski/failure_navigation"]["alternative_tool"])
+        allowed = False
+        result = await self.call(
+            mcp, name="grabowski_git",
+            arguments={"repo": "/repo", "reason": "probe", "user_intent": "inspect"},
+            meta=self.meta(),
+        )
+        self.assertIsNone(result.root.meta["grabowski/failure_navigation"]["alternative_tool"])
+
+    def test_failure_navigation_reported_errors_and_role_preflight(self) -> None:
+        from mcp.types import CallToolResult, TextContent
+
+        classes = {
+            "connector_transport": "connector_transport", "platform_filter": "platform_filter",
+            "fail_closed_gate": "policy_gate", "ci_contract": "contract_error",
+            "execution_context": "environment_tooling", "unknown": "unknown",
+        }
+        cases = [
+            ("test", True, {"failure_class": "connector_transport"}, "", "connector_transport"),
+            ("test", True, {"failure_class": "platform_filter"}, "", "platform_filter"),
+            ("test", True, None, "Resource is leased: repo:example", "policy_gate"),
+            ("test", True, None, "Unknown tool: test", "contract_error"),
+            ("test", True, None, "unchanged terminal task retry blocked; read back", "policy_gate"),
+            ("test", True, None, "operation retry fields require operation_identity", "contract_error"),
+            ("test", True, None, "arbitrary text platform_filter 502", "unknown"),
+            ("grabowski_agent_workspace_collect", False, {
+                "state": "role_toolchain_preflight_failed", "preflight": {"passed": False},
+            }, "", "environment_tooling"),
+        ]
+        for tool, error, payload, message, expected in cases:
+            with self.subTest(expected=expected, tool=tool):
+                result = CallToolResult(
+                    isError=error, structuredContent=payload,
+                    content=[TextContent(type="text", text=message)],
+                )
+                decorated = flowlines._with_failure_navigation(
+                    result, tool, {}, classify=lambda event: classes[event["kind"]], manager=None
+                )
+                nav = decorated.meta["grabowski/failure_navigation"]
+                self.assertEqual(nav["failure_class"], expected)
+                self.assertFalse(nav["retry_unchanged"])
+                self.assertIsNone(nav["alternative_tool"])
+                self.assertEqual(decorated.isError, error)
+                self.assertEqual(decorated.content[0], result.content[0])
+                if payload is not None:
+                    self.assertEqual(decorated.structuredContent, payload)
+                self.assertIsNone(result.meta)
+                self.assertIs(
+                    flowlines._with_failure_navigation(
+                        decorated, tool, {}, classify=lambda event: classes[event["kind"]], manager=None
+                    ),
+                    decorated,
+                )
+        target_failure = {
+            "status": "failed", "receipt_sha256": "b" * 64,
+            "output": {"state": "target_failed", "consumption_receipt_sha256": "c" * 64},
+        }
+        result = CallToolResult(isError=False, content=[], structuredContent=target_failure)
+        decorated = flowlines._with_failure_navigation(
+            result, "grip_run", {"name": "transport-roundtrip"},
+            classify=lambda event: classes[event["kind"]], manager=None,
+        )
+        nav = decorated.meta["grabowski/failure_navigation"]
+        self.assertEqual(nav["error_code"], "transport-target-outcome-uncertain")
+        self.assertEqual(nav["failure_class"], "unknown")
+        self.assertFalse(nav["retry_unchanged"])
+        self.assertEqual(decorated.structuredContent, target_failure)
+        success = CallToolResult(isError=False, content=[], structuredContent={"value": 42})
+        self.assertIs(
+            flowlines._with_failure_navigation(
+                success, "test", {}, classify=lambda event: classes[event["kind"]], manager=None
+            ), success,
+        )
+
+    def test_failure_navigation_diagnostic_failure_preserves_original(self) -> None:
+        from mcp.types import CallToolResult, TextContent
+
+        original = CallToolResult(isError=True, content=[TextContent(type="text", text="error")])
+        with mock.patch.object(flowlines, "_failure_navigation", side_effect=ValueError("secret")):
+            with self.assertLogs(flowlines.LOGGER, level="WARNING") as logs:
+                actual = flowlines._with_failure_navigation(
+                    original, "test", {}, classify=lambda event: "unknown", manager=None
+                )
+        self.assertIs(actual, original)
+        self.assertNotIn("secret", "\n".join(logs.output))
+        with (
+            mock.patch.object(flowlines, "_failure_navigation", side_effect=ValueError("bad classifier")),
+            mock.patch.object(flowlines.LOGGER, "warning", side_effect=RuntimeError("bad logger")),
+        ):
+            self.assertIs(
+                flowlines._with_failure_navigation(
+                    original, "test", {}, classify=lambda event: "unknown", manager=None
+                ),
+                original,
+            )
+
     async def test_success_span_contains_canonical_contract_and_strips_analytics_args(self) -> None:
         mcp = self.server()
         result = await self.call(
