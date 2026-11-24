@@ -23049,12 +23049,13 @@ class WorktreeHygieneReconcileTests(unittest.TestCase):
                  "binding_drift", "unsafe_plan", "opened", "updated", "successor",
                  "followup", "unknown", "no_change", "deployed", "merged_opened",
                  "source_false", "source_absent", "merged_source_false", "owned_opened",
-                 "cleanup_opened", "merged_mismatch", "merged_ambiguous", "github_unavailable")
+                 "cleanup_opened", "merged_mismatch", "merged_ambiguous", "github_unavailable",
+                 "other_source", "live_retention", "owned_legacy_archive")
         for case in cases:
             with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
                 path = str(Path(tmp) / "worktree")
                 owner = "lane:" + "b" * 32
-                state = "cleanup_candidate" if case in {"cleanup", "cleanup_error", "unsafe_plan", "cleanup_opened"} else "completed_retained"
+                state = "cleanup_candidate" if case in {"cleanup", "cleanup_error", "unsafe_plan", "cleanup_opened", "owned_legacy_archive"} else "completed_retained"
                 item = self._owned_item(path, state=state)
                 item["checkout_key"] = "checkout-key"
                 binding = {
@@ -23085,7 +23086,15 @@ class WorktreeHygieneReconcileTests(unittest.TestCase):
                     original["automatic_cleanup_authorized"] = False
                 if case == "source_absent":
                     original.pop("automatic_cleanup_authorized")
-                if case == "owned_opened":
+                if case == "other_source":
+                    binding["source"] = {"kind": "bureau_task", "id": "retained-source"}
+                if case == "live_retention":
+                    item["lifecycle"]["retention"] = {
+                        "owner_id": owner, "retention_until_unix": int(time.time()) + 3600,
+                    }
+                if case == "owned_legacy_archive":
+                    item["lifecycle"]["binding"] = None
+                if case in {"owned_opened", "owned_legacy_archive"}:
                     params_owner = owner
                 else:
                     params_owner = self.OWNER
@@ -23148,14 +23157,15 @@ class WorktreeHygieneReconcileTests(unittest.TestCase):
                     self.assertEqual(owner, archive.call_args.kwargs["owner_id"])
                     self.assertEqual(physical, archive.call_args.kwargs["expected_physical_identity"])
                     cleanup.assert_not_called()
-                elif case == "cleanup":
+                elif case in {"cleanup", "owned_legacy_archive"}:
                     self.assertEqual("passed", status)
                     self.assertEqual(2, cleanup.call_count)
                     for call in cleanup.call_args_list:
                         self.assertEqual(owner, call.kwargs["owner_id"])
                     self.assertEqual("f" * 64, cleanup.call_args.kwargs["expected_plan_sha256"])
-                    self.assertEqual(physical, cleanup.call_args_list[0].kwargs["expected_physical_identity"])
-                    self.assertEqual(physical, cleanup.call_args_list[1].kwargs["expected_physical_identity"])
+                    if case == "cleanup":
+                        self.assertEqual(physical, cleanup.call_args_list[0].kwargs["expected_physical_identity"])
+                        self.assertEqual(physical, cleanup.call_args_list[1].kwargs["expected_physical_identity"])
                     archive.assert_not_called()
                 elif case in {"archive_error", "cleanup_error"}:
                     self.assertEqual("failed", status)
@@ -23167,11 +23177,14 @@ class WorktreeHygieneReconcileTests(unittest.TestCase):
                 else:
                     archive.assert_not_called()
                     cleanup.assert_not_called()
-                    if case in {"head_drift", "branch_drift", "source_error", "physical_drift", "receipt_drift", "binding_drift", "opened", "updated", "successor", "followup",
-                                "unknown", "source_false", "source_absent", "merged_source_false", "owned_opened",
-                                "cleanup_opened", "merged_mismatch", "merged_ambiguous", "github_unavailable"}:
+                    if case in {"head_drift", "branch_drift", "source_error", "physical_drift", "receipt_drift", "binding_drift",
+                                "unknown", "merged_ambiguous", "github_unavailable"}:
                         self.assertEqual("blocked", status)
                         self.assertTrue(result["output"]["errors"])
+                    if case in {"source_false", "source_absent", "merged_source_false", "other_source", "live_retention",
+                                "opened", "updated", "successor", "followup", "owned_opened", "cleanup_opened", "merged_mismatch"}:
+                        self.assertEqual("passed", status)
+                        self.assertFalse(result["output"]["errors"])
 
     def test_exact_merged_pr_archives_owned_clean_checkout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
