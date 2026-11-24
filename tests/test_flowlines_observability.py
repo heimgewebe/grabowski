@@ -202,8 +202,11 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
             meta=self.meta(),
         )
         self.assertFalse(result.root.isError)
-        self.assertEqual(result.root.structuredContent, observed)
         nav = result.root.meta["grabowski/failure_navigation"]
+        self.assertEqual(result.root.structuredContent, {**observed, "failure_navigation": nav})
+        self.assertEqual(result.root.structuredContent["branch_mutation"], receipt)
+        self.assertNotIn("failure_navigation", observed)
+        self.assertEqual(json.loads(result.root.content[0].text), observed)
         self.assertEqual(nav["alternative_tool"], "grabowski_git_status")
         self.assertEqual(nav["evidence_ref"], "sha256:" + "a" * 64)
         self.assertFalse(nav["authority_changed"])
@@ -224,6 +227,70 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
             meta=self.meta(),
         )
         self.assertIsNone(result.root.meta["grabowski/failure_navigation"]["alternative_tool"])
+        self.assertIsNone(result.root.structuredContent["failure_navigation"]["alternative_tool"])
+
+    def test_failure_navigation_typed_git_result_does_not_overwrite_existing_field(self) -> None:
+        from mcp.types import CallToolResult, TextContent
+
+        payload = {
+            "branch_mutation": {
+                "kind": "grabowski_git_branch_mutation_receipt",
+                "status": "reconcile_required",
+                "reason": "git-preimage-drift-before-effect",
+                "repository": "/repo",
+                "effect_attempted": False,
+                "retry_allowed": False,
+                "receipt_sha256": "a" * 64,
+            },
+            "failure_navigation": {"existing": True},
+        }
+        result = CallToolResult(
+            isError=False, structuredContent=payload,
+            content=[TextContent(type="text", text=json.dumps(payload))],
+        )
+        decorated = flowlines._with_failure_navigation(
+            result, "grabowski_git", {"repo": "/repo"},
+            classify=lambda event: "policy_gate", manager=None,
+        )
+        self.assertEqual(decorated.structuredContent, payload)
+        self.assertEqual(decorated.content[0], result.content[0])
+        self.assertEqual(decorated.meta["grabowski/failure_navigation"]["error_code"], "stale-git-identity")
+
+    def test_failure_navigation_real_policy_and_missing_git_target(self) -> None:
+        from mcp.types import CallToolResult, TextContent
+
+        cases = [
+            (
+                "no_such_grabowski_tool_t041", {},
+                "MCP call rejected because the tool does not declare an explicit readOnlyHint annotation",
+                "fail_closed_gate", "tool-readonly-annotation-required",
+            ),
+            (
+                "grabowski_git_status", {"repo": "/missing"},
+                "Error executing tool grabowski_git_status: [Errno 2] No such file or directory: '/missing'",
+                "user_input", "git-read-target-unavailable",
+            ),
+            (
+                "grabowski_git_status", {"repo": "/repo"},
+                "Error executing tool grabowski_git_status: [Errno 2] No such file or directory: '/other'",
+                "unknown", "mcp-tool-error",
+            ),
+        ]
+        for tool, args, message, kind, code in cases:
+            with self.subTest(code=code):
+                result = CallToolResult(
+                    isError=True, content=[TextContent(type="text", text=message)]
+                )
+                decorated = flowlines._with_failure_navigation(
+                    result, tool, args, classify=lambda event: event["kind"], manager=None
+                )
+                nav = decorated.structuredContent["failure_navigation"]
+                self.assertEqual(nav["failure_class"], kind)
+                self.assertEqual(nav["error_code"], code)
+                self.assertIsNone(nav["alternative_tool"])
+                self.assertFalse(nav["authority_changed"])
+                self.assertFalse(nav["retry_unchanged"])
+                self.assertEqual(decorated.content[0], result.content[0])
 
     def test_failure_navigation_reported_errors_and_role_preflight(self) -> None:
         from mcp.types import CallToolResult, TextContent
