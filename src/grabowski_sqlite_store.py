@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import fcntl
 import hashlib
 import os
@@ -366,27 +366,44 @@ def inventory_coherent_readonly_sqlite(
     """
     wal = Path(str(path) + "-wal")
     shm = Path(str(path) + "-shm")
-    if (wal.exists() or wal.is_symlink()) and (shm.exists() or shm.is_symlink()):
-        if wal_mutation_admission is None:
-            raise PermissionError(
-                "Native SQLite WAL observation requires mutation admission "
-                "before SHM read-mark writes"
-            )
-        wal_mutation_admission()
-        with inventory_native_wal_readonly_sqlite(
-            path, error_type=error_type, message=message,
-        ) as connection:
+    # The last SQLite connection may checkpoint and remove both sidecars
+    # between selection and entry. Re-select once before exposing any snapshot.
+    # Never retry a failure after the caller has observed rows.
+    for attempt in range(2):
+        with ExitStack() as stack:
+            try:
+                if (wal.exists() or wal.is_symlink()) and (shm.exists() or shm.is_symlink()):
+                    if wal_mutation_admission is None:
+                        raise PermissionError(
+                            "Native SQLite WAL observation requires mutation admission "
+                            "before SHM read-mark writes"
+                        )
+                    wal_mutation_admission()
+                    connection = stack.enter_context(inventory_native_wal_readonly_sqlite(
+                        path, error_type=error_type, message=message,
+                    ))
+                else:
+                    connection = stack.enter_context(inventory_readonly_sqlite(
+                        path,
+                        temporary_prefix=temporary_prefix,
+                        error_type=error_type,
+                        message=message,
+                        allow_wal_copy=False,
+                        allow_checkpointed_empty_wal=allow_checkpointed_empty_wal,
+                    ))
+            except error_type as exc:
+                cause = exc.__cause__
+                if (
+                    attempt == 0
+                    and isinstance(cause, FileNotFoundError)
+                    and cause.filename is not None
+                    and Path(cause.filename).absolute() in (wal.absolute(), shm.absolute())
+                    and not (wal.exists() or wal.is_symlink() or shm.exists() or shm.is_symlink())
+                ):
+                    continue
+                raise
             yield connection
-    else:
-        with inventory_readonly_sqlite(
-            path,
-            temporary_prefix=temporary_prefix,
-            error_type=error_type,
-            message=message,
-            allow_wal_copy=False,
-            allow_checkpointed_empty_wal=allow_checkpointed_empty_wal,
-        ) as connection:
-            yield connection
+            return
 
 
 def sqlite_integrity(

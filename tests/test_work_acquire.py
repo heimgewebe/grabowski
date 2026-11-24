@@ -805,6 +805,44 @@ class WorkAcquireTests(unittest.TestCase):
                     )
                 common_reader.assert_called_once()
 
+    def test_native_owner_inventory_survives_wal_checkpoint_before_open(self) -> None:
+        # SQLite normally deletes both sidecars when the last connection closes.
+        # Reproduce the gap between selecting the WAL reader and opening it.
+        owner = "lane:" + "d" * 32
+        database = self.state / "native-checkpoint-before-open.sqlite3"
+        key = "component:wal-checkpoint"
+        with patch.object(work_acquire.resources, "RESOURCE_DB", database):
+            original = work_acquire.resources.acquire_resources(
+                owner, [key], purpose="checkpoint race", ttl_seconds=3600,
+            )["leases"][0]
+            keeper = sqlite3.connect(database)
+            self.addCleanup(keeper.close)
+            keeper.execute("PRAGMA journal_mode=WAL")
+            keeper.execute("SELECT count(*) FROM leases").fetchall()
+            wal = Path(str(database) + "-wal")
+            shm = Path(str(database) + "-shm")
+            self.assertTrue(wal.exists())
+            self.assertTrue(shm.exists())
+            store = work_acquire.resources.sqlite_store
+            native_reader = store.inventory_native_wal_readonly_sqlite
+
+            @contextmanager
+            def checkpoint_before_open(*args, **kwargs):
+                keeper.close()
+                self.assertFalse(wal.exists())
+                self.assertFalse(shm.exists())
+                with native_reader(*args, **kwargs) as connection:
+                    yield connection
+
+            with patch.object(store, "inventory_native_wal_readonly_sqlite",
+                              side_effect=checkpoint_before_open) as selected:
+                work_acquire._verify_multibatch_live_lease_generations(
+                    owner_id=owner, required_keys=[key],
+                    acquisitions=[{"receipt": {"leases": [original]}}],
+                    inventory_fn=work_acquire.resources.list_resources,
+                )
+            selected.assert_called_once()
+
     def test_native_owner_inventory_detects_interleaved_wal_generation_change(self) -> None:
         # SQLite PRAGMA data_version is pinned during BEGIN. A change by
         # another connection becomes visible only AFTER COMMIT ends the reader
