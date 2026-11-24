@@ -576,6 +576,17 @@ def _failure_navigation(
             if message == f"Unknown tool: {tool_name}":
                 kind, code = "ci_contract", "unknown-tool"
                 action = "Inspect the current tool catalog and select an existing supported tool."
+            elif message == "MCP call rejected because the tool does not declare an explicit readOnlyHint annotation":
+                kind, code = "fail_closed_gate", "tool-readonly-annotation-required"
+                action = "Inspect the current tool catalog and use an explicitly permitted read-only tool."
+            elif (
+                tool_name == "grabowski_git_status"
+                and isinstance(arguments.get("repo"), str)
+                and arguments["repo"].startswith("/")
+                and message == f"[Errno 2] No such file or directory: {arguments['repo']!r}"
+            ):
+                kind, code = "user_input", "git-read-target-unavailable"
+                action = "Verify the exact repository path and its availability before another call."
             elif (
                 message.startswith("Input validation error:")
                 or re.match(r"^\d+ validation errors? for [^\n]+\n", message)
@@ -648,6 +659,18 @@ def _with_failure_navigation(
         }
         if root.isError and root.structuredContent is None:
             updates["structuredContent"] = block
+        elif (
+            tool_name == "grabowski_git"
+            and navigation["error_code"] in (
+                "stale-git-identity", "git-reconciliation-required",
+            )
+            and isinstance(root.structuredContent, dict)
+            and "failure_navigation" not in root.structuredContent
+        ):
+            # Some typed connectors retain only structuredContent for normal
+            # tool results. Extend the outer command result, not its nested
+            # digest-bound branch_mutation receipt or original text.
+            updates["structuredContent"] = {**root.structuredContent, **block}
         decorated = root.model_copy(update=updates)
         return result.model_copy(update={"root": decorated}) if root is not result else decorated
     except Exception:
