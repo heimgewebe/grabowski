@@ -6018,7 +6018,10 @@ def _run_worktree_hygiene_reconcile(
             continue
         if observed_owner is not None:
             foreign_owned_count += 1
-    candidates.sort(key=lambda item: str(item.get("path")))
+    candidates.sort(key=lambda item: (
+        0 if include_terminal_owners and item.get("lifecycle_state") == "cleanup_candidate" else 1,
+        str(item.get("path")),
+    ))
 
     archived: list[dict[str, Any]] = []
     cleanup_plans: list[dict[str, Any]] = []
@@ -6063,9 +6066,27 @@ def _run_worktree_hygiene_reconcile(
                 skipped.append({"path": path, "reason": "active_coordination", "state": state})
                 continue
 
-            if include_terminal_owners and state in {"completed_retained", "cleanup_candidate"}:
+            binding = lifecycle.get("binding")
+            source = binding.get("source") if isinstance(binding, dict) else None
+            is_work_lane = isinstance(source, dict) and source.get("kind") == "work_lane"
+            terminal_owner_scope = include_terminal_owners and state in {
+                "completed_retained", "cleanup_candidate"
+            } and (owner_mode == "bound_terminal" or is_work_lane)
+            if include_terminal_owners and state == "completed_retained" and not is_work_lane:
+                skipped.append({"path": path, "reason": "unsupported_terminal_owner_source", "state": state})
+                continue
+            if terminal_owner_scope:
+                if not is_work_lane:
+                    skipped.append({"path": path, "reason": "unsupported_terminal_owner_source", "state": state})
+                    continue
+                # Explicit live retention wins; do not spend source/PR probes on
+                # work that is not yet eligible for retirement.
+                retention = lifecycle.get("retention")
+                until = retention.get("retention_until_unix") if isinstance(retention, dict) else None
+                if owner_mode == "bound_terminal" and isinstance(until, int) and until > now:
+                    skipped.append({"path": path, "reason": "active_retention_not_elapsed", "state": state})
+                    continue
                 try:
-                    binding = lifecycle.get("binding")
                     if not isinstance(binding, dict) or (
                         binding.get("owner_id") != candidate_owner
                         or binding.get("expected_head") != head
@@ -6083,15 +6104,21 @@ def _run_worktree_hygiene_reconcile(
 
                     if item.get("coordination", {}).get("blocking") is not False:
                         raise RuntimeError("coordination state unavailable")
-                    source_terminal = terminal_sources.source_terminal_evidence(binding)
-                    source = binding.get("source", {})
-                    if source.get("kind") != "work_lane":
-                        raise RuntimeError("original physical receipt unavailable for source")
-                    lane = work_acquire._read_state(work_acquire._state_root() / f"{source['id']}.json")
-                    if (not isinstance(lane, dict) or lane.get("lane_id") != source["id"]
-                            or lane.get("receipt_sha256") != source_terminal.get("lane_receipt_sha256")):
-                        raise RuntimeError("terminal source receipt changed")
+                    source_id = source.get("id")
+                    if not isinstance(source_id, str) or re.fullmatch(r"[0-9a-f]{32}", source_id) is None:
+                        raise RuntimeError("invalid terminal work lane source")
+                    lane = work_acquire._read_state(work_acquire._state_root() / f"{source_id}.json")
+                    if not isinstance(lane, dict) or lane.get("lane_id") != source_id:
+                        raise RuntimeError("terminal source receipt missing or mismatched")
                     original = lane.get("worktree_receipt", {}).get("lifecycle", {})
+                    # Historical false/missing opt-ins and explicit keep decisions
+                    # are normal exclusions, not a broken periodic operation.
+                    if not isinstance(original, dict) or original.get("automatic_cleanup_authorized") is not True:
+                        skipped.append({"path": path, "reason": "source_automatic_cleanup_not_authorized", "state": state})
+                        continue
+                    source_terminal = terminal_sources.source_terminal_evidence(binding)
+                    if lane.get("receipt_sha256") != source_terminal.get("lane_receipt_sha256"):
+                        raise RuntimeError("terminal source receipt changed")
                     physical = original.get("physical_checkout")
                     if (
                         original.get("owner_id") != candidate_owner
@@ -6106,12 +6133,12 @@ def _run_worktree_hygiene_reconcile(
                     # Operator opt-in never overrides the original source permission.
                     # A signed closeout alone can still describe ongoing PR work.
                     reason = None
+                    normal_skip = False
                     terminal_state = source_terminal.get("terminal_state")
-                    if original.get("automatic_cleanup_authorized") is not True:
-                        reason = "source_automatic_cleanup_not_authorized"
-                    elif terminal_state in {"pr_opened", "pr_updated"}:
+                    if terminal_state in {"pr_opened", "pr_updated"}:
                         if candidate_pr_queries >= WORKTREE_HYGIENE_MAX_CANDIDATES:
                             reason = "github_query_bound_reached"
+                            normal_skip = True
                         else:
                             if default_branch is None and default_branch_error is None:
                                 default_evidence = _lookup_default_branch(repo, github_runner)
@@ -6131,13 +6158,16 @@ def _run_worktree_hygiene_reconcile(
                                 candidate_pr_queries += 1
                                 if merged.get("status") != "exact_merged":
                                     reason = "terminal_owner_exact_merge_not_proven"
+                                    normal_skip = merged.get("status") == "not_terminal"
                                 else:
                                     source_terminal = {**source_terminal, "merged_pr": merged}
                     elif terminal_state not in {"pr_merged", "deployed", "no_change_proven"}:
                         reason = "terminal_owner_work_not_final"
+                        normal_skip = terminal_state in {"successor_handoff", "blocked_with_durable_followup"}
                     if reason is not None:
                         skipped.append({"path": path, "reason": reason, "state": state})
-                        errors.append({"path": path, "error": reason})
+                        if not normal_skip:
+                            errors.append({"path": path, "error": reason})
                         continue
                 except (ValueError, RuntimeError, PermissionError, OSError) as exc:
                     errors.append({"path": path, "error": str(exc)})
