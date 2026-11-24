@@ -29,6 +29,18 @@ Both `repo:<repo>` and `path:<target>` leases must be live and owned by the decl
 
 Every terminal result is written atomically to an owner-only durable receipt. Receipt and lock files are bounded regular files opened without symlink following. The receipt carries an integrity digest, normalized-input digest, lease observation, lifecycle source/artifact/limit evidence, bounded command outcome and exact post-state.
 
+## Prospective automatic retirement
+
+A successfully created ordinary \`implementation-worktree\` with the exact
+Work Lane source, owner and work-acquire idempotency identity may carry
+\`automatic_cleanup_authorized: true\`. The initial terminal decision remains
+\`retain\`: the periodic hygiene Grip still requires actual terminality,
+expired retention, clean and unchanged checkout identity, absence of active
+coordination, and a durable archive before removal. Use a different artifact
+class (for example \`retained-worktree\`) to opt out. Historical and recovered
+receipts are not retroactively authorized. See
+[terminal owner hygiene](worktree-hygiene-terminal-owners.md).
+
 ## Interruption recovery
 
 The intent receipt is durable before `git worktree add`. Repeating the same key serializes on the receipt lock and reads the actual Git state before deciding. If the exact state already exists, replay finalizes `CREATED` without a second mutation, even when the initiating lease has since expired; that exception is read-only and is recorded explicitly. If the state is absent, replay still requires live owner-bound leases before retrying. Conflicts fail closed and are never cleaned automatically.
