@@ -301,6 +301,16 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
                 )
         self.assertIs(actual, original)
         self.assertNotIn("secret", "\n".join(logs.output))
+        with (
+            mock.patch.object(flowlines, "_failure_navigation", side_effect=ValueError("bad classifier")),
+            mock.patch.object(flowlines.LOGGER, "warning", side_effect=RuntimeError("bad logger")),
+        ):
+            self.assertIs(
+                flowlines._with_failure_navigation(
+                    original, "test", {}, classify=lambda event: "unknown", manager=None
+                ),
+                original,
+            )
 
     async def test_success_span_contains_canonical_contract_and_strips_analytics_args(self) -> None:
         mcp = self.server()

@@ -653,7 +653,10 @@ def _with_failure_navigation(
     except Exception:
         # Navigation is advice only. A diagnostic bug must never hide an
         # already completed domain result or cause a second invocation.
-        LOGGER.warning("Grabowski failure navigation unavailable", exc_info=False)
+        try:
+            LOGGER.warning("Grabowski failure navigation unavailable", exc_info=False)
+        except Exception:
+            pass
         return result
 
 
