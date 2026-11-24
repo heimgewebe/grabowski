@@ -455,6 +455,208 @@ def _result_is_error(root: Any) -> bool:
     return bool(getattr(root, "isError", False))
 
 
+def _failure_navigation(
+    tool_name: str,
+    arguments: Mapping[str, Any],
+    result: Any,
+    *,
+    classify: Callable[[dict[str, Any]], str],
+    manager: Any,
+    alternative_allowed: Callable[[str, dict[str, Any]], bool] | None = None,
+) -> dict[str, Any] | None:
+    """Add advice to explicit failure results, never an execution or retry grant.
+
+    Domain receipts remain immutable. The MCP error message is only used for
+    a handful of stable server/SDK forms; arbitrary output is not interpreted
+    as a policy, transport, or platform diagnosis.
+    """
+    root = _result_root(result)
+    payload = getattr(root, "structuredContent", None)
+    payload = payload if isinstance(payload, dict) else {}
+    kind = "unknown"
+    code = "mcp-tool-error"
+    action = "Read the original error and current target state before another call."
+    alternative = None
+    evidence_ref = None
+
+    receipt = payload.get("branch_mutation")
+    if (
+        tool_name == "grabowski_git"
+        and isinstance(receipt, dict)
+        and receipt.get("kind") == "grabowski_git_branch_mutation_receipt"
+        and receipt.get("status") == "reconcile_required"
+        and receipt.get("effect_attempted") is False
+        and receipt.get("retry_allowed") is False
+    ):
+        reason = receipt.get("reason")
+        kind = "fail_closed_gate"
+        code = "git-reconciliation-required"
+        action = "Read the exact branch attempt and reconcile its current ownership and Git state."
+        if reason in (
+            "branch-drift-before-effect",
+            "git-preimage-drift-before-effect",
+            "git-preimage-drift-after-attempt-lease",
+        ):
+            code = "stale-git-identity"
+            action = "Read the same repository's current branch and preimage, then replan."
+            target = receipt.get("repository")
+            supplied = arguments.get("repo")
+            read_tool = manager.get_tool("grabowski_git_status") if manager is not None else None
+            if (
+                isinstance(target, str)
+                and target.startswith("/")
+                and target == supplied
+                and getattr(getattr(read_tool, "annotations", None), "readOnlyHint", None) is True
+                and alternative_allowed is not None
+                and alternative_allowed(
+                    "grabowski_git_status", {"repo": supplied, "include_branch_preimage": True}
+                )
+            ):
+                alternative = "grabowski_git_status"
+                action = (
+                    "Read the same repo using grabowski_git_status with "
+                    "include_branch_preimage=true; compare the original attempt before replanning."
+                )
+        digest = receipt.get("receipt_sha256")
+        if isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest):
+            evidence_ref = "sha256:" + digest
+    elif (
+        tool_name.startswith("grabowski_agent_workspace_")
+        and payload.get("state") in (
+            "role_toolchain_preflight_failed",
+            "role_toolchain_preflight_cached_failure",
+            "writer_toolchain_preflight_failed",
+        )
+        and isinstance(payload.get("preflight"), dict)
+        and payload["preflight"].get("passed") is False
+    ):
+        kind = "execution_context"
+        code = "role-toolchain-preflight-failed"
+        action = "Inspect the existing role preflight result and repair its toolchain before retrying."
+    elif (
+        tool_name == "grip_run"
+        and arguments.get("name") == "transport-roundtrip"
+        and payload.get("status") == "failed"
+        and isinstance(payload.get("output"), dict)
+        and payload["output"].get("state") == "target_failed"
+        and isinstance(payload["output"].get("consumption_receipt_sha256"), str)
+        and re.fullmatch(r"[0-9a-f]{64}", payload["output"]["consumption_receipt_sha256"])
+    ):
+        # A consumed capability does not prove the application effect, nor
+        # that the target failure was caused by the connector.
+        code = "transport-target-outcome-uncertain"
+        action = "Read back the exact target effect; do not repeat the consumed mutation."
+        digest = payload.get("receipt_sha256")
+        if isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest):
+            evidence_ref = "sha256:" + digest
+    elif not _result_is_error(root):
+        return None
+    else:
+        # These are error results, not normal command output. Prefer known
+        # explicit classifications over prose, and never echo arguments.
+        reported = payload.get("failure_class")
+        if reported in ("connector_transport", "platform_filter"):
+            kind = reported
+            code = reported.replace("_", "-")
+            action = (
+                "Check whether the original effect happened; do not repeat an ambiguous mutation."
+                if reported == "connector_transport"
+                else "Use an already permitted narrower surface or stop; do not retry unchanged."
+            )
+        else:
+            message = ""
+            content = getattr(root, "content", ())
+            if content:
+                candidate = getattr(content[0], "text", None)
+                if isinstance(candidate, str):
+                    message = candidate[:4096]
+            prefix = f"Error executing tool {tool_name}: "
+            if message.startswith(prefix):
+                message = message[len(prefix):]
+            if message == f"Unknown tool: {tool_name}":
+                kind, code = "ci_contract", "unknown-tool"
+                action = "Inspect the current tool catalog and select an existing supported tool."
+            elif (
+                message.startswith("Input validation error:")
+                or re.match(r"^\d+ validation errors? for [^\n]+\n", message)
+                or message == "Flowlines requires non-empty reason and user_intent"
+            ):
+                kind, code = "ci_contract", "input-validation-failed"
+                action = "Correct the arguments against the current tool schema."
+            elif message.startswith(("Resource is leased: ", "Resource is durably fenced by uncertain user-systemd state: ")):
+                kind, code = "fail_closed_gate", "resource-conflict"
+                action = "Inspect the exact blocking resource and its owner before continuing."
+            elif message.startswith("unchanged terminal task retry blocked;"):
+                kind, code = "fail_closed_gate", "unchanged-terminal-task-retry-blocked"
+                action = "Bind the retry to the changed source or state and the previous terminal receipt; do not repeat unchanged."
+            elif message == "operation retry fields require operation_identity":
+                kind, code = "ci_contract", "operation-identity-required"
+                action = "Supply the documented operation identity with retry evidence or choose a new bounded operation."
+            elif message == "claim-intent-no-eligible-task":
+                kind, code = "fail_closed_gate", "claim-intent-no-eligible-task"
+                action = "Read the task's current eligibility and rejection details; do not repeat the claim."
+            elif message.startswith("Output validation error:"):
+                kind, code = "ci_contract", "output-validation-failed"
+                action = "Read back the target effect before addressing the output contract."
+    return {
+        "schema_version": 1,
+        "kind": "grabowski_failure_navigation",
+        "failure_class": classify({"kind": kind}),
+        "error_code": code,
+        "retry_unchanged": False,
+        "next_action": action,
+        "alternative_tool": alternative,
+        "authority_changed": False,
+        "evidence_ref": evidence_ref,
+    }
+
+
+def _with_failure_navigation(
+    result: Any,
+    tool_name: str,
+    arguments: Mapping[str, Any],
+    *,
+    classify: Callable[[dict[str, Any]], str],
+    manager: Any,
+    alternative_allowed: Callable[[str, dict[str, Any]], bool] | None = None,
+) -> Any:
+    """Decorate only the final MCP response, outside every effect/receipt gate."""
+    try:
+        from mcp.types import CallToolResult, TextContent
+
+        root = _result_root(result)
+        if not isinstance(root, CallToolResult):
+            return result
+        meta = dict(root.meta or {})
+        key = "grabowski/failure_navigation"
+        if key in meta:
+            return result
+        navigation = _failure_navigation(
+            tool_name, arguments, result, classify=classify, manager=manager,
+            alternative_allowed=alternative_allowed,
+        )
+        if navigation is None:
+            return result
+        meta[key] = navigation
+        block = {"failure_navigation": navigation}
+        updates = {
+            "meta": meta,
+            "content": [
+                *root.content,
+                TextContent(type="text", text=_canonical_json(block)),
+            ],
+        }
+        if root.isError and root.structuredContent is None:
+            updates["structuredContent"] = block
+        decorated = root.model_copy(update=updates)
+        return result.model_copy(update={"root": decorated}) if root is not result else decorated
+    except Exception:
+        # Navigation is advice only. A diagnostic bug must never hide an
+        # already completed domain result or cause a second invocation.
+        LOGGER.warning("Grabowski failure navigation unavailable", exc_info=False)
+        return result
+
+
 def _safe_result_json(root: Any, *, tool_name: str) -> str | None:
     if _result_is_error(root):
         return _canonical_json({"isError": True, "content": [{"type": "text", "text": "tool_error"}]})
@@ -818,6 +1020,8 @@ def _install_lowlevel_handler(
     tracer: Any | None,
     *,
     verified_identity_resolver: Callable[[Any], Mapping[str, Any] | None] | None,
+    failure_classifier: Callable[[dict[str, Any]], str] | None,
+    failure_alternative_allowed: Callable[[str, dict[str, Any]], bool] | None,
 ) -> None:
     try:
         from mcp.types import CallToolRequest
@@ -847,7 +1051,7 @@ def _install_lowlevel_handler(
             # A broken diagnostic sink must not affect the actual MCP call.
             pass
 
-    async def flowlines_call_tool_handler(req: Any) -> Any:
+    async def traced_call_tool_handler(req: Any) -> Any:
         arguments = getattr(getattr(req, "params", None), "arguments", None) or {}
         tool_name = getattr(getattr(req, "params", None), "name", None)
         if not isinstance(tool_name, str) or not isinstance(arguments, dict):
@@ -950,6 +1154,19 @@ def _install_lowlevel_handler(
             LOGGER.warning("Flowlines telemetry span close failed open", exc_info=False)
         return result
 
+    async def flowlines_call_tool_handler(req: Any) -> Any:
+        result = await traced_call_tool_handler(req)
+        params = getattr(req, "params", None)
+        name = getattr(params, "name", None)
+        arguments = getattr(params, "arguments", None) or {}
+        if failure_classifier is None or not isinstance(name, str) or not isinstance(arguments, dict):
+            return result
+        return _with_failure_navigation(
+            result, name, arguments, classify=failure_classifier,
+            manager=getattr(mcp, "_tool_manager", None),
+            alternative_allowed=failure_alternative_allowed,
+        )
+
     setattr(flowlines_call_tool_handler, _HANDLER_MARKER, True)
     handlers[CallToolRequest] = flowlines_call_tool_handler
 
@@ -962,6 +1179,8 @@ def configure_flowlines_observability(
     provider: Any | None = None,
     verified_identity_resolver: Callable[[Any], Mapping[str, Any] | None] | None = None,
     load_environment_exporter: bool = True,
+    failure_classifier: Callable[[dict[str, Any]], str] | None = None,
+    failure_alternative_allowed: Callable[[str, dict[str, Any]], bool] | None = None,
 ) -> dict[str, Any]:
     if not isinstance(load_environment_exporter, bool):
         raise ValueError("load_environment_exporter must be a boolean")
@@ -983,6 +1202,8 @@ def configure_flowlines_observability(
         mcp,
         tracer,
         verified_identity_resolver=verified_identity_resolver,
+        failure_classifier=failure_classifier,
+        failure_alternative_allowed=failure_alternative_allowed,
     )
     if provider is not None:
         atexit.register(_bounded_flush, provider)
