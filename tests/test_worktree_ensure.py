@@ -767,6 +767,117 @@ class WorktreeEnsureTests(unittest.TestCase):
         stored = checkouts._retention_records([lifecycle["checkout_key"]])
         self.assertEqual(stored[lifecycle["checkout_key"]]["owner_id"], self.owner)
 
+    def test_new_regular_work_lane_has_prospective_cleanup_authority(self) -> None:
+        for n, artifact_class, expected in (
+            ("a", "implementation-worktree", True),
+            ("b", "retained-worktree", False),
+        ):
+            with self.subTest(artifact_class=artifact_class):
+                lane_id = n * 32
+                self.owner = f"lane:{lane_id}"
+                parameters = self._parameters(
+                    key=f"work-acquire:{lane_id}", branch=f"feat/lane-{n}",
+                    target=self.worktree_root / n,
+                )
+                parameters.update(
+                    source_kind="work_lane", source_id=lane_id,
+                    artifact_class=artifact_class,
+                )
+                with patch.dict(os.environ, {"GROSSER_ADLER_STATE_ROOT": str(self.root / "adler")}):
+                    created = self._ensure(parameters)
+                    replay = self._ensure(parameters)
+                self.assertEqual("CREATED", created["result_state"])
+                self.assertIs(created["lifecycle"]["automatic_cleanup_authorized"], expected)
+                self.assertEqual("retain", created["lifecycle"]["terminal_decision"])
+                self.assertTrue(replay["replayed"])
+                self.assertIs(replay["lifecycle"]["automatic_cleanup_authorized"], expected)
+                self.assertEqual(created["durable_receipt_sha256"], replay["durable_receipt_sha256"])
+                self.assertTrue(replay["lifecycle_integrity"]["bound_to_durable_receipt"])
+
+    def test_regular_lane_native_hygiene_archives_then_removes_and_keeps_refs(self) -> None:
+        import grabowski_work_acquire as work_acquire
+        import grabowski_lane_closeout as closeout
+
+        target = self.worktree_root / "native-hygiene"
+        params = {
+            "source_kind": "direct-user",
+            "source_id": "test:native-hygiene",
+            "controller_actor": "test:controller",
+            "repo": str(self.repo),
+            "base_head": self.head,
+            "branch": "feat/native-hygiene",
+            "target_path": str(target),
+            "purpose": "test real ordinary lane lifecycle",
+            "retention_until_unix": self.retention_until,
+            "idempotency_key": "native-hygiene",
+            "ttl_seconds": 1200,
+        }
+        events = []
+        def append(event):
+            events.append(dict(event))
+            return "c" * 64
+        def lookup(event):
+            return "c" * 64 if event in events else None
+        hygiene = {
+            "repo": str(self.repo), "owner_id": "operator:runtime-retention",
+            "apply_cleanup": True, "include_terminal_owners": True,
+            "allowed_checkout_roots": [str(self.worktree_root)],
+            "max_actions": 2,
+            "confirmation": grips.WORKTREE_HYGIENE_CONFIRMATION,
+        }
+        with (
+            patch.dict(os.environ, {
+                "GRABOWSKI_WORK_LANE_ROOT": str(self.root / "lanes"),
+                "GRABOWSKI_WORKTREE_ENSURE_RECEIPT_ROOT": str(self.receipt_root),
+                "GROSSER_ADLER_STATE_ROOT": str(self.root / "adler"),
+                "GRABOWSKI_OPERATOR_OBLIGATION_ROOT": str(self.root / "obligations"),
+            }),
+            patch.object(checkouts, "AUTO_SOURCE_CLEANUP_ACTIVITY_LOCK", self.root / "deploy.lock"),
+            patch.object(checkouts.operator, "_require_operator_mutation"),
+            patch.object(checkouts.operator, "_require_operator_capability"),
+            patch.object(checkouts.operator, "_safe_environment", return_value=os.environ.copy()),
+            patch.object(checkouts.base, "_append_audit"),
+            patch.object(checkouts, "_processes_under", return_value=[]),
+            patch.object(work_acquire, "_find_terminal_closeout_audit", side_effect=lookup),
+        ):
+            acquired = work_acquire.acquire_work(params, runner=grips._default_command_runner)
+            self.assertEqual("ready", acquired["state"], acquired)
+            self.assertTrue(acquired["worktree_receipt"]["lifecycle"]["automatic_cleanup_authorized"])
+            active = grips.run_grip("worktree-hygiene-reconcile", hygiene, allow_mutation=True)
+            self.assertEqual(0, active["output"]["actions"])
+            assessment = closeout.assess(closeout.LaneCloseoutObservation(
+                lane_id=acquired["lane_id"], repository=str(self.repo),
+                workspace=str(target), branch=params["branch"], base_revision=self.head,
+                writer_state="completed", task_active=False, process_active=False,
+                lease_active=True, git_dirty=False, head_sha=self.head,
+                remote_head_sha=self.head, ahead_commits=0, behind_commits=0,
+                no_change_proven=True,
+            ))
+            terminal = work_acquire.persist_terminal_closeout(
+                acquired["lane_id"], assessment,
+                expected_receipt_sha256=acquired["receipt_sha256"],
+                audit_fn=append, audit_lookup_fn=lookup,
+            )
+            self.assertEqual("completed_retained", terminal["checkout_lifecycle_closeout"]["state"])
+            protected = grips.run_grip("worktree-hygiene-reconcile", hygiene, allow_mutation=True)
+            self.assertEqual(0, protected["output"]["actions"])
+            self.assertTrue(target.exists())
+            with patch.object(time, "time", return_value=self.retention_until + 1):
+                archive_result = grips.run_grip("worktree-hygiene-reconcile", hygiene, allow_mutation=True)
+                self.assertEqual("passed", archive_result["receipt"]["status"], archive_result["output"])
+                self.assertEqual(1, len(archive_result["output"]["archived"]))
+                archive = archive_result["output"]["archived"][0]
+                refs_before = self._git(self.repo, "for-each-ref", "--format=%(refname) %(objectname)", "refs/grabowski").stdout
+                self.assertTrue(refs_before.strip())
+                self.assertTrue(target.exists())
+            with patch.object(time, "time", return_value=archive["cleanup_available_at_unix"] + 1):
+                cleanup = grips.run_grip("worktree-hygiene-reconcile", hygiene, allow_mutation=True)
+                self.assertEqual("passed", cleanup["receipt"]["status"], cleanup["output"])
+                self.assertEqual(1, len(cleanup["output"]["cleaned"]))
+            self.assertFalse(target.exists())
+            self.assertEqual(refs_before, self._git(self.repo, "for-each-ref", "--format=%(refname) %(objectname)", "refs/grabowski").stdout)
+            self.assertEqual(self.head, self._git(self.repo, "rev-parse", params["branch"]).stdout.strip())
+
     def test_success_replay_preflight_readback_is_action_failure(self) -> None:
         parameters = self._parameters(
             key="replay-readback-preflight",

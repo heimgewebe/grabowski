@@ -6556,6 +6556,15 @@ class RuntimeRetentionTests(unittest.TestCase):
         self.assertTrue(result["worktree_hygiene"]["bounded"])
         self.assertTrue(result["mutated"])
 
+    def test_periodic_terminal_owner_cleanup_enabled_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = Mock(return_value={"status": "passed", "output": {"actions": 0, "errors": []}})
+            RETENTION._apply_periodic_worktree_hygiene(
+                repositories=[tmp], owner_id="operator:runtime-retention",
+                allowed_checkout_roots=[tmp], max_actions=2, grip_runner=runner,
+            )
+            self.assertIs(runner.call_args.args[1]["include_terminal_owners"], True)
+
     def test_periodic_terminal_owner_opt_in_and_degraded_receipt(self) -> None:
         for enabled in (False, True):
             with self.subTest(enabled=enabled), tempfile.TemporaryDirectory() as tmp:

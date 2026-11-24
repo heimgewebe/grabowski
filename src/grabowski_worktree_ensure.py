@@ -144,6 +144,23 @@ def _locked_receipt(idempotency_key: str) -> Iterator[tuple[Path, Any]]:
         yield receipt_path, lock_handle
 
 
+def _regular_lane_cleanup_policy(inputs: dict[str, Any], key_sha256: str) -> bool:
+    """Prospective opt-in only for a newly created ordinary direct Work Lane.
+
+    A non-default artifact class (e.g. retained-worktree) keeps manual retention.
+    This policy is not terminal evidence or permission to delete a checkout.
+    """
+    lane_id = inputs.get("source_id")
+    return (
+        inputs.get("source_kind") == "work_lane"
+        and isinstance(lane_id, str)
+        and re.fullmatch(r"[0-9a-f]{32}", lane_id) is not None
+        and inputs.get("lease_owner_id") == f"lane:{lane_id}"
+        and inputs.get("artifact_class") == "implementation-worktree"
+        and key_sha256 == hashlib.sha256(f"work-acquire:{lane_id}".encode()).hexdigest()
+    )
+
+
 def _validate_receipt_shape(value: dict[str, Any], path: Path) -> None:
     if value.get("kind") != RECEIPT_KIND or value.get("schema_version") != SCHEMA_VERSION:
         raise WorktreeEnsureAction(f"durable receipt kind or schema mismatch: {path}")
@@ -168,7 +185,23 @@ def _validate_receipt_shape(value: dict[str, Any], path: Path) -> None:
     if lifecycle is not None:
         if not isinstance(lifecycle, dict):
             raise WorktreeEnsureAction(f"durable receipt lifecycle evidence is invalid: {path}")
-        if lifecycle.get("automatic_cleanup_authorized") is not False:
+        cleanup_authority = lifecycle.get("automatic_cleanup_authorized")
+        if not isinstance(cleanup_authority, bool) or (
+            cleanup_authority and (
+                result_state != "CREATED"
+                or not _regular_lane_cleanup_policy(
+                    value["inputs"], value["idempotency_key_sha256"]
+                )
+                or lifecycle.get("source") != {
+                    "kind": "work_lane", "id": value["inputs"]["source_id"]
+                }
+                or lifecycle.get("owner_id") != value["inputs"]["lease_owner_id"]
+                or lifecycle.get("artifact_class") != value["inputs"]["artifact_class"]
+                or lifecycle.get("checkout_path") != value["inputs"].get("target_path")
+                or lifecycle.get("expected_branch") != value["inputs"].get("branch")
+                or not isinstance(lifecycle.get("physical_checkout"), dict)
+            )
+        ):
             raise WorktreeEnsureAction(f"durable receipt lifecycle cleanup authority is invalid: {path}")
         if lifecycle.get("terminal_decision") != "retain":
             raise WorktreeEnsureAction(f"durable receipt lifecycle decision is invalid: {path}")
@@ -979,6 +1012,8 @@ def _bind_checkout_lifecycle(
     inputs: dict[str, Any],
     post_state: dict[str, Any],
     lease: dict[str, Any],
+    *,
+    newly_created: bool = False,
 ) -> dict[str, Any]:
     import grabowski_checkouts as checkouts
 
@@ -1058,7 +1093,12 @@ def _bind_checkout_lifecycle(
         "physical_checkout": physical,
         "terminal_decision": "retain",
         "terminal_reason": "external GitHub and Bureau truth require later reconciliation",
-        "automatic_cleanup_authorized": False,
+        "automatic_cleanup_authorized": (
+            newly_created
+            and _regular_lane_cleanup_policy(
+                inputs, hashlib.sha256(inputs["idempotency_key"].encode()).hexdigest()
+            )
+        ),
         "does_not_establish": [
             "permission_to_delete_checkout",
             "pull_request_integration_truth",
@@ -1513,7 +1553,11 @@ def ensure_worktree(
                 receipt_path,
                 replayed=True,
                 recovered=False,
-                lifecycle_override=lifecycle if isinstance(lifecycle, dict) else None,
+                lifecycle_override=(
+                    lifecycle
+                    if isinstance(lifecycle, dict) and not isinstance(existing.get("lifecycle"), dict)
+                    else None
+                ),
                 adler_sidecar_override=current_adler_sidecar,
             )
 
@@ -1893,7 +1937,10 @@ def ensure_worktree(
             )
             if sidecar_plan is not None:
                 record["adler_sidecar_plan"] = sidecar_plan
-            record["lifecycle"] = _bind_checkout_lifecycle(inputs, post_state, lease)
+            record["lifecycle"] = _bind_checkout_lifecycle(
+                inputs, post_state, lease,
+                newly_created=_returncode(mutation) == 0,
+            )
             record["mutation"] = {
                 "returncode": _returncode(mutation),
                 "stdout": _bounded_text(_stdout(mutation)),
