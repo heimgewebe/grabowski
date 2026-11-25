@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import errno
 import sqlite3
 import os
 import stat
@@ -97,6 +98,58 @@ class SQLiteStoreTests(unittest.TestCase):
                 )
             self.assertEqual(len(payload), identity[2])
             self.assertEqual(payload, (root / "exact.sqlite3").read_bytes())
+
+    def test_reflink_only_never_streams_on_unsupported_filesystem(self) -> None:
+        with TemporaryDirectory() as directory:
+            source = Path(directory) / "source"
+            target = Path(directory) / "clone"
+            source.write_bytes(b"source" * 4096)
+            before = sqlite_store.file_identity(source)
+            with patch.object(
+                sqlite_store.fcntl, "ioctl",
+                side_effect=OSError(errno.EOPNOTSUPP, "unsupported clone"),
+            ) as clone, patch.object(
+                sqlite_store.os, "dup",
+                side_effect=AssertionError("reflink-only streamed source"),
+            ):
+                with self.assertRaises(sqlite_store.ReflinkUnavailable):
+                    sqlite_store.copy_regular_file(
+                        source, target, error_type=InventoryChanged,
+                        max_bytes=1, reflink_only=True,
+                    )
+            clone.assert_called_once()
+            self.assertEqual(0, target.stat().st_size)
+            self.assertEqual(before, sqlite_store.file_identity(source))
+
+    def test_reflink_wal_snapshot_preserves_source_and_reads_committed_row(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "store.sqlite3"
+            writer = sqlite3.connect(database)
+            try:
+                writer.execute("PRAGMA journal_mode=WAL")
+                writer.execute("PRAGMA wal_autocheckpoint=0")
+                writer.execute("CREATE TABLE items(value TEXT)")
+                writer.execute("INSERT INTO items VALUES ('wal-only')")
+                writer.commit()
+                files = (database, Path(f"{database}-wal"), Path(f"{database}-shm"))
+                before = [(sqlite_store.file_identity(f), f.read_bytes()) for f in files]
+                try:
+                    with sqlite_store.inventory_readonly_sqlite(
+                        database, temporary_prefix="reflink-budget-",
+                        error_type=InventoryChanged, max_copy_bytes=1,
+                        reflink_only=True,
+                    ) as connection:
+                        self.assertEqual("wal-only", connection.execute(
+                            "SELECT value FROM items"
+                        ).fetchone()[0])
+                except sqlite_store.ReflinkUnavailable:
+                    self.skipTest("filesystem does not support CoW clone")
+                self.assertEqual(before, [
+                    (sqlite_store.file_identity(f), f.read_bytes()) for f in files
+                ])
+            finally:
+                writer.close()
 
     def test_inventory_wal_copy_enforces_combined_byte_budget(self) -> None:
         with TemporaryDirectory() as temporary_directory:
