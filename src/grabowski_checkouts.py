@@ -8400,6 +8400,76 @@ def _cleanup_plan_sha256(body: dict[str, Any]) -> str:
     return _sha256_json(authorization_material)
 
 
+def _review_source_paths(state_root: Path | None = None) -> set[str]:
+    """Observe checkout paths still required by the existing review verifier.
+
+    A started first-party session (including historical signed findings) or
+    legacy execution plan can require its original physical checkout. An
+    unstarted first-party plan alone carries no signed semantic evidence.
+    This is a retention observation, not review admission or signature proof.
+    """
+    root = state_root if state_root is not None else Path.home() / ".local/state/grabowski"
+
+    def entries(directory: Path) -> list[Path]:
+        try:
+            return list(directory.iterdir())
+        except FileNotFoundError:
+            return []
+
+    def record(path: Path, limit: int) -> dict[str, Any] | None:
+        try:
+            with path.open("rb") as stream:
+                raw = stream.read(limit + 1)
+        except FileNotFoundError:
+            # No committed record at this observation (e.g. session creation).
+            return None
+        if len(raw) > limit:
+            raise RuntimeError("Review source dependency record exceeds bound")
+        try:
+            value = json.loads(raw)
+        except (ValueError, UnicodeError) as exc:
+            raise RuntimeError("Review source dependency record unreadable") from exc
+        if not isinstance(value, dict):
+            raise RuntimeError("Review source dependency record invalid")
+        if value.get("kind") == "grabowski_signed_record_envelope_v1":
+            value = value.get("record")
+            if not isinstance(value, dict):
+                raise RuntimeError("Review source dependency envelope invalid")
+        return value
+
+    result: set[str] = set()
+
+    def add_source(value: dict[str, Any]) -> None:
+        path = value.get("worktree")
+        if not isinstance(path, str) or not Path(path).is_absolute() or ".." in Path(path).parts:
+            raise RuntimeError("Review source dependency path invalid")
+        result.add(str(Path(path)))
+
+    # The signed session inventory includes completed, rejected and pending
+    # reviews. Verification reopens the original path even after session expiry.
+    for directory in entries(root / "first-party-self-reviews" / "sessions"):
+        if re.fullmatch(r"[0-9a-f]{32}", directory.name) is None:
+            continue
+        value = record(directory / "session.json", 1024 * 1024)
+        if value is not None:
+            if value.get("kind") != "grabowski_first_party_semantic_review_session_v1":
+                raise RuntimeError("Review source dependency session kind invalid")
+            add_source(value)
+
+    # Older role/task-based reviews use the stored execution plan during sealing
+    # and verification. Do not pin a source for a first-party plan alone.
+    for path in entries(root / "self-review-executions" / "plans"):
+        if re.fullmatch(r"[0-9a-f]{32}\.json", path.name) is None:
+            continue
+        value = record(path, 128 * 1024)
+        if value is not None:
+            if value.get("kind") == "grabowski_self_review_execution_plan":
+                add_source(value)
+            elif value.get("kind") != "grabowski_first_party_review_plan":
+                raise RuntimeError("Review source dependency plan kind invalid")
+    return result
+
+
 def _cleanup_plan(
     *,
     repo_path: Path,
@@ -8454,6 +8524,7 @@ def _cleanup_plan(
     remote = _remote_secured_observation(record, verify_github_pull_ref=False)
     remote_secured = bool(remote.get("remote_secured"))
     dirty = status.get("dirty") is not False
+    review_source_required = str(checkout) in _review_source_paths()
     command = ["git", "-C", str(top_level), "worktree", "remove", str(checkout)]
     body = {
         "schema_version": CLEANUP_PLAN_SCHEMA_VERSION,
@@ -8484,6 +8555,7 @@ def _cleanup_plan(
                 ("archive_grace_not_elapsed", not archive_grace_elapsed),
                 ("active_coordination", coordination["blocking"]),
                 ("dirty_checkout", dirty),
+                ("review_source_dependency", review_source_required),
             )
             if blocked
         ],
@@ -8496,6 +8568,7 @@ def _cleanup_plan(
             and archive_grace_elapsed
             and not coordination["blocking"]
             and not dirty
+            and not review_source_required
         ),
         "rollback": {
             "available": True,
@@ -8643,6 +8716,8 @@ def grabowski_checkout_cleanup(
         raise RuntimeError("Active checkout retention has not elapsed")
     if not current_plan["archive_grace_elapsed"]:
         raise RuntimeError("Checkout archive grace period has not elapsed")
+    if "review_source_dependency" in current_plan["cleanup_blockers"]:
+        raise RuntimeError("Checkout is required by existing review source evidence")
     if not current_plan["safe_to_apply"]:
         _require_no_blockers(current_plan["coordination"])
     retention_until_unix = _now() + DRY_RUN_TTL_SECONDS
@@ -8661,6 +8736,8 @@ def grabowski_checkout_cleanup(
         },
     )
     try:
+        if str(checkout) in _review_source_paths():
+            raise RuntimeError("Checkout is required by existing review source evidence")
         uncertainty_fence = _persist_checkout_operation_uncertainty(
             lease=lease,
             checkout_key=current_plan["checkout_key"],
