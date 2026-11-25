@@ -648,8 +648,18 @@ class CheckoutIdentityTests(unittest.TestCase):
         git(self.repo, "commit", "-qm", "base")
         old = git(self.repo, "rev-parse", "HEAD")
         git(self.repo, "worktree", "add", "-q", "-b", "topic", str(self.checkout))
+        import os
+        import grabowski_work_acquire as work_acquire
+        import grabowski_physical_checkout as physical
+
+        lane_root = self.root / "lanes"
+        lane_root.mkdir()
+        env = patch.dict(os.environ, {"GRABOWSKI_WORK_LANE_ROOT": str(lane_root)})
+        env.start()
+        self.patches.append(env)
+        lane_id = "a" * 32
         prior = self._seed_prior(
-            owner="owner-retained", branch="topic", head=old,
+            owner=f"lane:{lane_id}", branch="topic", head=old,
             phase="active", archive=False,
         )
         inputs = self._inputs(
@@ -672,6 +682,37 @@ class CheckoutIdentityTests(unittest.TestCase):
                 owner_id=str(prior["owner_id"]),
                 expected_head=new, expected_branch="topic",
             )
+        bound = {
+            "lane_id": lane_id, "lease_owner_id": prior["owner_id"],
+            "repo": str(self.repo), "target_path": str(self.checkout),
+            "purpose": prior["purpose"], "artifact_class": prior["artifact_class"],
+        }
+        source = {"kind": prior["source_kind"], "id": prior["source_id"]}
+        assessment = work_acquire.lane_closeout.assess(
+            work_acquire.lane_closeout.LaneCloseoutObservation(
+                lane_id=lane_id, repository=str(self.repo),
+                workspace=str(self.checkout), branch="topic", base_revision=old,
+                writer_state="completed", task_active=False, process_active=False,
+                lease_active=True, git_dirty=False, head_sha=new,
+                remote_head_sha=new, ahead_commits=0, behind_commits=0,
+                pr_number=1, pr_state="open", pr_head_sha=new, pr_origin="opened",
+            ), observed_at_unix=self.now,
+        )
+        work_acquire._write_state(lane_root / f"{lane_id}.json", {
+            "kind": work_acquire.LANE_KIND, "schema_version": work_acquire.SCHEMA_VERSION,
+            "lane_id": lane_id, "inputs": bound,
+            "inputs_sha256": work_acquire._sha(bound), "lifecycle_source": source,
+            "worktree_receipt": {"lifecycle": {
+                "checkout_key": prior["checkout_key"], "checkout_path": str(self.checkout),
+                "owner_id": prior["owner_id"], "source": source, "expected_branch": "topic",
+            }},
+            "terminal_closeout": {
+                "kind": "grabowski.work_lane_terminal_closeout", "schema_version": 1,
+                "assessment": assessment, "assessment_sha256": assessment["assessment_sha256"],
+                "closeout_state": assessment["closeout_state"],
+                "checkout_physical_identity": physical.capture_physical_checkout_identity(self.checkout),
+            },
+        })
         request = {**inputs, "base_head": new, "idempotency_key": "resume-retained"}
         return prior, seeded, request
 
@@ -737,6 +778,43 @@ class CheckoutIdentityTests(unittest.TestCase):
             "SELECT * FROM lifecycle_bindings WHERE checkout_key=?",
             (prior["checkout_key"],),
         )["phase"])
+
+    def test_completed_retained_head_progress_rejects_recreated_checkout(self) -> None:
+        import subprocess
+        import grabowski_physical_checkout as physical
+
+        prior, seeded, request = self._completed_retained_head_fixture()
+        before = physical.capture_physical_checkout_identity(self.checkout)
+        for argv in (
+            ["worktree", "remove", str(self.checkout)],
+            ["worktree", "add", "-q", str(self.checkout), "topic"],
+        ):
+            subprocess.run(["git", "-C", str(self.repo), *argv],
+                           check=True, capture_output=True)
+        after = physical.capture_physical_checkout_identity(self.checkout)
+        self.assertNotEqual(before["physical_identity_sha256"], after["physical_identity_sha256"])
+        with patch.object(checkouts, "_safe_path", side_effect=lambda path, **kw: Path(path).resolve(strict=kw.get("must_exist", False))):
+            with self.assertRaises(identity.CheckoutIdentityConflict):
+                identity.prepare(request)
+        self.assertEqual("active", self._fetchone(
+            "SELECT * FROM checkout_identity_generations WHERE generation_id=?",
+            (seeded["generation_id"],),
+        )["state"])
+        self.assertEqual("completed_retained", self._fetchone(
+            "SELECT * FROM lifecycle_bindings WHERE checkout_key=?",
+            (prior["checkout_key"],),
+        )["phase"])
+
+    def test_completed_retained_head_progress_requires_terminal_receipt(self) -> None:
+        prior, seeded, request = self._completed_retained_head_fixture()
+        (self.root / "lanes" / ("a" * 32 + ".json")).unlink()
+        with patch.object(checkouts, "_safe_path", side_effect=lambda path, **kw: Path(path).resolve(strict=kw.get("must_exist", False))):
+            with self.assertRaises(identity.CheckoutIdentityConflict):
+                identity.prepare(request)
+        self.assertEqual("active", self._fetchone(
+            "SELECT * FROM checkout_identity_generations WHERE generation_id=?",
+            (seeded["generation_id"],),
+        )["state"])
 
     def test_archived_identity_reconciliation_rolls_back_without_handoff_authority(self) -> None:
         prior = self._seed_prior(

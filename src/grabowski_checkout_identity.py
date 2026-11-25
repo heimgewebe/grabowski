@@ -437,6 +437,60 @@ def _insert_baseline_generation(
     return existing
 
 
+def _retained_terminal_physical_identity(
+    inputs: dict[str, Any], prior: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Read the existing immutable terminal proof, without taking a lane lock.
+
+    prepare() already holds the checkout transaction; lane closeout takes
+    locks in the opposite order. The receipt reader verifies atomic file
+    contents and their digest, and does not acquire the lane lock.
+    """
+    import grabowski_work_acquire as work_acquire
+
+    owner = prior.get("owner_id")
+    if not isinstance(owner, str) or re.fullmatch(r"lane:[0-9a-f]{32}", owner) is None:
+        return None
+    lane_id = owner.removeprefix("lane:")
+    lane = work_acquire._read_state(work_acquire._state_root() / f"{lane_id}.json")
+    if not isinstance(lane, dict) or lane.get("lane_id") != lane_id:
+        return None
+    bound = lane.get("inputs")
+    if (
+        not isinstance(bound, dict)
+        or lane.get("inputs_sha256") != work_acquire._sha(bound)
+        or bound.get("lane_id") != lane_id
+        or bound.get("lease_owner_id") != owner
+        or bound.get("repo") != inputs["repo"]
+        or bound.get("target_path") != inputs["target_path"]
+        or bound.get("purpose") != prior.get("purpose")
+        or bound.get("artifact_class") != prior.get("artifact_class")
+        or lane.get("lifecycle_source") != {
+            "kind": prior.get("source_kind"), "id": prior.get("source_id"),
+        }
+    ):
+        return None
+    assessment = work_acquire._terminal_closeout_assessment(lane)
+    if (
+        not isinstance(assessment, dict)
+        or assessment.get("lease_release_ready") is not True
+        or assessment.get("terminal_head_sha") != prior.get("expected_head")
+    ):
+        return None
+    lifecycle = (lane.get("worktree_receipt") or {}).get("lifecycle")
+    if (
+        not isinstance(lifecycle, dict)
+        or lifecycle.get("checkout_key") != inputs["checkout_key"]
+        or lifecycle.get("checkout_path") != inputs["target_path"]
+        or lifecycle.get("owner_id") != owner
+        or lifecycle.get("source") != lane.get("lifecycle_source")
+        or lifecycle.get("expected_branch") != prior.get("expected_branch")
+    ):
+        return None
+    physical = lane["terminal_closeout"].get("checkout_physical_identity")
+    return physical if isinstance(physical, dict) else None
+
+
 def _completed_retained_progress_matches(
     *,
     inputs: dict[str, Any],
@@ -485,7 +539,12 @@ def _completed_retained_progress_matches(
             return False
         checkouts._require_clean_linked(record)
         checkouts._require_expected(record, prior["expected_head"], prior["expected_branch"])
-        observed = physical.capture_physical_checkout_identity(target)
+        historical = _retained_terminal_physical_identity(inputs, prior)
+        if historical is None:
+            return False
+        observed = physical.verify_physical_checkout_identity(
+            historical, allow_historical_device_remap=True
+        )
         registered = physical.capture_registered_linked_worktree_git_dir(common, target)
         if (
             observed["git_dir"] != registered
@@ -505,7 +564,7 @@ def _completed_retained_progress_matches(
             check=False,
         ).returncode != 0:
             return False
-    except (OSError, ValueError, RuntimeError, KeyError):
+    except (OSError, ValueError, RuntimeError, KeyError, TypeError, AttributeError):
         return False
     return True
 
