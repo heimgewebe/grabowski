@@ -631,6 +631,113 @@ class CheckoutIdentityTests(unittest.TestCase):
             archive_supersession["prior_generation_id"],
         )
 
+    def _completed_retained_head_fixture(self):
+        import subprocess
+
+        def git(cwd, *argv):
+            return subprocess.run(
+                ["git", "-C", str(cwd), *argv], check=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            ).stdout.strip()
+
+        git(self.repo, "init", "-q", "-b", "main")
+        git(self.repo, "config", "user.name", "Identity Test")
+        git(self.repo, "config", "user.email", "test@example.invalid")
+        (self.repo / "data.txt").write_text("one\\n")
+        git(self.repo, "add", "data.txt")
+        git(self.repo, "commit", "-qm", "base")
+        old = git(self.repo, "rev-parse", "HEAD")
+        git(self.repo, "worktree", "add", "-q", "-b", "topic", str(self.checkout))
+        prior = self._seed_prior(
+            owner="owner-retained", branch="topic", head=old,
+            phase="active", archive=False,
+        )
+        inputs = self._inputs(
+            owner=str(prior["owner_id"]),
+            purpose=str(prior["purpose"]),
+            source_kind=str(prior["source_kind"]),
+            source_id=str(prior["source_id"]),
+            artifact_class=str(prior["artifact_class"]),
+            branch="topic", head=old,
+            idempotency_key="before-retained",
+        )
+        seeded = identity.prepare(inputs)
+        (self.checkout / "data.txt").write_text("two\\n")
+        git(self.checkout, "add", "data.txt")
+        git(self.checkout, "commit", "-qm", "normal progress")
+        new = git(self.checkout, "rev-parse", "HEAD")
+        with patch.object(checkouts, "_now", return_value=self.now):
+            checkouts._mark_checkout_completed_retained(
+                checkout_key=str(prior["checkout_key"]),
+                owner_id=str(prior["owner_id"]),
+                expected_head=new, expected_branch="topic",
+            )
+        request = {**inputs, "base_head": new, "idempotency_key": "resume-retained"}
+        return prior, seeded, request
+
+    def test_completed_retained_head_progress_reconciles_immutable_generations(self) -> None:
+        prior, seeded, request = self._completed_retained_head_fixture()
+        with patch.object(checkouts, "_safe_path", side_effect=lambda path, **kw: Path(path).resolve(strict=kw.get("must_exist", False))):
+            reservation = identity.prepare(request)
+        self.assertEqual("reactivation", reservation["action"])
+        self.assertNotEqual(seeded["generation_id"], reservation["prior_generation_id"])
+        old = self._fetchone(
+            "SELECT * FROM checkout_identity_generations WHERE generation_id=?",
+            (seeded["generation_id"],),
+        )
+        baseline = self._fetchone(
+            "SELECT * FROM checkout_identity_generations WHERE generation_id=?",
+            (reservation["prior_generation_id"],),
+        )
+        self.assertEqual("superseded", old["state"])
+        self.assertEqual(baseline["generation_id"], old["superseded_by_generation_id"])
+        self.assertEqual("superseded", baseline["state"])
+        self.assertEqual(seeded["generation_id"], baseline["predecessor_generation_id"])
+        self.assertEqual(request["base_head"], json.loads(baseline["identity_json"])["expected_head"])
+        self.assertEqual(reservation["generation_id"], baseline["superseded_by_generation_id"])
+        self.assertEqual(reservation["generation_id"], identity.prepare(request)["generation_id"])
+
+    def test_completed_retained_head_progress_rejects_dirty_wrong_head_and_owner(self) -> None:
+        prior, seeded, request = self._completed_retained_head_fixture()
+        path = self.checkout / "data.txt"
+        clean = path.read_text()
+        with patch.object(checkouts, "_safe_path", side_effect=lambda path, **kw: Path(path).resolve(strict=kw.get("must_exist", False))):
+            path.write_text("uncommitted")
+            with self.assertRaises(identity.CheckoutIdentityConflict):
+                identity.prepare(request)
+            path.write_text(clean)
+            import subprocess
+
+            def git(*args):
+                subprocess.run(["git", "-C", str(self.checkout), *args], check=True, capture_output=True)
+
+            git("update-index", "--assume-unchanged", "data.txt")
+            path.write_text("hidden change")
+            with self.assertRaises(identity.CheckoutIdentityConflict):
+                identity.prepare(request)
+            path.write_text(clean)
+            git("update-index", "--no-assume-unchanged", "data.txt")
+            git("reset", "--hard", "HEAD^")
+            with self.assertRaises(identity.CheckoutIdentityConflict):
+                identity.prepare(request)
+            git("reset", "--hard", str(request["base_head"]))
+            for override in (
+                {"base_head": OLD_HEAD},
+                {"lease_owner_id": "foreign-owner"},
+                {"source_id": "foreign-task"},
+            ):
+                with self.assertRaises(identity.CheckoutIdentityConflict):
+                    identity.prepare({**request, **override})
+        current = self._fetchone(
+            "SELECT * FROM checkout_identity_generations WHERE generation_id=?",
+            (seeded["generation_id"],),
+        )
+        self.assertEqual("active", current["state"])
+        self.assertEqual("completed_retained", self._fetchone(
+            "SELECT * FROM lifecycle_bindings WHERE checkout_key=?",
+            (prior["checkout_key"],),
+        )["phase"])
+
     def test_archived_identity_reconciliation_rolls_back_without_handoff_authority(self) -> None:
         prior = self._seed_prior(
             phase="active", active_retention=True, archive=False

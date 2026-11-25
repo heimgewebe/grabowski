@@ -2822,8 +2822,11 @@ def _continuation_preimage(
     if not isinstance(checkout_key, str) or checkout_key != prior_lifecycle.get("checkout_key"):
         raise RuntimeError("managed worktree continuation checkout identity drifted")
     try:
+        # The durable ensure receipt may predate a mount namespace change.
+        # Reanchor only here; every subsequent snapshot and authorization
+        # uses this fresh, exact physical identity and registered Git directory.
         expected_physical = physical_checkout.verify_physical_checkout_identity(
-            prior_physical
+            prior_physical, allow_historical_device_remap=True
         )
     except Exception as exc:
         raise RuntimeError(
@@ -3083,7 +3086,7 @@ def _continuation_preimage(
         try:
             snapshot_physical = (
                 physical_checkout.verify_physical_checkout_identity(
-                    prior_physical
+                    expected_physical
                 )
             )
         except Exception as exc:

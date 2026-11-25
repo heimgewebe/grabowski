@@ -103,6 +103,43 @@ class PhysicalCheckoutIdentityTests(unittest.TestCase):
                 physical_checkout.verify_physical_checkout_identity(identity_before)
 
 
+    def test_historical_device_remap_keeps_fresh_identity_strict(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            checkout = Path(directory) / "checkout"
+            self._init_committed_repo(repo)
+            self._run("git", "worktree", "add", "-q", "-b", "topic", str(checkout), cwd=repo)
+            fresh = physical_checkout.capture_physical_checkout_identity(checkout)
+            historical = copy.deepcopy(fresh)
+            for key in ("root", "git_dir", "common_dir"):
+                historical[key]["device"] += 1
+            def rehash(value):
+                material = {k: v for k, v in value.items() if k != "physical_identity_sha256"}
+                value["physical_identity_sha256"] = physical_checkout._identity_sha256(material)
+            rehash(historical)
+            with self.assertRaises(physical_checkout.PhysicalCheckoutIdentityError):
+                physical_checkout.verify_physical_checkout_identity(historical)
+            self.assertEqual(
+                fresh,
+                physical_checkout.verify_physical_checkout_identity(
+                    historical, allow_historical_device_remap=True
+                ),
+            )
+            self.assertEqual(fresh, physical_checkout.verify_physical_checkout_identity(fresh))
+            changed_inode = copy.deepcopy(historical)
+            changed_inode["git_dir"]["inode"] += 1
+            rehash(changed_inode)
+            incoherent = copy.deepcopy(historical)
+            incoherent["git_dir"]["device"] += 1
+            rehash(incoherent)
+            tampered = copy.deepcopy(historical)
+            tampered["physical_identity_sha256"] = "0" * 64
+            for bad in (changed_inode, incoherent, tampered):
+                with self.assertRaises(physical_checkout.PhysicalCheckoutIdentityError):
+                    physical_checkout.verify_physical_checkout_identity(
+                        bad, allow_historical_device_remap=True
+                    )
+
     def test_bound_checkout_effect_root_survives_lexical_path_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

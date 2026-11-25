@@ -437,7 +437,80 @@ def _insert_baseline_generation(
     return existing
 
 
-def _reconcile_archived_evidence_generation(
+def _completed_retained_progress_matches(
+    *,
+    inputs: dict[str, Any],
+    prior: dict[str, Any],
+    current_identity: dict[str, Any],
+    current: dict[str, Any],
+    lifecycle: dict[str, Any],
+    retention: dict[str, Any],
+    now: int,
+) -> bool:
+    """Recognize only a clean, registered, descendant HEAD on the same branch."""
+    terminal = lifecycle.get("terminal_at_unix")
+    created = current.get("created_at_unix")
+    if not (
+        type(terminal) is int
+        and type(created) is int
+        and created <= terminal <= now
+        and lifecycle.get("archived_at_unix") is None
+        and current_identity.get("expected_branch") == prior.get("expected_branch")
+        and prior.get("expected_branch") is not None
+        and current_identity.get("expected_head") != prior.get("expected_head")
+        and all(
+            row.get("checkout_key") == inputs["checkout_key"]
+            and row.get("checkout_path") == inputs["target_path"]
+            and row.get("repo_common_dir") == inputs["repo_common_dir"]
+            for row in (current, lifecycle, retention)
+        )
+        and all(
+            retention.get(field) == lifecycle.get(field)
+            for field in ("owner_id", "purpose", "expected_head", "expected_branch")
+        )
+    ):
+        return False
+
+    checkouts = _checkouts()
+    try:
+        import grabowski_physical_checkout as physical
+
+        target = Path(inputs["target_path"])
+        repo = Path(inputs["repo"])
+        _, common, record = checkouts._worktree_for_path(repo, target)
+        if (
+            record.get("checkout_key") != inputs["checkout_key"]
+            or str(common) != inputs["repo_common_dir"]
+        ):
+            return False
+        checkouts._require_clean_linked(record)
+        checkouts._require_expected(record, prior["expected_head"], prior["expected_branch"])
+        observed = physical.capture_physical_checkout_identity(target)
+        registered = physical.capture_registered_linked_worktree_git_dir(common, target)
+        if (
+            observed["git_dir"] != registered
+            or observed["common_dir"]["path"] != str(common)
+            or observed["root"]["path"] != str(target)
+        ):
+            return False
+        index_flags = checkouts._git_read(target, ["ls-files", "-v", "-z"])
+        if any(
+            entry and (entry[0].islower() or entry[0] == "S")
+            for entry in index_flags.stdout.split("\0")
+        ):
+            return False
+        if checkouts._git_read(
+            target, ["--no-replace-objects", "merge-base", "--is-ancestor",
+                     current_identity["expected_head"], prior["expected_head"]],
+            check=False,
+        ).returncode != 0:
+            return False
+    except (OSError, ValueError, RuntimeError, KeyError):
+        return False
+    return True
+
+
+def _reconcile_protected_evidence_generation(
     connection: sqlite3.Connection,
     *,
     inputs: dict[str, Any],
@@ -445,7 +518,7 @@ def _reconcile_archived_evidence_generation(
     current: dict[str, Any],
     now: int,
 ) -> dict[str, Any]:
-    """Converge an immutable active generation to exact archived evidence.
+    """Converge an immutable active generation to exact protected evidence.
 
     Archive and safe identity-rebind paths may advance a checkout's head or
     branch after its original identity generation was finalized.  The ledger
@@ -488,7 +561,22 @@ def _reconcile_archived_evidence_generation(
         and type(current.get("created_at_unix")) is int
         and archive["created_at_unix"] >= current["created_at_unix"]
     )
-    if not valid:
+    retained = bool(
+        current.get("state") == "active"
+        and evidence.get("protected") is True
+        and isinstance(lifecycle, dict)
+        and lifecycle.get("phase") == "completed_retained"
+        and isinstance(retention, dict)
+        and archive is None
+        and _identity_complete(current_identity)
+        and _identity_complete(prior)
+        and all(current_identity.get(field) == prior.get(field) for field in immutable_fields)
+        and _completed_retained_progress_matches(
+            inputs=inputs, prior=prior, current_identity=current_identity,
+            current=current, lifecycle=lifecycle, retention=retention, now=now,
+        )
+    )
+    if not (valid or retained):
         raise CheckoutIdentityConflict(
             "identity ledger and protected checkout evidence disagree"
         )
@@ -496,9 +584,9 @@ def _reconcile_archived_evidence_generation(
     generation_id = _generation_id(
         inputs["checkout_key"],
         {
-            "kind": "archived-evidence-baseline",
+            "kind": "completed-retained-evidence-baseline" if retained else "archived-evidence-baseline",
             "identity": prior,
-            "archive_id": archive["archive_id"],
+            "archive_id": archive["archive_id"] if archive else None,
             "predecessor_generation_id": current["generation_id"],
         },
     )
@@ -507,7 +595,7 @@ def _reconcile_archived_evidence_generation(
         (generation_id,),
     ).fetchone() is not None:
         raise CheckoutIdentityConflict(
-            "archived evidence baseline generation already exists in a conflicting state"
+            "protected evidence baseline generation already exists in a conflicting state"
         )
     changed = connection.execute(
         """
@@ -540,7 +628,7 @@ def _reconcile_archived_evidence_generation(
     )
     if reconciled is None:
         raise CheckoutIdentityConflict(
-            "archived evidence baseline generation was not persisted"
+            "protected evidence baseline generation was not persisted"
         )
     return reconciled
 
@@ -819,7 +907,7 @@ def prepare(inputs: dict[str, Any]) -> dict[str, Any]:
         if current is not None:
             current_identity = json.loads(current["identity_json"])
             if evidence["protected"] and current_identity != evidence["prior_identity"]:
-                current = _reconcile_archived_evidence_generation(
+                current = _reconcile_protected_evidence_generation(
                     connection,
                     inputs=prepared_inputs,
                     evidence=evidence,

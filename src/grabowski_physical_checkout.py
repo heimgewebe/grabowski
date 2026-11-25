@@ -1104,7 +1104,15 @@ def bind_physical_checkout(
             ) from close_error
 
 
-def verify_physical_checkout_identity(expected: dict[str, Any]) -> dict[str, Any]:
+def verify_physical_checkout_identity(
+    expected: dict[str, Any], *, allow_historical_device_remap: bool = False
+) -> dict[str, Any]:
+    """Verify an exact observation, or reanchor a historical continuation.
+
+    Device numbers can change across mount namespaces and reboots. Only the
+    historical continuation entry point may opt into a coherent remapping;
+    subsequent observations must use the freshly captured exact identity.
+    """
     required_fields = {
         "schema_version",
         "kind",
@@ -1133,7 +1141,19 @@ def verify_physical_checkout_identity(expected: dict[str, Any]) -> dict[str, Any
 
     observed = capture_physical_checkout_identity(root["path"])
     if expected_digest != observed["physical_identity_sha256"]:
-        raise PhysicalCheckoutIdentityError(
-            "physical checkout identity changed since the expected observation"
+        nodes = ("root", "git_dir", "common_dir")
+        same_nodes = all(
+            material[key]["path"] == observed[key]["path"]
+            and material[key]["inode"] == observed[key]["inode"]
+            for key in nodes
         )
+        same_device_topology = all(
+            (material[left]["device"] == material[right]["device"])
+            == (observed[left]["device"] == observed[right]["device"])
+            for left in nodes for right in nodes
+        )
+        if not (allow_historical_device_remap and same_nodes and same_device_topology):
+            raise PhysicalCheckoutIdentityError(
+                "physical checkout identity changed since the expected observation"
+            )
     return observed
