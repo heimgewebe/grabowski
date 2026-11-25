@@ -138,6 +138,14 @@ BUREAU_FAILURE_STATUSES = frozenset(
 )
 
 
+def _resolve_registry_root(registry_root: str) -> str:
+    return str(
+        Path(registry_root).expanduser().resolve()
+        if registry_root
+        else _managed_runtime_binding().registry_root
+    )
+
+
 def _prepare_registry_root(
     registry_root: str,
     *,
@@ -145,11 +153,7 @@ def _prepare_registry_root(
     mutation: bool,
     require_current: bool = True,
 ) -> str:
-    resolved = (
-        Path(registry_root).expanduser().resolve()
-        if registry_root
-        else _managed_runtime_binding().registry_root
-    )
+    resolved = Path(_resolve_registry_root(registry_root))
     shared_root = bureau_runtime.BUREAU_REPOSITORY_ROOT.resolve()
     control_root = bureau_runtime.BUREAU_CONTROL_ROOT.resolve()
     if resolved == shared_root:
@@ -1730,8 +1734,10 @@ def grabowski_bureau_task_propose(
     registry_root: str = "",
 ) -> dict[str, Any]:
     """Create an immutable Bureau task proposal artifact without changing Registry or Queue truth."""
+    resolved_root = _resolve_registry_root(registry_root)
+    operator._require_operator_mutation("bureau_mutation", path=resolved_root)
     resolved_root = _prepare_registry_root(
-        registry_root, refresh=True, mutation=True
+        resolved_root, refresh=True, mutation=False
     )
     if bool(candidate_id) == bool(event_id):
         raise ValueError("provide exactly one of candidate_id or event_id")
@@ -1838,8 +1844,10 @@ def grabowski_bureau_task_review(
     registry_root: str = "",
 ) -> dict[str, Any]:
     """Review one exact Bureau proposal digest without changing Registry, Queue or publication truth."""
+    resolved_root = _resolve_registry_root(registry_root)
+    operator._require_operator_mutation("bureau_mutation", path=resolved_root)
     resolved_root = _prepare_registry_root(
-        registry_root, refresh=True, mutation=True
+        resolved_root, refresh=True, mutation=False
     )
     if not reviewer.strip():
         raise ValueError("reviewer must not be empty")
@@ -2051,10 +2059,12 @@ def grabowski_bureau_task_publish(
     lease_ttl_seconds: int = 240,
 ) -> dict[str, Any]:
     """Publish one reviewed task through the preview-selected Git or StateStore contract."""
+    resolved_root = _resolve_registry_root(registry_root)
+    operator._require_operator_mutation("bureau_mutation", path=resolved_root)
     resolved_root = _prepare_registry_root(
-        registry_root,
+        resolved_root,
         refresh=False,
-        mutation=True,
+        mutation=False,
         require_current=False,
     )
     operator._require_operator_mutation("resource_lease")
