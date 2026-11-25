@@ -1932,6 +1932,74 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(lifecycle["receipt_sha256"], stored["lifecycle_receipt_sha256"])
         self.assertNotEqual(legacy_digest, stored["lifecycle_receipt_sha256"])
 
+    def test_public_task_list_observes_pending_terminalization_without_recovery(self) -> None:
+        transition = self._prepare_pending_terminalization()
+        task_id = str(transition["task_id"])
+        self.assertEqual("leases_revoked", transition["phase"])
+        self.assertEqual("running", tasks._row_raw(task_id)["state"])
+
+        def database_truth(path: Path) -> list[str]:
+            connection = sqlite3.connect(path)
+            try:
+                return list(connection.iterdump())
+            finally:
+                connection.close()
+
+        before = (database_truth(self.database), database_truth(self.resource_database))
+        for state in (None, "running", "attention", None):
+            listed = asyncio.run(tasks._grabowski_task_list_tool(
+                limit=100, state=state, view="evidence",
+            ))
+            self.assertTrue(listed["read_only_snapshot"])
+            self.assertFalse(listed["reconciliation_performed"])
+            self.assertIn(
+                "terminalization_recovery_not_run",
+                {warning["code"] for warning in listed["warnings"]},
+            )
+            if state in (None, "running"):
+                item = next(row for row in listed["tasks"] if row["task_id"] == task_id)
+                self.assertEqual("running", item["state"])
+            self.assertEqual(before, (
+                database_truth(self.database), database_truth(self.resource_database),
+            ))
+        self.assertEqual("leases_revoked", resources.task_terminalization_record(task_id)["phase"])
+
+        # The ordinary explicit reconciliation still converges this same crash.
+        refreshed = tasks.reconcile_tasks_refresh(batch_size=1)
+        self.assertIn(task_id, refreshed["batch"]["terminalization_recovery"]["recovered"])
+        final = resources.task_terminalization_record(task_id)
+        self.assertEqual("projected", final["phase"])
+        self.assertEqual("failed", tasks._row_raw(task_id)["state"])
+        self.assertEqual(final["transition_sha256"], tasks._row_raw(task_id)["terminalization_sha256"])
+
+    def test_public_task_list_retains_decision_aware_projection(self) -> None:
+        self._start()
+        terminal = self._prepare_pending_terminalization()
+        recovered = tasks.reconcile_tasks_refresh(batch_size=1)
+        self.assertIn(terminal["task_id"], recovered["batch"]["terminalization_recovery"]["recovered"])
+        for state in (None, "attention", "running"):
+            with self.subTest(state=state):
+                expected = tasks.grabowski_task_list(limit=100, state=state, view="evidence")
+                actual = asyncio.run(tasks._grabowski_task_list_tool(
+                    limit=100, state=state, view="evidence",
+                ))
+                self.assertTrue(actual["read_only_snapshot"])
+                self.assertFalse(actual["reconciliation_performed"])
+                for field in (
+                    "tasks", "count", "total_matching", "projection_counts",
+                    "attention_projection", "projection_counts_semantics",
+                ):
+                    self.assertEqual(expected[field], actual[field], field)
+
+    def test_public_task_list_preserves_explicit_special_modes(self) -> None:
+        for options in ({"schema_only": True}, {"view": "managed_cargo_evidence"}):
+            with self.subTest(options=options), patch.object(
+                tasks, "grabowski_task_list", return_value={"mode": "explicit"},
+            ) as listed:
+                result = asyncio.run(tasks._grabowski_task_list_tool(**options))
+                self.assertEqual({"mode": "explicit"}, result)
+                self.assertIs(listed.call_args.kwargs["read_only"], False)
+
     def test_pending_resource_terminalization_recovers_task_projection_and_blocks_delegation(self) -> None:
         result = self._start(
             resource_keys=["component:test-terminalization-crash"]

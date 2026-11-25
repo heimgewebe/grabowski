@@ -13766,6 +13766,7 @@ def _grabowski_task_list_once(
     schema_only: bool = False,
     *,
     read_only: bool = False,
+    decision_aware: bool = False,
 ) -> dict[str, Any]:
     """List tasks; read_only=True never opens, migrates or reconciles a writable store."""
     operator._require_operator_capability("durable_job")
@@ -13847,7 +13848,7 @@ def _grabowski_task_list_once(
         )
         import grabowski_task_attention as task_attention
 
-        evaluate_attention_projection = not read_only and state in {None, "attention"}
+        evaluate_attention_projection = (not read_only or decision_aware) and state in {None, "attention"}
         decision_guard = (
             task_attention.decision_snapshot_guard()
             if evaluate_attention_projection
@@ -14099,6 +14100,7 @@ def grabowski_task_list(
     schema_only: bool = False,
     *,
     read_only: bool = False,
+    decision_aware: bool = False,
 ) -> dict[str, Any]:
     """Retry a complete read-only task list if a WAL checkpoint invalidated its snapshot.
 
@@ -14110,11 +14112,13 @@ def grabowski_task_list(
     if read_only is not True or schema_only:
         return _grabowski_task_list_once(
             limit, state, view, cursor, fields, schema_only, read_only=read_only,
+            decision_aware=decision_aware,
         )
     for attempt in range(3):
         try:
             return _grabowski_task_list_once(
                 limit, state, view, cursor, fields, schema_only, read_only=True,
+                decision_aware=decision_aware,
             )
         except TaskSchemaInventoryChanged as exc:
             missing = exc.__cause__
@@ -14273,6 +14277,10 @@ async def _grabowski_task_list_tool(
         cursor,
         fields,
         schema_only,
+        # Listing is observation, not implicit crash recovery. Keep the
+        # explicitly selected legacy schema/managed-cargo modes unchanged.
+        read_only=not (schema_only or view == "managed_cargo_evidence"),
+        decision_aware=True,
     )
 
 
