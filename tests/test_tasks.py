@@ -11832,6 +11832,24 @@ class TaskTests(unittest.TestCase):
         self.assertIsNone(tasks._task_scope_main_file_row(task_id))
         return keeper, task_id
 
+    def test_task_scope_oversize_selects_reflink_child(self) -> None:
+        keeper, task_id = self._wal_only_task()
+        try:
+            good = {"task_id": task_id, "cwd": "/srv/repo", "host": "remote",
+                    "lease_owner_id": None}
+            completed = subprocess.CompletedProcess(
+                [], 0, stdout=json.dumps({"status": "ok", "row": good}).encode(),
+                stderr=b"",
+            )
+            with (
+                patch.object(tasks, "TASK_SCOPE_COPY_MAX_BYTES", 1),
+                patch.object(tasks.subprocess, "run", return_value=completed) as child,
+            ):
+                self.assertEqual(good, tasks._task_scope_wal_copy_row(task_id))
+            self.assertEqual("reflink", child.call_args.args[0][-1])
+        finally:
+            keeper.close()
+
     def test_task_scope_copy_keeps_this_process_sqlite_locks(self) -> None:
         # Closing a plain descriptor on the live database in this process
         # would drop every SQLite POSIX lock it holds; another process could
@@ -11948,11 +11966,13 @@ class TaskTests(unittest.TestCase):
                     tasks._task_scope_wal_copy_row(task_id)
             with (
                 patch.object(tasks, "TASK_SCOPE_COPY_MAX_BYTES", 1),
-                patch.object(tasks.subprocess, "run") as child,
+                patch.object(tasks.subprocess, "run", return_value=subprocess.CompletedProcess(
+                    [], 0, stdout=b'{"status":"reflink_unavailable"}', stderr=b"",
+                )) as child,
             ):
-                with self.assertRaisesRegex(RuntimeError, "size budget"):
+                with self.assertRaisesRegex(RuntimeError, "streaming budget.*CoW"):
                     tasks._task_scope_wal_copy_row(task_id)
-            child.assert_not_called()
+            self.assertEqual("reflink", child.call_args.args[0][-1])
         finally:
             keeper.close()
 
