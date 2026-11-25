@@ -566,22 +566,33 @@ def _terminal_closeout_audit_event(
 
 
 def _find_terminal_closeout_audit(event: dict[str, Any]) -> str | None:
-    records, status = operator.base._audit_records_snapshot()
-    if not status.get("valid"):
-        raise RuntimeError("audit snapshot is invalid during terminal closeout recovery")
-    matches = [
-        record
-        for record in records
-        if all(record.get(key) == value for key, value in event.items())
-    ]
-    if len(matches) > 1:
-        raise RuntimeError("terminal closeout audit contains duplicate transition records")
-    if not matches:
-        return None
-    digest = matches[0].get("record_sha256")
-    if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
-        raise RuntimeError("terminal closeout audit record digest is invalid")
-    return digest
+    # Keep only one verified segment in memory. The audit chain grows across
+    # rotations; materializing all segment bytes and decoded records here
+    # stalls both terminal closeout and periodic worktree hygiene.
+    import grabowski_audit_query as audit_query
+
+    snapshot = audit_query.capture_verified_audit_snapshot()
+    found: str | None = None
+    for segment in snapshot.segments:
+        data = audit_query._load_snapshot_segment(segment)
+        lines = data.splitlines()
+        if len(lines) != segment.records:
+            raise RuntimeError("verified audit segment record count changed")
+        for line in lines:
+            record = json.loads(line.decode("utf-8"))
+            if not isinstance(record, dict):
+                raise RuntimeError("verified audit chain yielded a non-object record")
+            if not all(record.get(key) == value for key, value in event.items()):
+                continue
+            if found is not None:
+                raise RuntimeError("terminal closeout audit contains duplicate transition records")
+            digest = record.get("record_sha256")
+            if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+                raise RuntimeError("terminal closeout audit record digest is invalid")
+            found = digest
+        # Do not retain the previous segment while loading the next one.
+        del lines, data
+    return found
 
 
 def _ensure_terminal_closeout_audit(
