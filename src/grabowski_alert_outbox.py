@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -613,10 +614,13 @@ def schedule_dispatch(alert_id: str) -> bool:
     if not isinstance(alert_id, str) or ID_RE.fullmatch(alert_id) is None:
         raise AlertOutboxInputError("alert_id is invalid")
     unit = f"grabowski-ntfy-alert-{alert_id}.service"
+    systemd_run = shutil.which("systemd-run")
+    if systemd_run is None:
+        return False
     try:
         result = subprocess.run(
             [
-                "/usr/bin/systemd-run",
+                systemd_run,
                 "--user",
                 "--collect",
                 "--quiet",
