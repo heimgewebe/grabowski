@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 from contextlib import ExitStack, contextmanager
+import errno
 import fcntl
 import hashlib
 import os
@@ -18,6 +19,12 @@ INVENTORY_CHANGED_MESSAGE = (
     "Store changed while schema inventory was read; retry inventory"
 )
 COPY_CHUNK_BYTES = 1024 * 1024
+# Linux FICLONE: clone extents, never fall back to a physical byte copy.
+FICLONE = 0x40049409
+
+
+class ReflinkUnavailable(RuntimeError):
+    """The explicitly requested CoW clone cannot be created."""
 
 
 def status_identity(status: os.stat_result) -> FileIdentity:
@@ -68,6 +75,7 @@ def copy_regular_file(
     error_type: type[ChangedError],
     message: str = INVENTORY_CHANGED_MESSAGE,
     max_bytes: int | None = None,
+    reflink_only: bool = False,
 ) -> FileIdentity:
     flags = os.O_RDONLY
     if hasattr(os, "O_CLOEXEC"):
@@ -83,16 +91,26 @@ def copy_regular_file(
         if not stat.S_ISREG(before_status.st_mode):
             raise _changed(error_type, message)
         before = status_identity(before_status)
-        with os.fdopen(os.dup(descriptor), "rb") as source_handle:
+        if reflink_only:
             with target.open("xb") as target_handle:
-                copied = 0
-                while chunk := source_handle.read(COPY_CHUNK_BYTES):
-                    # A source that grows while it is streamed never writes
-                    # past the caller's budget.
-                    copied += len(chunk)
-                    if max_bytes is not None and copied > max_bytes:
-                        raise _changed(error_type, message)
-                    target_handle.write(chunk)
+                try:
+                    fcntl.ioctl(target_handle.fileno(), FICLONE, descriptor)
+                except OSError as exc:
+                    if exc.errno in (errno.EXDEV, errno.EOPNOTSUPP, errno.ENOTTY,
+                                     errno.EINVAL, errno.ENOSYS):
+                        raise ReflinkUnavailable("CoW clone unavailable") from exc
+                    raise
+        else:
+            with os.fdopen(os.dup(descriptor), "rb") as source_handle:
+                with target.open("xb") as target_handle:
+                    copied = 0
+                    while chunk := source_handle.read(COPY_CHUNK_BYTES):
+                        # A source that grows while it is streamed never writes
+                        # past the caller's budget.
+                        copied += len(chunk)
+                        if max_bytes is not None and copied > max_bytes:
+                            raise _changed(error_type, message)
+                        target_handle.write(chunk)
         os.chmod(target, 0o600)
         target_status = os.lstat(target)
         if (
@@ -147,6 +165,7 @@ def inventory_readonly_sqlite(
     allow_wal_copy: bool = True,
     allow_checkpointed_empty_wal: bool = False,
     max_copy_bytes: int | None = None,
+    reflink_only: bool = False,
 ) -> Iterator[sqlite3.Connection]:
     wal_path = Path(str(path) + "-wal")
     wal_present = wal_path.exists() or wal_path.is_symlink()
@@ -230,6 +249,7 @@ def inventory_readonly_sqlite(
             error_type=error_type,
             message=message,
             max_bytes=max_copy_bytes,
+            reflink_only=reflink_only,
         )
         wal_identity = copy_regular_file(
             wal_path,
@@ -241,6 +261,7 @@ def inventory_readonly_sqlite(
                 if max_copy_bytes is None
                 else max_copy_bytes - database_identity[2]
             ),
+            reflink_only=reflink_only,
         )
         connection = sqlite3.connect(snapshot, timeout=1)
         connection.row_factory = sqlite3.Row
