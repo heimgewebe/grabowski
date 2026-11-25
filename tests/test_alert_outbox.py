@@ -187,6 +187,62 @@ class AlertOutboxTests(unittest.TestCase):
             [alert["alert_id"]], [row["alert_id"] for row in listed["alerts"]]
         )
 
+    def _write_delivery_hold(self, cutoff: str) -> None:
+        path = self.root / outbox.HOLD_FILENAME
+        path.write_text(json.dumps({
+            "schema_version": 1, "kind": outbox.HOLD_KIND,
+            "created_before": cutoff, "reason": "historical_recovery_backlog",
+        }), encoding="utf-8")
+        os.chmod(path, 0o600)
+
+    def test_historical_hold_does_not_ack_or_dispatch_old_receipts(self) -> None:
+        with patch.object(outbox, "_utc_now", return_value="2026-01-01T00:00:00Z"):
+            old = self._enqueue(deduplication_key="old")["alert"]
+            already_ack = self._enqueue(deduplication_key="old-ack")["alert"]
+        with patch.object(outbox, "_utc_now", return_value="2026-01-02T00:00:00Z"):
+            boundary = self._enqueue(deduplication_key="boundary")["alert"]
+        outbox.acknowledge_alert(already_ack["alert_id"], already_ack["receipt_sha256"], 204)
+        self._write_delivery_hold("2026-01-02T00:00:00Z")
+        queued = outbox.list_alerts(state="queued")
+        self.assertEqual([boundary["alert_id"]], [x["alert_id"] for x in queued["alerts"]])
+        self.assertEqual((1, 1, 1), (queued["queued_count"], queued["held_count"], queued["acknowledged_count"]))
+        self.assertEqual([old["alert_id"]], [x["alert_id"] for x in outbox.list_alerts(state="held")["alerts"]])
+        self.assertEqual(3, len(outbox.list_alerts(state="all")["alerts"]))
+        publisher = Mock(return_value=204)
+        result = ntfy.dispatch_alerts(topic="test", publisher=publisher)
+        self.assertEqual("ok", result["status"])
+        self.assertEqual(1, publisher.call_count)
+        self.assertEqual(boundary["alert_id"], publisher.call_args.args[1]["alert_id"])
+        self.assertFalse((self.root / f"{old['alert_id']}.ack.json").exists())
+        self.assertTrue((self.root / f"{old['alert_id']}.json").exists())
+        with patch.object(outbox, "_utc_now", return_value="2026-01-03T00:00:00Z"):
+            replay = self._enqueue(deduplication_key="old")
+        self.assertTrue(replay["replayed"])
+        self.assertEqual(old["receipt_sha256"], replay["alert"]["receipt_sha256"])
+        self.assertEqual([], outbox.list_alerts(state="queued")["alerts"])
+
+    def test_invalid_delivery_hold_never_dispatches(self) -> None:
+        self._enqueue()
+        for cutoff in ("not-a-time", "2999-01-01T00:00:00Z"):
+            self._write_delivery_hold(cutoff)
+            listed = outbox.list_alerts()
+            self.assertEqual([], listed["alerts"])
+            self.assertTrue(listed["invalid_receipts"])
+            publisher = Mock(return_value=204)
+            self.assertEqual("blocked", ntfy.dispatch_alerts(topic="test", publisher=publisher)["status"])
+            publisher.assert_not_called()
+
+    def test_history_size_no_longer_disables_dispatch(self) -> None:
+        current = self._enqueue()["alert"]
+        # Reproduce the old directory-entry limit with valid transient files.
+        # No receipt bytes or ACKs need to be fabricated for this regression.
+        for i in range(1001):
+            path = self.root / f".{'a' * 32}.json.{i+1}.{'b' * 32}.tmp"
+            path.touch(mode=0o600)
+        listed = outbox.list_alerts(limit=1)
+        self.assertEqual([], listed["invalid_receipts"])
+        self.assertEqual([current["alert_id"]], [x["alert_id"] for x in listed["alerts"]])
+
     def test_dispatch_scheduling_uses_existing_entrypoint_and_is_fail_soft(
         self,
     ) -> None:

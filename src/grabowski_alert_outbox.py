@@ -43,7 +43,8 @@ MAX_IDENTITY_BYTES = 2_048
 MAX_FIELD_COUNT = 8
 MAX_FIELD_BYTES = 160
 MAX_LIST_LIMIT = 100
-MAX_LIST_SCAN = 1_000
+HOLD_FILENAME = "delivery-hold.json"
+HOLD_KIND = "grabowski_ntfy_delivery_hold"
 CODE_RE = re.compile(r"[a-z][a-z0-9._-]{0,63}\Z")
 ID_RE = re.compile(r"[0-9a-f]{32}\Z")
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
@@ -51,7 +52,7 @@ FIELD_VALUE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._:=@/+\-\[\]]{0,159}\Z")
 ALERT_FILE_RE = re.compile(r"(?P<alert_id>[0-9a-f]{32})\.json\Z")
 ACK_FILE_RE = re.compile(r"(?P<alert_id>[0-9a-f]{32})\.ack\.json\Z")
 PRIVATE_IO_TEMP_RE = re.compile(
-    r"\.(?:[0-9a-f]{32}\.json|[0-9a-f]{32}\.ack\.json)"
+    r"\.(?:[0-9a-f]{32}\.json|[0-9a-f]{32}\.ack\.json|delivery-hold\.json)"
     r"\.[1-9][0-9]*\.[0-9a-f]{32}\.tmp\Z"
 )
 SECRET_ASSIGNMENT_RE = re.compile(
@@ -475,9 +476,33 @@ def acknowledge_alert(
     }
 
 
+def _delivery_hold_cutoff(root: Path) -> datetime | None:
+    """Read an explicit recovery cutoff, not an acknowledgement or TTL."""
+    try:
+        hold, _ = _read_private_json(root / HOLD_FILENAME, label="ntfy delivery hold")
+    except FileNotFoundError:
+        return None
+    if (
+        set(hold) != {"schema_version", "kind", "created_before", "reason"}
+        or type(hold["schema_version"]) is not int
+        or hold["schema_version"] != SCHEMA_VERSION
+        or hold["kind"] != HOLD_KIND
+    ):
+        raise AlertOutboxIntegrityError("invalid delivery hold schema")
+    try:
+        _validate_code(hold["reason"], label="delivery hold reason")
+        _validate_timestamp(hold["created_before"], label="delivery hold cutoff")
+        cutoff = datetime.fromisoformat(hold["created_before"].replace("Z", "+00:00"))
+    except (AlertOutboxInputError, ValueError, TypeError, AttributeError) as exc:
+        raise AlertOutboxIntegrityError("invalid delivery hold cutoff or reason") from exc
+    if cutoff > datetime.now(timezone.utc):
+        raise AlertOutboxIntegrityError("delivery hold cutoff cannot be in the future")
+    return cutoff
+
+
 def list_alerts(*, state: str = "queued", limit: int = 50) -> dict[str, Any]:
-    if state not in {"queued", "acknowledged", "all"}:
-        raise AlertOutboxInputError("state must be queued, acknowledged, or all")
+    if state not in {"queued", "acknowledged", "held", "all"}:
+        raise AlertOutboxInputError("state must be queued, acknowledged, held, or all")
     if (
         isinstance(limit, bool)
         or not isinstance(limit, int)
@@ -491,19 +516,27 @@ def list_alerts(*, state: str = "queued", limit: int = 50) -> dict[str, Any]:
         return {"alerts": [], "invalid_receipts": [], "state": state}
     alerts: list[dict[str, Any]] = []
     invalid: list[dict[str, str]] = []
-    entries: list[Path] = []
-    for index, path in enumerate(root.iterdir()):
-        if index >= MAX_LIST_SCAN:
-            invalid.append({"name": "scan", "error": "scan_truncated"})
-            break
-        entries.append(path)
-    entries.sort(key=lambda item: item.name)
+    try:
+        cutoff = _delivery_hold_cutoff(root)
+    except (OSError, AlertOutboxError, AlertOutboxInputError) as exc:
+        return {"alerts": [], "invalid_receipts": [
+            {"name": HOLD_FILENAME, "error": type(exc).__name__}
+        ], "state": state}
+    # The directory is a private append-only history. Counting *all* receipts
+    # and ACKs against a fixed lifetime cap eventually prevents any delivery.
+    # Keep the returned result bounded, but inspect the complete inventory.
+    entries = sorted(root.iterdir(), key=lambda item: item.name)
+    held_count = 0
+    queued_count = 0
+    acknowledged_count = 0
     alert_ids = {
         match.group("alert_id")
         for path in entries
         if (match := ALERT_FILE_RE.fullmatch(path.name)) is not None
     }
     for path in entries:
+        if path.name == HOLD_FILENAME:
+            continue
         match = ALERT_FILE_RE.fullmatch(path.name)
         if match is None:
             ack_match = ACK_FILE_RE.fullmatch(path.name)
@@ -544,13 +577,30 @@ def list_alerts(*, state: str = "queued", limit: int = 50) -> dict[str, Any]:
             invalid.append({"name": path.name, "error": type(exc).__name__})
             continue
         acknowledged = acknowledgement is not None
-        if state == "queued" and acknowledged:
+        held = (
+            not acknowledged
+            and cutoff is not None
+            and datetime.fromisoformat(alert["created_at"].replace("Z", "+00:00")) < cutoff
+        )
+        if acknowledged:
+            acknowledged_count += 1
+        elif held:
+            held_count += 1
+        else:
+            queued_count += 1
+        if state == "queued" and (acknowledged or held):
             continue
         if state == "acknowledged" and not acknowledged:
             continue
+        if state == "held" and not held:
+            continue
         if len(alerts) < limit:
             alerts.append({**alert, "file_sha256": alert_file_sha256})
-    return {"alerts": alerts, "invalid_receipts": invalid, "state": state}
+    return {
+        "alerts": alerts, "invalid_receipts": invalid, "state": state,
+        "queued_count": queued_count, "held_count": held_count,
+        "acknowledged_count": acknowledged_count,
+    }
 
 
 def validate_alert(alert: dict[str, Any]) -> dict[str, Any]:
