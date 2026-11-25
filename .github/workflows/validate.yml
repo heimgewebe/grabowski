@@ -10,6 +10,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   validate:
@@ -87,8 +88,101 @@ jobs:
             --tmpfs /tmp --dev /dev --proc /proc --chdir / \
             -- /usr/bin/true
 
+      - name: Choose validation tier
+        id: tier
+        shell: python
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REPOSITORY: ${{ github.repository }}
+          REF_NAME: ${{ github.ref }}
+          HEAD_SHA: ${{ github.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          import json
+          import os
+          import re
+          import subprocess
+
+          def api(path):
+              return json.loads(subprocess.run(
+                  ["gh", "api", path], check=True, capture_output=True,
+                  text=True, timeout=10,
+              ).stdout)
+
+          def complete_inventory(response, key):
+              rows = response[key]
+              if (not isinstance(rows, list) or type(response["total_count"]) is not int
+                      or response["total_count"] != len(rows)):
+                  raise ValueError("incomplete Actions inventory")
+              return rows
+
+          def full_group(repo, sha):
+              # Query by SHA at repository level: retired queue refs may not
+              # be discoverable through the workflow-filtered endpoint.
+              runs = complete_inventory(api(
+                  f"repos/{repo}/actions/runs?head_sha={sha}&per_page=30"
+              ), "workflow_runs")
+              matches = [
+                  r for r in runs
+                  if r.get("head_sha") == sha
+                  and (r.get("repository") or {}).get("full_name") == repo
+                  and (r.get("head_repository") or {}).get("full_name") == repo
+                  and r.get("event") == "merge_group"
+                  and r.get("path") == ".github/workflows/validate.yml"
+                  and r.get("head_branch", "").startswith("gh-readonly-queue/main/")
+              ]
+              if len(matches) != 1 or not (
+                  matches[0].get("status") == "completed"
+                  and matches[0].get("conclusion") == "success"
+              ):
+                  return False
+              run_id, attempt = matches[0]["id"], matches[0]["run_attempt"]
+              if any(type(n) is not int or n < 1 for n in (run_id, attempt)):
+                  return False
+              jobs = complete_inventory(api(
+                  f"repos/{repo}/actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100"
+              ), "jobs")
+              if sorted(j.get("name") for j in jobs) != ["validate (3.10)", "validate (3.12)"]:
+                  return False
+              for job in jobs:
+                  if not (
+                      job.get("run_id") == run_id and job.get("head_sha") == sha
+                      and job.get("run_attempt") == attempt
+                      and job.get("status") == "completed" and job.get("conclusion") == "success"
+                  ):
+                      return False
+                  for name in ("Validate repository", "Prove reproducible deployment staging"):
+                      steps = [s for s in job["steps"] if s.get("name") == name]
+                      if len(steps) != 1 or not (
+                          steps[0].get("status") == "completed" and steps[0].get("conclusion") == "success"
+                      ):
+                          return False
+              print(f"Reusing complete merge-group suite: run {run_id} attempt {attempt} for {sha}")
+              return True
+
+          tier = "full"
+          repo, sha = os.environ["REPOSITORY"], os.environ["HEAD_SHA"]
+          if (
+              os.environ["EVENT_NAME"] == "push" and repo == "heimgewebe/grabowski"
+              and os.environ["REF_NAME"] == "refs/heads/main" and re.fullmatch(r"[0-9a-f]{40}", sha)
+          ):
+              try:
+                  if full_group(repo, sha):
+                      tier = "main-reuse"
+              except (OSError, subprocess.SubprocessError, ValueError, TypeError, KeyError, AttributeError):
+                  # Unavailable or malformed proof does not reduce validation.
+                  pass
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              print(f"tier={tier}", file=output)
+          print(f"Validation tier: {tier}")
+
       - name: Validate repository
+        if: steps.tier.outputs.tier != 'main-reuse'
         run: make validate
+
+      - name: Validate main contracts after proven full integration
+        if: steps.tier.outputs.tier == 'main-reuse'
+        run: make validate-main-reuse
 
       - name: Prove reproducible deployment staging
         run: make deploy-check
