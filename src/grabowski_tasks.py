@@ -7421,6 +7421,7 @@ try:
         temporary_prefix="grabowski-task-scope-",
         error_type=Changed,
         max_copy_bytes=int(sys.argv[4]),
+        reflink_only=(len(sys.argv) > 5 and sys.argv[5] == "reflink"),
     ) as connection:
         row = connection.execute(
             "SELECT task_id, cwd, host, lease_owner_id FROM tasks WHERE task_id=?",
@@ -7429,6 +7430,8 @@ try:
         result = {"status": "ok", "row": dict(row) if row is not None else None}
 except (Changed, sqlite3.Error):
     result = {"status": "changed"}
+except store.ReflinkUnavailable:
+    result = {"status": "reflink_unavailable"}
 except OSError:
     result = {"status": "failed"}
 sys.stdout.write(json.dumps(result))
@@ -7443,8 +7446,10 @@ def _task_scope_wal_copy_row(identifier: str) -> dict[str, Any] | None:
     another process checkpoint and delete the live WAL and -shm. Only a
     short-lived child, which holds no SQLite lock, copies database and WAL
     with identity checks and queries the copy; the live -shm is never opened.
-    The child enforces the copy budget while streaming, so a WAL that grows
-    after the size check cannot exceed it.
+    The child enforces the byte budget while streaming. Stores already
+    above that budget use an explicitly CoW-only private snapshot; the same
+    source identity checks apply, and unsupported clone operations never
+    fall back to an unbounded stream. Live WAL/SHM remain untouched.
     """
     changed = "Task store changed during scope snapshot"
     try:
@@ -7455,11 +7460,7 @@ def _task_scope_wal_copy_row(identifier: str) -> dict[str, Any] | None:
             wal_size = 0
     except FileNotFoundError as exc:
         raise TaskSchemaInventoryChanged(changed) from exc
-    if database_size + wal_size > TASK_SCOPE_COPY_MAX_BYTES:
-        raise RuntimeError(
-            "Task scope copy exceeds its size budget; retry after the task "
-            "WAL is checkpointed"
-        )
+    over_budget = database_size + wal_size > TASK_SCOPE_COPY_MAX_BYTES
     # This process owns the private directory: a child killed on timeout
     # cannot leave its database copy behind.
     with tempfile.TemporaryDirectory(prefix="grabowski-task-scope-") as private:
@@ -7475,6 +7476,7 @@ def _task_scope_wal_copy_row(identifier: str) -> dict[str, Any] | None:
                     str(TASK_DB),
                     identifier,
                     str(TASK_SCOPE_COPY_MAX_BYTES),
+                    "reflink" if over_budget else "stream",
                 ],
                 stdin=subprocess.DEVNULL,
                 capture_output=True,
@@ -7492,6 +7494,11 @@ def _task_scope_wal_copy_row(identifier: str) -> dict[str, Any] | None:
         result = None
     if result == {"status": "changed"}:
         raise TaskSchemaInventoryChanged(changed)
+    if over_budget and result == {"status": "reflink_unavailable"}:
+        raise RuntimeError(
+            "Task scope exceeds its streaming budget and a private CoW "
+            "snapshot is unavailable; retry after the task is checkpointed"
+        )
     row = result.get("row") if isinstance(result, dict) else None
     if (
         not isinstance(result, dict)
