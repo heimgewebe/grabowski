@@ -128,6 +128,39 @@ hide a primary exception, or change the primary return value. The alert path
 itself remains fail-closed: it records no scheduling or delivery claim without
 the corresponding observed result, and no acknowledgement before HTTP 2xx.
 
+## Explicit historical delivery hold
+
+When recovering a missing topic after an extended outage, do not silently
+send the entire stale backlog. After inspecting the existing receipts, the
+operator may publish one private (0600) `delivery-hold.json` in the existing
+alert-outbox directory **before** restoring the topic, while holding the
+existing dispatcher lock:
+
+```json
+{
+  "schema_version": 1,
+  "kind": "grabowski_ntfy_delivery_hold",
+  "created_before": "2026-01-02T00:00:00Z",
+  "reason": "historical_recovery_backlog"
+}
+```
+
+The cutoff is explicit, absolute and not in the future. It is not an
+automatic age-based expiry. Unacknowledged alerts strictly before the
+cutoff are excluded from `list_alerts(state="queued")` and can be
+inspected with `state="held"`; `state="all"` includes the complete
+history. Returned alert windows remain bounded and the projection reports
+queued, held and acknowledged counts. Every receipt and ACK keeps its
+original bytes and deterministic identity. A hold neither resolves an
+underlying incident nor acknowledges delivery. An invalid hold blocks
+dispatch. Only an explicit, deliberate operator adjustment of the cutoff
+under the dispatcher lock may release held alerts for delivery. An older
+dispatcher does not recognize the hold file; before rolling back, remove
+the active topic or otherwise stop dispatch to avoid historical replay.
+Historical directory cardinality does not impose a lifetime delivery
+limit; all entries remain integrity-checked and the returned window is
+bounded by `limit`.
+
 ## Recovery and rollback
 
 Queued alerts are retried by invoking the same dispatcher entrypoint. Because
