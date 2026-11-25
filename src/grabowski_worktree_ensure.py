@@ -1032,7 +1032,9 @@ def _bind_checkout_lifecycle(
         str(inputs["branch"]),
     )
     try:
-        physical = physical_checkout.capture_physical_checkout_identity(checkout)
+        physical = physical_checkout.capture_physical_checkout_identity(
+            checkout, include_stable_witness=True
+        )
     except Exception as exc:
         raise WorktreeEnsureAction(
             "worktree lifecycle physical checkout identity could not be captured"

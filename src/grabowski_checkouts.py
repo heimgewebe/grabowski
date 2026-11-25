@@ -6510,28 +6510,14 @@ def _expired_same_lane_catchup_evidence(
     ):
         raise RuntimeError("expired catchup original checkout receipt is incomplete")
     try:
-        physical = physical_checkout.verify_physical_checkout_identity(original_physical)
+        physical = physical_checkout.verify_physical_checkout_identity(
+            original_physical, allow_historical_device_remap=True
+        )
+    except physical_checkout.PhysicalCheckoutIdentityError as exc:
+        raise RuntimeError("expired catchup physical checkout identity drifted") from exc
+    if physical["physical_identity_sha256"] == original_physical["physical_identity_sha256"]:
         physical_transition = "exact"
-    except physical_checkout.PhysicalCheckoutIdentityError:
-        # Following a genuine filesystem remount, Linux may renumber st_dev
-        # without changing any of the three Git-linked inodes or paths.
-        # This narrowly handles uniform device renumbering, not arbitrary
-        # relocated, replaced or identity-ambiguous checkouts.
-        physical = physical_checkout.capture_physical_checkout_identity(record["path"])
-        nodes = ("root", "git_dir", "common_dir")
-        old_devices = {original_physical[node]["device"] for node in nodes}
-        new_devices = {physical[node]["device"] for node in nodes}
-        if (
-            len(old_devices) != 1
-            or len(new_devices) != 1
-            or old_devices == new_devices
-            or any(
-                original_physical[node]["path"] != physical[node]["path"]
-                or original_physical[node]["inode"] != physical[node]["inode"]
-                for node in nodes
-            )
-        ):
-            raise RuntimeError("expired catchup physical checkout identity drifted")
+    else:
         physical_transition = "uniform_device_renumber"
 
     keys = resources.normalize_resource_keys(inputs.get("resource_keys", []))

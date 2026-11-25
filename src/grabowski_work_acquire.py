@@ -481,11 +481,20 @@ def _terminal_checkout_physical_identity(
     ):
         raise RuntimeError("terminal managed checkout path binding is invalid")
     try:
-        observed = (
-            physical_checkout.capture_physical_checkout_identity(checkout_path)
-            if expected is None
-            else physical_checkout.verify_physical_checkout_identity(expected)
-        )
+        if expected is None:
+            observed = physical_checkout.capture_physical_checkout_identity(
+                checkout_path, include_stable_witness=True
+            )
+            # Do not turn an unverified replacement into a new durable witness.
+            original = lifecycle.get("physical_checkout")
+            if isinstance(original, dict):
+                verified = physical_checkout.verify_physical_checkout_identity(
+                    original, allow_historical_device_remap=True
+                )
+                if verified["physical_identity_sha256"] != observed["physical_identity_sha256"]:
+                    raise RuntimeError("terminal checkout changed during physical readback")
+        else:
+            observed = physical_checkout.verify_physical_checkout_identity(expected)
     except Exception as exc:
         raise RuntimeError(
             f"terminal managed checkout physical identity is invalid: {type(exc).__name__}: {exc}"
@@ -493,7 +502,8 @@ def _terminal_checkout_physical_identity(
     root = observed.get("root")
     if not isinstance(root, dict) or root.get("path") != checkout_path:
         raise RuntimeError("terminal managed checkout physical root drifted")
-    return observed
+    # Preserve the verified pending receipt's historical witness.
+    return expected if expected is not None else observed
 
 
 def _terminal_closeout_pending_assessment(
@@ -2822,8 +2832,11 @@ def _continuation_preimage(
     if not isinstance(checkout_key, str) or checkout_key != prior_lifecycle.get("checkout_key"):
         raise RuntimeError("managed worktree continuation checkout identity drifted")
     try:
+        # The durable ensure receipt may predate a mount namespace change.
+        # Reanchor only here; every subsequent snapshot and authorization
+        # uses this fresh, exact physical identity and registered Git directory.
         expected_physical = physical_checkout.verify_physical_checkout_identity(
-            prior_physical
+            prior_physical, allow_historical_device_remap=True
         )
     except Exception as exc:
         raise RuntimeError(
@@ -3083,7 +3096,7 @@ def _continuation_preimage(
         try:
             snapshot_physical = (
                 physical_checkout.verify_physical_checkout_identity(
-                    prior_physical
+                    expected_physical
                 )
             )
         except Exception as exc:

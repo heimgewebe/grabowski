@@ -8206,7 +8206,7 @@ class WorkAcquireTests(unittest.TestCase):
                 lane_id, assessment, expected_receipt_sha256=str(receipt["receipt_sha256"])
             )
 
-        capture.assert_called_once_with(str(self.target))
+        capture.assert_called_once_with(str(self.target), include_stable_witness=True)
         self.assertEqual(stored["terminal_closeout"]["checkout_physical_identity"], physical)
         self.assertNotIn("terminal_closeout_pending", stored)
 
