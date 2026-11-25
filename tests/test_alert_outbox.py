@@ -247,14 +247,25 @@ class AlertOutboxTests(unittest.TestCase):
         self,
     ) -> None:
         completed = Mock(returncode=0)
-        with patch.object(outbox.subprocess, "run", return_value=completed) as run:
-            self.assertTrue(outbox.schedule_dispatch("a" * 32))
+        systemd_run = "/nix/store/test-systemd/bin/systemd-run"
+        with patch.object(outbox.shutil, "which", return_value=systemd_run) as which:
+            with patch.object(outbox.subprocess, "run", return_value=completed) as run:
+                self.assertTrue(outbox.schedule_dispatch("a" * 32))
+        which.assert_called_once_with("systemd-run")
 
         argv = run.call_args.args[0]
+        self.assertEqual(systemd_run, argv[0])
         self.assertIn("--unit=grabowski-ntfy-alert-" + "a" * 32 + ".service", argv)
         self.assertEqual(["-I", "-m", "grabowski_ntfy_dispatch"], argv[-3:])
-        with patch.object(outbox.subprocess, "run", side_effect=OSError("offline")):
-            self.assertFalse(outbox.schedule_dispatch("a" * 32))
+        with patch.object(outbox.shutil, "which", return_value=systemd_run):
+            with patch.object(outbox.subprocess, "run", side_effect=OSError("offline")):
+                self.assertFalse(outbox.schedule_dispatch("a" * 32))
+
+    def test_dispatch_without_systemd_run_is_fail_soft(self) -> None:
+        with patch.object(outbox.shutil, "which", return_value=None):
+            with patch.object(outbox.subprocess, "run") as run:
+                self.assertFalse(outbox.schedule_dispatch("a" * 32))
+        run.assert_not_called()
 
 
 class AlertDispatchTests(unittest.TestCase):

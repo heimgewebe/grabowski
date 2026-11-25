@@ -21639,6 +21639,42 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertIn("merge_guard_live_diff_empty", errors)
         self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
 
+    def test_captain_preflight_diagnostic_preserves_executor_error(self) -> None:
+        cases = (
+            ([], "provider observation failed", ["provider observation failed"]),
+            ([], None, ["pre-execution failure"]),
+            (["explicit_preflight_error"], "fallback", ["explicit_preflight_error"]),
+        )
+        for errors, detail, expected in cases:
+            with self.subTest(errors=errors, detail=detail):
+                parameters = authorized_captain_run_parameters()
+                gh = FakeGh(view={
+                    "number": 96, "state": "OPEN", "baseRefName": "main",
+                    "baseRefOid": CAPTAIN_BASE_SHA, "headRefOid": CAPTAIN_HEAD,
+                    "isDraft": False, "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
+                })
+                with patch.object(
+                    grips, "_run_captain_pr_merge",
+                    return_value={
+                        "action": "pr-merge", "execution_invoked": False,
+                        "execution_attempted": False, "verification_passed": False,
+                        "preflight_passed": False, "preflight_errors": errors,
+                        "verification_error": detail,
+                    },
+                ):
+                    result = grips.grip_run(
+                        "captain-run", parameters, profile="captain", allow_mutation=True,
+                        command_runner=FakeGit(), github_runner=gh,
+                    )
+                self.assertEqual("blocked", result["receipt"]["status"])
+                self.assertEqual(expected, result["output"]["blocked_reasons"])
+                check = next(c for c in result["receipt"]["checks"]
+                             if c["id"] == "execution-preflight")
+                self.assertEqual("fail", check["status"])
+                self.assertEqual("; ".join(expected), check["detail"])
+                self.assertFalse(result["output"]["executions"][0]["execution_invoked"])
+                self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
+
     def test_atomic_merge_guard_releases_after_unexpected_executor_exception(self) -> None:
         parameters = authorized_captain_run_parameters()
         gh = FakeGh(view={
