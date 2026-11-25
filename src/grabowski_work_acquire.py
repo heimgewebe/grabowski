@@ -3841,6 +3841,176 @@ def _compensate_acquisitions(
     )
 
 
+def _ensure_parameters(
+    inputs: dict[str, Any], lifecycle_source: dict[str, str]
+) -> dict[str, Any]:
+    return {
+        "repo": inputs["repo"],
+        "target_path": inputs["target_path"],
+        "branch": inputs["branch"],
+        "base_head": inputs["base_head"],
+        "lease_owner_id": inputs["lease_owner_id"],
+        "purpose": inputs["purpose"],
+        "source_kind": lifecycle_source["kind"],
+        "source_id": lifecycle_source["id"],
+        "artifact_class": inputs["artifact_class"],
+        "retention_until_unix": inputs["retention_until_unix"],
+        "idempotency_key": f"work-acquire:{inputs['lane_id']}",
+        "system_convergence": inputs["system_convergence"],
+        "system_convergence_plan_sha256": inputs["system_convergence_plan"][
+            "plan_sha256"
+        ],
+    }
+
+
+def _lane_authority(
+    inputs: dict[str, Any], lifecycle_source: dict[str, str]
+) -> dict[str, Any]:
+    return {
+        "controller": inputs["controller"],
+        "scoped_writer": inputs["scoped_writer"],
+        "source": inputs["source"],
+        "lifecycle_source": lifecycle_source,
+        "writer_effects": [
+            "implement",
+            "test",
+            "commit",
+            "push",
+            "pull-request-create-or-update",
+        ],
+        "controller_only_effects": [
+            "merge",
+            "deployment",
+            "bureau-terminalization",
+            "closeout",
+        ],
+        "single_writer_scope": "overlapping-resource-lane",
+    }
+
+
+def _recover_interrupted_ensure(
+    existing: dict[str, Any],
+    inputs: dict[str, Any],
+    lifecycle_source: dict[str, str],
+    receipt_path: Path,
+    *,
+    inspect_resource_fn: Callable[[str], dict[str, Any] | None],
+    ensure_worktree_fn: Callable[..., dict[str, Any]],
+    runner: Callable[[Path, list[str]], dict[str, Any]],
+    audit_fn: Callable[[dict[str, Any]], None] | None,
+) -> dict[str, Any] | None:
+    """Converge a proven existing Git effect; never retry Git create or a writer."""
+    if (
+        existing.get("error_class") != "ResourceSchemaInventoryChanged"
+        or existing.get("effect_observed") is not None
+        or existing.get("compensation") is not None
+        or existing.get("acquisition") is not None
+        or existing.get("writer_start") is not None
+        or existing.get("writer_job") is not None
+        or existing.get("worktree_receipt") is not None
+        or inputs.get("scoped_writer_command") is not None
+    ):
+        return None
+
+    try:
+        owner = inputs["lease_owner_id"]
+        lease_receipt = existing.get("lease_receipt")
+        if not isinstance(lease_receipt, dict) or lease_receipt.get("owner_id") != owner:
+            raise LeaseAcquisitionOutcomeUnknown("interrupted ensure lacks original acquisition")
+        snapshots = {
+            row["resource_key"]: _lease_snapshot(row, owner_id=owner)
+            for row in lease_receipt.get("leases", [])
+        }
+        if sorted(snapshots) != inputs["resource_keys"] or len(snapshots) != len(
+            lease_receipt["leases"]
+        ):
+            raise LeaseAcquisitionOutcomeUnknown("interrupted ensure lease scope differs")
+
+        def inspect_exact(key: str) -> dict[str, Any]:
+            current = inspect_resource_fn(key)
+            expected = snapshots.get(key)
+            if (
+                expected is None or current is None
+                or _lease_snapshot(current, owner_id=owner) != expected
+                or expected["expires_at_unix"] <= int(time.time()) + 30
+            ):
+                raise LeaseAcquisitionOutcomeUnknown("interrupted ensure live lease changed")
+            return current
+
+        for key in snapshots:
+            inspect_exact(key)
+        output = ensure_worktree_fn(
+            _ensure_parameters(inputs, lifecycle_source), runner, inspect_exact,
+            recover_existing_only=True,
+        )
+        if (
+            not isinstance(output, dict)
+            or output.get("result_state") not in SUCCESS_STATES
+            or output.get("replayed") is not True
+            or not output.get("post_state", {}).get("matches_requested_state")
+            or not isinstance(output.get("lifecycle"), dict)
+        ):
+            raise RuntimeError("interrupted ensure did not establish the exact existing effect")
+
+        candidate = {
+            **existing,
+            "state": "ready",
+            "worktree_receipt": output,
+        }
+        preimage = _continuation_preimage(candidate, inputs, lifecycle_source, runner)
+        if (
+            preimage is None or preimage.get("head") != inputs["base_head"]
+            or preimage.get("dirty") or preimage.get("tracked_index_dirty")
+            or preimage.get("tracked_worktree_dirty") or preimage.get("untracked_count")
+        ):
+            raise RuntimeError("interrupted ensure checkout no longer has the exact clean state")
+        with _continuation_authorization_guard(preimage):
+            for key in snapshots:
+                inspect_exact(key)
+            record = _write_state(
+                receipt_path,
+                {
+                    **{key: value for key, value in candidate.items()
+                       if key not in {"error", "error_class", "next_action"}},
+                    "decision": "CONTINUE_EXISTING",
+                    "effect_observed": True,
+                    "authority": _lane_authority(inputs, lifecycle_source),
+                    "continuation_preimage": preimage,
+                    "attempt_count": int(existing.get("attempt_count", 0)) + 1,
+                    "updated_at_unix": int(time.time()),
+                    "next_action": (
+                        "start_scoped_writer" if inputs["scoped_writer"]
+                        else "controller_execute"
+                    ),
+                    "interrupted_ensure_recovery": {
+                        "previous_receipt_sha256": existing["receipt_sha256"],
+                        "error_class": existing["error_class"],
+                        "error": existing.get("error"),
+                        "same_lease_generations": True,
+                        "git_create_repeated": False,
+                    },
+                },
+            )
+    except Exception as exc:
+        # Keep the original uncertainty fence and all lease ownership unchanged.
+        # A successful inner receipt can still be read back on the next attempt.
+        return {
+            **existing,
+            "durable_receipt_path": str(receipt_path),
+            "replayed": True,
+            "recovery_blocker": f"{type(exc).__name__}: {str(exc)[:512]}",
+        }
+    if audit_fn is not None:
+        audit_fn({
+            "operation": "work-acquire",
+            "lane_id": inputs["lane_id"],
+            "state": record["state"],
+            "inputs_sha256": record["inputs_sha256"],
+            "effect_observed": True,
+        })
+    return {**record, "durable_receipt_path": str(receipt_path), "replayed": True}
+
+
 def acquire_work(
     parameters: dict[str, Any],
     *,
@@ -3923,6 +4093,15 @@ def acquire_work(
                 "replayed": True,
             }
         if existing is not None and existing.get("state") == "outcome_unknown":
+            recovered = _recover_interrupted_ensure(
+                existing, inputs, lifecycle_source, receipt_path,
+                inspect_resource_fn=inspect_resource_fn,
+                ensure_worktree_fn=ensure_worktree_fn,
+                runner=runner,
+                audit_fn=audit_fn,
+            )
+            if recovered is not None:
+                return recovered
             return {
                 **existing,
                 "durable_receipt_path": str(receipt_path),
@@ -4364,23 +4543,7 @@ def acquire_work(
                 writer_liveness=writer_liveness,
             )
 
-        ensure_parameters = {
-            "repo": inputs["repo"],
-            "target_path": inputs["target_path"],
-            "branch": inputs["branch"],
-            "base_head": inputs["base_head"],
-            "lease_owner_id": inputs["lease_owner_id"],
-            "purpose": inputs["purpose"],
-            "source_kind": lifecycle_source["kind"],
-            "source_id": lifecycle_source["id"],
-            "artifact_class": inputs["artifact_class"],
-            "retention_until_unix": inputs["retention_until_unix"],
-            "idempotency_key": f"work-acquire:{lane_id}",
-            "system_convergence": inputs["system_convergence"],
-            "system_convergence_plan_sha256": inputs["system_convergence_plan"][
-                "plan_sha256"
-            ],
-        }
+        ensure_parameters = _ensure_parameters(inputs, lifecycle_source)
         try:
             if continuation_preimage is not None:
                 output = existing["worktree_receipt"]
@@ -4494,26 +4657,7 @@ def acquire_work(
                 if result_state == "CREATED"
                 else "EXECUTE"
             )
-            authority = {
-                "controller": inputs["controller"],
-                "scoped_writer": inputs["scoped_writer"],
-                "source": inputs["source"],
-                "lifecycle_source": lifecycle_source,
-                "writer_effects": [
-                    "implement",
-                    "test",
-                    "commit",
-                    "push",
-                    "pull-request-create-or-update",
-                ],
-                "controller_only_effects": [
-                    "merge",
-                    "deployment",
-                    "bureau-terminalization",
-                    "closeout",
-                ],
-                "single_writer_scope": "overlapping-resource-lane",
-            }
+            authority = _lane_authority(inputs, lifecycle_source)
             continuation_authorized = continuation_preimage is None
             writer_job = existing_writer_job
             writer_start: dict[str, Any] | None = None

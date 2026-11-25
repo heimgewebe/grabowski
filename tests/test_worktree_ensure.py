@@ -800,6 +800,166 @@ class WorktreeEnsureTests(unittest.TestCase):
             self.head,
         )
 
+    def test_interrupted_work_lane_recovers_post_create_inventory_failure(self) -> None:
+        import grabowski_work_acquire as work_acquire
+
+        target = self.worktree_root / "interrupted-lane"
+        parameters = {
+            "source_kind": "bureau_task",
+            "source_id": "STORAGE-LIFECYCLE-V1-T003",
+            "controller_actor": "test-controller",
+            "repo": str(self.repo),
+            "base_head": self.head,
+            "branch": "topic-interrupted",
+            "target_path": str(target),
+            "purpose": "verify exact post-create recovery",
+            "retention_until_unix": self.retention_until,
+            "idempotency_key": "outer-interrupted",
+        }
+        now = int(time.time())
+        live_leases = {}
+        acquire_calls = []
+        git_add_calls = []
+
+        def acquire(owner, keys, **kwargs):
+            acquire_calls.append(tuple(keys))
+            for key in keys:
+                live_leases[key] = {
+                    "resource_key": key, "owner_id": owner,
+                    "purpose": parameters["purpose"],
+                    "acquired_at_unix": now, "updated_at_unix": now,
+                    "expires_at_unix": now + 1800, "metadata_sha256": "d" * 64,
+                }
+            return {
+                "owner_id": owner, "leases": [dict(live_leases[k]) for k in keys],
+                "preserved": [], "reclaimed": [], "bureau_contract": None,
+            }
+
+        def runner(repo, argv):
+            if argv[:2] == ["worktree", "add"]:
+                git_add_calls.append(tuple(argv))
+            return grips._default_command_runner(repo, argv)
+
+        def release(*args, **kwargs):
+            self.fail("recovery must not release the original acquired leases")
+
+        kwargs = {
+            "acquire_resources_fn": acquire,
+            "release_resources_fn": release,
+            "inspect_resource_fn": lambda key: live_leases.get(key),
+            "runner": runner,
+        }
+        original_bind = worktree_ensure._bind_checkout_lifecycle
+        bind_calls = []
+
+        def fail_once(*args, **kwargs):
+            bind_calls.append(True)
+            if len(bind_calls) == 1:
+                raise checkouts.resources.ResourceSchemaInventoryChanged(
+                    "simulated inventory churn after verified Git creation"
+                )
+            return original_bind(*args, **kwargs)
+
+        with patch.dict(os.environ, {
+            "GRABOWSKI_WORK_LANE_ROOT": str(self.root / "lanes"),
+            "GRABOWSKI_WORKTREE_ENSURE_RECEIPT_ROOT": str(self.receipt_root),
+            "GROSSER_ADLER_STATE_ROOT": str(self.root / "adler"),
+        }), patch.object(
+            worktree_ensure, "_bind_checkout_lifecycle", side_effect=fail_once,
+        ):
+            first = work_acquire.acquire_work(parameters, **kwargs)
+            self.assertEqual("outcome_unknown", first["state"], first)
+            self.assertEqual("ResourceSchemaInventoryChanged", first["error_class"])
+            self.assertEqual(self.head, self._git(target, "rev-parse", "HEAD").stdout.strip())
+            inner = json.loads(next(self.receipt_root.glob("*.json")).read_text())
+            self.assertEqual("intent", inner["state"])
+            self.assertIn("verified_post_create", inner)
+            before = dict(live_leases)
+            key = sorted(live_leases)[0]
+            old_lease = dict(live_leases[key])
+            for changed in (
+                {**old_lease, "owner_id": "foreign-owner"},
+                {**old_lease, "updated_at_unix": old_lease["updated_at_unix"] + 1},
+            ):
+                live_leases[key] = changed
+                blocked = work_acquire.acquire_work(parameters, **kwargs)
+                self.assertEqual("outcome_unknown", blocked["state"], blocked)
+                self.assertEqual(first["receipt_sha256"], blocked["receipt_sha256"])
+            live_leases[key] = old_lease
+            (target / "dirty.txt").write_text("preserve unsaved content")
+            blocked = work_acquire.acquire_work(parameters, **kwargs)
+            self.assertEqual("outcome_unknown", blocked["state"], blocked)
+            self.assertEqual("preserve unsaved content", (target / "dirty.txt").read_text())
+            (target / "dirty.txt").unlink()
+
+            with patch.object(
+                checkouts, "_reserve_checkout_lifecycle",
+                side_effect=AssertionError("recovery must reuse the original reservation"),
+            ):
+                recovered = work_acquire.acquire_work(parameters, **kwargs)
+            self.assertEqual("ready", recovered["state"], recovered)
+            self.assertEqual("CONTINUE_EXISTING", recovered["decision"])
+            self.assertEqual(first["lane_id"], recovered["lane_id"])
+            self.assertEqual(first["receipt_sha256"],
+                             recovered["interrupted_ensure_recovery"]["previous_receipt_sha256"])
+            self.assertEqual("active", recovered["worktree_receipt"]["lifecycle"]["identity"]["state"])
+            self.assertEqual(before, live_leases)
+            self.assertEqual(1, len(acquire_calls))
+            self.assertEqual(1, len(git_add_calls))
+
+    def test_readback_only_without_existing_effect_never_creates_checkout(self) -> None:
+        parameters = self._parameters(key="readback-only")
+        with patch.dict(os.environ, {
+            "GRABOWSKI_WORKTREE_ENSURE_RECEIPT_ROOT": str(self.receipt_root),
+        }):
+            with self.assertRaisesRegex(worktree_ensure.WorktreeEnsureAction,
+                                        "no verified existing worktree effect"):
+                worktree_ensure.ensure_worktree(
+                    parameters, grips._default_command_runner, self._lease,
+                    recover_existing_only=True,
+                )
+        self.assertFalse(Path(parameters["target_path"]).exists())
+
+    def test_readback_only_refuses_replaced_or_aborted_verified_checkout(self) -> None:
+        for change in ("replace", "abort"):
+            with self.subTest(change=change):
+                target = self.worktree_root / change
+                parameters = self._parameters(key=change, branch="topic-" + change, target=target)
+                with patch.dict(os.environ, {
+                    "GRABOWSKI_WORKTREE_ENSURE_RECEIPT_ROOT": str(self.receipt_root),
+                }), patch.object(
+                    worktree_ensure, "_bind_checkout_lifecycle",
+                    side_effect=checkouts.resources.ResourceSchemaInventoryChanged("fixture"),
+                ):
+                    with self.assertRaises(checkouts.resources.ResourceSchemaInventoryChanged):
+                        worktree_ensure.ensure_worktree(
+                            parameters, grips._default_command_runner, self._lease
+                        )
+                receipt = next(
+                    json.loads(path.read_text()) for path in self.receipt_root.glob("*.json")
+                    if json.loads(path.read_text())["inputs"]["target_path"] == str(target)
+                )
+                proof = receipt["verified_post_create"]
+                if change == "replace":
+                    self._git(self.repo, "worktree", "remove", str(target))
+                    self._git(self.repo, "worktree", "add", str(target), "topic-" + change)
+                else:
+                    worktree_ensure.checkout_identity.abort(
+                        proof["reserved_lifecycle"]["identity_reservation"], reason="fixture abort"
+                    )
+                with patch.dict(os.environ, {
+                    "GRABOWSKI_WORKTREE_ENSURE_RECEIPT_ROOT": str(self.receipt_root),
+                }):
+                    with self.assertRaises((RuntimeError, ValueError)):
+                        worktree_ensure.ensure_worktree(
+                            parameters, grips._default_command_runner, self._lease,
+                            recover_existing_only=True,
+                        )
+                self.assertTrue(target.is_dir())
+                self.assertEqual({}, checkouts._retention_records(
+                    [proof["reserved_lifecycle"]["checkout_key"]]
+                ))
+
     def test_post_create_drifted_lifecycle_reservation_is_not_overwritten(self) -> None:
         parameters = self._parameters()
         target = Path(parameters["target_path"])
