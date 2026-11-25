@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 import fcntl
 import hashlib
 import inspect
@@ -1014,6 +1014,7 @@ def _bind_checkout_lifecycle(
     lease: dict[str, Any],
     *,
     newly_created: bool = False,
+    reserved_lifecycle: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     import grabowski_checkouts as checkouts
 
@@ -1057,21 +1058,54 @@ def _bind_checkout_lifecycle(
     owner_id = checkouts._owner(str(inputs["lease_owner_id"]))
     task_id = f"worktree-ensure:{inputs['idempotency_key']}"
     purpose = str(inputs["purpose"])
-    lifecycle_binding = _reserve_input_lifecycle(inputs)
-    retention = checkouts._upsert_retention(
-        checkout_key=str(record["checkout_key"]),
-        repo_common_dir=common_dir,
-        repo_path=top_level,
-        checkout_path=checkout,
-        owner_id=owner_id,
-        purpose=purpose,
-        retention_until_unix=retention_until_unix,
-        expected_head=str(post_state["actual_head"]),
-        expected_branch=str(inputs["branch"]),
+    # Git creation already had an exact, serialized lifecycle reservation.
+    # Finalizing its verified post-state is not admission of another writer.
+    # Do not repeat the fleet-wide capacity observation or abort that identity
+    # if an unrelated resource-store snapshot changes after Git has succeeded.
+    lifecycle_binding = (
+        reserved_lifecycle
+        if reserved_lifecycle is not None
+        else _reserve_input_lifecycle(inputs)
     )
     identity_reservation = lifecycle_binding.get("identity_reservation")
     if not isinstance(identity_reservation, dict):
         raise WorktreeEnsureAction("worktree lifecycle identity reservation is missing")
+    retention_fields = {
+        "checkout_key": str(record["checkout_key"]),
+        "repo_common_dir": common_dir,
+        "repo_path": top_level,
+        "checkout_path": checkout,
+        "owner_id": owner_id,
+        "purpose": purpose,
+        "retention_until_unix": retention_until_unix,
+        "expected_head": str(post_state["actual_head"]),
+        "expected_branch": str(inputs["branch"]),
+    }
+    expected_binding = {
+        key: value
+        for key, value in lifecycle_binding.items()
+        if key not in {"identity_reservation", "limit"}
+    }
+    if (
+        expected_binding.get("phase") != "active"
+        or any(
+            expected_binding.get(key) != (str(value) if isinstance(value, Path) else value)
+            for key, value in retention_fields.items()
+        )
+    ):
+        raise WorktreeEnsureAction("worktree lifecycle reservation changed before finalization")
+    # Compare the complete reserved row under the same checkout transaction as
+    # the retention write. Never overwrite a new owner or a drifted reservation.
+    with closing(checkouts._database()) as connection, connection:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute(
+            "SELECT * FROM lifecycle_bindings WHERE checkout_key=?",
+            (retention_fields["checkout_key"],),
+        ).fetchone()
+        if row is None or checkouts._lifecycle_public(row) != expected_binding:
+            raise WorktreeEnsureAction("worktree lifecycle reservation changed before finalization")
+        retention = checkouts._upsert_retention_in_connection(connection, **retention_fields)
+        connection.commit()
     identity = checkout_identity.finalize(identity_reservation)
     return {
         "schema_version": 1,
@@ -1940,6 +1974,7 @@ def ensure_worktree(
             record["lifecycle"] = _bind_checkout_lifecycle(
                 inputs, post_state, lease,
                 newly_created=_returncode(mutation) == 0,
+                reserved_lifecycle=lifecycle_reservation,
             )
             record["mutation"] = {
                 "returncode": _returncode(mutation),

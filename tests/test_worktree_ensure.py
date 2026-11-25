@@ -767,6 +767,74 @@ class WorktreeEnsureTests(unittest.TestCase):
         stored = checkouts._retention_records([lifecycle["checkout_key"]])
         self.assertEqual(stored[lifecycle["checkout_key"]]["owner_id"], self.owner)
 
+    def test_post_create_reuses_exact_lifecycle_reservation(self) -> None:
+        parameters = self._parameters()
+        actual_reserve = checkouts._reserve_checkout_lifecycle
+        reservation_calls = []
+        git_add_calls = []
+
+        def reserve_once(**kwargs):
+            if reservation_calls:
+                raise checkouts.resources.ResourceSchemaInventoryChanged(
+                    "simulated inventory churn after Git create"
+                )
+            result = actual_reserve(**kwargs)
+            reservation_calls.append(result)
+            return result
+
+        def runner(repo, argv):
+            if argv[:2] == ["worktree", "add"]:
+                git_add_calls.append(tuple(argv))
+            return grips._default_command_runner(repo, argv)
+
+        with patch.object(checkouts, "_reserve_checkout_lifecycle", side_effect=reserve_once):
+            created = self._ensure(parameters, runner=runner)
+            replay = self._ensure(parameters, runner=runner)
+        self.assertEqual(created["result_state"], "CREATED")
+        self.assertEqual(created["lifecycle"]["identity"]["state"], "active")
+        self.assertEqual(replay["durable_receipt_sha256"], created["durable_receipt_sha256"])
+        self.assertEqual(len(reservation_calls), 1)
+        self.assertEqual(len(git_add_calls), 1)
+        self.assertEqual(
+            self._git(Path(parameters["target_path"]), "rev-parse", "HEAD").stdout.strip(),
+            self.head,
+        )
+
+    def test_post_create_drifted_lifecycle_reservation_is_not_overwritten(self) -> None:
+        parameters = self._parameters()
+        target = Path(parameters["target_path"])
+        drifted = []
+
+        def drift_after_git_create():
+            self.assertTrue(target.is_dir())
+            with closing(checkouts._database()) as connection, connection:
+                connection.execute(
+                    "UPDATE lifecycle_bindings SET purpose=? WHERE checkout_path=?",
+                    ("changed lifecycle fixture", str(target)),
+                )
+                row = connection.execute(
+                    "SELECT * FROM lifecycle_bindings WHERE checkout_path=?", (str(target),)
+                ).fetchone()
+                self.assertIsNotNone(row)
+                drifted.append(checkouts._lifecycle_public(row))
+
+        with patch.object(
+            worktree_ensure, "_after_worktree_mutation", side_effect=drift_after_git_create
+        ):
+            with self.assertRaisesRegex(
+                worktree_ensure.WorktreeEnsureAction, "lifecycle reservation changed"
+            ):
+                self._ensure(parameters)
+        self.assertEqual(len(drifted), 1)
+        self.assertEqual(
+            checkouts._strict_lifecycle_binding(drifted[0]["checkout_key"]), drifted[0]
+        )
+        self.assertEqual(checkouts._retention_records([drifted[0]["checkout_key"]]), {})
+        self.assertTrue(target.is_dir())
+        receipts = list(self.receipt_root.glob("*.json"))
+        self.assertEqual(len(receipts), 1)
+        self.assertEqual(json.loads(receipts[0].read_text())["state"], "intent")
+
     def test_new_regular_work_lane_has_prospective_cleanup_authority(self) -> None:
         for n, artifact_class, expected in (
             ("a", "implementation-worktree", True),
