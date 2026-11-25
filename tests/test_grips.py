@@ -12887,6 +12887,15 @@ class CaptainAuthorityPathTests(unittest.TestCase):
                         "mergeStateStatus": "CLEAN",
                     }
                 )
+                self.active_rules.append(
+                    {
+                        "type": "merge_queue",
+                        "parameters": {"merge_method": "MERGE"},
+                        "ruleset_source_type": "Repository",
+                        "ruleset_source": "heimgewebe/grabowski",
+                        "ruleset_id": 18801517,
+                    }
+                )
                 self.queue_reads = 0
 
             def __call__(self, repo: Path, argv: list[str]) -> dict[str, object]:
@@ -13998,6 +14007,104 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertTrue(observations["during_dispatch"])
         self.assertTrue(observations["left"])
 
+    def test_captain_queue_readback_rate_limit_respects_authoritative_rules(self) -> None:
+        for explicit in (False, True):
+            for scenario in ("absent", "active", "unknown", "appears_at_dispatch"):
+                with self.subTest(explicit=explicit, scenario=scenario):
+                    class RateLimitedQueueGh(FakeGh):
+                        def __init__(self):
+                            super().__init__(view={
+                                "number": 96, "state": "OPEN", "baseRefName": "main",
+                                "baseRefOid": CAPTAIN_BASE_SHA,
+                                "headRefName": "feat/captain", "headRefOid": CAPTAIN_HEAD,
+                                "isDraft": False, "mergeable": "MERGEABLE",
+                                "mergeStateStatus": "CLEAN",
+                            })
+                            self.rule_reads = 0
+                            self.queue_rule = {
+                                "type": "merge_queue",
+                                "parameters": {"merge_method": "MERGE"},
+                                "ruleset_source_type": "Repository",
+                                "ruleset_source": "heimgewebe/grabowski",
+                                "ruleset_id": 18801517,
+                            }
+                            if scenario == "active":
+                                self.active_rules.append(self.queue_rule)
+                            if scenario == "unknown":
+                                self.active_rules.append({"type": None})
+
+                        def __call__(self, repo, argv):
+                            if argv[:2] == ["api", "graphql"] and any(
+                                "mergeQueueEntry" in item for item in argv
+                            ):
+                                self.calls.append(tuple(argv))
+                                return {
+                                    "returncode": 1, "stdout": "",
+                                    "stderr": "HTTP 403 GraphQL RATE_LIMIT",
+                                }
+                            if any("/rules/branches/" in item for item in argv):
+                                self.rule_reads += 1
+                                # Initial base guard performs two observations;
+                                # an explicit merge method also reads branch policy.
+                                if (
+                                    scenario == "appears_at_dispatch"
+                                    and self.rule_reads == (4 if explicit else 3)
+                                ):
+                                    self.active_rules.append(self.queue_rule)
+                            return super().__call__(repo, argv)
+
+                    gh = RateLimitedQueueGh()
+                    parameters = authorized_captain_run_parameters()
+                    if explicit:
+                        parameters["actions"][0]["target"]["merge_method"] = "merge"
+                        parameters["execution_intent"] = captain_execution_intent(parameters)
+                    with patch.object(
+                        merge_guard, "resolve_captain_merge_repository",
+                        return_value=(Path.cwd().resolve(), "test-bound-checkout"),
+                    ):
+                        result = grips.grip_run(
+                            "captain-run", parameters, profile="captain",
+                            allow_mutation=True, command_runner=FakeGit(), github_runner=gh,
+                        )
+                    execution = result["output"]["executions"][0]
+                    queue_calls = [
+                        call for call in gh.calls if call[:2] == ("api", "graphql")
+                        and any("mergeQueueEntry" in item for item in call)
+                    ]
+                    merge_calls = [call for call in gh.calls if call[:2] == ("pr", "merge")]
+                    if scenario == "absent":
+                        self.assertEqual("passed", result["receipt"]["status"])
+                        self.assertTrue(execution["merge_completion_verified"])
+                        self.assertEqual([], queue_calls)
+                        self.assertEqual(1, len(merge_calls))
+                        self.assertEqual(
+                            "not_applicable_queue_absent",
+                            execution["pre_dispatch_merge_queue_readback"]["state"],
+                        )
+                        self.assertEqual(
+                            "not_applicable_queue_absent",
+                            execution["merge_lease_guard"]["dispatch_merge_queue_readback"]["state"],
+                        )
+                    else:
+                        self.assertEqual("blocked", result["receipt"]["status"])
+                        self.assertEqual([], merge_calls)
+                        self.assertGreaterEqual(len(queue_calls), 1)
+                        self.assertFalse(execution.get("merge_completion_verified", False))
+                        if scenario != "appears_at_dispatch":
+                            self.assertIn(
+                                "merge_queue_readback_unavailable", execution["preflight_errors"]
+                            )
+                        else:
+                            self.assertEqual(
+                                "not_applicable_queue_absent",
+                                execution["pre_dispatch_merge_queue_readback"]["state"],
+                            )
+                            self.assertFalse(execution["merge_lease_guard"]["dispatch_called"])
+                    with resources._database() as connection:
+                        self.assertEqual(
+                            0, connection.execute("SELECT COUNT(*) FROM leases").fetchone()[0]
+                        )
+
     def test_captain_run_treats_exact_merge_queue_entry_as_scheduled_after_dispatch(self) -> None:
         parameters = authorized_captain_run_parameters()
         gh = FakeGh(
@@ -14184,6 +14291,16 @@ class CaptainAuthorityPathTests(unittest.TestCase):
                 "state": "MERGED",
                 "headRefOid": "f" * 40,
             },
+        )
+
+        gh.active_rules.append(
+            {
+                "type": "merge_queue",
+                "parameters": {"merge_method": "MERGE"},
+                "ruleset_source_type": "Repository",
+                "ruleset_source": "heimgewebe/grabowski",
+                "ruleset_id": 18801517,
+            }
         )
 
         result = grips.grip_run(
@@ -18287,6 +18404,9 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             return_value=captain_independent_review_reconciliation(
                 status="not_applicable", pass_count=0
             ),
+        ), patch(
+            "grabowski_self_review_execution.FIRST_PARTY_REVIEW_ROOT",
+            Path(self._resource_tempdir.name) / "first-party-review",
         ):
             result = grips.grip_run(
                 "captain-run",
