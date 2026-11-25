@@ -51,6 +51,8 @@ import grabowski_checkouts as checkouts
 import grabowski_operator_obligation as obligations
 import grabowski_work_admission as work_admission
 
+_review_source_paths_real = checkouts._review_source_paths
+
 
 class CheckoutLifecycleTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -88,6 +90,7 @@ class CheckoutLifecycleTests(unittest.TestCase):
             patch.object(checkouts.operator, "_require_operator_capability"),
             patch.object(checkouts.base, "_append_audit"),
             patch.object(checkouts, "_processes_under", return_value=[]),
+            patch.object(checkouts, "_review_source_paths", return_value=set()),
             patch.dict(
                 os.environ,
                 {
@@ -3841,6 +3844,59 @@ class CheckoutLifecycleTests(unittest.TestCase):
         stored = checkouts._load_checkout_operation_uncertainty(fence["fence_id"])
         self.assertEqual(stored, cleared)
         self.assertEqual(stored["clearance"]["outcome"], "confirmed_no_effect")
+
+    def test_review_source_paths_distinguish_started_and_unstarted_reviews(self) -> None:
+        root = self.root / "review-state"
+        sessions = root / "first-party-self-reviews" / "sessions"
+        plans = root / "self-review-executions" / "plans"
+        plans.mkdir(parents=True)
+        session = sessions / ("a" * 32)
+        session.mkdir(parents=True)
+        (session / "session.json").write_text(json.dumps({
+            "kind": "grabowski_first_party_semantic_review_session_v1",
+            "worktree": str(self.checkout),
+        }))
+        abandoned = self.root / "unstarted"
+        legacy = self.root / "legacy"
+        (plans / ("b" * 32 + ".json")).write_text(json.dumps({
+            "kind": "grabowski_first_party_review_plan",
+            "worktree": str(abandoned),
+        }))
+        (plans / ("c" * 32 + ".json")).write_text(json.dumps({
+            "kind": "grabowski_self_review_execution_plan",
+            "worktree": str(legacy),
+        }))
+        # Bypass only this class's isolation mock to exercise the real scanner.
+        self.assertEqual(_review_source_paths_real(root), {str(self.checkout), str(legacy)})
+
+    def test_review_source_dependency_blocks_cleanup_and_late_dependency(self) -> None:
+        self._publish_remote()
+        archive = self._archive()["archive"]
+        kwargs = dict(repo=str(self.repo), checkout_path=str(self.checkout),
+                      owner_id="owner-a", archive_id=archive["archive_id"],
+                      expected_head=self.head, expected_branch="topic")
+        with patch.object(checkouts, "_review_source_paths", return_value={str(self.checkout)}):
+            held = checkouts.grabowski_checkout_cleanup(**kwargs, dry_run=True)
+            self.assertFalse(held["plan"]["safe_to_apply"])
+            self.assertIn("review_source_dependency", held["plan"]["cleanup_blockers"])
+            with self.assertRaisesRegex(RuntimeError, "required by existing review"):
+                checkouts.grabowski_checkout_cleanup(
+                    **kwargs, dry_run=False, plan_id=held["dry_run_record"]["plan_id"],
+                    expected_plan_sha256=held["plan"]["plan_sha256"],
+                    confirmation="remove-linked-checkout",
+                )
+        dry = checkouts.grabowski_checkout_cleanup(**kwargs, dry_run=True)
+        self.assertTrue(dry["plan"]["safe_to_apply"])
+        with patch.object(checkouts, "_review_source_paths",
+                          side_effect=[set(), {str(self.checkout)}]):
+            with self.assertRaisesRegex(RuntimeError, "required by existing review"):
+                checkouts.grabowski_checkout_cleanup(
+                    **kwargs, dry_run=False, plan_id=dry["dry_run_record"]["plan_id"],
+                    expected_plan_sha256=dry["plan"]["plan_sha256"],
+                    confirmation="remove-linked-checkout",
+                )
+        self.assertTrue(self.checkout.is_dir())
+        self.assertEqual(self._git("rev-parse", "refs/heads/topic").stdout.strip(), self.head)
 
     def test_cleanup_requires_prior_dry_run_and_uses_plain_worktree_remove(self) -> None:
         self._publish_remote()

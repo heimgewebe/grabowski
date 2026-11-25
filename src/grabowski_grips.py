@@ -6029,6 +6029,7 @@ def _run_worktree_hygiene_reconcile(
     skipped: list[dict[str, Any]] = []
     github_queries = 0
     candidate_pr_queries = 0
+    review_source_paths: set[str] | None = None
     default_branch: str | None = None
     default_branch_error: dict[str, Any] | None = None
     actions = 0
@@ -6172,6 +6173,14 @@ def _run_worktree_hygiene_reconcile(
                 except (ValueError, RuntimeError, PermissionError, OSError) as exc:
                     errors.append({"path": path, "error": str(exc)})
                     continue
+
+            # Existing review verifiers still reopen their original physical
+            # source. Keep those exact paths, not every old checkout or plan.
+            if review_source_paths is None:
+                review_source_paths = grabowski_checkouts._review_source_paths()
+            if str(checkout_path) in review_source_paths:
+                skipped.append({"path": path, "reason": "review_source_dependency", "state": state})
+                continue
 
             if include_terminal_owners and ((state == "cleanup_candidate" and archived)
                     or (state != "cleanup_candidate" and cleanup_plans)):

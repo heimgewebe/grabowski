@@ -23337,6 +23337,38 @@ class WorktreeHygieneReconcileTests(unittest.TestCase):
             sorted(item["reason"] for item in result["output"]["skipped"]),
         )
 
+    def test_review_source_dependency_skips_archive_and_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "review-source")
+            archived = str(Path(tmp) / "archived-review-source")
+            inventory = {
+                "inventory_sha256": "4" * 64,
+                "worktrees": [
+                    self._owned_item(path),
+                    self._owned_item(archived, state="cleanup_candidate",
+                                     archive={"owner_id": self.OWNER, "archive_id": "archive"}),
+                ],
+            }
+            with (
+                patch("grabowski_checkouts.checkout_inventory", return_value=inventory),
+                patch("grabowski_checkouts._review_source_paths", return_value={path, archived}) as sources,
+                patch("grabowski_checkouts.grabowski_checkout_archive") as archive,
+                patch("grabowski_checkouts.grabowski_checkout_cleanup") as cleanup,
+            ):
+                result = grips.run_grip(
+                    "worktree-hygiene-reconcile", self._parameters(tmp, apply_cleanup=True),
+                    allow_mutation=True, command_runner=FakeGit(),
+                    github_runner=lambda *_args: (_ for _ in ()).throw(AssertionError("unexpected GitHub")),
+                )
+            sources.assert_called_once()
+            archive.assert_not_called()
+            cleanup.assert_not_called()
+            self.assertEqual(0, result["output"]["actions"])
+            self.assertEqual(
+                ["review_source_dependency"] * 2,
+                [item["reason"] for item in result["output"]["skipped"]],
+            )
+
     def test_cleanup_candidate_uses_dry_run_hash_before_apply(self) -> None:
         archive_record = {
             "owner_id": self.OWNER,

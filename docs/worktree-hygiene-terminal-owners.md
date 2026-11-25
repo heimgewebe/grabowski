@@ -33,3 +33,15 @@ checkout removal.
 The NixOS worktree-hygiene service uses the pinned Grabowski retention
 module's default. A repository merge alone does not change that service:
 the new operator package must be activated and the periodic path observed.
+
+### Physical review-source dependencies
+
+The existing signed review verifier reopens its original checkout. Hygiene
+therefore skips exact paths named by a started first-party review session or
+legacy role/task review execution plan. The native cleanup plan and its apply
+path independently recheck the same dependency. An unstarted first-party
+plan alone is not a retention claim. This is an observed dependency of the
+current verifier, not another review or approval requirement. Recovery refs
+preserve Git content but do not by themselves make a path-bound review
+verifiable. Decoupling historical verification from the physical checkout is
+the longer-term way to retire these dependencies without retaining worktrees.
