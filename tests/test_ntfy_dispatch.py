@@ -303,11 +303,15 @@ class NtfyFinalizerTriggerTests(TestCase):
         import grabowski_job_finalizer as finalizer
 
         completed = mock.Mock(returncode=0)
-        with mock.patch.object(finalizer.subprocess, "run", return_value=completed) as run:
-            scheduled = finalizer._schedule_ntfy_dispatch("a" * 32, ["ntfy"])
+        systemd_run = "/nix/store/test-systemd/bin/systemd-run"
+        with mock.patch.object(finalizer.shutil, "which", return_value=systemd_run) as which:
+            with mock.patch.object(finalizer.subprocess, "run", return_value=completed) as run:
+                scheduled = finalizer._schedule_ntfy_dispatch("a" * 32, ["ntfy"])
 
         self.assertTrue(scheduled)
+        which.assert_called_once_with("systemd-run")
         argv = run.call_args.args[0]
+        self.assertEqual(systemd_run, argv[0])
         self.assertIn("--unit=grabowski-ntfy-dispatch-" + "a" * 32 + ".service", argv)
         self.assertEqual(argv[-3:], ["-I", "-m", "grabowski_ntfy_dispatch"])
         self.assertTrue(run.call_args.kwargs["check"] is False)
@@ -324,7 +328,18 @@ class NtfyFinalizerTriggerTests(TestCase):
     def test_dispatcher_launch_failure_is_fail_soft(self) -> None:
         import grabowski_job_finalizer as finalizer
 
-        with mock.patch.object(finalizer.subprocess, "run", side_effect=OSError("systemd unavailable")):
-            scheduled = finalizer._schedule_ntfy_dispatch("a" * 32, ["ntfy"])
+        with mock.patch.object(finalizer.shutil, "which", return_value="/nix/store/test-systemd/bin/systemd-run"):
+            with mock.patch.object(finalizer.subprocess, "run", side_effect=OSError("systemd unavailable")):
+                scheduled = finalizer._schedule_ntfy_dispatch("a" * 32, ["ntfy"])
 
         self.assertFalse(scheduled)
+
+    def test_missing_systemd_run_is_fail_soft(self) -> None:
+        import grabowski_job_finalizer as finalizer
+
+        with mock.patch.object(finalizer.shutil, "which", return_value=None):
+            with mock.patch.object(finalizer.subprocess, "run") as run:
+                scheduled = finalizer._schedule_ntfy_dispatch("a" * 32, ["ntfy"])
+
+        self.assertFalse(scheduled)
+        run.assert_not_called()
