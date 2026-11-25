@@ -507,7 +507,10 @@ def run_captain_run(
     preflight_reasons = [
         reason
         for result in pre_execution_failures
-        for reason in result.get("preflight_errors", [str(result.get("verification_error") or "pre-execution failure")])
+        for reason in (
+            result.get("preflight_errors")
+            or [str(result.get("verification_error") or "pre-execution failure")]
+        )
     ]
     post_execution_reasons = [
         str(result.get("verification_error") or "post-execution verification failed")
