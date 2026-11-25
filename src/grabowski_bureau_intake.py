@@ -145,7 +145,11 @@ def _prepare_registry_root(
     mutation: bool,
     require_current: bool = True,
 ) -> str:
-    resolved = Path(registry_root).expanduser().resolve()
+    resolved = (
+        Path(registry_root).expanduser().resolve()
+        if registry_root
+        else _managed_runtime_binding().registry_root
+    )
     shared_root = bureau_runtime.BUREAU_REPOSITORY_ROOT.resolve()
     control_root = bureau_runtime.BUREAU_CONTROL_ROOT.resolve()
     if resolved == shared_root:
@@ -1078,6 +1082,20 @@ def _invoke_bureau(
     try:
         bureau_runtime._assert_contract_runtime_unchanged(runtime)
         _assert_managed_runtime_unchanged(managed_runtime)
+        command, _ = _adapter_command_contract(arguments)
+        if (
+            command in {
+                "operator-task-propose", "operator-task-review", "operator-task-publish",
+            }
+            and len(arguments) >= 2
+            and arguments[0] == "--root"
+            and arguments[1] == str(managed_runtime.registry_root)
+            and "--state-root" not in arguments
+            and "--state-db" not in arguments
+        ):
+            state_root = _absolute_bureau_state_root(BUREAU_STATE_ROOT)
+            _assert_bureau_state_root_has_no_symlink_components(state_root)
+            arguments = [*arguments[:2], "--state-root", str(state_root), *arguments[2:]]
     except (OSError, RuntimeError, bureau_runtime.BureauLeaseContractError) as exc:
         return _adapter_failure(
             "bureau-runtime-drift",
@@ -1709,15 +1727,11 @@ def grabowski_bureau_task_propose(
     event_id: int = 0,
     unresolved_fields: list[str] | None = None,
     placeholder_justification: str = "",
-    registry_root: str = str(BUREAU_ROOT),
+    registry_root: str = "",
 ) -> dict[str, Any]:
     """Create an immutable Bureau task proposal artifact without changing Registry or Queue truth."""
-    operator._require_operator_mutation(
-        "bureau_mutation",
-        path=str(Path(registry_root).expanduser().resolve()),
-    )
     resolved_root = _prepare_registry_root(
-        registry_root, refresh=True, mutation=False
+        registry_root, refresh=True, mutation=True
     )
     if bool(candidate_id) == bool(event_id):
         raise ValueError("provide exactly one of candidate_id or event_id")
@@ -1730,7 +1744,8 @@ def grabowski_bureau_task_propose(
         "event_id": event_id,
         "unresolved_fields": sorted(set(unresolved_fields or [])),
         "placeholder_justification": placeholder_justification,
-        "registry_root": resolved_root,
+        # Keep default proposal replay stable across installed Registry refreshes.
+        "registry_root": resolved_root if registry_root else "",
     }
     proposal_id = _sha256(_canonical_json(request))
     directory = _proposal_directory(proposal_id)
@@ -1745,7 +1760,7 @@ def grabowski_bureau_task_propose(
         preview = _invoke_bureau(
             [
                 "--root",
-                request["registry_root"],
+                resolved_root,
                 "--json",
                 "--json-envelope",
                 "operator-task-publish",
@@ -1779,7 +1794,7 @@ def grabowski_bureau_task_propose(
         }
     arguments = [
         "--root",
-        request["registry_root"],
+        resolved_root,
         "--json",
         "--json-envelope",
         "operator-task-propose",
@@ -1820,15 +1835,11 @@ def grabowski_bureau_task_review(
     proposal_id: str,
     reviewer: str,
     proposal_sha256: str,
-    registry_root: str = str(BUREAU_ROOT),
+    registry_root: str = "",
 ) -> dict[str, Any]:
     """Review one exact Bureau proposal digest without changing Registry, Queue or publication truth."""
-    operator._require_operator_mutation(
-        "bureau_mutation",
-        path=str(Path(registry_root).expanduser().resolve()),
-    )
     resolved_root = _prepare_registry_root(
-        registry_root, refresh=True, mutation=False
+        registry_root, refresh=True, mutation=True
     )
     if not reviewer.strip():
         raise ValueError("reviewer must not be empty")
@@ -1990,7 +2001,7 @@ def _task_publication_apply_arguments(
 @mcp.tool(name="grabowski_bureau_task_publish_preview", annotations=READ_ONLY)
 def grabowski_bureau_task_publish_preview(
     proposal_id: str,
-    registry_root: str = str(BUREAU_ROOT),
+    registry_root: str = "",
 ) -> dict[str, Any]:
     """Validate one immutable Bureau proposal and report its exact publication resources without effects."""
     plan_path = _proposal_directory(proposal_id) / "plan.json"
@@ -2022,12 +2033,13 @@ def grabowski_bureau_task_publish_preview(
         except ValueError as exc:
             return _adapter_failure(str(exc))
         if publication_mode == "git_pr":
-            _prepare_registry_root(
-                registry_root,
+            git_root = _prepare_registry_root(
+                registry_root or str(BUREAU_ROOT),
                 refresh=False,
                 mutation=False,
                 require_current=True,
             )
+            arguments[1] = git_root
             payload = _invoke_bureau(arguments)
     return payload
 
@@ -2035,18 +2047,14 @@ def grabowski_bureau_task_publish_preview(
 @mcp.tool(name="grabowski_bureau_task_publish", annotations=MUTATING)
 def grabowski_bureau_task_publish(
     proposal_id: str,
-    registry_root: str = str(BUREAU_ROOT),
+    registry_root: str = "",
     lease_ttl_seconds: int = 240,
 ) -> dict[str, Any]:
     """Publish one reviewed task through the preview-selected Git or StateStore contract."""
-    operator._require_operator_mutation(
-        "bureau_mutation",
-        path=str(Path(registry_root).expanduser().resolve()),
-    )
     resolved_root = _prepare_registry_root(
         registry_root,
         refresh=False,
-        mutation=False,
+        mutation=True,
         require_current=False,
     )
     operator._require_operator_mutation("resource_lease")
@@ -2078,7 +2086,7 @@ def grabowski_bureau_task_publish(
             return _adapter_failure(str(exc))
         if publication_mode == "git_pr":
             resolved_root = _prepare_registry_root(
-                registry_root, refresh=True, mutation=False
+                registry_root or str(BUREAU_ROOT), refresh=True, mutation=True
             )
         apply_arguments = _task_publication_apply_arguments(
             resolved_root=resolved_root,
@@ -2104,7 +2112,7 @@ def grabowski_bureau_task_publish(
             "leases_released": True,
             "idempotent_adapter_replay": True,
         }
-    preview = grabowski_bureau_task_publish_preview(proposal_id, resolved_root)
+    preview = grabowski_bureau_task_publish_preview(proposal_id, registry_root)
     if (
         preview.get("kind") != "bureau_task_publication_preview"
         or preview.get("status") != "ready"
@@ -2116,7 +2124,7 @@ def grabowski_bureau_task_publish(
         return _adapter_failure(str(exc))
     if publication_mode == "git_pr":
         resolved_root = _prepare_registry_root(
-            registry_root, refresh=True, mutation=False
+            registry_root or str(BUREAU_ROOT), refresh=True, mutation=True
         )
         preview = grabowski_bureau_task_publish_preview(proposal_id, resolved_root)
         if (
