@@ -89,6 +89,64 @@ def _identity(path: Path, metadata: os.stat_result) -> dict[str, Any]:
     }
 
 
+def _stable_btrfs_witness(descriptor: int) -> dict[str, Any] | None:
+    """Observe the Btrfs filesystem UUID and object handle on an open fd."""
+    if not sys.platform.startswith("linux"):
+        return None
+    import ctypes
+    import fcntl
+
+    class FileHandle(ctypes.Structure):
+        _fields_ = [
+            ("handle_bytes", ctypes.c_uint),
+            ("handle_type", ctypes.c_int),
+            ("data", ctypes.c_ubyte * 128),
+        ]
+
+    try:
+        fs_info = bytearray(1024)
+        # BTRFS_IOC_FS_INFO: struct btrfs_ioctl_fs_info_args (1024 bytes).
+        fcntl.ioctl(descriptor, 0x8400941F, fs_info, True)
+        function = ctypes.CDLL(None, use_errno=True).name_to_handle_at
+        function.argtypes = [
+            ctypes.c_int, ctypes.c_char_p, ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_int), ctypes.c_int,
+        ]
+        function.restype = ctypes.c_int
+        handle = FileHandle()
+        handle.handle_bytes = 128
+        mount_id = ctypes.c_int()
+        # AT_FDCWD, AT_SYMLINK_FOLLOW: the procfs link of the held fd.
+        if function(
+            -100, f"/proc/self/fd/{descriptor}".encode(),
+            ctypes.byref(handle), ctypes.byref(mount_id), 0x400,
+        ) != 0:
+            return None
+        # FILEID_BTRFS_WITHOUT_PARENT includes inode generation and root ID.
+        if handle.handle_type != 77 or not 0 < handle.handle_bytes <= 128:
+            return None
+        fs_uuid = bytes(fs_info[16:32]).hex()
+        if fs_uuid == "0" * 32:
+            return None
+        return {
+            "filesystem_uuid": fs_uuid,
+            "handle_type": handle.handle_type,
+            "file_handle": bytes(handle.data[:handle.handle_bytes]).hex(),
+        }
+    except (OSError, AttributeError):
+        # Optional evidence: unsupported filesystems stay exact-device only.
+        return None
+
+
+def _historical_witness_digest(
+    physical_sha256: str, witness: dict[str, Any]
+) -> str:
+    return _identity_sha256({
+        "physical_identity_sha256": physical_sha256,
+        "historical_witness": witness,
+    })
+
+
 def _identity_material(
     *,
     root: dict[str, Any],
@@ -798,6 +856,8 @@ def capture_registered_linked_worktree_git_dir(
 
 def capture_physical_checkout_identity(
     worktree_root: str | os.PathLike[str],
+    *,
+    include_stable_witness: bool = False,
 ) -> dict[str, Any]:
     """Capture only physical checkout identity: paths plus device/inode triples.
 
@@ -883,6 +943,15 @@ def capture_physical_checkout_identity(
             git_dir=_identity(git_path, git_metadata),
             common_dir=_identity(common_path, common_metadata),
         )
+        witness = None
+        if include_stable_witness:
+            nodes = {
+                "root": _stable_btrfs_witness(root_descriptor),
+                "git_dir": _stable_btrfs_witness(git_descriptor),
+                "common_dir": _stable_btrfs_witness(common_descriptor),
+            }
+            if all(value is not None for value in nodes.values()):
+                witness = nodes
 
         _assert_absolute_directory_node(
             root_path, root_metadata, label="checkout root"
@@ -932,10 +1001,16 @@ def capture_physical_checkout_identity(
                 label="commondir pointer",
             )
 
-        return {
+        result = {
             **material,
             "physical_identity_sha256": _identity_sha256(material),
         }
+        if witness is not None:
+            result["historical_witness"] = witness
+            result["historical_witness_sha256"] = _historical_witness_digest(
+                result["physical_identity_sha256"], witness
+            )
+        return result
     finally:
         if common_descriptor is not None:
             os.close(common_descriptor)
@@ -1123,7 +1198,10 @@ def verify_physical_checkout_identity(
     }
     if (
         not isinstance(expected, dict)
-        or set(expected) != required_fields
+        or set(expected) not in (
+            required_fields,
+            required_fields | {"historical_witness", "historical_witness_sha256"},
+        )
         or expected.get("schema_version") != SCHEMA_VERSION
         or expected.get("kind") != KIND
     ):
@@ -1139,7 +1217,22 @@ def verify_physical_checkout_identity(
             "expected physical identity digest is internally inconsistent"
         )
 
-    observed = capture_physical_checkout_identity(root["path"])
+    witness = expected.get("historical_witness")
+    has_witness = "historical_witness" in expected
+    if has_witness and (
+        not isinstance(witness, dict)
+        or set(witness) != {"root", "git_dir", "common_dir"}
+        or expected.get("historical_witness_sha256")
+        != _historical_witness_digest(expected_digest, witness)
+    ):
+        raise PhysicalCheckoutIdentityError("historical physical witness is invalid")
+    observed = (
+        capture_physical_checkout_identity(root["path"], include_stable_witness=True)
+        if has_witness
+        else capture_physical_checkout_identity(root["path"])
+    )
+    if has_witness and observed.get("historical_witness") != witness:
+        raise PhysicalCheckoutIdentityError("historical filesystem object changed")
     if expected_digest != observed["physical_identity_sha256"]:
         nodes = ("root", "git_dir", "common_dir")
         same_nodes = all(
@@ -1152,8 +1245,16 @@ def verify_physical_checkout_identity(
             == (observed[left]["device"] == observed[right]["device"])
             for left in nodes for right in nodes
         )
-        if not (allow_historical_device_remap and same_nodes and same_device_topology):
+        if not (
+            allow_historical_device_remap and has_witness
+            and same_nodes and same_device_topology
+        ):
             raise PhysicalCheckoutIdentityError(
                 "physical checkout identity changed since the expected observation"
             )
-    return observed
+    # Exact verification preserves the original receipt shape (including a
+    # witness) for existing cleanup CAS. Historical continuation alone needs
+    # the fresh, unextended exact-device preimage for subsequent live checks.
+    if not allow_historical_device_remap:
+        return observed
+    return {key: value for key, value in observed.items() if key in required_fields}

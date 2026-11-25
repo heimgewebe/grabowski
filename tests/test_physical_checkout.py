@@ -103,42 +103,83 @@ class PhysicalCheckoutIdentityTests(unittest.TestCase):
                 physical_checkout.verify_physical_checkout_identity(identity_before)
 
 
-    def test_historical_device_remap_keeps_fresh_identity_strict(self) -> None:
+    def test_historical_device_remap_requires_original_witness(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "repo"
             checkout = Path(directory) / "checkout"
             self._init_committed_repo(repo)
             self._run("git", "worktree", "add", "-q", "-b", "topic", str(checkout), cwd=repo)
             fresh = physical_checkout.capture_physical_checkout_identity(checkout)
-            historical = copy.deepcopy(fresh)
+            witness = {
+                "filesystem_uuid": "1" * 32,
+                "handle_type": 77,
+                "file_handle": "0123456789abcdef",
+            }
+            with patch.object(physical_checkout, "_stable_btrfs_witness", return_value=witness):
+                anchored = physical_checkout.capture_physical_checkout_identity(
+                    checkout, include_stable_witness=True
+                )
+            self.assertEqual(fresh["physical_identity_sha256"], anchored["physical_identity_sha256"])
+            self.assertIn("historical_witness_sha256", anchored)
+            historical = copy.deepcopy(anchored)
+
+            def rehash(value):
+                material = {
+                    k: v for k, v in value.items()
+                    if k not in {"physical_identity_sha256", "historical_witness", "historical_witness_sha256"}
+                }
+                value["physical_identity_sha256"] = physical_checkout._identity_sha256(material)
+                if "historical_witness" in value:
+                    value["historical_witness_sha256"] = physical_checkout._historical_witness_digest(
+                        value["physical_identity_sha256"], value["historical_witness"]
+                    )
+
             for key in ("root", "git_dir", "common_dir"):
                 historical[key]["device"] += 1
-            def rehash(value):
-                material = {k: v for k, v in value.items() if k != "physical_identity_sha256"}
-                value["physical_identity_sha256"] = physical_checkout._identity_sha256(material)
             rehash(historical)
+            legacy = {
+                k: v for k, v in historical.items()
+                if k not in {"historical_witness", "historical_witness_sha256"}
+            }
             with self.assertRaises(physical_checkout.PhysicalCheckoutIdentityError):
-                physical_checkout.verify_physical_checkout_identity(historical)
-            self.assertEqual(
-                fresh,
                 physical_checkout.verify_physical_checkout_identity(
-                    historical, allow_historical_device_remap=True
-                ),
-            )
-            self.assertEqual(fresh, physical_checkout.verify_physical_checkout_identity(fresh))
-            changed_inode = copy.deepcopy(historical)
-            changed_inode["git_dir"]["inode"] += 1
-            rehash(changed_inode)
-            incoherent = copy.deepcopy(historical)
-            incoherent["git_dir"]["device"] += 1
-            rehash(incoherent)
-            tampered = copy.deepcopy(historical)
-            tampered["physical_identity_sha256"] = "0" * 64
-            for bad in (changed_inode, incoherent, tampered):
+                    legacy, allow_historical_device_remap=True
+                )
+            with patch.object(physical_checkout, "_stable_btrfs_witness", return_value=witness):
+                self.assertEqual(anchored, physical_checkout.verify_physical_checkout_identity(anchored))
                 with self.assertRaises(physical_checkout.PhysicalCheckoutIdentityError):
+                    physical_checkout.verify_physical_checkout_identity(historical)
+                self.assertEqual(
+                    fresh,
                     physical_checkout.verify_physical_checkout_identity(
-                        bad, allow_historical_device_remap=True
-                    )
+                        historical, allow_historical_device_remap=True
+                    ),
+                )
+                changed_inode = copy.deepcopy(historical)
+                changed_inode["git_dir"]["inode"] += 1
+                rehash(changed_inode)
+                incoherent = copy.deepcopy(historical)
+                incoherent["git_dir"]["device"] += 1
+                rehash(incoherent)
+                tampered = copy.deepcopy(historical)
+                tampered["historical_witness_sha256"] = "0" * 64
+                for bad in (changed_inode, incoherent, tampered):
+                    with self.assertRaises(physical_checkout.PhysicalCheckoutIdentityError):
+                        physical_checkout.verify_physical_checkout_identity(
+                            bad, allow_historical_device_remap=True
+                        )
+            # A snapshot can have the same paths and inode numbers even when
+            # its backing object differs. Neither remapping nor strict equality
+            # of st_dev is sufficient once an original witness was recorded.
+            other = {**witness, "file_handle": "fedcba9876543210"}
+            for replacement in (other, None):
+                with patch.object(physical_checkout, "_stable_btrfs_witness", return_value=replacement):
+                    for original in (historical, anchored):
+                        with self.assertRaises(physical_checkout.PhysicalCheckoutIdentityError):
+                            physical_checkout.verify_physical_checkout_identity(
+                                original, allow_historical_device_remap=True
+                            )
+            self.assertEqual(fresh, physical_checkout.verify_physical_checkout_identity(fresh))
 
     def test_bound_checkout_effect_root_survives_lexical_path_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

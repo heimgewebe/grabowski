@@ -6707,6 +6707,10 @@ class CheckoutLifecycleTests(unittest.TestCase):
                     )
                 )
             )
+            if "historical_witness" in original:
+                original["historical_witness_sha256"] = physical_checkout._historical_witness_digest(
+                    original["physical_identity_sha256"], original["historical_witness"]
+                )
             lane["worktree_receipt"]["lifecycle"]["physical_checkout"] = original
             work_acquire._write_state(path, lane)
 
@@ -7050,8 +7054,29 @@ class CheckoutLifecycleTests(unittest.TestCase):
             self.assertEqual(f"lane:{lane_id}", checkouts.resources.inspect_resource(key)["owner_id"])
 
 
-    def test_expired_same_lane_recovery_accepts_only_uniform_device_renumber(self) -> None:
+    def test_expired_same_lane_recovery_accepts_witnessed_device_renumber(self) -> None:
+        import grabowski_physical_checkout as physical_checkout
+        import grabowski_work_acquire as work_acquire
+
         binding, head, lane_id = self._expired_same_lane_fixture()
+        witness = {
+            "filesystem_uuid": "1" * 32,
+            "handle_type": 77,
+            "file_handle": "0123456789abcdef",
+        }
+        witness_patch = patch.object(
+            physical_checkout, "_stable_btrfs_witness", return_value=witness
+        )
+        witness_patch.start()
+        self.patches.append(witness_patch)
+        with work_acquire._lane_lock(lane_id) as path:
+            lane = work_acquire._read_state(path)
+            lane["worktree_receipt"]["lifecycle"]["physical_checkout"] = (
+                physical_checkout.capture_physical_checkout_identity(
+                    self.checkout, include_stable_witness=True
+                )
+            )
+            work_acquire._write_state(path, lane)
         self._change_original_lane_physical(lane_id, change="uniform_device")
         preview = checkouts.grabowski_checkout_binding_identity_rebind_preview(
             binding["checkout_key"]
@@ -7069,6 +7094,12 @@ class CheckoutLifecycleTests(unittest.TestCase):
         )
         self.assertEqual(head, applied["after"]["lifecycle"]["expected_head"])
         self.assertEqual("uniform_device_renumber", applied["audit"]["physical_identity_transition"])
+
+    def test_expired_same_lane_recovery_rejects_unwitnessed_device_renumber(self) -> None:
+        binding, _, lane_id = self._expired_same_lane_fixture()
+        self._change_original_lane_physical(lane_id, change="uniform_device")
+        with self.assertRaisesRegex(RuntimeError, "physical checkout identity drifted"):
+            checkouts.grabowski_checkout_binding_identity_rebind_preview(binding["checkout_key"])
 
     def test_expired_same_lane_recovery_rejects_partial_device_renumber(self) -> None:
         binding, _, lane_id = self._expired_same_lane_fixture()
