@@ -187,12 +187,56 @@ def _alert_render_row(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def render_alert_notification(row: dict[str, Any]) -> dict[str, str]:
+    # Validate the full canonical receipt before using any producer fields.
+    rendered = render_notification(_alert_render_row(row))
+    if row.get("producer") != "netdata_watch" or row.get("subject") != "heim-pc-netdata":
+        return rendered
+
+    fields = row["fields"]
+    condition = fields.get("condition")
+    kind = rendered["event_class"]
+    short_id = rendered["correlation_id"][-8:]
+    title = "Heim-PC: Netdata-Warnung"
+    body = "Netdata meldet einen Zustand, der Aufmerksamkeit erfordert. Details lokal prüfen."
+    if kind == "owner_decision" and condition == "cpu_temperature_sustained":
+        title = "Heim-PC: CPU-Temperatur"
+        body = "Die CPU-Temperatur ist anhaltend hoch."
+        threshold = re.fullmatch(r"([0-9]{1,3})C for most of ([0-9]{1,3})min", fields.get("threshold", ""))
+        if threshold and int(threshold[1]) > 0 and int(threshold[2]) > 0:
+            body += f" Schwelle: {int(threshold[1])} °C über den Großteil von {int(threshold[2])} Minuten."
+    elif kind == "owner_decision" and condition == "new_btrfs_device_errors":
+        title = "Heim-PC: neuer Btrfs-Fehler"
+        body = "Ein Btrfs-Gerätefehlerzähler ist gestiegen."
+        labels = {
+            "write_errs": "Schreibfehler",
+            "read_errs": "Lesefehler",
+            "flush_errs": "Flush-Fehler",
+            "corruption_errs": "Korruptionsfehler",
+            "generation_errs": "Generationsfehler",
+        }
+        label = labels.get(fields.get("counter"))
+        count = fields.get("count", "")
+        if label and re.fullmatch(r"[0-9]{1,20}", count) and int(count) > 0:
+            body = f"Btrfs-Zähler für {label} ist auf {int(count)} gestiegen. Das ist der Gesamtzähler, nicht die Zahl neuer Fehler."
+    elif kind == "owner_decision" and condition == "native_critical":
+        title = "Heim-PC: kritischer Netdata-Alarm"
+        body = "Netdata meldet einen kritischen Alarm."
+        alarm = fields.get("alarm", "")
+        if re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,99}", alarm):
+            body += f" Alarm: {alarm}."
+    elif kind == "service_failure" and fields.get("error_type") == "two_failed_reads":
+        title = "Heim-PC: Netdata-Messdaten fehlen"
+        body = "Zwei aufeinanderfolgende Monitoring-Abfragen waren fehlerhaft oder unvollständig. Betroffene Messreihen lokal prüfen."
+    else:
+        # Unknown events must still be delivered, without exposing arbitrary
+        # producer fields or replacing the canonical event classification.
+        body += " " + rendered["body"]
+    return {**rendered, "title": title, "body": f"{body} (Ref. {short_id})"}
+
+
 def publish_alert(topic: str, row: dict[str, Any], *, server: str = SERVER) -> int:
-    return _publish_rendered(
-        topic,
-        render_notification(_alert_render_row(row)),
-        server=server,
-    )
+    return _publish_rendered(topic, render_alert_notification(row), server=server)
 
 
 def _notification_list(*, limit: int, state: str) -> dict[str, Any]:

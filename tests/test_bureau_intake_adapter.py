@@ -1610,8 +1610,8 @@ class BureauIntakeAdapterTests(unittest.TestCase):
         )
         self.assertEqual(set(schema["properties"]), set(schema["required"]))
 
-    def test_registry_defaults_use_isolated_control_checkout(self) -> None:
-        expected = str(intake.bureau_runtime.BUREAU_CONTROL_ROOT)
+    def test_registry_defaults_select_manifest_snapshot(self) -> None:
+        expected = ""
         functions = (
             intake.grabowski_bureau_task_propose,
             intake.grabowski_bureau_task_review,
@@ -1624,6 +1624,151 @@ class BureauIntakeAdapterTests(unittest.TestCase):
                     inspect.signature(function).parameters["registry_root"].default,
                     expected,
                 )
+
+    def test_default_proposal_uses_manifest_without_control_checkout_refresh(self) -> None:
+        snapshot = self.root / "runtime" / "registry-snapshots" / "source-a"
+        snapshot.mkdir(parents=True)
+        control = self.root / "newer-control-checkout"
+        control.mkdir()
+        binding = mock.Mock(registry_root=snapshot)
+        task = {"schema_version": 1, "id": "INIT-T099"}
+
+        def invoke(arguments, **_kwargs):
+            self.assertEqual(arguments[:2], ["--root", str(snapshot)])
+            if "--write-plan" in arguments:
+                plan = Path(arguments[arguments.index("--write-plan") + 1])
+                plan.write_text(json.dumps({
+                    "publishing_task_id": "INIT-T001", "proposal_sha256": "a" * 64,
+                }))
+                return {"kind": "bureau_task_proposal_result", "status": "written"}
+            return {
+                "kind": "bureau_task_publication_preview", "status": "ready",
+                "publication_mode": "state_store", "proposal_sha256": "a" * 64,
+                "coordination_state_root": str(self.root / "state"),
+            }
+
+        with (
+            mock.patch.object(intake, "_managed_runtime_binding", return_value=binding),
+            mock.patch.object(intake.bureau_runtime, "BUREAU_CONTROL_ROOT", control),
+            mock.patch.object(intake.bureau_runtime, "refresh_bureau_control_checkout") as refresh,
+            mock.patch.object(intake.bureau_runtime, "inspect_bureau_control_checkout") as inspect_root,
+            mock.patch.object(intake, "_invoke_bureau", side_effect=invoke),
+        ):
+            first = intake.grabowski_bureau_task_propose(task, "INIT-T001", candidate_id="candidate-a")
+            second = intake.grabowski_bureau_task_propose(task, "INIT-T001", candidate_id="candidate-a")
+            preview = intake.grabowski_bureau_task_publish_preview(first["adapter_proposal_id"])
+        self.assertEqual(first["adapter_proposal_id"], second["adapter_proposal_id"])
+        self.assertTrue(second["idempotent_adapter_replay"])
+        self.assertEqual(preview["publication_mode"], "state_store")
+        refresh.assert_not_called()
+        inspect_root.assert_not_called()
+
+    def test_default_publish_and_receipt_replay_keep_manifest_root_and_state_lease(self) -> None:
+        proposal_id = "9" * 64
+        self._write_proposal(proposal_id)
+        snapshot = self.root / "snapshot"
+        snapshot.mkdir()
+        state_root = str(self.root / "state")
+        binding = mock.Mock(registry_root=snapshot)
+        keys = ["path:" + state_root]
+        preview = {
+            "kind": "bureau_task_publication_preview", "status": "ready",
+            "publication_mode": "state_store", "coordination_state_root": state_root,
+            "required_resource_keys": keys,
+        }
+        published = {
+            "kind": "bureau_task_publication_receipt", "status": "published",
+            "publication_mode": "state_store", "coordination_state_root": state_root,
+        }
+
+        def invoke(arguments, **_kwargs):
+            self.assertEqual(arguments[:2], ["--root", str(snapshot)])
+            if "--preview" in arguments:
+                return preview
+            self.assertEqual(arguments[arguments.index("--state-root") + 1], state_root)
+            receipt = Path(arguments[arguments.index("--receipt") + 1])
+            if not receipt.exists():
+                receipt.write_text(json.dumps(published))
+            return published
+
+        with (
+            mock.patch.object(intake, "_managed_runtime_binding", return_value=binding),
+            mock.patch.object(intake.bureau_runtime, "refresh_bureau_control_checkout") as refresh,
+            mock.patch.object(intake.bureau_runtime, "inspect_bureau_control_checkout") as inspect_root,
+            mock.patch.object(intake, "_invoke_bureau", side_effect=invoke),
+            mock.patch.object(intake.resources, "acquire_resources",
+                              return_value={"expires_at_unix": 200, "bureau_contract": {}}) as acquire,
+            mock.patch.object(intake.resources, "release_resources",
+                              return_value={"released": [{"resource_key": keys[0]}]}) as release,
+        ):
+            result = intake.grabowski_bureau_task_publish(proposal_id)
+            replay = intake.grabowski_bureau_task_publish(proposal_id)
+        self.assertTrue(result["leases_released"])
+        self.assertTrue(replay["idempotent_adapter_replay"])
+        acquire.assert_called_once()
+        self.assertEqual(acquire.call_args.args[1], keys)
+        release.assert_called_once()
+        refresh.assert_not_called()
+        inspect_root.assert_not_called()
+
+    def test_default_legacy_git_receipt_requires_git_root_authority(self) -> None:
+        proposal_id = "8" * 64
+        directory = self._write_proposal(proposal_id)
+        snapshot = self.root / "snapshot"
+        control = self.root / "control"
+        snapshot.mkdir()
+        control.mkdir()
+        receipt = {
+            "kind": "bureau_task_publication_receipt", "status": "published",
+            "publication_mode": "git_pr",
+        }
+        (directory / "publication-receipt.json").write_text(json.dumps(receipt))
+        intake.operator._require_operator_mutation.reset_mock()
+        with (
+            mock.patch.object(intake, "_managed_runtime_binding",
+                              return_value=mock.Mock(registry_root=snapshot)),
+            mock.patch.object(intake, "BUREAU_ROOT", control),
+            mock.patch.object(intake.bureau_runtime, "BUREAU_CONTROL_ROOT", control),
+            mock.patch.object(intake.bureau_runtime, "refresh_bureau_control_checkout") as refresh,
+            mock.patch.object(intake, "_invoke_bureau", return_value=receipt) as invoke,
+            mock.patch.object(intake.resources, "acquire_resources") as acquire,
+        ):
+            replay = intake.grabowski_bureau_task_publish(proposal_id)
+        self.assertTrue(replay["idempotent_adapter_replay"])
+        self.assertEqual(invoke.call_args.args[0][:2], ["--root", str(control)])
+        intake.operator._require_operator_mutation.assert_any_call(
+            "bureau_mutation", path=str(control)
+        )
+        refresh.assert_called_once()
+        acquire.assert_not_called()
+
+    def test_canonical_intake_invocation_passes_explicit_coordination_state(self) -> None:
+        snapshot = self.root / "snapshot"
+        state = self.root / "state"
+        binding = mock.Mock(registry_root=snapshot)
+        runtime = {"python_launcher": Path("/runtime/python")}
+        completed = subprocess.CompletedProcess(
+            ["bureau"], 0, json.dumps({"result": {"status": "ready"}}), "",
+        )
+        with (
+            mock.patch.object(intake, "BUREAU_STATE_ROOT", state),
+            mock.patch.object(intake.bureau_runtime, "_contract_runtime", return_value=runtime),
+            mock.patch.object(intake.bureau_runtime, "_assert_contract_runtime_unchanged"),
+            mock.patch.object(intake, "_managed_runtime_binding", return_value=binding),
+            mock.patch.object(intake, "_assert_managed_runtime_unchanged"),
+            mock.patch.object(intake, "_bound_launcher_fd", self._mock_bound_launcher()),
+            mock.patch.object(intake.bureau_runtime, "_safe_environment", return_value={}),
+            mock.patch.object(intake.subprocess, "run", return_value=completed) as run,
+        ):
+            for command in ("operator-task-propose", "operator-task-review", "operator-task-publish"):
+                intake._invoke_bureau(["--root", str(snapshot), "--json", command])
+                self.assertEqual(run.call_args.args[0][3:7],
+                                 ["--root", str(snapshot), "--state-root", str(state)])
+            intake._invoke_bureau(["--root", str(self.root), "--json", "operator-task-propose"])
+            self.assertNotIn("--state-root", run.call_args.args[0])
+            intake._invoke_bureau(["--root", str(snapshot), "--state-root", str(state),
+                                   "--json", "operator-task-publish", "--apply"])
+            self.assertEqual(run.call_args.args[0].count("--state-root"), 1)
 
     def test_shared_workbench_registry_root_is_rejected(self) -> None:
         shared = self.root / "shared-workbench"

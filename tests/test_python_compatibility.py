@@ -33,5 +33,18 @@ class PythonCompatibilityTests(unittest.TestCase):
         )
 
 
+    def test_ci_validates_native_merge_groups(self) -> None:
+        workflow = (
+            ROOT / ".github" / "workflows" / "validate.yml"
+        ).read_text(encoding="utf-8")
+
+        self.assertRegex(
+            workflow,
+            r"(?m)^  merge_group:\n    types: \[checks_requested\]$",
+        )
+        self.assertIn("run: make validate", workflow)
+        self.assertIn("run: make deploy-check", workflow)
+
+
 if __name__ == "__main__":
     unittest.main()
