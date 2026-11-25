@@ -59,6 +59,78 @@ class WorkAcquireTests(unittest.TestCase):
         self.addCleanup(self.effective_toplevel_patcher.stop)
         self.addCleanup(self._restore_env)
 
+    def test_terminal_audit_lookup_streams_verified_rotated_chain(self) -> None:
+        base = work_acquire.operator.base
+        audit_root = self.root / "audit-state"
+        audit_root.mkdir(mode=0o700)
+        audit = audit_root / "write-audit.jsonl"
+        event = {
+            "operation": "work-lane-terminal-closeout",
+            "lane_id": "a" * 32,
+            "terminal_transition_sha256": "b" * 64,
+            "state": "persisted",
+        }
+        with ExitStack() as stack:
+            for key, value in {
+                "STATE_DIR": audit_root,
+                "AUDIT_LOG": audit,
+                "QUARANTINE_DIR": audit_root / "quarantine",
+                "KILL_SWITCH_PATH": audit_root / "operator-kill-switch",
+                "MAX_AUDIT_BYTES": 8192,
+                "MAX_AUDIT_RECORD_BYTES": 1024,
+                "AUDIT_ROTATION_RESERVE_BYTES": 512,
+            }.items():
+                stack.enter_context(patch.object(base, key, value))
+            expected = base._append_audit_with_digest(event)
+            for index in range(30):
+                base._append_audit({"operation": "unrelated", "index": index,
+                                    "payload": "x" * 120})
+            self.assertGreater(base._verify_audit_log(audit)["archived_segment_count"], 0)
+            stack.enter_context(patch.object(
+                base, "_audit_records_snapshot",
+                side_effect=AssertionError("full audit materialization forbidden"),
+            ))
+            self.assertEqual(expected, work_acquire._find_terminal_closeout_audit(event))
+            self.assertIsNone(work_acquire._find_terminal_closeout_audit(
+                {**event, "state": "different"}))
+            # Duplicate transitions across the verified archived and active
+            # segments must still fail rather than select the newest receipt.
+            base._append_audit_with_digest(event)
+            with self.assertRaisesRegex(RuntimeError, "duplicate transition"):
+                work_acquire._find_terminal_closeout_audit(event)
+
+    def test_terminal_audit_lookup_rejects_changed_archived_segment(self) -> None:
+        import grabowski_audit_query as query
+        base = work_acquire.operator.base
+        root = self.root / "audit-tamper"
+        root.mkdir(mode=0o700)
+        audit = root / "write-audit.jsonl"
+        event = {"operation": "work-lane-terminal-closeout",
+                 "lane_id": "a" * 32, "terminal_transition_sha256": "b" * 64}
+        with ExitStack() as stack:
+            for key, value in {
+                "STATE_DIR": root, "AUDIT_LOG": audit,
+                "QUARANTINE_DIR": root / "quarantine",
+                "KILL_SWITCH_PATH": root / "operator-kill-switch",
+                "MAX_AUDIT_BYTES": 8192, "MAX_AUDIT_RECORD_BYTES": 1024,
+                "AUDIT_ROTATION_RESERVE_BYTES": 512,
+            }.items():
+                stack.enter_context(patch.object(base, key, value))
+            base._append_audit_with_digest(event)
+            for index in range(30):
+                base._append_audit({"operation": "other", "index": index,
+                                    "payload": "x" * 120})
+            snapshot = query.capture_verified_audit_snapshot(audit)
+            archived = next(s for s in snapshot.segments if not s.active)
+            original = archived.path.read_bytes()
+            archived.path.write_bytes(original[:-1] + b"X")
+            # Simulate a historical segment changing after the coherent
+            # snapshot was captured, not a fake successful verifier.
+            with patch.object(query, "capture_verified_audit_snapshot",
+                              return_value=snapshot):
+                with self.assertRaisesRegex(ValueError, "sha256-mismatch"):
+                    work_acquire._find_terminal_closeout_audit(event)
+
     def _restore_env(self) -> None:
         work_acquire.checkouts.CHECKOUT_DB = self.previous_checkout_db
         if self.previous is None:
