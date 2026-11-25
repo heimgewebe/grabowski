@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import re
 import resource
+import shutil
 import stat
 import subprocess
 import sys
@@ -537,10 +538,13 @@ def _schedule_ntfy_dispatch(notification_id: str, requested_channels: list[str])
     if "ntfy" not in requested_channels:
         return False
     unit = f"grabowski-ntfy-dispatch-{notification_id}.service"
+    systemd_run = shutil.which("systemd-run")
+    if systemd_run is None:
+        return False
     try:
         result = subprocess.run(
             [
-                "/usr/bin/systemd-run",
+                systemd_run,
                 "--user",
                 "--collect",
                 "--quiet",
