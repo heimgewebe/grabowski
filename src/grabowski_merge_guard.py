@@ -3885,6 +3885,13 @@ def verify_github_base_update_guard(
         ],
     }
     policy["binding_sha256"] = _sha256_json(policy)
+    # Reuse the complete, revalidated branch rules rather than querying
+    # GraphQL for a queue which is not configured. Unknown is not absence.
+    evidence["merge_queue_present"] = (
+        any(rule["type"] == "merge_queue" for rule in active)
+        if all(isinstance(rule.get("type"), str) and rule["type"].strip() for rule in active)
+        else None
+    )
     evidence["policy_sha256"] = _sha256_json(policy)
     evidence["errors"] = []
     return policy, evidence, []
@@ -6613,15 +6620,25 @@ class CaptainMergeGuardRunner:
                 if isinstance(dispatch_policy, dict)
                 else None
             )
-            queue_entry, queue_evidence, queue_errors = _dispatch_merge_queue_readback(
-                self.repo_path,
-                self.github_runner,
-                repo_slug=str(bindings["repository"]),
-                pr_number=int(bindings["pull_request"]),
-                expected_head=str(bindings["head_sha"]),
-                expected_base=str(bindings["base_branch"]),
-                expected_base_sha=str(bindings["base_sha"]),
-            )
+            if (
+                dispatch_mode == "strict_required_status_checks_ruleset"
+                and dispatch_guard.get("merge_queue_present") is False
+            ):
+                queue_entry, queue_evidence, queue_errors = None, {
+                    "state": "not_applicable_queue_absent",
+                    "active_rules_sha256": dispatch_policy["active_rules_sha256"],
+                    "errors": [],
+                }, []
+            else:
+                queue_entry, queue_evidence, queue_errors = _dispatch_merge_queue_readback(
+                    self.repo_path,
+                    self.github_runner,
+                    repo_slug=str(bindings["repository"]),
+                    pr_number=int(bindings["pull_request"]),
+                    expected_head=str(bindings["head_sha"]),
+                    expected_base=str(bindings["base_branch"]),
+                    expected_base_sha=str(bindings["base_sha"]),
+                )
             self.receipt["dispatch_merge_queue_readback"] = queue_evidence
             if queue_errors:
                 self.receipt["status"] = "blocked_after_guard_revalidation"

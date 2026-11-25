@@ -16096,15 +16096,28 @@ def _run_captain_pr_merge(
             f"merge not attempted: {detail}"
         )
         return execution_result
-    queue_entry, queue_info, queue_errors = _captain_pr_merge_queue_readback(
-        repo_path,
-        github_runner,
-        repo_slug=repo_slug,
-        pr_number=pr_number,
-        expected_head=expected_head,
-        expected_base=expected_base,
-        expected_base_sha=expected_base_sha,
-    )
+    if (
+        base_update_guard.get("mode") == "strict_required_status_checks_ruleset"
+        and base_update_guard_evidence.get("merge_queue_present") is False
+        and merge_policy.get("branch_merge_policy", {"merge_queue_present": False}).get(
+            "merge_queue_present"
+        ) is False
+    ):
+        queue_entry, queue_info, queue_errors = None, {
+            "state": "not_applicable_queue_absent",
+            "active_rules_sha256": base_update_guard["active_rules_sha256"],
+            "errors": [],
+        }, []
+    else:
+        queue_entry, queue_info, queue_errors = _captain_pr_merge_queue_readback(
+            repo_path,
+            github_runner,
+            repo_slug=repo_slug,
+            pr_number=pr_number,
+            expected_head=expected_head,
+            expected_base=expected_base,
+            expected_base_sha=expected_base_sha,
+        )
     execution_result["pre_dispatch_merge_queue_readback"] = queue_info
     pre_queue_view = queue_info.get("view") if isinstance(queue_info, dict) else None
     pre_queue_binding_errors = [
