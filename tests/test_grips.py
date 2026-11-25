@@ -1410,6 +1410,26 @@ class WorktreeOrientCleanupTests(unittest.TestCase):
 
 
 class GripFoundationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # These integration-style fixtures close real obligations. Keep their
+        # alert receipts private to the test and never start a live dispatcher.
+        temporary = tempfile.TemporaryDirectory(prefix="grip-alert-outbox-")
+        self.addCleanup(temporary.cleanup)
+        self._test_alert_root = Path(temporary.name) / "alerts"
+        environment = patch.dict(
+            "os.environ",
+            {"GRABOWSKI_ALERT_OUTBOX_ROOT": str(self._test_alert_root)},
+        )
+        environment.start()
+        self.addCleanup(environment.stop)
+        scheduler = patch.object(
+            grips.grabowski_operator_obligation.alert_outbox,
+            "schedule_dispatch",
+            return_value=True,
+        )
+        self._test_alert_scheduler = scheduler.start()
+        self.addCleanup(scheduler.stop)
+
     @staticmethod
     def _systemic_convergence_fixture(
         root: Path, obligation_id: str
@@ -5201,6 +5221,15 @@ class GripFoundationTests(unittest.TestCase):
         self.assertFalse(close_result["output"]["systemic_convergence_claim"])
         self.assertTrue(close_result["output"]["response_may_end"])
         self.assertTrue(close_result["output"]["work_complete"])
+        outbox = grips.grabowski_operator_obligation.alert_outbox
+        self.assertEqual(self._test_alert_root, outbox._root())
+        alerts = outbox.list_alerts(state="queued")
+        self.assertEqual(1, alerts["queued_count"])
+        self.assertEqual([], alerts["invalid_receipts"])
+        row = alerts["alerts"][0]
+        self.assertEqual("operator_obligation", row["producer"])
+        self.assertEqual("long_run_completed", row["event_class"])
+        self._test_alert_scheduler.assert_called_once_with(row["alert_id"])
 
     def test_operator_obligation_resolve_grip_projects_historical_attention(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, patch.dict(
