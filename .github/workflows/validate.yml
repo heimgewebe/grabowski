@@ -32,6 +32,36 @@ jobs:
         with:
           path: grabowski
 
+      - name: Reject proven superseded initial PR head
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -eu
+          # Only initial canonical PR runs may use the early stale-head exit.
+          if [[ "$EVENT_NAME" != pull_request || "$REPOSITORY" != heimgewebe/grabowski || "$RUN_ATTEMPT" != 1 ]]; then
+            exit 0
+          fi
+          if [[ ! "$PR_NUMBER" =~ ^[1-9][0-9]*$ || ! "$PR_HEAD" =~ ^[0-9a-f]{40}$ ]]; then
+            exit 0
+          fi
+          ref="refs/pull/$PR_NUMBER/head"
+          if ! reply="$(timeout 10s git ls-remote --exit-code --refs origin "$ref" 2>/dev/null)"; then
+            exit 0
+          fi
+          IFS=$'\t' read -r live returned <<< "$reply"
+          if [[ ! "$live" =~ ^[0-9a-f]{40}$ || "$returned" != "$ref" || "$reply" != "$live"$'\t'"$ref" ]]; then
+            exit 0
+          fi
+          if [[ "$live" != "$PR_HEAD" ]]; then
+            printf '::notice::PR head superseded; refusing to certify obsolete revision\n'
+            exit 1
+          fi
+
       - name: Checkout pinned convergence protocol
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
