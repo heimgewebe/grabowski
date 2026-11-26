@@ -186,4 +186,10 @@ class MainValidationReuseTests(unittest.TestCase):
         self.assertIn("run: make validate-main-reuse", workflow)
         self.assertIn("run: make deploy-check", workflow)
         self.assertIn("validate: $(VALIDATE_PRECHECKS) test $(VALIDATE_CONTRACT_CHECKS)", makefile)
+        prechecks = next(
+            line for line in makefile.splitlines()
+            if line.startswith("VALIDATE_PRECHECKS :=")
+        ).split(":=", 1)[1].split()
+        self.assertIn("context-check", prechecks)
+        self.assertIn("profiles-check", prechecks)
         self.assertIn("validate-main-reuse: $(VALIDATE_PRECHECKS) $(VALIDATE_CONTRACT_CHECKS)", makefile)
