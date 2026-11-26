@@ -19,6 +19,7 @@ If the two sides ever disagree again, this fails in CI instead of in production.
 from __future__ import annotations
 
 import copy
+from dataclasses import replace
 import importlib.metadata
 import importlib.util
 import json
@@ -99,6 +100,39 @@ grabowski_mcp = _load_grabowski_mcp()
 deploy_runtime = _load_deploy_runtime()
 
 
+# Reuse only the unchanged repository inputs within this test module.
+# Every StagedRelease still writes its own files and runs real runtime validation.
+_fixture_snapshot = None
+
+
+def setUpModule():
+    global _fixture_snapshot
+    _fixture_snapshot = deploy_runtime.snapshot_from_worktree(ROOT)
+
+
+def tearDownModule():
+    global _fixture_snapshot
+    _fixture_snapshot = None
+
+
+def _staged_snapshot():
+    assert _fixture_snapshot is not None
+    validator = deploy_runtime.load_contract_validator_bytes(
+        _fixture_snapshot.supporting_source_bytes[
+            grabowski_runtime_contract.CANONICAL_VALIDATOR_MODULE
+        ]
+    )
+    # Snapshot is frozen, but its contract and source/asset maps are not deeply
+    # immutable. Keep those, and the validator namespace, private to each fixture.
+    return replace(
+        _fixture_snapshot,
+        validator=validator,
+        contract=copy.deepcopy(_fixture_snapshot.contract),
+        supporting_source_bytes=dict(_fixture_snapshot.supporting_source_bytes),
+        runtime_asset_bytes=dict(_fixture_snapshot.runtime_asset_bytes),
+    )
+
+
 class StagedRelease:
     """A release staged with the real deployment builder code paths.
 
@@ -109,7 +143,7 @@ class StagedRelease:
 
     def __init__(self, root: Path) -> None:
         self.root = root
-        self.snapshot = deploy_runtime.snapshot_from_worktree(ROOT)
+        self.snapshot = _staged_snapshot()
         self.releases_root = root / "grabowski-mcp-releases"
         self.release = self.releases_root / "release-lifecycle-001"
         self.stable = root / "grabowski-mcp"
@@ -202,6 +236,25 @@ class StagedRelease:
             ),
         ):
             return grabowski_mcp._deployment_metadata()
+
+
+class SnapshotFixtureIsolationTests(unittest.TestCase):
+    def test_staged_snapshot_mutations_do_not_leak_into_next_fixture(self) -> None:
+        first = _staged_snapshot()
+        second = _staged_snapshot()
+        self.assertEqual(first.repo_head, second.repo_head)
+        self.assertEqual(first.source_set_sha256, second.source_set_sha256)
+        self.assertEqual(first.contract.to_manifest(), second.contract.to_manifest())
+        self.assertIsNot(first.contract, second.contract)
+        self.assertIsNot(first.validator, second.validator)
+        module = grabowski_runtime_contract.CANONICAL_VALIDATOR_MODULE
+        first.supporting_source_bytes.pop(module)
+        first.runtime_asset_bytes.clear()
+        first.contract.browser_operator_default.clear()
+        third = _staged_snapshot()
+        self.assertEqual(second.source_set_sha256, third.source_set_sha256)
+        self.assertEqual(second.contract.to_manifest(), third.contract.to_manifest())
+        self.assertIn(module, third.supporting_source_bytes)
 
 
 class ReleaseLifecycleConsistencyTests(unittest.TestCase):
