@@ -231,10 +231,9 @@ class PostHogMCPAnalyticsTests(unittest.TestCase):
                 side_effect=lambda: calls.append("posthog"),
             ),
             patch.object(
-                self.operator.mcp,
-                "run",
-                create=True,
-                side_effect=lambda **kwargs: calls.append("run"),
+                self.operator,
+                "_run_http_runtime",
+                side_effect=lambda *_args, **_kwargs: calls.append("run"),
             ),
             patch.object(
                 self.operator,
@@ -277,7 +276,7 @@ class PostHogMCPAnalyticsTests(unittest.TestCase):
             self.operator.mcp._tool_manager.call_tool = wrapped
             return True
 
-        def exercise_http_transport(**_kwargs) -> None:
+        def exercise_http_transport(*_args, **_kwargs) -> None:
             async def run_calls() -> None:
                 await asyncio.gather(
                     *(
@@ -308,9 +307,8 @@ class PostHogMCPAnalyticsTests(unittest.TestCase):
                 "_shutdown_posthog_mcp_analytics",
             ),
             patch.object(
-                self.operator.mcp,
-                "run",
-                create=True,
+                self.operator,
+                "_run_http_runtime",
                 side_effect=exercise_http_transport,
             ),
         ):
@@ -352,10 +350,9 @@ class PostHogMCPAnalyticsTests(unittest.TestCase):
                 )[-1],
             ),
             patch.object(
-                self.operator.mcp,
-                "run",
-                create=True,
-                side_effect=lambda **kwargs: calls.append("run"),
+                self.operator,
+                "_run_http_runtime",
+                side_effect=lambda *_args, **_kwargs: calls.append("run"),
             ),
             patch.object(
                 self.operator,

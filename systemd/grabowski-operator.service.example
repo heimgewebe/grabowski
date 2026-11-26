@@ -13,7 +13,8 @@ ExecStart=/home/alex/.local/share/grabowski-mcp/.venv/bin/python -m grabowski_op
 Restart=on-failure
 RestartSec=2
 TimeoutStartSec=20
-TimeoutStopSec=20
+# HTTP graceful drain is bounded at 65s; retain margin for lifespan shutdown.
+TimeoutStopSec=90
 KillMode=mixed
 UMask=0077
 Environment=HOME=/home/alex
