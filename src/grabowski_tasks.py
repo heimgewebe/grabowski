@@ -9741,14 +9741,17 @@ def grabowski_task_start(
         if candidate_admission.get("applicable") is True:
             coding_agent_pre_dispatch_admission = candidate_admission
 
-    retry_binding = (
-        None
-        if operation_retry_binding is not None
-        else _guard_unchanged_terminal_retry(
-            execution_identity,
-            _retry_context,
+    if operation_retry_binding is not None and _retry_context is None:
+        # Legacy named retries may have a retained successor without an
+        # operation identity. An explicit operation retry must not duplicate it.
+        _guard_linked_retry_successor(
+            None, source_task_id=operation_retry_binding["source_task_id"],
         )
-    )
+        retry_binding = None
+    else:
+        retry_binding = _guard_unchanged_terminal_retry(
+            execution_identity, _retry_context,
+        )
     routing_shadow_capture: dict[str, Any] | None = None
     if normalized_route_evidence is not None:
         import grabowski_operator_routing_shadow_capture as routing_shadow
@@ -11659,6 +11662,20 @@ def _terminal_retry_successor(
         else {}
     )
     retry_context = _build_terminal_retry_context(record, reason=reason)
+    operation_identity = _persisted_task_operation_identity(record)
+    operation_retry: dict[str, Any] = {}
+    if operation_identity is not None:
+        # Retrying the same named operation preserves its existing identity,
+        # not a newly inferred fingerprint. Keep both canonical retry guards.
+        operation_retry = {
+            "operation_identity": {
+                key: operation_identity[key]
+                for key in ("repository_head", "source_fingerprint_sha256", "purpose", "scope_sha256")
+            },
+            "supersedes_task_id": str(record["task_id"]),
+            "supersedes_receipt_sha256": retry_context["source_lifecycle_receipt_sha256"],
+            "force_new_reason": retry_context["named_state_change"],
+        }
     started = grabowski_task_start(
         str(record["host"]),
         _terminal_retry_command(record),
@@ -11685,6 +11702,7 @@ def _terminal_retry_successor(
             )
         ),
         _retry_context=retry_context,
+        **operation_retry,
     )
     task = dict(started["task"])
     task["retry_of_task_id"] = record["task_id"]

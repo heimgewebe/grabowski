@@ -16105,6 +16105,84 @@ class TaskTests(unittest.TestCase):
                 tasks.grabowski_task_start(**retry)
             self.assertEqual(2, dispatch.call_count)
 
+    def test_named_retry_preserves_operation_identity_and_reuses_successor(self) -> None:
+        common = dict(
+            host="local", argv=["/bin/false"], cwd=str(self.root),
+            runtime_seconds=60, resume_policy="manual",
+            operation_identity=self._operation_identity_fixture(),
+        )
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()) as dispatch,
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(tasks, "_require_recovery_gate", return_value={"checked_at_unix": 123}),
+        ):
+            first = tasks.grabowski_task_start(**common)
+            source_id = first["task"]["task_id"]
+            failed = tasks._set_state(source_id, "failed", observation={
+                "state": "failed", "observed_at_unix": tasks._now(),
+            })
+            resumed = tasks.reconcile_tasks_resume(
+                task_id=source_id, max_resumes=1, reason="test precondition corrected",
+            )
+            self.assertEqual([], resumed["blocked"])
+            successor_id = resumed["resumed"][0]["task_id"]
+            successor = tasks._row_raw(successor_id)
+            self.assertEqual(first["operation_identity"],
+                             tasks._persisted_task_operation_identity(successor))
+            launcher = json.loads(successor["launcher_json"])
+            self.assertEqual(source_id, launcher["retry_binding"]["source_task_id"])
+            self.assertEqual(source_id, launcher["operation_retry_binding"]["source_task_id"])
+            self.assertEqual(failed["lifecycle_receipt_sha256"],
+                             launcher["operation_retry_binding"]["source_lifecycle_receipt_sha256"])
+            tasks._set_state(successor_id, "completed", observation={
+                "state": "completed", "observed_at_unix": tasks._now(),
+            })
+            reused = tasks.grabowski_task_start(**common)
+            self.assertEqual(successor_id, reused["task"]["task_id"])
+            self.assertTrue(reused["deduplicated_reuse"]["reused"])
+            self.assertEqual(2, dispatch.call_count)
+
+    def test_operation_retry_rejects_legacy_unbound_named_successor(self) -> None:
+        common = dict(
+            host="local", argv=["/bin/false"], cwd=str(self.root),
+            runtime_seconds=60, resume_policy="manual",
+            operation_identity=self._operation_identity_fixture(),
+        )
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()) as dispatch,
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(tasks, "_require_recovery_gate", return_value={"checked_at_unix": 123}),
+        ):
+            first = tasks.grabowski_task_start(**common)
+            source_id = first["task"]["task_id"]
+            failed = tasks._set_state(source_id, "failed", observation={
+                "state": "failed", "observed_at_unix": tasks._now(),
+            })
+            # Reproduce the old server's named retry: retained linkage, but no
+            # operation identity on the successor.
+            legacy = tasks.grabowski_task_start(
+                **{**common, "operation_identity": None},
+                _retry_context=tasks._build_terminal_retry_context(
+                    tasks._row_raw(source_id), reason="test precondition corrected",
+                ),
+            )
+            successor_id = legacy["task"]["task_id"]
+            tasks._set_state(successor_id, "completed", observation={
+                "state": "completed", "observed_at_unix": tasks._now(),
+            })
+            for receipt in ("", failed["lifecycle_receipt_sha256"]):
+                with self.subTest(receipt=receipt), self.assertRaisesRegex(
+                    RuntimeError, f"retained successor; reconcile task {successor_id}",
+                ):
+                    tasks.grabowski_task_start(
+                        **common, supersedes_task_id=source_id,
+                        supersedes_receipt_sha256=receipt,
+                        force_new_reason="test precondition corrected",
+                    )
+            self.assertEqual(2, dispatch.call_count)
+
     def test_operation_retry_server_receipt_requires_terminal_policy_and_evidence(self) -> None:
         import grabowski_task_attention as task_attention
 
