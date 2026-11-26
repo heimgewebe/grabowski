@@ -14140,6 +14140,43 @@ def grabowski_task_list(
     raise AssertionError("bounded task-list snapshot retry ended unexpectedly")
 
 
+TaskConsumerView = Literal["full", "compact"]
+
+
+def _validate_task_consumer_view(view: TaskConsumerView) -> None:
+    if view not in ("full", "compact"):
+        raise ValueError("task consumer view must be full or compact")
+
+
+def _task_consumer_projection(
+    result: dict[str, Any], view: TaskConsumerView,
+) -> dict[str, Any]:
+    """Omit only repeated argument representations from a consumer response."""
+    _validate_task_consumer_view(view)
+    if view == "full":
+        return result
+    projected = dict(result)
+    omitted: list[str] = []
+    if "argv" in projected:
+        del projected["argv"]
+        omitted.append("argv")
+    launcher = projected.get("launcher")
+    if isinstance(launcher, dict):
+        projected_launcher = dict(launcher)
+        for key in ("argv", "command"):
+            if key in projected_launcher:
+                del projected_launcher[key]
+                omitted.append(f"launcher.{key}")
+        projected["launcher"] = projected_launcher
+    projected["projection"] = {
+        "view": "compact",
+        "omitted_fields": omitted,
+        "detail_tool": "grabowski_task_status",
+        "detail_view": "full",
+    }
+    return projected
+
+
 @mcp.tool(name="grabowski_task_start", annotations=MUTATING)
 async def _grabowski_task_start_tool(
     host: str,
@@ -14164,6 +14201,7 @@ async def _grabowski_task_start_tool(
     supersedes_receipt_sha256: str = "",
     force_new_reason: str = "",
     effect_profile: str | None = None,
+    view: TaskConsumerView = "full",
 ) -> dict[str, Any]:
     """Start one persistent local or fleet task in its own systemd unit.
 
@@ -14178,9 +14216,14 @@ async def _grabowski_task_start_tool(
     resume, leases, shell/indirect execution, larger output, and long runtime
     continue to require persistent tasks. Caller-supplied effect_profile=read_only
     alone never establishes read safety.
+
+    Use view="compact" for routine launch decisions. It preserves all admission,
+    identity and lifecycle evidence but omits repeated task/launcher arguments.
+    The legacy full view is unchanged; retrieve full diagnostics via task_status.
     """
+    _validate_task_consumer_view(view)
     operator._require_operator_capability("durable_job")
-    return await asyncio.to_thread(
+    result = await asyncio.to_thread(
         grabowski_task_start,
         host,
         argv,
@@ -14205,13 +14248,25 @@ async def _grabowski_task_start_tool(
         force_new_reason,
         effect_profile,
     )
+    if view == "compact" and isinstance(result.get("task"), dict):
+        return {**result, "task": _task_consumer_projection(result["task"], view)}
+    return result
 
 
 @mcp.tool(name="grabowski_task_status", annotations=MUTATING)
-async def _grabowski_task_status_tool(task_id: str) -> dict[str, Any]:
-    """Observe and persist one task state; lease maintenance may mutate resources."""
+async def _grabowski_task_status_tool(
+    task_id: str, view: TaskConsumerView = "full",
+) -> dict[str, Any]:
+    """Observe and persist one task state; lease maintenance may mutate resources.
+
+    Use view="compact" for routine status, exit, lease and closeout decisions.
+    It omits only repeated task/launcher arguments, retaining hashes and
+    diagnostics. The full view preserves the legacy response unchanged.
+    """
+    _validate_task_consumer_view(view)
     operator._require_operator_mutation("durable_job", task_id=task_id)
-    return await asyncio.to_thread(grabowski_task_status, task_id)
+    result = await asyncio.to_thread(grabowski_task_status, task_id)
+    return _task_consumer_projection(result, view)
 
 
 @mcp.tool(name="grabowski_task_routing_shadow_seal", annotations=MUTATING)
