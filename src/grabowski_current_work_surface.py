@@ -534,6 +534,43 @@ def _collect_independent_source(
     return value, errors
 
 
+def _compact_current_work(payload: dict[str, Any]) -> dict[str, Any]:
+    """Keep selection/coverage metadata; omit detailed work evidence on request."""
+    work_fields = (
+        "work_id", "binding", "binding_status", "work_class", "projection_state",
+        "action_required", "action_reasons", "lease_summary", "source_states",
+        "surface_counts", "drill_down_refs", "convergence_stage",
+        "next_convergence_action",
+    )
+    checkout_fields = (
+        "checkout_key", "repository", "path", "head", "branch", "dirty",
+        "lifecycle_state", "coordination_blocking",
+    )
+    work = []
+    for group in payload["work"]:
+        item = {key: group[key] for key in work_fields if key in group}
+        item["checkout_refs"] = [
+            {key: ref[key] for key in checkout_fields if key in ref}
+            for ref in group.get("checkout_refs", [])
+        ]
+        work.append(item)
+    return {
+        **payload,
+        "view": "compact",
+        "work": work,
+        "detail_projection": {
+            "work_evidence_omitted": True,
+            "evidence_view": "current",
+            "same_selection_and_cursor_contract": True,
+            "next_action": "Use view=current and verify fresh exact authority evidence before effects.",
+        },
+        "does_not_establish": [
+            *payload["does_not_establish"],
+            "complete work-group evidence from the compact selection view",
+        ],
+    }
+
+
 def grabowski_current_work(
     repositories: list[str],
     view: str = "current",
@@ -542,8 +579,11 @@ def grabowski_current_work(
 ) -> dict[str, Any]:
     """Project global operator work plus repository-filtered Git checkout surfaces."""
     repository_filters = _require_repositories(repositories)
+    compact = view == "compact"
+    if compact:
+        view = "current"
     if view not in current_work.CURRENT_WORK_VIEWS:
-        raise ValueError("view must be current or history")
+        raise ValueError("view must be current, compact or history")
 
     source_errors: list[dict[str, Any]] = []
     independent_sources = [
@@ -700,7 +740,7 @@ def grabowski_current_work(
     browser_payload = independent_payloads["browser_workers"]
     gui_payload = independent_payloads["gui_workers"]
 
-    return current_work.build_current_work_projection(
+    payload = current_work.build_current_work_projection(
         tasks_payload=tasks_payload,
         attention_payload=attention_payload,
         resources_payload=resources_payload,
@@ -717,3 +757,4 @@ def grabowski_current_work(
         limit=limit,
         cursor=cursor,
     )
+    return _compact_current_work(payload) if compact else payload

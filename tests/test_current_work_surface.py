@@ -711,7 +711,21 @@ class CurrentWorkSurfaceTests(unittest.TestCase):
             "_worker_payload",
             side_effect=lambda kind, view: {"workers": [], "has_more": False},
         ):
-            result = surface.grabowski_current_work([REPOSITORY])
+            with patch.object(surface.time, "time", return_value=100):
+                result = surface.grabowski_current_work([REPOSITORY])
+                compact = surface.grabowski_current_work([REPOSITORY], view="compact")
+
+        self.assertEqual(compact["view"], "compact")
+        for key in ("snapshot_sha256", "selection", "pagination", "scope_contract",
+                    "state_counts", "source_errors", "source_truncation", "warnings"):
+            self.assertEqual(compact[key], result[key], key)
+        self.assertEqual(compact["work"][0]["work_id"], result["work"][0]["work_id"])
+        self.assertEqual(compact["work"][0]["action_reasons"], result["work"][0]["action_reasons"])
+        self.assertIn("authority_refs", result["work"][0])
+        self.assertNotIn("authority_refs", compact["work"][0])
+        self.assertNotIn("heuristic_refs", compact["work"][0])
+        self.assertEqual(compact["detail_projection"]["evidence_view"], "current")
+        self.assertLess(len(str(compact)), len(str(result)))
 
         self.assertEqual(result["view"], "current")
         self.assertEqual(result["total_projected"], 1)
