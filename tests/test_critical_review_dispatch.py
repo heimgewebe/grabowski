@@ -42,6 +42,18 @@ class CriticalClaudeDispatchTest(unittest.TestCase):
   self.assertIn("claude",cmd)
   self.assertEqual(self.starter.call_args.kwargs["decision_review_binding"]["slot"],"independent-claude")
   self.assertFalse(result["independent_review_required"])
+ def test_default_job_start_uses_packaged_operator_core(self):
+  # The installed public entrypoint assembles tools but does not export
+  # grabowski_job_start. The core module owns the actual job-start adapter.
+  import types
+  from unittest.mock import patch
+  public=types.ModuleType("grabowski_operator")
+  core=types.ModuleType("grabowski_operator_core")
+  core.grabowski_job_start=self.starter
+  with patch.dict(sys.modules,{"grabowski_operator":public,"grabowski_operator_core":core}):
+   result=self.run_dispatch(job_start=None)
+  self.assertEqual(result["state"],"dispatched",result)
+  self.starter.assert_called_once()
  def test_no_duplicate_once_revision_has_attempt(self):
   self.history.return_value={"attempts":[{"slot":"independent-claude"}],"errors":[]}
   self.assertEqual(self.run_dispatch()["state"],"already_attempted")
