@@ -272,7 +272,7 @@ class SelfReviewAefWorktreeTests(unittest.TestCase):
         }
         with mock.patch.object(checkouts, "_strict_lifecycle_binding", return_value=binding) as lookup:
             self.assertEqual((target, "heimgewebe/grabowski"), producer._managed_repository_identity(target))
-            lookup.assert_called_once_with(key)
+            lookup.assert_called_once_with(key, write_free=True)
             # No live lease or fixed base HEAD is required for read-only review.
             for phase in ("completed_retained", "archived"):
                 binding["phase"] = phase
@@ -297,6 +297,47 @@ class SelfReviewAefWorktreeTests(unittest.TestCase):
         with mock.patch.object(checkouts, "_strict_lifecycle_binding", return_value=binding):
             with self.assertRaisesRegex(self.review.ReviewExecutionRejected, "repository origin invalid"):
                 producer._managed_repository_identity(target, expected_repo="heimgewebe/vibe-lab")
+
+    def test_registered_lane_review_does_not_mutate_wal_sidecars(self) -> None:
+        import grabowski_checkouts as checkouts
+
+        target = self._linked(self.canonical, self.root / "registered-wal-lane")
+        branch = "fix/registered-wal-lane"
+        self._git(target, "switch", "-c", branch)
+        common = (self.canonical / ".git").resolve()
+        lane = "a" * 32
+        key = checkouts._checkout_key(common, target)
+        database = self.root / "fixture-checkouts.sqlite3"
+        wal = Path(str(database) + "-wal")
+        shm = Path(str(database) + "-shm")
+        with mock.patch.object(checkouts, "CHECKOUT_DB", database):
+            connection = checkouts._database()
+            try:
+                connection.execute(
+                    "INSERT INTO lifecycle_bindings VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (key, str(common), str(self.canonical), str(target), "lane:" + lane,
+                     "review fixture", "work_lane", lane, "implementation-worktree",
+                     "active", int(time.time()) + 3600, self._git(target, "rev-parse", "HEAD"),
+                     branch, 1, 1, None, None),
+                )
+                connection.commit()
+                self.assertEqual(0, connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0])
+                self.assertEqual(0, wal.stat().st_size)
+                before = [p.read_bytes() for p in (database, wal, shm)]
+                self.assertEqual((target, "heimgewebe/grabowski"), producer._managed_repository_identity(target))
+                self.assertEqual(before, [p.read_bytes() for p in (database, wal, shm)])
+                connection.execute("UPDATE lifecycle_bindings SET phase='completed_retained'")
+                connection.commit()
+                self.assertGreater(wal.stat().st_size, 0)
+                before = [p.read_bytes() for p in (database, wal, shm)]
+                with self.assertRaisesRegex(self.review.ReviewExecutionRejected, "lifecycle evidence unavailable"):
+                    producer._managed_repository_identity(target)
+                self.assertEqual(before, [p.read_bytes() for p in (database, wal, shm)])
+            finally:
+                connection.close()
+            self.assertEqual((target, "heimgewebe/grabowski"), producer._managed_repository_identity(target))
+            self.assertFalse(wal.exists())
+            self.assertFalse(shm.exists())
 
     def test_exact_kleinanzeiger_repository_can_use_signed_first_party_review(self) -> None:
         canonical = self._clone(self.root / "kleinanzeiger", "kleinanzeiger")

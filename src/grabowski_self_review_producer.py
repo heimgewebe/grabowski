@@ -75,9 +75,12 @@ def _registered_lane_checkout(real: Path, canonical: Path, common: Path, root: P
 
     key = checkouts._checkout_key(common, real)
     try:
-        binding = checkouts._strict_lifecycle_binding(key)
-    except (OSError, sqlite3.Error) as exc:
-        raise provenance.ReviewExecutionRejected("review checkout lifecycle evidence unavailable") from exc
+        binding = checkouts._strict_lifecycle_binding(key, write_free=True)
+    except (OSError, sqlite3.Error, RuntimeError) as exc:
+        raise provenance.ReviewExecutionRejected(
+            "review checkout lifecycle evidence unavailable; revalidate the existing checkout "
+            "after the checkout database settles, without creating a replacement checkout"
+        ) from exc
     if not binding:
         return False
     owner = binding.get("owner_id")
