@@ -3168,10 +3168,100 @@ def _exact_base_content_git_head_cas_update_pr_head(
                 if push["returncode"] == 0
                 else "push_response_ambiguous_recovered_applied"
             )
+            # The published merge was constructed in temp_root, which is
+            # discarded below. Import the exact, remotely proven object into
+            # the original repository without advancing any checkout or ref.
+            remote_status = evidence["status"]
+            evidence["remote_effect_status"] = remote_status
+            local_import: dict[str, Any] = {
+                "status": "failed",
+                "head_sha": merge_sha,
+                "reason": "not_verified",
+            }
+            evidence["local_object_import"] = local_import
+            try:
+                shallow = run(
+                    "local-import-shallow-check",
+                    repo_path,
+                    ["rev-parse", "--is-shallow-repository"],
+                )
+                if shallow["returncode"] != 0 or shallow["stdout"].strip() != "false":
+                    local_import["reason"] = "shallow_or_unknown_repository"
+                else:
+                    # Reuse the existing remote-head-materialize SSH pin
+                    # primitive; do not invoke its checkout/lane transitions.
+                    from grabowski_grips import _remote_materialization_pinned_target
+
+                    pinned_remote, pin_config = _remote_materialization_pinned_target(
+                        remote_url
+                    )
+                    fetched = run(
+                        "import-published-head-object",
+                        repo_path,
+                        [
+                            "-c", pin_config,
+                            "-c", "protocol.ext.allow=never",
+                            "-c", "fetch.writeCommitGraph=false",
+                            "-c", "gc.auto=0",
+                            "-c", "maintenance.auto=false",
+                            "fetch",
+                            "--no-tags",
+                            "--no-write-fetch-head",
+                            "--no-recurse-submodules",
+                            "--no-prune",
+                            "--no-prune-tags",
+                            "--refmap=",
+                            "--upload-pack=git-upload-pack",
+                            pinned_remote,
+                            merge_sha,
+                        ],
+                        timeout=120,
+                    )
+                    if fetched["returncode"] != 0:
+                        local_import["reason"] = "fetch_failed"
+                    else:
+                        imported_parents = run(
+                            "verify-imported-head-parents",
+                            repo_path,
+                            [
+                                "--no-replace-objects", "rev-list",
+                                "--parents", "-n", "1", merge_sha,
+                            ],
+                        )
+                        imported_tree = run(
+                            "verify-imported-head-tree",
+                            repo_path,
+                            [
+                                "--no-replace-objects", "rev-parse",
+                                f"{merge_sha}^{{tree}}",
+                            ],
+                        )
+                        if (
+                            imported_parents["returncode"] == 0
+                            and imported_parents["stdout"].strip().split() == parent_fields
+                            and imported_tree["returncode"] == 0
+                            and imported_tree["stdout"].strip() == merge_tree_sha
+                        ):
+                            local_import.update(status="verified", reason=None)
+                        else:
+                            local_import["reason"] = "imported_identity_unverified"
+            except Exception as exc:
+                # A local import exception cannot erase proven remote success
+                # or cause callers to repeat the already applied CAS push.
+                local_import["reason"] = f"import_exception:{type(exc).__name__}"
+
+            local_error = ""
+            if local_import["status"] != "verified":
+                evidence["status"] = f"{remote_status}_local_import_failed"
+                local_error = (
+                    "remote CAS publication proven; local object import failed; "
+                    "read back the exact published head before import recovery; "
+                    "do not repeat the push"
+                )
             return {
                 "returncode": 0,
                 "stdout": "updated PR head via exact-base Git head CAS\n",
-                "stderr": "",
+                "stderr": local_error,
             }, evidence
 
         if head_after == head_sha and push["returncode"] != 0:

@@ -2570,6 +2570,8 @@ class _ScriptedPrHeadCasGit:
         push_returncode: int = 0,
         push_applies: bool | None = None,
         push_raises: bool = False,
+        import_returncode: int = 0,
+        import_verify: bool = True,
         base_before: str = _CAS_BASE,
         base_after: str | None = None,
         head_after: str | None = None,
@@ -2581,6 +2583,8 @@ class _ScriptedPrHeadCasGit:
             push_returncode == 0 if push_applies is None else push_applies
         )
         self.push_raises = push_raises
+        self.import_returncode = import_returncode
+        self.import_verify = import_verify
         self.base_before = base_before
         self.base_after = base_after
         self.head_after = head_after
@@ -2591,6 +2595,7 @@ class _ScriptedPrHeadCasGit:
         self.base_reads = 0
         self.head_reads = 0
         self.pull_reads = 0
+        self.imported = False
 
     def __call__(
         self, _repo: Path, args: list[str], *, timeout: int = 60
@@ -2620,6 +2625,19 @@ class _ScriptedPrHeadCasGit:
             or "merge" in args
         ):
             return {"returncode": 0, "stdout": "", "stderr": ""}
+        if args == ["rev-parse", "--is-shallow-repository"]:
+            return {"returncode": 0, "stdout": "false\n", "stderr": ""}
+        if "fetch" in args and "--no-write-fetch-head" in args:
+            self.imported = self.import_returncode == 0
+            return {"returncode": self.import_returncode, "stdout": "", "stderr": ""}
+        if args == ["--no-replace-objects", "rev-list", "--parents", "-n", "1", _CAS_MERGE]:
+            return {
+                "returncode": 0 if self.imported and self.import_verify else 1,
+                "stdout": f"{_CAS_MERGE} {_CAS_HEAD} {_CAS_BASE}\n" if self.imported and self.import_verify else "",
+                "stderr": "",
+            }
+        if args == ["--no-replace-objects", "rev-parse", f"{_CAS_MERGE}^{{tree}}"]:
+            return {"returncode": 0, "stdout": _CAS_TREE + "\n", "stderr": ""}
         if args == ["rev-parse", "refs/converge/base^{commit}"]:
             return {"returncode": 0, "stdout": _CAS_BASE + "\n", "stderr": ""}
         if args == ["rev-parse", "refs/converge/head-branch^{commit}"] or args == [
@@ -2762,6 +2780,154 @@ class ExactPrHeadConvergenceCasTests(unittest.TestCase):
             call for call in git.calls if call[:3] == ("rev-list", "--parents", "-n")
         )
         self.assertEqual(("rev-list", "--parents", "-n", "1", "HEAD"), parents)
+
+    def test_published_head_import_is_ref_free_and_bound(self) -> None:
+        git = _ScriptedPrHeadCasGit()
+        result, evidence = self.run_cas(git)
+        self.assertEqual(0, result["returncode"])
+        self.assertEqual("verified", evidence["local_object_import"]["status"])
+        self.assertEqual(_CAS_MERGE, evidence["local_object_import"]["head_sha"])
+        imports = [call for call in git.calls if "--no-write-fetch-head" in call]
+        self.assertEqual(1, len(imports))
+        call = imports[0]
+        self.assertEqual(_CAS_MERGE, call[-1])
+        self.assertIn("--refmap=", call)
+        self.assertIn("--no-tags", call)
+        self.assertIn("--no-prune", call)
+        self.assertIn("--no-recurse-submodules", call)
+        self.assertTrue(call[-2].startswith("grabowski-pinned-"))
+        self.assertGreater(git.calls.index(call), next(i for i, c in enumerate(git.calls) if c[:2] == ("push", "--porcelain")))
+
+    def test_local_import_failure_does_not_erase_proven_remote_success(self) -> None:
+        for git in (
+            _ScriptedPrHeadCasGit(import_returncode=1),
+            _ScriptedPrHeadCasGit(import_verify=False),
+            _ScriptedPrHeadCasGit(push_raises=True, push_applies=True, import_returncode=1),
+        ):
+            with self.subTest(git=git):
+                result, evidence = self.run_cas(git)
+                self.assertEqual(0, result["returncode"])
+                self.assertTrue(evidence["effect_proven"])
+                self.assertEqual("failed", evidence["local_object_import"]["status"])
+                self.assertTrue(evidence["status"].endswith("_local_import_failed"))
+                self.assertIn("local object import", result["stderr"])
+                self.assertEqual(1, sum(c[:2] == ("push", "--porcelain") for c in git.calls))
+
+    def test_failed_or_unknown_push_never_imports(self) -> None:
+        for git in (
+            _ScriptedPrHeadCasGit(push_returncode=1, push_applies=False),
+            _ScriptedPrHeadCasGit(push_returncode=1, push_applies=False, head_after=_CAS_OTHER),
+        ):
+            with self.subTest(git=git):
+                result, _ = self.run_cas(git)
+                self.assertNotEqual(0, result["returncode"])
+                self.assertFalse(any("--no-write-fetch-head" in c for c in git.calls))
+
+    def test_real_git_import_preserves_refs_index_and_foreign_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "source"
+            source.mkdir()
+            local = root / "local"
+            foreign = root / "foreign"
+            _git(source, "init", "-q")
+            _git(source, "config", "user.name", "Fixture")
+            _git(source, "config", "user.email", "fixture@example.invalid")
+            _git(source, "config", "gc.auto", "0")
+            (source / "shared.txt").write_text("initial\n")
+            _git(source, "add", "shared.txt")
+            _git(source, "commit", "-qm", "initial")
+            initial = _git(source, "rev-parse", "HEAD")
+            _git(source, "checkout", "-qb", "pr-head")
+            (source / "feature.txt").write_text("feature\n")
+            _git(source, "add", "feature.txt")
+            _git(source, "commit", "-qm", "feature")
+            head = _git(source, "rev-parse", "HEAD")
+            _git(source, "checkout", "-qb", "fixture-base", initial)
+            (source / "base.txt").write_text("base\n")
+            _git(source, "add", "base.txt")
+            _git(source, "commit", "-qm", "base")
+            base = _git(source, "rev-parse", "HEAD")
+            _git(root, "clone", "--quiet", "--no-local", str(source), str(local))
+            _git(local, "worktree", "add", "--quiet", "--detach", str(foreign), head)
+            (foreign / "shared.txt").write_text("foreign dirty content\n")
+            fetch_head = Path(_git(
+                local, "rev-parse", "--path-format=absolute", "--git-path", "FETCH_HEAD"
+            ))
+            fetch_head.write_bytes(b"fixture FETCH_HEAD sentinel\n")
+            _git(source, "checkout", "-q", "pr-head")
+            _git(source, "merge", "--no-ff", "-m", "published", base)
+            published = _git(source, "rev-parse", "HEAD")
+            tree = _git(source, "rev-parse", "HEAD^{tree}")
+            missing = subprocess.run(
+                ["git", "-C", str(local), "cat-file", "-t", published],
+                capture_output=True,
+            )
+            self.assertNotEqual(0, missing.returncode)
+
+            def snapshot():
+                def git_path(repo, name):
+                    return Path(_git(
+                        repo, "rev-parse", "--path-format=absolute", "--git-path", name
+                    )).read_bytes()
+
+                return (
+                    _git(local, "for-each-ref", "--format=%(refname) %(objectname)"),
+                    git_path(local, "HEAD"),
+                    git_path(local, "index"),
+                    git_path(foreign, "HEAD"),
+                    git_path(foreign, "index"),
+                    fetch_head.read_bytes(),
+                    (foreign / "shared.txt").read_bytes(),
+                )
+
+            before = snapshot()
+
+            class RealImportGit(_ScriptedPrHeadCasGit):
+                def __call__(self, repo, args, *, timeout=60):
+                    if repo == local and (
+                        args == ["rev-parse", "--is-shallow-repository"]
+                        or "--no-write-fetch-head" in args
+                        or args[0] == "--no-replace-objects"
+                    ):
+                        self.calls.append(tuple(args))
+                        actual = list(args)
+                        if "--no-write-fetch-head" in args:
+                            # Substitute only the transport endpoint in this
+                            # disposable fixture; exercise the actual flags.
+                            actual[1] = f"url.{source.as_uri()}.insteadOf={args[-2]}"
+                            actual = ["-c", "protocol.file.allow=always", *actual]
+                        completed = subprocess.run(
+                            ["git", "-C", str(repo), *actual],
+                            capture_output=True, text=True, timeout=timeout,
+                        )
+                        return {
+                            "returncode": completed.returncode,
+                            "stdout": completed.stdout,
+                            "stderr": completed.stderr,
+                        }
+                    return super().__call__(repo, args, timeout=timeout)
+
+            with mock.patch.multiple(
+                sys.modules[__name__],
+                _CAS_BASE=base, _CAS_HEAD=head, _CAS_MERGE=published, _CAS_TREE=tree,
+            ):
+                runner = RealImportGit(base_before=base)
+                result, evidence = merge_guard._exact_base_content_git_head_cas_update_pr_head(
+                    local,
+                    base_branch="main",
+                    base_sha=base,
+                    head_sha=head,
+                    head_branch=_CAS_HEAD_BRANCH,
+                    pr_number=153,
+                    github_runner=_AuthenticatedUserGh(),
+                    git_runner=runner,
+                )
+            self.assertEqual(0, result["returncode"])
+            self.assertEqual("verified", evidence["local_object_import"]["status"])
+            self.assertEqual("commit", _git(local, "cat-file", "-t", published))
+            self.assertEqual(tree, _git(local, "rev-parse", f"{published}^{{tree}}"))
+            self.assertEqual(before, snapshot())
 
     def test_exact_pr_head_cas_rejects_identity_changing_effective_push_url(
         self,
