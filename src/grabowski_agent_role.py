@@ -1077,13 +1077,28 @@ def _claude_json_review_command(
           "PASS requires no actionable P1/P2 and an empty findings list. "
           "NEEDS_CHANGE/BLOCK require specific findings. Do not invoke any external tool."
     ).encode("utf-8")
+    # The automatic advisory has no semantic axis/batch identity. Do not offer
+    # those optional properties to Claude: a partial semantic document is valid
+    # against the generic provider schema but is correctly rejected by the role
+    # parser. Match the canonical dispatch prompt, not untrusted diff content.
+    from grabowski_critical_review_dispatch import PROMPT as advisory_prompt
+    review_schema = CLAUDE_REVIEW_SCHEMA
+    if prepared_command[-1] == advisory_prompt:
+        review_schema = {
+            **CLAUDE_REVIEW_SCHEMA,
+            "properties": {
+                key: CLAUDE_REVIEW_SCHEMA["properties"][key]
+                for key in ("verdict", "findings")
+            },
+        }
+
     # Print mode requires an explicit positional instruction. The *actual
     # immutable review data* remains bounded stdin, not argv. Without stdin
     # delivery, no exact-head evidence may be inferred from a generic answer.
     actual = (
         *execution_prefix,
         "--output-format", "json",
-        "--json-schema", json.dumps(CLAUDE_REVIEW_SCHEMA, separators=(",", ":"), sort_keys=True),
+        "--json-schema", json.dumps(review_schema, separators=(",", ":"), sort_keys=True),
         "--tools=",
         # Built-ins are disabled by --tools= and custom/MCP configuration by
         # --safe-mode. Deny all MCP names explicitly, without denying Claude's
