@@ -253,6 +253,9 @@ MAX_CONSUMER_FIELDS = consumer_surface.MAX_CONSUMER_FIELDS
 MAX_CONSUMER_CURSOR_BYTES = consumer_surface.MAX_CONSUMER_CURSOR_BYTES
 HTTP_STATELESS_MODE = True
 HTTP_LOG_LEVEL = "WARNING"
+# Leave headroom for the longest ordinary synchronous call (60s); systemd
+# must allow a longer hard stop budget than this HTTP response drain.
+HTTP_GRACEFUL_SHUTDOWN_SECONDS = 65
 HTTP_TRANSPORT_VERBOSE_LOGGERS = (
     "mcp.server.lowlevel.server",
     "mcp.server.streamable_http",
@@ -10886,6 +10889,49 @@ def grabowski_privileged_action_reference(
     return payload
 
 
+def _run_http_runtime(server: FastMCP) -> None:
+    """Drain finite stateless MCP responses before ending SSE on SIGTERM."""
+    import uvicorn
+    from sse_starlette.sse import AppStatus
+
+    if server.settings.stateless_http is not True:
+        raise RuntimeError("Graceful MCP shutdown requires stateless HTTP")
+
+    class _StatelessHTTPServer(uvicorn.Server):
+        async def shutdown(self, sockets=None):
+            try:
+                # Uvicorn first stops accepting connections and then waits
+                # for admitted requests, bounded by timeout_graceful_shutdown.
+                await super().shutdown(sockets=sockets)
+            finally:
+                # Signal SSE shutdown only after the response drain, not
+                # immediately on SIGTERM. This also runs before Uvicorn
+                # restores/replays the original process signal.
+                AppStatus.should_exit = True
+
+    async def serve() -> None:
+        previous_auto_drain = AppStatus.enable_automatic_graceful_drain
+        previous_should_exit = AppStatus.should_exit
+        # sse-starlette otherwise cancels finite POST response streams as
+        # soon as Uvicorn receives SIGTERM, even while tools are still running.
+        AppStatus.disable_automatic_graceful_drain()
+        try:
+            config = uvicorn.Config(
+                server.streamable_http_app(),
+                host=server.settings.host,
+                port=server.settings.port,
+                log_level=server.settings.log_level.lower(),
+                timeout_graceful_shutdown=HTTP_GRACEFUL_SHUTDOWN_SECONDS,
+            )
+            await _StatelessHTTPServer(config).serve()
+        finally:
+            if previous_auto_drain:
+                AppStatus.enable_automatic_graceful_drain_mode()
+            AppStatus.should_exit = previous_should_exit
+
+    asyncio.run(serve())
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run the Grabowski MCP operator."
@@ -10930,7 +10976,9 @@ def main() -> None:
             # admission gate is already inside that wrapper so its sync worker
             # never executes PostHog's server-wide asyncio locks.
             _configure_http_runtime(admission_gate_preinstalled=True)
-        mcp.run(transport=args.transport)
+            _run_http_runtime(mcp)
+        else:
+            mcp.run(transport=args.transport)
     finally:
         _shutdown_posthog_mcp_analytics()
 
