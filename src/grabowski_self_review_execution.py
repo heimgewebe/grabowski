@@ -1431,7 +1431,7 @@ def start_first_party_review_session(
     root_owned_signers: bool = True,
     now_unix: int | None = None,
 ) -> dict[str, Any]:
-    """Create the only authenticated controller session for one review batch."""
+    """Create or resume the exact authenticated PR review batch."""
     authenticated = _validate_first_party_issuer(
         issuer, expected_tool=FIRST_PARTY_TOOL_START,
     )
@@ -1469,7 +1469,13 @@ def start_first_party_review_session(
         _ensure_private_state_directory(sessions)
         index_path = batches / (binding["review_batch_id"] + ".json")
         if index_path.exists():
-            raise ReviewExecutionRejected("first-party review batch already has a session")
+            if binding["review_purpose"] != "pull_request":
+                raise ReviewExecutionRejected("first-party review batch already has a session")
+            return _resume_first_party_pr_session(
+                index_path, session, nonce, authenticated, root=root,
+                key=key, signers=signers, root_owned_signers=root_owned_signers,
+                now_unix=observed_at,
+            )
         session_root = sessions / session_id
         # Incomplete starts (including crash leftovers) must stay outside the
         # authenticated history scanned under sessions/.
@@ -1514,14 +1520,11 @@ def start_first_party_review_session(
     }
 
 
-def _load_first_party_session(
-    session_id: str, nonce: str, *, root: Path, signers: Path,
+def _load_first_party_session_record(
+    session_id: str, *, root: Path, signers: Path,
     root_owned_signers: bool, now_unix: int, require_fresh: bool,
 ) -> tuple[dict[str, Any], Path]:
-    if (
-        not isinstance(session_id, str) or ID.fullmatch(session_id) is None
-        or not isinstance(nonce, str) or ID.fullmatch(nonce) is None
-    ):
+    if not isinstance(session_id, str) or ID.fullmatch(session_id) is None:
         raise ReviewExecutionRejected("first-party session identity invalid")
     session_root = root / "sessions" / session_id
     record = _read_signed_record(
@@ -1538,8 +1541,8 @@ def _load_first_party_session(
         or record.get("schema_version") != 1
         or record.get("kind") != FIRST_PARTY_SESSION_KIND
         or record.get("session_id") != session_id
-        or record.get("session_nonce_sha256")
-        != hashlib.sha256(nonce.encode("ascii")).hexdigest()
+        or not isinstance(record.get("session_nonce_sha256"), str)
+        or SHA256.fullmatch(record["session_nonce_sha256"]) is None
         or record.get("binding_sha256") != _digest(_first_party_binding(record.get("binding")))
         or not isinstance(record.get("changed_paths"), list)
         or not isinstance(record.get("issuer_principal"), dict)
@@ -1558,6 +1561,139 @@ def _load_first_party_session(
         or (require_fresh and now_unix > record["expires_at_unix"])
     ):
         raise ReviewExecutionRejected("first-party review session expired")
+    return record, session_root
+
+
+FIRST_PARTY_RESUME_KIND = "grabowski_first_party_review_resume_v1"
+
+
+def _resume_first_party_pr_session(
+    index_path: Path, proposed: dict[str, Any], nonce: str,
+    authenticated: dict[str, Any], *, root: Path, key: Path, signers: Path,
+    root_owned_signers: bool, now_unix: int,
+) -> dict[str, Any]:
+    """Under the existing publication lock, issue a credential for one existing PR session.
+
+    A fresh signed START from the same principal is required. Neither the original
+    session, original credential hash, read receipts nor axis receipts are rewritten.
+    The new credential expires at the original deadline and grants no new revision.
+    """
+    fd = _private_dir(index_path.parent)
+    try:
+        index = _json_record(_private_read(fd, index_path.name, limit=4096))
+    finally:
+        os.close(fd)
+    if (
+        set(index) != {
+            "schema_version", "kind", "review_batch_id", "session_id",
+            "binding_sha256", "session_receipt_sha256", "session_signature_sha256",
+        }
+        or index.get("schema_version") != 1
+        or index.get("kind") != "grabowski_first_party_review_batch_index_v1"
+        or index.get("review_batch_id") != proposed["binding"]["review_batch_id"]
+        or index.get("binding_sha256") != proposed["binding_sha256"]
+    ):
+        raise ReviewExecutionRejected("first-party resume batch index invalid")
+    session, session_root = _load_first_party_session_record(
+        index.get("session_id"), root=root, signers=signers,
+        root_owned_signers=root_owned_signers, now_unix=now_unix, require_fresh=True,
+    )
+    _issuer_matches_session(authenticated, session, expected_tool=FIRST_PARTY_TOOL_START)
+    fd = _private_dir(session_root)
+    try:
+        signature = _private_read(fd, "session.sig", limit=MAX_RECORD_SIGNATURE)
+    finally:
+        os.close(fd)
+    if (
+        hashlib.sha256(_canonical(session)).hexdigest() != index.get("session_receipt_sha256")
+        or hashlib.sha256(signature).hexdigest() != index.get("session_signature_sha256")
+        or session["binding"]["review_purpose"] != "pull_request"
+        or any(session.get(k) != proposed.get(k) for k in (
+            "binding", "binding_sha256", "worktree", "source_raw_diff_sha256",
+            "canonical_diff_sha256", "changed_paths",
+        ))
+        or now_unix < session["created_at_unix"]
+    ):
+        raise ReviewExecutionRejected("first-party resume crossed review source")
+    _assert_first_party_source_current(
+        session, session_root=session_root, signers=signers,
+        root_owned_signers=root_owned_signers,
+    )
+    fd = _private_dir(session_root / "axes")
+    try:
+        with os.scandir(fd) as entries:
+            completed = {entry.name for entry in entries if entry.name.endswith(".json")}
+    finally:
+        os.close(fd)
+    pending = [axis for axis in REQUIRED_AXES if axis + ".json" not in completed]
+    if not pending:
+        raise ReviewExecutionRejected("first-party review session already complete")
+    nonce_hash = hashlib.sha256(nonce.encode("ascii")).hexdigest()
+    credentials = session_root / "resume-credentials"
+    _ensure_private_state_directory(credentials)
+    receipt = {
+        "schema_version": 1, "kind": FIRST_PARTY_RESUME_KIND,
+        "session_id": session["session_id"], "binding_sha256": session["binding_sha256"],
+        "session_receipt_sha256": index["session_receipt_sha256"],
+        "nonce_sha256": nonce_hash, "issuer": authenticated, "issued_at_unix": now_unix,
+    }
+    _write_signed_record(
+        credentials / (nonce_hash + ".json"), receipt, key=key, signers=signers,
+        atomic=True,
+    )
+    return {
+        "status": "review_session_resumed",
+        "review_session_id": session["session_id"], "session_nonce": nonce,
+        "review_batch_id": session["binding"]["review_batch_id"],
+        "head_sha": session["binding"]["head_sha"],
+        "canonical_diff_sha256": session["canonical_diff_sha256"],
+        "required_axes": list(REQUIRED_AXES), "pending_axes": pending,
+        "expires_at_unix": session["expires_at_unix"],
+        "does_not_establish": ["source_inspection", "semantic_review", "review_pass"],
+    }
+
+
+def _load_first_party_session(
+    session_id: str, nonce: str, *, root: Path, signers: Path,
+    root_owned_signers: bool, now_unix: int, require_fresh: bool,
+) -> tuple[dict[str, Any], Path]:
+    if not isinstance(nonce, str) or ID.fullmatch(nonce) is None:
+        raise ReviewExecutionRejected("first-party session identity invalid")
+    record, session_root = _load_first_party_session_record(
+        session_id, root=root, signers=signers, root_owned_signers=root_owned_signers,
+        now_unix=now_unix, require_fresh=require_fresh,
+    )
+    nonce_hash = hashlib.sha256(nonce.encode("ascii")).hexdigest()
+    if record["session_nonce_sha256"] == nonce_hash:
+        return record, session_root
+    # The caller cannot supply a resumption assertion. It must have been
+    # published by the normal authenticated START and server signing path.
+    try:
+        resumed = _read_signed_record(
+            session_root / "resume-credentials" / (nonce_hash + ".json"),
+            signers=signers, root_owned_signers=root_owned_signers,
+        )
+    except FileNotFoundError as exc:
+        raise ReviewExecutionRejected("first-party session receipt invalid") from exc
+    if (
+        set(resumed) != {
+            "schema_version", "kind", "session_id", "binding_sha256",
+            "session_receipt_sha256", "nonce_sha256", "issuer", "issued_at_unix",
+        }
+        or resumed.get("schema_version") != 1
+        or resumed.get("kind") != FIRST_PARTY_RESUME_KIND
+        or record["binding"]["review_purpose"] != "pull_request"
+        or resumed.get("session_id") != session_id
+        or resumed.get("binding_sha256") != record["binding_sha256"]
+        or resumed.get("session_receipt_sha256") != hashlib.sha256(_canonical(record)).hexdigest()
+        or resumed.get("nonce_sha256") != nonce_hash
+        or type(resumed.get("issued_at_unix")) is not int
+        or not record["created_at_unix"] <= resumed["issued_at_unix"] <= min(
+            now_unix, record["expires_at_unix"],
+        )
+    ):
+        raise ReviewExecutionRejected("first-party resume credential invalid")
+    _issuer_matches_session(resumed.get("issuer"), record, expected_tool=FIRST_PARTY_TOOL_START)
     return record, session_root
 
 
@@ -1858,11 +1994,21 @@ def _validate_first_party_report(
     report: Any, *, axis: str, reads: list[dict[str, Any]],
     binding: dict[str, Any], prior_observations: set[str],
 ) -> dict[str, Any]:
-    if not isinstance(report, dict) or set(report) != {
+    if not isinstance(report, dict) or set(report) - {"coverage_reuse_batch_id"} != {
         "axis", "verdict", "summary", "axis_observations", "evidence_refs",
         "reviewed_risks", "findings",
     }:
         raise ReviewExecutionRejected("first-party axis report shape invalid")
+    if "coverage_reuse_batch_id" in report:
+        prior = report["coverage_reuse_batch_id"]
+        if (
+            axis != REQUIRED_AXES[0]
+            or binding.get("review_purpose") != "pull_request"
+            or report.get("verdict") != "PASS"
+            or not isinstance(prior, str) or ID.fullmatch(prior) is None
+            or prior == binding["review_batch_id"]
+        ):
+            raise ReviewExecutionRejected("first-party coverage reuse selector invalid")
     if report.get("axis") != axis or report.get("verdict") not in {"PASS", "REJECT"}:
         raise ReviewExecutionRejected("first-party axis report verdict invalid")
     if not _substantive_text(report.get("summary"), 160, 8000):
@@ -2093,9 +2239,68 @@ def verified_first_party_candidate_handoff(
 
 
 
+def _reuse_intervening_material_axes(
+    old: dict[str, Any], historical_root: Path, *, since_unix: int,
+    signers: Path, root_owned_signers: bool,
+) -> dict[str, dict[str, Any]]:
+    """Read later same-PR findings only when borrowing previous coverage.
+
+    Sessions with no material-finding history need no old checkout read. For
+    signed reports carrying findings, revalidate the actual historical
+    source evidence before allowing a later resolution to count.
+    """
+    if type(old.get("expires_at_unix")) is not int:
+        raise ReviewExecutionRejected("first-party coverage historical session time invalid")
+    if old["expires_at_unix"] < since_unix:
+        return {}
+    has_findings = False
+    fd = _private_dir(historical_root / "axes")
+    try:
+        with os.scandir(fd) as entries:
+            names = sorted(entry.name for entry in entries if entry.name.endswith(".json"))
+    finally:
+        os.close(fd)
+    for name in names:
+        axis = name[:-5]
+        if axis not in REQUIRED_AXES:
+            raise ReviewExecutionRejected("first-party coverage historical axis invalid")
+        record = _read_signed_record(
+            historical_root / "axes" / name, signers=signers,
+            root_owned_signers=root_owned_signers,
+        )
+        if (
+            record.get("session_id") != old["session_id"]
+            or record.get("binding_sha256") != old["binding_sha256"]
+            or record.get("axis") != axis
+            or type(record.get("submitted_at_unix")) is not int
+            or not isinstance(record.get("report"), dict)
+            or not isinstance(record["report"].get("findings"), list)
+        ):
+            raise ReviewExecutionRejected("first-party coverage historical finding identity invalid")
+        if record["submitted_at_unix"] >= since_unix and record["report"]["findings"]:
+            has_findings = True
+    if not has_findings:
+        return {}
+    historical_repository = _assert_first_party_source_current(
+        old, session_root=historical_root, signers=signers,
+        root_owned_signers=root_owned_signers,
+    )
+    reads = _load_first_party_reads(
+        old, historical_root, signers=signers,
+        root_owned_signers=root_owned_signers, repository=historical_repository,
+    )
+    axes = _load_first_party_axes(
+        old, historical_root, reads=reads, signers=signers,
+        root_owned_signers=root_owned_signers,
+    )
+    return {axis: record for axis, record in axes.items()
+            if record["submitted_at_unix"] >= since_unix}
+
+
 def _assert_prior_first_party_material_findings_resolved(
     session: dict[str, Any], current_axes: dict[str, dict[str, Any]], *,
     root: Path, repository: Path, signers: Path, root_owned_signers: bool,
+    reuse_prior_created_at: int | None = None,
 ) -> None:
     """An unchanged revision cannot discard a signed REJECT by rotating batches.
 
@@ -2167,6 +2372,33 @@ def _assert_prior_first_party_material_findings_resolved(
                             for k in revision_fields if k != "repo"
                         )
                     ):
+                        # Full current reads retain the original same-revision
+                        # debt policy. Borrowed coverage cannot skip signed
+                        # material findings on intervening heads of this PR.
+                        if (
+                            reuse_prior_created_at is not None
+                            and candidate_repo.lower() == decisive_repo.lower()
+                            and candidate.get("review_purpose") == "pull_request"
+                            and candidate.get("pr") == decisive["pr"]
+                            and candidate.get("base_sha") == decisive["base_sha"]
+                        ):
+                            old_axes = _reuse_intervening_material_axes(
+                                old, historical_root, since_unix=reuse_prior_created_at,
+                                signers=signers, root_owned_signers=root_owned_signers,
+                            )
+                            for axis, old_axis in old_axes.items():
+                                submitted = old_axis["submitted_at_unix"]
+                                for finding in old_axis["report"]["findings"]:
+                                    identity = (axis, finding["id"], finding["severity"])
+                                    if (old_axis["report"]["verdict"] == "REJECT"
+                                            and finding["verdict"] == "UNRESOLVED"):
+                                        unresolved_latest[identity] = max(
+                                            submitted, unresolved_latest.get(identity, -1),
+                                        )
+                                    elif finding["verdict"] == "RESOLVED":
+                                        resolved_latest[identity] = max(
+                                            submitted, resolved_latest.get(identity, -1),
+                                        )
                         continue
                     if decisive.get("review_purpose") == "frozen_candidate":
                         # A new signed Test receipt changes the full Candidate
@@ -2349,6 +2581,21 @@ def submit_first_party_axis_review(
         issuer, session, expected_tool=FIRST_PARTY_TOOL_SUBMIT,
     )
     signers = _allowed_signers(signers, root_owned=root_owned_signers)
+    # An invalid prior selector must fail before the immutable current axis
+    # is written. The final verifier independently revalidates the proof.
+    # Do not hold the exclusive publication lock while verifying history.
+    reuse_preflight = None
+    if isinstance(report, dict) and "coverage_reuse_batch_id" in report:
+        if report.get("axis") != REQUIRED_AXES[0] or report.get("verdict") != "PASS":
+            raise ReviewExecutionRejected("first-party coverage reuse selector invalid")
+        current_diff = _first_party_signed_diff(
+            Path(session["worktree"]), session, session_root=session_root,
+            signers=signers, root_owned_signers=root_owned_signers,
+        )
+        reuse_preflight = _verified_first_party_coverage_reuse(
+            session, current_diff, report["coverage_reuse_batch_id"], root=root,
+            signers=signers, root_owned_signers=root_owned_signers, now_unix=observed_at,
+        )
     lock = _first_party_lock(root)
     try:
         worktree = _assert_first_party_source_current(
@@ -2410,7 +2657,139 @@ def submit_first_party_axis_review(
         "material_findings": sum(
             item["verdict"] == "UNRESOLVED" for item in normalized["findings"]
         ),
+        **({"coverage_reuse": {
+            "prior_batch_id": reuse_preflight["prior_batch_id"],
+            "proof_sha256": _digest(reuse_preflight),
+            "identical_file_count": len(reuse_preflight["ranges"]),
+            "covered_line_count": sum(last - first + 1 for first, last, _ in reuse_preflight["ranges"]),
+        }} if reuse_preflight is not None else {}),
         "does_not_establish": ["technical_task_pass", "Captain_merge", "deployment"],
+    }
+
+
+def _canonical_file_diff_blocks(diff: bytes) -> list[tuple[int, int, bytes]]:
+    """Use complete canonical file blocks, never line similarity or file names alone."""
+    # Git headers start on literal LF-delimited byte lines. Python splitlines
+    # also recognizes Unicode separators inside a changed source line, so it
+    # must not be used to discover file boundaries. It remains the existing
+    # signed reader's line-number convention for counting coverage.
+    starts = [match.start() for match in re.finditer(rb"(?m)^diff --git ", diff)]
+    if not starts or starts[0] != 0:
+        raise ReviewExecutionRejected("first-party coverage diff lacks canonical file headers")
+    result = []
+    first = 1
+    try:
+        for start, end in zip(starts, [*starts[1:], len(diff)], strict=True):
+            block = diff[start:end]
+            last = first + len(block.decode("utf-8").splitlines(keepends=True)) - 1
+            result.append((first, last, block))
+            first = last + 1
+        if first - 1 != len(diff.decode("utf-8").splitlines(keepends=True)):
+            raise ReviewExecutionRejected("first-party coverage diff line identity invalid")
+    except UnicodeError as exc:
+        raise ReviewExecutionRejected("first-party coverage diff not text") from exc
+    return result
+
+
+def _identical_file_diff_ranges(current: bytes, prior: bytes) -> list[tuple[int, int, str]]:
+    """Exact path, mode, full object indexes and patch bytes are all part of a block."""
+    previous = {data for _, _, data in _canonical_file_diff_blocks(prior)}
+    return [
+        (first, last, hashlib.sha256(data).hexdigest())
+        for first, last, data in _canonical_file_diff_blocks(current)
+        if data in previous
+    ]
+
+
+def _first_party_ranges_complete(ranges: list[tuple[int, int]], line_count: int) -> bool:
+    next_unseen = 1
+    for first, last in sorted(ranges):
+        if first > next_unseen:
+            break
+        next_unseen = max(next_unseen, last + 1)
+        if next_unseen > line_count:
+            break
+    return next_unseen > line_count
+
+
+def _verified_first_party_coverage_reuse(
+    session: dict[str, Any], current_diff: bytes, prior_batch_id: str, *,
+    root: Path, signers: Path, root_owned_signers: bool, now_unix: int,
+) -> dict[str, Any]:
+    """Verify the entire selected earlier review through the ordinary verifier.
+
+    A batch ID is only a selector. No caller-provided range, digest, verdict or
+    source equivalence is accepted. For the first version, inherit only from
+    a complete directly read review, not a recursive chain of reuse proofs.
+    """
+    binding = session["binding"]
+    if (
+        binding["review_purpose"] != "pull_request"
+        or not isinstance(prior_batch_id, str) or ID.fullmatch(prior_batch_id) is None
+        or prior_batch_id == binding["review_batch_id"]
+    ):
+        raise ReviewExecutionRejected("first-party coverage reuse selector invalid")
+    index_path = root / "batches" / (prior_batch_id + ".json")
+    try:
+        fd = _private_dir(index_path.parent)
+        try:
+            index = _json_record(_private_read(fd, index_path.name, limit=4096))
+        finally:
+            os.close(fd)
+        prior, prior_root = _load_first_party_session_record(
+            index.get("session_id"), root=root, signers=signers,
+            root_owned_signers=root_owned_signers, now_unix=now_unix, require_fresh=False,
+        )
+    except FileNotFoundError as exc:
+        raise ReviewExecutionRejected("first-party coverage prior review absent") from exc
+    old = prior["binding"]
+    if (
+        old["review_batch_id"] != prior_batch_id
+        or old["review_purpose"] != "pull_request"
+        or old["repo"].lower() != binding["repo"].lower()
+        or old["pr"] != binding["pr"]
+        or old["base_sha"] != binding["base_sha"]
+        or prior["created_at_unix"] >= session["created_at_unix"]
+    ):
+        raise ReviewExecutionRejected("first-party coverage prior crossed PR/base or time")
+    # The previous review must already have been complete before this session
+    # started. Later receipts cannot retroactively become inherited evidence.
+    for axis in REQUIRED_AXES:
+        try:
+            old_axis = _read_signed_record(
+                prior_root / "axes" / (axis + ".json"), signers=signers,
+                root_owned_signers=root_owned_signers,
+            )
+        except FileNotFoundError as exc:
+            raise ReviewExecutionRejected("first-party coverage prior review incomplete") from exc
+        if (
+            type(old_axis.get("submitted_at_unix")) is not int
+            or old_axis["submitted_at_unix"] > session["created_at_unix"]
+        ):
+            raise ReviewExecutionRejected("first-party coverage prior review not earlier")
+    prior_verified = verified_first_party_semantic_review_passes(
+        old, repository=None, root=root, signers=signers,
+        root_owned_signers=root_owned_signers, now_unix=now_unix,
+        allow_coverage_reuse=False,
+    )
+    prior_diff = _first_party_signed_diff(
+        Path(prior["worktree"]), prior, session_root=prior_root,
+        signers=signers, root_owned_signers=root_owned_signers,
+    )
+    ranges = _identical_file_diff_ranges(current_diff, prior_diff)
+    if not ranges:
+        raise ReviewExecutionRejected("first-party coverage prior has no identical file blocks")
+    return {
+        "schema_version": 1, "kind": "first_party_exact_coverage_reuse_v1",
+        "current_binding_sha256": session["binding_sha256"],
+        "current_diff_sha256": session["canonical_diff_sha256"],
+        "prior_batch_id": prior_batch_id,
+        "prior_session_id": prior["session_id"],
+        "prior_created_at_unix": prior["created_at_unix"],
+        "prior_binding_sha256": prior["binding_sha256"],
+        "prior_diff_sha256": prior["canonical_diff_sha256"],
+        "prior_verified_sha256": _digest(prior_verified),
+        "ranges": [list(item) for item in ranges],
     }
 
 
@@ -2422,8 +2801,9 @@ def verified_first_party_semantic_review_passes(
     now_unix: int | None = None,
     axes_to_review: tuple[str, ...] = REQUIRED_AXES,
     legacy_seal_cutoff_unix: int | None = None,
+    allow_coverage_reuse: bool = True,
 ) -> dict[str, dict[str, Any]]:
-    """Verify five signed controller reports and every persisted source read."""
+    """Verify all current axes and complete direct or exact inherited diff coverage."""
     if legacy_seal_cutoff_unix is not None and (
         type(legacy_seal_cutoff_unix) is not int or legacy_seal_cutoff_unix < 0
     ):
@@ -2568,18 +2948,23 @@ def verified_first_party_semantic_review_passes(
         diff_line_count = len(diff.decode("utf-8").splitlines(keepends=True))
     except UnicodeError as exc:
         raise ReviewExecutionRejected("first-party canonical diff not text") from exc
-    next_unseen = 1
-    for first, last in sorted(bound_diff_ranges):
-        if first > next_unseen:
-            break
-        next_unseen = max(next_unseen, last + 1)
-        if next_unseen > diff_line_count:
-            break
-    if next_unseen <= diff_line_count:
-        raise ReviewExecutionRejected("first-party canonical diff coverage incomplete")
+    reuse_proof = None
+    if not _first_party_ranges_complete(bound_diff_ranges, diff_line_count):
+        prior_batch_id = axes[REQUIRED_AXES[0]]["report"].get("coverage_reuse_batch_id")
+        if allow_coverage_reuse and prior_batch_id is not None:
+            reuse_proof = _verified_first_party_coverage_reuse(
+                session, diff, prior_batch_id, root=root, signers=signers,
+                root_owned_signers=root_owned_signers, now_unix=observed_at,
+            )
+            bound_diff_ranges.extend((first, last) for first, last, _ in reuse_proof["ranges"])
+        if not _first_party_ranges_complete(bound_diff_ranges, diff_line_count):
+            raise ReviewExecutionRejected("first-party canonical diff coverage incomplete")
     _assert_prior_first_party_material_findings_resolved(
         session, axes, root=root, repository=repository,
         signers=signers, root_owned_signers=root_owned_signers,
+        reuse_prior_created_at=(
+            reuse_proof["prior_created_at_unix"] if reuse_proof is not None else None
+        ),
     )
     accepted: dict[str, dict[str, Any]] = {}
     for sequence, axis in enumerate(axes_to_review, start=1):
@@ -2629,6 +3014,10 @@ def verified_first_party_semantic_review_passes(
                     )
                 )),
                 "canonical_diff_sha256": session["canonical_diff_sha256"],
+                **({
+                    "coverage_reuse_batch_id": reuse_proof["prior_batch_id"],
+                    "coverage_reuse_sha256": _digest(reuse_proof),
+                } if reuse_proof is not None else {}),
             },
         }
     _assert_first_party_source_current(
