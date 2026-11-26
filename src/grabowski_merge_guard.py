@@ -2575,7 +2575,7 @@ def _dispatch_merge_queue_readback(
     query = (
         "query($owner:String!,$name:String!,$number:Int!){"
         "repository(owner:$owner,name:$name){pullRequest(number:$number){"
-        "state headRefOid baseRefName baseRefOid "
+        "id state headRefOid baseRefName baseRefOid "
         "mergeQueueEntry{id position estimatedTimeToMerge}}}}"
     )
     args = [
@@ -2646,6 +2646,8 @@ def _dispatch_merge_queue_readback(
             "baseRefOid": viewed.get("baseRefOid"),
         }
     )
+    # Node identity comes from the same exact PR/head/base observation.
+    evidence["pull_request_node_id"] = viewed.get("id")
     entry = viewed.get("mergeQueueEntry")
     if entry is None:
         evidence["entry_present"] = False
@@ -3982,6 +3984,11 @@ def verify_github_base_update_guard(
         if all(isinstance(rule.get("type"), str) and rule["type"].strip() for rule in active)
         else None
     )
+    evidence["merge_queue_methods"] = [
+        rule.get("parameters", {}).get("merge_method")
+        if isinstance(rule.get("parameters"), dict) else None
+        for rule in active if rule.get("type") == "merge_queue"
+    ]
     evidence["policy_sha256"] = _sha256_json(policy)
     evidence["errors"] = []
     return policy, evidence, []
@@ -6837,7 +6844,61 @@ class CaptainMergeGuardRunner:
                 self.receipt["exact_base_git_cas_merge"] = fallback_evidence
                 return result
 
-            self.receipt["dispatch_mode"] = "github_pr_merge"
+            # GitHub's gh pr merge may invoke enablePullRequestAutoMerge
+            # even for an active merge queue. Enqueue directly, once, only
+            # under the same authoritative queue rules and exact-head guard.
+            dispatch_args = args
+            if dispatch_guard.get("merge_queue_present") is True:
+                node_id = queue_evidence.get("pull_request_node_id")
+                methods = dispatch_guard.get("merge_queue_methods", [])
+                flags = [method for method in ("merge", "squash", "rebase") if f"--{method}" in args]
+                queue_methods = {
+                    method.lower() if isinstance(method, str) else None
+                    for method in methods
+                }
+                queue_method = next(iter(queue_methods)) if len(queue_methods) == 1 else None
+                policy_field = {
+                    "merge": "allow_merge_commit",
+                    "squash": "allow_squash_merge",
+                    "rebase": "allow_rebase_merge",
+                }.get(queue_method)
+                requested_method = self.action["target"].get("merge_method")
+                method_matches = (
+                    len(flags) == 1
+                    and policy_field is not None
+                    and (self.repository_policy_snapshot or {}).get(policy_field) is True
+                    and (
+                        requested_method is None
+                        or requested_method == queue_method == flags[0]
+                    )
+                )
+                if (
+                    dispatch_mode != "strict_required_status_checks_ruleset"
+                    or not method_matches
+                    or not isinstance(node_id, str)
+                    or not node_id.strip()
+                ):
+                    self.receipt["status"] = "blocked_after_guard_revalidation"
+                    self.receipt["contract_satisfied"] = False
+                    self.receipt["errors"] = ["merge_guard_native_enqueue_binding_invalid"]
+                    raise RuntimeError("native merge queue identity or method not proven")
+                query = (
+                    "mutation($pr:ID!,$head:GitObjectID!){"
+                    "enqueuePullRequest(input:{pullRequestId:$pr,expectedHeadOid:$head,jump:false})"
+                    "{mergeQueueEntry{id position}}}"
+                )
+                dispatch_args = [
+                    "api", "graphql", "-f", f"query={query}",
+                    "-f", f"pr={node_id}", "-f", f"head={bindings['head_sha']}",
+                ]
+                self.receipt["dispatch_mode"] = "github_native_merge_queue_enqueue"
+                self.receipt["native_enqueue_command"] = ["gh", *dispatch_args]
+                self.receipt["native_enqueue_merge_method"] = queue_method
+                self.receipt["native_enqueue_method_source"] = (
+                    "explicit_target" if requested_method is not None else "active_queue_rule"
+                )
+            else:
+                self.receipt["dispatch_mode"] = "github_pr_merge"
             self._require_live_bureau_run_binding(
                 phase="pre-dispatch",
                 blocked_status="blocked_after_guard_revalidation",
@@ -6845,7 +6906,7 @@ class CaptainMergeGuardRunner:
             self.receipt["dispatch_at_unix_ns"] = time.time_ns()
             self.receipt["dispatch_called"] = True
             self.dispatch_called = True
-            return self.github_runner(repo_path, args)
+            return self.github_runner(repo_path, dispatch_args)
 
     def reconcile_exact_base_git_cas_closed_pr(
         self,
