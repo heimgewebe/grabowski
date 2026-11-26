@@ -170,13 +170,16 @@ cannot excuse one of the five mandatory substantive phases. The source now
 also defines a provider-independent first-party controller path:
 
 1. `grabowski_self_review_session_start` consumes the existing enrolled
-   connector's fresh signed-one-call assertion and binds one unrepeatable
-   session/nonce to the private stored plan and exact Git revision.
+   connector's fresh signed-one-call assertion and binds one session to the
+   private stored plan and exact Git revision. An authenticated same-principal
+   call for an unfinished PR batch may issue a new resume nonce without
+   altering the signed session, prior receipts or original deadline.
 2. `grabowski_self_review_source_read` reads immutable Git diff or source
    ranges in bounded chunks (at most 1,000 lines and 256 KiB per call), returning
    their actual bytes and recording signed server-observed read receipts. The
-   five-axis audit cannot PASS unless the union of observed chunks covers every
-   line of the canonical base/head diff, including changed-file headers.
+   five-axis audit cannot PASS unless the union of current observed chunks
+   and verified inherited coverage covers every line of the canonical base/head
+   diff, including changed-file headers.
 3. `grabowski_self_review_axis_submit` accepts no caller-selected issuer or
    provider; only the authenticated primary Grabowski connector can initiate
    this first-party route. Each axis must actually read the canonical diff and
@@ -214,6 +217,27 @@ A source commit does not itself prove deployment of these tools or authorize
 Captain merge or R3 release; the serving runtime and its root-owned public
 signer allowlist must be activated and read back. Critical release source and
 recovery contracts remain unchanged pending their post-merge evidence.
+
+## Resuming PR reviews and reusing exact coverage
+
+For an unfinished, unexpired PR batch, repeat `session_start` with the same
+stored batch and a fresh signed request (a distinct truthful continuation
+reason). The enrolled principal, repository, PR, base, head and source
+identity must remain identical. Use the newly returned nonce with the original
+session ID. The original expiry and already signed reads/axes remain intact.
+This does not reopen a sealed, expired, release or candidate review.
+
+To reuse unchanged coverage, optionally provide `coverage_reuse_batch_id` in
+the first current axis's PASS report. It selects an earlier fully signed,
+directly observed five-axis PASS for the same repository, PR and base; it
+does not assert coverage. The server verifies the earlier review and compares
+complete canonical Git file-diff blocks, including paths, modes, object
+identities and bytes. Only exact matches contribute to inherited coverage.
+New paths (including copied generated snapshots), changed blocks and different
+bases are not inferred equivalent. The current five axes still require their
+own actual source reads, substantive assessments and resolution of material
+findings. The final verifier independently reconstructs the proof; no selector,
+partial receipt or previous PASS can waive a current coverage gap or finding.
 
 ## PR self-review policy v4 (2026-10-26)
 
