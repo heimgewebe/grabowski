@@ -2239,6 +2239,39 @@ def verified_first_party_candidate_handoff(
 
 
 
+def _historical_pr_source(
+    session: dict[str, Any], *, repository: Path | None = None,
+    session_root: Path | None = None, signers: Path | None = None,
+    root_owned_signers: bool = True,
+) -> Path:
+    """Revalidate historical signed PR bytes using the canonical Git repository."""
+    expected = _first_party_binding(session["binding"])
+    if expected["review_purpose"] != "pull_request":
+        raise ReviewExecutionRejected("historical object proof limited to committed PR")
+    from grabowski_self_review_producer import (
+        MANAGED_REPOS_ROOT, _managed_repository_identity, _read_command,
+    )
+    canonical = MANAGED_REPOS_ROOT.resolve(strict=True) / expected["repo"].split("/")[-1]
+    if repository is not None and repository.resolve(strict=True) != canonical.resolve(strict=True):
+        raise ReviewExecutionRejected("historical review repository must be canonical")
+    real, _slug = _managed_repository_identity(canonical, expected_repo=expected["repo"])
+    if real != canonical:
+        raise ReviewExecutionRejected("historical canonical source mismatch")
+    for key in ("base_sha", "head_sha"):
+        if _read_command(real, ["cat-file", "-t", expected[key]]).strip() != b"commit":
+            raise ReviewExecutionRejected("historical commit absent")
+    raw = _read_command(real, ["diff", "--no-ext-diff", "--no-textconv", "--no-renames",
+                       "--ignore-submodules=none", "--raw", "--abbrev=40", "-z",
+                       expected["base_sha"], expected["head_sha"], "--"], timeout=60)
+    if hashlib.sha256(raw).hexdigest() != session["source_raw_diff_sha256"]:
+        raise ReviewExecutionRejected("historical raw diff drift")
+    if _first_party_changed_paths(real, expected) != session["changed_paths"]:
+        raise ReviewExecutionRejected("historical changed paths drift")
+    _first_party_signed_diff(real, session, session_root=session_root, signers=signers,
+                             root_owned_signers=root_owned_signers)
+    return real
+
+
 def _reuse_intervening_material_axes(
     old: dict[str, Any], historical_root: Path, *, since_unix: int,
     signers: Path, root_owned_signers: bool,
@@ -2281,7 +2314,7 @@ def _reuse_intervening_material_axes(
             has_findings = True
     if not has_findings:
         return {}
-    historical_repository = _assert_first_party_source_current(
+    historical_repository = _historical_pr_source(
         old, session_root=historical_root, signers=signers,
         root_owned_signers=root_owned_signers,
     )
@@ -2770,10 +2803,14 @@ def _verified_first_party_coverage_reuse(
     prior_verified = verified_first_party_semantic_review_passes(
         old, repository=None, root=root, signers=signers,
         root_owned_signers=root_owned_signers, now_unix=now_unix,
-        allow_coverage_reuse=False,
+        allow_coverage_reuse=False, historical_objects=True,
+    )
+    prior_repository = _historical_pr_source(
+        prior, session_root=prior_root, signers=signers,
+        root_owned_signers=root_owned_signers,
     )
     prior_diff = _first_party_signed_diff(
-        Path(prior["worktree"]), prior, session_root=prior_root,
+        prior_repository, prior, session_root=prior_root,
         signers=signers, root_owned_signers=root_owned_signers,
     )
     ranges = _identical_file_diff_ranges(current_diff, prior_diff)
@@ -2802,8 +2839,14 @@ def verified_first_party_semantic_review_passes(
     axes_to_review: tuple[str, ...] = REQUIRED_AXES,
     legacy_seal_cutoff_unix: int | None = None,
     allow_coverage_reuse: bool = True,
+    historical_objects: bool = False,
 ) -> dict[str, dict[str, Any]]:
-    """Verify all current axes and complete direct or exact inherited diff coverage."""
+    """Verify all current axes and complete direct or exact inherited diff coverage.
+
+    Historical object verification is limited to previously signed committed
+    PR material. Live session admission, source reads and sealing retain the
+    original strict checkout check.
+    """
     if legacy_seal_cutoff_unix is not None and (
         type(legacy_seal_cutoff_unix) is not int or legacy_seal_cutoff_unix < 0
     ):
@@ -2876,18 +2919,24 @@ def verified_first_party_semantic_review_passes(
     from grabowski_self_review_producer import (
         _current_source, _managed_repository_identity,
     )
-    session_repository, _session_slug = _managed_repository_identity(
-        Path(session["worktree"]), expected_repo=expected["repo"],
-    )
-    if repository is not None:
-        supplied_repository, _supplied_slug = _managed_repository_identity(
-            repository, expected_repo=expected["repo"],
+    if historical_objects:
+        repository = _historical_pr_source(
+            session, repository=repository, session_root=session_path.parent,
+            signers=signers, root_owned_signers=root_owned_signers,
         )
-        if supplied_repository != session_repository:
-            raise ReviewExecutionRejected("first-party repository crossed review session")
-    repository = session_repository
-    if _current_source(repository, expected) != session["source_raw_diff_sha256"]:
-        raise ReviewExecutionRejected("first-party verified source identity changed")
+    else:
+        session_repository, _session_slug = _managed_repository_identity(
+            Path(session["worktree"]), expected_repo=expected["repo"],
+        )
+        if repository is not None:
+            supplied_repository, _supplied_slug = _managed_repository_identity(
+                repository, expected_repo=expected["repo"],
+            )
+            if supplied_repository != session_repository:
+                raise ReviewExecutionRejected("first-party repository crossed review session")
+        repository = session_repository
+        if _current_source(repository, expected) != session["source_raw_diff_sha256"]:
+            raise ReviewExecutionRejected("first-party verified source identity changed")
     material = _canonical(session)
     parent_fd = _private_dir(session_path.parent)
     try:
@@ -3020,10 +3069,16 @@ def verified_first_party_semantic_review_passes(
                 } if reuse_proof is not None else {}),
             },
         }
-    _assert_first_party_source_current(
-        session, session_root=session_root, signers=signers,
-        root_owned_signers=root_owned_signers,
-    )
+    if historical_objects:
+        _historical_pr_source(
+            session, repository=repository, session_root=session_root,
+            signers=signers, root_owned_signers=root_owned_signers,
+        )
+    else:
+        _assert_first_party_source_current(
+            session, session_root=session_root, signers=signers,
+            root_owned_signers=root_owned_signers,
+        )
     return accepted
 
 
@@ -3390,6 +3445,7 @@ def _verify(
     read_source: Callable[[str, str], bytes] | None = None,
     capture_root: Path = CAPTURE_ROOT,
     first_party_root: Path = FIRST_PARTY_REVIEW_ROOT,
+    historical_objects: bool = False,
 ) -> None:
     if not isinstance(audit, dict):
         raise ReviewExecutionRejected("self-review audit is absent")
@@ -3456,6 +3512,7 @@ def _verify(
             semantic_binding, repository=repository, root=first_party_root,
             signers=signers, root_owned_signers=root_owned_signers,
             now_unix=now_unix, axes_to_review=tuple(axes),
+            historical_objects=historical_objects,
         )
         legacy_semantic_reviews: dict[str, dict[str, Any]] | None = None
         for phase, ref in zip(phases, refs, strict=True):
@@ -3513,6 +3570,7 @@ def _verify(
                         signers=signers, root_owned_signers=root_owned_signers,
                         now_unix=now_unix, axes_to_review=tuple(axes),
                         legacy_seal_cutoff_unix=seal_cutoff,
+                        historical_objects=historical_objects,
                     )
                 legacy = legacy_semantic_reviews.get(axis)
                 if not isinstance(legacy, dict) or ref != {
