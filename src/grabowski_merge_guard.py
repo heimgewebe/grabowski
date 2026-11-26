@@ -6852,10 +6852,25 @@ class CaptainMergeGuardRunner:
                 node_id = queue_evidence.get("pull_request_node_id")
                 methods = dispatch_guard.get("merge_queue_methods", [])
                 flags = [method for method in ("merge", "squash", "rebase") if f"--{method}" in args]
+                queue_methods = {
+                    method.lower() if isinstance(method, str) else None
+                    for method in methods
+                }
+                queue_method = next(iter(queue_methods)) if len(queue_methods) == 1 else None
+                policy_field = {
+                    "merge": "allow_merge_commit",
+                    "squash": "allow_squash_merge",
+                    "rebase": "allow_rebase_merge",
+                }.get(queue_method)
+                requested_method = self.action["target"].get("merge_method")
                 method_matches = (
                     len(flags) == 1
-                    and bool(methods)
-                    and all(isinstance(method, str) and method.lower() == flags[0] for method in methods)
+                    and policy_field is not None
+                    and (self.repository_policy_snapshot or {}).get(policy_field) is True
+                    and (
+                        requested_method is None
+                        or requested_method == queue_method == flags[0]
+                    )
                 )
                 if (
                     dispatch_mode != "strict_required_status_checks_ruleset"
@@ -6878,6 +6893,10 @@ class CaptainMergeGuardRunner:
                 ]
                 self.receipt["dispatch_mode"] = "github_native_merge_queue_enqueue"
                 self.receipt["native_enqueue_command"] = ["gh", *dispatch_args]
+                self.receipt["native_enqueue_merge_method"] = queue_method
+                self.receipt["native_enqueue_method_source"] = (
+                    "explicit_target" if requested_method is not None else "active_queue_rule"
+                )
             else:
                 self.receipt["dispatch_mode"] = "github_pr_merge"
             self._require_live_bureau_run_binding(

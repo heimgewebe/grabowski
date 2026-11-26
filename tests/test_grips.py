@@ -14572,7 +14572,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertEqual([], [call for call in gh.calls if gh.is_merge_dispatch(call)])
 
     def test_atomic_guard_native_enqueue_exact_head_without_auto_merge(self) -> None:
-        for scenario in ("success", "missing_node", "wrong_method", "failed_dispatch"):
+        for scenario in ("success", "implicit_squash", "missing_node", "wrong_method", "explicit_mismatch", "failed_dispatch"):
             with self.subTest(scenario=scenario):
                 class NativeQueueGh(FakeGh):
                     def __call__(self, repo, args):
@@ -14602,16 +14602,20 @@ class CaptainAuthorityPathTests(unittest.TestCase):
                 )
                 gh.active_rules.append({
                     "type": "merge_queue",
-                    "parameters": {"merge_method": "SQUASH" if scenario == "wrong_method" else "MERGE"},
+                    "parameters": {"merge_method": "SQUASH" if scenario in ("implicit_squash", "explicit_mismatch") else "INVALID" if scenario == "wrong_method" else "MERGE"},
                     "ruleset_source_type": "Repository",
                     "ruleset_source": "heimgewebe/grabowski", "ruleset_id": 18801517,
                 })
+                parameters = authorized_captain_run_parameters()
+                if scenario == "explicit_mismatch":
+                    parameters["actions"][0]["target"]["merge_method"] = "merge"
+                    parameters["execution_intent"] = captain_execution_intent(parameters)
                 with patch.object(
                     merge_guard, "resolve_captain_merge_repository",
                     return_value=(Path.cwd().resolve(), "test-bound-checkout"),
                 ):
                     result = grips.grip_run(
-                        "captain-run", authorized_captain_run_parameters(),
+                        "captain-run", parameters,
                         profile="captain", allow_mutation=True,
                         command_runner=FakeGit(), github_runner=gh,
                     )
@@ -14621,18 +14625,23 @@ class CaptainAuthorityPathTests(unittest.TestCase):
                     "enqueuePullRequest" in item for item in call
                 )]
                 self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
-                self.assertEqual(scenario == "success", execution["verification_passed"])
-                if scenario in ("success", "failed_dispatch"):
+                self.assertEqual(scenario in ("success", "implicit_squash"), execution["verification_passed"])
+                if scenario in ("success", "implicit_squash", "failed_dispatch"):
                     self.assertEqual(1, len(enqueues))
                     self.assertIn("pr=PR_native", enqueues[0])
                     self.assertIn(f"head={CAPTAIN_HEAD}", enqueues[0])
                     self.assertTrue(any("jump:false" in item for item in enqueues[0]))
                     self.assertEqual("github_native_merge_queue_enqueue", guard["dispatch_mode"])
+                    self.assertEqual("squash" if scenario == "implicit_squash" else "merge", guard["native_enqueue_merge_method"])
+                    self.assertEqual("active_queue_rule", guard["native_enqueue_method_source"])
                 else:
                     self.assertEqual([], enqueues)
                     self.assertFalse(guard["dispatch_called"])
-                    self.assertIn("merge_guard_native_enqueue_binding_invalid", guard["errors"])
-                if scenario == "success":
+                    if scenario == "explicit_mismatch":
+                        self.assertTrue(any("repository_merge_queue_method_mismatch" in error for error in execution["preflight_errors"]))
+                    else:
+                        self.assertIn("merge_guard_native_enqueue_binding_invalid", guard["errors"])
+                if scenario in ("success", "implicit_squash"):
                     self.assertTrue(execution["merge_queued"])
                     self.assertFalse(execution["merge_completion_verified"])
                     self.assertEqual("scheduled", result["output"]["decision"])
