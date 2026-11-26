@@ -14,6 +14,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 
@@ -47,7 +48,7 @@ operator._run_http_runtime(mcp)
 
 @unittest.skipUnless(os.name == "posix", "requires POSIX process signals")
 class MCPGracefulShutdownTests(unittest.TestCase):
-    def _probe(self, *, calls: int, delay: float, budget: int):
+    def _probe(self, *, calls: int, delay: float, budget: int, standalone_get=False):
         with tempfile.TemporaryDirectory(prefix="grabowski-http-shutdown-") as tmp_name:
             tmp = Path(tmp_name)
             with socket.socket() as sock:
@@ -92,7 +93,25 @@ class MCPGracefulShutdownTests(unittest.TestCase):
                             self.fail(f"test server did not start:\n{log.read()}")
                         time.sleep(0.05)
 
-                    with ThreadPoolExecutor(max_workers=calls) as pool:
+                    get_ready = threading.Event()
+
+                    def read_standalone_get():
+                        with httpx.Client(trust_env=False, timeout=12) as client:
+                            with client.stream("GET", url, headers=headers) as response:
+                                if (response.status_code != 200 or
+                                        "text/event-stream" not in response.headers.get("content-type", "")):
+                                    get_ready.set()
+                                    return False
+                                get_ready.set()
+                                for _ in response.iter_bytes():
+                                    pass
+                                return True
+
+                    with ThreadPoolExecutor(max_workers=calls + int(standalone_get)) as pool:
+                        get_future = pool.submit(read_standalone_get) if standalone_get else None
+                        if get_future is not None:
+                            self.assertTrue(get_ready.wait(timeout=8))
+                            self.assertFalse(get_future.done(), "GET must be open at SIGTERM")
                         futures = [
                             pool.submit(rpc, "tools/call", {
                                 "name": "slow", "arguments": {"value": index},
@@ -118,23 +137,35 @@ class MCPGracefulShutdownTests(unittest.TestCase):
                                 )
                             except httpx.HTTPError:
                                 results.append(False)
+                        get_closed = get_future.result(timeout=12) if get_future else None
                         proc.wait(timeout=12)
                         elapsed = time.monotonic() - started
                     log.seek(0)
-                    return results, elapsed, log.read()
+                    return results, elapsed, log.read(), get_closed
                 finally:
                     if proc.poll() is None:
                         proc.kill()
                         proc.wait(timeout=5)
 
     def test_four_finite_sse_responses_complete_on_sigterm(self):
-        results, elapsed, log = self._probe(calls=4, delay=2, budget=10)
+        results, elapsed, log, get_closed = self._probe(
+            calls=4, delay=2, budget=10, standalone_get=True)
         self.assertEqual(results, [True] * 4, log)
+        self.assertTrue(get_closed, log)
         self.assertNotIn("ASGI callable returned without completing response", log)
         self.assertLess(elapsed, 12, log)
 
+    def test_idle_get_does_not_exhaust_the_drain_budget(self):
+        results, elapsed, log, get_closed = self._probe(
+            calls=0, delay=0, budget=8, standalone_get=True)
+        self.assertEqual(results, [])
+        self.assertTrue(get_closed, log)
+        self.assertLess(elapsed, 5, log)
+        self.assertNotIn("timeout graceful shutdown exceeded", log)
+        self.assertNotIn("ASGI callable returned without completing response", log)
+
     def test_over_budget_request_cannot_hang_shutdown(self):
-        results, elapsed, log = self._probe(calls=1, delay=60, budget=1)
+        results, elapsed, log, _ = self._probe(calls=1, delay=60, budget=1)
         self.assertEqual(results, [False], log)
         self.assertLess(elapsed, 10, log)
 

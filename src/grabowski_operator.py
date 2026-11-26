@@ -10891,14 +10891,58 @@ def grabowski_privileged_action_reference(
 
 def _run_http_runtime(server: FastMCP) -> None:
     """Drain finite stateless MCP responses before ending SSE on SIGTERM."""
+    import anyio
     import uvicorn
     from sse_starlette.sse import AppStatus
 
     if server.settings.stateless_http is not True:
         raise RuntimeError("Graceful MCP shutdown requires stateless HTTP")
 
+    http_app = server.streamable_http_app()
+    active_get_streams: set[anyio.CancelScope] = set()
+    stopping = False
+
+    async def drainable_app(scope, receive, send):
+        # Standalone GET streams have no finite response to wait for.
+        # Leave POST, lifespan and unrelated HTTP routes untouched.
+        if (scope["type"] != "http" or scope["method"] != "GET"
+                or scope["path"] != server.settings.streamable_http_path):
+            await http_app(scope, receive, send)
+            return
+
+        response_started = response_complete = False
+
+        async def track_send(message):
+            nonlocal response_started, response_complete
+            await send(message)
+            if message["type"] == "http.response.start":
+                response_started = True
+            elif message["type"] == "http.response.body":
+                response_complete = not message.get("more_body", False)
+
+        with anyio.CancelScope() as stream_scope:
+            active_get_streams.add(stream_scope)
+            try:
+                if stopping:
+                    stream_scope.cancel()
+                await http_app(scope, receive, track_send)
+            finally:
+                active_get_streams.discard(stream_scope)
+
+        # Complete the HTTP response after the scoped GET cancellation.
+        if stream_scope.cancel_called and not response_complete:
+            if not response_started:
+                await send({"type": "http.response.start", "status": 503,
+                            "headers": [(b"content-length", b"0")]})
+            await send({"type": "http.response.body", "body": b"",
+                        "more_body": False})
+
     class _StatelessHTTPServer(uvicorn.Server):
         async def shutdown(self, sockets=None):
+            nonlocal stopping
+            stopping = True
+            for stream_scope in tuple(active_get_streams):
+                stream_scope.cancel()
             try:
                 # Uvicorn first stops accepting connections and then waits
                 # for admitted requests, bounded by timeout_graceful_shutdown.
@@ -10917,7 +10961,7 @@ def _run_http_runtime(server: FastMCP) -> None:
         AppStatus.disable_automatic_graceful_drain()
         try:
             config = uvicorn.Config(
-                server.streamable_http_app(),
+                drainable_app,
                 host=server.settings.host,
                 port=server.settings.port,
                 log_level=server.settings.log_level.lower(),
