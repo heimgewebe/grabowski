@@ -66,9 +66,9 @@ def _managed_repository_identity(
     repo: Path, *, expected_repo: str | None = None,
 ) -> tuple[Path, str]:
     """Resolve one supported checkout from Git common-dir and origin identity."""
-    real = repo.resolve(strict=True)
-    root = MANAGED_REPOS_ROOT.resolve(strict=True)
     try:
+        real = repo.resolve(strict=True)
+        root = MANAGED_REPOS_ROOT.resolve(strict=True)
         top = Path(
             _read_command(real, ["rev-parse", "--show-toplevel"]).decode().strip()
         ).resolve(strict=True)

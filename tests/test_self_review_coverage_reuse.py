@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import subprocess
 import unittest
 
 import test_self_review_first_party as fixture
@@ -164,6 +165,132 @@ class FirstPartyCoverageReuseTests(unittest.TestCase):
         self._complete(plan, started, prior=prior)
         with self.assertRaisesRegex(review.ReviewExecutionRejected, "material finding unresolved"):
             self._verify(plan)
+
+    def _remove(self, path, ref):
+        f = self.f
+        canonical = f.root/"grabowski"
+        assert path.parent==f.root/".grabowski-worktrees"
+        assert path.is_dir()
+        head=subprocess.check_output(["git","-C",str(path),"rev-parse","HEAD"],text=True).strip()
+        subprocess.run(["git","-C",str(canonical),"update-ref","refs/heads/"+ref,head],check=True)
+        subprocess.run(["git","-C",str(canonical),"worktree","remove",str(path)],check=True)
+        assert not path.exists()
+        assert subprocess.check_output(["git","-C",str(canonical),"rev-parse",ref],text=True).strip()==head
+        return canonical
+
+    def _linked_prior(self):
+        f = self.f
+        pool=f.root/".grabowski-worktrees"
+        pool.mkdir()
+        path=pool/"prior"
+        f._git("worktree","add","--detach",str(path),f.head)
+        f.repo=path
+        return self._prior(),path
+
+    def test_removed_prior_and_current_still_verify(self):
+        f = self.f
+        prior,prior_path=self._linked_prior()
+        plan,started=self._next("current")
+        canonical=self._remove(prior_path,"recovery-prior")
+        first=self._complete(plan,started,prior=prior)
+        self.assertGreater(first["coverage_reuse"]["covered_line_count"],80)
+        audit,receipts=f._seal_direct(plan)
+        current=f.repo
+        # A current review must be able to borrow exact signed earlier
+        # coverage even after the earlier physical checkout is gone.
+        self.assertEqual(5,len(self._verify(plan)))
+        self._remove(current,"recovery-current")
+        kwargs=dict(receipts=receipts,outcomes=f.root/"outcomes",signers=f.signers,
+                    repository=canonical,now_unix=f.now,root_owned_signers=False,
+                    first_party_root=f.state,historical_objects=True)
+        review._verify(audit,**kwargs)
+        with self.assertRaisesRegex(
+            review.ReviewExecutionRejected, "historical review repository must be canonical"
+        ):
+            review._verify(audit, **{**kwargs, "repository": prior_path})
+        forged=copy.deepcopy(audit)
+        forged["review_pass_receipts"][0]["coverage_reuse_sha256"]="0"*64
+        with self.assertRaisesRegex(
+            review.ReviewExecutionRejected, "direct first-party audit proof differs from signed records"
+        ):
+            review._verify(forged, **kwargs)
+        historical, historical_root = review._load_first_party_session_record(
+            started["review_session_id"], root=f.state, signers=f.signers,
+            root_owned_signers=False, now_unix=f.now, require_fresh=False,
+        )
+        for field, altered, message in (
+            ("source_raw_diff_sha256", "0" * 64, "historical raw diff drift"),
+            ("changed_paths", [], "historical changed paths drift"),
+        ):
+            with self.subTest(field=field), self.assertRaisesRegex(
+                review.ReviewExecutionRejected, message
+            ):
+                review._historical_pr_source(
+                    {**historical, field: altered}, repository=canonical,
+                    session_root=historical_root, signers=f.signers,
+                    root_owned_signers=False,
+                )
+        missing = {**historical, "binding": {**historical["binding"], "head_sha": "0" * 40}}
+        with self.assertRaisesRegex(
+            review.ReviewExecutionRejected, "trusted source Git probe failed"
+        ):
+            review._historical_pr_source(
+                missing, repository=canonical, session_root=historical_root,
+                signers=f.signers, root_owned_signers=False,
+            )
+        # Strict live-source admission stays distinct.
+        with self.assertRaisesRegex(
+            review.ReviewExecutionRejected, "review source Git checkout identity invalid"
+        ):
+            review.verified_first_party_semantic_review_passes(
+                plan["binding"],repository=None,root=f.state,signers=f.signers,
+                root_owned_signers=False,now_unix=f.now)
+
+    def _release_plan(self):
+        f = self.f
+        _technical, release, diff = f._signed_release_plan()
+        return fixture.producer.plan_first_party_review(
+            repo=f.repo, pr=1649, base_sha=f.base, head_sha=f.head,
+            diff_sha256=diff, purpose="post_merge_release", release_binding=release,
+        )
+
+    def test_non_pr_prior_is_not_a_coverage_source(self):
+        f = self.f
+        prior = self._release_plan()
+        f._start_plan(prior)
+        f.now += 2
+        plan, started = self._next("current")
+        with self.assertRaisesRegex(
+            review.ReviewExecutionRejected, "coverage prior crossed PR/base or time"
+        ):
+            self._submit(plan, started, 1, prior=prior)
+
+    def test_intervening_release_finding_does_not_cross_pr_purpose(self):
+        f = self.f
+        prior = self._prior()
+        self._next("intervening")
+        release = self._release_plan()
+        started_release = f._start_plan(release)
+        f._submit_axis(started_release, review.REQUIRED_AXES[0], 1, reject=True)
+        f.now += 2
+        plan, started = self._next("current")
+        self._complete(plan, started, prior=prior)
+        self.assertEqual(5, len(self._verify(plan)))
+
+    def test_removed_intervening_reject_still_blocks(self):
+        f = self.f
+        prior,prior_path=self._linked_prior()
+        _,intervening=self._next("intervening")
+        f._submit_axis(intervening,review.REQUIRED_AXES[0],1,reject=True)
+        intervening_path=f.repo
+        f.now+=2
+        plan,started=self._next("current")
+        self._complete(plan,started,prior=prior)
+        self._remove(prior_path,"recovery-prior")
+        self._remove(intervening_path,"recovery-intervening")
+        with self.assertRaisesRegex(review.ReviewExecutionRejected,"material finding unresolved"):
+            self._verify(plan)
+
 
     def test_large_exact_file_blocks_and_non_lf_separator(self):
         # Representative generated-release shape. A Unicode line separator
