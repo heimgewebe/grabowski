@@ -267,6 +267,52 @@ class BackupNtfsOperationTests(unittest.TestCase):
             "reference_sha256": "b" * 64,
         }
 
+    def test_list_exposes_builtins_when_local_registry_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "operations.json"
+            with (
+                patch.object(operations, "OPERATIONS_CONFIG", path),
+                patch.object(operations.operator, "_require_operator_capability"),
+                patch.object(operations.operator, "_maulwurf_runtime_active", return_value=False),
+            ):
+                missing = operations.grabowski_operation_list()
+                self.assertEqual("missing", missing["registry_state"])
+                self.assertFalse(path.exists())
+                with self.assertRaisesRegex(RuntimeError, "registry missing"):
+                    operations._validated("unknown-recipe")
+                path.write_text(
+                    json.dumps({"schema_version": 1, "operations": {}}),
+                    encoding="utf-8",
+                )
+                configured = operations.grabowski_operation_list()
+                self.assertEqual("configured", configured["registry_state"])
+                self.assertEqual(configured["operations"], missing["operations"])
+                self.assertEqual(
+                    set(operations.BACKUP_STORAGE_TYPED_OPERATIONS)
+                    | {
+                        operations.FLEET_MUTATION_OPERATION,
+                        operations.ROOTBROKER_AUTHORITY_REFRESH_OPERATION,
+                        operations.PLATFORM_CONNECTOR_CAPTURE_OPERATION,
+                        operations.BLOCKADE_AUTHORITY_HARDEN_OPERATION,
+                    },
+                    set(missing["operations"]),
+                )
+
+    def test_list_rejects_invalid_or_symlink_registry(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "operations.json"
+            with (
+                patch.object(operations, "OPERATIONS_CONFIG", path),
+                patch.object(operations.operator, "_require_operator_capability"),
+            ):
+                path.write_text("invalid json", encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "not valid UTF-8 JSON"):
+                    operations.grabowski_operation_list()
+                path.unlink()
+                path.symlink_to(Path(raw) / "missing-target")
+                with self.assertRaisesRegex(PermissionError, "may not be a symlink"):
+                    operations.grabowski_operation_list()
+
     def test_list_exposes_reserved_typed_operations_and_rejects_shadowing(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             path = Path(raw) / "operations.json"
