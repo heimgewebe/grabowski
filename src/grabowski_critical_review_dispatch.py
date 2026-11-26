@@ -91,7 +91,7 @@ def maybe_start_claude_review(
             from grabowski_agent_role import committed_diff
             committed_diff_reader = committed_diff
         if job_start is None:
-            from grabowski_operator import grabowski_job_start
+            from grabowski_operator_core import grabowski_job_start
             job_start = grabowski_job_start
 
         binding = reviews.normalize_binding({
