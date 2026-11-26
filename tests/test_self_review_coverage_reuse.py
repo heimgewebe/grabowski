@@ -292,6 +292,54 @@ class FirstPartyCoverageReuseTests(unittest.TestCase):
             self._verify(plan)
 
 
+    def _legacy_guard(self, plan, repository):
+        f = self.f
+        review._assert_no_first_party_reject_for_legacy_review(
+            plan["binding"], repository=repository, root=f.state,
+            signers=f.signers, root_owned_signers=False,
+        )
+
+    def test_removed_legacy_pass_remains_acceptable(self):
+        plan, path = self._linked_prior()
+        canonical = self._remove(path, "recovery-legacy-pass")
+        self._legacy_guard(plan, canonical)
+        self._legacy_guard(
+            {**plan, "binding": {**plan["binding"], "repo": "heimgewebe/Grabowski"}},
+            canonical,
+        )
+        (self.f.root / "Grabowski").mkdir()
+        with self.assertRaisesRegex(
+            review.ReviewExecutionRejected, "historical canonical source ambiguous or absent"
+        ):
+            self._legacy_guard(plan, canonical)
+
+    def test_removed_legacy_reject_and_resolution_remain_effective(self):
+        f = self.f
+        pool = f.root / ".grabowski-worktrees"
+        pool.mkdir()
+        original = pool / "rejected"
+        f._git("worktree", "add", "--detach", str(original), f.head)
+        f.repo = original
+        rejected = self._prior(reject=True)
+        canonical = self._remove(original, "recovery-legacy-reject")
+        with self.assertRaisesRegex(
+            review.ReviewExecutionRejected, "previous signed material finding unresolved"
+        ):
+            self._legacy_guard(rejected, canonical)
+
+        newer = pool / "resolution"
+        f.repo = canonical
+        f._git("worktree", "add", "--detach", str(newer), f.head)
+        f.repo = newer
+        plan = f._first_party_plan()
+        started = f._start_plan(plan)
+        for n, axis in enumerate(review.REQUIRED_AXES, 1):
+            f._submit_axis(started, axis, n, resolve_ids=("material-1",) if n == 1 else ())
+        audit, _ = f._seal_direct(plan)
+        self.assertEqual("PASS", audit["gate_verdict"])
+        self._remove(newer, "recovery-legacy-resolution")
+        self._legacy_guard(plan, canonical)
+
     def test_large_exact_file_blocks_and_non_lf_separator(self):
         # Representative generated-release shape. A Unicode line separator
         # inside an added source line is NOT an actual Git file header.
