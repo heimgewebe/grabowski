@@ -2553,6 +2553,54 @@ class BureauPickupTests(unittest.TestCase):
         self.assertEqual(3, status.call_count)
         resume.assert_not_called()
 
+    def test_orphan_recovery_compensated_commit_is_not_an_assignment(self) -> None:
+        key = "path:" + str(self.root / "ci-file")
+        fixture = self.orphan_recovery_fixture(keys=[key])
+        run_dir = fixture["run_dir"]
+        intent = fixture["intent"]
+        owner = intent["lease_owner_id"]
+        lease = fixture["acquisition"]["leases"][0]
+        missing = {"status": "failed", "code": "state-error",
+                   "detail": "unknown run " + intent["run_id"]}
+        failure = {"status": "failed", "effect_started": True, "ambiguity": True}
+        (run_dir / "commit-result.json").unlink()
+        pickup._write_bound_json(run_dir / "commit-result.json", failure)
+        pickup._write_bound_json(run_dir / "commit-readback.json", missing)
+        good = {"required": True, "status": "released", "result": {
+            "owner_id": owner, "force": False, "released": [lease]}}
+        cases = (
+            ("compensated", good, missing, None, True),
+            ("foreign current lease", good, missing, {**lease, "owner_id": "foreign"}, True),
+            ("still owned", good, missing, lease, False),
+            ("new run exists", good, fixture["resumed"], None, False),
+            ("uncertain readback", good, {"status": "unknown", "code": "runtime-timeout"}, None, False),
+            ("wrong missing run", good, {**missing, "detail": "unknown run BUR-RUN-20260918T051636Z-28a07139b1"}, None, False),
+            ("partial release", {**good, "result": {**good["result"], "released": []}}, missing, None, False),
+            ("wrong compensation owner", {**good, "result": {**good["result"], "owner_id": "foreign"}}, missing, None, False),
+            ("changed lease identity", {**good, "result": {**good["result"], "released": [{**lease, "metadata_sha256": "b" * 64}]}}, missing, None, False),
+            ("failed compensation", {**good, "status": "release-failed"}, missing, None, False),
+        )
+        for label, compensation, fresh, live, expected in cases:
+            with self.subTest(label=label):
+                (run_dir / "compensation.json").unlink(missing_ok=True)
+                pickup._write_bound_json(run_dir / "compensation.json", compensation)
+                with (
+                    mock.patch.object(pickup, "_coordination_status", return_value=fresh),
+                    mock.patch.object(pickup.resources, "inspect_resource", return_value=live),
+                    mock.patch.object(pickup.resources, "release_resources") as release,
+                    mock.patch.object(pickup.resources, "acquire_resources") as acquire,
+                ):
+                    if expected:
+                        self.assertIsNone(pickup._journaled_orphan_recovery_candidate(
+                            fixture["current_request"], fixture["current_binding"]))
+                    else:
+                        with self.assertRaisesRegex(pickup.BureauPickupError,
+                                                    "orphan-recovery-journal-commit-invalid"):
+                            pickup._journaled_orphan_recovery_candidate(
+                                fixture["current_request"], fixture["current_binding"])
+                    release.assert_not_called()
+                    acquire.assert_not_called()
+
     def test_orphan_recovery_skips_incomplete_pre_acquisition_journal(self) -> None:
         fixture = self.orphan_recovery_fixture()
         (fixture["run_dir"] / "acquisition.json").unlink()

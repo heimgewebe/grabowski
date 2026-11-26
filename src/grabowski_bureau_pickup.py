@@ -2951,6 +2951,85 @@ def _validate_recoverable_orphan(
     return run
 
 
+def _compensated_unapplied_journal(
+    run_dir: Path,
+    intent: dict[str, Any],
+    acquisition: dict[str, Any],
+    request: dict[str, Any],
+    current_binding: RegistryBinding,
+) -> bool:
+    """Recognize a fully compensated non-commit, never an unbound live run."""
+    commit = _read_bound_json(run_dir / "commit-result.json", label="commit-result")
+    if (
+        commit.get("status") in {"claimed", "existing-assignment", "existing-terminal"}
+        or commit.get("run") is not None
+        or commit.get("envelope") is not None
+    ):
+        return False
+    _validate_acquisition(acquisition)
+    expected = {
+        "run_id": intent["run_id"], "task_id": intent["task_id"],
+        "owner_id": intent["lease_owner_id"],
+        "claim_intent_sha256": intent["intent_sha256"],
+        "resource_keys": intent["required_resource_keys"],
+    }
+    if any(acquisition.get(key) != value for key, value in expected.items()):
+        return False
+    # The historical failure alone is insufficient; require original missing-run
+    # evidence (or an explicitly pre-effect refusal), compensation, and live readback.
+    if not (commit.get("effect_started") is False and commit.get("ambiguity") is not True):
+        try:
+            prior = _read_bound_json(run_dir / "commit-readback.json", label="commit-readback")
+        except BureauPickupError:
+            return False
+        if not _definitive_missing_run(prior, expected_run_id=intent["run_id"]):
+            return False
+    keys = intent["required_resource_keys"]
+    if keys:
+        try:
+            compensation = _read_bound_json(run_dir / "compensation.json", label="compensation")
+        except BureauPickupError:
+            return False
+        result = compensation.get("result")
+        if (
+            compensation.get("required") is not True
+            or compensation.get("status") != "released"
+            or not isinstance(result, dict)
+            or result.get("owner_id") != intent["lease_owner_id"]
+            or result.get("force") is not False
+        ):
+            return False
+        acquired = acquisition.get("leases")
+        released = result.get("released")
+        if not isinstance(acquired, list) or not isinstance(released, list):
+            return False
+        if not all(isinstance(x, dict) and isinstance(x.get("resource_key"), str)
+                   for x in acquired + released):
+            return False
+        old = {x["resource_key"]: x for x in acquired}
+        done = {x["resource_key"]: x for x in released}
+        if (len(old) != len(acquired) or len(done) != len(released)
+                or sorted(old) != keys or sorted(done) != keys):
+            return False
+        if not all(old[k].get("owner_id") == intent["lease_owner_id"]
+                   and _owner_lease_matches_snapshot(old[k], done[k]) for k in keys):
+            return False
+        for key in keys:
+            live = resources.inspect_resource(key)
+            if live is not None and live.get("owner_id") == intent["lease_owner_id"]:
+                return False
+    fresh = _bound_bureau_call(
+        current_binding,
+        lambda: _coordination_status(
+            intent["run_id"], registry_root=request["registry_root"],
+            coordination_root=request["coordination_root"],
+        ),
+    )
+    return isinstance(fresh, dict) and _definitive_missing_run(
+        fresh, expected_run_id=intent["run_id"]
+    )
+
+
 def _journaled_orphan_recovery_candidate(
     request: dict[str, Any], current_binding: RegistryBinding
 ) -> dict[str, Any] | None:
@@ -3001,6 +3080,10 @@ def _journaled_orphan_recovery_candidate(
                 "acquisition-missing",
                 "commit-result-missing",
             }:
+                continue
+            if exc.code == "orphan-recovery-journal-commit-invalid" and _compensated_unapplied_journal(
+                run_dir, validated_intent, acquisition, request, current_binding
+            ):
                 continue
             raise
         _validate_acquisition(acquisition)
