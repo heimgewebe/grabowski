@@ -255,6 +255,49 @@ class SelfReviewAefWorktreeTests(unittest.TestCase):
                     producer._managed_repository_identity(path, expected_repo="heimgewebe/vibe-lab"),
                 )
 
+    def test_registered_direct_work_lane_review_identity(self) -> None:
+        import grabowski_checkouts as checkouts
+
+        target = self._linked(self.canonical, self.root / "grabowski-operation-list-20261126")
+        branch = "fix/operation-list"
+        self._git(target, "switch", "-c", branch)
+        common = (self.canonical / ".git").resolve()
+        lane = "a" * 32
+        key = checkouts._checkout_key(common, target)
+        binding = {
+            "checkout_key": key, "repo_common_dir": str(common),
+            "repo_path": str(self.canonical), "checkout_path": str(target),
+            "owner_id": "lane:" + lane, "source": {"kind": "work_lane", "id": lane},
+            "expected_branch": branch, "phase": "active",
+        }
+        with mock.patch.object(checkouts, "_strict_lifecycle_binding", return_value=binding) as lookup:
+            self.assertEqual((target, "heimgewebe/grabowski"), producer._managed_repository_identity(target))
+            lookup.assert_called_once_with(key)
+            # No live lease or fixed base HEAD is required for read-only review.
+            for phase in ("completed_retained", "archived"):
+                binding["phase"] = phase
+                self.assertEqual((target, "heimgewebe/grabowski"), producer._managed_repository_identity(target))
+            binding["phase"] = "active"
+            for field, value in (
+                ("checkout_key", "b" * 64), ("repo_common_dir", "/other/.git"),
+                ("repo_path", "/other"), ("checkout_path", "/other/checkout"),
+                ("owner_id", "unbound"), ("expected_branch", "wrong"),
+                ("source", {"kind": "work_lane", "id": "b" * 32}),
+                ("source", {"kind": "untrusted", "id": lane}),
+                ("phase", "externally_terminal_missing"),
+            ):
+                old = binding[field]
+                binding[field] = value
+                with self.subTest(field=field), self.assertRaisesRegex(self.review.ReviewExecutionRejected, "not a managed checkout"):
+                    producer._managed_repository_identity(target)
+                binding[field] = old
+        with mock.patch.object(checkouts, "_strict_lifecycle_binding", return_value=None):
+            with self.assertRaisesRegex(self.review.ReviewExecutionRejected, "not a managed checkout"):
+                producer._managed_repository_identity(target)
+        with mock.patch.object(checkouts, "_strict_lifecycle_binding", return_value=binding):
+            with self.assertRaisesRegex(self.review.ReviewExecutionRejected, "repository origin invalid"):
+                producer._managed_repository_identity(target, expected_repo="heimgewebe/vibe-lab")
+
     def test_exact_kleinanzeiger_repository_can_use_signed_first_party_review(self) -> None:
         canonical = self._clone(self.root / "kleinanzeiger", "kleinanzeiger")
         expected = "alexdermohr/kleinanzeiger"

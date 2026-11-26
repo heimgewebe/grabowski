@@ -62,6 +62,44 @@ def _read_command(repo: Path, arguments: list[str], *, timeout: int = 30) -> byt
     return completed.stdout
 
 
+def _registered_lane_checkout(real: Path, canonical: Path, common: Path, root: Path) -> bool:
+    """Admit an exact managed Work Lane outside the legacy layout allowlist.
+
+    Lifecycle identity is read-only evidence, not execution authority. Active
+    leases and the original base HEAD are intentionally not required: reviewing
+    an advanced branch or a retained checkout must not create another checkout.
+    """
+    if not real.is_relative_to(root):
+        return False
+    import grabowski_checkouts as checkouts
+
+    key = checkouts._checkout_key(common, real)
+    try:
+        binding = checkouts._strict_lifecycle_binding(key)
+    except (OSError, sqlite3.Error) as exc:
+        raise provenance.ReviewExecutionRejected("review checkout lifecycle evidence unavailable") from exc
+    if not binding:
+        return False
+    owner = binding.get("owner_id")
+    source = binding.get("source")
+    if (
+        binding.get("checkout_key") != key
+        or binding.get("repo_common_dir") != str(common)
+        or binding.get("repo_path") != str(canonical)
+        or binding.get("checkout_path") != str(real)
+        or not isinstance(owner, str)
+        or re.fullmatch(r"lane:[0-9a-f]{32}", owner) is None
+        or not isinstance(source, dict)
+        or source.get("kind") not in checkouts.TERMINAL_EVIDENCE_SOURCE_KINDS
+        or not source.get("id")
+        or (source.get("kind") == "work_lane" and source["id"] != owner[5:])
+        or binding.get("phase") not in {"active", "completed_retained", "archived"}
+    ):
+        return False
+    branch = _read_command(real, ["rev-parse", "--abbrev-ref", "HEAD"]).decode().strip()
+    return branch != "HEAD" and branch == binding.get("expected_branch")
+
+
 def _managed_repository_identity(
     repo: Path, *, expected_repo: str | None = None,
 ) -> tuple[Path, str]:
@@ -101,10 +139,13 @@ def _managed_repository_identity(
         re.escape(f".grabowski-aef-{aef_repo_slug}-") + r"[0-9a-f]{12}",
         real.name,
     ) is not None
-    if real != canonical and real.parent not in worktrees and not aef_checkout:
-        raise provenance.ReviewExecutionRejected("review source not a managed checkout")
     if common != (canonical / ".git").resolve(strict=True):
         raise provenance.ReviewExecutionRejected("review source Git common-dir mismatch")
+    if (
+        real != canonical and real.parent not in worktrees and not aef_checkout
+        and not _registered_lane_checkout(real, canonical, common, root)
+    ):
+        raise provenance.ReviewExecutionRejected("review source not a managed checkout")
     remote = _read_command(
         real, ["config", "--local", "--get", "remote.origin.url"],
     ).decode().strip()
