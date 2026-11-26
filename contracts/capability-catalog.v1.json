@@ -578,7 +578,7 @@
     },
     {
       "category": "work-coordination",
-      "description": "Acquire a work lane, persist terminal closeout, or repair only its missing audit.\n\nNew acquisitions accept source_kind only from bureau_task, github_issue,\noperator_obligation, thread_focus, work_lane, direct, or direct-user.\nDirect sources bind checkout lifecycle evidence to the Work Lane itself.",
+      "description": "Acquire a work lane, persist terminal closeout, or repair only its missing audit.\n\nNew acquisitions accept source_kind only from bureau_task, github_issue,\noperator_obligation, thread_focus, work_lane, direct, or direct-user.\nDirect sources bind checkout lifecycle evidence to the Work Lane itself.\nFor an exact published PR on a direct controller lane, use terminal_closeout\nwith published_pr={lane_id, pr_number, pr_origin}; current checkout, publication,\nliveness and the inner receipt CAS are derived by the server.",
       "effects": [
         "resource-lease",
         "git-worktree-create",
