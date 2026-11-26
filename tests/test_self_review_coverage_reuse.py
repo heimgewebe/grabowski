@@ -204,14 +204,18 @@ class FirstPartyCoverageReuseTests(unittest.TestCase):
                     repository=canonical,now_unix=f.now,root_owned_signers=False,
                     first_party_root=f.state,historical_objects=True)
         review._verify(audit,**kwargs)
-        with self.assertRaises((review.ReviewExecutionRejected, FileNotFoundError)):
-            review._verify(audit,**{**kwargs,"repository":prior_path})
+        with self.assertRaisesRegex(
+            review.ReviewExecutionRejected, "historical review repository must be canonical"
+        ):
+            review._verify(audit, **{**kwargs, "repository": prior_path})
         forged=copy.deepcopy(audit)
         forged["review_pass_receipts"][0]["coverage_reuse_sha256"]="0"*64
         with self.assertRaises(review.ReviewExecutionRejected):
             review._verify(forged,**kwargs)
         # Strict live-source admission stays distinct.
-        with self.assertRaises((review.ReviewExecutionRejected,FileNotFoundError)):
+        with self.assertRaisesRegex(
+            review.ReviewExecutionRejected, "review source Git checkout identity invalid"
+        ):
             review.verified_first_party_semantic_review_passes(
                 plan["binding"],repository=None,root=f.state,signers=f.signers,
                 root_owned_signers=False,now_unix=f.now)

@@ -2251,10 +2251,13 @@ def _historical_pr_source(
     from grabowski_self_review_producer import (
         MANAGED_REPOS_ROOT, _managed_repository_identity, _read_command,
     )
-    canonical = MANAGED_REPOS_ROOT.resolve(strict=True) / expected["repo"].split("/")[-1]
-    if repository is not None and repository.resolve(strict=True) != canonical.resolve(strict=True):
-        raise ReviewExecutionRejected("historical review repository must be canonical")
-    real, _slug = _managed_repository_identity(canonical, expected_repo=expected["repo"])
+    try:
+        canonical = MANAGED_REPOS_ROOT.resolve(strict=True) / expected["repo"].split("/")[-1]
+        if repository is not None and repository.resolve(strict=True) != canonical.resolve(strict=True):
+            raise ReviewExecutionRejected("historical review repository must be canonical")
+        real, _slug = _managed_repository_identity(canonical, expected_repo=expected["repo"])
+    except OSError as exc:
+        raise ReviewExecutionRejected("historical review repository must be canonical") from exc
     if real != canonical:
         raise ReviewExecutionRejected("historical canonical source mismatch")
     for key in ("base_sha", "head_sha"):
