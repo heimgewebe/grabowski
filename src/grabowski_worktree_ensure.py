@@ -1744,7 +1744,9 @@ def ensure_worktree(
                 if isinstance(sidecar_plan, dict):
                     record["adler_sidecar_plan"] = sidecar_plan
                 record["lifecycle"] = _bind_checkout_lifecycle(
-                    inputs, observation, lease, reserved_lifecycle=reserved_lifecycle,
+                    inputs, observation, lease,
+                    newly_created=isinstance(verified_create, dict),
+                    reserved_lifecycle=reserved_lifecycle,
                     expected_physical=(
                         verified_create["physical_checkout"]
                         if isinstance(verified_create, dict) else None

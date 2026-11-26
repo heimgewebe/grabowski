@@ -907,6 +907,59 @@ class WorktreeEnsureTests(unittest.TestCase):
             self.assertEqual(1, len(acquire_calls))
             self.assertEqual(1, len(git_add_calls))
 
+    def test_recovered_regular_lane_cleanup_requires_verified_create(self) -> None:
+        cases = (
+            ("a", True, "implementation-worktree", True),
+            ("b", False, "implementation-worktree", False),
+            ("c", True, "retained-worktree", False),
+        )
+        for n, verified, artifact_class, cleanup_expected in cases:
+            with self.subTest(verified=verified, artifact_class=artifact_class):
+                lane_id = n * 32
+                self.owner = f"lane:{lane_id}"
+                target = self.worktree_root / f"recovery-cleanup-{n}"
+                parameters = self._parameters(
+                    key=f"work-acquire:{lane_id}",
+                    branch=f"feat/recovery-cleanup-{n}",
+                    target=target,
+                )
+                parameters.update(
+                    source_kind="work_lane", source_id=lane_id,
+                    artifact_class=artifact_class,
+                )
+                hook = "_bind_checkout_lifecycle" if verified else "_after_worktree_mutation"
+                error = (
+                    checkouts.resources.ResourceSchemaInventoryChanged("fixture post-create")
+                    if verified else SystemExit("fixture pre-proof process loss")
+                )
+                with patch.dict(os.environ, {
+                    "GRABOWSKI_WORKTREE_ENSURE_RECEIPT_ROOT": str(self.receipt_root),
+                    "GROSSER_ADLER_STATE_ROOT": str(self.root / "adler"),
+                }), patch.object(worktree_ensure, hook, side_effect=error):
+                    with self.assertRaises(type(error)):
+                        worktree_ensure.ensure_worktree(
+                            parameters, grips._default_command_runner, self._lease,
+                        )
+                intent = next(
+                    record for path in self.receipt_root.glob("*.json")
+                    if (record := json.loads(path.read_text()))["inputs"]["target_path"] == str(target)
+                )
+                self.assertEqual("intent", intent["state"])
+                self.assertIs("verified_post_create" in intent, verified)
+                with patch.dict(os.environ, {"GROSSER_ADLER_STATE_ROOT": str(self.root / "adler")}):
+                    recovered = self._ensure(parameters)
+                    replayed = self._ensure(parameters)
+                self.assertEqual("CREATED", recovered["result_state"])
+                self.assertTrue(recovered["recovered_after_interruption"])
+                self.assertIs(
+                    recovered["lifecycle"]["automatic_cleanup_authorized"], cleanup_expected,
+                )
+                self.assertIs(
+                    replayed["lifecycle"]["automatic_cleanup_authorized"], cleanup_expected,
+                )
+                self.assertEqual(recovered["durable_receipt_sha256"], replayed["durable_receipt_sha256"])
+                self.assertEqual(self.head, self._git(target, "rev-parse", "HEAD").stdout.strip())
+
     def test_readback_only_without_existing_effect_never_creates_checkout(self) -> None:
         parameters = self._parameters(key="readback-only")
         with patch.dict(os.environ, {
