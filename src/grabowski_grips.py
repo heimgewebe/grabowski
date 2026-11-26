@@ -839,16 +839,9 @@ GRIP_SPECS: dict[str, GripSpec] = {
     "saga-settle": GripSpec(
         name="saga-settle",
         version="1.0",
-        summary="Settle one exact saga from its run receipt, Captain receipt and typed live readback.",
+        summary="Settle one exact saga from verified run/Captain references or explicit legacy plan parameters and typed live readback.",
         effect=READ_ONLY,
-        required_parameters=(
-            "saga_kind",
-            "target",
-            "idempotency_key",
-            "expected_plan_sha256",
-            "run_receipt",
-            "captain_result",
-        ),
+        required_parameters=("run_receipt", "captain_result"),
         acceptance_ids=("plan-run-captain-bound", "captain-audit-bound", "live-readback-bound", "partial-failure-explicit", "authority-preserved"),
         runner="saga_settle",
         uses_github=True,
@@ -12483,6 +12476,7 @@ def _saga_persist_run_receipt(
                 "schema_version": grabowski_grip_orchestration.SCHEMA_VERSION,
                 "saga_kind": plan["saga_kind"],
                 "plan_sha256": plan["plan_sha256"],
+                "plan": grabowski_grip_orchestration.validate_plan(plan),
                 "run_sha256": validated["run_sha256"],
                 "run_receipt_sha256": grabowski_grip_orchestration.sha256_json(validated),
                 "run_receipt": validated,
@@ -12817,8 +12811,21 @@ def _run_saga_settle(
             "captain_result",
         },
     )
-    plan = _saga_plan_from_parameters(parameters)
-    _saga_expected_plan(plan, parameters)
+    plan_keys = {"saga_kind", "target", "idempotency_key", "expected_plan_sha256"}
+    supplied = plan_keys.intersection(parameters)
+    run_receipt_value = parameters.get("run_receipt")
+    if supplied:
+        if supplied != plan_keys:
+            raise GripPreflightError("saga settlement requires all legacy plan parameters or none")
+        plan = _saga_plan_from_parameters(parameters)
+        _saga_expected_plan(plan, parameters)
+    else:
+        try:
+            plan, run_receipt_value = grabowski_grip_orchestration.recover_saga_run(
+                run_receipt_value
+            )
+        except grabowski_grip_orchestration.SagaError as exc:
+            raise GripPreflightError(str(exc)) from exc
     captain_audit_binding = _saga_captain_audit_binding(
         plan, parameters.get("captain_result")
     )
@@ -12826,7 +12833,7 @@ def _run_saga_settle(
     try:
         settlement = grabowski_grip_orchestration.settle(
             plan_value=plan,
-            run_receipt_value=parameters.get("run_receipt"),
+            run_receipt_value=run_receipt_value,
             captain_result_value=parameters.get("captain_result"),
             captain_audit_binding_value=captain_audit_binding,
             readback_value=readback,
