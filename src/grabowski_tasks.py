@@ -9084,11 +9084,38 @@ def _resolve_task_operation_identity(
             "retry_binding": None,
         }
     if str(latest["state"]) in TASK_STATE_PROJECTIONS["attention"]:
-        if not all(retry_fields):
+        if not supersedes_task_id or not force_new_reason:
             raise RuntimeError(
-                "operation identity has an attention predecessor; bind "
-                "supersedes_task_id, predecessor receipt and force-new reason"
+                "operation identity has an attention predecessor; explicitly retry "
+                f"task {latest['task_id']} with supersedes_task_id and force_new_reason; "
+                "a verified terminal receipt can be bound by the server"
             )
+        if supersedes_task_id != str(latest["task_id"]):
+            raise ValueError("operation retry supersedes_task_id is stale")
+        if not supersedes_receipt_sha256:
+            # task_start holds the existing task-mutation lock. Only an exact
+            # named predecessor may opt into server-owned receipt binding;
+            # never select a new failed successor on replay of an old request.
+            if str(latest["state"]) not in {"failed", "timed_out", "signalled"}:
+                raise RuntimeError("server-bound operation retry requires a terminal failure")
+            if latest["resume_policy"] not in {"manual", "verify-then-retry", "retry-safe"}:
+                raise RuntimeError("server-bound operation retry is denied by predecessor resume policy")
+            if _terminal_convergence_evidence(latest) != (True, True):
+                raise RuntimeError("server-bound operation retry requires valid terminal and lease evidence")
+            from grabowski_task_attention import terminal_closeout_plan
+
+            closeout = terminal_closeout_plan(latest)
+            receipt = latest.get("lifecycle_receipt_sha256")
+            if (
+                closeout.get("lifecycle_evidence_valid") is not True
+                or closeout.get("outcome_receipt_sha256") != receipt
+                or not isinstance(receipt, str)
+                or SHA256.fullmatch(receipt) is None
+            ):
+                raise RuntimeError("server-bound operation retry lifecycle receipt is missing or invalid")
+            if resources.count_resources(owner_id=f"task:{supersedes_task_id}", include_expired=False) != 0:
+                raise RuntimeError("server-bound operation retry has live predecessor leases")
+            supersedes_receipt_sha256 = receipt
         return {
             "reuse": None,
             "reuse_reason": None,
