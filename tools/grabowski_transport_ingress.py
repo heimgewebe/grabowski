@@ -868,6 +868,15 @@ class TransportIngress:
         )
         try:
             upstream = await client.send(outbound, stream=True)
+        except (httpx.ConnectError, httpx.ConnectTimeout):
+            # A fresh, direct client failed to establish the connection. No
+            # upstream request was sent. Do not retry an MCP call implicitly.
+            await client.aclose()
+            return JSONResponse(
+                {"error": "operator_unavailable", "upstream_request_sent": False},
+                status_code=503,
+                headers={"Cache-Control": "no-store"},
+            )
         except BaseException:
             await client.aclose()
             raise
