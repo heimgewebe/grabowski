@@ -475,6 +475,89 @@ class TransportIngressTests(unittest.TestCase):
                 canonical["selector_sha256"],
             )
 
+    def test_real_unavailable_upstream_returns_json_503(self) -> None:
+        if (importlib.util.find_spec("httpx") is None
+                or importlib.util.find_spec("starlette") is None):
+            self.skipTest("runtime HTTP dependencies unavailable")
+        import socket
+
+        proxy = ingress.TransportIngress(
+            token=SECRET,
+            upstream=ingress.DEFAULT_UPSTREAM,
+            runtime_binding_sha256=_runtime_sha256(),
+        )
+        request = self.FakeRequest([_tool_body()])
+        request.method = "POST"
+        # Reserve a loopback port without listening. The fixture never
+        # touches either production slot or modifies the production selector.
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            route = proxy._route()
+            route["upstream"] = f"http://127.0.0.1:{sock.getsockname()[1]}/mcp"
+            with mock.patch.object(proxy, "_route", return_value=route):
+                response = asyncio.run(proxy.proxy(request))
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(json.loads(response.body), {
+            "error": "operator_unavailable", "upstream_request_sent": False,
+        })
+        self.assertEqual(response.headers["cache-control"], "no-store")
+
+    def test_connection_errors_do_not_retry_or_claim_ambiguous_delivery(self) -> None:
+        fake_httpx = types.ModuleType("httpx")
+        fake_httpx.ConnectError = type("ConnectError", (Exception,), {})
+        fake_httpx.ConnectTimeout = type("ConnectTimeout", (Exception,), {})
+        fake_httpx.ReadError = type("ReadError", (Exception,), {})
+        fake_httpx.WriteError = type("WriteError", (Exception,), {})
+        fake_background = types.ModuleType("starlette.background")
+        fake_background.BackgroundTask = object
+        fake_responses = types.ModuleType("starlette.responses")
+        fake_responses.JSONResponse = mock.Mock()
+        fake_responses.StreamingResponse = object
+        fake_starlette = types.ModuleType("starlette")
+        fake_starlette.background = fake_background
+        fake_starlette.responses = fake_responses
+
+        proxy = ingress.TransportIngress(
+            token=SECRET,
+            upstream=ingress.DEFAULT_UPSTREAM,
+            runtime_binding_sha256=_runtime_sha256(),
+        )
+        request = self.FakeRequest([_tool_body()])
+        request.method = "POST"
+        cases = (
+            (fake_httpx.ConnectError, True),
+            (fake_httpx.ConnectTimeout, True),
+            (fake_httpx.ReadError, False),
+            (fake_httpx.WriteError, False),
+        )
+        with mock.patch.dict(sys.modules, {
+            "httpx": fake_httpx,
+            "starlette": fake_starlette,
+            "starlette.background": fake_background,
+            "starlette.responses": fake_responses,
+        }):
+            for error_type, preconnect in cases:
+                with self.subTest(error=error_type.__name__):
+                    client = mock.Mock()
+                    client.send = mock.AsyncMock(side_effect=error_type("fixture"))
+                    client.aclose = mock.AsyncMock()
+                    fake_httpx.AsyncClient = mock.Mock(return_value=client)
+                    fake_responses.JSONResponse.reset_mock()
+                    if preconnect:
+                        response = asyncio.run(proxy.proxy(request))
+                        self.assertIs(response, fake_responses.JSONResponse.return_value)
+                        fake_responses.JSONResponse.assert_called_once_with(
+                            {"error": "operator_unavailable", "upstream_request_sent": False},
+                            status_code=503,
+                            headers={"Cache-Control": "no-store"},
+                        )
+                    else:
+                        with self.assertRaises(error_type):
+                            asyncio.run(proxy.proxy(request))
+                        fake_responses.JSONResponse.assert_not_called()
+                    client.send.assert_awaited_once()
+                    client.aclose.assert_awaited_once()
+
     def test_chunked_request_body_is_bounded_while_streaming(self) -> None:
         proxy = ingress.TransportIngress(
             token=SECRET,
