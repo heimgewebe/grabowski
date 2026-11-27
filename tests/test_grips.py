@@ -12875,6 +12875,11 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             return_value=captain_independent_review_reconciliation(),
         )
         self._decision_review_patch.start()
+        # The GitHub runner is synthetic: responses advance by call count.
+        # Keep retry logic and explicit delay assertions, not real wall waits.
+        sleep_fixture = patch.object(grips, "_captain_sleep", return_value=None)
+        sleep_fixture.start()
+        self.addCleanup(sleep_fixture.stop)
         # These action-envelope fixtures isolate policy/dispatch from the
         # separately tested signed task origin. The dedicated production
         # no-origin rejection and real signer suite never apply this patch.
