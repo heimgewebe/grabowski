@@ -14,7 +14,7 @@ Der Adapter stellt den in Bureau definierten Operator-Intake-Vertrag als schmale
 | `grabowski_bureau_task_propose` | Erzeugt ein digestgebundenes privates Proposal-Artefakt; Registry und Queue bleiben unverändert. |
 | `grabowski_bureau_task_review` | Prüft exakt den angegebenen Proposal-Digest und erzeugt `reviewed_plan`-Approval-Evidenz; Reviewzeitpunkt kommt ausschließlich aus Bureau. |
 | `grabowski_bureau_task_publish_preview` | Validiert ein Proposal und liefert die exakt benötigten Publikationsressourcen ohne Wirkung. |
-| `grabowski_bureau_task_publish` | Erwirbt zwei exakte Kurzleasen, publiziert Branch und Pull Request und gibt Leases nur nach eindeutigem Ausgang frei. |
+| `grabowski_bureau_task_publish` | Erwirbt die vom Preview bestimmten Kurzleasen, publiziert den TaskSpec und projiziert die exakte Lease-Konvergenz. |
 
 ## Acceptance-Authentifizierung
 
@@ -39,12 +39,23 @@ Kandidaten verwenden den Bureau-Idempotenzschlüssel. Proposal-Verzeichnisse wer
 
 ## Publikationsvertrag
 
-Vor einer Publikation muss Bureau `status=ready` und exakt zwei Ressourcen liefern:
+Das Preview bestimmt die exakten Publikationsressourcen: für StateStore-Publikation
+den Koordinations-State-Root, für historische Git-Publikation Registry-Gate und
+Task-Datei. Der Owner und die Lease-Metadaten sind an Publikationstask, Operation
+und Proposal-SHA gebunden; die Laufzeit beträgt 90 bis 300 Sekunden.
 
-1. den kanonischen Registry-Publikations-Gate-Pfad;
-2. die exakte Task-Datei.
+Bei StateStore-Publikation ist Bureau die Freigabeautorität: Es gibt die
+ursprünglich beobachteten Lease-Zeilen exakt und atomar frei. Der Adapter
+verifiziert das eingebettete Release-Receipt gegen diese Bindung und den
+aktuellen Ressourcen-Readback. Bei nachgewiesener Konvergenz meldet er
+`leases_released=true`, ohne erneut freizugeben. Dasselbe gilt beim Receipt-Replay.
+Eine fehlende oder driftende Bindung oder eine noch belegte Ressource wird als
+`cleanup_incomplete` mit `resource_leases` in `required_readback` ausgewiesen,
+nicht durch einen zweiten Release bereinigt. Bei eindeutig wirkungslosem
+Abbruch darf der Adapter nur seine exakt unveränderten Akquise-Snapshots
+freigeben; bei Ambiguität bleiben sie erhalten.
 
-Grabowski erwirbt beide Ressourcen unter einem proposalgebundenen Owner für 90 bis 300 Sekunden. Die Lease-Metadaten binden Publikationstask, Operation und Proposal-SHA. Ein klarer Ausgang löst die Freigabe aus. Bei unklarem Ausgang bleiben die Kurzleasen bis zum Ablauf erhalten, sofern kein gültiges Receipt einen eindeutigen Replay ermöglicht.
+Historische Git-Publikationen behalten ihren bisherigen Release-Pfad.
 
 ## Fehler- und Ambiguitätsvertrag
 
