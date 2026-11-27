@@ -4959,9 +4959,26 @@ def _audit_records() -> list[dict[str, Any]]:
 def _find_transaction_record(transaction_id: str) -> dict[str, Any]:
     if not re.fullmatch(r"\d{8}T\d{6}\.\d{6}Z-[0-9a-f]{12}", transaction_id):
         raise ValueError("Invalid transaction_id")
-    for record in reversed(_audit_records()):
-        if record.get("transaction_id") == transaction_id:
-            return record
+    # Verify the entire captured chain before returning any transaction.
+    # Unlike the bulk compatibility reader, keep only the active bytes and
+    # verified predecessor metadata, then decode at most one segment at a time.
+    head, predecessor, _identity = _capture_verified_audit_head(AUDIT_LOG)
+    predecessors = []
+    if predecessor is not None:
+        predecessors, _compatibility = _read_audit_chain_unlocked(
+            AUDIT_LOG,
+            use_segment_cache=False,
+            retain_verified_segment_data=False,
+            initial_expected=predecessor,
+        )
+    for index, (path, data, status) in enumerate([head, *predecessors]):
+        if index:
+            data, exists = _read_audit_file_bytes(path)
+            if not exists or hashlib.sha256(data).hexdigest() != status["segment_sha256"]:
+                raise ValueError("audit-segment-changed-after-verification")
+        for record in reversed(_audit_records_from_components([(path, data, status)])):
+            if record.get("transaction_id") == transaction_id:
+                return record
     raise ValueError(f"Transaction not found in audit log: {transaction_id}")
 
 

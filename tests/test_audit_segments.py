@@ -154,6 +154,87 @@ class AuditSegmentLifecycleTests(unittest.TestCase):
                 self.assertEqual(first["payload"], "x" * 80)
                 self.assertTrue(status["audit_writable"], status)
 
+    def test_transaction_lookup_does_not_materialize_full_chain(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            state.mkdir(mode=0o700)
+            audit, patches = self._patches(state)
+            transaction = "20260719T000000.000000Z-000000000000"
+            with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]:
+                for index in range(30):
+                    grabowski_mcp._append_audit(
+                        {"operation": "lookup-test", "transaction_id": transaction,
+                         "index": index, "payload": "x" * 120}
+                    )
+                self.assertGreater(grabowski_mcp._verify_audit_log(audit)["archived_segment_count"], 0)
+                with patch.object(
+                    grabowski_mcp, "_audit_records",
+                    side_effect=AssertionError("full audit materialization"),
+                ):
+                    with patch.object(
+                        grabowski_mcp,
+                        "_audit_records_from_components",
+                        wraps=grabowski_mcp._audit_records_from_components,
+                    ) as decode:
+                        latest = grabowski_mcp._find_transaction_record(transaction)
+                    self.assertEqual(latest["index"], 29)
+                    self.assertEqual(decode.call_count, 1)
+                    self.assertEqual(len(decode.call_args.args[0]), 1)
+                    with self.assertRaisesRegex(ValueError, "Transaction not found"):
+                        grabowski_mcp._find_transaction_record(
+                            "20260719T000000.000001Z-000000000001"
+                        )
+
+    def test_transaction_lookup_rejects_corrupt_history_even_for_recent_match(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            state.mkdir(mode=0o700)
+            audit, patches = self._patches(state)
+            transaction = "20260719T000000.000000Z-000000000000"
+            with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]:
+                for index in range(30):
+                    grabowski_mcp._append_audit(
+                        {"operation": "lookup-test", "transaction_id": transaction,
+                         "index": index, "payload": "x" * 120}
+                    )
+                first = json.loads(audit.read_text(encoding="utf-8").splitlines()[0])
+                segment = Path(first["archived_audit_path"])
+                data = segment.read_bytes()
+                segment.write_bytes(data[:-1] + b"X")
+                os.chmod(segment, 0o600)
+                with self.assertRaisesRegex(ValueError, "audit-segment"):
+                    grabowski_mcp._find_transaction_record(transaction)
+
+    def test_transaction_lookup_rejects_archive_change_after_verification(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            state.mkdir(mode=0o700)
+            audit, patches = self._patches(state)
+            transaction = "20260719T000000.000000Z-000000000000"
+            with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]:
+                grabowski_mcp._append_audit(
+                    {"operation": "lookup-test", "transaction_id": transaction}
+                )
+                for index in range(30):
+                    grabowski_mcp._append_audit(
+                        {"operation": "lookup-filler", "index": index, "payload": "x" * 120}
+                    )
+                verify = grabowski_mcp._read_audit_chain_unlocked
+
+                def verify_then_change(*args, **kwargs):
+                    components, compatibility = verify(*args, **kwargs)
+                    self.assertTrue(components)
+                    path = components[-1][0]
+                    data = path.read_bytes()
+                    path.write_bytes(data[:-1] + b"X")
+                    return components, compatibility
+
+                with patch.object(
+                    grabowski_mcp, "_read_audit_chain_unlocked", side_effect=verify_then_change
+                ):
+                    with self.assertRaisesRegex(ValueError, "audit-segment-changed-after-verification"):
+                        grabowski_mcp._find_transaction_record(transaction)
+
     def test_archived_segment_tamper_blocks_append_and_preserves_active_head(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory) / "state"
