@@ -292,6 +292,7 @@ class PrReviewGateTargetMatrixTests(unittest.TestCase):
             "heimgewebe/hausKI-audio": ("scan",),
             "heimgewebe/hauski-audio": ("scan",),
             "Hall-of-Memory/Hall-of-Memory": ("verify",),
+            "alexdermohr/beziehungsgestaltung-okja": ("Inhalte und Navigation",),
             "alexdermohr/mark-api": ("verify",),
             "alexdermohr/kleinanzeiger": ("verify", "verify-py313", "installed-offline", "installed-offline-py313", "windows-installed-py3.12", "windows-installed-py3.13"),
             "heimgewebe/metarepo": ("ci (ubuntu-latest)", "ci (macos-latest)"),
