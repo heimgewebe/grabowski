@@ -2239,23 +2239,37 @@ def verified_first_party_candidate_handoff(
 
 
 
-def _historical_pr_source(
+def _historical_pr_repository(
     session: dict[str, Any], *, repository: Path | None = None,
-    session_root: Path | None = None, signers: Path | None = None,
-    root_owned_signers: bool = True,
+    canonical_slug: str | None = None,
 ) -> Path:
-    """Revalidate historical signed PR bytes using the canonical Git repository."""
+    """Validate immutable PR objects and source identity in the canonical repository."""
     expected = _first_party_binding(session["binding"])
     if expected["review_purpose"] != "pull_request":
         raise ReviewExecutionRejected("historical object proof limited to committed PR")
+    slug = canonical_slug or expected["repo"]
+    if slug.lower() != expected["repo"].lower():
+        raise ReviewExecutionRejected("historical canonical source mismatch")
     from grabowski_self_review_producer import (
         MANAGED_REPOS_ROOT, _managed_repository_identity, _read_command,
     )
     try:
-        canonical = MANAGED_REPOS_ROOT.resolve(strict=True) / expected["repo"].split("/")[-1]
+        managed_root = MANAGED_REPOS_ROOT.resolve(strict=True)
+        if canonical_slug is None:
+            canonical = managed_root / expected["repo"].split("/")[-1]
+        else:
+            name = slug.split("/")[-1].lower()
+            matches = [path for path in managed_root.iterdir() if path.name.lower() == name]
+            if len(matches) != 1:
+                raise ReviewExecutionRejected("historical canonical source ambiguous or absent")
+            canonical = matches[0]
         if repository is not None and repository.resolve(strict=True) != canonical.resolve(strict=True):
             raise ReviewExecutionRejected("historical review repository must be canonical")
-        real, _slug = _managed_repository_identity(canonical, expected_repo=expected["repo"])
+        real, observed_slug = _managed_repository_identity(
+            canonical, expected_repo=expected["repo"] if canonical_slug is None else None,
+        )
+        if observed_slug.lower() != expected["repo"].lower():
+            raise ReviewExecutionRejected("historical canonical source mismatch")
     except OSError as exc:
         raise ReviewExecutionRejected("historical review repository must be canonical") from exc
     if real != canonical:
@@ -2270,6 +2284,15 @@ def _historical_pr_source(
         raise ReviewExecutionRejected("historical raw diff drift")
     if _first_party_changed_paths(real, expected) != session["changed_paths"]:
         raise ReviewExecutionRejected("historical changed paths drift")
+    return real
+
+def _historical_pr_source(
+    session: dict[str, Any], *, repository: Path | None = None,
+    session_root: Path | None = None, signers: Path | None = None,
+    root_owned_signers: bool = True,
+) -> Path:
+    """Revalidate historical signed PR bytes using the canonical Git repository."""
+    real = _historical_pr_repository(session, repository=repository)
     _first_party_signed_diff(real, session, session_root=session_root, signers=signers,
                              root_owned_signers=root_owned_signers)
     return real
@@ -2461,6 +2484,11 @@ def _assert_prior_first_party_material_findings_resolved(
                     if legacy_history_only and not isinstance(old.get("worktree"), str):
                         raise ReviewExecutionRejected("previous signed review worktree invalid")
                     old_binding = _first_party_binding(candidate)
+                    historical_pr = legacy_history_only and old_binding["review_purpose"] == "pull_request"
+                    if historical_pr:
+                        historical_repository = _historical_pr_repository(
+                            old, canonical_slug=decisive["repo"],
+                        )
                     if "canonical_diff_sha256" not in session:
                         # Check the original signed Git repository spelling,
                         # not a caller-supplied case alias. A frozen Candidate
@@ -2474,8 +2502,9 @@ def _assert_prior_first_party_material_findings_resolved(
                         )
                         from grabowski_self_review_producer import _current_source
 
-                        session["source_raw_diff_sha256"] = _current_source(
-                            historical_repository, source_binding,
+                        session["source_raw_diff_sha256"] = (
+                            old["source_raw_diff_sha256"] if historical_pr else
+                            _current_source(historical_repository, source_binding)
                         )
                         session["canonical_diff_sha256"] = hashlib.sha256(
                             _first_party_diff(historical_repository, source_binding)
