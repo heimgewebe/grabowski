@@ -2052,6 +2052,85 @@ def grabowski_bureau_task_publish_preview(
     return payload
 
 
+def _state_store_release_verified(
+    payload: dict[str, Any],
+    *,
+    owner_id: str,
+    proposal_sha256: str,
+    publishing_task_id: str,
+    resource_keys: list[str],
+    acquired: dict[str, Any] | None = None,
+) -> None:
+    """Consume the exact domain release proof, never release its keys again."""
+    binding = payload.get("lease_binding")
+    release = payload.get("lease_release")
+    keys = sorted(resource_keys)
+    if (
+        payload.get("kind") != "bureau_task_publication_receipt"
+        or payload.get("status") != "published"
+        or payload.get("ambiguity")
+        or payload.get("proposal_sha256") != proposal_sha256
+        or payload.get("publishing_task_id") != publishing_task_id
+        or not isinstance(binding, dict)
+        or binding.get("owner_id") != owner_id
+        or binding.get("task_id") != publishing_task_id
+        or binding.get("resource_keys") != keys
+        or binding.get("resource_db") != str(resources.RESOURCE_DB.resolve())
+    ):
+        raise ValueError("publication-domain-release-binding-invalid")
+    digest = binding.get("lease_binding_sha256")
+    unsigned = {k: v for k, v in binding.items() if k != "lease_binding_sha256"}
+    expected_digest = _sha256(
+        (json.dumps(unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+         + "\n").encode("utf-8")
+    )
+    snapshots = binding.get("lease_snapshots")
+    if (
+        digest != expected_digest
+        or release != {
+            "released": True,
+            "owner_id": owner_id,
+            "resource_keys": keys,
+            "lease_binding_sha256": digest,
+        }
+        or not isinstance(snapshots, list)
+        or len(snapshots) != len(keys)
+        or any(
+            not isinstance(item, dict)
+            or set(item) != resources.LEASE_SNAPSHOT_KEYS
+            or item.get("owner_id") != owner_id
+            for item in snapshots
+        )
+        or [item["resource_key"] for item in snapshots] != keys
+    ):
+        raise ValueError("publication-domain-release-evidence-invalid")
+    if acquired is not None:
+        acquired_snapshots = sorted(
+            (
+                {field: lease[field] for field in resources.LEASE_SNAPSHOT_KEYS}
+                for lease in acquired["leases"]
+            ),
+            key=lambda lease: lease["resource_key"],
+        )
+        if snapshots != acquired_snapshots:
+            raise ValueError("publication-domain-release-snapshot-drift")
+    if resources.inspect_resources(keys):
+        raise RuntimeError("publication-domain-release-live-lease-present")
+
+
+def _publication_cleanup_incomplete(
+    payload: dict[str, Any], error: dict[str, Any]
+) -> dict[str, Any]:
+    return {
+        **payload,
+        "cleanup_incomplete": True,
+        "lease_release_error": error,
+        "required_readback": sorted(
+            set(payload.get("required_readback", [])) | {"resource_leases"}
+        ),
+    }
+
+
 @mcp.tool(name="grabowski_bureau_task_publish", annotations=MUTATING)
 def grabowski_bureau_task_publish(
     proposal_id: str,
@@ -2108,6 +2187,21 @@ def grabowski_bureau_task_publish(
             coordination_state_root=coordination_state_root,
         )
         payload = _invoke_bureau(apply_arguments, timeout_seconds=30)
+        leases_released = payload.get("status") == "published" and not payload.get("ambiguity")
+        if publication_mode == "state_store":
+            try:
+                _state_store_release_verified(
+                    payload,
+                    owner_id=owner_id,
+                    proposal_sha256=proposal_sha256,
+                    publishing_task_id=publishing_task_id,
+                    resource_keys=[f"path:{coordination_state_root}"],
+                )
+            except Exception as exc:
+                leases_released = False
+                payload = _publication_cleanup_incomplete(
+                    payload, {"error_type": type(exc).__name__}
+                )
         _audit(
             "bureau-task-publish-receipt-replay",
             payload,
@@ -2119,7 +2213,7 @@ def grabowski_bureau_task_publish(
             "adapter_proposal_id": proposal_id,
             "lease_owner_id": owner_id,
             "leases_acquired": False,
-            "leases_released": True,
+            "leases_released": bool(leases_released),
             "idempotent_adapter_replay": True,
         }
     preview = grabowski_bureau_task_publish_preview(proposal_id, registry_root)
@@ -2246,9 +2340,30 @@ def grabowski_bureau_task_publish(
     release_requested = not bool(payload.get("ambiguity"))
     leases_released = False
     release_error: dict[str, Any] | None = None
-    if release_requested:
+    if publication_mode == "state_store" and payload.get("status") == "published":
         try:
-            released = resources.release_resources(owner_id, resource_keys)
+            _state_store_release_verified(
+                payload,
+                owner_id=owner_id,
+                proposal_sha256=proposal_sha256,
+                publishing_task_id=publishing_task_id,
+                resource_keys=resource_keys,
+                acquired=acquired,
+            )
+            leases_released = True
+        except Exception as exc:
+            release_error = {"error_type": type(exc).__name__}
+    elif release_requested and (
+        publication_mode != "state_store" or payload.get("effect_started") is False
+    ):
+        try:
+            release_kwargs = {}
+            if publication_mode == "state_store":
+                release_kwargs["expected_leases"] = [
+                    {field: lease[field] for field in resources.LEASE_SNAPSHOT_KEYS}
+                    for lease in acquired["leases"]
+                ]
+            released = resources.release_resources(owner_id, resource_keys, **release_kwargs)
             leases_released = len(released["released"]) == len(resource_keys)
             base._append_audit(
                 {
@@ -2262,6 +2377,8 @@ def grabowski_bureau_task_publish(
             )
         except Exception as exc:
             release_error = {"error_type": type(exc).__name__}
+    elif publication_mode == "state_store":
+        release_error = {"error_type": "PublicationReleaseUncertain"}
     payload = {
         **payload,
         "receipt_readback_attempted": receipt_readback_attempted,
@@ -2274,14 +2391,7 @@ def grabowski_bureau_task_publish(
             "adapter_receipt_sha256": _sha256(_canonical_json(receipt)),
         }
     if release_error is not None:
-        payload = {
-            **payload,
-            "cleanup_incomplete": True,
-            "lease_release_error": release_error,
-            "required_readback": sorted(
-                set(payload.get("required_readback", [])) | {"resource_leases"}
-            ),
-        }
+        payload = _publication_cleanup_incomplete(payload, release_error)
     _audit("bureau-task-publish", payload, proposal_id=proposal_id, owner_id=owner_id)
     return {
         **payload,

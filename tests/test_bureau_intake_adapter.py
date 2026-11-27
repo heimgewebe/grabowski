@@ -1676,10 +1676,8 @@ class BureauIntakeAdapterTests(unittest.TestCase):
             "publication_mode": "state_store", "coordination_state_root": state_root,
             "required_resource_keys": keys,
         }
-        published = {
-            "kind": "bureau_task_publication_receipt", "status": "published",
-            "publication_mode": "state_store", "coordination_state_root": state_root,
-        }
+        acquired = self._publication_acquired(state_root)
+        published = self._domain_release_receipt(acquired, state_root)
 
         def invoke(arguments, **_kwargs):
             self.assertEqual(arguments[:2], ["--root", str(snapshot)])
@@ -1692,12 +1690,13 @@ class BureauIntakeAdapterTests(unittest.TestCase):
             return published
 
         with (
+            mock.patch.object(intake.resources, "inspect_resources", return_value={}),
             mock.patch.object(intake, "_managed_runtime_binding", return_value=binding),
             mock.patch.object(intake.bureau_runtime, "refresh_bureau_control_checkout") as refresh,
             mock.patch.object(intake.bureau_runtime, "inspect_bureau_control_checkout") as inspect_root,
             mock.patch.object(intake, "_invoke_bureau", side_effect=invoke),
             mock.patch.object(intake.resources, "acquire_resources",
-                              return_value={"expires_at_unix": 200, "bureau_contract": {}}) as acquire,
+                              return_value=acquired) as acquire,
             mock.patch.object(intake.resources, "release_resources",
                               return_value={"released": [{"resource_key": keys[0]}]}) as release,
         ):
@@ -1707,7 +1706,7 @@ class BureauIntakeAdapterTests(unittest.TestCase):
         self.assertTrue(replay["idempotent_adapter_replay"])
         acquire.assert_called_once()
         self.assertEqual(acquire.call_args.args[1], keys)
-        release.assert_called_once()
+        release.assert_not_called()
         refresh.assert_not_called()
         inspect_root.assert_not_called()
 
@@ -2008,29 +2007,17 @@ class BureauIntakeAdapterTests(unittest.TestCase):
             "required_lease_metadata": required_metadata,
         }
 
+        acquired = self._publication_acquired(state_root)
+
         def invoke(arguments, **_kwargs):
             receipt = Path(arguments[arguments.index("--receipt") + 1])
-            receipt.write_text(
-                json.dumps(
-                    {
-                        "kind": "bureau_task_publication_receipt",
-                        "status": "published",
-                        "publication_mode": "state_store",
-                        "coordination_state_root": state_root,
-                    }
-                )
-                + "\n"
-            )
-            return {
-                "kind": "bureau_task_publication_receipt",
-                "status": "published",
-                "publication_mode": "state_store",
-                "coordination_state_root": state_root,
-            }
+            published = self._domain_release_receipt(acquired, state_root)
+            receipt.write_text(json.dumps(published))
+            return published
 
-        acquired = {"expires_at_unix": 200, "bureau_contract": {}}
-        released = {"released": [{"resource_key": key} for key in keys]}
+        released = {"released": []}
         with (
+            mock.patch.object(intake.resources, "inspect_resources", return_value={}),
             mock.patch.object(
                 intake, "grabowski_bureau_task_publish_preview", return_value=preview
             ) as preview_call,
@@ -2064,6 +2051,218 @@ class BureauIntakeAdapterTests(unittest.TestCase):
         )
         self.assertTrue(result["leases_released"])
         self.assertTrue((directory / "publication-receipt.json").exists())
+
+    def _publication_acquired(self, state_root):
+        return {
+            "expires_at_unix": 400, "bureau_contract": {},
+            "leases": [{
+                "resource_key": f"path:{state_root}",
+                "owner_id": "bureau-publication:" + "c" * 24,
+                "acquired_at_unix": 100, "updated_at_unix": 100,
+                "expires_at_unix": 400, "metadata_sha256": "d" * 64,
+            }],
+        }
+
+    def _domain_release_receipt(self, acquired, state_root):
+        owner = "bureau-publication:" + "c" * 24
+        keys = [f"path:{state_root}"]
+        snapshots = [
+            {field: lease[field] for field in intake.resources.LEASE_SNAPSHOT_KEYS}
+            for lease in acquired["leases"]
+        ]
+        binding = {
+            "owner_id": owner,
+            "task_id": "INIT-T001",
+            "resource_keys": keys,
+            "lease_snapshots": snapshots,
+            "resource_db": str(intake.resources.RESOURCE_DB),
+        }
+        binding["lease_binding_sha256"] = intake._sha256(
+            (json.dumps(binding, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+             + "\n").encode()
+        )
+        return {
+            "kind": "bureau_task_publication_receipt",
+            "status": "published",
+            "publication_mode": "state_store",
+            "coordination_state_root": str(state_root),
+            "proposal_sha256": "c" * 64,
+            "publishing_task_id": "INIT-T001",
+            "lease_binding": binding,
+            "lease_release": {
+                "released": True,
+                "owner_id": owner,
+                "resource_keys": keys,
+                "lease_binding_sha256": binding["lease_binding_sha256"],
+            },
+        }
+
+    def test_publish_state_store_projects_domain_release_without_second_release(self):
+        proposal_id = "7" * 64
+        directory = self._write_proposal(proposal_id)
+        state_root = self.root / "isolated-state"
+        state_root.mkdir()
+        keys = [f"path:{state_root}"]
+        owner = "bureau-publication:" + "c" * 24
+        now = intake.resources._now()
+        snapshot = {
+            "resource_key": keys[0], "owner_id": owner,
+            "acquired_at_unix": now, "updated_at_unix": now,
+            "expires_at_unix": now + 240,
+            "metadata_sha256": hashlib.sha256(b"{}").hexdigest(),
+        }
+        acquired = {"expires_at_unix": now + 240, "leases": [snapshot]}
+        preview = {
+            "kind": "bureau_task_publication_preview",
+            "status": "ready", "publication_mode": "state_store",
+            "coordination_state_root": str(state_root),
+            "required_resource_keys": keys,
+        }
+        inner_release = intake.resources.release_resources
+        db = self.root / "resources.sqlite3"
+        with (
+            mock.patch.object(intake.resources, "RESOURCE_DB", db),
+            mock.patch.object(
+                intake, "grabowski_bureau_task_publish_preview", return_value=preview
+            ),
+            mock.patch.object(intake.resources, "acquire_resources", return_value=acquired),
+            mock.patch.object(intake.resources, "release_resources") as release,
+            mock.patch.object(intake, "_invoke_bureau") as invoke,
+        ):
+            def seed(row):
+                with intake.resources._database() as connection:
+                    fields = {**row, "purpose": "test", "metadata_json": "{}"}
+                    connection.execute(
+                        "INSERT INTO leases (" + ",".join(fields) + ") VALUES ("
+                        + ",".join("?" for _ in fields) + ")",
+                        list(fields.values()),
+                    )
+
+            seed(snapshot)
+            receipt = self._domain_release_receipt(acquired, state_root)
+
+            def domain_publish(*args, **kwargs):
+                path = directory / "publication-receipt.json"
+                if not path.exists():
+                    inner_release(owner, keys, expected_leases=[snapshot])
+                    path.write_text(json.dumps(receipt))
+                return json.loads(path.read_text())
+
+            invoke.side_effect = domain_publish
+            result = intake.grabowski_bureau_task_publish(
+                proposal_id, registry_root=str(self.root)
+            )
+            self.assertTrue(result["leases_released"])
+            self.assertEqual(intake.resources.inspect_resources(keys), {})
+            replay = intake.grabowski_bureau_task_publish(
+                proposal_id, registry_root=str(self.root)
+            )
+            self.assertTrue(replay["leases_released"])
+            self.assertFalse(replay["leases_acquired"])
+            release.assert_not_called()
+
+            seed({**snapshot, "owner_id": "foreign-owner"})
+            blocked = intake.grabowski_bureau_task_publish(
+                proposal_id, registry_root=str(self.root)
+            )
+            self.assertFalse(blocked["leases_released"])
+            self.assertTrue(blocked["cleanup_incomplete"])
+            self.assertIn("resource_leases", blocked["required_readback"])
+            self.assertEqual(
+                intake.resources.inspect_resources(keys)[keys[0]]["owner_id"], "foreign-owner"
+            )
+            release.assert_not_called()
+
+
+    def test_state_store_domain_release_rejects_live_foreign_or_renewed_lease(self):
+        state_root = self.root / "state"
+        acquired = self._publication_acquired(state_root)
+        receipt = self._domain_release_receipt(acquired, state_root)
+        key = f"path:{state_root}"
+        for owner in ("foreign-owner", "bureau-publication:" + "c" * 24):
+            with self.subTest(owner=owner), mock.patch.object(
+                intake.resources, "inspect_resources", return_value={key: {"owner_id": owner}}
+            ):
+                with self.assertRaisesRegex(RuntimeError, "live-lease-present"):
+                    intake._state_store_release_verified(
+                        receipt, owner_id="bureau-publication:" + "c" * 24,
+                        proposal_sha256="c" * 64, publishing_task_id="INIT-T001",
+                        resource_keys=[key], acquired=acquired,
+                    )
+
+    def test_state_store_domain_release_rejects_missing_or_drifted_proof(self):
+        state_root = self.root / "state"
+        acquired = self._publication_acquired(state_root)
+        receipt = self._domain_release_receipt(acquired, state_root)
+        for field in ("lease_release", "lease_binding"):
+            with self.subTest(field=field), mock.patch.object(
+                intake.resources, "inspect_resources"
+            ) as inspect_resources:
+                bad = dict(receipt)
+                del bad[field]
+                with self.assertRaises(ValueError):
+                    intake._state_store_release_verified(
+                        bad, owner_id="bureau-publication:" + "c" * 24,
+                        proposal_sha256="c" * 64, publishing_task_id="INIT-T001",
+                        resource_keys=[f"path:{state_root}"], acquired=acquired,
+                    )
+                inspect_resources.assert_not_called()
+        drifted = self._publication_acquired(state_root)
+        drifted["leases"][0]["updated_at_unix"] += 1
+        with self.assertRaisesRegex(ValueError, "snapshot-drift"):
+            intake._state_store_release_verified(
+                receipt, owner_id="bureau-publication:" + "c" * 24,
+                proposal_sha256="c" * 64, publishing_task_id="INIT-T001",
+                resource_keys=[f"path:{state_root}"], acquired=drifted,
+            )
+
+    def test_state_store_failure_does_not_release_uncertain_or_unbound_leases(self):
+        state_root = str(self.root / "state")
+        acquired = self._publication_acquired(state_root)
+        keys = [f"path:{state_root}"]
+        preview = {
+            "kind": "bureau_task_publication_preview",
+            "status": "ready", "publication_mode": "state_store",
+            "coordination_state_root": state_root,
+            "required_resource_keys": keys,
+        }
+        cases = [
+            ("published", {"status": "published"}, False),
+            ("ambiguous", {"status": "failed", "ambiguity": True,
+                           "effect_started": True}, False),
+            ("post-effect", {"status": "failed", "effect_started": True}, False),
+            ("pre-effect", {"status": "failed", "effect_started": False}, True),
+        ]
+        for index, (name, payload, may_release) in enumerate(cases, 10):
+            with self.subTest(name=name):
+                proposal_id = f"{index:064x}"
+                self._write_proposal(proposal_id)
+                with (
+                    mock.patch.object(
+                        intake, "grabowski_bureau_task_publish_preview", return_value=preview
+                    ),
+                    mock.patch.object(
+                        intake.resources, "acquire_resources", return_value=acquired
+                    ),
+                    mock.patch.object(
+                        intake.resources, "release_resources",
+                        return_value={"released": acquired["leases"]},
+                    ) as release,
+                    mock.patch.object(intake, "_invoke_bureau", return_value=payload),
+                ):
+                    result = intake.grabowski_bureau_task_publish(
+                        proposal_id, registry_root=str(self.root)
+                    )
+                self.assertEqual(result["leases_released"], may_release)
+                if may_release:
+                    release.assert_called_once_with(
+                        "bureau-publication:" + "c" * 24, keys,
+                        expected_leases=acquired["leases"],
+                    )
+                else:
+                    release.assert_not_called()
+                    self.assertTrue(result["cleanup_incomplete"])
+                    self.assertIn("resource_leases", result["required_readback"])
 
     def test_publish_state_store_accepts_legacy_revision_lease_metadata(
         self,
@@ -2156,29 +2355,17 @@ class BureauIntakeAdapterTests(unittest.TestCase):
             },
         }
 
+        acquired = self._publication_acquired(state_root)
+
         def invoke(arguments, **_kwargs):
             receipt = Path(arguments[arguments.index("--receipt") + 1])
-            receipt.write_text(
-                json.dumps(
-                    {
-                        "kind": "bureau_task_publication_receipt",
-                        "status": "published",
-                        "publication_mode": "state_store",
-                        "coordination_state_root": state_root,
-                    }
-                )
-                + "\n"
-            )
-            return {
-                "kind": "bureau_task_publication_receipt",
-                "status": "published",
-                "publication_mode": "state_store",
-                "coordination_state_root": state_root,
-            }
+            published = self._domain_release_receipt(acquired, state_root)
+            receipt.write_text(json.dumps(published))
+            return published
 
-        acquired = {"expires_at_unix": 200, "bureau_contract": {}}
-        released = {"released": [{"resource_key": key} for key in keys]}
+        released = {"released": []}
         with (
+            mock.patch.object(intake.resources, "inspect_resources", return_value={}),
             mock.patch.object(
                 intake, "grabowski_bureau_task_publish_preview", return_value=preview
             ),
