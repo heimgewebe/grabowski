@@ -1567,6 +1567,90 @@ class WorktreeEnsureTests(unittest.TestCase):
         self.assertEqual(recovered["lifecycle"]["terminal_decision"], "retain")
         self.assertGreater(recovered["lifecycle"]["expires_at_unix"], int(time.time()))
 
+    def _removed_verified_creation(self):
+        target = self.worktree_root / "removed-verified"
+        parameters = self._parameters(key="removed-proof", branch="topic-removed-proof", target=target)
+        with patch.object(
+            worktree_ensure, "_bind_checkout_lifecycle",
+            side_effect=checkouts.resources.ResourceSchemaInventoryChanged("fixture post-create"),
+        ):
+            with self.assertRaises(checkouts.resources.ResourceSchemaInventoryChanged):
+                self._ensure(parameters)
+        path = next(self.receipt_root.glob("*.json"))
+        before = json.loads(path.read_text())
+        self._git(self.repo, "worktree", "remove", str(target))
+        self._git(self.repo, "branch", "-D", "topic-removed-proof")
+        return parameters, path, before
+
+    def _assert_absent_reservation(self, before, *, released):
+        binding = before["verified_post_create"]["reserved_lifecycle"]
+        with closing(checkouts._database()) as db:
+            identity = db.execute(
+                "SELECT state FROM checkout_identity_reservations WHERE intent_key=?",
+                (binding["identity_reservation"]["intent_key"],),
+            ).fetchone()
+            lifecycle = db.execute(
+                "SELECT phase FROM lifecycle_bindings WHERE checkout_key=?",
+                (binding["checkout_key"],),
+            ).fetchone()
+        self.assertEqual(identity[0], "aborted" if released else "reserved")
+        if released:
+            self.assertIsNone(lifecycle)
+        else:
+            self.assertEqual(lifecycle[0], "active")
+
+    def test_absent_verified_creation_releases_exact_initial_reservation(self):
+        parameters, path, before = self._removed_verified_creation()
+        def no_create(repo, argv):
+            self.assertNotEqual(argv[:2], ["worktree", "add"])
+            return grips._default_command_runner(repo, argv)
+        with patch.dict(os.environ, {"GRABOWSKI_WORKTREE_ENSURE_RECEIPT_ROOT": str(self.receipt_root)}):
+            result = worktree_ensure.ensure_worktree(
+                parameters, no_create, self._lease, recover_existing_only=True,
+            )
+        self.assertEqual(result["error_class"], "VERIFIED_CREATE_ABSENT")
+        self.assertEqual(result["result_state"], "CONFLICT")
+        self.assertTrue(result["lifecycle_reservation"]["released"])
+        self.assertEqual(json.loads(path.read_text())["verified_post_create"], before["verified_post_create"])
+        self._assert_absent_reservation(before, released=True)
+        self.assertEqual(self._ensure(parameters, runner=no_create)["durable_receipt_sha256"],
+                         result["durable_receipt_sha256"])
+
+    def test_absent_verified_creation_replays_after_abort_before_receipt(self):
+        parameters, path, before = self._removed_verified_creation()
+        original_write = worktree_ensure._write_receipt
+        def lose_receipt(receipt_path, record):
+            if record.get("error_class") == "VERIFIED_CREATE_ABSENT":
+                raise SystemExit("fixture crash after committed abort")
+            return original_write(receipt_path, record)
+        with patch.object(worktree_ensure, "_write_receipt", side_effect=lose_receipt):
+            with self.assertRaises(SystemExit):
+                self._ensure(parameters)
+        self.assertEqual(json.loads(path.read_text())["receipt_sha256"], before["receipt_sha256"])
+        self._assert_absent_reservation(before, released=True)
+        result = self._ensure(parameters)
+        self.assertEqual(result["error_class"], "VERIFIED_CREATE_ABSENT")
+        self._assert_absent_reservation(before, released=True)
+
+    def test_absent_verified_creation_does_not_release_drifted_binding(self):
+        parameters, path, before = self._removed_verified_creation()
+        binding = before["verified_post_create"]["reserved_lifecycle"]
+        with closing(checkouts._database()) as db, db:
+            db.execute("UPDATE lifecycle_bindings SET purpose=? WHERE checkout_key=?",
+                       ("changed fixture", binding["checkout_key"]))
+        with self.assertRaisesRegex(RuntimeError, "reservation changed"):
+            self._ensure(parameters)
+        self.assertEqual(json.loads(path.read_text())["receipt_sha256"], before["receipt_sha256"])
+        self._assert_absent_reservation(before, released=False)
+        self.assertEqual(checkouts._strict_lifecycle_binding(binding["checkout_key"])["purpose"], "changed fixture")
+
+    def test_absent_verified_creation_requires_live_lease(self):
+        parameters, path, before = self._removed_verified_creation()
+        with self.assertRaises(worktree_ensure.WorktreeEnsureAction):
+            self._ensure(parameters, inspect_lease=lambda key: None)
+        self.assertEqual(json.loads(path.read_text())["receipt_sha256"], before["receipt_sha256"])
+        self._assert_absent_reservation(before, released=False)
+
     def test_replay_detects_post_state_drift(self) -> None:
         parameters = self._parameters(key="drift")
         created = self._ensure(parameters)

@@ -1668,6 +1668,46 @@ def ensure_worktree(
             lease = _lease_state(inputs, inspect_lease)
             verified_create = existing.get("verified_post_create")
             reserved_lifecycle = None
+            if (
+                isinstance(verified_create, dict)
+                and isinstance(verified_create.get("reserved_lifecycle"), dict)
+                and isinstance(verified_create.get("physical_checkout"), dict)
+                and observation["classification"] == "ABSENT"
+                and lease["valid"]
+            ):
+                import grabowski_checkouts as checkouts
+
+                binding = verified_create["reserved_lifecycle"]
+                reservation = binding.get("identity_reservation")
+                if not isinstance(reservation, dict):
+                    raise WorktreeEnsureAction("verified creation lacks its identity reservation")
+                # Serialize with the existing Git creation path and recheck absence
+                # and authority. No Git creation or deletion is authorized here.
+                with checkouts._operation_lock():
+                    observation = _observe_after_possible_effect(
+                        inputs, runner, phase="absent verified creation reconciliation"
+                    )
+                    lease = _lease_state(inputs, inspect_lease)
+                    if observation["classification"] != "ABSENT" or not lease["valid"]:
+                        raise WorktreeEnsureAction("absent creation observation or lease changed")
+                    error = "verified creation no longer exists; exact initial reservation aborted"
+                    transition = checkout_identity.abort(
+                        reservation, reason=error, absent_lifecycle=binding,
+                    )
+                record = _durable_record(
+                    inputs=inputs, parameters_sha256=parameters_sha256,
+                    state="complete", result_state="CONFLICT", post_state=observation,
+                    error_class="VERIFIED_CREATE_ABSENT", error=error,
+                    friction=recovery_friction, created_at_unix=existing.get("created_at_unix"),
+                )
+                record["lease"] = lease
+                record["verified_post_create"] = verified_create
+                record["lifecycle_reservation"] = {
+                    "preserved": False, "released": True, "binding": None,
+                    "identity_transition": transition,
+                }
+                written = _write_receipt(receipt_path, record)
+                return _public_output(written, receipt_path, replayed=True, recovered=False)
             if recover_existing_only and (
                 observation["classification"] != "ALREADY_CORRECT" or not lease["valid"]
             ):
@@ -1979,6 +2019,8 @@ def ensure_worktree(
             return _public_output(written, receipt_path, replayed=recovering_intent, recovered=False)
 
         lease = pre_mutation_lease
+        if recover_existing_only:
+            raise WorktreeEnsureAction("existing-only recovery cannot create a worktree")
         try:
             lifecycle_reservation = _reserve_input_lifecycle(inputs)
         except (PermissionError, RuntimeError, ValueError) as exc:
