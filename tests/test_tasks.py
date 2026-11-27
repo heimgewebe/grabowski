@@ -16067,6 +16067,152 @@ class TaskTests(unittest.TestCase):
             binding["source_operation_identity_sha256"],
         )
 
+    def test_operation_retry_server_binds_exact_terminal_receipt(self) -> None:
+        identity = self._operation_identity_fixture()
+        common = dict(
+            host="local", argv=["/bin/false"], cwd=str(self.root),
+            runtime_seconds=60, resume_policy="manual", operation_identity=identity,
+        )
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()) as dispatch,
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(tasks, "_require_recovery_gate", return_value={"checked_at_unix": 123}),
+        ):
+            first = tasks.grabowski_task_start(**common)
+            source_id = first["task"]["task_id"]
+            failed = tasks._set_state(
+                source_id, "failed",
+                observation={"state": "failed", "observed_at_unix": tasks._now()},
+            )
+            receipt = failed["lifecycle_receipt_sha256"]
+            retry = {**common, "argv": ["/bin/true"],
+                     "supersedes_task_id": source_id, "force_new_reason": "test input corrected"}
+            with self.assertRaisesRegex(ValueError, "supersedes_task_id is stale"):
+                tasks.grabowski_task_start(**{**retry, "supersedes_task_id": "f" * 24})
+            self.assertEqual(1, dispatch.call_count)
+            retried = tasks.grabowski_task_start(**retry)
+            self.assertEqual(2, dispatch.call_count)
+            binding = retried["operation_retry_binding"]
+            self.assertEqual(source_id, binding["source_task_id"])
+            self.assertEqual(receipt, binding["source_lifecycle_receipt_sha256"])
+            self.assertEqual(first["operation_identity"], retried["operation_identity"])
+            successor_id = retried["task"]["task_id"]
+            tasks._set_state(successor_id, "failed", observation={
+                "state": "failed", "observed_at_unix": tasks._now(),
+            })
+            with self.assertRaisesRegex(ValueError, "supersedes_task_id is stale"):
+                tasks.grabowski_task_start(**retry)
+            self.assertEqual(2, dispatch.call_count)
+
+    def test_named_retry_preserves_operation_identity_and_reuses_successor(self) -> None:
+        common = dict(
+            host="local", argv=["/bin/false"], cwd=str(self.root),
+            runtime_seconds=60, resume_policy="manual",
+            operation_identity=self._operation_identity_fixture(),
+        )
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()) as dispatch,
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(tasks, "_require_recovery_gate", return_value={"checked_at_unix": 123}),
+        ):
+            first = tasks.grabowski_task_start(**common)
+            source_id = first["task"]["task_id"]
+            failed = tasks._set_state(source_id, "failed", observation={
+                "state": "failed", "observed_at_unix": tasks._now(),
+            })
+            resumed = tasks.reconcile_tasks_resume(
+                task_id=source_id, max_resumes=1, reason="test precondition corrected",
+            )
+            self.assertEqual([], resumed["blocked"])
+            successor_id = resumed["resumed"][0]["task_id"]
+            successor = tasks._row_raw(successor_id)
+            self.assertEqual(first["operation_identity"],
+                             tasks._persisted_task_operation_identity(successor))
+            launcher = json.loads(successor["launcher_json"])
+            self.assertEqual(source_id, launcher["retry_binding"]["source_task_id"])
+            self.assertEqual(source_id, launcher["operation_retry_binding"]["source_task_id"])
+            self.assertEqual(failed["lifecycle_receipt_sha256"],
+                             launcher["operation_retry_binding"]["source_lifecycle_receipt_sha256"])
+            tasks._set_state(successor_id, "completed", observation={
+                "state": "completed", "observed_at_unix": tasks._now(),
+            })
+            reused = tasks.grabowski_task_start(**common)
+            self.assertEqual(successor_id, reused["task"]["task_id"])
+            self.assertTrue(reused["deduplicated_reuse"]["reused"])
+            self.assertEqual(2, dispatch.call_count)
+
+    def test_operation_retry_rejects_legacy_unbound_named_successor(self) -> None:
+        common = dict(
+            host="local", argv=["/bin/false"], cwd=str(self.root),
+            runtime_seconds=60, resume_policy="manual",
+            operation_identity=self._operation_identity_fixture(),
+        )
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()) as dispatch,
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(tasks, "_require_recovery_gate", return_value={"checked_at_unix": 123}),
+        ):
+            first = tasks.grabowski_task_start(**common)
+            source_id = first["task"]["task_id"]
+            failed = tasks._set_state(source_id, "failed", observation={
+                "state": "failed", "observed_at_unix": tasks._now(),
+            })
+            # Reproduce the old server's named retry: retained linkage, but no
+            # operation identity on the successor.
+            legacy = tasks.grabowski_task_start(
+                **{**common, "operation_identity": None},
+                _retry_context=tasks._build_terminal_retry_context(
+                    tasks._row_raw(source_id), reason="test precondition corrected",
+                ),
+            )
+            successor_id = legacy["task"]["task_id"]
+            tasks._set_state(successor_id, "completed", observation={
+                "state": "completed", "observed_at_unix": tasks._now(),
+            })
+            for receipt in ("", failed["lifecycle_receipt_sha256"]):
+                with self.subTest(receipt=receipt), self.assertRaisesRegex(
+                    RuntimeError, f"retained successor; reconcile task {successor_id}",
+                ):
+                    tasks.grabowski_task_start(
+                        **common, supersedes_task_id=source_id,
+                        supersedes_receipt_sha256=receipt,
+                        force_new_reason="test precondition corrected",
+                    )
+            self.assertEqual(2, dispatch.call_count)
+
+    def test_operation_retry_server_receipt_requires_terminal_policy_and_evidence(self) -> None:
+        import grabowski_task_attention as task_attention
+
+        normalized = tasks._normalize_task_operation_identity(
+            self._operation_identity_fixture(), cwd=str(self.root),
+        )
+        record = {"task_id": "a" * 24, "state": "failed", "resume_policy": "manual",
+                  "lifecycle_receipt_sha256": "b" * 64}
+        for changes, convergence, closeout, lease_count, expected in (
+            ({"state": "outcome_unknown"}, (True, True), True, 0, "terminal failure"),
+            ({"resume_policy": "never"}, (True, True), True, 0, "resume policy"),
+            ({}, (False, True), True, 0, "terminal and lease evidence"),
+            ({}, (True, False), True, 0, "terminal and lease evidence"),
+            ({}, (True, True), False, 0, "lifecycle receipt"),
+            ({}, (True, True), True, 1, "live predecessor leases"),
+        ):
+            with (
+                self.subTest(changes=changes, convergence=convergence, closeout=closeout, lease_count=lease_count),
+                patch.object(tasks, "_latest_task_for_operation_identity", return_value={**record, **changes}),
+                patch.object(tasks, "_terminal_convergence_evidence", return_value=convergence),
+                patch.object(task_attention, "terminal_closeout_plan",
+                             return_value={"lifecycle_evidence_valid": closeout, "outcome_receipt_sha256": "b" * 64}),
+                patch.object(tasks.resources, "count_resources", return_value=lease_count),
+            ):
+                with self.assertRaisesRegex(RuntimeError, expected):
+                    tasks._resolve_task_operation_identity(
+                        normalized, supersedes_task_id=record["task_id"],
+                        supersedes_receipt_sha256="", force_new_reason="test input corrected",
+                    )
+
     def _runtime_refresh_prelaunch_fixture(
         self, resource_keys: list[str] | None = None
     ) -> dict[str, object]:
