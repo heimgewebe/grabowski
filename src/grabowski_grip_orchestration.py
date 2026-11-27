@@ -1695,9 +1695,8 @@ def validate_run_receipt(value: Any, *, plan_value: Any) -> dict[str, Any]:
     return run
 
 
-def _verified_saga_run_receipt_reference(
-    plan: dict[str, Any], audit_ref: dict[str, Any]
-) -> dict[str, Any]:
+def _verified_saga_run_record(audit_ref: Any) -> dict[str, Any]:
+    audit_ref = validate_saga_run_receipt_ref(audit_ref)
     try:
         import grabowski_audit_query
 
@@ -1724,10 +1723,18 @@ def _verified_saga_run_receipt_reference(
         or record.get("operation") != SAGA_RUN_AUDIT_OPERATION
     ):
         raise SagaError("verified Saga run audit record contract is invalid")
+    return record
+
+
+def _validate_saga_run_record(
+    record: dict[str, Any], plan: dict[str, Any]
+) -> dict[str, Any]:
     if record.get("plan_sha256") != plan["plan_sha256"]:
         raise SagaError("verified Saga run audit record is bound to another saga plan")
     if record.get("saga_kind") != plan["saga_kind"]:
         raise SagaError("verified Saga run audit record saga kind drifted")
+    if "plan" in record and validate_plan(record["plan"]) != plan:
+        raise SagaError("verified Saga run audit stored plan drifted")
     run_value = _bounded_mapping(
         record.get("run_receipt"), "verified Saga run audit.run_receipt"
     )
@@ -1737,6 +1744,25 @@ def _verified_saga_run_receipt_reference(
     if record.get("run_sha256") != run["run_sha256"]:
         raise SagaError("verified Saga run audit run digest mismatch")
     return run
+
+
+def _verified_saga_run_receipt_reference(
+    plan: dict[str, Any], audit_ref: dict[str, Any]
+) -> dict[str, Any]:
+    return _validate_saga_run_record(_verified_saga_run_record(audit_ref), plan)
+
+
+def recover_saga_run(audit_ref: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Resolve the exact plan and run from one verified, immutable audit record.
+
+    Older records deliberately require the original explicit plan parameters.
+    Neither a guessed plan nor caller-supplied receipt data is recovery evidence.
+    """
+    record = _verified_saga_run_record(audit_ref)
+    if "plan" not in record:
+        raise SagaError("legacy Saga run audit lacks the plan; supply original plan parameters")
+    plan = validate_plan(record["plan"])
+    return plan, _validate_saga_run_record(record, plan)
 
 
 def _captain_outcome(
