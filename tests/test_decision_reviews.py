@@ -1478,6 +1478,51 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
         self.assertEqual(settled["slots"][0]["independent_pass_count"], 1)
         self.assertEqual(settled["slots"][0]["infrastructure_error_count"], 1)
 
+    def test_v2_429_usage_limit_reached_with_zero_safety_stops(self) -> None:
+        # Exact new envelope fields and counters observed on 2026-11-27
+        # (issue #1857); anonymized UUIDs, no provider call or model work.
+        with tempfile.TemporaryDirectory() as temporary:
+            jobs = Path(temporary) / "jobs"
+            jobs.mkdir(mode=0o700)
+            failed = make_job(
+                jobs, suffix="a88888888888", slot="independent-claude",
+                terminal_status="failed", review_result=None,
+                review_role=True, attempt_bound=True, attempt_epoch=2,
+            )
+            stamp_claude_quota_429(failed, envelope_updates={
+                "api_error": "usage_limit_reached",
+                "safety_stops": 0,
+                "result": "You've hit your session limit · resets 9:20pm (UTC)",
+                "duration_ms": 454,
+                "num_turns": 1,
+                "stop_reason": "stop_sequence",
+                "session_id": "00000000-0000-4000-8000-000000000001",
+                "uuid": "00000000-0000-4000-8000-000000000002",
+                "fast_mode_state": "off",
+                "fast_mode_disabled_reason": "sdk_opt_in_required",
+                "subtype": "success",
+                "queued_turn_count": 0,
+                "result_index": 0,
+            })
+            before = (failed / reviews.REVIEW_ROLE_ATTEMPT_RECEIPT_NAME).read_bytes()
+            prior = self.reconcile(jobs)
+            self.assertEqual(prior["status"], "blocked")
+            self.assertEqual(prior["attempts"][0]["classification"], "infrastructure_error")
+            self.assertTrue(prior["attempts"][0]["pre_result_quota_failure_verified"])
+            self.assertEqual(prior["slots"][0]["independent_pass_count"], 0)
+            make_job(
+                jobs, suffix="b99999999999", slot="independent-claude",
+                terminal_status="succeeded", review_result=None,
+                review_role=True, attempt_bound=True, attempt_epoch=2,
+                created_at_unix=1_787_000_200,
+            )
+            settled = self.reconcile(jobs)
+            self.assertEqual(before, (failed / reviews.REVIEW_ROLE_ATTEMPT_RECEIPT_NAME).read_bytes())
+        self.assertEqual(settled["status"], "settled")
+        self.assertEqual(settled["errors"], [])
+        self.assertEqual(settled["slots"][0]["independent_pass_count"], 1)
+        self.assertEqual(settled["slots"][0]["infrastructure_error_count"], 1)
+
     def test_v2_429_generic_pass_cannot_supersede_independent_claude(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             jobs = Path(temporary) / "jobs"
@@ -1521,6 +1566,23 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
     def test_v2_429_near_misses_remain_blocking_even_after_valid_pass(self) -> None:
         cases = [
             ("http_401", {"api_error_status": 401}, {}),
+            ("new_error_unknown", {"api_error": "rate_limit", "safety_stops": 0}, {}),
+            ("new_error_null", {"api_error": None, "safety_stops": 0}, {}),
+            ("new_error_semantic", {"api_error": "REJECT_THIS_REVISION", "safety_stops": 0}, {}),
+            ("new_safety_stop", {"api_error": "usage_limit_reached", "safety_stops": 1}, {}),
+            ("new_safety_bool", {"api_error": "usage_limit_reached", "safety_stops": False}, {}),
+            ("new_safety_float", {"api_error": "usage_limit_reached", "safety_stops": 0.0}, {}),
+            ("new_safety_null", {"api_error": "usage_limit_reached", "safety_stops": None}, {}),
+            ("new_unknown_field", {
+                "api_error": "usage_limit_reached", "safety_stops": 0, "future": 0,
+            }, {}),
+            ("new_semantic_result", {
+                "api_error": "usage_limit_reached", "safety_stops": 0,
+                "structured_output": {"verdict": "NEEDS_CHANGE", "findings": [{}]},
+            }, {}),
+            ("new_error_hash_tamper", {
+                "api_error": "usage_limit_reached", "safety_stops": 0,
+            }, {"stdout_sha256": "f" * 64}),
             ("nonzero_output", {"usage": {
                 "input_tokens": 0, "output_tokens": 1,
                 "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
