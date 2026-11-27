@@ -1521,7 +1521,7 @@
     },
     {
       "category": "task",
-      "description": "Start one persistent local or fleet task in its own systemd unit.\n\nDirect local write-capable agent CLIs receive an implicit repository lease\nunless the caller supplies an explicit path or repository scope. Every\ntask-owned broad repository lease carries a complete whole-repository scope manifest.\n\nFor short effect-free direct reads, prefer an existing typed read surface.\nThe first server-verified advisory cohort is guarded local Git reads routed\nto grabowski_git. Other direct commands stay on persistent tasks unless a\nserver-owned read classifier proves their effect boundary. Durable lifecycle,\nresume, leases, shell/indirect execution, larger output, and long runtime\ncontinue to require persistent tasks. Caller-supplied effect_profile=read_only\nalone never establishes read safety.",
+      "description": "Start one persistent local or fleet task in its own systemd unit.\n\nDirect local write-capable agent CLIs receive an implicit repository lease\nunless the caller supplies an explicit path or repository scope. Every\ntask-owned broad repository lease carries a complete whole-repository scope manifest.\n\nFor short effect-free direct reads, prefer an existing typed read surface.\nThe first server-verified advisory cohort is guarded local Git reads routed\nto grabowski_git. Other direct commands stay on persistent tasks unless a\nserver-owned read classifier proves their effect boundary. Durable lifecycle,\nresume, leases, shell/indirect execution, larger output, and long runtime\ncontinue to require persistent tasks. Caller-supplied effect_profile=read_only\nalone never establishes read safety.\n\nUse view=\"compact\" for routine launch decisions. It preserves all admission,\nidentity and lifecycle evidence but omits repeated task/launcher arguments.\nThe legacy full view is unchanged; retrieve full diagnostics via task_status.",
       "effects": [
         "process-start",
         "state-create",
@@ -1550,7 +1550,7 @@
     },
     {
       "category": "task",
-      "description": "Observe and persist one task state; lease maintenance may mutate resources.",
+      "description": "Observe and persist one task state; lease maintenance may mutate resources.\n\nUse view=\"compact\" for routine status, exit, lease and closeout decisions.\nIt omits only repeated task/launcher arguments, retaining hashes and\ndiagnostics. The full view preserves the legacy response unchanged.",
       "effects": [
         "lease-reacquire",
         "lease-renew",
@@ -3932,7 +3932,7 @@
       "src/grabowski_systemkatalog.py": "3740e9245ed599123bec5a96381a102bdd77f800346be71bd956bd02f9bdbc98",
       "src/grabowski_task_attention.py": "a16d4b045bef23bf78ad3df0c4c58d91a304dc9a83b6e757fb1b0f88754ad6f3",
       "src/grabowski_task_reconcile.py": "64dc6195c9d0cb3435d192e4715a0d4d5679b9f1904057308366f4e2f2e9bbea",
-      "src/grabowski_tasks.py": "dbf2cd3744aee06f47341ac5366370ff29aa7443b4c3d04fc6362585963bfc57",
+      "src/grabowski_tasks.py": "c9ad9f57072eafeca188dac9134ee0c44b8beb675e5ebb9dad7f36091ccaa472",
       "src/grabowski_terminal_convergence.py": "8f172a65b2af1dbca3d5b226a18e82df3ca5229ca5f4ae8b2ab1792506c69195",
       "src/grabowski_text_artifact_reconcile.py": "b302be1dbb101abbf825732bfe41658c13ac64417c2a6034326e57409daa4772",
       "src/grabowski_transport_assertion.py": "20d75d1f94c1d0273108c36eed8c58aa85e55a30b73546c4ac8af8a835fb8c8e",
