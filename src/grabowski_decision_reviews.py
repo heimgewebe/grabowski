@@ -1832,9 +1832,21 @@ def _proven_claude_pre_result_failure_before_review(
     except ValueError:
         return False
     permitted_fields = _CLAUDE_QUOTA_ENVELOPE_FIELDS | (
-        frozenset({"api_error_origin", "safety_stops"}) if auth_401 else frozenset()
+        frozenset({"api_error_origin", "safety_stops"}) if auth_401
+        else frozenset({"api_error", "safety_stops"})
     )
     if not isinstance(envelope, dict) or set(envelope) - permitted_fields:
+        return False
+    # The observed 429 envelope can include the explicit quota error and
+    # zero safety stops. Neither field may conceal semantic output or work.
+    # Preserve the distinct, already strict 401 contract below.
+    if not auth_401 and (
+        ("api_error" in envelope and envelope["api_error"] != "usage_limit_reached")
+        or (
+            "safety_stops" in envelope
+            and (type(envelope["safety_stops"]) is not int or envelope["safety_stops"] != 0)
+        )
+    ):
         return False
     # The actual 429 result has one CLI wrapper turn, not one model turn.
     # An unexpected count, tool trace or provider state is not pre-result proof.
