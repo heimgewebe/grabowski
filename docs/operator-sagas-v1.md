@@ -43,8 +43,10 @@ run receipt. For read-only settlement, supply only `run_receipt` (the
 `VerifiedSagaRunReceiptRef.v1`) and `captain_result` (the existing verified
 Captain completion reference). The server resolves and checks the plan and run
 against the same verified immutable audit record, then performs the existing
-Captain validation and typed live readback. No Prepare or Captain effect is
-replayed. Old records without a stored plan require all four original plan
+Captain validation and typed live readback. Both reference forms use one
+fresh server-captured verified audit snapshot per settlement invocation;
+the snapshot is not a public parameter or a cross-call cache. No Prepare
+or Captain effect is replayed. Old records without a stored plan require all four original plan
 parameters; partial or guessed legacy inputs are rejected.
 
 The Captain-result recovery path accepts only `VerifiedCaptainAuditResultRef.v1` pointing at an exact verified completion record. Resolution scans the verified immutable audit segments backward and may cheaply skip segments that cannot contain the requested record; it is not limited to the newest 100,000 records. The referenced completion and its paired intent must still satisfy the exact Saga binding, otherwise settlement fails closed and gains no retry authority.
