@@ -9084,11 +9084,38 @@ def _resolve_task_operation_identity(
             "retry_binding": None,
         }
     if str(latest["state"]) in TASK_STATE_PROJECTIONS["attention"]:
-        if not all(retry_fields):
+        if not supersedes_task_id or not force_new_reason:
             raise RuntimeError(
-                "operation identity has an attention predecessor; bind "
-                "supersedes_task_id, predecessor receipt and force-new reason"
+                "operation identity has an attention predecessor; explicitly retry "
+                f"task {latest['task_id']} with supersedes_task_id and force_new_reason; "
+                "a verified terminal receipt can be bound by the server"
             )
+        if supersedes_task_id != str(latest["task_id"]):
+            raise ValueError("operation retry supersedes_task_id is stale")
+        if not supersedes_receipt_sha256:
+            # task_start holds the existing task-mutation lock. Only an exact
+            # named predecessor may opt into server-owned receipt binding;
+            # never select a new failed successor on replay of an old request.
+            if str(latest["state"]) not in {"failed", "timed_out", "signalled"}:
+                raise RuntimeError("server-bound operation retry requires a terminal failure")
+            if latest["resume_policy"] not in {"manual", "verify-then-retry", "retry-safe"}:
+                raise RuntimeError("server-bound operation retry is denied by predecessor resume policy")
+            if _terminal_convergence_evidence(latest) != (True, True):
+                raise RuntimeError("server-bound operation retry requires valid terminal and lease evidence")
+            from grabowski_task_attention import terminal_closeout_plan
+
+            closeout = terminal_closeout_plan(latest)
+            receipt = latest.get("lifecycle_receipt_sha256")
+            if (
+                closeout.get("lifecycle_evidence_valid") is not True
+                or closeout.get("outcome_receipt_sha256") != receipt
+                or not isinstance(receipt, str)
+                or SHA256.fullmatch(receipt) is None
+            ):
+                raise RuntimeError("server-bound operation retry lifecycle receipt is missing or invalid")
+            if resources.count_resources(owner_id=f"task:{supersedes_task_id}", include_expired=False) != 0:
+                raise RuntimeError("server-bound operation retry has live predecessor leases")
+            supersedes_receipt_sha256 = receipt
         return {
             "reuse": None,
             "reuse_reason": None,
@@ -9714,14 +9741,17 @@ def grabowski_task_start(
         if candidate_admission.get("applicable") is True:
             coding_agent_pre_dispatch_admission = candidate_admission
 
-    retry_binding = (
-        None
-        if operation_retry_binding is not None
-        else _guard_unchanged_terminal_retry(
-            execution_identity,
-            _retry_context,
+    if operation_retry_binding is not None and _retry_context is None:
+        # Legacy named retries may have a retained successor without an
+        # operation identity. An explicit operation retry must not duplicate it.
+        _guard_linked_retry_successor(
+            None, source_task_id=operation_retry_binding["source_task_id"],
         )
-    )
+        retry_binding = None
+    else:
+        retry_binding = _guard_unchanged_terminal_retry(
+            execution_identity, _retry_context,
+        )
     routing_shadow_capture: dict[str, Any] | None = None
     if normalized_route_evidence is not None:
         import grabowski_operator_routing_shadow_capture as routing_shadow
@@ -11632,6 +11662,20 @@ def _terminal_retry_successor(
         else {}
     )
     retry_context = _build_terminal_retry_context(record, reason=reason)
+    operation_identity = _persisted_task_operation_identity(record)
+    operation_retry: dict[str, Any] = {}
+    if operation_identity is not None:
+        # Retrying the same named operation preserves its existing identity,
+        # not a newly inferred fingerprint. Keep both canonical retry guards.
+        operation_retry = {
+            "operation_identity": {
+                key: operation_identity[key]
+                for key in ("repository_head", "source_fingerprint_sha256", "purpose", "scope_sha256")
+            },
+            "supersedes_task_id": str(record["task_id"]),
+            "supersedes_receipt_sha256": retry_context["source_lifecycle_receipt_sha256"],
+            "force_new_reason": retry_context["named_state_change"],
+        }
     started = grabowski_task_start(
         str(record["host"]),
         _terminal_retry_command(record),
@@ -11658,6 +11702,7 @@ def _terminal_retry_successor(
             )
         ),
         _retry_context=retry_context,
+        **operation_retry,
     )
     task = dict(started["task"])
     task["retry_of_task_id"] = record["task_id"]
@@ -14140,6 +14185,43 @@ def grabowski_task_list(
     raise AssertionError("bounded task-list snapshot retry ended unexpectedly")
 
 
+TaskConsumerView = Literal["full", "compact"]
+
+
+def _validate_task_consumer_view(view: TaskConsumerView) -> None:
+    if view not in ("full", "compact"):
+        raise ValueError("task consumer view must be full or compact")
+
+
+def _task_consumer_projection(
+    result: dict[str, Any], view: TaskConsumerView,
+) -> dict[str, Any]:
+    """Omit only repeated argument representations from a consumer response."""
+    _validate_task_consumer_view(view)
+    if view == "full":
+        return result
+    projected = dict(result)
+    omitted: list[str] = []
+    if "argv" in projected:
+        del projected["argv"]
+        omitted.append("argv")
+    launcher = projected.get("launcher")
+    if isinstance(launcher, dict):
+        projected_launcher = dict(launcher)
+        for key in ("argv", "command"):
+            if key in projected_launcher:
+                del projected_launcher[key]
+                omitted.append(f"launcher.{key}")
+        projected["launcher"] = projected_launcher
+    projected["projection"] = {
+        "view": "compact",
+        "omitted_fields": omitted,
+        "detail_tool": "grabowski_task_status",
+        "detail_view": "full",
+    }
+    return projected
+
+
 @mcp.tool(name="grabowski_task_start", annotations=MUTATING)
 async def _grabowski_task_start_tool(
     host: str,
@@ -14164,6 +14246,7 @@ async def _grabowski_task_start_tool(
     supersedes_receipt_sha256: str = "",
     force_new_reason: str = "",
     effect_profile: str | None = None,
+    view: TaskConsumerView = "full",
 ) -> dict[str, Any]:
     """Start one persistent local or fleet task in its own systemd unit.
 
@@ -14178,9 +14261,14 @@ async def _grabowski_task_start_tool(
     resume, leases, shell/indirect execution, larger output, and long runtime
     continue to require persistent tasks. Caller-supplied effect_profile=read_only
     alone never establishes read safety.
+
+    Use view="compact" for routine launch decisions. It preserves all admission,
+    identity and lifecycle evidence but omits repeated task/launcher arguments.
+    The legacy full view is unchanged; retrieve full diagnostics via task_status.
     """
+    _validate_task_consumer_view(view)
     operator._require_operator_capability("durable_job")
-    return await asyncio.to_thread(
+    result = await asyncio.to_thread(
         grabowski_task_start,
         host,
         argv,
@@ -14205,13 +14293,25 @@ async def _grabowski_task_start_tool(
         force_new_reason,
         effect_profile,
     )
+    if view == "compact" and isinstance(result.get("task"), dict):
+        return {**result, "task": _task_consumer_projection(result["task"], view)}
+    return result
 
 
 @mcp.tool(name="grabowski_task_status", annotations=MUTATING)
-async def _grabowski_task_status_tool(task_id: str) -> dict[str, Any]:
-    """Observe and persist one task state; lease maintenance may mutate resources."""
+async def _grabowski_task_status_tool(
+    task_id: str, view: TaskConsumerView = "full",
+) -> dict[str, Any]:
+    """Observe and persist one task state; lease maintenance may mutate resources.
+
+    Use view="compact" for routine status, exit, lease and closeout decisions.
+    It omits only repeated task/launcher arguments, retaining hashes and
+    diagnostics. The full view preserves the legacy response unchanged.
+    """
+    _validate_task_consumer_view(view)
     operator._require_operator_mutation("durable_job", task_id=task_id)
-    return await asyncio.to_thread(grabowski_task_status, task_id)
+    result = await asyncio.to_thread(grabowski_task_status, task_id)
+    return _task_consumer_projection(result, view)
 
 
 @mcp.tool(name="grabowski_task_routing_shadow_seal", annotations=MUTATING)

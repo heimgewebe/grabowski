@@ -863,6 +863,237 @@ class SagaContractTests(unittest.TestCase):
         self.assertIn("pr_merge_commit_missing", result["reasons"])
 
 
+class SagaDurablePlanRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        helper = SagaContractTests()
+        self.plan = sagas.build_plan(
+            "runtime-deployment", helper.runtime_target(), "durable-plan-recovery"
+        )
+        self.run = sagas.build_run_receipt(
+            self.plan, helper.mechanic_result(self.plan)
+        )
+        self.ref = {
+            "schema_version": 1,
+            "kind": grip_orchestration.SAGA_RUN_RECEIPT_REF_KIND,
+            "record_sha256": "9" * 64,
+        }
+        self.record = {
+            "schema_version": 1,
+            "kind": grip_orchestration.SAGA_RUN_AUDIT_KIND,
+            "operation": grip_orchestration.SAGA_RUN_AUDIT_OPERATION,
+            "record_sha256": self.ref["record_sha256"],
+            "saga_kind": self.plan["saga_kind"],
+            "plan_sha256": self.plan["plan_sha256"],
+            "plan": self.plan,
+            "run_sha256": self.run["run_sha256"],
+            "run_receipt_sha256": sagas.sha256_json(self.run),
+            "run_receipt": self.run,
+        }
+        self.captain = helper.captain_result(self.plan)
+        self.binding = helper.audit_binding(self.plan, self.captain)
+
+    def snapshot(self, record):
+        payload = (json.dumps(record, separators=(",", ":")) + "\n").encode()
+        return types.SimpleNamespace(
+            segments=(types.SimpleNamespace(captured_data=payload),)
+        )
+
+    def test_exact_plan_and_run_recover_from_one_verified_record(self):
+        import grabowski_audit_query
+        with patch.object(
+            grabowski_audit_query, "capture_verified_audit_snapshot",
+            return_value=self.snapshot(self.record),
+        ) as capture:
+            self.assertEqual(
+                (self.plan, self.run), grip_orchestration.recover_saga_run(self.ref)
+            )
+        capture.assert_called_once_with()
+
+    def test_legacy_record_only_accepts_original_explicit_plan(self):
+        import grabowski_audit_query
+        record = dict(self.record)
+        del record["plan"]
+        with patch.object(
+            grabowski_audit_query, "capture_verified_audit_snapshot",
+            return_value=self.snapshot(record),
+        ):
+            with self.assertRaisesRegex(sagas.SagaError, "legacy Saga run audit"):
+                grip_orchestration.recover_saga_run(self.ref)
+            self.assertEqual(
+                self.run,
+                grip_orchestration._verified_saga_run_receipt_reference(self.plan, self.ref),
+            )
+
+    def test_rejects_tampering_foreign_plan_and_inline_reference(self):
+        import grabowski_audit_query
+        changed = copy.deepcopy(self.plan)
+        changed["idempotency_key"] = "tampered"
+        foreign = sagas.build_plan(
+            "runtime-deployment", SagaContractTests().runtime_target(), "foreign"
+        )
+        for record in (
+            {**self.record, "plan": changed},
+            {**self.record, "plan": foreign},
+            {**self.record, "run_receipt_sha256": "0" * 64},
+        ):
+            with self.subTest(record=record), patch.object(
+                grabowski_audit_query, "capture_verified_audit_snapshot",
+                return_value=self.snapshot(record),
+            ):
+                with self.assertRaises(sagas.SagaError):
+                    grip_orchestration.recover_saga_run(self.ref)
+        with self.assertRaises(sagas.SagaError):
+            grip_orchestration.recover_saga_run(self.run)
+
+    def test_public_settlement_reentry_does_not_repeat_prepare_or_apply(self):
+        import grabowski_audit_query
+        import grabowski_grips as grips
+        readback = {
+            "identity": {"repo_head": HEAD, "completion_status": "complete"},
+            "integrity": {"manifest_schema_valid": True},
+            "serving_process": {
+                "matches_deployed_manifest": True,
+                "serves_deployed_release": True,
+            },
+        }
+        params = {"run_receipt": self.ref, "captain_result": self.captain}
+        with patch.object(
+            grabowski_audit_query, "capture_verified_audit_snapshot",
+            return_value=self.snapshot(self.record),
+        ) as capture, patch.object(
+            grips, "_saga_captain_audit_binding", return_value=self.binding,
+        ), patch.object(
+            grips, "_saga_live_readback", return_value=(readback, "fixture"),
+        ) as live, patch.object(
+            grips, "_default_command_runner", side_effect=AssertionError("unexpected execution"),
+        ), patch.object(
+            grips, "_default_github_runner", side_effect=AssertionError("unexpected execution"),
+        ):
+            first = grips.run_grip("saga-settle", params)
+            resumed = grips.run_grip("saga-settle", params)
+            self.assertEqual("passed", first["status"])
+            self.assertEqual("settled", first["output"]["state"])
+            self.assertEqual(first["output"], resumed["output"])
+            self.assertEqual(2, capture.call_count)
+            self.assertEqual(2, live.call_count)
+            mixed = grips.run_grip("saga-settle", {**params, "target": self.plan["target"]})
+            self.assertEqual("blocked", mixed["status"])
+            self.assertEqual(2, live.call_count)
+
+    def reference_fixture(self):
+        import grabowski_grips as grips
+        common = {
+            "kind": "grabowski_captain_run_audit",
+            "action": self.plan["captain_handoff"]["action"],
+            "target_sha256": grips.sha256_json(self.plan["captain_handoff"]["target"]),
+            "expected_head": HEAD,
+            "expected_base": None,
+            "expected_base_sha": None,
+            "actor_id": "runtime-actor:test",
+            "context_sha256": "e" * 64,
+            "request_sha256": "f" * 64,
+        }
+        intent = {
+            **common, "operation": "captain-run-audit-intent",
+            "phase": "intent", "record_sha256": "c" * 64,
+        }
+        execution = {
+            "status": "passed", "receipt_sha256": "1" * 64, "output_sha256": "2" * 64,
+        }
+        completion = {
+            **common, "operation": "captain-run-audit-completion",
+            "phase": "completion", "record_sha256": "d" * 64,
+            "intent_audit_sha256": intent["record_sha256"],
+            "execution_result": execution,
+            "execution_result_sha256": grips.sha256_json(execution),
+        }
+        params = {
+            "run_receipt": self.ref,
+            "captain_result": {
+                "schema_version": 1,
+                "kind": grip_orchestration.CAPTAIN_AUDIT_RESULT_REF_KIND,
+                "completion_record_sha256": completion["record_sha256"],
+            },
+        }
+        readback = {
+            "identity": {"repo_head": HEAD, "completion_status": "complete"},
+            "integrity": {"manifest_schema_valid": True},
+            "serving_process": {
+                "matches_deployed_manifest": True, "serves_deployed_release": True,
+            },
+        }
+        return params, intent, completion, readback
+
+    def snapshot_records(self, *records):
+        payload = b"".join(
+            (json.dumps(record, separators=(",", ":")) + "\n").encode()
+            for record in records
+        )
+        return types.SimpleNamespace(
+            segments=(types.SimpleNamespace(captured_data=payload),)
+        )
+
+    def test_two_references_use_one_fresh_verified_snapshot_per_invocation(self):
+        import grabowski_audit_query
+        import grabowski_grips as grips
+        params, intent, completion, readback = self.reference_fixture()
+        valid = self.snapshot_records(self.record, intent, completion)
+        missing = self.snapshot_records(self.record, intent)
+        legacy = {
+            **params, "saga_kind": self.plan["saga_kind"], "target": self.plan["target"],
+            "idempotency_key": self.plan["idempotency_key"],
+            "expected_plan_sha256": self.plan["plan_sha256"],
+        }
+        with patch.object(
+            grabowski_audit_query, "capture_verified_audit_snapshot",
+            side_effect=[valid, valid, missing],
+        ) as capture, patch.object(
+            grips, "_saga_live_readback", return_value=(readback, "fixture"),
+        ) as live:
+            short = grips.run_grip("saga-settle", params)
+            self.assertEqual("passed", short["status"], short)
+            self.assertEqual("settled", short["output"]["state"])
+            self.assertEqual(1, capture.call_count)
+            explicit = grips.run_grip("saga-settle", legacy)
+            self.assertEqual(short["output"], explicit["output"])
+            self.assertEqual(2, capture.call_count)
+            absent = grips.run_grip("saga-settle", params)
+            self.assertEqual("blocked", absent["status"])
+            self.assertEqual(3, capture.call_count)
+            self.assertEqual(2, live.call_count)
+            injected = grips.run_grip("saga-settle", {**params, "_audit_snapshot": {}})
+            self.assertEqual("blocked", injected["status"])
+            self.assertEqual(3, capture.call_count)
+
+    def test_single_snapshot_unavailable_or_foreign_captain_fails_before_readback(self):
+        import grabowski_audit_query
+        import grabowski_grips as grips
+        params, intent, completion, readback = self.reference_fixture()
+        foreign = {**completion, "expected_head": "f" * 40}
+        for effect in (OSError("snapshot unavailable"), self.snapshot_records(self.record, intent, foreign)):
+            with self.subTest(effect=type(effect).__name__), patch.object(
+                grabowski_audit_query, "capture_verified_audit_snapshot", side_effect=[effect],
+            ) as capture, patch.object(
+                grips, "_saga_live_readback", return_value=(readback, "fixture"),
+            ) as live:
+                result = grips.run_grip("saga-settle", params)
+                self.assertEqual("blocked", result["status"], result)
+                capture.assert_called_once_with()
+                live.assert_not_called()
+
+    def test_new_audit_persists_exact_plan(self):
+        import grabowski_grips as grips
+        import grabowski_work_acquire as work_acquire
+        with patch.object(
+            work_acquire.operator.base, "_append_audit_with_digest",
+            return_value=self.ref["record_sha256"],
+        ) as append:
+            self.assertEqual(self.ref, grips._saga_persist_run_receipt(self.plan, self.run))
+        stored = append.call_args.args[0]
+        self.assertEqual(self.plan, stored["plan"])
+        self.assertEqual(self.run, stored["run_receipt"])
+
+
 class ExternalMergeSagaSettlementTests(unittest.TestCase):
     """Original no-dispatch Captain audit is not a retroactive merge PASS."""
 

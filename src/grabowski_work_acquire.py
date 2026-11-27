@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import replace
 import fcntl
 import hashlib
 import json
@@ -1283,12 +1284,13 @@ def converge_terminal_resource_closeout(
 
 def _persist_terminal_closeout_impl(
     lane_id: str,
-    assessment: dict[str, Any],
+    assessment: dict[str, Any] | None,
     *,
-    expected_receipt_sha256: str,
+    expected_receipt_sha256: str | None,
     audit_fn: Callable[[dict[str, Any]], str | None] | None = None,
     audit_lookup_fn: Callable[[dict[str, Any]], str | None] | None = None,
     _successor_handoff_guard: Callable[[dict[str, Any], dict[str, Any]], None] | None = None,
+    _published_pr: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """CAS-persist one terminal assessment and converge release-ready lane leases.
 
@@ -1299,19 +1301,34 @@ def _persist_terminal_closeout_impl(
     authoritative publication readback.
     """
     _text(lane_id, "lane_id", pattern=re.compile(r"[0-9a-f]{32}\Z"))
-    _text(
-        expected_receipt_sha256,
-        "expected_receipt_sha256",
-        pattern=re.compile(r"[0-9a-f]{64}\Z"),
-    )
-    validated = lane_closeout.validate_terminal_assessment(assessment)
-    if validated.get("lane_id") != lane_id:
-        raise RuntimeError("terminal closeout assessment is bound to another lane")
+    if _published_pr is None:
+        _text(
+            expected_receipt_sha256,
+            "expected_receipt_sha256",
+            pattern=re.compile(r"[0-9a-f]{64}\Z"),
+        )
+        validated = lane_closeout.validate_terminal_assessment(assessment)
+        if validated.get("lane_id") != lane_id:
+            raise RuntimeError("terminal closeout assessment is bound to another lane")
+    elif (
+        assessment is not None
+        or expected_receipt_sha256 is not None
+        or _successor_handoff_guard is not None
+    ):
+        raise ValueError("published PR closeout requires server-owned observation and CAS")
 
     with _lane_lock(lane_id) as receipt_path:
         record = _read_state(receipt_path)
         if record is None or record.get("lane_id") != lane_id:
             raise RuntimeError("work-lane receipt is missing or bound to another lane")
+
+        if _published_pr is not None:
+            validated = lane_closeout.validate_terminal_assessment(
+                _observe_published_pr_closeout(record, **_published_pr)
+            )
+            if validated.get("lane_id") != lane_id:
+                raise RuntimeError("published PR closeout assessment is bound to another lane")
+            expected_receipt_sha256 = record["receipt_sha256"]
 
         existing = _terminal_closeout_assessment(record)
         if existing is not None:
@@ -1586,6 +1603,7 @@ def _github_pr_exact_head(
     branch: str,
     head: str,
     required_state: str,
+    require_ready_same_repo: bool = False,
 ) -> dict[str, Any]:
     """Require one exact GitHub PR publication for the successor head."""
     if required_state not in {"OPEN", "MERGED"}:
@@ -1620,7 +1638,8 @@ def _github_pr_exact_head(
             "--repo",
             github_repo,
             "--json",
-            "number,state,headRefName,headRefOid",
+            "number,state,headRefName,headRefOid"
+            + (",isCrossRepository,isDraft" if require_ready_same_repo else ""),
         ],
         cwd=repo,
         timeout_seconds=30,
@@ -1640,6 +1659,10 @@ def _github_pr_exact_head(
         raise RuntimeError("successor handoff GitHub PR readback returned invalid payload")
     if payload.get("number") != pr_number:
         raise RuntimeError("successor handoff GitHub PR number drifted")
+    if require_ready_same_repo and (
+        payload.get("isCrossRepository") is not False or payload.get("isDraft") is not False
+    ):
+        raise RuntimeError("published PR closeout requires a non-draft same-repository PR")
     if payload.get("state") != required_state:
         if required_state == "OPEN":
             raise RuntimeError("successor handoff requires the bound PR to remain open")
@@ -1661,6 +1684,118 @@ def _github_pr_exact_head(
         "head_ref_name": published_branch,
         "head_sha": head,
     }
+
+
+def _observe_published_pr_closeout(
+    record: dict[str, Any],
+    *,
+    expected_inputs: dict[str, Any],
+    pr_number: int,
+    pr_origin: str,
+) -> dict[str, Any]:
+    """Bind the ordinary direct controller's published PR under its lane lock.
+
+    No caller-supplied observations or hashes enter this path. The current lane
+    receipt, exact checkout, publication and liveness are the evidence sources.
+    Scoped writers retain their separate workspace completion contract.
+    """
+    if (
+        type(pr_number) is not int
+        or pr_number <= 0
+        or not isinstance(pr_origin, str)
+        or pr_origin not in lane_closeout.PR_ORIGINS
+    ):
+        raise ValueError("published PR closeout requires a positive PR number and opened or updated origin")
+    inputs = record.get("inputs")
+    if (
+        not isinstance(inputs, dict)
+        or inputs != expected_inputs
+        or record.get("inputs_sha256") != _sha(inputs)
+        or record.get("state") != "ready"
+        or inputs.get("scoped_writer") is not None
+        or (inputs.get("source") or {}).get("kind") not in DIRECT_SOURCE_KINDS
+    ):
+        raise RuntimeError("published PR closeout requires the exact ready direct controller lane")
+    lane_id = str(record["lane_id"])
+    repo = Path(inputs["repo"])
+    target = Path(inputs["target_path"])
+    branch = inputs["branch"]
+    lifecycle = (record.get("worktree_receipt") or {}).get("lifecycle")
+    if not isinstance(lifecycle, dict) or not lifecycle.get("checkout_key"):
+        raise RuntimeError("published PR closeout requires a managed checkout lifecycle")
+    physical = _terminal_checkout_physical_identity(record)
+    if physical is None:
+        raise RuntimeError("published PR closeout requires physical checkout identity")
+
+    def local_observation(expected_head: str | None = None) -> str:
+        top, common, checkout = checkouts._worktree_for_path(repo, target)
+        if checkout.get("checkout_key") != lifecycle["checkout_key"]:
+            raise RuntimeError("published PR closeout checkout key drifted")
+        head = _text(checkout.get("head"), "published PR checkout head", pattern=SHA40_RE)
+        checkouts._require_expected(checkout, expected_head or head, branch)
+        checkouts._require_clean_linked(checkout)
+        checkouts._require_no_blockers(checkouts._linked_checkout_coordination(
+            target, top, common, branch=branch, include_processes=True,
+            include_tasks=True, include_resources=True,
+            ignored_lease_owner_ids=[inputs["lease_owner_id"]],
+        ))
+        return head
+
+    head = local_observation()
+    owner, registered, leases = _terminal_lane_resource_observation(record)
+    ancestry = _git_runner(
+        repo, ["--no-replace-objects", "merge-base", "--is-ancestor", inputs["base_head"], head],
+    )
+    if ancestry.get("returncode") != 0 or ancestry.get("timed_out") is True:
+        raise RuntimeError("published PR closeout HEAD is not a verified descendant of the lane base")
+    ref = f"refs/heads/{branch}"
+    remote = _git_runner(repo, ["ls-remote", "--exit-code", "--refs", "origin", ref])
+    if (
+        remote.get("returncode") != 0
+        or remote.get("timed_out") is True
+        or remote.get("stdout_truncated") is True
+        or str(remote.get("stdout") or "").split() != [head, ref]
+    ):
+        raise RuntimeError("published PR closeout remote head is absent, unavailable or drifted")
+    _github_pr_exact_head(
+        repo, pr_number=pr_number, branch=branch, head=head,
+        required_state="OPEN", require_ready_same_repo=True,
+    )
+    # Network observations may take time. Revalidate exact local identity,
+    # liveness and owner lease generations immediately before pending intent.
+    local_observation(head)
+    _terminal_checkout_physical_identity(record, expected=physical)
+    if _terminal_lane_resource_observation(record) != (owner, registered, leases):
+        raise RuntimeError("published PR closeout owner lease observation drifted")
+    observation = lane_closeout.LaneCloseoutObservation(
+        lane_id=lane_id, repository=str(repo), workspace=str(target),
+        branch=branch, base_revision=inputs["base_head"], writer_state="completed",
+        task_active=False, process_active=False, lease_active=bool(leases),
+        git_dirty=False, head_sha=head, remote_head_sha=head,
+        ahead_commits=0, behind_commits=0, pr_number=pr_number,
+        pr_state="open", pr_head_sha=head, pr_origin=pr_origin,
+    )
+    current = lane_closeout.assess(observation)
+    terminal = _terminal_closeout_assessment(record)
+    prior = terminal or _terminal_closeout_pending_assessment(record)
+    if prior is not None:
+        # Only the own-lease present -> absent transition may change the
+        # observation on retry. Do not silently substitute another PR or head.
+        compatible = {current["observation_sha256"]}
+        if not leases:
+            compatible.add(
+                lane_closeout.assess(replace(observation, lease_active=True))["observation_sha256"]
+            )
+        if (
+            prior.get("observation_sha256") not in compatible
+            or prior.get("terminal_head_sha") != head
+        ):
+            raise RuntimeError("published PR closeout conflicts with stored publication intent")
+        if terminal is not None:
+            if leases:
+                raise RuntimeError("published PR closeout already terminal but owns live leases; reconcile existing intent")
+            return prior
+    return current
 
 
 def _github_open_pr_exact_head(
@@ -4979,6 +5114,9 @@ def grabowski_work_acquire(
     New acquisitions accept source_kind only from bureau_task, github_issue,
     operator_obligation, thread_focus, work_lane, direct, or direct-user.
     Direct sources bind checkout lifecycle evidence to the Work Lane itself.
+    For an exact published PR on a direct controller lane, use terminal_closeout
+    with published_pr={lane_id, pr_number, pr_origin}; current checkout, publication,
+    liveness and the inner receipt CAS are derived by the server.
     """
     parameters = {
         "source_kind": source_kind,
@@ -5004,6 +5142,30 @@ def grabowski_work_acquire(
     if terminal_closeout is not None:
         if not isinstance(terminal_closeout, dict):
             raise ValueError("terminal_closeout must be an object")
+        if set(terminal_closeout) == {"published_pr"}:
+            publication = terminal_closeout["published_pr"]
+            if (
+                not isinstance(publication, dict)
+                or set(publication) != {"lane_id", "pr_number", "pr_origin"}
+            ):
+                raise ValueError("terminal_closeout.published_pr requires lane_id, pr_number and pr_origin")
+            lane_id = _text(
+                publication["lane_id"], "lane_id", pattern=re.compile(r"[0-9a-f]{32}\Z"),
+            )
+            inputs = _closeout_inputs(parameters, lane_id)
+            operator._require_operator_mutation(
+                "resource_lease", path=inputs["target_path"], repo=inputs["repo"]
+            )
+            return _persist_terminal_closeout_impl(
+                lane_id, None, expected_receipt_sha256=None,
+                audit_fn=operator.base._append_audit_with_digest,
+                audit_lookup_fn=_find_terminal_closeout_audit,
+                _published_pr={
+                    "expected_inputs": inputs,
+                    "pr_number": publication["pr_number"],
+                    "pr_origin": publication["pr_origin"],
+                },
+            )
         audit_only_keys = {
             "expected_receipt_sha256",
             "lane_id",
@@ -5071,7 +5233,7 @@ def grabowski_work_acquire(
             "observation",
         }:
             raise ValueError(
-                "terminal_closeout must contain expected_receipt_sha256 plus observation, successor_handoff, or lane_id + reconcile_audit_only"
+                "terminal_closeout must contain published_pr, or expected_receipt_sha256 plus observation, successor_handoff, or lane_id + reconcile_audit_only"
             )
         observation = terminal_closeout["observation"]
         if not isinstance(observation, dict):

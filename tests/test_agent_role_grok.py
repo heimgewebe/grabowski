@@ -1071,6 +1071,34 @@ class GrokReviewRoleTests(unittest.TestCase):
                 self.assertIn(b"BEGIN UNTRUSTED REVIEW INPUT", stdin)
                 self.assertNotIn("Review exact diff", " ".join(actual))
 
+    def test_claude_automatic_advisory_requests_only_basic_verdict_schema(self) -> None:
+        from grabowski_critical_review_dispatch import PROMPT
+
+        route = (
+            "/opt/grabowski-external/claude", "--model", "claude-opus-5-5",
+            "--effort", "high", "--permission-mode", "plan",
+        )
+        actual, stdin = role._claude_json_review_command(
+            (*route, PROMPT), expected_head="a" * 40,
+            expected_base_head="b" * 40, review_diff=b"diff --git a/a b/a\n",
+        )
+        schema = json.loads(actual[actual.index("--json-schema") + 1])
+        self.assertFalse(schema["additionalProperties"])
+        self.assertEqual({"verdict", "findings"}, set(schema["properties"]))
+        self.assertEqual({"verdict", "findings"}, set(schema["required"]))
+        self.assertEqual(role.CLAUDE_REVIEW_SCHEMA["properties"]["findings"],
+                         schema["properties"]["findings"])
+        self.assertIn(b"BEGIN UNTRUSTED REVIEW INPUT", stdin)
+        # A basic advisory must not mutate the established semantic schema.
+        semantic, _ = role._claude_json_review_command(
+            (*route, "Review exact diff for a semantic axis"),
+            expected_head="a" * 40, expected_base_head="b" * 40,
+            review_diff=b"diff --git a/a b/a\n",
+        )
+        semantic_schema = json.loads(semantic[semantic.index("--json-schema") + 1])
+        self.assertEqual(role.CLAUDE_REVIEW_SCHEMA, semantic_schema)
+        self.assertIn("review_batch_id", semantic_schema["properties"])
+
     def test_claude_review_preserves_invalid_structured_output_denial(self) -> None:
         """Permission-denied StructuredOutput cannot masquerade as a PASS."""
         denied = {

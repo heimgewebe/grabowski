@@ -636,6 +636,16 @@ class FakeGh:
         self.calls: list[tuple[str, ...]] = []
 
     @staticmethod
+    def is_native_enqueue(args: list[str] | tuple[str, ...]) -> bool:
+        return tuple(args[:2]) == ("api", "graphql") and any(
+            "enqueuePullRequest" in value for value in args
+        )
+
+    @staticmethod
+    def is_merge_dispatch(args: list[str] | tuple[str, ...]) -> bool:
+        return tuple(args[:2]) == ("pr", "merge") or FakeGh.is_native_enqueue(args)
+
+    @staticmethod
     def _bounded_api_page(payload: object, endpoint: str) -> object:
         if (
             not isinstance(payload, list)
@@ -678,7 +688,7 @@ class FakeGh:
             else:
                 value = [self.existing]
             return {"returncode": 0, "stdout": json.dumps(value), "stderr": ""}
-        if argv[:2] == ["api", "graphql"]:
+        if argv[:2] == ["api", "graphql"] and not self.is_native_enqueue(argv):
             query = next(
                 (item for item in argv if isinstance(item, str) and item.startswith("query=")),
                 "",
@@ -687,6 +697,7 @@ class FakeGh:
                 if self.merge_queue_failure:
                     return {"returncode": 1, "stdout": "", "stderr": "queue readback failed"}
                 queue_view = {
+                    "id": self.view.get("id", "PR_test"),
                     "state": self.view.get("state"),
                     "headRefOid": self.view.get("headRefOid"),
                     "baseRefName": self.view.get("baseRefName"),
@@ -695,7 +706,7 @@ class FakeGh:
                 }
                 queue_view.update(self.merge_queue_view_overrides)
                 merge_dispatched = any(
-                    call[:2] == ("pr", "merge") for call in self.calls
+                    self.is_merge_dispatch(call) for call in self.calls
                 )
                 if merge_dispatched:
                     queue_view.update(self.post_merge_queue_view_overrides)
@@ -726,7 +737,7 @@ class FakeGh:
             if self.codex_state_sequence:
                 self.codex_state = deepcopy(self.codex_state_sequence.pop(0))
             return {"returncode": 0, "stdout": json.dumps(payload), "stderr": ""}
-        if argv[:1] == ["api"] and len(argv) >= 2:
+        if argv[:1] == ["api"] and len(argv) >= 2 and not self.is_native_enqueue(argv):
             state = (
                 self.codex_state_sequence[0]
                 if self.codex_state_sequence
@@ -794,7 +805,7 @@ class FakeGh:
             if "/pulls/" in endpoint and "/reviews/" in endpoint:
                 payload = state.get("review") if isinstance(state, dict) else None
                 return {"returncode": 0, "stdout": json.dumps(payload), "stderr": ""}
-        if argv[:1] == ["api"]:
+        if argv[:1] == ["api"] and not self.is_native_enqueue(argv):
             jq = (
                 argv[argv.index("--jq") + 1]
                 if "--jq" in argv and argv.index("--jq") + 1 < len(argv)
@@ -840,7 +851,7 @@ class FakeGh:
                 "stdout": json.dumps(self.required_checks),
                 "stderr": "",
             }
-        if argv[:2] == ["pr", "merge"]:
+        if self.is_merge_dispatch(argv):
             if self.merge_exception:
                 raise RuntimeError("merge runner exploded")
             if self.post_merge_queue_entry is not None:
@@ -851,7 +862,12 @@ class FakeGh:
                 merged_view.update({"state": "MERGED", "mergedAt": "2026-07-08T03:00:00Z", "mergeCommit": {"oid": "d" * 40}})
                 merged_view.update(self.post_merge_view)
                 self.view = merged_view
-            return {"returncode": self.merge_returncode, "stdout": self.merge_stdout, "stderr": self.merge_stderr}
+            stdout = self.merge_stdout
+            if self.is_native_enqueue(argv) and self.merge_returncode == 0:
+                stdout = json.dumps({"data": {
+                    "enqueuePullRequest": {"mergeQueueEntry": self.merge_queue_entry}
+                }})
+            return {"returncode": self.merge_returncode, "stdout": stdout, "stderr": self.merge_stderr}
         if argv[:2] == ["pr", "view"]:
             if self.view_results:
                 result = self.view_results.pop(0)
@@ -12859,6 +12875,11 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             return_value=captain_independent_review_reconciliation(),
         )
         self._decision_review_patch.start()
+        # The GitHub runner is synthetic: responses advance by call count.
+        # Keep retry logic and explicit delay assertions, not real wall waits.
+        sleep_fixture = patch.object(grips, "_captain_sleep", return_value=None)
+        sleep_fixture.start()
+        self.addCleanup(sleep_fixture.stop)
         # These action-envelope fixtures isolate policy/dispatch from the
         # separately tested signed task origin. The dedicated production
         # no-origin rejection and real signer suite never apply this patch.
@@ -14183,7 +14204,8 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertTrue(execution["merge_queued"])
         self.assertFalse(execution["merge_completion_verified"])
         self.assertEqual("queued_after_dispatch", execution["merge_queue_reconciliation"])
-        self.assertEqual(1, len([call for call in gh.calls if call[:2] == ("pr", "merge")]))
+        self.assertEqual(1, len([call for call in gh.calls if gh.is_native_enqueue(call)]))
+        self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
         self.assertNotIn("post_verify_errors", execution)
 
     def test_captain_run_blocks_partial_merge_queue_graphql_errors_before_dispatch(self) -> None:
@@ -14230,7 +14252,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             "merge_queue_readback_graphql_errors", execution["preflight_errors"]
         )
         self.assertIn("not safely reconcilable", execution["verification_error"])
-        self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
+        self.assertEqual([], [call for call in gh.calls if gh.is_merge_dispatch(call)])
 
     def test_captain_run_reconciles_merge_completed_during_pre_dispatch_queue_readback(self) -> None:
         parameters = authorized_captain_run_parameters()
@@ -14294,7 +14316,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             execution["external_merge_reconciliation"]["external_merge_observed"]
         )
         self.assertFalse(execution["external_merge_reconciliation"]["dispatch_called"])
-        self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
+        self.assertEqual([], [call for call in gh.calls if gh.is_merge_dispatch(call)])
         attempted_checks = [
             check
             for check in result["receipt"]["checks"]
@@ -14347,7 +14369,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertFalse(execution["execution_attempted"])
         self.assertIn("merge_queue_head_mismatch", execution["preflight_errors"])
         self.assertFalse(execution["remote_mutation_observed"])
-        self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
+        self.assertEqual([], [call for call in gh.calls if gh.is_merge_dispatch(call)])
 
     def test_captain_run_reconciles_merge_completed_during_queue_readback(self) -> None:
         parameters = authorized_captain_run_parameters()
@@ -14450,7 +14472,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertFalse(guard["external_merge_observed"])
         self.assertNotIn("external_merge_reconciliation", guard)
         self.assertNotIn("external_merge_reconciliation", execution)
-        self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
+        self.assertEqual([], [call for call in gh.calls if gh.is_merge_dispatch(call)])
         execution_attempt_checks = [
             check for check in result["receipt"]["checks"] if check["id"] == "execution-attempted"
         ]
@@ -14552,7 +14574,84 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             "blocked_existing_queue_without_server_base_guard",
             execution["merge_queue_reconciliation"],
         )
-        self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
+        self.assertEqual([], [call for call in gh.calls if gh.is_merge_dispatch(call)])
+
+    def test_atomic_guard_native_enqueue_exact_head_without_auto_merge(self) -> None:
+        for scenario in ("success", "implicit_squash", "missing_node", "wrong_method", "explicit_mismatch", "failed_dispatch"):
+            with self.subTest(scenario=scenario):
+                class NativeQueueGh(FakeGh):
+                    def __call__(self, repo, args):
+                        if args[:2] == ["api", "graphql"] and any(
+                            "enqueuePullRequest" in value for value in args
+                        ):
+                            self.calls.append(tuple(args))
+                            if scenario == "failed_dispatch":
+                                return {"returncode": 1, "stdout": "", "stderr": "enqueue denied"}
+                            self.merge_queue_entry = {"id": "MQE_native", "position": 1}
+                            return {"returncode": 0, "stdout": json.dumps({"data": {
+                                "enqueuePullRequest": {"mergeQueueEntry": self.merge_queue_entry}
+                            }}), "stderr": ""}
+                        if args[:2] == ["pr", "merge"]:
+                            self.calls.append(tuple(args))
+                            return {"returncode": 1, "stdout": "", "stderr": "Auto merge is not allowed"}
+                        return super().__call__(repo, args)
+
+                gh = NativeQueueGh(
+                    view={
+                        "number": 96, "state": "OPEN", "baseRefName": "main",
+                        "baseRefOid": CAPTAIN_BASE_SHA, "headRefName": "feat/captain",
+                        "headRefOid": CAPTAIN_HEAD, "isDraft": False,
+                        "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
+                    },
+                    merge_queue_view_overrides={"id": None if scenario == "missing_node" else "PR_native"},
+                )
+                gh.active_rules.append({
+                    "type": "merge_queue",
+                    "parameters": {"merge_method": "SQUASH" if scenario in ("implicit_squash", "explicit_mismatch") else "INVALID" if scenario == "wrong_method" else "MERGE"},
+                    "ruleset_source_type": "Repository",
+                    "ruleset_source": "heimgewebe/grabowski", "ruleset_id": 18801517,
+                })
+                parameters = authorized_captain_run_parameters()
+                if scenario == "explicit_mismatch":
+                    parameters["actions"][0]["target"]["merge_method"] = "merge"
+                    parameters["execution_intent"] = captain_execution_intent(parameters)
+                with patch.object(
+                    merge_guard, "resolve_captain_merge_repository",
+                    return_value=(Path.cwd().resolve(), "test-bound-checkout"),
+                ):
+                    result = grips.grip_run(
+                        "captain-run", parameters,
+                        profile="captain", allow_mutation=True,
+                        command_runner=FakeGit(), github_runner=gh,
+                    )
+                execution = result["output"]["executions"][0]
+                guard = execution["merge_lease_guard"]
+                enqueues = [call for call in gh.calls if any(
+                    "enqueuePullRequest" in item for item in call
+                )]
+                self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
+                self.assertEqual(scenario in ("success", "implicit_squash"), execution["verification_passed"])
+                if scenario in ("success", "implicit_squash", "failed_dispatch"):
+                    self.assertEqual(1, len(enqueues))
+                    self.assertIn("pr=PR_native", enqueues[0])
+                    self.assertIn(f"head={CAPTAIN_HEAD}", enqueues[0])
+                    self.assertTrue(any("jump:false" in item for item in enqueues[0]))
+                    self.assertEqual("github_native_merge_queue_enqueue", guard["dispatch_mode"])
+                    self.assertEqual("squash" if scenario == "implicit_squash" else "merge", guard["native_enqueue_merge_method"])
+                    self.assertEqual("active_queue_rule", guard["native_enqueue_method_source"])
+                else:
+                    self.assertEqual([], enqueues)
+                    self.assertFalse(guard["dispatch_called"])
+                    if scenario == "explicit_mismatch":
+                        self.assertTrue(any("repository_merge_queue_method_mismatch" in error for error in execution["preflight_errors"]))
+                    else:
+                        self.assertIn("merge_guard_native_enqueue_binding_invalid", guard["errors"])
+                if scenario in ("success", "implicit_squash"):
+                    self.assertTrue(execution["merge_queued"])
+                    self.assertFalse(execution["merge_completion_verified"])
+                    self.assertEqual("scheduled", result["output"]["decision"])
+                with resources._database() as connection:
+                    self.assertEqual(0, connection.execute("SELECT COUNT(*) FROM leases").fetchone()[0])
 
     def test_atomic_guard_reconciles_queue_race_without_duplicate_dispatch(self) -> None:
         parameters = authorized_captain_run_parameters()
@@ -14589,7 +14688,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertEqual(
             "scheduled", guard["dispatch_merge_queue_reconciliation"]["status"]
         )
-        self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
+        self.assertEqual([], [call for call in gh.calls if gh.is_merge_dispatch(call)])
 
     def test_atomic_guard_blocks_queue_race_under_exact_base_cas(self) -> None:
         parameters = authorized_captain_run_parameters()
@@ -14639,7 +14738,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertEqual(
             "blocked", guard["dispatch_merge_queue_reconciliation"]["status"]
         )
-        self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
+        self.assertEqual([], [call for call in gh.calls if gh.is_merge_dispatch(call)])
 
     def test_captain_run_blocks_mismatched_existing_merge_queue_binding(self) -> None:
         parameters = authorized_captain_run_parameters()
@@ -14681,7 +14780,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         execution = result["output"]["executions"][0]
         self.assertFalse(execution["execution_invoked"])
         self.assertIn("merge_queue_head_mismatch", execution["preflight_errors"])
-        self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
+        self.assertEqual([], [call for call in gh.calls if gh.is_merge_dispatch(call)])
 
     def test_captain_run_blocks_without_server_enforced_base_guard(self) -> None:
         parameters = authorized_captain_run_parameters()

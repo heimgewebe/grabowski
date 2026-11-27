@@ -50,12 +50,64 @@ def measure(call: Callable[[], Any], samples: int) -> dict[str, Any]:
     }
 
 
+def compare_task_status(snapshot: dict[str, Any], samples: int) -> dict[str, Any]:
+    """Compare two views of the exact same captured status, without task effects."""
+    if not isinstance(snapshot, dict) or not isinstance(snapshot.get("task_id"), str):
+        raise ValueError("expected a captured task-status object")
+    full = measure(lambda: grabowski_tasks._task_consumer_projection(snapshot, "full"), samples)
+    compact = measure(lambda: grabowski_tasks._task_consumer_projection(snapshot, "compact"), samples)
+    projected = grabowski_tasks._task_consumer_projection(snapshot, "compact")
+    omitted = projected["projection"]["omitted_fields"]
+    reconstructed = dict(projected)
+    del reconstructed["projection"]
+    for field in omitted:
+        if field.startswith("launcher."):
+            key = field.split(".", 1)[1]
+            reconstructed["launcher"] = {**reconstructed["launcher"], key: snapshot["launcher"][key]}
+        else:
+            reconstructed[field] = snapshot[field]
+    if reconstructed != snapshot:
+        raise RuntimeError("compact projection changed decision or evidence fields")
+    return {
+        "task_id": snapshot["task_id"],
+        "state": snapshot.get("state"),
+        "full": full,
+        "compact": compact,
+        "omitted_fields": omitted,
+        "unchanged_except_declared_fields": True,
+        "reduction_percent": round(
+            100 * (full["bytes_median"] - compact["bytes_median"]) / full["bytes_median"], 2
+        ),
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--samples", type=int, default=3)
+    parser.add_argument(
+        "--task-status-json",
+        type=argparse.FileType("r"),
+        help="Compare one or a list of captured task-status objects; use - for stdin.",
+    )
     args = parser.parse_args()
     if not 1 <= args.samples <= 20:
         raise SystemExit("samples must be between 1 and 20")
+    if args.task_status_json is not None:
+        snapshots = json.load(args.task_status_json)
+        if isinstance(snapshots, dict):
+            snapshots = [snapshots]
+        if not isinstance(snapshots, list) or not 1 <= len(snapshots) <= 100:
+            raise SystemExit("expected 1 to 100 captured status objects")
+        print(json.dumps({
+            "schema_version": 1,
+            "measurement": "same-snapshot-task-status-projection",
+            "results": [compare_task_status(item, args.samples) for item in snapshots],
+            "does_not_establish": [
+                "model_token_count", "live_connector_projection", "workflow_correctness",
+                "task_status_collection_latency",
+            ],
+        }, ensure_ascii=False, sort_keys=True))
+        return 0
     cases: dict[str, Callable[[], Any]] = {
         "status_minimal": lambda: grabowski_mcp.grabowski_status(view="minimal"),
         "status_standard": lambda: grabowski_mcp.grabowski_status(view="standard"),

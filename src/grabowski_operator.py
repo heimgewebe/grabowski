@@ -253,6 +253,9 @@ MAX_CONSUMER_FIELDS = consumer_surface.MAX_CONSUMER_FIELDS
 MAX_CONSUMER_CURSOR_BYTES = consumer_surface.MAX_CONSUMER_CURSOR_BYTES
 HTTP_STATELESS_MODE = True
 HTTP_LOG_LEVEL = "WARNING"
+# Leave headroom for the longest ordinary synchronous call (60s); systemd
+# must allow a longer hard stop budget than this HTTP response drain.
+HTTP_GRACEFUL_SHUTDOWN_SECONDS = 65
 HTTP_TRANSPORT_VERBOSE_LOGGERS = (
     "mcp.server.lowlevel.server",
     "mcp.server.streamable_http",
@@ -10886,6 +10889,93 @@ def grabowski_privileged_action_reference(
     return payload
 
 
+def _run_http_runtime(server: FastMCP) -> None:
+    """Drain finite stateless MCP responses before ending SSE on SIGTERM."""
+    import anyio
+    import uvicorn
+    from sse_starlette.sse import AppStatus
+
+    if server.settings.stateless_http is not True:
+        raise RuntimeError("Graceful MCP shutdown requires stateless HTTP")
+
+    http_app = server.streamable_http_app()
+    active_get_streams: set[anyio.CancelScope] = set()
+    stopping = False
+
+    async def drainable_app(scope, receive, send):
+        # Standalone GET streams have no finite response to wait for.
+        # Leave POST, lifespan and unrelated HTTP routes untouched.
+        if (scope["type"] != "http" or scope["method"] != "GET"
+                or scope["path"] != server.settings.streamable_http_path):
+            await http_app(scope, receive, send)
+            return
+
+        response_started = response_complete = False
+
+        async def track_send(message):
+            nonlocal response_started, response_complete
+            await send(message)
+            if message["type"] == "http.response.start":
+                response_started = True
+            elif message["type"] == "http.response.body":
+                response_complete = not message.get("more_body", False)
+
+        with anyio.CancelScope() as stream_scope:
+            active_get_streams.add(stream_scope)
+            try:
+                if stopping:
+                    stream_scope.cancel()
+                await http_app(scope, receive, track_send)
+            finally:
+                active_get_streams.discard(stream_scope)
+
+        # Complete the HTTP response after the scoped GET cancellation.
+        if stream_scope.cancel_called and not response_complete:
+            if not response_started:
+                await send({"type": "http.response.start", "status": 503,
+                            "headers": [(b"content-length", b"0")]})
+            await send({"type": "http.response.body", "body": b"",
+                        "more_body": False})
+
+    class _StatelessHTTPServer(uvicorn.Server):
+        async def shutdown(self, sockets=None):
+            nonlocal stopping
+            stopping = True
+            for stream_scope in tuple(active_get_streams):
+                stream_scope.cancel()
+            try:
+                # Uvicorn first stops accepting connections and then waits
+                # for admitted requests, bounded by timeout_graceful_shutdown.
+                await super().shutdown(sockets=sockets)
+            finally:
+                # Signal SSE shutdown only after the response drain, not
+                # immediately on SIGTERM. This also runs before Uvicorn
+                # restores/replays the original process signal.
+                AppStatus.should_exit = True
+
+    async def serve() -> None:
+        previous_auto_drain = AppStatus.enable_automatic_graceful_drain
+        previous_should_exit = AppStatus.should_exit
+        # sse-starlette otherwise cancels finite POST response streams as
+        # soon as Uvicorn receives SIGTERM, even while tools are still running.
+        AppStatus.disable_automatic_graceful_drain()
+        try:
+            config = uvicorn.Config(
+                drainable_app,
+                host=server.settings.host,
+                port=server.settings.port,
+                log_level=server.settings.log_level.lower(),
+                timeout_graceful_shutdown=HTTP_GRACEFUL_SHUTDOWN_SECONDS,
+            )
+            await _StatelessHTTPServer(config).serve()
+        finally:
+            if previous_auto_drain:
+                AppStatus.enable_automatic_graceful_drain_mode()
+            AppStatus.should_exit = previous_should_exit
+
+    asyncio.run(serve())
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run the Grabowski MCP operator."
@@ -10930,7 +11020,9 @@ def main() -> None:
             # admission gate is already inside that wrapper so its sync worker
             # never executes PostHog's server-wide asyncio locks.
             _configure_http_runtime(admission_gate_preinstalled=True)
-        mcp.run(transport=args.transport)
+            _run_http_runtime(mcp)
+        else:
+            mcp.run(transport=args.transport)
     finally:
         _shutdown_posthog_mcp_analytics()
 

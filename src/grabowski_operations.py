@@ -112,6 +112,10 @@ def _hash(value: Any) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+class _OperationsRegistryMissing(RuntimeError):
+    """The local recipe registry is not installed."""
+
+
 def _load() -> dict[str, Any]:
     path = OPERATIONS_CONFIG
     if path.is_symlink():
@@ -119,7 +123,7 @@ def _load() -> dict[str, Any]:
     try:
         metadata = path.stat()
     except FileNotFoundError as exc:
-        raise RuntimeError(f"Operations registry missing: {path}") from exc
+        raise _OperationsRegistryMissing(f"Operations registry missing: {path}") from exc
     if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 512 * 1024:
         raise ValueError(f"Operations registry is not a bounded regular file: {path}")
     try:
@@ -1662,7 +1666,13 @@ def grabowski_operation_list() -> dict[str, Any]:
         operator._require_operator_capability("terminal_execute")
     except PermissionError:
         return _maulwurf_recovery_operation_list()
-    raw = _load()
+    try:
+        raw = _load()
+    except _OperationsRegistryMissing:
+        raw = {"schema_version": 1, "operations": {}}
+        registry_state = "missing"
+    else:
+        registry_state = "configured"
     shadowed = RESERVED_TYPED_OPERATIONS.intersection(raw["operations"])
     if shadowed:
         raise ValueError(
@@ -1735,7 +1745,11 @@ def grabowski_operation_list() -> dict[str, Any]:
             "typed_builtin": True,
             "effect": spec["effect"],
         }
-    return {"path": str(OPERATIONS_CONFIG), "operations": operations}
+    return {
+        "path": str(OPERATIONS_CONFIG),
+        "registry_state": registry_state,
+        "operations": operations,
+    }
 
 
 @mcp.tool(name="grabowski_operation_plan", annotations=READ_ONLY)

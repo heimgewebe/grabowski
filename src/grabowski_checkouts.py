@@ -789,12 +789,35 @@ def _lifecycle_bindings(
     return {row["checkout_key"]: _lifecycle_public(row) for row in rows}
 
 
-def _strict_lifecycle_binding(checkout_key: str) -> dict[str, Any] | None:
-    "Read one lifecycle binding without collapsing SQLite failures into legacy absence."
-    connection = _readonly_connection(CHECKOUT_DB)
-    if connection is None:
-        return None
-    try:
+def _strict_lifecycle_binding(
+    checkout_key: str, *, write_free: bool = False,
+) -> dict[str, Any] | None:
+    """Read one binding without collapsing SQLite failures into legacy absence.
+
+    Review admission uses an immutable snapshot, never the native WAL reader
+    which can create SHM or update read marks. A checkpointed empty WAL is safe
+    only while the existing DB and sidecars retain their exact identities.
+    Internal lifecycle operations retain their existing WAL-aware contract.
+    """
+    with ExitStack() as stack:
+        if write_free:
+            if CHECKOUT_DB.is_symlink():
+                raise PermissionError("Checkout database may not be a symlink")
+            if not CHECKOUT_DB.exists():
+                return None
+            connection = stack.enter_context(sqlite_store.inventory_readonly_sqlite(
+                CHECKOUT_DB,
+                temporary_prefix="unused-review-checkout-readonly.",
+                error_type=RuntimeError,
+                message="Review checkout lifecycle snapshot changed",
+                allow_wal_copy=False,
+                allow_checkpointed_empty_wal=True,
+            ))
+        else:
+            connection = _readonly_connection(CHECKOUT_DB)
+            if connection is None:
+                return None
+            stack.enter_context(closing(connection))
         table = connection.execute(
             "SELECT 1 FROM sqlite_master "
             "WHERE type='table' AND name='lifecycle_bindings'"
@@ -805,9 +828,7 @@ def _strict_lifecycle_binding(checkout_key: str) -> dict[str, Any] | None:
             "SELECT * FROM lifecycle_bindings WHERE checkout_key=?",
             (checkout_key,),
         ).fetchone()
-    finally:
-        connection.close()
-    return None if row is None else _lifecycle_public(row)
+        return None if row is None else _lifecycle_public(row)
 
 
 def _phase_limit(phase: str) -> int:

@@ -9021,6 +9021,164 @@ class WorkAcquireTests(unittest.TestCase):
                 lane_id, self.terminal_assessment(lane_id, 202), expected_receipt_sha256="e" * 64
             )
 
+    @contextmanager
+    def native_pr_closeout_fixture(self):
+        params = self.parameters()
+        params["scoped_writer_actor"] = None
+        inputs, receipt = self.store_lane(params)
+        lane_id = str(inputs["lane_id"])
+        path = self.state / f"{lane_id}.json"
+        checkout_key = "f" * 64
+        receipt = work_acquire._write_state(path, {
+            **receipt, "worktree_receipt": {"lifecycle": {
+                "checkout_key": checkout_key, "checkout_path": str(self.target),
+                "expected_branch": params["branch"], "owner_id": f"lane:{lane_id}",
+            }},
+        })
+        checkout = {"checkout_key": checkout_key, "head": SHA, "branch": params["branch"]}
+        common = self.repo / ".git"
+        leases = [{"resource_key": "test-owned-lease"}]
+        def git(repo, argv):
+            if argv[0] == "ls-remote":
+                return {"returncode": 0, "stdout": f"{SHA}\trefs/heads/{params['branch']}\n"}
+            if argv[:2] == ["--no-replace-objects", "merge-base"]:
+                return {"returncode": 0, "stdout": ""}
+            raise AssertionError(argv)
+        def release(record, *, assessment):
+            leases.clear()
+            return {"remaining_owner_leases": 0}
+        audits = {}
+        def append_audit(event):
+            audits[event["terminal_transition_sha256"]] = "a" * 64
+            return "a" * 64
+        def lookup_audit(event):
+            return audits.get(event["terminal_transition_sha256"])
+        def invoke(number=1845, origin="opened"):
+            return work_acquire.grabowski_work_acquire(
+                **params, terminal_closeout={"published_pr": {
+                    "lane_id": lane_id, "pr_number": number, "pr_origin": origin,
+                }},
+            )
+        with ExitStack() as stack:
+            mocks = {
+                "mutation": stack.enter_context(patch.object(work_acquire.operator, "_require_operator_mutation")),
+                "checkout": stack.enter_context(patch.object(work_acquire.checkouts, "_worktree_for_path", return_value=(self.repo, common, checkout))),
+                "clean": stack.enter_context(patch.object(work_acquire.checkouts, "_require_clean_linked")),
+                "coordination": stack.enter_context(patch.object(work_acquire.checkouts, "_linked_checkout_coordination", return_value={"blocking": False})),
+                "physical": stack.enter_context(patch.object(work_acquire, "_terminal_checkout_physical_identity", return_value=PHYSICAL)),
+                "git": stack.enter_context(patch.object(work_acquire, "_git_runner", side_effect=git)),
+                "pr": stack.enter_context(patch.object(work_acquire, "_github_pr_exact_head", return_value={"state": "OPEN", "head_sha": SHA})),
+                "leases": stack.enter_context(patch.object(work_acquire, "_terminal_lane_resource_observation", side_effect=lambda record: (f"lane:{lane_id}", [], list(leases)))),
+                "lifecycle": stack.enter_context(patch.object(work_acquire, "_converge_terminal_checkout_lifecycle", return_value={"state": "completed_retained"})),
+                "release": stack.enter_context(patch.object(work_acquire, "_converge_terminal_resource_leases", side_effect=release)),
+                "audit": stack.enter_context(patch.object(work_acquire.operator.base, "_append_audit_with_digest", side_effect=append_audit)),
+                "audit_lookup": stack.enter_context(patch.object(work_acquire, "_find_terminal_closeout_audit", side_effect=lookup_audit)),
+                "acquire": stack.enter_context(patch.object(work_acquire, "acquire_work")),
+            }
+            yield invoke, path, receipt, mocks, release
+
+    def test_native_published_pr_closeout_binds_current_inner_receipt_and_readback(self) -> None:
+        with self.native_pr_closeout_fixture() as (invoke, path, receipt, mocks, _release):
+            result = invoke()
+            self.assertEqual("pr_opened", result["terminal_closeout"]["closeout_state"])
+            self.assertEqual(receipt["receipt_sha256"], result["terminal_closeout"]["expected_receipt_sha256"])
+            self.assertEqual(SHA, result["terminal_closeout"]["assessment"]["terminal_head_sha"])
+            self.assertNotEqual(receipt["receipt_sha256"], result["receipt_sha256"])
+            self.assertEqual(result["receipt_sha256"], work_acquire._read_state(path)["receipt_sha256"])
+            self.assertFalse(result["replayed"])
+            self.assertTrue(invoke()["replayed"])
+            with self.assertRaisesRegex(RuntimeError, "publication intent"):
+                invoke(number=1846)
+            mocks["acquire"].assert_not_called()
+            self.assertGreaterEqual(mocks["coordination"].call_count, 2)
+
+    def test_native_published_pr_closeout_rejects_dirty_active_or_drifted_readback(self) -> None:
+        for failure, message in (
+            ("clean", "dirty checkout"),
+            ("coordination", "active work"),
+            ("pr", "PR head drifted"),
+            ("git", "remote head"),
+        ):
+            with self.subTest(failure=failure), self.native_pr_closeout_fixture() as (invoke, path, receipt, mocks, _release):
+                if failure == "clean":
+                    mocks[failure].side_effect = RuntimeError(message)
+                elif failure == "coordination":
+                    mocks[failure].return_value = {"blocking": True, "blocking_counts": {"resource_leases": 0, "tasks": 1, "processes": 0}}
+                elif failure == "pr":
+                    mocks[failure].side_effect = RuntimeError(message)
+                else:
+                    original = mocks["git"].side_effect
+                    mocks["git"].side_effect = lambda repo, argv: ({"returncode": 0, "stdout": "bad-ref"} if argv[0] == "ls-remote" else original(repo, argv))
+                with self.assertRaisesRegex(RuntimeError, message):
+                    invoke()
+                self.assertEqual(receipt, work_acquire._read_state(path))
+                mocks["lifecycle"].assert_not_called()
+                mocks["release"].assert_not_called()
+
+    def test_native_published_pr_closeout_revalidates_local_state_and_leases(self) -> None:
+        for drift in ("head", "lease", "process"):
+            with self.subTest(drift=drift), self.native_pr_closeout_fixture() as (invoke, path, receipt, mocks, _release):
+                if drift == "head":
+                    top, common, checkout = mocks["checkout"].return_value
+                    mocks["checkout"].side_effect = [
+                        (top, common, checkout),
+                        (top, common, {**checkout, "head": "b" * 40}),
+                    ]
+                    message = "HEAD precondition failed"
+                elif drift == "lease":
+                    initial = mocks["leases"].side_effect
+                    first = initial(receipt)
+                    mocks["leases"].side_effect = [first, (*first[:2], [])]
+                    message = "owner lease observation drifted"
+                else:
+                    mocks["coordination"].side_effect = [
+                        {"blocking": False},
+                        {"blocking": True, "blocking_counts": {
+                            "resource_leases": 0, "tasks": 0, "processes": 1,
+                        }},
+                    ]
+                    message = "active work"
+                with self.assertRaisesRegex(RuntimeError, message):
+                    invoke()
+                self.assertEqual(receipt, work_acquire._read_state(path))
+                mocks["release"].assert_not_called()
+
+    def test_native_published_pr_closeout_requires_ready_same_repo_pr(self) -> None:
+        origin = {"returncode": 0, "stdout": "git@github.com:heimgewebe/grabowski.git\n"}
+        pr = {"number": 1845, "state": "OPEN", "headRefName": "topic",
+              "headRefOid": SHA, "isCrossRepository": False, "isDraft": False}
+        with patch.object(work_acquire, "_git_runner", return_value=origin):
+            for override in ({}, {"isCrossRepository": True}, {"isDraft": True}, {"isCrossRepository": None}):
+                with self.subTest(override=override), patch.object(
+                    work_acquire.operator, "_run",
+                    return_value={"returncode": 0, "stdout": json.dumps({**pr, **override})},
+                ) as readback:
+                    args = dict(pr_number=1845, branch="topic", head=SHA,
+                                required_state="OPEN", require_ready_same_repo=True)
+                    if override:
+                        with self.assertRaisesRegex(RuntimeError, "non-draft same-repository"):
+                            work_acquire._github_pr_exact_head(self.repo, **args)
+                    else:
+                        self.assertEqual(SHA, work_acquire._github_pr_exact_head(self.repo, **args)["head_sha"])
+                    self.assertIn("isCrossRepository,isDraft", readback.call_args.args[0][-1])
+
+    def test_native_published_pr_closeout_resumes_exact_pending_intent_without_caller_cas(self) -> None:
+        with self.native_pr_closeout_fixture() as (invoke, path, receipt, mocks, release):
+            mocks["release"].side_effect = RuntimeError("interrupted lease release")
+            with self.assertRaisesRegex(RuntimeError, "interrupted lease release"):
+                invoke()
+            pending = work_acquire._read_state(path)
+            self.assertIn("terminal_closeout_pending", pending)
+            self.assertNotEqual(receipt["receipt_sha256"], pending["receipt_sha256"])
+            with self.assertRaisesRegex(RuntimeError, "publication intent"):
+                invoke(number=1846)
+            self.assertEqual(pending, work_acquire._read_state(path))
+            mocks["release"].side_effect = release
+            result = invoke()
+            self.assertTrue(result["replayed"])
+            self.assertNotIn("terminal_closeout_pending", result)
+            self.assertEqual(receipt["receipt_sha256"], result["terminal_closeout"]["expected_receipt_sha256"])
+
     def test_mcp_entry_routes_terminal_closeout_after_original_retention_expires(self) -> None:
         params = self.parameters()
         params["retention_until_unix"] = 100

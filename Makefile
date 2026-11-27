@@ -12,8 +12,9 @@ RETENTION_MAX_ARCHIVE_JOBS ?= 128
 
 .PHONY: validate validate-main-reuse syntax test policy tool-surface-budget catalog-data-refresh catalog-data-check context-refresh context-check profiles-refresh profiles-check runtime-lock chronik-runtime-contract runtime-lock-refresh secrets deploy-tooling deploy-tooling-check deploy-tooling-lock-refresh deploy-check deploy-preflight deploy-apply deploy-direct deploy runtime-retention-check runtime-retention-apply runtime-legacy-status routing-cli-check routing-cli-apply
 
-VALIDATE_PRECHECKS := catalog-data-check syntax
-VALIDATE_CONTRACT_CHECKS := policy tool-surface-budget context-check profiles-check runtime-lock chronik-runtime-contract deploy-tooling-check secrets
+# Reject generated-contract drift before spending time on the full test suite.
+VALIDATE_PRECHECKS := catalog-data-check syntax context-check profiles-check
+VALIDATE_CONTRACT_CHECKS := policy tool-surface-budget runtime-lock chronik-runtime-contract deploy-tooling-check secrets
 
 validate: $(VALIDATE_PRECHECKS) test $(VALIDATE_CONTRACT_CHECKS)
 
