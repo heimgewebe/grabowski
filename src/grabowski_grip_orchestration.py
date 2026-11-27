@@ -1400,11 +1400,15 @@ def _verified_captain_audit_reference_identity(
     *,
     receipt_sha256_json: ReceiptHasher | None = None,
     require_passed: bool = True,
+    _audit_snapshot: Any = None,
 ) -> dict[str, Any]:
     try:
         import grabowski_audit_query
 
-        snapshot = grabowski_audit_query.capture_verified_audit_snapshot()
+        snapshot = (
+            _audit_snapshot if _audit_snapshot is not None
+            else grabowski_audit_query.capture_verified_audit_snapshot()
+        )
     except (ImportError, OSError, RuntimeError, ValueError) as exc:
         raise SagaError(
             f"verified Captain audit snapshot unavailable: {type(exc).__name__}"
@@ -1695,13 +1699,17 @@ def validate_run_receipt(value: Any, *, plan_value: Any) -> dict[str, Any]:
     return run
 
 
-def _verified_saga_run_receipt_reference(
-    plan: dict[str, Any], audit_ref: dict[str, Any]
+def _verified_saga_run_record(
+    audit_ref: Any, *, _audit_snapshot: Any = None
 ) -> dict[str, Any]:
+    audit_ref = validate_saga_run_receipt_ref(audit_ref)
     try:
         import grabowski_audit_query
 
-        snapshot = grabowski_audit_query.capture_verified_audit_snapshot()
+        snapshot = (
+            _audit_snapshot if _audit_snapshot is not None
+            else grabowski_audit_query.capture_verified_audit_snapshot()
+        )
     except (ImportError, OSError, RuntimeError, ValueError) as exc:
         raise SagaError(
             f"verified Saga run audit snapshot unavailable: {type(exc).__name__}"
@@ -1724,10 +1732,18 @@ def _verified_saga_run_receipt_reference(
         or record.get("operation") != SAGA_RUN_AUDIT_OPERATION
     ):
         raise SagaError("verified Saga run audit record contract is invalid")
+    return record
+
+
+def _validate_saga_run_record(
+    record: dict[str, Any], plan: dict[str, Any]
+) -> dict[str, Any]:
     if record.get("plan_sha256") != plan["plan_sha256"]:
         raise SagaError("verified Saga run audit record is bound to another saga plan")
     if record.get("saga_kind") != plan["saga_kind"]:
         raise SagaError("verified Saga run audit record saga kind drifted")
+    if "plan" in record and validate_plan(record["plan"]) != plan:
+        raise SagaError("verified Saga run audit stored plan drifted")
     run_value = _bounded_mapping(
         record.get("run_receipt"), "verified Saga run audit.run_receipt"
     )
@@ -1737,6 +1753,29 @@ def _verified_saga_run_receipt_reference(
     if record.get("run_sha256") != run["run_sha256"]:
         raise SagaError("verified Saga run audit run digest mismatch")
     return run
+
+
+def _verified_saga_run_receipt_reference(
+    plan: dict[str, Any], audit_ref: dict[str, Any], *, _audit_snapshot: Any = None
+) -> dict[str, Any]:
+    return _validate_saga_run_record(
+        _verified_saga_run_record(audit_ref, _audit_snapshot=_audit_snapshot), plan
+    )
+
+
+def recover_saga_run(
+    audit_ref: Any, *, _audit_snapshot: Any = None
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Resolve the exact plan and run from one verified, immutable audit record.
+
+    Older records deliberately require the original explicit plan parameters.
+    Neither a guessed plan nor caller-supplied receipt data is recovery evidence.
+    """
+    record = _verified_saga_run_record(audit_ref, _audit_snapshot=_audit_snapshot)
+    if "plan" not in record:
+        raise SagaError("legacy Saga run audit lacks the plan; supply original plan parameters")
+    plan = validate_plan(record["plan"])
+    return plan, _validate_saga_run_record(record, plan)
 
 
 def _captain_outcome(
@@ -1793,6 +1832,7 @@ def validate_captain_audit_binding(
     plan_value: Any,
     captain_result_value: Any,
     receipt_sha256_json: ReceiptHasher | None = None,
+    _audit_snapshot: Any = None,
 ) -> dict[str, Any]:
     plan = validate_plan(plan_value)
     captain = _bounded_mapping(captain_result_value, "captain_result")
@@ -1813,7 +1853,8 @@ def validate_captain_audit_binding(
         )
     else:
         trusted_audit_identity = _verified_captain_audit_reference_identity(
-            plan, audit_ref, receipt_sha256_json=receipt_hasher
+            plan, audit_ref, receipt_sha256_json=receipt_hasher,
+            _audit_snapshot=_audit_snapshot,
         )
 
     binding = _bounded_mapping(value, "captain_audit_binding")
@@ -1996,11 +2037,14 @@ def settle(
     captain_audit_binding_value: Any,
     readback_value: Any,
     receipt_sha256_json: ReceiptHasher | None = None,
+    _audit_snapshot: Any = None,
 ) -> dict[str, Any]:
     plan = validate_plan(plan_value)
     if is_saga_run_receipt_ref(run_receipt_value):
         run_ref = validate_saga_run_receipt_ref(run_receipt_value)
-        run = _verified_saga_run_receipt_reference(plan, run_ref)
+        run = _verified_saga_run_receipt_reference(
+            plan, run_ref, _audit_snapshot=_audit_snapshot
+        )
     else:
         run = validate_run_receipt(run_receipt_value, plan_value=plan)
     captain = _bounded_mapping(captain_result_value, "captain_result")
@@ -2009,6 +2053,7 @@ def settle(
         plan_value=plan,
         captain_result_value=captain,
         receipt_sha256_json=receipt_sha256_json,
+        _audit_snapshot=_audit_snapshot,
     )
     readback = _bounded_mapping(readback_value, "readback")
     if run.get("captain_ready") is not True or run.get("state") != "captain_required":

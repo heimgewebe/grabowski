@@ -839,16 +839,9 @@ GRIP_SPECS: dict[str, GripSpec] = {
     "saga-settle": GripSpec(
         name="saga-settle",
         version="1.0",
-        summary="Settle one exact saga from its run receipt, Captain receipt and typed live readback.",
+        summary="Settle one exact saga from verified run/Captain references or explicit legacy plan parameters and typed live readback.",
         effect=READ_ONLY,
-        required_parameters=(
-            "saga_kind",
-            "target",
-            "idempotency_key",
-            "expected_plan_sha256",
-            "run_receipt",
-            "captain_result",
-        ),
+        required_parameters=("run_receipt", "captain_result"),
         acceptance_ids=("plan-run-captain-bound", "captain-audit-bound", "live-readback-bound", "partial-failure-explicit", "authority-preserved"),
         runner="saga_settle",
         uses_github=True,
@@ -12483,6 +12476,7 @@ def _saga_persist_run_receipt(
                 "schema_version": grabowski_grip_orchestration.SCHEMA_VERSION,
                 "saga_kind": plan["saga_kind"],
                 "plan_sha256": plan["plan_sha256"],
+                "plan": grabowski_grip_orchestration.validate_plan(plan),
                 "run_sha256": validated["run_sha256"],
                 "run_receipt_sha256": grabowski_grip_orchestration.sha256_json(validated),
                 "run_receipt": validated,
@@ -12581,7 +12575,7 @@ def _run_saga_run(
 
 
 def _saga_verified_audit_records(
-    record_sha256s: list[str],
+    record_sha256s: list[str], *, _audit_snapshot: Any = None
 ) -> dict[str, dict[str, Any]]:
     if (
         not record_sha256s
@@ -12592,7 +12586,10 @@ def _saga_verified_audit_records(
     try:
         import grabowski_audit_query
 
-        snapshot = grabowski_audit_query.capture_verified_audit_snapshot()
+        snapshot = (
+            _audit_snapshot if _audit_snapshot is not None
+            else grabowski_audit_query.capture_verified_audit_snapshot()
+        )
     except (ImportError, OSError, RuntimeError, ValueError) as exc:
         raise GripPreflightError(
             f"verified Captain audit snapshot unavailable: {type(exc).__name__}"
@@ -12639,12 +12636,16 @@ def _saga_verified_audit_records(
     return found
 
 
-def _saga_verified_audit_record(record_sha256: str) -> dict[str, Any]:
-    return _saga_verified_audit_records([record_sha256])[record_sha256]
+def _saga_verified_audit_record(
+    record_sha256: str, *, _audit_snapshot: Any = None
+) -> dict[str, Any]:
+    return _saga_verified_audit_records(
+        [record_sha256], _audit_snapshot=_audit_snapshot
+    )[record_sha256]
 
 
 def _saga_captain_audit_binding(
-    plan: dict[str, Any], captain_result_value: Any
+    plan: dict[str, Any], captain_result_value: Any, *, _audit_snapshot: Any = None
 ) -> dict[str, Any]:
     if not isinstance(captain_result_value, dict):
         raise GripPreflightError("captain_result must be an object")
@@ -12657,7 +12658,9 @@ def _saga_captain_audit_binding(
                 captain_result
             )
             completion_sha = str(audit_ref["completion_record_sha256"])
-            completion = _saga_verified_audit_record(completion_sha)
+            completion = _saga_verified_audit_record(
+                completion_sha, _audit_snapshot=_audit_snapshot
+            )
             intent_sha = completion.get("intent_audit_sha256")
             if not _is_sha256_hex(intent_sha):
                 raise GripPreflightError("Captain audit completion lacks a valid intent binding")
@@ -12683,7 +12686,9 @@ def _saga_captain_audit_binding(
                 raise GripPreflightError("captain_result Captain audit record identity is invalid")
     except grabowski_grip_orchestration.SagaError as exc:
         raise GripPreflightError(str(exc)) from exc
-    verified_records = _saga_verified_audit_records([str(intent_sha), str(completion_sha)])
+    verified_records = _saga_verified_audit_records(
+        [str(intent_sha), str(completion_sha)], _audit_snapshot=_audit_snapshot
+    )
     intent = verified_records[str(intent_sha)]
     completion = verified_records[str(completion_sha)]
     expected_identity = plan["expected_identity"]
@@ -12817,20 +12822,56 @@ def _run_saga_settle(
             "captain_result",
         },
     )
-    plan = _saga_plan_from_parameters(parameters)
-    _saga_expected_plan(plan, parameters)
+    plan_keys = {"saga_kind", "target", "idempotency_key", "expected_plan_sha256"}
+    supplied = plan_keys.intersection(parameters)
+    run_receipt_value = parameters.get("run_receipt")
+    captain_result_value = parameters.get("captain_result")
+    if supplied and supplied != plan_keys:
+        raise GripPreflightError("saga settlement requires all legacy plan parameters or none")
+    if supplied:
+        plan = _saga_plan_from_parameters(parameters)
+        _saga_expected_plan(plan, parameters)
+    # Both immutable audit references already exist at invocation time. Capture
+    # one server-owned view for their verification, never reuse across calls
+    # or accept a snapshot via the public parameter envelope. Target readback
+    # still happens live after verifying the Captain binding.
+    audit_snapshot = None
+    if (
+        grabowski_grip_orchestration.is_saga_run_receipt_ref(run_receipt_value)
+        and grabowski_grip_orchestration.is_captain_audit_result_ref(captain_result_value)
+    ):
+        try:
+            grabowski_grip_orchestration.validate_saga_run_receipt_ref(run_receipt_value)
+            grabowski_grip_orchestration.validate_captain_audit_result_ref(captain_result_value)
+            import grabowski_audit_query
+
+            audit_snapshot = grabowski_audit_query.capture_verified_audit_snapshot()
+        except grabowski_grip_orchestration.SagaError as exc:
+            raise GripPreflightError(str(exc)) from exc
+        except (ImportError, OSError, RuntimeError, ValueError) as exc:
+            raise GripPreflightError(
+                f"verified Saga settlement audit snapshot unavailable: {type(exc).__name__}"
+            ) from exc
+    if not supplied:
+        try:
+            plan, run_receipt_value = grabowski_grip_orchestration.recover_saga_run(
+                run_receipt_value, _audit_snapshot=audit_snapshot
+            )
+        except grabowski_grip_orchestration.SagaError as exc:
+            raise GripPreflightError(str(exc)) from exc
     captain_audit_binding = _saga_captain_audit_binding(
-        plan, parameters.get("captain_result")
+        plan, captain_result_value, _audit_snapshot=audit_snapshot
     )
     readback, readback_source = _saga_live_readback(plan, github_runner)
     try:
         settlement = grabowski_grip_orchestration.settle(
             plan_value=plan,
-            run_receipt_value=parameters.get("run_receipt"),
-            captain_result_value=parameters.get("captain_result"),
+            run_receipt_value=run_receipt_value,
+            captain_result_value=captain_result_value,
             captain_audit_binding_value=captain_audit_binding,
             readback_value=readback,
             receipt_sha256_json=sha256_json,
+            _audit_snapshot=audit_snapshot,
         )
     except grabowski_grip_orchestration.SagaError as exc:
         raise GripPreflightError(str(exc)) from exc
