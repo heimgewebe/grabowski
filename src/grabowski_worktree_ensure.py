@@ -1015,6 +1015,7 @@ def _bind_checkout_lifecycle(
     *,
     newly_created: bool = False,
     reserved_lifecycle: dict[str, Any] | None = None,
+    expected_physical: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     import grabowski_checkouts as checkouts
 
@@ -1032,8 +1033,12 @@ def _bind_checkout_lifecycle(
         str(inputs["branch"]),
     )
     try:
-        physical = physical_checkout.capture_physical_checkout_identity(
-            checkout, include_stable_witness=True
+        physical = (
+            physical_checkout.capture_physical_checkout_identity(
+                checkout, include_stable_witness=True
+            )
+            if expected_physical is None
+            else physical_checkout.verify_physical_checkout_identity(expected_physical)
         )
     except Exception as exc:
         raise WorktreeEnsureAction(
@@ -1106,6 +1111,28 @@ def _bind_checkout_lifecycle(
         ).fetchone()
         if row is None or checkouts._lifecycle_public(row) != expected_binding:
             raise WorktreeEnsureAction("worktree lifecycle reservation changed before finalization")
+        if expected_physical is not None:
+            # The recorded reservation may since have been aborted or superseded.
+            # Reject before changing retention, in the existing checkout transaction.
+            identity_row = connection.execute(
+                "SELECT * FROM checkout_identity_reservations WHERE intent_key=?",
+                (identity_reservation["intent_key"],),
+            ).fetchone()
+            generation = checkout_identity._current_generation(
+                connection, retention_fields["checkout_key"]
+            )
+            if (
+                identity_row is None
+                or identity_row["state"] not in {"reserved", "active"}
+                or any(
+                    identity_row[field] != identity_reservation[field]
+                    for field in ("checkout_key", "generation_id", "requested_identity_sha256")
+                )
+                or generation is None
+                or generation["generation_id"] != identity_reservation["generation_id"]
+                or generation["state"] not in {"reserved", "active"}
+            ):
+                raise WorktreeEnsureAction("worktree identity reservation changed before finalization")
         retention = checkouts._upsert_retention_in_connection(connection, **retention_fields)
         connection.commit()
     identity = checkout_identity.finalize(identity_reservation)
@@ -1482,6 +1509,7 @@ def ensure_worktree(
     record_friction: FrictionRecorder | None = None,
     resolve_friction: FrictionResolver | None = None,
     assess_admission: Callable[..., dict[str, Any]] | None = None,
+    recover_existing_only: bool = False,
 ) -> dict[str, Any]:
     if (
         parameters.get("system_convergence") is not None
@@ -1515,6 +1543,21 @@ def ensure_worktree(
                 "non_claims": ["the existing durable receipt was not overwritten"],
             }
 
+        # The outer unknown-effect recovery must never perform another Git create.
+        if recover_existing_only and (
+            existing is None
+            or (
+                existing.get("state") == "intent"
+                and not isinstance(existing.get("verified_post_create"), dict)
+            )
+            or (
+                existing.get("state") == "complete"
+                and existing.get("result_state") not in SUCCESS_STATES
+                and existing.get("error_class") != "VERIFIED_CREATE_ABSENT"
+            )
+        ):
+            raise WorktreeEnsureAction("no verified existing worktree effect to recover")
+
         adler_provenance_path = _adler_sidecar_provenance_path(receipt_path)
         adler_provenance: dict[str, Any] | None = None
         if _adler_lane_id(inputs) is not None:
@@ -1529,6 +1572,30 @@ def ensure_worktree(
 
         if existing is not None and existing.get("state") == "complete":
             result_state = existing.get("result_state")
+            if recover_existing_only and existing.get("error_class") == "VERIFIED_CREATE_ABSENT":
+                # A crash after the inner abort but before outer lane closeout
+                # must not discard the terminal evidence or repeat the abort.
+                reservation = existing.get("lifecycle_reservation") or {}
+                transition = reservation.get("identity_transition") or {}
+                if (
+                    result_state != "CONFLICT"
+                    or not isinstance(existing.get("verified_post_create"), dict)
+                    or reservation.get("released") is not True
+                    or transition.get("state") != "aborted"
+                    or existing.get("post_state", {}).get("classification") != "ABSENT"
+                ):
+                    raise WorktreeEnsureAction("absent creation lacks terminal reservation evidence")
+                import grabowski_checkouts as checkouts
+
+                with checkouts._operation_lock():
+                    observation = _observe_after_possible_effect(
+                        inputs, runner, phase="durable absent creation replay"
+                    )
+                    if observation["classification"] != "ABSENT" or not _lease_state(
+                        inputs, inspect_lease
+                    )["valid"]:
+                        raise WorktreeEnsureAction("absent creation observation or lease changed")
+                return _public_output(existing, receipt_path, replayed=True, recovered=False)
             if result_state in SUCCESS_STATES:
                 observation = _observe_after_possible_effect(
                     inputs, runner, phase="durable success replay"
@@ -1551,6 +1618,17 @@ def ensure_worktree(
                         "non_claims": ["the prior durable receipt remains immutable evidence of the earlier result"],
                     }
             lifecycle = existing.get("lifecycle")
+            if recover_existing_only:
+                if (
+                    not isinstance(lifecycle, dict)
+                    or not isinstance(lifecycle.get("physical_checkout"), dict)
+                    or not _lease_state(inputs, inspect_lease)["valid"]
+                ):
+                    raise WorktreeEnsureAction("existing success lacks exact live recovery evidence")
+                physical_checkout.verify_physical_checkout_identity(
+                    lifecycle["physical_checkout"]
+                )
+                return _public_output(existing, receipt_path, replayed=True, recovered=True)
             if result_state in SUCCESS_STATES and not isinstance(lifecycle, dict):
                 assert observation is not None
                 lifecycle = _bind_checkout_lifecycle(inputs, observation, existing["lease"])
@@ -1613,6 +1691,63 @@ def ensure_worktree(
                 inputs, runner, phase="interrupted intent recovery"
             )
             lease = _lease_state(inputs, inspect_lease)
+            verified_create = existing.get("verified_post_create")
+            reserved_lifecycle = None
+            if (
+                isinstance(verified_create, dict)
+                and isinstance(verified_create.get("reserved_lifecycle"), dict)
+                and isinstance(verified_create.get("physical_checkout"), dict)
+                and observation["classification"] == "ABSENT"
+                and lease["valid"]
+            ):
+                import grabowski_checkouts as checkouts
+
+                binding = verified_create["reserved_lifecycle"]
+                reservation = binding.get("identity_reservation")
+                if not isinstance(reservation, dict):
+                    raise WorktreeEnsureAction("verified creation lacks its identity reservation")
+                # Serialize with the existing Git creation path and recheck absence
+                # and authority. No Git creation or deletion is authorized here.
+                with checkouts._operation_lock():
+                    observation = _observe_after_possible_effect(
+                        inputs, runner, phase="absent verified creation reconciliation"
+                    )
+                    lease = _lease_state(inputs, inspect_lease)
+                    if observation["classification"] != "ABSENT" or not lease["valid"]:
+                        raise WorktreeEnsureAction("absent creation observation or lease changed")
+                    error = "verified creation no longer exists; exact initial reservation aborted"
+                    transition = checkout_identity.abort(
+                        reservation, reason=error, absent_lifecycle=binding,
+                    )
+                record = _durable_record(
+                    inputs=inputs, parameters_sha256=parameters_sha256,
+                    state="complete", result_state="CONFLICT", post_state=observation,
+                    error_class="VERIFIED_CREATE_ABSENT", error=error,
+                    friction=recovery_friction, created_at_unix=existing.get("created_at_unix"),
+                )
+                record["lease"] = lease
+                record["verified_post_create"] = verified_create
+                record["lifecycle_reservation"] = {
+                    "preserved": False, "released": True, "binding": None,
+                    "identity_transition": transition,
+                }
+                written = _write_receipt(receipt_path, record)
+                return _public_output(written, receipt_path, replayed=True, recovered=False)
+            if recover_existing_only and (
+                observation["classification"] != "ALREADY_CORRECT" or not lease["valid"]
+            ):
+                raise WorktreeEnsureAction("interrupted worktree or live lease no longer matches")
+            if isinstance(verified_create, dict):
+                if (
+                    observation["classification"] != "ALREADY_CORRECT"
+                    or not isinstance(verified_create.get("reserved_lifecycle"), dict)
+                    or not isinstance(verified_create.get("physical_checkout"), dict)
+                ):
+                    raise WorktreeEnsureAction("verified post-create evidence no longer matches")
+                physical_checkout.verify_physical_checkout_identity(
+                    verified_create["physical_checkout"]
+                )
+                reserved_lifecycle = verified_create["reserved_lifecycle"]
 
             if observation["classification"] == "ALREADY_CORRECT":
                 event_id = str((recovery_friction or {}).get("event_id") or "")
@@ -1673,7 +1808,17 @@ def ensure_worktree(
                 )
                 if isinstance(sidecar_plan, dict):
                     record["adler_sidecar_plan"] = sidecar_plan
-                record["lifecycle"] = _bind_checkout_lifecycle(inputs, observation, lease)
+                record["lifecycle"] = _bind_checkout_lifecycle(
+                    inputs, observation, lease,
+                    newly_created=isinstance(verified_create, dict),
+                    reserved_lifecycle=reserved_lifecycle,
+                    expected_physical=(
+                        verified_create["physical_checkout"]
+                        if isinstance(verified_create, dict) else None
+                    ),
+                )
+                if verified_create is not None:
+                    record["verified_post_create"] = verified_create
                 written = _write_receipt(receipt_path, record)
                 return _public_output(written, receipt_path, replayed=True, recovered=True)
 
@@ -1899,6 +2044,8 @@ def ensure_worktree(
             return _public_output(written, receipt_path, replayed=recovering_intent, recovered=False)
 
         lease = pre_mutation_lease
+        if recover_existing_only:
+            raise WorktreeEnsureAction("existing-only recovery cannot create a worktree")
         try:
             lifecycle_reservation = _reserve_input_lifecycle(inputs)
         except (PermissionError, RuntimeError, ValueError) as exc:
@@ -1944,6 +2091,22 @@ def ensure_worktree(
             inputs, runner, phase="post-mutation"
         )
         if post_state.get("matches_requested_state"):
+            # Preserve the verified effect before lifecycle finalization can fail.
+            # Reuse the original reservation; do not admit a second writer.
+            verified_create = None
+            if _returncode(mutation) == 0:
+                if not isinstance(existing, dict) or existing.get("state") != "intent":
+                    raise WorktreeEnsureAction("post-create recovery requires the original intent")
+                verified_create = {
+                    "reserved_lifecycle": lifecycle_reservation,
+                    "physical_checkout": physical_checkout.capture_physical_checkout_identity(
+                        inputs["target_path"], include_stable_witness=True,
+                    ),
+                }
+                existing = _write_receipt(
+                    receipt_path, {**existing, "verified_post_create": verified_create,
+                                   "updated_at_unix": int(time.time())},
+                )
             event_id = str((recovery_friction or {}).get("event_id") or "")
             closeout = _resolve_friction(resolve_friction, event_id, receipt_path, parameters_sha256)
             record = _durable_record(
@@ -1977,6 +2140,9 @@ def ensure_worktree(
                 inputs, post_state, lease,
                 newly_created=_returncode(mutation) == 0,
                 reserved_lifecycle=lifecycle_reservation,
+                expected_physical=(
+                    verified_create["physical_checkout"] if verified_create else None
+                ),
             )
             record["mutation"] = {
                 "returncode": _returncode(mutation),

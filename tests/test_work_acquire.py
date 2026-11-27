@@ -4802,6 +4802,26 @@ class WorkAcquireTests(unittest.TestCase):
         self.assertEqual(ensure.call_count, 1)
         release.assert_not_called()
 
+    def test_inventory_failure_with_uncertain_writer_start_never_recovers_ensure(self) -> None:
+        inputs, receipt = self.store_lane(self.parameters())
+        with work_acquire._lane_lock(inputs["lane_id"]) as path:
+            unknown = work_acquire._write_state(path, {
+                **receipt,
+                "state": "outcome_unknown",
+                "error_class": "ResourceSchemaInventoryChanged",
+                "effect_observed": None,
+                "writer_start": {"state": "outcome_unknown"},
+            })
+        ensure = Mock(side_effect=AssertionError("writer outcome must stay fenced"))
+        acquire = Mock(side_effect=AssertionError("no lease reacquisition"))
+        result = work_acquire.acquire_work(
+            self.parameters(), ensure_worktree_fn=ensure, acquire_resources_fn=acquire,
+        )
+        self.assertEqual("outcome_unknown", result["state"])
+        self.assertEqual(unknown["receipt_sha256"], result["receipt_sha256"])
+        ensure.assert_not_called()
+        acquire.assert_not_called()
+
     def test_preflight_exception_after_lease_acquisition_is_compensated(self) -> None:
         release = Mock(side_effect=self.release)
         result = work_acquire.acquire_work(

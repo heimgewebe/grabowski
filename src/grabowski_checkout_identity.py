@@ -1280,7 +1280,12 @@ def _restore_row(
     )
 
 
-def abort(reservation: dict[str, Any], *, reason: str) -> dict[str, Any]:
+def abort(
+    reservation: dict[str, Any],
+    *,
+    reason: str,
+    absent_lifecycle: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     intent_key = _required_text(reservation.get("intent_key"), "identity reservation intent")
     error = _required_text(reason, "identity abort reason", maximum=2000)
     now = _now()
@@ -1295,6 +1300,53 @@ def abort(reservation: dict[str, Any], *, reason: str) -> dict[str, Any]:
         )
         if row is None:
             raise CheckoutIdentityConflict("identity reservation is missing")
+        if absent_lifecycle is not None:
+            current = _reservation_public(row)
+            immutable = (
+                "intent_key", "checkout_key", "generation_id", "action",
+                "prior_generation_id", "requested_identity_sha256", "created_at_unix",
+            )
+            if (
+                any(current.get(key) != reservation.get(key) for key in immutable)
+                or reservation.get("state") != "reserved"
+                or row["action"] != "new"
+                or row.get("prior_generation_id") is not None
+                or row.get("archive_id") is not None
+                or absent_lifecycle.get("checkout_key") != row["checkout_key"]
+            ):
+                raise CheckoutIdentityConflict("absent creation lacks exact initial reservation")
+            # An interrupted receipt write can replay our own committed abort.
+            if row["state"] == "aborted" and row.get("error") == error:
+                connection.commit()
+                return current
+            generation = _current_generation(connection, row["checkout_key"])
+            lifecycle = _row_dict(connection.execute(
+                "SELECT * FROM lifecycle_bindings WHERE checkout_key=?",
+                (row["checkout_key"],),
+            ).fetchone())
+            retention = connection.execute(
+                "SELECT 1 FROM retention WHERE checkout_key=?", (row["checkout_key"],)
+            ).fetchone()
+            expected_lifecycle = {
+                key: value for key, value in absent_lifecycle.items()
+                if key not in {"identity_reservation", "limit"}
+            }
+            if (
+                current != reservation
+                or row["state"] != "reserved"
+                or generation is None
+                or generation["generation_id"] != row["generation_id"]
+                or generation["state"] != "reserved"
+                or lifecycle is None
+                or lifecycle["phase"] != "active"
+                or _checkouts()._lifecycle_public(lifecycle) != expected_lifecycle
+                or retention is not None
+            ):
+                raise CheckoutIdentityConflict("absent creation reservation changed or was finalized")
+            # Exact lifecycle preimage was checked under this same write transaction.
+            connection.execute(
+                "DELETE FROM lifecycle_bindings WHERE checkout_key=?", (row["checkout_key"],)
+            )
         if row["state"] == "active":
             connection.commit()
             return _reservation_public(row)
