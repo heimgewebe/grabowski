@@ -61,6 +61,12 @@ MAX_REQUEST_BYTES = 1024 * 1024
 # Hash each inventory entry with its existing safe reader, while bounding total
 # work above the size of the current legitimate canonical Bureau Registry.
 MAX_REGISTRY_TREE_BYTES = 32 * 1024 * 1024
+# Claim phases compose live GitHub observations (each bounded at 30 s),
+# registry/StateStore validation and, at commit, workspace materialization.
+# Keep a separate bounded phase deadline; the generic 30 s adapter deadline
+# can cancel valid work before these checks finish. Readback and recovery keep
+# their existing defaults and authority/lease checks are unchanged.
+CLAIM_PHASE_TIMEOUT_SECONDS = 90
 MAX_CLAIM_REJECTION_CODE_BYTES = 128
 MAX_CLAIM_REJECTION_VALUE_BYTES = 16 * 1024
 MIN_LEASE_TTL_SECONDS = 120
@@ -1391,7 +1397,11 @@ def _claim_intent(request: dict[str, Any]) -> dict[str, Any]:
         "--break-glass" if request["approval_level"] == "break_glass" else "--approve"
     )
     arguments.extend(["--approval-source", request["approval_source"]])
-    return bureau._invoke_bureau(arguments, include_runtime_identity=True)
+    return bureau._invoke_bureau(
+        arguments,
+        timeout_seconds=CLAIM_PHASE_TIMEOUT_SECONDS,
+        include_runtime_identity=True,
+    )
 
 
 def _claim_intent_or_closeout(
@@ -2052,6 +2062,7 @@ def _commit_claim(
         arguments.append("--workspace")
     return bureau._invoke_bureau(
         arguments,
+        timeout_seconds=CLAIM_PHASE_TIMEOUT_SECONDS,
         mutation=True,
         required_readback=[
             f"bureau_run:{intent['run_id']}",
