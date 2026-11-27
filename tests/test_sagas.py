@@ -863,6 +863,136 @@ class SagaContractTests(unittest.TestCase):
         self.assertIn("pr_merge_commit_missing", result["reasons"])
 
 
+class SagaDurablePlanRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        helper = SagaContractTests()
+        self.plan = sagas.build_plan(
+            "runtime-deployment", helper.runtime_target(), "durable-plan-recovery"
+        )
+        self.run = sagas.build_run_receipt(
+            self.plan, helper.mechanic_result(self.plan)
+        )
+        self.ref = {
+            "schema_version": 1,
+            "kind": grip_orchestration.SAGA_RUN_RECEIPT_REF_KIND,
+            "record_sha256": "9" * 64,
+        }
+        self.record = {
+            "schema_version": 1,
+            "kind": grip_orchestration.SAGA_RUN_AUDIT_KIND,
+            "operation": grip_orchestration.SAGA_RUN_AUDIT_OPERATION,
+            "record_sha256": self.ref["record_sha256"],
+            "saga_kind": self.plan["saga_kind"],
+            "plan_sha256": self.plan["plan_sha256"],
+            "plan": self.plan,
+            "run_sha256": self.run["run_sha256"],
+            "run_receipt_sha256": sagas.sha256_json(self.run),
+            "run_receipt": self.run,
+        }
+        self.captain = helper.captain_result(self.plan)
+        self.binding = helper.audit_binding(self.plan, self.captain)
+
+    def snapshot(self, record):
+        payload = (json.dumps(record, separators=(",", ":")) + "\n").encode()
+        return types.SimpleNamespace(
+            segments=(types.SimpleNamespace(captured_data=payload),)
+        )
+
+    def test_exact_plan_and_run_recover_from_one_verified_record(self):
+        import grabowski_audit_query
+        with patch.object(
+            grabowski_audit_query, "capture_verified_audit_snapshot",
+            return_value=self.snapshot(self.record),
+        ) as capture:
+            self.assertEqual(
+                (self.plan, self.run), grip_orchestration.recover_saga_run(self.ref)
+            )
+        capture.assert_called_once_with()
+
+    def test_legacy_record_only_accepts_original_explicit_plan(self):
+        import grabowski_audit_query
+        record = dict(self.record)
+        del record["plan"]
+        with patch.object(
+            grabowski_audit_query, "capture_verified_audit_snapshot",
+            return_value=self.snapshot(record),
+        ):
+            with self.assertRaisesRegex(sagas.SagaError, "legacy Saga run audit"):
+                grip_orchestration.recover_saga_run(self.ref)
+            self.assertEqual(
+                self.run,
+                grip_orchestration._verified_saga_run_receipt_reference(self.plan, self.ref),
+            )
+
+    def test_rejects_tampering_foreign_plan_and_inline_reference(self):
+        import grabowski_audit_query
+        changed = copy.deepcopy(self.plan)
+        changed["idempotency_key"] = "tampered"
+        foreign = sagas.build_plan(
+            "runtime-deployment", SagaContractTests().runtime_target(), "foreign"
+        )
+        for record in (
+            {**self.record, "plan": changed},
+            {**self.record, "plan": foreign},
+            {**self.record, "run_receipt_sha256": "0" * 64},
+        ):
+            with self.subTest(record=record), patch.object(
+                grabowski_audit_query, "capture_verified_audit_snapshot",
+                return_value=self.snapshot(record),
+            ):
+                with self.assertRaises(sagas.SagaError):
+                    grip_orchestration.recover_saga_run(self.ref)
+        with self.assertRaises(sagas.SagaError):
+            grip_orchestration.recover_saga_run(self.run)
+
+    def test_public_settlement_reentry_does_not_repeat_prepare_or_apply(self):
+        import grabowski_audit_query
+        import grabowski_grips as grips
+        readback = {
+            "identity": {"repo_head": HEAD, "completion_status": "complete"},
+            "integrity": {"manifest_schema_valid": True},
+            "serving_process": {
+                "matches_deployed_manifest": True,
+                "serves_deployed_release": True,
+            },
+        }
+        params = {"run_receipt": self.ref, "captain_result": self.captain}
+        with patch.object(
+            grabowski_audit_query, "capture_verified_audit_snapshot",
+            return_value=self.snapshot(self.record),
+        ) as capture, patch.object(
+            grips, "_saga_captain_audit_binding", return_value=self.binding,
+        ), patch.object(
+            grips, "_saga_live_readback", return_value=(readback, "fixture"),
+        ) as live, patch.object(
+            grips, "_default_command_runner", side_effect=AssertionError("unexpected execution"),
+        ), patch.object(
+            grips, "_default_github_runner", side_effect=AssertionError("unexpected execution"),
+        ):
+            first = grips.run_grip("saga-settle", params)
+            resumed = grips.run_grip("saga-settle", params)
+            self.assertEqual("passed", first["status"])
+            self.assertEqual("settled", first["output"]["state"])
+            self.assertEqual(first["output"], resumed["output"])
+            self.assertEqual(2, capture.call_count)
+            self.assertEqual(2, live.call_count)
+            mixed = grips.run_grip("saga-settle", {**params, "target": self.plan["target"]})
+            self.assertEqual("blocked", mixed["status"])
+            self.assertEqual(2, live.call_count)
+
+    def test_new_audit_persists_exact_plan(self):
+        import grabowski_grips as grips
+        import grabowski_work_acquire as work_acquire
+        with patch.object(
+            work_acquire.operator.base, "_append_audit_with_digest",
+            return_value=self.ref["record_sha256"],
+        ) as append:
+            self.assertEqual(self.ref, grips._saga_persist_run_receipt(self.plan, self.run))
+        stored = append.call_args.args[0]
+        self.assertEqual(self.plan, stored["plan"])
+        self.assertEqual(self.run, stored["run_receipt"])
+
+
 class ExternalMergeSagaSettlementTests(unittest.TestCase):
     """Original no-dispatch Captain audit is not a retroactive merge PASS."""
 

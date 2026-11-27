@@ -638,7 +638,7 @@
     },
     {
       "category": "work-coordination",
-      "description": "Acquire a work lane, persist terminal closeout, or repair only its missing audit.\n\nNew acquisitions accept source_kind only from bureau_task, github_issue,\noperator_obligation, thread_focus, work_lane, direct, or direct-user.\nDirect sources bind checkout lifecycle evidence to the Work Lane itself.",
+      "description": "Acquire a work lane, persist terminal closeout, or repair only its missing audit.\n\nNew acquisitions accept source_kind only from bureau_task, github_issue,\noperator_obligation, thread_focus, work_lane, direct, or direct-user.\nDirect sources bind checkout lifecycle evidence to the Work Lane itself.\nFor an exact published PR on a direct controller lane, use terminal_closeout\nwith published_pr={lane_id, pr_number, pr_origin}; current checkout, publication,\nliveness and the inner receipt CAS are derived by the server.",
       "effects": [
         "resource-lease",
         "git-worktree-create",
@@ -3937,7 +3937,7 @@
       "src/grabowski_text_artifact_reconcile.py": "b302be1dbb101abbf825732bfe41658c13ac64417c2a6034326e57409daa4772",
       "src/grabowski_transport_assertion.py": "20d75d1f94c1d0273108c36eed8c58aa85e55a30b73546c4ac8af8a835fb8c8e",
       "src/grabowski_transport_roundtrip.py": "cf9f8ad76f504437c4ef7850b5099bdf9e68cdb104f31b98952a94433604c4c3",
-      "src/grabowski_work_acquire.py": "293f005639ae814c3093d05ca78689a8c3168495bf5832805228244a81c388d9",
+      "src/grabowski_work_acquire.py": "9d71c5a5a78560f3a87ddc51327632b8ab293110e19701d1bf7e915641a8c663",
       "src/grabowski_work_admission.py": "5c7529ac26df8ae698d59dbac8267dc1065711b9579274267e9a661e55748c2a",
       "src/grabowski_worker_process.py": "36b8bef1785e9e41c4a8a041b95cc69f3686c881680a89ac6680f2074f5919c0",
       "src/grabowski_workers.py": "a8fa8f49e6030a88acc270840be3cba4a1a39682ba8fbad933b7ce3c28eda1ad",
