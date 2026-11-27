@@ -4031,18 +4031,29 @@ def _recover_interrupted_ensure(
     *,
     inspect_resource_fn: Callable[[str], dict[str, Any] | None],
     ensure_worktree_fn: Callable[..., dict[str, Any]],
+    release_resources_fn: Callable[..., dict[str, Any]],
     runner: Callable[[Path, list[str]], dict[str, Any]],
     audit_fn: Callable[[dict[str, Any]], None] | None,
 ) -> dict[str, Any] | None:
-    """Converge a proven existing Git effect; never retry Git create or a writer."""
+    """Converge a proven existing or absent Git effect; never retry creation or a writer."""
+    pending_absence = (
+        existing.get("error_class") == "VERIFIED_CREATE_ABSENT"
+        and existing.get("effect_observed") is False
+        and isinstance(existing.get("worktree_receipt"), dict)
+        and existing.get("worktree_receipt", {}).get("error_class") == "VERIFIED_CREATE_ABSENT"
+        and existing.get("compensation") is None
+        and existing.get("next_action") == "reconcile_lease_compensation_before_retry"
+    )
     if (
-        existing.get("error_class") != "ResourceSchemaInventoryChanged"
-        or existing.get("effect_observed") is not None
+        (not pending_absence and (
+            existing.get("error_class") != "ResourceSchemaInventoryChanged"
+            or existing.get("effect_observed") is not None
+            or existing.get("worktree_receipt") is not None
+        ))
         or existing.get("compensation") is not None
         or existing.get("acquisition") is not None
         or existing.get("writer_start") is not None
         or existing.get("writer_job") is not None
-        or existing.get("worktree_receipt") is not None
         or inputs.get("scoped_writer_command") is not None
     ):
         return None
@@ -4078,6 +4089,84 @@ def _recover_interrupted_ensure(
             _ensure_parameters(inputs, lifecycle_source), runner, inspect_exact,
             recover_existing_only=True,
         )
+        if pending_absence and (
+            not isinstance(output, dict)
+            or output.get("durable_receipt_sha256") != existing["worktree_receipt"].get("durable_receipt_sha256")
+            or output.get("error_class") != "VERIFIED_CREATE_ABSENT"
+        ):
+            raise RuntimeError("verified absent creation receipt drifted before compensation")
+        if (
+            isinstance(output, dict)
+            and output.get("result_state") == "CONFLICT"
+            and output.get("error_class") == "VERIFIED_CREATE_ABSENT"
+            and output.get("replayed") is True
+            and output.get("post_state", {}).get("classification") == "ABSENT"
+            and (output.get("lifecycle_reservation") or {}).get("released") is True
+            and ((output.get("lifecycle_reservation") or {}).get("identity_transition") or {}).get("state") == "aborted"
+            and re.fullmatch(r"[0-9a-f]{64}", str(output.get("durable_receipt_sha256") or ""))
+        ):
+            # Preserve the terminal inner proof before any release. A failed
+            # or interrupted compensation remains fenced by the existing journal.
+            absent = {
+                **existing,
+                "state": "outcome_unknown",
+                "decision": "HARD_BLOCK",
+                "worktree_receipt": output,
+                "error_class": "VERIFIED_CREATE_ABSENT",
+                "error": output.get("error"),
+                "effect_observed": False,
+                "interrupted_ensure_recovery": {
+                    "previous_receipt_sha256": (
+                        existing["interrupted_ensure_recovery"]["previous_receipt_sha256"]
+                        if pending_absence else existing["receipt_sha256"]
+                    ),
+                    "same_lease_generations": True,
+                    "git_create_repeated": False,
+                    "worktree_receipt_sha256": output["durable_receipt_sha256"],
+                },
+                "next_action": "reconcile_lease_compensation_before_retry",
+                "updated_at_unix": int(time.time()),
+            }
+            _write_state(receipt_path, absent)
+            plan = _resource_acquisition_plan(inputs["resource_keys"])
+            if len(plan) == 1:
+                acquisitions = [_acquisition_evidence(plan[0], lease_receipt, owner_id=owner)]
+            else:
+                acquisitions = existing.get("lease_acquisition_groups")
+                if (
+                    existing.get("acquisition_plan") != plan
+                    or not isinstance(acquisitions, list)
+                    or len(acquisitions) != len(plan)
+                    or _acquisition_bundle(owner, plan, acquisitions) != lease_receipt
+                ):
+                    raise LeaseAcquisitionOutcomeUnknown("absent creation lacks original acquisition groups")
+            for key in snapshots:
+                inspect_exact(key)
+            compensation, complete = _compensate_acquisitions(
+                owner_id=owner, plan=plan, acquisitions=acquisitions,
+                release_resources_fn=release_resources_fn, receipt_path=receipt_path,
+                base_record=absent, lease_receipt=lease_receipt,
+            )
+            record = _write_state(receipt_path, {
+                **absent,
+                "state": "blocked" if complete else "outcome_unknown",
+                "decision": "AUTO_PREPARE_FAILED" if complete else "HARD_BLOCK",
+                "compensation": compensation,
+                "next_action": (
+                    "plan_new_lane_after_verified_absence" if complete
+                    else "reconcile_lease_compensation_before_retry"
+                ),
+            })
+            if audit_fn is not None:
+                audit_fn({
+                    "operation": "work-acquire",
+                    "lane_id": inputs["lane_id"],
+                    "state": record["state"],
+                    "inputs_sha256": record["inputs_sha256"],
+                    "effect_observed": False,
+                    "worktree_receipt_sha256": output["durable_receipt_sha256"],
+                })
+            return {**record, "durable_receipt_path": str(receipt_path), "replayed": True}
         if (
             not isinstance(output, dict)
             or output.get("result_state") not in SUCCESS_STATES
@@ -4127,10 +4216,11 @@ def _recover_interrupted_ensure(
                 },
             )
     except Exception as exc:
-        # Keep the original uncertainty fence and all lease ownership unchanged.
-        # A successful inner receipt can still be read back on the next attempt.
+        # Do not project a stale outer receipt after a durable absence proof
+        # or compensation intent was already written.
+        latest = _read_state(receipt_path) or existing
         return {
-            **existing,
+            **latest,
             "durable_receipt_path": str(receipt_path),
             "replayed": True,
             "recovery_blocker": f"{type(exc).__name__}: {str(exc)[:512]}",
@@ -4178,6 +4268,13 @@ def acquire_work(
         if existing is not None and existing.get("inputs_sha256") != inputs_sha256:
             raise RuntimeError("work-lane identity collision")
         if existing is not None and _terminal_closeout_assessment(existing) is not None:
+            return {**existing, "durable_receipt_path": str(receipt_path), "replayed": True}
+        if (
+            existing is not None and existing.get("state") == "blocked"
+            and existing.get("error_class") == "VERIFIED_CREATE_ABSENT"
+            and existing.get("effect_observed") is False
+            and (existing.get("compensation") or {}).get("state") == "complete"
+        ):
             return {**existing, "durable_receipt_path": str(receipt_path), "replayed": True}
         if (
             existing is not None
@@ -4232,6 +4329,7 @@ def acquire_work(
                 existing, inputs, lifecycle_source, receipt_path,
                 inspect_resource_fn=inspect_resource_fn,
                 ensure_worktree_fn=ensure_worktree_fn,
+                release_resources_fn=release_resources_fn,
                 runner=runner,
                 audit_fn=audit_fn,
             )

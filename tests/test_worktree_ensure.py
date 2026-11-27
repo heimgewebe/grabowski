@@ -907,6 +907,110 @@ class WorktreeEnsureTests(unittest.TestCase):
             self.assertEqual(1, len(acquire_calls))
             self.assertEqual(1, len(git_add_calls))
 
+    def _assert_outer_absent_recovery(self, *, lose_inner_reply=False, lose_outer_before_release=False, release_failure=False):
+        import grabowski_work_acquire as work_acquire
+
+        target = self.worktree_root / "absent-outer"
+        parameters = {
+            "source_kind": "bureau_task", "source_id": "STORAGE-LIFECYCLE-V1-T003",
+            "controller_actor": "test-controller", "repo": str(self.repo),
+            "base_head": self.head, "branch": "topic-absent-outer",
+            "target_path": str(target), "purpose": "verified absence closeout",
+            "retention_until_unix": self.retention_until, "idempotency_key": "outer-absent",
+        }
+        live, calls, releases, adds = {}, [], [], []
+        now = int(time.time())
+
+        def acquire(owner, keys, **kwargs):
+            calls.append(tuple(keys))
+            for key in keys:
+                live[key] = {"resource_key": key, "owner_id": owner,
+                             "purpose": parameters["purpose"], "acquired_at_unix": now,
+                             "updated_at_unix": now, "expires_at_unix": now + 1800,
+                             "metadata_sha256": "e" * 64}
+            return {"owner_id": owner, "leases": [dict(live[k]) for k in keys],
+                    "preserved": [], "reclaimed": [], "bureau_contract": None}
+
+        def runner(repo, argv):
+            if argv[:2] == ["worktree", "add"]:
+                adds.append(tuple(argv))
+            return grips._default_command_runner(repo, argv)
+
+        def release(owner, keys, *, expected_leases):
+            releases.append(list(keys))
+            self.assertEqual(expected_leases, [work_acquire._lease_snapshot(live[k], owner_id=owner) for k in keys])
+            # The inner terminal proof must already be durable before release.
+            lane = work_acquire._read_state(next((self.root / "lanes").glob("*.json")))
+            self.assertEqual(lane["worktree_receipt"]["error_class"], "VERIFIED_CREATE_ABSENT")
+            self.assertIs(lane["effect_observed"], False)
+            if release_failure:
+                raise RuntimeError("fixture lost compensation response")
+            released = [live.pop(k) for k in keys]
+            return {"owner_id": owner, "snapshot_guarded": True, "released": released}
+
+        lost = False
+        def ensure(*args, **kwargs):
+            nonlocal lost
+            output = worktree_ensure.ensure_worktree(*args, **kwargs)
+            if lose_inner_reply and not lost and output.get("error_class") == "VERIFIED_CREATE_ABSENT":
+                lost = True
+                raise SystemExit("fixture crash after inner durable receipt")
+            return output
+
+        kwargs = dict(acquire_resources_fn=acquire, release_resources_fn=release,
+                      inspect_resource_fn=lambda key: live.get(key), runner=runner,
+                      ensure_worktree_fn=ensure)
+        with patch.dict(os.environ, {
+            "GRABOWSKI_WORK_LANE_ROOT": str(self.root / "lanes"),
+            "GRABOWSKI_WORKTREE_ENSURE_RECEIPT_ROOT": str(self.receipt_root),
+            "GROSSER_ADLER_STATE_ROOT": str(self.root / "adler"),
+        }):
+            with patch.object(worktree_ensure, "_bind_checkout_lifecycle",
+                              side_effect=checkouts.resources.ResourceSchemaInventoryChanged("fixture")):
+                first = work_acquire.acquire_work(parameters, **kwargs)
+            self.assertEqual(first["state"], "outcome_unknown")
+            self._git(self.repo, "worktree", "remove", str(target))
+            self._git(self.repo, "branch", "-D", "topic-absent-outer")
+            if lose_inner_reply:
+                with self.assertRaises(SystemExit):
+                    work_acquire.acquire_work(parameters, **kwargs)
+                self.assertTrue(lost)
+                self.assertFalse(releases)
+            if lose_outer_before_release:
+                with patch.object(work_acquire, "_compensate_acquisitions",
+                                  side_effect=SystemExit("fixture crash before compensation starts")):
+                    with self.assertRaises(SystemExit):
+                        work_acquire.acquire_work(parameters, **kwargs)
+                pending = work_acquire._read_state(next((self.root / "lanes").glob("*.json")))
+                self.assertEqual(pending["error_class"], "VERIFIED_CREATE_ABSENT")
+                self.assertIsNone(pending["compensation"])
+                self.assertFalse(releases)
+            result = work_acquire.acquire_work(parameters, **kwargs)
+            self.assertEqual(result["state"], "outcome_unknown" if release_failure else "blocked", result)
+            self.assertEqual(result["error_class"], "VERIFIED_CREATE_ABSENT")
+            self.assertIs(result["effect_observed"], False)
+            self.assertEqual(result["worktree_receipt"]["error_class"], "VERIFIED_CREATE_ABSENT")
+            self.assertEqual(result["compensation"]["state"], "outcome_unknown" if release_failure else "complete")
+            self.assertEqual(bool(live), release_failure)
+            replay = work_acquire.acquire_work(parameters, **kwargs)
+            self.assertEqual(result["receipt_sha256"], replay["receipt_sha256"])
+            self.assertEqual(len(releases), 1)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(len(adds), 1)
+            self.assertFalse(target.exists())
+
+    def test_outer_absent_creation_compensates_exact_leases(self):
+        self._assert_outer_absent_recovery()
+
+    def test_outer_absent_creation_recovers_lost_inner_reply(self):
+        self._assert_outer_absent_recovery(lose_inner_reply=True)
+
+    def test_outer_absent_creation_resumes_before_compensation_starts(self):
+        self._assert_outer_absent_recovery(lose_outer_before_release=True)
+
+    def test_outer_absent_creation_preserves_proof_on_uncertain_compensation(self):
+        self._assert_outer_absent_recovery(release_failure=True)
+
     def test_recovered_regular_lane_cleanup_requires_verified_create(self) -> None:
         cases = (
             ("a", True, "implementation-worktree", True),

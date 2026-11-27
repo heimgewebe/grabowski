@@ -1553,6 +1553,7 @@ def ensure_worktree(
             or (
                 existing.get("state") == "complete"
                 and existing.get("result_state") not in SUCCESS_STATES
+                and existing.get("error_class") != "VERIFIED_CREATE_ABSENT"
             )
         ):
             raise WorktreeEnsureAction("no verified existing worktree effect to recover")
@@ -1571,6 +1572,30 @@ def ensure_worktree(
 
         if existing is not None and existing.get("state") == "complete":
             result_state = existing.get("result_state")
+            if recover_existing_only and existing.get("error_class") == "VERIFIED_CREATE_ABSENT":
+                # A crash after the inner abort but before outer lane closeout
+                # must not discard the terminal evidence or repeat the abort.
+                reservation = existing.get("lifecycle_reservation") or {}
+                transition = reservation.get("identity_transition") or {}
+                if (
+                    result_state != "CONFLICT"
+                    or not isinstance(existing.get("verified_post_create"), dict)
+                    or reservation.get("released") is not True
+                    or transition.get("state") != "aborted"
+                    or existing.get("post_state", {}).get("classification") != "ABSENT"
+                ):
+                    raise WorktreeEnsureAction("absent creation lacks terminal reservation evidence")
+                import grabowski_checkouts as checkouts
+
+                with checkouts._operation_lock():
+                    observation = _observe_after_possible_effect(
+                        inputs, runner, phase="durable absent creation replay"
+                    )
+                    if observation["classification"] != "ABSENT" or not _lease_state(
+                        inputs, inspect_lease
+                    )["valid"]:
+                        raise WorktreeEnsureAction("absent creation observation or lease changed")
+                return _public_output(existing, receipt_path, replayed=True, recovered=False)
             if result_state in SUCCESS_STATES:
                 observation = _observe_after_possible_effect(
                     inputs, runner, phase="durable success replay"
