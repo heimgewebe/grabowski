@@ -123,6 +123,97 @@ def _missing_unit_observation(
     }
 
 
+class TaskConsumerProjectionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        payload = "embedded program " * 2048
+        self.full = {
+            "task_id": "test-task",
+            "state": "failed",
+            "attempt": 2,
+            "argv": ["python3", "-c", payload],
+            "argv_sha256": "a" * 64,
+            "launcher": {
+                "argv": ["systemd-run", "python3", "-c", payload],
+                "command": payload,
+                "argv_sha256": "b" * 64,
+                "returncode": 1,
+                "stderr": "launch failure",
+                "stdout": "partial output",
+                "timed_out": False,
+                "stderr_truncated": True,
+                "stdout_truncated": False,
+            },
+            "last_observation": {"state": "failed", "properties": {"ExecMainStatus": "1"}},
+            "lease_maintenance": {"status": "released"},
+            "closeout": {"attention_required": True, "recommended_next_action": "inspect"},
+            "lifecycle_receipt_sha256": "c" * 64,
+            "chronik_knowledge_capture": {"classification": "source_unreadable"},
+        }
+
+    def test_compact_is_lossless_except_declared_argument_representations(self) -> None:
+        before = json.dumps(self.full, sort_keys=True)
+        result = tasks._task_consumer_projection(self.full, "compact")
+        self.assertEqual(json.dumps(self.full, sort_keys=True), before)
+        self.assertIs(tasks._task_consumer_projection(self.full, "full"), self.full)
+        projection = result.pop("projection")
+        self.assertEqual(projection["omitted_fields"], ["argv", "launcher.argv", "launcher.command"])
+        self.assertEqual(projection["detail_view"], "full")
+        self.assertLess(len(json.dumps(result)), len(before) * 0.1)
+        result["argv"] = self.full["argv"]
+        result["launcher"]["argv"] = self.full["launcher"]["argv"]
+        result["launcher"]["command"] = self.full["launcher"]["command"]
+        self.assertEqual(result, self.full)
+
+    def test_status_wrapper_keeps_mutation_gate_and_full_default(self) -> None:
+        with (
+            patch.object(tasks.operator, "_require_operator_mutation") as gate,
+            patch.object(tasks, "grabowski_task_status", return_value=self.full) as observe,
+        ):
+            self.assertEqual(asyncio.run(tasks._grabowski_task_status_tool("test-task")), self.full)
+            compact = asyncio.run(tasks._grabowski_task_status_tool("test-task", view="compact"))
+        self.assertEqual(gate.call_count, 2)
+        self.assertEqual(observe.call_count, 2)
+        self.assertEqual(compact["closeout"], self.full["closeout"])
+        self.assertNotIn("argv", compact)
+
+    def test_start_wrapper_preserves_admission_reuse_and_reroute(self) -> None:
+        for response in (
+            {"task": self.full, "deduplicated_reuse": {"reused": True},
+             "audit": {"receipt": "example"}, "retry_binding": {"status": "bound"}},
+            {"task": None, "read_routing_reroute": {"status": "recommended"}},
+        ):
+            with self.subTest(response=response.get("deduplicated_reuse")):
+                with (
+                    patch.object(tasks.operator, "_require_operator_capability") as gate,
+                    patch.object(tasks, "grabowski_task_start", return_value=response) as launch,
+                ):
+                    self.assertEqual(asyncio.run(tasks._grabowski_task_start_tool("heim-pc", ["true"])), response)
+                    compact = asyncio.run(tasks._grabowski_task_start_tool("heim-pc", ["true"], view="compact"))
+                self.assertEqual(gate.call_count, 2)
+                self.assertEqual(launch.call_count, 2)
+                self.assertEqual({k:v for k,v in compact.items() if k != "task"},
+                                 {k:v for k,v in response.items() if k != "task"})
+                if response["task"] is None:
+                    self.assertIsNone(compact["task"])
+                else:
+                    self.assertNotIn("argv", compact["task"])
+                    self.assertEqual(compact["task"]["argv_sha256"], self.full["argv_sha256"])
+
+    def test_invalid_view_is_rejected_before_task_effects(self) -> None:
+        with (
+            patch.object(tasks.operator, "_require_operator_mutation") as gate,
+            patch.object(tasks.operator, "_require_operator_capability") as capability,
+            patch.object(tasks, "grabowski_task_status") as observe,
+            patch.object(tasks, "grabowski_task_start") as launch,
+        ):
+            with self.assertRaisesRegex(ValueError, "full or compact"):
+                asyncio.run(tasks._grabowski_task_status_tool("test-task", view="unknown"))
+            with self.assertRaisesRegex(ValueError, "full or compact"):
+                asyncio.run(tasks._grabowski_task_start_tool("heim-pc", ["true"], view="unknown"))
+        for mock in (gate, capability, observe, launch):
+            mock.assert_not_called()
+
+
 class TaskTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
