@@ -315,6 +315,35 @@ class BureauPickupTests(unittest.TestCase):
         self.assertEqual(intent["task_id"], validated["task_id"])
         self.assertIsNone(normalized["task_id"])
 
+    def test_claim_phases_have_bounded_deadline_separate_from_readback(self) -> None:
+        request = pickup._normalize_request(
+            {"worker_id": "operator-test", "capabilities": ["repository", "shell"]}
+        )
+        intent = self.intent()
+        run_dir = self.root / "run"
+        run_dir.mkdir()
+        with (
+            mock.patch.object(pickup.bureau, "_invoke_bureau", return_value={}) as invoke,
+            mock.patch.object(pickup, "_lease_binding", return_value=run_dir / "lease.json"),
+        ):
+            pickup._claim_intent(request)
+            self.assertEqual(90, invoke.call_args.kwargs["timeout_seconds"])
+            self.assertTrue(invoke.call_args.kwargs["include_runtime_identity"])
+            self.assertFalse(invoke.call_args.kwargs.get("mutation", False))
+            pickup._commit_claim(intent, request, run_dir)
+            self.assertEqual(90, invoke.call_args.kwargs["timeout_seconds"])
+            self.assertTrue(invoke.call_args.kwargs["mutation"])
+            self.assertEqual(
+                [f"bureau_run:{intent['run_id']}", f"grabowski_leases:{intent['lease_owner_id']}"],
+                invoke.call_args.kwargs["required_readback"],
+            )
+            pickup._coordination_status(
+                intent["run_id"], registry_root=request["registry_root"],
+                coordination_root=request["coordination_root"],
+            )
+            self.assertNotIn("timeout_seconds", invoke.call_args.kwargs)
+        self.assertEqual(30, pickup.bureau.COMMAND_TIMEOUT_SECONDS)
+
     def test_explicit_task_id_stays_strict_on_bureau_selection(self) -> None:
         normalized = pickup._normalize_request(
             {
