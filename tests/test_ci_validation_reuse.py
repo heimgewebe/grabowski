@@ -1,5 +1,6 @@
 """Exercise the actual CI tier script, including incomplete provider evidence."""
 import copy
+import io
 import json
 import os
 from pathlib import Path
@@ -8,6 +9,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 SHA = "a" * 40
@@ -74,6 +76,7 @@ class MainValidationReuseTests(unittest.TestCase):
                 GH_RUNS=runs if isinstance(runs, str) else json.dumps(runs),
                 GH_JOBS=jobs if isinstance(jobs, str) else json.dumps(jobs),
                 GH_RUNS_EXIT=str(runs_exit), GH_JOBS_EXIT=str(jobs_exit),
+                BASE_REF='', BASE_SHA='', PR_HEAD='', HEAD_REPOSITORY='',
             )
             subprocess.run(
                 [sys.executable, "-c", script], env=env, check=True, capture_output=True
@@ -193,3 +196,134 @@ class MainValidationReuseTests(unittest.TestCase):
         self.assertIn("context-check", prechecks)
         self.assertIn("profiles-check", prechecks)
         self.assertIn("validate-main-reuse: $(VALIDATE_PRECHECKS) $(VALIDATE_CONTRACT_CHECKS)", makefile)
+
+class QueueAdmissionTests(unittest.TestCase):
+    BASE = "b" * 40
+    PR_HEAD = "c" * 40
+
+    @staticmethod
+    def rules():
+        identity = {
+            "ruleset_id": 18801517,
+            "ruleset_source_type": "Repository",
+            "ruleset_source": REPO,
+        }
+        return [
+            dict(identity, type="merge_queue", parameters={
+                "grouping_strategy": "ALLGREEN", "merge_method": "SQUASH",
+            }),
+            dict(identity, type="required_status_checks", parameters={
+                "strict_required_status_checks_policy": True,
+                "do_not_enforce_on_create": False,
+                "required_status_checks": [
+                    {"context": name, "integration_id": 15368}
+                    for name in ("validate (3.10)", "validate (3.12)")
+                ],
+            }),
+        ]
+
+    def select(self, *, env=None, rules=None, base=None, parents=None,
+               diff_rc=0, failed=False):
+        workflow = (ROOT / ".github/workflows/validate.yml").read_text()
+        selector = workflow.split("- name: Choose validation tier\n", 1)[1]
+        script = textwrap.dedent(selector.split("\n      - name:", 1)[0].split("        run: |\n", 1)[1])
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "output"
+            variables = {
+                "EVENT_NAME": "pull_request", "REPOSITORY": REPO, "BASE_REF": "main",
+                "HEAD_REPOSITORY": REPO, "BASE_SHA": self.BASE, "HEAD_SHA": SHA,
+                "PR_HEAD": self.PR_HEAD, "REF_NAME": "refs/pull/12/merge",
+                "GITHUB_OUTPUT": str(output),
+            }
+            variables.update(env or {})
+            responses = [
+                subprocess.CompletedProcess([], 0, json.dumps({
+                    "object": {"sha": self.BASE if base is None else base}
+                }), ""),
+                subprocess.CompletedProcess([], 0, " ".join(
+                    [SHA, self.BASE, self.PR_HEAD] if parents is None else parents
+                ), ""),
+                subprocess.CompletedProcess([], diff_rc, "", ""),
+                subprocess.CompletedProcess([], 0, json.dumps(
+                    self.rules() if rules is None else rules
+                ), ""),
+            ]
+            with patch.dict(os.environ, variables), patch(
+                "subprocess.run", side_effect=(
+                    subprocess.TimeoutExpired("gh", 10) if failed else responses
+                )
+            ) as api, patch("sys.stdout", new_callable=io.StringIO):
+                exec(compile(script, "<workflow admission selector>", "exec"), {})
+            return output.read_text().strip(), [call.args[0] for call in api.call_args_list]
+
+    def test_exact_queued_main_pr_admission(self):
+        result, calls = self.select()
+        self.assertEqual("tier=admission", result)
+        self.assertEqual([
+            ["gh", "api", f"repos/{REPO}/git/ref/heads/main"],
+            ["git", "rev-list", "--parents", "-n", "1", "HEAD"],
+            ["git", "diff", "--quiet", "--no-renames", self.BASE, SHA, "--",
+             ".github", "Makefile", "requirements", "config", "tools",
+             "tests/test_ci_validation_reuse.py"],
+            ["gh", "api", f"repos/{REPO}/rules/branches/main?per_page=100"],
+        ], calls)
+
+    def test_never_admit_other_contexts(self):
+        for env in (
+            {"EVENT_NAME": "merge_group"}, {"EVENT_NAME": "workflow_dispatch"},
+            {"REPOSITORY": "other/repo"}, {"BASE_REF": "other"},
+            {"HEAD_REPOSITORY": "fork/repo"}, {"BASE_SHA": "invalid"},
+            {"PR_HEAD": "invalid"}, {"HEAD_SHA": "invalid"}, {"HEAD_SHA": self.BASE},
+        ):
+            with self.subTest(env=env):
+                self.assertEqual(("tier=full", []), self.select(env=env))
+
+    def test_base_control_and_api_failures_require_full_validation(self):
+        for kwargs in (
+            {"base": "d" * 40}, {"parents": [SHA, self.PR_HEAD, self.BASE]},
+            {"parents": [SHA]}, {"diff_rc": 1}, {"diff_rc": 128}, {"failed": True},
+            {"rules": []}, {"rules": {"bad": True}}, {"rules": [None]},
+            {"rules": self.rules() * 50},
+        ):
+            with self.subTest(kwargs=kwargs):
+                self.assertEqual("tier=full", self.select(**kwargs)[0])
+
+    def test_invalid_rules_require_full_validation(self):
+        for case in ("no-queue", "duplicate-queue", "no-checks", "wrong-id", "wrong-source",
+                     "wrong-method", "wrong-grouping", "loose-checks", "creation-exempt",
+                     "missing-check", "wrong-integration"):
+            rules = self.rules()
+            with self.subTest(case=case):
+                if case == "no-queue":
+                    rules.pop(0)
+                elif case == "duplicate-queue":
+                    rules.append(copy.deepcopy(rules[0]))
+                elif case == "no-checks":
+                    rules.pop(1)
+                elif case == "wrong-id":
+                    rules[0]["ruleset_id"] = 1
+                elif case == "wrong-source":
+                    rules[0]["ruleset_source"] = "other/repo"
+                elif case == "wrong-method":
+                    rules[0]["parameters"]["merge_method"] = "MERGE"
+                elif case == "wrong-grouping":
+                    rules[0]["parameters"]["grouping_strategy"] = "HEADGREEN"
+                elif case == "loose-checks":
+                    rules[1]["parameters"]["strict_required_status_checks_policy"] = False
+                elif case == "creation-exempt":
+                    rules[1]["parameters"]["do_not_enforce_on_create"] = True
+                elif case == "missing-check":
+                    rules[1]["parameters"]["required_status_checks"].pop()
+                else:
+                    rules[1]["parameters"]["required_status_checks"][-1]["integration_id"] = 1
+                self.assertEqual("tier=full", self.select(rules=rules)[0])
+
+    def test_workflow_keeps_full_group_and_deploy_checks(self):
+        workflow = (ROOT / ".github/workflows/validate.yml").read_text()
+        makefile = (ROOT / "Makefile").read_text()
+        self.assertIn("fetch-depth: 2", workflow)
+        self.assertIn("steps.tier.outputs.tier != 'main-reuse' && steps.tier.outputs.tier != 'admission'", workflow)
+        self.assertIn("steps.tier.outputs.tier == 'admission'", workflow)
+        self.assertIn("run: make validate-admission", workflow)
+        self.assertIn("validate-admission: validate-main-reuse", makefile)
+        self.assertIn("run: make deploy-check", workflow)

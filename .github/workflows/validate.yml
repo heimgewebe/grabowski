@@ -31,6 +31,8 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: grabowski
+          # PR merge checkout must contain both exact parents for admission.
+          fetch-depth: 2
 
       - name: Reject proven superseded initial PR head
         shell: bash
@@ -126,6 +128,10 @@ jobs:
           REPOSITORY: ${{ github.repository }}
           REF_NAME: ${{ github.ref }}
           HEAD_SHA: ${{ github.sha }}
+          BASE_REF: ${{ github.base_ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
           GH_TOKEN: ${{ github.token }}
         run: |
           import json
@@ -190,8 +196,71 @@ jobs:
               print(f"Reusing complete merge-group suite: run {run_id} attempt {attempt} for {sha}")
               return True
 
+          def queue_admission(repo, sha):
+              base, head = os.environ.get("BASE_SHA", ""), os.environ.get("PR_HEAD", "")
+              if not (
+                  os.environ.get("EVENT_NAME") == "pull_request"
+                  and repo == "heimgewebe/grabowski"
+                  and os.environ.get("HEAD_REPOSITORY") == repo
+                  and os.environ.get("BASE_REF") == "main"
+                  and all(re.fullmatch(r"[0-9a-f]{40}", value) for value in (base, head, sha))
+                  and len({base, head, sha}) == 3
+              ):
+                  return False
+              # Validate the actual tested PR merge checkout, not a stale base.
+              if api(f"repos/{repo}/git/ref/heads/main")["object"]["sha"] != base:
+                  return False
+              parents = subprocess.run(
+                  ["git", "rev-list", "--parents", "-n", "1", "HEAD"],
+                  check=True, capture_output=True, text=True, timeout=10,
+              ).stdout.split()
+              if parents != [sha, base, head]:
+                  return False
+              if subprocess.run(
+                  ["git", "diff", "--quiet", "--no-renames", base, sha, "--",
+                   ".github", "Makefile", "requirements", "config", "tools",
+                   "tests/test_ci_validation_reuse.py"],
+                  check=False, capture_output=True, timeout=10,
+              ).returncode != 0:
+                  return False
+              rules = api(f"repos/{repo}/rules/branches/main?per_page=100")
+              if not isinstance(rules, list) or not 0 < len(rules) < 100:
+                  return False
+              queues = [r for r in rules if r.get("type") == "merge_queue"]
+              required = [r for r in rules if r.get("type") == "required_status_checks"]
+              if len(queues) != 1 or len(required) != 1:
+                  return False
+              queue, checks = queues[0], required[0]
+              if any(
+                  r.get("ruleset_source_type") != "Repository"
+                  or r.get("ruleset_source") != repo
+                  or r.get("ruleset_id") != 18801517
+                  for r in (queue, checks)
+              ):
+                  return False
+              qp, cp = queue["parameters"], checks["parameters"]
+              return (
+                  qp.get("grouping_strategy") == "ALLGREEN"
+                  and qp.get("merge_method") == "SQUASH"
+                  and cp.get("strict_required_status_checks_policy") is True
+                  and cp.get("do_not_enforce_on_create") is False
+                  and all(
+                      {"context": name, "integration_id": 15368}
+                      in cp["required_status_checks"]
+                      for name in ("validate (3.10)", "validate (3.12)")
+                  )
+              )
+
           tier = "full"
           repo, sha = os.environ["REPOSITORY"], os.environ["HEAD_SHA"]
+          # Admission is not final integration evidence. The mandatory ALLGREEN
+          # queue must run full validation. Restore full PR checks and revalidate
+          # open PRs before removing the queue or introducing bypass actors.
+          try:
+              if queue_admission(repo, sha):
+                  tier = "admission"
+          except (OSError, subprocess.SubprocessError, ValueError, TypeError, KeyError, AttributeError):
+              pass
           if (
               os.environ["EVENT_NAME"] == "push" and repo == "heimgewebe/grabowski"
               and os.environ["REF_NAME"] == "refs/heads/main" and re.fullmatch(r"[0-9a-f]{40}", sha)
@@ -207,8 +276,12 @@ jobs:
           print(f"Validation tier: {tier}")
 
       - name: Validate repository
-        if: steps.tier.outputs.tier != 'main-reuse'
+        if: steps.tier.outputs.tier != 'main-reuse' && steps.tier.outputs.tier != 'admission'
         run: make validate
+
+      - name: Validate PR queue admission (not final integration)
+        if: steps.tier.outputs.tier == 'admission'
+        run: make validate-admission
 
       - name: Validate main contracts after proven full integration
         if: steps.tier.outputs.tier == 'main-reuse'
