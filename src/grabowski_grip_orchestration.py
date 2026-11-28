@@ -164,6 +164,194 @@ def run_mechanic_loop(core: CoreModule, spec: Any, parameters: dict[str, Any], r
     }
 
 
+def _settlement_read_sealed_review(batch_id: str) -> dict[str, Any]:
+    from grabowski_self_review_execution import RECEIPT_ROOT, _read_private_json
+
+    # A batch selector, not an arbitrary caller-selected path or signer.
+    return _read_private_json(RECEIPT_ROOT / "batches" / (batch_id + ".json"))
+
+
+def _settlement_bureau_status(repo_slug: str) -> dict[str, Any]:
+    from grabowski_bureau_intake import (
+        BUREAU_STATE_ROOT,
+        _absolute_bureau_state_root,
+        _assert_bureau_state_root_has_no_symlink_components,
+        _invoke_bureau,
+        _managed_runtime_binding,
+    )
+
+    binding = _managed_runtime_binding()
+    state_root = _absolute_bureau_state_root(BUREAU_STATE_ROOT)
+    _assert_bureau_state_root_has_no_symlink_components(state_root)
+    # GitHub evidence is obtained separately for the exact PR below. The
+    # existing Bureau adapter pins the installed runtime and registry.
+    return _invoke_bureau([
+        "--root", str(binding.registry_root), "--state-root", str(state_root),
+        "--json", "status-projection", "--repo", repo_slug.split("/", 1)[1],
+        "--skip-github",
+    ], timeout_seconds=60)
+
+
+def prepare_captain_pr_settlement(
+    core: CoreModule, spec: Any, parameters: dict[str, Any],
+    receipt: dict[str, Any], runner: Any, github_runner: Any,
+) -> dict[str, Any]:
+    """Produce the exact ordinary Captain request; never dispatch its effect.
+
+    The caller selects an existing sealed review and an authorized PR action.
+    Evidence is read and hashed here, before the authenticated Captain-run
+    ingress binds its request. That ingress and its atomic guard remain the
+    only execution path; this read-only preparation confers no authority.
+    """
+    request = parameters.get("prepare_pr_settlement")
+    required = {"review_batch_id", "actor_id", "purpose"}
+    if (
+        not isinstance(request, dict)
+        or not required.issubset(request)
+        or set(request) - (required | {"lease_owner_id"})
+        or any(
+            not isinstance(value, str) or not value.strip() or len(value) > 1024
+            for value in request.values()
+        )
+        or re.fullmatch(r"[a-f0-9]{32}", request["review_batch_id"]) is None
+    ):
+        raise core.GripPreflightError("settlement_prepare_selector_invalid")
+    derived = {
+        "expected_head", "expected_base_sha", "diff_sha256", "review_evidence",
+        "status_projection", "status_projection_fresh", "status_projection_source",
+        "status_projection_sha256", "ci_evidence", "execution_intent", "saga_run_ref",
+    }
+    if derived.intersection(parameters):
+        raise core.GripPreflightError("settlement_prepare_conflicting_evidence")
+    if parameters.get("allow_execution") is not True:
+        raise core.GripPreflightError("settlement_prepare_explicit_execution_decision_required")
+    actions = core._captain_actions(parameters)
+    if len(actions) != 1 or actions[0]["action"] != "pr-merge":
+        raise core.GripPreflightError("settlement_prepare_exact_pr_merge_required")
+    target = actions[0]["target"]
+    repo_slug, pr = target["repo"], target["pr"]
+    if not isinstance(parameters.get("local_repo"), str) or not parameters["local_repo"].strip():
+        raise core.GripPreflightError("settlement_prepare_local_repo_required")
+    try:
+        repo_path, observed_repo = grabowski_merge_guard.merge_guard_repository_identity(
+            core._captain_execution_cwd(parameters)
+        )
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise core.GripPreflightError("settlement_prepare_repository_unavailable") from exc
+    if observed_repo.casefold() != repo_slug.casefold():
+        raise core.GripPreflightError("settlement_prepare_repository_mismatch")
+    try:
+        audit = _settlement_read_sealed_review(request["review_batch_id"])
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise core.GripPreflightError("settlement_prepare_sealed_review_unavailable") from exc
+    if (
+        not isinstance(audit, dict)
+        or audit.get("review_batch_id") != request["review_batch_id"]
+        or audit.get("review_purpose") != "pull_request"
+        or audit.get("review_tier") != "high_critical"
+        or not core._is_hex_sha(audit.get("head_sha"), lengths=(40,))
+        or not core._is_hex_sha(audit.get("base_sha"), lengths=(40,))
+        or not core._is_sha256_hex(audit.get("diff_sha256"))
+        or not isinstance(audit.get("repo"), str)
+        or audit["repo"].casefold() != repo_slug.casefold()
+        or type(audit.get("pr")) is not int or audit["pr"] != pr
+    ):
+        raise core.GripPreflightError("settlement_prepare_sealed_review_identity_invalid")
+
+    def require_live_pr() -> None:
+        live, _query = core._captain_pr_view(
+            repo_path, github_runner, repo_slug=repo_slug, pr_number=str(pr)
+        )
+        if (
+            live is None or live.get("number") != pr
+            or core._captain_pr_merge_preflight_errors(
+                live, expected_head=audit["head_sha"], expected_base=target["base"],
+                expected_base_sha=audit["base_sha"],
+            )
+        ):
+            raise core.GripPreflightError("settlement_prepare_live_pr_identity_or_state_drift")
+
+    require_live_pr()
+    checks = grabowski_merge_guard.required_pr_checks_probe(
+        repo_path, github_runner, repo_slug=repo_slug, pr_number=pr,
+    )
+    count = checks.get("required_check_count")
+    names = checks.get("required_check_names")
+    if (
+        checks.get("status") != "green"
+        or type(count) is not int or count < 1
+        or not isinstance(names, list) or len(names) != count
+        or any(not isinstance(name, str) or not name.strip() for name in names)
+    ):
+        raise core.GripPreflightError("settlement_prepare_required_ci_unavailable_or_not_green")
+    try:
+        status = _settlement_bureau_status(repo_slug)
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise core.GripPreflightError("settlement_prepare_bureau_status_unavailable") from exc
+    if not isinstance(status, dict) or status.get("healthy") is not True:
+        raise core.GripPreflightError("settlement_prepare_bureau_status_unhealthy")
+    projection = {
+        "schema_version": core.CAPTAIN_STATUS_PROJECTION_SCHEMA_VERSION,
+        "source": "bureau status-projection",
+        "healthy": status["healthy"],
+        "generated_at": status.get("generated_at"),
+        "receipt_ref": core.sha256_json(status),
+    }
+    # Bracket the check and status observations with the same live PR
+    # identity. Captain-run still independently revalidates at effect time.
+    require_live_pr()
+    prepared = {key: value for key, value in parameters.items() if key != "prepare_pr_settlement"}
+    prepared.update({
+        "local_repo": str(repo_path),
+        "expected_head": audit["head_sha"],
+        "expected_base_sha": audit["base_sha"],
+        "diff_sha256": audit["diff_sha256"],
+        "review_evidence": audit,
+        "status_projection": projection,
+        "status_projection_fresh": True,
+        "status_projection_source": projection["source"],
+        "status_projection_sha256": core.sha256_json(projection),
+        "ci_evidence": {
+            "state": "passed", "head_sha": audit["head_sha"],
+            "source": "github required PR checks",
+            "required_check_count": count, "required_check_names": names,
+        },
+    })
+    context = {"purpose": request["purpose"]}
+    if "lease_owner_id" in request:
+        context["lease_owner_id"] = request["lease_owner_id"]
+    evidence = core._captain_execution_intent_expected_evidence(prepared, actions)
+    prepared["execution_intent"] = {
+        "schema_version": core.CAPTAIN_EXECUTION_INTENT_SCHEMA_VERSION,
+        "kind": core.CAPTAIN_EXECUTION_INTENT_KIND,
+        "action": "pr-merge", "target_sha256": actions[0]["target_sha256"],
+        "expected_head": audit["head_sha"], "expected_base": target["base"],
+        "expected_base_sha": audit["base_sha"],
+        "evidence_sha256": {key: value for key, value in evidence.items() if value is not None},
+        "actor": {"id": request["actor_id"]},
+        "context": context, "issued_at": core._captain_now_utc().isoformat(),
+    }
+    # Includes the existing authenticated review provenance validation,
+    # optional/required external review rules, and authorization gates.
+    result = run_captain_preflight(core, spec, prepared, receipt, runner)
+    if result["gate_decision"] == "blocked":
+        return result
+    intent, errors = core._captain_execution_intent_review(prepared, actions)
+    if errors:
+        raise core.GripPreflightError("settlement_prepare_execution_intent_invalid")
+    core._check(receipt, "settlement-request-prepared", "pass", str(intent["intent_sha256"]))
+    return {
+        **result,
+        "decision": "prepared", "status": "passed", "receipt_status": "passed",
+        "blocked_reasons": [], "errors": [], "execution_invoked": False,
+        "prepared_parameters": prepared,
+        "prepared_request_sha256": grabowski_merge_guard.captain_request_sha256(prepared),
+        "does_not_establish": [
+            *result["does_not_establish"], "merge_authority", "merge_effect",
+        ],
+    }
+
+
 def run_captain_preflight(core: CoreModule, spec: Any, parameters: dict[str, Any], receipt: dict[str, Any], runner: Any) -> dict[str, Any]:
     actions = core._captain_actions(parameters, gate_native_validation=True)
     core._mechanic_bool(parameters, "allow_execution", False)

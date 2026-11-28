@@ -875,6 +875,7 @@ GRIP_SPECS: dict[str, GripSpec] = {
         required_parameters=("actions",),
         acceptance_ids=("high-impact-marked", "recovery-or-irreversibility", "target-change-record"),
         runner="captain_preflight",
+        uses_github=True,
     ),
     "captain-run": GripSpec(
         name="captain-run",
@@ -18631,7 +18632,12 @@ def _run_captain_preflight(
     parameters: dict[str, Any],
     receipt: Receipt,
     runner: CommandRunner,
+    github_runner: GithubRunner,
 ) -> dict[str, Any]:
+    if "prepare_pr_settlement" in parameters:
+        return grabowski_grip_orchestration.prepare_captain_pr_settlement(
+            sys.modules[__name__], spec, parameters, receipt, runner, github_runner
+        )
     return grabowski_grip_orchestration.run_captain_preflight(sys.modules[__name__], spec, parameters, receipt, runner)
 
 

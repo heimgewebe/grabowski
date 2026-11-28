@@ -13044,6 +13044,115 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertEqual(action["captain_receipt"]["recovery_path"], "revert the merge commit on main")
         self.assertIn("captain-preflight is read-only", output["why_no_mutation"])
 
+    def test_captain_preflight_prepares_exact_settlement_evidence(self) -> None:
+        from unittest.mock import patch
+        from pathlib import Path
+        import grabowski_grip_orchestration as orchestration
+
+        full = captain_parameters()
+        audit = dict(full["review_evidence"], review_batch_id="a" * 32,
+                     review_purpose="pull_request")
+        action = full["actions"][0]
+        request = {
+            "actions": full["actions"], "local_repo": "/tmp/exact-settlement",
+            "trusted_owner_mode": True,
+            "autonomy_policy": grips.CAPTAIN_TRUSTED_OWNER_AUTONOMY_POLICY,
+            "allow_execution": True,
+            "prepare_pr_settlement": {
+                "review_batch_id": "a" * 32, "actor_id": "operator",
+                "purpose": "authorized integration",
+            },
+            "codex_review_evidence": full["codex_review_evidence"],
+        }
+        live = {
+            "number": action["target"]["pr"], "state": "OPEN", "isDraft": False,
+            "headRefOid": audit["head_sha"], "baseRefOid": audit["base_sha"],
+            "baseRefName": action["target"]["base"],
+            "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
+        }
+        status = {"healthy": True, "generated_at": datetime.now(timezone.utc).isoformat()}
+        checks = {"status": "green", "required_check_count": 1,
+                  "required_check_names": ["validate"]}
+        with patch.object(merge_guard, "merge_guard_repository_identity",
+                          return_value=(Path(request["local_repo"]), action["target"]["repo"])), \
+             patch.object(orchestration, "_settlement_read_sealed_review", return_value=audit), \
+             patch.object(orchestration, "_settlement_bureau_status", return_value=status), \
+             patch.object(grips, "_captain_pr_view", return_value=(live, {})), \
+             patch.object(merge_guard, "required_pr_checks_probe", return_value=checks), \
+             patch.object(merge_guard, "high_critical_review_pass_evidence_errors", return_value=[]):
+            result = grips.grip_run("captain-preflight", request, profile="captain")
+            self.assertEqual("passed", result["receipt"]["status"], result["output"])
+            prepared = result["output"]["prepared_parameters"]
+            self.assertEqual(audit["head_sha"], prepared["expected_head"])
+            self.assertEqual(audit["base_sha"], prepared["expected_base_sha"])
+            self.assertEqual(audit["diff_sha256"], prepared["diff_sha256"])
+            self.assertEqual(audit, prepared["review_evidence"])
+            self.assertEqual("passed", prepared["ci_evidence"]["state"])
+            self.assertEqual(grips.sha256_json(prepared["status_projection"]), prepared["status_projection_sha256"])
+            self.assertNotIn("prepare_pr_settlement", prepared)
+            self.assertFalse(result["output"]["execution_invoked"])
+            self.assertEqual(merge_guard.captain_request_sha256(prepared),
+                             result["output"]["prepared_request_sha256"])
+            actions = grips._captain_actions(prepared)
+            info, errors = grips._captain_execution_intent_review(prepared, actions)
+            self.assertEqual([], errors)
+            self.assertTrue(info["valid"])
+            self.assertNotIn("execution_intent", request)
+
+            for change in (
+                {"expected_head": "0" * 40},
+                {"allow_execution": False},
+                {"trusted_owner_mode": False},
+                {"prepare_pr_settlement": {"review_batch_id": "../outside", "actor_id": "operator", "purpose": "merge"}},
+            ):
+                with self.subTest(change=change):
+                    blocked = grips.grip_run("captain-preflight", {**request, **change}, profile="captain")
+                    self.assertEqual("blocked", blocked["receipt"]["status"], blocked["output"])
+                    self.assertNotIn("prepared_parameters", blocked["output"])
+
+            with patch.object(grips, "_captain_pr_view", return_value=({**live, "headRefOid": "0" * 40}, {})):
+                blocked = grips.grip_run("captain-preflight", request, profile="captain")
+                self.assertEqual("blocked", blocked["receipt"]["status"])
+                self.assertNotIn("prepared_parameters", blocked["output"])
+            with patch.object(merge_guard, "required_pr_checks_probe", return_value={"status": "green", "required_check_count": 0}):
+                blocked = grips.grip_run("captain-preflight", request, profile="captain")
+                self.assertEqual("blocked", blocked["receipt"]["status"])
+                self.assertNotIn("prepared_parameters", blocked["output"])
+            with patch.object(orchestration, "_settlement_bureau_status", return_value={**status, "healthy": False}):
+                blocked = grips.grip_run("captain-preflight", request, profile="captain")
+                self.assertEqual("blocked", blocked["receipt"]["status"])
+                self.assertNotIn("prepared_parameters", blocked["output"])
+            with patch.object(grips, "_captain_pr_view", side_effect=[(live, {}), ({**live, "baseRefOid": "0" * 40}, {})]):
+                blocked = grips.grip_run("captain-preflight", request, profile="captain")
+                self.assertEqual("blocked", blocked["receipt"]["status"])
+                self.assertNotIn("prepared_parameters", blocked["output"])
+            for changed_audit in (
+                {**audit, "review_batch_id": "b" * 32},
+                {**audit, "pr": audit["pr"] + 1},
+                {**audit, "review_purpose": "post_merge_release"},
+                {**audit, "review_tier": "standard"},
+            ):
+                with self.subTest(audit_change=changed_audit), patch.object(
+                    orchestration, "_settlement_read_sealed_review", return_value=changed_audit
+                ):
+                    blocked = grips.grip_run("captain-preflight", request, profile="captain")
+                    self.assertEqual("blocked", blocked["receipt"]["status"])
+                    self.assertNotIn("prepared_parameters", blocked["output"])
+            with patch.object(merge_guard, "high_critical_review_pass_evidence_errors",
+                              return_value=["high_critical_server_review_provenance_invalid"]):
+                blocked = grips.grip_run("captain-preflight", request, profile="captain")
+                self.assertEqual("blocked", blocked["receipt"]["status"])
+                self.assertNotIn("prepared_parameters", blocked["output"])
+            with patch.object(orchestration, "_settlement_bureau_status",
+                              return_value={**status, "generated_at": "2020-01-01T00:00:00Z"}):
+                blocked = grips.grip_run("captain-preflight", request, profile="captain")
+                self.assertEqual("blocked", blocked["receipt"]["status"])
+                self.assertNotIn("prepared_parameters", blocked["output"])
+            with patch.object(grips, "_run_captain_pr_merge", side_effect=AssertionError("preview cannot merge")) as merge:
+                prepared_only = grips.grip_run("captain-preflight", request, profile="captain")
+                self.assertEqual("passed", prepared_only["receipt"]["status"])
+                merge.assert_not_called()
+
     def test_captain_preflight_exposes_authority_contract(self) -> None:
         result = self.run_captain(captain_parameters())
         contract = result["output"]["authority_contract"]
