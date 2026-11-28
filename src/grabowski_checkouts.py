@@ -794,9 +794,10 @@ def _strict_lifecycle_binding(
 ) -> dict[str, Any] | None:
     """Read one binding without collapsing SQLite failures into legacy absence.
 
-    Review admission uses an immutable snapshot, never the native WAL reader
-    which can create SHM or update read marks. A checkpointed empty WAL is safe
-    only while the existing DB and sidecars retain their exact identities.
+    Review admission uses an immutable or bounded private snapshot, never the
+    native WAL reader which can create SHM or update read marks. A checkpointed
+    empty WAL retains the strict immutable fast path; committed nonempty WAL
+    frames are read from a verified copy, never ignored.
     Internal lifecycle operations retain their existing WAL-aware contract.
     """
     with ExitStack() as stack:
@@ -805,12 +806,15 @@ def _strict_lifecycle_binding(
                 raise PermissionError("Checkout database may not be a symlink")
             if not CHECKOUT_DB.exists():
                 return None
+            wal = Path(str(CHECKOUT_DB) + "-wal")
+            copy_wal = wal.is_file() and not wal.is_symlink() and wal.stat().st_size > 0
             connection = stack.enter_context(sqlite_store.inventory_readonly_sqlite(
                 CHECKOUT_DB,
-                temporary_prefix="unused-review-checkout-readonly.",
+                temporary_prefix="review-checkout-readonly.",
                 error_type=RuntimeError,
                 message="Review checkout lifecycle snapshot changed",
-                allow_wal_copy=False,
+                allow_wal_copy=copy_wal,
+                max_copy_bytes=64 * 1024 * 1024,
                 allow_checkpointed_empty_wal=True,
             ))
         else:

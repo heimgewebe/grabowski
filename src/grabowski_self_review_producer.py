@@ -103,6 +103,73 @@ def _registered_lane_checkout(real: Path, canonical: Path, common: Path, root: P
     return branch != "HEAD" and branch == binding.get("expected_branch")
 
 
+def _active_bureau_review_checkout(real: Path, canonical: Path, root: Path) -> bool:
+    """Recognize only a journal-bound, actively leased Bureau review source.
+
+    A directory name is merely a run selector, never authority. This reads the
+    existing coordination contract; it does not claim, renew, release or change
+    a workspace. Signed historical PR objects retain their canonical-repo path.
+    """
+    if real.parent != root / ".bureau-worktrees":
+        return False
+    from grabowski_bureau_pickup import RUN_ID_RE, grabowski_bureau_pickup_status
+
+    run_id = real.name
+    if RUN_ID_RE.fullmatch(run_id) is None:
+        return False
+    try:
+        status = grabowski_bureau_pickup_status(run_id)
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise provenance.ReviewExecutionRejected(
+            "review Bureau checkout coordination unavailable"
+        ) from exc
+    if not isinstance(status, dict):
+        return False
+    coordination = status.get("coordination")
+    execution = status.get("execution_binding")
+    if (
+        status.get("run_id") != run_id
+        or status.get("root_binding_source") != "journal-bound"
+        or status.get("journal_available") is not True
+        or not isinstance(coordination, dict)
+        or coordination.get("status") != "coordinated"
+        or coordination.get("blocking") is not False
+        or not isinstance(execution, dict)
+        or execution.get("run_id") != run_id
+        or execution.get("actively_bound") is not True
+    ):
+        return False
+    run = coordination.get("run")
+    lease = coordination.get("lease")
+    stored = coordination.get("stored_lease_binding")
+    release = coordination.get("release")
+    owner = "bureau-run:" + run_id
+    if (
+        not isinstance(run, dict)
+        or run.get("run_id") != run_id
+        or run.get("workspace_path") != str(real)
+        or not isinstance(run.get("workspace_branch"), str)
+        or not isinstance(lease, dict)
+        or lease.get("status") != "active-bound"
+        or not isinstance(stored, dict)
+        or stored.get("owner_id") != owner
+        or stored.get("task_id") != run.get("task_id")
+        or not isinstance(release, dict)
+        or release.get("owner_id") != owner
+        or release.get("required") is not True
+        or not isinstance(run.get("reservations"), list)
+        or not any(
+            isinstance(reservation, dict)
+            and reservation.get("resource_id") == "repo." + canonical.name
+            and reservation.get("mode") == "write"
+            for reservation in run["reservations"]
+        )
+    ):
+        return False
+    branch = _read_command(real, ["rev-parse", "--abbrev-ref", "HEAD"]).decode().strip()
+    return branch != "HEAD" and branch == run["workspace_branch"]
+
+
 def _managed_repository_identity(
     repo: Path, *, expected_repo: str | None = None,
 ) -> tuple[Path, str]:
@@ -147,6 +214,7 @@ def _managed_repository_identity(
     if (
         real != canonical and real.parent not in worktrees and not aef_checkout
         and not _registered_lane_checkout(real, canonical, common, root)
+        and not _active_bureau_review_checkout(real, canonical, root)
     ):
         raise provenance.ReviewExecutionRejected("review source not a managed checkout")
     remote = _read_command(
