@@ -1788,7 +1788,8 @@ def _proven_claude_pre_result_failure_before_review(
     """Verify a narrow, authenticated Claude 429 or revoked-OAuth 401 with zero review work.
 
     This never grants a review PASS, forgives ambiguous output, or erases a REJECT.
-    The sole 401 shape is the observed first-party authentication refusal.
+    Authentication failures are limited to the observed first-party 401 and
+    the exact local OAuth-refresh refusal with no API status.
     """
     if (
         provenance.get("schema_version") != 2
@@ -1837,6 +1838,15 @@ def _proven_claude_pre_result_failure_before_review(
     )
     if not isinstance(envelope, dict) or set(envelope) - permitted_fields:
         return False
+    local_oauth_expired = (
+        auth_401
+        and "api_error_status" in envelope
+        and envelope["api_error_status"] is None
+        and "api_error_origin" not in envelope
+        and envelope.get("result") == "Failed to authenticate: OAuth session expired and could not be refreshed"
+        and type(envelope.get("num_turns")) is int
+        and envelope["num_turns"] == 1
+    )
     # The observed 429 envelope can include the explicit quota error and
     # zero safety stops. Neither field may conceal semantic output or work.
     # Preserve the distinct, already strict 401 contract below.
@@ -1882,8 +1892,13 @@ def _proven_claude_pre_result_failure_before_review(
         envelope.get("type") == "result"
         and envelope.get("is_error") is True
         and envelope.get("terminal_reason") == "api_error"
-        and type(envelope.get("api_error_status")) is int
-        and envelope["api_error_status"] == (401 if auth_401 else 429)
+        and (
+            local_oauth_expired
+            or (
+                type(envelope.get("api_error_status")) is int
+                and envelope["api_error_status"] == (401 if auth_401 else 429)
+            )
+        )
         and type(envelope.get("duration_api_ms")) is int
         and envelope["duration_api_ms"] == 0
         and envelope.get("modelUsage") == {}
@@ -1892,8 +1907,11 @@ def _proven_claude_pre_result_failure_before_review(
         and len(envelope["result"]) <= 256
         and (
             (
-                envelope.get("api_error_origin") == "first_party"
-                and envelope["result"] == _CLAUDE_AUTH_REVOKED_RESULT
+                local_oauth_expired
+                or (
+                    envelope.get("api_error_origin") == "first_party"
+                    and envelope["result"] == _CLAUDE_AUTH_REVOKED_RESULT
+                )
             )
             if auth_401 else (
                 _CLAUDE_QUOTA_RESULT_RE.fullmatch(envelope["result"]) is not None

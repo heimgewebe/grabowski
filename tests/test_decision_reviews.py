@@ -418,6 +418,33 @@ def stamp_claude_oauth_401(directory: Path, *, envelope_updates: dict | None = N
     write_private(path, json.dumps(receipt))
 
 
+def stamp_claude_oauth_expired(directory: Path, *, envelope_updates: dict | None = None,
+                               receipt_updates: dict | None = None) -> None:
+    """Observed local OAuth refresh refusal, no API status and no inference."""
+    updates = {'api_error_status': None,
+     'duration_api_ms': 0,
+     'duration_ms': 87,
+     'fast_mode_disabled_reason': 'sdk_opt_in_required',
+     'fast_mode_state': 'off',
+     'is_error': True,
+     'modelUsage': {},
+     'num_turns': 1,
+     'permission_denials': [],
+     'queued_turn_count': 0,
+     'result': 'Failed to authenticate: OAuth session expired and could not be refreshed',
+     'result_index': 0,
+     'safety_stops': 0,
+     'session_id': '00000000-0000-4000-8000-000000000001',
+     'stop_reason': 'stop_sequence',
+     'subtype': 'success',
+     'terminal_reason': 'api_error',
+     'total_cost_usd': 0,
+     'type': 'result',
+     'uuid': '00000000-0000-4000-8000-000000000002'}
+    updates.update(envelope_updates or {})
+    stamp_claude_quota_429(directory, envelope_updates=updates, receipt_updates=receipt_updates)
+
+
 class DecisionReviewReconciliationTests(unittest.TestCase):
     @staticmethod
     def captain_reconcile(jobs: Path) -> dict:
@@ -1108,6 +1135,56 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
                     )
                 else:
                     self.assertEqual(checked["errors"], [])
+
+
+    def test_v2_local_oauth_expired_is_optional_unavailable_not_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            jobs = Path(temporary) / "jobs"
+            jobs.mkdir(mode=0o700)
+            failed = make_job(
+                jobs, suffix="a88888888888", slot="independent-claude",
+                terminal_status="failed", review_result=None,
+                review_role=True, attempt_bound=True, attempt_epoch=2,
+            )
+            stamp_claude_oauth_expired(failed)
+            outcome = self.reconcile(jobs)
+            self.assertEqual(outcome["attempts"][0]["classification"], "infrastructure_error")
+            self.assertTrue(outcome["attempts"][0]["pre_result_auth_failure_verified"])
+            self.assertFalse(outcome["attempts"][0]["pre_result_quota_failure_verified"])
+            self.assertEqual(outcome["slots"][0]["independent_pass_count"], 0)
+            import grabowski_merge_guard as merge_guard
+            optional = merge_guard.decision_review_blocking_errors(outcome, independent_required=False)
+            self.assertEqual(optional["errors"], [])
+            self.assertEqual(optional["status"], "optional_unavailable")
+            mandatory = merge_guard.decision_review_blocking_errors(outcome, independent_required=True)
+            self.assertTrue(mandatory["errors"])
+
+    def test_v2_local_oauth_expired_rejects_ambiguous_envelopes(self) -> None:
+        for updates in (
+            {"result": "Failed to authenticate: unknown reason"},
+            {"api_error_status": 401}, {"api_error_status": False},
+            {"api_error_origin": "first_party"}, {"api_error": "unknown"},
+            {"safety_stops": 1}, {"safety_stops": False},
+            {"duration_api_ms": 1}, {"num_turns": 2},
+            {"usage": {"output_tokens": 1}}, {"usage": {"input_tokens": 1}},
+            {"usage": {"iterations": [{"unexpected": True}]}},
+            {"structured_output": {"verdict": "NEEDS_CHANGE"}},
+            {"modelUsage": {"model": {}}}, {"total_cost_usd": 0.01},
+            {"unknown_field": 0}, {"permission_denials": ["tool"]},
+            {"subagent_stats": {"spawned": 1}},
+        ):
+            with self.subTest(updates=updates), tempfile.TemporaryDirectory() as temporary:
+                jobs = Path(temporary) / "jobs"
+                jobs.mkdir(mode=0o700)
+                failed = make_job(
+                    jobs, suffix="a88888888888", slot="independent-claude",
+                    terminal_status="failed", review_result=None,
+                    review_role=True, attempt_bound=True, attempt_epoch=2,
+                )
+                stamp_claude_oauth_expired(failed, envelope_updates=updates)
+                outcome = self.reconcile(jobs)
+                self.assertEqual(outcome["attempts"][0]["classification"], "invalid_result")
+                self.assertFalse(outcome["attempts"][0]["pre_result_auth_failure_verified"])
 
     def test_v2_oauth_401_without_model_work_is_infrastructure_not_review(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
