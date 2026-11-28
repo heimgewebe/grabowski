@@ -1778,6 +1778,48 @@ def recover_saga_run(
     return plan, _validate_saga_run_record(record, plan)
 
 
+def resolve_captain_saga_lease_owner(parameters: dict[str, Any]) -> str:
+    """Resolve the owner from a verified Captain-ready PR Saga, not merge authority."""
+    plan, run = recover_saga_run(parameters["saga_run_ref"])
+    if (
+        plan["saga_kind"] != "pr-settlement"
+        or run.get("captain_ready") is not True
+        or run.get("state") != "captain_required"
+    ):
+        raise SagaError("Captain handoff requires a verified Captain-ready PR Saga")
+    run_id = plan["target"].get("bureau_run_id")
+    if run_id is None:
+        raise SagaError("Captain handoff requires a Bureau-bound PR Saga")
+    actions = parameters.get("actions")
+    if not isinstance(actions, list) or len(actions) != 1:
+        raise SagaError("Captain handoff requires exactly one PR merge action")
+    action = actions[0]
+    handoff = plan["captain_handoff"]
+    if (
+        not isinstance(action, dict)
+        or action.get("action") != handoff["action"]
+        or action.get("target") != handoff["target"]
+        or type(action["target"].get("pr")) is not int
+    ):
+        raise SagaError("Captain handoff action or target differs from verified Saga")
+    identity = plan["expected_identity"]
+    for parameter, field in (
+        ("expected_head", "expected_head"),
+        ("expected_base_sha", "expected_base_sha"),
+        ("diff_sha256", "expected_diff_sha256"),
+    ):
+        if parameters.get(parameter) != identity[field]:
+            raise SagaError(f"Captain handoff {parameter} differs from verified Saga")
+    intent = parameters.get("execution_intent")
+    context = intent.get("context") if isinstance(intent, dict) else None
+    if not isinstance(context, dict):
+        raise SagaError("Captain handoff requires an execution intent context")
+    owner = f"bureau-run:{run_id}"
+    if "lease_owner_id" in context and context["lease_owner_id"] != owner:
+        raise SagaError("Captain handoff owner differs from verified Saga")
+    return owner
+
+
 def _captain_outcome(
     captain_result: dict[str, Any],
     *,
