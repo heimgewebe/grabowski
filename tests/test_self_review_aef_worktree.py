@@ -330,14 +330,90 @@ class SelfReviewAefWorktreeTests(unittest.TestCase):
                 connection.commit()
                 self.assertGreater(wal.stat().st_size, 0)
                 before = [p.read_bytes() for p in (database, wal, shm)]
-                with self.assertRaisesRegex(self.review.ReviewExecutionRejected, "lifecycle evidence unavailable"):
+                self.assertEqual((target, "heimgewebe/grabowski"), producer._managed_repository_identity(target))
+                self.assertEqual(before, [p.read_bytes() for p in (database, wal, shm)])
+                connection.execute("UPDATE lifecycle_bindings SET phase='externally_terminal_missing'")
+                connection.commit()
+                before = [p.read_bytes() for p in (database, wal, shm)]
+                with self.assertRaisesRegex(self.review.ReviewExecutionRejected, "not a managed checkout"):
                     producer._managed_repository_identity(target)
                 self.assertEqual(before, [p.read_bytes() for p in (database, wal, shm)])
+                connection.execute("UPDATE lifecycle_bindings SET phase='completed_retained'")
+                connection.commit()
             finally:
                 connection.close()
             self.assertEqual((target, "heimgewebe/grabowski"), producer._managed_repository_identity(target))
             self.assertFalse(wal.exists())
             self.assertFalse(shm.exists())
+
+    def test_active_bureau_review_requires_exact_journal_workspace_and_live_owner(self) -> None:
+        import grabowski_bureau_pickup as pickup
+
+        run_id = "BUR-RUN-20261128T200220Z-c251c39643"
+        owner = "bureau-run:" + run_id
+        branch = "bureau/review-fixture/c251c39643"
+        target = self._linked(self.canonical, self.root / ".bureau-worktrees" / run_id)
+        self._git(target, "switch", "-c", branch)
+        status = {
+            "run_id": run_id, "root_binding_source": "journal-bound", "journal_available": True,
+            "execution_binding": {"run_id": run_id, "actively_bound": True},
+            "coordination": {
+                "status": "coordinated", "blocking": False,
+                "run": {
+                    "run_id": run_id, "workspace_path": str(target), "workspace_branch": branch,
+                    "task_id": "review-fixture",
+                    "reservations": [{"resource_id": "repo.grabowski", "mode": "write"}],
+                },
+                "lease": {"status": "active-bound"},
+                "stored_lease_binding": {"owner_id": owner, "task_id": "review-fixture"},
+                "release": {"owner_id": owner, "required": True},
+            },
+        }
+        with mock.patch.object(producer, "_registered_lane_checkout", return_value=False), \
+             mock.patch.object(pickup, "grabowski_bureau_pickup_status", return_value=status) as observe:
+            self.assertEqual((target, "heimgewebe/grabowski"), producer._managed_repository_identity(target))
+            observe.assert_called_once_with(run_id)
+            for path, value in (
+                (("journal_available",), False),
+                (("root_binding_source",), "current-canonical-with-legacy-fallback"),
+                (("run_id",), "foreign"),
+                (("execution_binding", "actively_bound"), False),
+                (("execution_binding", "run_id"), "foreign"),
+                (("coordination", "blocking"), True),
+                (("coordination", "lease", "status"), "terminal-released-or-expired"),
+                (("coordination", "stored_lease_binding", "owner_id"), "foreign"),
+                (("coordination", "stored_lease_binding", "task_id"), "foreign"),
+                (("coordination", "release", "owner_id"), "foreign"),
+                (("coordination", "run", "workspace_path"), str(self.root / "other")),
+                (("coordination", "run", "workspace_branch"), "foreign"),
+                (("coordination", "run", "reservations"), [{"resource_id": "repo.foreign", "mode": "write"}]),
+                (("coordination", "run", "reservations"), [{"resource_id": "repo.grabowski", "mode": "read"}]),
+            ):
+                with self.subTest(path=path, value=value):
+                    changed = copy.deepcopy(status)
+                    node = changed
+                    for part in path[:-1]:
+                        node = node[part]
+                    node[path[-1]] = value
+                    observe.return_value = changed
+                    with self.assertRaisesRegex(self.review.ReviewExecutionRejected, "not a managed checkout"):
+                        producer._managed_repository_identity(target)
+            observe.return_value = status
+            observe.side_effect = RuntimeError("unavailable")
+            with self.assertRaisesRegex(self.review.ReviewExecutionRejected, "coordination unavailable"):
+                producer._managed_repository_identity(target)
+            observe.side_effect = None
+            self._git(target, "switch", "-c", "foreign-branch")
+            with self.assertRaisesRegex(self.review.ReviewExecutionRejected, "not a managed checkout"):
+                producer._managed_repository_identity(target)
+            self._git(target, "switch", branch)
+            (target / self.fixture.source_path).write_text("dirty review source\n")
+            binding = {
+                "repo": "heimgewebe/grabowski", "head_sha": self._git(target, "rev-parse", "HEAD"),
+                "base_sha": self.fixture.base, "review_purpose": "pull_request",
+            }
+            with self.assertRaisesRegex(self.review.ReviewExecutionRejected, "not clean"):
+                producer._current_source(target, binding)
 
     def test_exact_kleinanzeiger_repository_can_use_signed_first_party_review(self) -> None:
         canonical = self._clone(self.root / "kleinanzeiger", "kleinanzeiger")
