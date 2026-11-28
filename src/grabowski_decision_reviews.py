@@ -1784,13 +1784,17 @@ def _claude_no_external_activity(usage: Any, subagents: Any) -> bool:
 
 def _proven_claude_pre_result_failure_before_review(
     receipt: dict[str, Any], provenance: dict[str, Any], *, auth_401: bool = False,
+    unattributed_401: bool = False,
 ) -> bool:
     """Verify a narrow, authenticated Claude 429 or revoked-OAuth 401 with zero review work.
 
     This never grants a review PASS, forgives ambiguous output, or erases a REJECT.
     Authentication failures are limited to the observed first-party 401 and
-    the exact local OAuth-refresh refusal with no API status.
+    the exact local OAuth-refresh refusal with no API status. The separate
+    unattributed mode proves only result-free work, not HTTP origin.
     """
+    if unattributed_401 and not auth_401:
+        return False
     if (
         provenance.get("schema_version") != 2
         or provenance.get("review_route", {}).get("provider_family") != "anthropic"
@@ -1840,6 +1844,7 @@ def _proven_claude_pre_result_failure_before_review(
         return False
     local_oauth_expired = (
         auth_401
+        and not unattributed_401
         and "api_error_status" in envelope
         and envelope["api_error_status"] is None
         and "api_error_origin" not in envelope
@@ -1909,7 +1914,15 @@ def _proven_claude_pre_result_failure_before_review(
             (
                 local_oauth_expired
                 or (
-                    envelope.get("api_error_origin") == "first_party"
+                    (
+                        (
+                            "api_error_origin" not in envelope
+                            and type(envelope.get("num_turns")) is int
+                            and envelope["num_turns"] == 1
+                        )
+                        if unattributed_401
+                        else envelope.get("api_error_origin") == "first_party"
+                    )
                     and envelope["result"] == _CLAUDE_AUTH_REVOKED_RESULT
                 )
             )
@@ -1949,6 +1962,15 @@ def _proven_claude_auth_failure_before_review(
 ) -> bool:
     return _proven_claude_pre_result_failure_before_review(
         receipt, provenance, auth_401=True,
+    )
+
+
+def _proven_claude_unattributed_failure_before_review(
+    receipt: dict[str, Any], provenance: dict[str, Any],
+) -> bool:
+    """Verify an exact result-free 401 envelope without asserting HTTP origin."""
+    return _proven_claude_pre_result_failure_before_review(
+        receipt, provenance, auth_401=True, unattributed_401=True,
     )
 
 
@@ -2303,6 +2325,10 @@ def _validated_review_role_evidence(
         "pre_result_auth_failure_verified": (
             result is None
             and _proven_claude_auth_failure_before_review(receipt, provenance)
+        ),
+        "pre_result_unattributed_failure_verified": (
+            result is None
+            and _proven_claude_unattributed_failure_before_review(receipt, provenance)
         ),
     }
 
@@ -3187,6 +3213,7 @@ def _reconcile_once(
                 "pre_result_quota_failure_verified": False,
                 "pre_result_cli_failure_verified": False,
                 "pre_result_auth_failure_verified": False,
+                "pre_result_unattributed_failure_verified": False,
                 "diff_identity_deferred": False,
             }
             if binding["base_sha"] != expected["base_sha"]:
@@ -3327,6 +3354,7 @@ def _reconcile_once(
                             role_evidence.get("pre_result_quota_failure_verified") is True
                             or role_evidence.get("pre_result_cli_failure_verified") is True
                             or role_evidence.get("pre_result_auth_failure_verified") is True
+                            or role_evidence.get("pre_result_unattributed_failure_verified") is True
                         )
                         and attempt["terminal_status"] in _PRE_RESULT_INFRASTRUCTURE_STATUSES
                         and attempt["terminal_status"] == "failed"
@@ -3340,6 +3368,9 @@ def _reconcile_once(
                         )
                         attempt["pre_result_auth_failure_verified"] = (
                             role_evidence.get("pre_result_auth_failure_verified") is True
+                        )
+                        attempt["pre_result_unattributed_failure_verified"] = (
+                            role_evidence.get("pre_result_unattributed_failure_verified") is True
                         )
                     else:
                         attempt["classification"] = "invalid_result"
@@ -3398,6 +3429,7 @@ def _reconcile_once(
                 infrastructure_attempt.get("pre_result_quota_failure_verified") is True
                 or infrastructure_attempt.get("pre_result_cli_failure_verified") is True
                 or infrastructure_attempt.get("pre_result_auth_failure_verified") is True
+                or infrastructure_attempt.get("pre_result_unattributed_failure_verified") is True
             ):
                 # Only authenticated pre-semantic failures can be superseded
                 # by a later independent PASS from the same provider family.
@@ -3419,6 +3451,7 @@ def _reconcile_once(
                 item.get("pre_result_quota_failure_verified") is True
                 or item.get("pre_result_cli_failure_verified") is True
                 or item.get("pre_result_auth_failure_verified") is True
+                or item.get("pre_result_unattributed_failure_verified") is True
                 for item in infrastructure
             )
         )
@@ -3488,6 +3521,7 @@ def _reconcile_once(
                 "pre_result_quota_failure_verified",
                 "pre_result_cli_failure_verified",
                 "pre_result_auth_failure_verified",
+                "pre_result_unattributed_failure_verified",
                 "diff_identity_deferred",
             )
         }

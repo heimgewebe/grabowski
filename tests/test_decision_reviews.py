@@ -387,7 +387,8 @@ def stamp_claude_quota_429(directory: Path, *, envelope_updates: dict | None = N
 
 
 def stamp_claude_oauth_401(directory: Path, *, envelope_updates: dict | None = None,
-                           receipt_updates: dict | None = None) -> None:
+                           receipt_updates: dict | None = None,
+                           omit_origin: bool = False) -> None:
     """Synthetic receipt with the exact observed provider-auth refusal, no model work."""
     stamp_claude_quota_429(directory)
     path = directory / reviews.REVIEW_ROLE_ATTEMPT_RECEIPT_NAME
@@ -402,6 +403,8 @@ def stamp_claude_oauth_401(directory: Path, *, envelope_updates: dict | None = N
             "Please log in again or contact your administrator."
         ),
     })
+    if omit_origin:
+        envelope.pop("api_error_origin")
     if envelope_updates:
         envelope.update(envelope_updates)
     payload = json.dumps(envelope, separators=(",", ":")).encode("utf-8")
@@ -1213,6 +1216,82 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
                 "decision_review_named_provider_slot_without_independent_pass:independent-claude",
                 optional["ignored_unavailable"],
             )
+
+    def test_v2_unattributed_oauth_401_proves_no_result_not_origin(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            jobs = Path(temporary) / "jobs"
+            jobs.mkdir(mode=0o700)
+            failed = make_job(
+                jobs, suffix="a88888888888", slot="independent-claude",
+                terminal_status="failed", review_result=None,
+                review_role=True, attempt_bound=True, attempt_epoch=2,
+            )
+            stamp_claude_oauth_401(failed, omit_origin=True,
+                                  envelope_updates={"num_turns": 1})
+            outcome = self.reconcile(jobs)
+            row = outcome["attempts"][0]
+            self.assertEqual(row["classification"], "infrastructure_error")
+            self.assertTrue(row["pre_result_unattributed_failure_verified"])
+            self.assertFalse(row["pre_result_auth_failure_verified"])
+            self.assertFalse(row["pre_result_quota_failure_verified"])
+            self.assertIsNone(row["verdict"])
+            self.assertIsNone(row["result_sha256"])
+            self.assertEqual(outcome["slots"][0]["independent_pass_count"], 0)
+            import grabowski_merge_guard as merge_guard
+            optional = merge_guard.decision_review_blocking_errors(
+                outcome, independent_required=False,
+            )
+            self.assertEqual(optional["errors"], [])
+            self.assertEqual(optional["status"], "optional_unavailable")
+            mandatory = merge_guard.decision_review_blocking_errors(
+                outcome, independent_required=True,
+            )
+            self.assertTrue(mandatory["errors"])
+            self.assertEqual(mandatory["ignored_unavailable"], [])
+            summary = merge_guard.independent_review_reconciliation_summary(outcome)
+            self.assertEqual(summary["pass_count"], 0)
+
+    def test_v2_unattributed_oauth_401_keeps_ambiguous_evidence_blocking(self) -> None:
+        cases = [
+            ("null_origin", {"api_error_origin": None}, {}),
+            ("proxy_origin", {"api_error_origin": "proxy"}, {}),
+            ("empty_origin", {"api_error_origin": ""}, {}),
+            ("unknown_origin", {"api_error_origin": "unknown"}, {}),
+            ("turn_count", {"num_turns": 2}, {}),
+            ("no_turn_count", {"num_turns": None}, {}),
+            ("bool_turn", {"num_turns": True}, {}),
+            ("work", {"usage": {"input_tokens": 1}}, {}),
+            ("output", {"usage": {"output_tokens": 1}}, {}),
+            ("model", {"modelUsage": {"model": {}}}, {}),
+            ("api_duration", {"duration_api_ms": 1}, {}),
+            ("safety", {"safety_stops": 1}, {}),
+            ("structured", {"structured_output": {"verdict": "NEEDS_CHANGE"}}, {}),
+            ("material", {"result": "REJECT_THIS_REVISION"}, {}),
+            ("unknown_field", {"model_text": "REJECT_THIS_REVISION"}, {}),
+            ("document", {}, {"review_document_bytes": 1}),
+            ("digest", {}, {"review_provider_envelope_sha256": "f" * 64}),
+        ]
+        for label, updates, receipt_updates in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary:
+                jobs = Path(temporary) / "jobs"
+                jobs.mkdir(mode=0o700)
+                failed = make_job(
+                    jobs, suffix="a88888888888", slot="independent-claude",
+                    terminal_status="failed", review_result=None,
+                    review_role=True, attempt_bound=True, attempt_epoch=2,
+                )
+                stamp_claude_oauth_401(
+                    failed, omit_origin=True,
+                    envelope_updates={"num_turns": 1, **updates},
+                    receipt_updates=receipt_updates,
+                )
+                outcome = self.reconcile(jobs)
+                self.assertEqual(outcome["attempts"][0]["classification"], "invalid_result")
+                self.assertFalse(outcome["attempts"][0]["pre_result_unattributed_failure_verified"])
+                import grabowski_merge_guard as merge_guard
+                self.assertTrue(merge_guard.decision_review_blocking_errors(
+                    outcome, independent_required=False,
+                )["errors"])
 
     def test_v2_oauth_401_provider_switch_does_not_poison_optional_review(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

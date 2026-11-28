@@ -876,8 +876,8 @@ def decision_review_blocking_errors(
                 # Legacy "infrastructure_error" can mean an unstructured
                 # semantic REJECT. Optional absence is advisory only for
                 # a server-proven never-started job or a fully verified V2
-                # role receipt proving auth refusal or quota exhaustion
-                # before any semantic review work.
+                # role receipt proving auth refusal, quota exhaustion, or
+                # an exact result-free 401 without asserting HTTP origin.
                 or not (
                     (
                         row.get("terminal_status") == "launch_failed"
@@ -885,12 +885,19 @@ def decision_review_blocking_errors(
                         and row.get("review_role_receipt_sha256") is None
                         and row.get("pre_result_quota_failure_verified") is False
                         and row.get("pre_result_auth_failure_verified") is not True
+                        and row.get("pre_result_unattributed_failure_verified") is not True
                     )
                     or (
                         row.get("terminal_status") == "failed"
                         and (
                             row.get("pre_result_quota_failure_verified") is True
                             or row.get("pre_result_auth_failure_verified") is True
+                            or (
+                                row.get("pre_result_unattributed_failure_verified") is True
+                                and row.get("review_provider_family") == "anthropic"
+                                and row.get("pre_result_auth_failure_verified") is False
+                                and row.get("pre_result_quota_failure_verified") is False
+                            )
                         )
                         and row.get("review_role_verified") is True
                         and row.get("review_route_verified") is True

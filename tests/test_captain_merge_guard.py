@@ -593,6 +593,57 @@ class RiskScaledIndependentReviewContractTests(unittest.TestCase):
         self.assertEqual(outcome["status"], "optional_unavailable")
         self.assertEqual(outcome["ignored_unavailable"], proof["errors"])
 
+    def test_verified_unattributed_401_is_optional_but_not_independent_pass(self) -> None:
+        proof = self._infra_only_reconciliation()
+        attempt = proof["attempts"][0]
+        attempt.update({
+            "terminal_status": "failed",
+            "pre_result_unattributed_failure_verified": True,
+            "pre_result_auth_failure_verified": False,
+            "pre_result_quota_failure_verified": False,
+            "review_provider_family": "anthropic",
+            "review_role_verified": True,
+            "review_route_verified": True,
+            "independence_verified": True,
+            "review_role_receipt_sha256": "c" * 64,
+        })
+        optional = merge_guard.decision_review_blocking_errors(
+            proof, independent_required=False
+        )
+        self.assertEqual(optional["errors"], [])
+        self.assertEqual(optional["status"], "optional_unavailable")
+        required = merge_guard.decision_review_blocking_errors(
+            proof, independent_required=True
+        )
+        self.assertEqual(required["errors"], proof["errors"])
+        self.assertEqual(required["ignored_unavailable"], [])
+        for key, invalid in (
+            ("review_role_verified", False),
+            ("review_route_verified", False),
+            ("independence_verified", False),
+            ("review_provider_family", "other"),
+            ("review_role_receipt_sha256", None),
+            ("pre_result_auth_failure_verified", None),
+            ("terminal_status", "launch_failed"),
+            ("verdict", "REJECT_THIS_REVISION"),
+        ):
+            with self.subTest(key=key):
+                original = attempt[key]
+                attempt[key] = invalid
+                self.assertEqual(
+                    merge_guard.decision_review_blocking_errors(
+                        proof, independent_required=False
+                    )["errors"], proof["errors"]
+                )
+                attempt[key] = original
+        proof["errors"].append("decision_review_material_reject:independent-reviewer:grabowski-job-bbbbbbbbbbbb")
+        self.assertIn(
+            proof["errors"][-1],
+            merge_guard.decision_review_blocking_errors(
+                proof, independent_required=False
+            )["errors"],
+        )
+
     def test_explicit_independent_review_keeps_transport_failure_blocking(self) -> None:
         info = merge_guard.decision_review_blocking_errors(
             self._infra_only_reconciliation(), independent_required=True
