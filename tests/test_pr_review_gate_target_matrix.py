@@ -203,6 +203,24 @@ class PrReviewGateTargetMatrixTests(unittest.TestCase):
                 ],
             )
 
+    def test_nabu_first_pr_cannot_self_authorize_a_different_check(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            repo = Path(raw)
+            head = '{"schema_version":1,"required_checks":["fake-green-check"]}'
+            with mock.patch.object(
+                pr_review_gate, "_required_check_catalog_text_at_revision",
+                side_effect=[head, None],
+            ), mock.patch.object(
+                pr_review_gate, "_workflow_text_at_revision", return_value=None,
+            ):
+                self.assertEqual(
+                    pr_review_gate.expected_check_names_for_repo(
+                        repo, repo_name="heimgewebe/nabu",
+                        head_sha="a" * 40, base_sha="b" * 40,
+                    ),
+                    ("test",),
+                )
+
     def test_nixer_unmerged_head_catalog_cannot_replace_bootstrap(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             repo = Path(raw)
@@ -293,6 +311,7 @@ class PrReviewGateTargetMatrixTests(unittest.TestCase):
             "heimgewebe/hauski-audio": ("scan",),
             "Hall-of-Memory/Hall-of-Memory": ("verify",),
             "alexdermohr/beziehungsgestaltung-okja": ("Inhalte und Navigation",),
+            "heimgewebe/nabu": ("test",),
             "alexdermohr/mark-api": ("verify",),
             "alexdermohr/kleinanzeiger": ("verify", "verify-py313", "installed-offline", "installed-offline-py313", "windows-installed-py3.12", "windows-installed-py3.13"),
             "heimgewebe/metarepo": ("ci (ubuntu-latest)", "ci (macos-latest)"),

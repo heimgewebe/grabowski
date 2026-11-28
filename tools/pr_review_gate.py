@@ -116,6 +116,7 @@ BOOTSTRAP_EXPECTED_CHECK_NAMES_BY_REPO = {
     "heimgewebe/hauski-audio": ("scan",),
     "hall-of-memory/hall-of-memory": ("verify",),
     "alexdermohr/beziehungsgestaltung-okja": ("Inhalte und Navigation",),
+    "heimgewebe/nabu": ("test",),
     "alexdermohr/mark-api": ("verify",),
     "alexdermohr/kleinanzeiger": ("verify", "verify-py313", "installed-offline", "installed-offline-py313", "windows-installed-py3.12", "windows-installed-py3.13"),
     "heimgewebe/metarepo": ("ci (ubuntu-latest)", "ci (macos-latest)"),
