@@ -26,6 +26,14 @@ recovery, or unresolved findings.  No new Grok route is executable because the p
 owner-disabled; historical route identities stay for old signed receipts.  No API usage credits, additional pay-as-you-go,
 or automatic overage are authorized.
 
+An authenticated V2 role receipt containing the complete, digest-bound exact
+revoked-OAuth 401 envelope, with one wrapper turn, zero API/model/tool activity,
+no semantic result and an absent HTTP-origin field, can establish only
+result-free unavailability. It does not establish first-party HTTP origin or
+a review PASS. Explicit unknown, null or proxy origin, ambiguous output and
+material findings remain blocking. Mandatory independent review still requires
+a real PASS; original job and role receipts remain unchanged.
+
 The automatic trigger currently covers signed first-party PR reviews; an
 ordinary self-review without such a session is unchanged.  This is not a
 claim that all critical PRs are automatically routed through Claude until
