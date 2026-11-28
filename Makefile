@@ -10,7 +10,7 @@ GRABOWSKI_RUNTIME_PYTHON ?= $(HOME)/.local/share/grabowski-mcp/.venv/bin/python
 RETENTION_MIN_AGE_SECONDS ?= 86400
 RETENTION_MAX_ARCHIVE_JOBS ?= 128
 
-.PHONY: validate validate-main-reuse syntax test policy tool-surface-budget catalog-data-refresh catalog-data-check context-refresh context-check profiles-refresh profiles-check runtime-lock chronik-runtime-contract runtime-lock-refresh secrets deploy-tooling deploy-tooling-check deploy-tooling-lock-refresh deploy-check deploy-preflight deploy-apply deploy-direct deploy runtime-retention-check runtime-retention-apply runtime-legacy-status routing-cli-check routing-cli-apply
+.PHONY: validate validate-main-reuse validate-admission syntax test policy tool-surface-budget catalog-data-refresh catalog-data-check context-refresh context-check profiles-refresh profiles-check runtime-lock chronik-runtime-contract runtime-lock-refresh secrets deploy-tooling deploy-tooling-check deploy-tooling-lock-refresh deploy-check deploy-preflight deploy-apply deploy-direct deploy runtime-retention-check runtime-retention-apply runtime-legacy-status routing-cli-check routing-cli-apply
 
 # Reject generated-contract drift before spending time on the full test suite.
 VALIDATE_PRECHECKS := catalog-data-check syntax context-check profiles-check
@@ -22,6 +22,10 @@ validate: $(VALIDATE_PRECHECKS) test $(VALIDATE_CONTRACT_CHECKS)
 # Keep fresh contracts and the focused selector regression tests.
 validate-main-reuse: $(VALIDATE_PRECHECKS) $(VALIDATE_CONTRACT_CHECKS)
 >$(PYTHON) -m unittest discover -s tests -p 'test_ci_validation_reuse.py' -v
+
+# PR admission runs the same fresh contracts and selector regression tests.
+# Full test suite and deployment staging still run on the queue merge group.
+validate-admission: validate-main-reuse
 
 syntax:
 >$(PYTHON) -m py_compile tools/operator_patch_relay.py
