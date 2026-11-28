@@ -909,6 +909,80 @@ class SagaDurablePlanRecoveryTests(unittest.TestCase):
             )
         capture.assert_called_once_with()
 
+    def captain_handoff_fixture(self):
+        helper = SagaContractTests()
+        plan = sagas.build_plan("pr-settlement", helper.pr_target(), "captain-handoff")
+        run = sagas.build_run_receipt(plan, helper.mechanic_result(plan))
+        record = {
+            **self.record, "saga_kind": plan["saga_kind"],
+            "plan_sha256": plan["plan_sha256"], "plan": plan,
+            "run_sha256": run["run_sha256"],
+            "run_receipt_sha256": sagas.sha256_json(run), "run_receipt": run,
+        }
+        parameters = {
+            "saga_run_ref": self.ref,
+            "actions": [{"action": "pr-merge",
+                         "target": copy.deepcopy(plan["captain_handoff"]["target"])}],
+            "expected_head": HEAD, "expected_base_sha": BASE, "diff_sha256": DIFF,
+            "execution_intent": {"context": {"purpose": "test"}},
+        }
+        return plan, run, record, parameters
+
+    def test_captain_saga_handoff_exact_owner_and_drift(self):
+        import grabowski_audit_query
+        _, _, record, params = self.captain_handoff_fixture()
+        original = copy.deepcopy(params)
+        owner = f"bureau-run:{RUN_ID}"
+        with patch.object(grabowski_audit_query, "capture_verified_audit_snapshot",
+                          return_value=self.snapshot(record)) as capture:
+            self.assertEqual(owner, grip_orchestration.resolve_captain_saga_lease_owner(params))
+        capture.assert_called_once_with()
+        self.assertEqual(original, params)
+        same = copy.deepcopy(params)
+        same["execution_intent"]["context"]["lease_owner_id"] = owner
+        with patch.object(grabowski_audit_query, "capture_verified_audit_snapshot",
+                          return_value=self.snapshot(record)):
+            self.assertEqual(owner, grip_orchestration.resolve_captain_saga_lease_owner(same))
+        variants = []
+        for field in ("expected_head", "expected_base_sha", "diff_sha256"):
+            variants.append({**params, field: "f" * len(params[field])})
+        for field, value in (("repo", "other/repo"), ("pr", 999), ("base", "other"),
+                             ("merge_method", "merge")):
+            drift = copy.deepcopy(params)
+            drift["actions"][0]["target"][field] = value
+            variants.append(drift)
+        variants.extend([
+            {**params, "actions": []},
+            {**params, "execution_intent": {"context": {"lease_owner_id": "operator:other"}}},
+            {**params, "execution_intent": {}},
+            {**params, "saga_run_ref": record["run_receipt"]},
+        ])
+        for variant in variants:
+            with self.subTest(variant=variant), patch.object(
+                grabowski_audit_query, "capture_verified_audit_snapshot",
+                return_value=self.snapshot(record),
+            ):
+                with self.assertRaises(sagas.SagaError):
+                    grip_orchestration.resolve_captain_saga_lease_owner(variant)
+
+    def test_captain_saga_handoff_rejects_non_bureau_and_non_pr_runs(self):
+        helper = SagaContractTests()
+        plan, _, _, params = self.captain_handoff_fixture()
+        standalone = sagas.build_plan(
+            "pr-settlement", {**helper.pr_target(), "bureau_run_id": None}, "standalone",
+        )
+        for candidate_plan, candidate_run in (
+            (standalone, {"captain_ready": True, "state": "captain_required"}),
+            (self.plan, self.run),
+            (plan, {"captain_ready": False, "state": "prepare_blocked"}),
+        ):
+            with self.subTest(plan=candidate_plan["saga_kind"]), patch.object(
+                grip_orchestration, "recover_saga_run",
+                return_value=(candidate_plan, candidate_run),
+            ):
+                with self.assertRaises(sagas.SagaError):
+                    grip_orchestration.resolve_captain_saga_lease_owner(params)
+
     def test_legacy_record_only_accepts_original_explicit_plan(self):
         import grabowski_audit_query
         record = dict(self.record)

@@ -1403,6 +1403,70 @@ class OperatorV2RuntimeTests(unittest.TestCase):
                     blocked_bureau["output"]["error"],
                 )
 
+                saga_parameters = dict(valid_parameters)
+                saga_parameters["saga_run_ref"] = {
+                    "schema_version": 1.0, "kind": "grabowski_saga_run_receipt_ref",
+                    "record_sha256": "9" * 64,
+                }
+                saga_parameters["execution_intent"] = {"context": {"purpose": "saga"}}
+                with (
+                    patch.dict(sys.modules, {"grabowski_bureau_pickup": fake_bureau_pickup}),
+                    patch.object(
+                        grabowski_mcp.grabowski_grips.grabowski_grip_orchestration,
+                        "resolve_captain_saga_lease_owner", return_value=bureau_owner,
+                    ) as resolve_owner,
+                    patch.object(grabowski_mcp.grabowski_grips, "grip_run",
+                                 return_value={"ok": True}) as saga_run,
+                ):
+                    saga_result = grabowski_mcp.grip_run(
+                        "captain-run", saga_parameters, ctx=RequestContext()
+                    )
+                self.assertEqual({"ok": True}, saga_result)
+                resolve_owner.assert_called_once()
+                self.assertIs(
+                    type(resolve_owner.call_args.args[0]["saga_run_ref"]["schema_version"]), int
+                )
+                saga_dispatched = saga_run.call_args.args[1]
+                self.assertEqual(
+                    bureau_owner, saga_dispatched["execution_intent"]["context"]["lease_owner_id"]
+                )
+                self.assertNotIn("lease_owner_id", saga_parameters["execution_intent"]["context"])
+                verified_saga = grabowski_mcp.grabowski_merge_guard.verify_server_bureau_run_lease_delegation(
+                    saga_dispatched["_server_bureau_run_lease_delegation"],
+                    actor_identity=saga_dispatched["_server_runtime_actor_identity"],
+                    captain_request_sha256_value=(
+                        grabowski_mcp.grabowski_merge_guard.captain_request_sha256(saga_dispatched)
+                    ),
+                )
+                self.assertEqual(bureau_owner, verified_saga["lease_owner_id"])
+                with (
+                    patch.object(
+                        grabowski_mcp.grabowski_grips.grabowski_grip_orchestration,
+                        "resolve_captain_saga_lease_owner", side_effect=ValueError("conflict"),
+                    ),
+                    patch.object(grabowski_mcp.grabowski_grips, "grip_run") as refused,
+                ):
+                    blocked_saga = grabowski_mcp.grip_run(
+                        "captain-run", saga_parameters, ctx=RequestContext()
+                    )
+                self.assertEqual("blocked", blocked_saga["receipt"]["status"])
+                refused.assert_not_called()
+                with (
+                    patch.dict(sys.modules, {"grabowski_bureau_pickup": types.SimpleNamespace(
+                        server_bureau_run_lease_delegation_evidence=lambda _run_id: None
+                    )}),
+                    patch.object(
+                        grabowski_mcp.grabowski_grips.grabowski_grip_orchestration,
+                        "resolve_captain_saga_lease_owner", return_value=bureau_owner,
+                    ),
+                    patch.object(grabowski_mcp.grabowski_grips, "grip_run") as refused,
+                ):
+                    no_live_lease = grabowski_mcp.grip_run(
+                        "captain-run", saga_parameters, ctx=RequestContext()
+                    )
+                self.assertEqual("blocked", no_live_lease["receipt"]["status"])
+                refused.assert_not_called()
+
                 unavailable = grabowski_mcp.grip_run(
                     "captain-run", valid_parameters, ctx=None
                 )

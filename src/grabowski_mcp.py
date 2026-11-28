@@ -1776,6 +1776,9 @@ def _normalize_captain_transport_integer_fields(value: Any) -> Any:
         normalized.get("execution_intent"), ("schema_version",)
     )
     _normalize_captain_transport_mapping_integers(
+        normalized.get("saga_run_ref"), ("schema_version",)
+    )
+    _normalize_captain_transport_mapping_integers(
         normalized.get("session_escalation"), ("expires_at_unix",)
     )
     return normalized
@@ -15371,6 +15374,29 @@ def _grip_run_core(
             dispatch_parameters["_server_runtime_actor_identity"] = actor_identity
             captain_actor_identity = actor_identity
             execution_intent = dispatch_parameters.get("execution_intent")
+            if "saga_run_ref" in dispatch_parameters:
+                # Bind the verified owner before hashing, auditing, or issuing
+                # the existing live, request-bound lease delegation.
+                try:
+                    owner = (
+                        grabowski_grips.grabowski_grip_orchestration
+                        .resolve_captain_saga_lease_owner(dispatch_parameters)
+                    )
+                except grabowski_grips.grabowski_grip_orchestration.SagaError as exc:
+                    return grabowski_grips._blocked_surface_receipt(
+                        name,
+                        raw_parameters,
+                        "Captain Saga handoff blocked: "
+                        + grabowski_grips._bounded_command_output(str(exc), limit=256),
+                    )
+                execution_intent = {
+                    **execution_intent,
+                    "context": {
+                        **execution_intent["context"],
+                        "lease_owner_id": owner,
+                    },
+                }
+                dispatch_parameters["execution_intent"] = execution_intent
             context = (
                 execution_intent.get("context")
                 if isinstance(execution_intent, dict)
